@@ -1,6 +1,6 @@
 # mu
 
-Fast terminal agent harness — a Rust filter binary plus zsh plugin for agent mode.
+Fast terminal agent harness — a Rust filter binary plus shell plugins for agent mode.
 
 ## Build
 
@@ -24,6 +24,9 @@ eval "$(mu init zsh)"
 ```
 
 Press **Alt-M** to enter agent mode. Type a prompt and press Enter.
+
+The zsh integration source lives at `shell-plugins/mu.zsh`; additional shell
+integrations can live next to it with shell-specific suffixes.
 
 ## CLI
 

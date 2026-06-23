@@ -24,7 +24,7 @@ use provider::openai::OpenAiProvider;
 use provider::Provider;
 use renderer::Renderer;
 
-const ZSH_PLUGIN: &str = include_str!("plugin.zsh");
+const ZSH_PLUGIN: &str = include_str!("../shell-plugins/mu.zsh");
 
 #[tokio::main]
 async fn main() {
