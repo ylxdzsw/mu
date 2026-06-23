@@ -1,0 +1,282 @@
+use std::path::Path;
+
+use anyhow::Result;
+
+use crate::config::Config;
+use crate::provider::{Message, Provider, ProviderError};
+use crate::store::Store;
+
+pub async fn maybe_compact(
+    store: &Store,
+    config: &Config,
+    session_id: &str,
+    model: &str,
+    provider: &dyn Provider,
+    system_prompt: &str,
+) -> Result<()> {
+    let session = store
+        .get_session(session_id)?
+        .ok_or_else(|| anyhow::anyhow!("session not found"))?;
+
+    let context_window = config.context_window(model);
+    let threshold = config.compaction.fraction;
+
+    let tokens = if session.last_total_tokens > 0 {
+        session.last_total_tokens
+    } else {
+        store.estimate_context_tokens(session_id)
+    };
+
+    let should_compact = match context_window {
+        Some(cw) => (tokens as f64) > (cw as f64 * threshold),
+        None => false,
+    };
+
+    if should_compact {
+        run_compaction(store, config, session_id, provider, system_prompt).await?;
+    }
+    Ok(())
+}
+
+pub async fn run_compaction(
+    store: &Store,
+    config: &Config,
+    session_id: &str,
+    provider: &dyn Provider,
+    system_prompt: &str,
+) -> Result<()> {
+    let messages = store.all_messages_for_session(session_id)?;
+    let keep = config.compaction.keep_recent_turns;
+
+    // Count user turns from the end
+    let mut user_turn_starts: Vec<i64> = Vec::new();
+    for msg in messages.iter().rev() {
+        if msg.role == "user" {
+            user_turn_starts.push(msg.seq);
+            if user_turn_starts.len() >= keep {
+                break;
+            }
+        }
+    }
+    user_turn_starts.reverse();
+
+    let cut_seq = if keep == 0 {
+        i64::MAX
+    } else {
+        user_turn_starts.first().copied().unwrap_or(i64::MAX)
+    };
+
+    let to_summarize: Vec<String> = messages
+        .iter()
+        .filter(|m| m.seq < cut_seq && m.role != "summary")
+        .map(|m| {
+            let role = match m.role.as_str() {
+                "user" => "user",
+                "assistant" => "assistant",
+                "tool" => "tool-result",
+                _ => "system",
+            };
+            if m.content.is_empty() {
+                format!("[{role}]: (no text content)")
+            } else {
+                format!("[{role}]: {}", m.content)
+            }
+        })
+        .collect();
+
+    if to_summarize.is_empty() {
+        return Ok(());
+    }
+
+    let prior_summary = messages
+        .iter()
+        .filter(|m| m.role == "summary")
+        .last()
+        .map(|m| m.content.as_str());
+
+    let summarize_prompt = if let Some(prior) = prior_summary {
+        format!(
+            "Update this conversation summary. Preserve still-true details, remove stale facts.\n\nPrior summary:\n{prior}\n\nNew messages to incorporate:\n{}",
+            to_summarize.join("\n---\n")
+        )
+    } else {
+        format!(
+            "Summarize this conversation concisely for future context:\n\n{}",
+            to_summarize.join("\n---\n")
+        )
+    };
+
+    let msgs = vec![
+        Message::System {
+            content: system_prompt.into(),
+        },
+        Message::User {
+            content: summarize_prompt,
+        },
+    ];
+
+    let tools: Vec<serde_json::Value> = vec![];
+    let model = store
+        .get_session(session_id)?
+        .map(|s| s.model)
+        .unwrap_or_else(|| config.default_model.clone());
+
+    let mut ignore_text = |_delta: String| Ok(());
+    let result = provider
+        .stream_chat(&model, &msgs, &tools, &mut ignore_text)
+        .await;
+    match result {
+        Ok(r) => {
+            let content = match r.message {
+                Message::Assistant { content, .. } => content.unwrap_or_default(),
+                _ => String::new(),
+            };
+            if keep == 0 || cut_seq == i64::MAX {
+                store.append_summary(session_id, &content)?;
+            } else {
+                store.insert_summary_before(session_id, &content, cut_seq)?;
+            }
+        }
+        Err(ProviderError::ContextLength) => {
+            // Don't overwrite a prior summary with a failure string — that
+            // would silently destroy all earlier context. If we have a prior
+            // summary, leave it intact and return; the caller's retry logic
+            // will eventually bail with a clear error. If there is no prior
+            // summary at all, insert an honest minimal note so the model knows
+            // earlier history was lost.
+            let has_prior = messages.iter().any(|m| m.role == "summary");
+            if !has_prior {
+                let note = "Earlier conversation history was lost due to context overflow.";
+                if keep == 0 || cut_seq == i64::MAX {
+                    store.append_summary(session_id, note)?;
+                } else {
+                    store.insert_summary_before(session_id, note, cut_seq)?;
+                }
+            }
+        }
+        Err(e) => {
+            return Err(anyhow::anyhow!("compaction failed: {e}"));
+        }
+    }
+    Ok(())
+}
+
+pub fn prune_spills(state_dir: &Path) {
+    crate::tools::truncate::prune_truncation_spills(state_dir, 7);
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use async_trait::async_trait;
+    use serde_json::Value;
+
+    use super::*;
+    use crate::provider::{FinishReason, StreamResult, Usage};
+
+    struct FakeProvider;
+
+    #[async_trait(?Send)]
+    impl Provider for FakeProvider {
+        async fn stream_chat(
+            &self,
+            _model: &str,
+            _messages: &[Message],
+            _tools: &[Value],
+            _on_text_delta: &mut dyn FnMut(String) -> Result<(), ProviderError>,
+        ) -> Result<StreamResult, ProviderError> {
+            Ok(StreamResult {
+                message: Message::Assistant {
+                    content: Some("summary".into()),
+                    tool_calls: None,
+                },
+                finish_reason: FinishReason::Stop,
+                usage: Some(Usage {
+                    prompt_tokens: 1,
+                    completion_tokens: 1,
+                    total_tokens: 2,
+                }),
+            })
+        }
+    }
+
+    fn test_config() -> Config {
+        Config {
+            provider: crate::config::ProviderConfig {
+                base_url: "http://localhost".into(),
+                api_key_env: "TEST_KEY".into(),
+            },
+            default_model: "fake-model".into(),
+            models: Default::default(),
+            agent_mode_key: "\\eM".into(),
+            magic_space: false,
+            compaction: crate::config::CompactionConfig {
+                fraction: 0.75,
+                keep_recent_turns: 2,
+            },
+            limits: crate::config::LimitsConfig::default(),
+        }
+    }
+
+    #[tokio::test]
+    async fn compaction_keeps_only_requested_recent_turns() {
+        let tmp = std::env::temp_dir().join(format!("mu-compaction-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let store = Store::open(&tmp.join("mu.db")).unwrap();
+        let session = store.create_session("/tmp", "fake-model").unwrap();
+
+        for n in 1..=4 {
+            store
+                .append_message(
+                    &session.id,
+                    &Message::User {
+                        content: format!("user {n}"),
+                    },
+                )
+                .unwrap();
+            store
+                .append_message(
+                    &session.id,
+                    &Message::Assistant {
+                        content: Some(format!("assistant {n}")),
+                        tool_calls: None,
+                    },
+                )
+                .unwrap();
+        }
+
+        run_compaction(
+            &store,
+            &test_config(),
+            &session.id,
+            &FakeProvider,
+            "system prompt",
+        )
+        .await
+        .unwrap();
+
+        let messages = store.load_context_messages(&session.id).unwrap();
+        let visible_users: Vec<String> = messages
+            .iter()
+            .filter_map(|message| match message {
+                Message::User { content } => Some(content.clone()),
+                _ => None,
+            })
+            .collect();
+
+        // The summary is now framed as a leading user message (so the
+        // assembled context keeps exactly one leading system message), followed
+        // by the kept-verbatim recent turns.
+        assert_eq!(
+            visible_users,
+            vec![
+                "[summary of earlier conversation]\nsummary".to_string(),
+                "user 3".to_string(),
+                "user 4".to_string()
+            ]
+        );
+
+        let _ = std::fs::remove_dir_all(Path::new(&tmp));
+    }
+}
