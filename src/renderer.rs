@@ -13,6 +13,7 @@ const UNDERLINE: &str = "\x1b[4m";
 const STRIKE: &str = "\x1b[9m";
 const RED: &str = "\x1b[91m";
 const GREEN: &str = "\x1b[92m";
+const YELLOW: &str = "\x1b[93m";
 const CYAN: &str = "\x1b[96m";
 
 pub struct Renderer {
@@ -70,10 +71,20 @@ impl Renderer {
             .and_then(|value| value.as_str())
             .or_else(|| args.get("script").and_then(|value| value.as_str()))
             .unwrap_or_default();
+        let risk = args
+            .get("risk")
+            .and_then(|value| value.as_str())
+            .map(|risk| format_risk_label(risk, self.styled));
         let line = if self.styled {
-            format!("{CYAN}${RESET} {BOLD}{command}{RESET}\n")
+            match risk {
+                Some(risk) => format!("{CYAN}${RESET} {risk} {BOLD}{command}{RESET}\n"),
+                None => format!("{CYAN}${RESET} {BOLD}{command}{RESET}\n"),
+            }
         } else {
-            format!("$ {command}\n")
+            match risk {
+                Some(risk) => format!("$ {risk} {command}\n"),
+                None => format!("$ {command}\n"),
+            }
         };
         self.write_stdout(&line)
     }
@@ -427,6 +438,18 @@ fn format_tool(display: &ToolDisplay, elapsed: Duration, styled: bool) -> String
                 format!("[bash] exit {exit_code} ({elapsed})\n")
             }
         }
+    }
+}
+
+fn format_risk_label(risk: &str, styled: bool) -> String {
+    if !styled {
+        return format!("[{risk}]");
+    }
+    match risk {
+        "readonly" => format!("{CYAN}[{risk}]{RESET}"),
+        "reversible" => format!("{YELLOW}[{risk}]{RESET}"),
+        "destructive" => format!("{RED}[{risk}]{RESET}"),
+        _ => format!("{DIM}[{risk}]{RESET}"),
     }
 }
 

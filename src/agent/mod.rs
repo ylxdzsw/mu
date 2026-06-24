@@ -249,11 +249,13 @@ impl<'a> AgentLoop<'a> {
             }
         };
 
+        let risk = tool_call_risk(&call.function.arguments);
         self.store.record_tool_call(
             message_id,
             &call.id,
             &call.function.name,
             &call.function.arguments,
+            risk.as_deref(),
             &output,
             status,
         )?;
@@ -270,6 +272,15 @@ impl<'a> AgentLoop<'a> {
 
 fn parse_tool_args(call: &ToolCall) -> Value {
     serde_json::from_str(&call.function.arguments).unwrap_or(Value::Object(Default::default()))
+}
+
+fn tool_call_risk(args: &str) -> Option<String> {
+    let value: Value = serde_json::from_str(args).ok()?;
+    let risk = value.get("risk")?.as_str()?;
+    match risk {
+        "readonly" | "reversible" | "destructive" => Some(risk.to_string()),
+        _ => None,
+    }
 }
 
 fn unknown_tool_result(name: &str) -> Result<ToolResult> {

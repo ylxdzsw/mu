@@ -43,7 +43,7 @@ impl Tool for BashTool {
                 "title": { "type": "string", "description": "Short human-readable title for the action" },
                 "risk": {
                     "type": "string",
-                    "enum": ["read-only", "reversible", "destructive"],
+                    "enum": ["readonly", "reversible", "destructive"],
                     "description": "Advisory risk label for UI and audit only"
                 },
                 "script": { "type": "string", "description": "Bash script to run with bash -lc" },
@@ -340,7 +340,7 @@ mod tests {
     fn args(script: &str) -> BashArgs {
         BashArgs {
             title: "test".into(),
-            risk: BashRisk::ReadOnly,
+            risk: BashRisk::Readonly,
             script: script.into(),
             timeout: None,
             cwd: None,

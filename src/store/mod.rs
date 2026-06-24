@@ -85,6 +85,20 @@ impl Store {
                 skills_json TEXT NOT NULL
             );",
         )?;
+        self.ensure_tool_call_column("risk", "TEXT")?;
+        Ok(())
+    }
+
+    fn ensure_tool_call_column(&self, name: &str, sql_type: &str) -> Result<()> {
+        let mut stmt = self.conn.prepare("PRAGMA table_info(tool_call)")?;
+        let columns = stmt.query_map([], |row| row.get::<_, String>(1))?;
+        for column in columns {
+            if column? == name {
+                return Ok(());
+            }
+        }
+        self.conn
+            .execute(&format!("ALTER TABLE tool_call ADD COLUMN {name} {sql_type}"), [])?;
         Ok(())
     }
 
@@ -348,13 +362,14 @@ impl Store {
         id: &str,
         tool: &str,
         args: &str,
+        risk: Option<&str>,
         output: &str,
         status: &str,
     ) -> Result<()> {
         self.conn.execute(
-            "INSERT OR REPLACE INTO tool_call (id, message_id, tool, args, output, status)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![id, message_id, tool, args, output, status],
+            "INSERT OR REPLACE INTO tool_call (id, message_id, tool, args, risk, output, status)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![id, message_id, tool, args, risk, output, status],
         )?;
         Ok(())
     }

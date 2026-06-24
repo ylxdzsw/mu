@@ -249,7 +249,7 @@ This is the exact sequence the binary follows for one turn invocation
       request order. Render and **persist tool result messages** (`role:
       "tool"`, with their `tool_call_id`) in the model's original call order,
       then loop back to (a). A future version may run contiguous
-      `risk:"read-only"` calls concurrently once renderer interleaving and
+      `risk:"readonly"` calls concurrently once renderer interleaving and
       cancellation semantics are explicitly designed.
    f. If `finish_reason` is `stop`: the loop ends.
 10. **Update the session row:** `last_total_tokens` = the `total_tokens` from the
@@ -283,7 +283,7 @@ The model-visible tool surface is exactly:
 ```ts
 bash({
   title: string,
-  risk: "read-only" | "reversible" | "destructive",
+  risk: "readonly" | "reversible" | "destructive",
   script: string,
   cwd?: string,
   timeout?: number, // seconds, default 120
@@ -302,13 +302,13 @@ quotes, or heredoc delimiters without shell expansion.
 **Execution ordering.** V1 executes every `bash` call sequentially in request
 order. This keeps filesystem effects, terminal output, and cancellation simple
 while the tool is unsandboxed. A future version may run contiguous
-`risk:"read-only"` calls concurrently because per-call bash processes are
+`risk:"readonly"` calls concurrently because per-call bash processes are
 isolated.
 
-**Terminal visibility.** `bash` prints `$ <title>`, streams combined output, and
-finishes with exit status/duration. Every tool error is visible. TTY output uses
-OpenCode-inspired color and glyphs; redirected output uses ANSI-free ASCII
-equivalents.
+**Terminal visibility.** `bash` prints `$ [risk] <title>`, streams combined
+output, and finishes with exit status/duration. Every tool error is visible.
+TTY output uses OpenCode-inspired color and glyphs, including colored risk
+labels; redirected output uses ANSI-free ASCII equivalents.
 
 **Output truncation policy.** Following opencode's model, every bash output is
 capped before it enters the context window so a single large result cannot blow
@@ -367,7 +367,7 @@ captures the complete portable transcript while fatal diagnostics/summary
 remain visible. Stdout TTY detection selects rich versus portable rendering;
 stderr TTY detection suppresses the summary when redirected.
 
-- **Tool presentation.** Bash prints `$ <title>`, streams ANSI-sanitized output,
+- **Tool presentation.** Bash prints `$ [risk] <title>`, streams ANSI-sanitized output,
   and prints its final exit status. Full tool results still follow the shared
   model-context truncation policy (§4).
 - **Assistant text.** Raw deltas stream unchanged when redirected. TTY display
@@ -520,8 +520,9 @@ target `.zshrc`):
   `HIST_IGNORE_SPACE`, or omits it from `accept-line` history recording), so
   each turn produces exactly one history entry: the prompt itself.
 - **Full structured history:** `mu` independently records the complete prompt,
-  assistant responses, and tool calls in SQLite (§10) — the authoritative
-  transcript.
+  assistant responses, and tool calls in SQLite (§10). Tool output is stored
+  with the shared truncation/spill policy, so the DB keeps the structured
+  transcript and the spill files hold any oversized raw command output.
 - **No shell-command sharing (V1):** commands you run in *normal* shell mode are
   **not** automatically fed to the agent. Bridging interactive shell activity
   into the session (e.g. via `preexec`/`precmd` capture) is deferred; V1 keeps
@@ -733,9 +734,9 @@ Conceptual schema (flat and small):
   Provider-neutral representation. A `summary` row is a compaction summary
   (§"Context window and compaction"); the context builder starts from the latest
   `summary` row and includes everything after it.
-- **tool_call** — `id`, `message_id`, `tool`, `args` (JSON), `output`, `status`,
-  timings. Records the agent's tool invocations for inspection and the renderer's
-  truncation pointers. (Tool *results* fed back to the model are stored as
+- **tool_call** — `id`, `message_id`, `tool`, `args` (JSON), `risk`, `output`,
+  `status`, timings. Records the agent's tool invocations for inspection and the
+  renderer's truncation pointers. (Tool *results* fed back to the model are stored as
   `tool` messages; this table is the structured audit copy.)
 
 ### Session ↔ shell mapping

@@ -127,7 +127,7 @@ pub struct BashArgs {
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub enum BashRisk {
-    ReadOnly,
+    Readonly,
     Reversible,
     Destructive,
 }
@@ -167,6 +167,10 @@ mod tests {
     fn bash_schema_requires_title_risk_and_script() {
         let schema = BashTool.parameters_schema();
         assert_eq!(schema["required"], json!(["title", "risk", "script"]));
+        assert_eq!(
+            schema["properties"]["risk"]["enum"],
+            json!(["readonly", "reversible", "destructive"])
+        );
         assert!(schema["properties"].get("command").is_none());
         assert!(schema["properties"].get("workdir").is_none());
         assert!(schema["properties"].get("cwd").is_some());
