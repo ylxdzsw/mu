@@ -83,6 +83,17 @@ impl Store {
             CREATE TABLE IF NOT EXISTS skill_cache (
                 dir_mtime INTEGER NOT NULL,
                 skills_json TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS review (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT NOT NULL,
+                tool_call_id TEXT,
+                action_json TEXT NOT NULL,
+                risk_level TEXT NOT NULL,
+                user_auth_level TEXT NOT NULL,
+                outcome TEXT NOT NULL,
+                reason TEXT,
+                created_at TEXT NOT NULL
             );",
         )?;
         self.ensure_tool_call_column("risk", "TEXT")?;
@@ -370,6 +381,25 @@ impl Store {
             "INSERT OR REPLACE INTO tool_call (id, message_id, tool, args, risk, output, status)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![id, message_id, tool, args, risk, output, status],
+        )?;
+        Ok(())
+    }
+
+    pub fn record_review(
+        &self,
+        session_id: &str,
+        tool_call_id: Option<&str>,
+        action_json: &str,
+        risk_level: &str,
+        user_auth_level: &str,
+        outcome: &str,
+        reason: Option<&str>,
+    ) -> Result<()> {
+        let now = chrono::Utc::now().to_rfc3339();
+        self.conn.execute(
+            "INSERT INTO review (session_id, tool_call_id, action_json, risk_level, user_auth_level, outcome, reason, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![session_id, tool_call_id, action_json, risk_level, user_auth_level, outcome, reason, now],
         )?;
         Ok(())
     }

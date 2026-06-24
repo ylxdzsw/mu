@@ -189,6 +189,7 @@ mod tests {
             magic_space: false,
             compaction: CompactionConfig::default(),
             limits: LimitsConfig::default(),
+            guardrail: crate::config::GuardrailConfig::default(),
         }
     }
 }

@@ -216,6 +216,7 @@ mod tests {
                 keep_recent_turns: 2,
             },
             limits: crate::config::LimitsConfig::default(),
+            guardrail: crate::config::GuardrailConfig::default(),
         }
     }
 

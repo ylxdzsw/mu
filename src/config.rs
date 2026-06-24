@@ -20,6 +20,8 @@ pub struct Config {
     pub compaction: CompactionConfig,
     #[serde(default)]
     pub limits: LimitsConfig,
+    #[serde(default)]
+    pub guardrail: GuardrailConfig,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -61,6 +63,28 @@ pub struct LimitsConfig {
     pub max_line_bytes: usize,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub struct GuardrailConfig {
+    #[serde(default = "default_guardrail_enabled")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub review_model: Option<String>,
+    #[serde(default = "default_guardrail_timeout_ms")]
+    pub timeout_ms: u64,
+    #[serde(default)]
+    pub circuit_breaker: CircuitBreakerConfig,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct CircuitBreakerConfig {
+    #[serde(default = "default_cb_consecutive")]
+    pub consecutive: u32,
+    #[serde(default = "default_cb_window")]
+    pub window: usize,
+    #[serde(default = "default_cb_window_denials")]
+    pub window_denials: u32,
+}
+
 fn default_agent_mode_key() -> String {
     "\\eM".into()
 }
@@ -82,6 +106,21 @@ fn default_max_bytes() -> usize {
 fn default_max_line_bytes() -> usize {
     10240
 }
+fn default_guardrail_enabled() -> bool {
+    false
+}
+fn default_guardrail_timeout_ms() -> u64 {
+    90_000
+}
+fn default_cb_consecutive() -> u32 {
+    3
+}
+fn default_cb_window() -> usize {
+    50
+}
+fn default_cb_window_denials() -> u32 {
+    10
+}
 
 impl Default for CompactionConfig {
     fn default() -> Self {
@@ -99,6 +138,27 @@ impl Default for LimitsConfig {
             max_lines: default_max_lines(),
             max_bytes: default_max_bytes(),
             max_line_bytes: default_max_line_bytes(),
+        }
+    }
+}
+
+impl Default for GuardrailConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_guardrail_enabled(),
+            review_model: None,
+            timeout_ms: default_guardrail_timeout_ms(),
+            circuit_breaker: CircuitBreakerConfig::default(),
+        }
+    }
+}
+
+impl Default for CircuitBreakerConfig {
+    fn default() -> Self {
+        Self {
+            consecutive: default_cb_consecutive(),
+            window: default_cb_window(),
+            window_denials: default_cb_window_denials(),
         }
     }
 }
@@ -173,6 +233,12 @@ impl Config {
     "max_lines": 2000,
     "max_bytes": 51200,
     "max_line_bytes": 10240
+  },
+  "guardrail": {
+    "enabled": false,
+    // "review_model": "gpt-4o-mini",  // null → same as default_model
+    "timeout_ms": 90000,
+    "circuit_breaker": { "consecutive": 3, "window": 50, "window_denials": 10 }
   }
 }
 "#,

@@ -906,6 +906,99 @@ Sandboxing and an approval/policy layer are explicitly out of scope for now and
 can be layered on later without changing the architecture, should the threat
 model warrant it.
 
+### 11.1 Guardrail (optional)
+
+An opt-in review gate for destructive commands. When enabled, a separate model
+call assesses each `bash` call whose declared `risk` is `"destructive"` before
+execution. The reviewer returns `risk_level`, `user_auth_level`, and `reason`;
+the action executes only if `user_auth_level >= risk_level` on a fixed ordinal
+scale. There is no interactive y/n prompt — denied actions return as tool
+errors so the agent can adapt or ask the user.
+
+**Ordinal scale.** Both levels map to integers; the gap between `high`(2) and
+`critical`(4) ensures only `explicit`(4) authorization can approve critical-risk
+actions:
+
+| | unknown | low | medium | high | critical |
+|---|---|---|---|---|---|
+| **rank** | 0 | 1 | 2 | 3 | 4 (auth) / 4 (risk) |
+
+`user_auth_level >= risk_level` yields:
+- `low`(0): allowed by any auth level including `unknown`(0).
+- `medium`(1): requires at least `low`.
+- `high`(2): requires at least `medium`.
+- `critical`(4): requires `explicit` — the only level that can approve it.
+
+**Reviewer call.** A separate non-streaming chat-completions call inside the
+turn process (mu is per-turn, so there is no persistent reviewer session). The
+reviewer uses the same provider and API key as the primary agent; the model
+defaults to `default_model` but can be overridden via `guardrail.review_model`.
+The reviewer has no tools — it judges from a compact transcript and the action
+JSON alone.
+
+**Context sent to the reviewer.** A filtered, budgeted transcript (user +
+assistant + tool-call arguments + tool results, skipping the system message),
+with the same token caps as Codex: 10 000 for messages, 10 000 for tools, 2 000
+per message entry, 1 000 per tool entry, 40 recent non-user entries. Truncation
+keeps prefix + suffix with a `<truncated omitted_approx_tokens="N"/>` marker.
+The planned action is provided as pretty-printed JSON (capped at 16 000 tokens).
+
+**Reviewer system prompt.** A trimmed port of Codex's Guardian policy prompt
+(`src/guardrail/policy.md`), adapted for mu: "terminal-agent" framing, no
+sandbox/escalation concepts, no tool-check instructions (the reviewer has no
+tools), and no model-emitted allow/deny decision (the decision is computed from
+the ordinal comparison). The prompt covers evidence handling (transcript =
+untrusted), user authorization scoring (including `explicit`), base risk
+taxonomy, risk category rules, and a strict JSON output contract.
+
+**Outcomes.**
+
+- **Allow** (`auth >= risk`): the bash call executes. A `[guardrail: allow]`
+  line is rendered before execution.
+- **Deny** (`auth < risk`): the bash call does not execute. A `[guardrail: deny]`
+  line is rendered, and a tool error is returned to the agent:
+  > guardrail: action rejected — risk_level X exceeds user_auth_level Y (reason).
+  > Do not work around this; stop and ask the user to authorize, or choose a
+  > less destructive approach.
+  The agent can then adapt its approach or stop and ask the user.
+- **Reviewer failure** (timeout, malformed JSON, network error after 3 retry
+  attempts): the turn is **aborted** (`bail!`). Re-authorizing would likely
+  fail again since the reviewer itself is malfunctioning.
+
+**User authorization via history.** There is no dedicated "re-prompt" mechanism.
+When the agent asks the user and the user responds with explicit approval
+("yes, force push"), the user's message becomes part of the session history. On
+the next turn, the reviewer sees this in the transcript and can score
+`user_auth_level: "explicit"`, which permits even `critical`-risk actions.
+
+**Circuit breaker.** Per-turn, tracks consecutive denials and a sliding window
+of recent reviews. If consecutive denials reach 3, or denials in the last 50
+reviews reach 10, the turn is aborted with a clear notice. This prevents the
+agent from repeatedly attempting destructive actions that the reviewer keeps
+denying.
+
+**Retry.** The reviewer call retries up to 3 times on transient errors (timeout,
+network failure, parse failure) with exponential backoff (1s, 2s). Context-
+length errors are not retried.
+
+**Config.**
+
+```jsonc
+"guardrail": {
+  "enabled": false,                          // default off (preserves yolo default)
+  "review_model": null,                      // null → same as default_model
+  "timeout_ms": 90000,
+  "circuit_breaker": { "consecutive": 3, "window": 50, "window_denials": 10 }
+}
+```
+
+**Audit.** Each review is recorded in the `review` table (SQLite): action JSON,
+risk level, auth level, outcome, reason, and timestamp.
+
+**Concurrency.** Guardrail only targets `destructive` calls, which are always
+sequential (concurrent batches only run `readonly` tools). There is no
+interaction with the concurrent execution path.
+
 ---
 
 ## 12. Startup-speed plan

@@ -10,6 +10,7 @@ mod agent;
 mod cli;
 mod compaction;
 mod config;
+mod guardrail;
 mod paths;
 mod provider;
 mod renderer;

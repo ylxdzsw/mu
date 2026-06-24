@@ -118,6 +118,39 @@ impl Renderer {
         self.write_stdout(&line)
     }
 
+    pub fn guardrail_verdict(
+        &mut self,
+        allowed: bool,
+        risk_level: &str,
+        user_auth_level: &str,
+        reason: &str,
+        script: &str,
+    ) -> io::Result<()> {
+        self.ensure_line_start()?;
+        let verdict = if allowed { "allow" } else { "deny" };
+        let script_preview = script.lines().next().unwrap_or(script);
+        let script_preview = if script_preview.len() > 120 {
+            format!("{}…", &script_preview[..117])
+        } else {
+            script_preview.to_string()
+        };
+        let line = if self.styled {
+            let (color, verdict) = if allowed {
+                (GREEN, "allow")
+            } else {
+                (RED, "deny")
+            };
+            format!(
+                "{color}[guardrail: {verdict}]{RESET} {DIM}risk={risk_level} auth={user_auth_level} — {reason}{RESET}\n{DIM}  {script_preview}{RESET}\n"
+            )
+        } else {
+            format!(
+                "[guardrail: {verdict}] risk={risk_level} auth={user_auth_level} — {reason}\n  {script_preview}\n"
+            )
+        };
+        self.write_stdout(&line)
+    }
+
     pub fn error(&mut self, msg: &str) -> io::Result<()> {
         writeln!(self.stderr, "error: {msg}")?;
         self.stderr.flush()
