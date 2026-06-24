@@ -111,7 +111,7 @@ pub async fn run_compaction(
             content: system_prompt.into(),
         },
         Message::User {
-            content: summarize_prompt,
+            content: summarize_prompt.into(),
         },
     ];
 
@@ -232,7 +232,7 @@ mod tests {
                 .append_message(
                     &session.id,
                     &Message::User {
-                        content: format!("user {n}"),
+                        content: format!("user {n}").into(),
                     },
                 )
                 .unwrap();
@@ -261,7 +261,7 @@ mod tests {
         let visible_users: Vec<String> = messages
             .iter()
             .filter_map(|message| match message {
-                Message::User { content } => Some(content.clone()),
+                Message::User { content } => Some(content.text()),
                 _ => None,
             })
             .collect();

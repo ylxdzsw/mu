@@ -6,7 +6,7 @@ use anyhow::{bail, Context, Result};
 use rusqlite::{params, Connection, OptionalExtension};
 use uuid::Uuid;
 
-use crate::provider::{approx_tokens, Message, ToolCall};
+use crate::provider::{approx_tokens, Message, ToolCall, UserContent};
 
 #[derive(Debug, Clone)]
 pub struct Session {
@@ -64,6 +64,7 @@ impl Store {
                 session_id TEXT NOT NULL,
                 role TEXT NOT NULL,
                 content TEXT NOT NULL,
+                user_content_json TEXT,
                 tool_call_id TEXT,
                 tool_calls_json TEXT,
                 seq INTEGER NOT NULL,
@@ -96,20 +97,31 @@ impl Store {
                 created_at TEXT NOT NULL
             );",
         )?;
+        self.ensure_message_column("user_content_json", "TEXT")?;
         self.ensure_tool_call_column("risk", "TEXT")?;
         Ok(())
     }
 
+    fn ensure_message_column(&self, name: &str, sql_type: &str) -> Result<()> {
+        self.ensure_column("message", name, sql_type)
+    }
+
     fn ensure_tool_call_column(&self, name: &str, sql_type: &str) -> Result<()> {
-        let mut stmt = self.conn.prepare("PRAGMA table_info(tool_call)")?;
+        self.ensure_column("tool_call", name, sql_type)
+    }
+
+    fn ensure_column(&self, table: &str, name: &str, sql_type: &str) -> Result<()> {
+        let mut stmt = self.conn.prepare(&format!("PRAGMA table_info({table})"))?;
         let columns = stmt.query_map([], |row| row.get::<_, String>(1))?;
         for column in columns {
             if column? == name {
                 return Ok(());
             }
         }
-        self.conn
-            .execute(&format!("ALTER TABLE tool_call ADD COLUMN {name} {sql_type}"), [])?;
+        self.conn.execute(
+            &format!("ALTER TABLE {table} ADD COLUMN {name} {sql_type}"),
+            [],
+        )?;
         Ok(())
     }
 
@@ -172,6 +184,26 @@ impl Store {
             .context("listing sessions")
     }
 
+    pub fn latest_session(&self) -> Result<Option<Session>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, cwd, model, title, last_total_tokens, cost_total
+             FROM session ORDER BY updated_at DESC LIMIT 1",
+        )?;
+        let row = stmt
+            .query_row([], |row| {
+                Ok(Session {
+                    id: row.get(0)?,
+                    cwd: row.get(1)?,
+                    model: row.get(2)?,
+                    title: row.get(3)?,
+                    last_total_tokens: row.get::<_, i64>(4)? as u64,
+                    cost_total: row.get(5)?,
+                })
+            })
+            .optional()?;
+        Ok(row)
+    }
+
     pub fn update_session(
         &self,
         id: &str,
@@ -196,20 +228,36 @@ impl Store {
         Ok(())
     }
 
+    pub fn update_session_cwd(&self, id: &str, cwd: &str) -> Result<()> {
+        let now = chrono::Utc::now().to_rfc3339();
+        self.conn.execute(
+            "UPDATE session SET updated_at = ?1, cwd = ?2 WHERE id = ?3",
+            params![now, cwd, id],
+        )?;
+        Ok(())
+    }
+
     pub fn load_context_messages(&self, session_id: &str) -> Result<Vec<Message>> {
         let summary_seq = self.latest_summary_seq(session_id)?;
         let start_seq = summary_seq.unwrap_or(-1);
 
         let mut stmt = self.conn.prepare(
-            "SELECT role, content, tool_call_id, tool_calls_json FROM message
+            "SELECT role, content, user_content_json, tool_call_id, tool_calls_json FROM message
              WHERE session_id = ?1 AND seq > ?2 ORDER BY seq ASC",
         )?;
         let rows = stmt.query_map(params![session_id, start_seq], |row| {
             let role: String = row.get(0)?;
             let content: String = row.get(1)?;
-            let tool_call_id: Option<String> = row.get(2)?;
-            let tool_calls_json: Option<String> = row.get(3)?;
-            Ok((role, content, tool_call_id, tool_calls_json))
+            let user_content_json: Option<String> = row.get(2)?;
+            let tool_call_id: Option<String> = row.get(3)?;
+            let tool_calls_json: Option<String> = row.get(4)?;
+            Ok((
+                role,
+                content,
+                user_content_json,
+                tool_call_id,
+                tool_calls_json,
+            ))
         })?;
 
         let mut messages = Vec::new();
@@ -219,15 +267,20 @@ impl Store {
                 // context has exactly one leading system message. Servers that
                 // reject a non-first system message would otherwise fail.
                 messages.push(Message::User {
-                    content: format!("[summary of earlier conversation]\n{}", summary.content),
+                    content: UserContent::Text(format!(
+                        "[summary of earlier conversation]\n{}",
+                        summary.content
+                    )),
                 });
             }
         }
 
         for row in rows {
-            let (role, content, tool_call_id, tool_calls_json) = row?;
+            let (role, content, user_content_json, tool_call_id, tool_calls_json) = row?;
             match role.as_str() {
-                "user" => messages.push(Message::User { content }),
+                "user" => messages.push(Message::User {
+                    content: load_user_content(content, user_content_json),
+                }),
                 "assistant" => {
                     let tool_calls = tool_calls_json
                         .as_ref()
@@ -247,7 +300,7 @@ impl Store {
                 }),
                 "summary" => {}
                 other => messages.push(Message::User {
-                    content: format!("[{other}] {content}"),
+                    content: UserContent::Text(format!("[{other}] {content}")),
                 }),
             }
         }
@@ -300,9 +353,11 @@ impl Store {
         let now = chrono::Utc::now().to_rfc3339();
         match message {
             Message::User { content } => {
+                let user_content_json = serde_json::to_string(content)?;
                 self.conn.execute(
-                    "INSERT INTO message (session_id, role, content, seq, created_at) VALUES (?1, 'user', ?2, ?3, ?4)",
-                    params![session_id, content, seq, now],
+                    "INSERT INTO message (session_id, role, content, user_content_json, seq, created_at)
+                     VALUES (?1, 'user', ?2, ?3, ?4, ?5)",
+                    params![session_id, content.text(), user_content_json, seq, now],
                 )?;
             }
             Message::Assistant {
@@ -431,7 +486,7 @@ impl Store {
             .map(|msgs| {
                 msgs.iter()
                     .map(|m| match m {
-                        Message::User { content } => approx_tokens(content),
+                        Message::User { content } => approx_tokens(&content.text()),
                         Message::Assistant {
                             content,
                             tool_calls,
@@ -496,4 +551,92 @@ pub fn write_session_id(path: &Path, id: &str) -> Result<()> {
     }
     std::fs::write(path, id)?;
     Ok(())
+}
+
+fn load_user_content(content: String, user_content_json: Option<String>) -> UserContent {
+    user_content_json
+        .and_then(|json| serde_json::from_str(&json).ok())
+        .unwrap_or(UserContent::Text(content))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::provider::{ContentPart, ImageUrl};
+
+    fn temp_store() -> (Store, std::path::PathBuf) {
+        let tmp = std::env::temp_dir().join(format!("mu-store-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        (Store::open(&tmp.join("mu.db")).unwrap(), tmp)
+    }
+
+    #[test]
+    fn reloads_full_user_content_with_images() {
+        let (store, tmp) = temp_store();
+        let session = store.create_session("/tmp", "fake-model").unwrap();
+        let expected_image_url = "data:image/png;base64,abcd".to_string();
+
+        store
+            .append_message(
+                &session.id,
+                &Message::User {
+                    content: UserContent::Parts(vec![
+                        ContentPart::Text {
+                            text: "describe this".to_string(),
+                        },
+                        ContentPart::ImageUrl {
+                            image_url: ImageUrl {
+                                url: expected_image_url.clone(),
+                            },
+                        },
+                    ]),
+                },
+            )
+            .unwrap();
+
+        let messages = store.load_context_messages(&session.id).unwrap();
+        let Message::User {
+            content: UserContent::Parts(parts),
+        } = &messages[0]
+        else {
+            panic!("expected user parts");
+        };
+
+        assert!(matches!(
+            &parts[0],
+            ContentPart::Text { text } if text == "describe this"
+        ));
+        assert!(matches!(
+            &parts[1],
+            ContentPart::ImageUrl { image_url } if image_url.url == expected_image_url
+        ));
+
+        let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    #[test]
+    fn reloads_legacy_text_user_content() {
+        let (store, tmp) = temp_store();
+        let session = store.create_session("/tmp", "fake-model").unwrap();
+        let now = chrono::Utc::now().to_rfc3339();
+        store
+            .conn
+            .execute(
+                "INSERT INTO message (session_id, role, content, seq, created_at)
+                 VALUES (?1, 'user', ?2, 0, ?3)",
+                params![session.id, "legacy text", now],
+            )
+            .unwrap();
+
+        let messages = store.load_context_messages(&session.id).unwrap();
+        let Message::User {
+            content: UserContent::Text(text),
+        } = &messages[0]
+        else {
+            panic!("expected text user content");
+        };
+
+        assert_eq!(text, "legacy text");
+        let _ = std::fs::remove_dir_all(tmp);
+    }
 }

@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
@@ -164,26 +164,25 @@ impl Default for CircuitBreakerConfig {
 }
 
 impl Config {
-    pub fn load() -> Result<Self> {
-        let path = paths::config_dir().join("config.jsonc");
-        if !path.exists() {
-            bail!(
-                "config not found at {} — run `mu init` to create a starter config",
-                path.display()
-            );
+    pub fn load_for_scope(project_config_dir: Option<&Path>) -> Result<Self> {
+        let global_path = paths::global_dir().join("config.jsonc");
+        let mut value = read_config_value(&global_path)?;
+
+        if let Some(dir) = project_config_dir {
+            let project_path = dir.join("config.jsonc");
+            if project_path.exists() {
+                let project = read_config_value(&project_path)?;
+                merge_json(&mut value, project);
+            }
         }
-        let raw = std::fs::read_to_string(&path)
-            .with_context(|| format!("reading {}", path.display()))?;
-        let value = jsonc_parser::parse_to_serde_value(&raw, &Default::default())
-            .map_err(|e| anyhow::anyhow!("parsing config.jsonc: {e}"))?
-            .ok_or_else(|| anyhow::anyhow!("config.jsonc is empty"))?;
+
         let config: Config =
             serde_json::from_value(value).context("invalid config.jsonc structure")?;
         Ok(config)
     }
 
-    pub fn try_load() -> Option<Self> {
-        Self::load().ok()
+    pub fn try_load_for_scope(project_config_dir: Option<&Path>) -> Option<Self> {
+        Self::load_for_scope(project_config_dir).ok()
     }
 
     pub fn api_key(&self) -> Result<String> {
@@ -203,16 +202,53 @@ impl Config {
         self.models.get(model).and_then(|m| m.context_window)
     }
 
+    pub fn starter_path() -> PathBuf {
+        paths::global_dir().join("config.jsonc")
+    }
+
     pub fn write_starter(path: &Path) -> Result<()> {
-        if path.exists() {
-            bail!("config already exists at {}", path.display());
+        if !path.exists() {
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::write(path, STARTER_CONFIG)?;
+            return Ok(());
         }
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
+        bail!("config already exists at {}", path.display());
+    }
+}
+
+fn read_config_value(path: &Path) -> Result<serde_json::Value> {
+    if !path.exists() {
+        bail!(
+            "config not found at {} — run `mu init` to create a starter config",
+            path.display()
+        );
+    }
+    let raw =
+        std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+    jsonc_parser::parse_to_serde_value(&raw, &Default::default())
+        .map_err(|e| anyhow::anyhow!("parsing {}: {e}", path.display()))?
+        .ok_or_else(|| anyhow::anyhow!("{} is empty", path.display()))
+}
+
+fn merge_json(base: &mut serde_json::Value, overlay: serde_json::Value) {
+    match (base, overlay) {
+        (serde_json::Value::Object(base), serde_json::Value::Object(overlay)) => {
+            for (key, value) in overlay {
+                match base.get_mut(&key) {
+                    Some(existing) => merge_json(existing, value),
+                    None => {
+                        base.insert(key, value);
+                    }
+                }
+            }
         }
-        std::fs::write(
-            path,
-            r#"{
+        (base, overlay) => *base = overlay,
+    }
+}
+
+const STARTER_CONFIG: &str = r#"{
   // Provider settings — set the env var named below to your API key
   "provider": {
     "base_url": "https://api.openai.com/v1",
@@ -241,8 +277,31 @@ impl Config {
     "circuit_breaker": { "consecutive": 3, "window": 50, "window_denials": 10 }
   }
 }
-"#,
-        )?;
-        Ok(())
+"#;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn merge_overrides_nested_values_and_keeps_base() {
+        let mut base = serde_json::json!({
+            "provider": {"base_url": "a", "api_key_env": "KEY"},
+            "default_model": "one",
+            "models": {"one": {"context_window": 1}},
+            "limits": {"max_iterations": 5, "max_lines": 10}
+        });
+        let overlay = serde_json::json!({
+            "default_model": "two",
+            "models": {"two": {"context_window": 2}},
+            "limits": {"max_lines": 20}
+        });
+        merge_json(&mut base, overlay);
+
+        assert_eq!(base["default_model"], "two");
+        assert_eq!(base["models"]["one"]["context_window"], 1);
+        assert_eq!(base["models"]["two"]["context_window"], 2);
+        assert_eq!(base["limits"]["max_iterations"], 5);
+        assert_eq!(base["limits"]["max_lines"], 20);
     }
 }

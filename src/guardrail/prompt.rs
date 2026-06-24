@@ -3,9 +3,11 @@ use serde_json::Value;
 
 use crate::provider::{approx_tokens, Message};
 
-use super::{RiskLevel, UserAuthLevel, MAX_ACTION_STRING_TOKENS, MAX_MESSAGE_ENTRY_TOKENS,
-            MAX_MESSAGE_TRANSCRIPT_TOKENS, MAX_TOOL_ENTRY_TOKENS, MAX_TOOL_TRANSCRIPT_TOKENS,
-            RECENT_ENTRY_LIMIT, TRUNCATION_TAG};
+use super::{
+    RiskLevel, UserAuthLevel, MAX_ACTION_STRING_TOKENS, MAX_MESSAGE_ENTRY_TOKENS,
+    MAX_MESSAGE_TRANSCRIPT_TOKENS, MAX_TOOL_ENTRY_TOKENS, MAX_TOOL_TRANSCRIPT_TOKENS,
+    RECENT_ENTRY_LIMIT, TRUNCATION_TAG,
+};
 
 const POLICY_PROMPT: &str = include_str!("policy.md");
 
@@ -54,10 +56,11 @@ fn collect_transcript_entries(messages: &[Message]) -> Vec<TranscriptEntry> {
         match msg {
             Message::System { .. } => continue,
             Message::User { content } => {
-                if !content.trim().is_empty() {
+                let text = content.text();
+                if !text.trim().is_empty() {
                     entries.push(TranscriptEntry {
                         kind: TranscriptEntryKind::User,
-                        text: content.clone(),
+                        text,
                     });
                 }
             }
@@ -65,10 +68,7 @@ fn collect_transcript_entries(messages: &[Message]) -> Vec<TranscriptEntry> {
                 content,
                 tool_calls,
             } => {
-                if let Some(text) = content
-                    .as_ref()
-                    .filter(|c| !c.trim().is_empty())
-                {
+                if let Some(text) = content.as_ref().filter(|c| !c.trim().is_empty()) {
                     entries.push(TranscriptEntry {
                         kind: TranscriptEntryKind::Assistant,
                         text: text.clone(),
@@ -145,7 +145,8 @@ fn render_transcript(entries: &[TranscriptEntry]) -> (Vec<String>, Option<String
     }
 
     if let Some(&last) = user_indices.last() {
-        if !included[last] && msg_tokens + rendered[last].1 <= MAX_MESSAGE_TRANSCRIPT_TOKENS as u64 {
+        if !included[last] && msg_tokens + rendered[last].1 <= MAX_MESSAGE_TRANSCRIPT_TOKENS as u64
+        {
             included[last] = true;
             msg_tokens += rendered[last].1;
         }
@@ -369,7 +370,8 @@ mod tests {
 
     #[test]
     fn parse_assessment_explicit_allows_critical() {
-        let text = r#"{"risk_level":"critical","user_auth_level":"explicit","reason":"user approved"}"#;
+        let text =
+            r#"{"risk_level":"critical","user_auth_level":"explicit","reason":"user approved"}"#;
         let a = parse_assessment(text).unwrap();
         assert_eq!(a.risk_level, RiskLevel::Critical);
         assert_eq!(a.user_auth_level, UserAuthLevel::Explicit);
@@ -392,7 +394,8 @@ mod tests {
 
     #[test]
     fn parse_assessment_critical_never_allowed_by_high() {
-        let text = r#"{"risk_level":"critical","user_auth_level":"high","reason":"very dangerous"}"#;
+        let text =
+            r#"{"risk_level":"critical","user_auth_level":"high","reason":"very dangerous"}"#;
         let a = parse_assessment(text).unwrap();
         assert!(!a.is_allowed());
     }

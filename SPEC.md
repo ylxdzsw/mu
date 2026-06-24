@@ -1,11 +1,11 @@
 # mu — Design Specification
 
-`mu` is a fast agent harness for the terminal. It is built as two pieces: a
-small, plain command-line binary that reads a prompt on stdin, runs an agent
-loop, and streams logs and responses to stdout/stderr; and a zsh plugin that
-adds an "agent mode" to your normal interactive shell. The long-term goal is a
-tool you live in day to day, augmenting (and eventually rivaling) the shell as
-the primary terminal interface.
+`mu` is a small, composable agent runtime for the terminal: one prompt in, one
+completed agent turn out. The core `mu` binary reads a prompt on stdin, accepts
+attached inputs such as images, runs an agent loop, streams turn events in the
+selected output format, persists completed messages, and exits. Interactive
+shells, REPLs, web daemons, editor integrations, and other surfaces build around
+that simple turn unit instead of changing it.
 
 This document describes the design, the key decisions behind it, and the
 high-level shape of the implementation. It favors prose and decisions over code,
@@ -24,13 +24,17 @@ is unambiguous.
   turn and must be negligible next to model latency.
 - **Responsive.** Output streams as it is produced. Control returns to the shell
   immediately when a turn completes.
+- **Composable.** The main abstraction is a turn, not a chat app, daemon,
+  terminal UI, or project manager. Wrappers such as `mu-cli`, shell plugins, and
+  a future `mu-web` coordinate and present turns; they do not host a separate
+  agent loop.
 - **Non-magical.** No TUI. The shell owns the terminal and line editing; `mu`
   just reads a prompt and appends output. Output streams as it is produced (a
   tool line may appear before its output), but once a line is printed it is never
   rewritten or erased.
 - **Minimal.** One model-visible tool: `bash`. A flat config directory. A
-  single SQLite file for state. The binary itself has no interactive input
-  handling.
+  SQLite file for state in the active scope. The core binary itself has no
+  interactive input handling.
 - **Native shell.** In normal use you are in unmodified zsh — full completion,
   history, job control, aliases, plugins, and interactive programs (vim, htop,
   ssh) all work because `mu` never replaces the shell.
@@ -39,13 +43,15 @@ is unambiguous.
 
 ### Non-goals
 
-- **No TUI, no REPL inside `mu`.** No alternate screen, no full-screen layout,
+- **No TUI, no REPL inside core `mu`.** No alternate screen, no full-screen layout,
   no widgets, no in-place history editing, no mouse, no line editor in the
-  binary. `mu` never puts the terminal into raw mode.
+  turn binary. `mu` never puts the terminal into raw mode. `mu-cli` may provide
+  a convenience REPL, but each submitted line is still a separate `mu` turn.
 - **No re-rendering.** Lines are written once and never rewritten. Native
   terminal scrollback is the history mechanism.
-- **No daemon (V1).** Each turn is a fresh, stateless-on-exit process that
-  loads/saves session state from SQLite. No background server.
+- **No daemon in the core path (V1).** Each turn is a fresh, stateless-on-exit
+  process that loads/saves session state from SQLite. A future `mu-web` daemon is
+  a coordinator around this turn boundary, not a separate agent runtime.
 - **No plugin SDK, no MCP, no sub-agents (initially).** Extensibility is via
   skills (markdown) and `bash` (call any CLI tool).
 - **zsh only (V1).** Other shells (bash, fish, nushell) may get plugins later;
@@ -77,38 +83,46 @@ Tradeoff accepted: slower iteration than TypeScript, and no off-the-shelf
 "AI SDK". Provider integration is hand-written against HTTP APIs (see §7); the
 surface is small (chat completions + streaming + tool calls).
 
-### 2.2 Architecture split: filter binary + zsh plugin
+### 2.2 Architecture split: turn core + thin surfaces
 
-`mu`-the-binary is a **filter**: prompt in (stdin), streamed output out
-(stdout/stderr), exit. It has no concept of modes, prompts, or key bindings.
+`mu`-the-binary is a **turn runner**: prompt and attached inputs in, streamed
+turn events out, completed state persisted, exit. It has no concept of modes,
+prompts, key bindings, web sessions, or long-lived UI state.
 
-All interactivity lives in a **zsh plugin**. The plugin adds an *agent mode* to
-the shell's line editor (ZLE). Entering agent mode changes the prompt and
-rebinds a few keys; submitting runs `mu` as an ordinary foreground command.
+Interactive surfaces are thin wrappers around that unit:
+
+- `mu-cli` is an interactive REPL convenience wrapper. Each line entered in the
+  REPL is submitted by spawning the `mu` command-line interface for one turn; it
+  is not a second in-process agent host.
+- The zsh plugin is small: pressing the configured key with an empty buffer
+  invokes `mu-cli`; pressing it with a non-empty buffer submits that buffer as a
+  single `mu` turn.
+- `mu-web` is a future web daemon, similar in spirit to `opencode serve`. It
+  coordinates sessions and presentation, but talks to the same `mu` command-line
+  interface rather than carrying a separate agent loop.
 
 This split is the central decision (see §3 for the full rationale recap). It
-gives 100% real shell fidelity for free, keeps the binary tiny, and reuses
-zsh's editor, history, and job control rather than reimplementing them.
+keeps the agent semantics small and scriptable while letting each surface choose
+the interaction style that fits it.
 
 ### 2.3 Agent mode is a zsh editor mode
 
 Modeled on the Julia REPL's mode switching:
 
 - **Entry (explicit, default):** a dedicated key binding (configurable in
-  `config.jsonc`, e.g. `Alt-M` or another combo) enters agent mode. This is
-  the default and only entry method.
+  `config.jsonc`, e.g. `Alt-M` or another combo) invokes the agent surface. With
+  an empty shell buffer it starts `mu-cli`; with a non-empty buffer it submits
+  that buffer as a one-shot `mu` turn.
 - **Entry (magic space, opt-in):** when magic space is enabled in config, typing
   `mu` at an empty shell buffer and pressing Space enters agent mode instead of
   inserting a space. Disabled by default because it prevents typing `mu <args>`
   as a normal shell command (e.g. `mu init zsh`). When enabled, call `mu`
   subcommands as `command mu init zsh` (or with a leading space if
   `HIST_IGNORE_SPACE` is set) to bypass the trigger.
-- **Exit:** Backspace on an empty agent-mode line returns to normal shell mode
-  (symmetric, Julia-like). Esc also exits.
-- **Submit:** Enter runs the prompt through `mu`. Because submission happens by
-  accepting an ordinary command line, `mu` runs as a normal foreground job — it
-  owns the TTY naturally, streaming works, and **Ctrl-C delivers SIGINT
-  straight to `mu`** with no signal-routing machinery.
+- **Submit:** Enter in `mu-cli`, or the zsh key binding with a non-empty buffer,
+  runs the prompt through `mu`. Because each prompt is submitted by spawning an
+  ordinary foreground command, `mu` owns the TTY naturally, streaming works, and
+  **Ctrl-C delivers SIGINT straight to `mu`** with no signal-routing machinery.
 
 See §6 for the full plugin behavior.
 
@@ -129,113 +143,129 @@ one tool and makes skills "just files".
 ### 2.6 Flat config, single SQLite state file
 
 All user-facing configuration is a flat directory of plain files
-(`config.jsonc`, `AGENTS.md`, `skills/`). All runtime state (sessions, messages,
-tool calls) is one SQLite database. See §9 and §10.
+(`config.jsonc`, `AGENTS.md`, `skills/`). Runtime state is one SQLite database
+in the active global/project scope. See §9, §10, and §11.
 
 ---
 
 ## 3. Architecture overview
 
-`mu` is two cooperating components. There is no client/server split and no
-daemon; the "glue" is the zsh process the user already runs.
+`mu` has one core runtime and multiple thin surfaces. There is no client/server
+split in V1; the "glue" is the command-line contract around a completed turn.
 
 ```
-   ┌──────────────────────────── zsh (user's shell) ───────────────────────────┐
-   │  Normal mode: unmodified zsh — completion, history, jobs, plugins, vim…    │
-   │                                                                            │
-   │  mu plugin (ZLE):                                                          │
-   │    · dedicated key (default) / magic-space (opt-in) → enter agent mode      │
-   │    · agent-mode accept-line → run `mu --session $MU_SESSION_ID <<< PROMPT` │
-   │    · empty-line backspace / Esc → exit agent mode                          │
-   │    · disables syntax-highlight + autosuggest while in agent mode           │
-   └───────────────────────────────────┬────────────────────────────────────────┘
-                                        │ spawns (foreground job, owns TTY)
+   ┌──────────────────────────── thin surfaces ────────────────────────────────┐
+   │  shell scripts / editor tasks: `mu [opts] <<< PROMPT`                     │
+   │  zsh plugin: key with text → one `mu` turn; empty key → `mu-cli`          │
+   │  mu-cli: REPL wrapper; every entered line spawns one `mu` turn            │
+   │  mu-web (V2): web coordinator around the same CLI turn boundary           │
+   └───────────────────────────────────┬───────────────────────────────────────┘
+                                        │ spawns / coordinates foreground turns
                                         ▼
-   ┌──────────────────────────── mu (binary, per turn) ─────────────────────────┐
-   │  stdin → prompt                                                            │
-   │     │                                                                      │
-   │     ▼                                                                      │
-   │  Agent loop ──► Provider client (HTTP/SSE)                                 │
-   │     │                                                                      │
-   │     ├──► Tool registry: bash                                               │
-   │     │                                                                      │
-   │     ├──► Renderer (append-only TTY UI / portable stdout transcript)        │
-   │     │                                                                      │
-   │     └──► Store (SQLite: load session on start, append per completed msg)   │
-   └────────────────────────────────────────────────────────────────────────────┘
+   ┌──────────────────────────── mu (binary, per turn) ────────────────────────┐
+   │  project/config/session resolution                                        │
+   │  stdin prompt + repeatable `-i` image attachments                         │
+   │     │                                                                     │
+   │     ▼                                                                     │
+   │  Agent loop ──► Provider client (HTTP/SSE)                                │
+   │     │                                                                     │
+   │     ├──► Tool registry: bash                                              │
+   │     │                                                                     │
+   │     ├──► Renderer (plain / terminal / JSON event stream)                  │
+   │     │                                                                     │
+   │     └──► Store (SQLite in active global/project scope)                    │
+   └───────────────────────────────────────────────────────────────────────────┘
 ```
 
 ### Why this split (recap)
 
 The hard part of "replace bash" is shell fidelity. Having the real shell own the
-terminal gives that for free and forever; a REPL-owning binary would have to
-reimplement completion, job control, PTY handling, and plugin behavior
-indefinitely. The cost is (a) session state must persist across process
-invocations — handled by SQLite + a shell variable, §10 — and (b) interactive
-shell commands are not automatically visible to the agent, which V1 accepts
-(§6.7).
+terminal gives that for free and forever; a core binary that owns a long-lived
+REPL would have to reimplement completion, job control, PTY handling, and plugin
+behavior indefinitely. The cost is (a) session state must persist across process
+invocations — handled by SQLite in the active session scope, §11 — and (b)
+interactive shell commands are not automatically visible to the agent, which V1
+accepts (§6.4). `mu-cli` is allowed because it is only a wrapper around repeated
+turn invocations, not a replacement runtime.
 
 ### Binary module responsibilities
 
-- **Entry.** Parse args (`--session`, subcommands), read the prompt from stdin,
-  run one turn, persisting each completed message as it lands (§10), exit.
+- **Entry.** Resolve project/config/session scope, parse args (`--session`,
+  `--continue-latest`, `--image`, `--output`, subcommands), read the prompt from
+  stdin, run one turn, persisting each completed message as it lands (§11), exit.
 - **Agent loop.** Send context to the provider, stream the response, execute
   tool calls, loop until the model stops requesting tools, yield final text.
-  A configurable max-iterations guard bounds runaway loops (§10).
+  A configurable max-iterations guard bounds runaway loops (§11).
 - **Tool registry.** The built-in `bash` tool with a JSON-schema parameter
   definition and an execute function.
 - **Provider client.** Streaming HTTP to the model API behind one internal
   interface.
-- **Renderer.** Sole writer to the terminal; append-only (§5).
-- **Store.** SQLite load/append (§10).
+- **Renderer.** Sole writer to output; render the same turn as plain text,
+  terminal UI, or JSON events (§5).
+- **Store.** SQLite load/append in either project-local or global scope (§11).
 
 The binary runs on a single `tokio` runtime. There is no input thread or line
 editor — stdin is read once, fully, as the prompt.
 
 ### Binary CLI surface
 
-The binary is invoked one of two ways: as a **turn** (default, reads a prompt on
-stdin) or as a **subcommand** (management, no prompt). The surface is small:
+The core binary is invoked one of two ways: as a **turn** (default, reads a
+prompt on stdin) or as a **subcommand** (management, no prompt). The surface is
+small:
 
-- `mu [--session <id>] [--model <id>]` — run one turn; prompt read from stdin.
-  This is what the zsh plugin invokes.
+- `mu [-s <id>] [-c] [--model <id>] [-i <image>] [--output plain|terminal|json]`
+  — run one turn; prompt read from stdin. `-i/--image` is repeatable.
+- `mu-cli [-s <id>] [--model <id>] [--output plain|terminal|json]` — interactive
+  REPL wrapper around repeated `mu` turn invocations.
+- `mu init` — write starter global config if needed.
 - `mu init zsh` — print the zsh plugin for `eval`.
 - `mu session new` — create a session, print its id (used by `mu-new`).
 - `mu session list` — list recent sessions (used by `mu-sessions`).
 - `mu compact --session <id>` — force compaction (used by `mu-compact`).
 
-The `mu-new`/`mu-attach`/`mu-sessions`/`mu-compact` shell functions (§6.8) are
-thin wrappers over these subcommands. No other CLI surface exists in V1.
+The `mu-new`/`mu-attach`/`mu-sessions`/`mu-compact` shell functions (§6.5) are
+thin wrappers over these subcommands. `mu-web` is explicitly V2.
 
 Subcommands (`init`, `session new/list`, `compact`) do **not** require a
 configured provider; only the turn invocation does (§7).
 
 ### Turn lifecycle (authoritative end-to-end flow)
 
-This is the exact sequence the binary follows for one turn invocation
-(`mu [--session <id>] [--model <id>]`). Implement it in this order:
+This is the exact sequence the binary follows for one turn invocation. Implement
+it in this order:
 
-1. **Parse args**, read the entire prompt from stdin into a string.
-2. **Load config** (§9). If the provider's required fields are missing, print an
+1. **Parse args**, resolve the active project (§9), read the entire prompt from
+   stdin into a string, and load any attached inputs such as repeatable
+   `-i/--image` image files.
+2. **Load config** (§9): global first, then project config over it when a
+   project is active. If the provider's required fields are missing, print an
    error to stderr and exit non-zero (§7). Resolve the effective model:
-   `--model` if given, else the session's stored `model`, else the config
+   `--model` if given, else the session's stored `model`, else the merged config
    default.
-3. **Open the SQLite DB** (create + run migrations if absent).
+3. **Open the active-scope SQLite DB** (create + run migrations if absent):
+   project-local when inside a project, global otherwise.
 4. **Resolve the session:**
-   - If `--session <id>` is given and the row exists → use it.
-   - If `--session <id>` is given and the row does **not** exist → print an error
-     to stderr, exit non-zero (do *not* silently create it).
-   - If `--session` is absent → create a new session row, and write its id to the
-     runtime file named by `$MU_SESSION_FILE` (§10).
-5. **Acquire the session `flock`** (§10). If held, print "session busy", exit
+   - If `--session <id>` is given and the row exists in the active scope → use
+     it.
+   - If `--session <id>` is given and the row does **not** exist in the active
+     scope → print an error to stderr, exit non-zero (do *not* silently create
+     it or fall back to a global session).
+   - If `-c/--continue-latest` is given → use the latest session in the active
+     scope, or create one if no session exists.
+   - If neither `--session` nor `--continue-latest` is given → create a new
+     session row, and write its id to the runtime file named by
+     `$MU_SESSION_FILE` when that env var is set (§11).
+5. **Acquire the session `flock`** (§11). If held, print "session busy", exit
    non-zero.
 6. **Build the context message list** from the DB: the latest compaction summary
    message (if any) followed by all messages after it, in order.
-7. **Pre-turn compaction check** (§10, Tier 1): if the session's stored
+7. **Pre-turn compaction check** (§11, Tier 1): if the session's stored
    `last_total_tokens` (or bytes÷4 on the first turn) exceeds the configured
    fraction of the model context window, run compaction now, then rebuild the
    context list.
-8. **Append the new user message** to the DB and to the context list.
+8. **Append the new user message** to the DB and to the context list. If images
+   were attached, persist and reload the full multi-part user content
+   (text + image URLs), not only the textual projection.
 9. **Agent loop** — repeat until the model returns `finish_reason: "stop"` or the
    max-iterations cap is hit:
    a. Send the context list + tool definitions to the provider (streaming).
@@ -269,7 +299,7 @@ for each round-trip).
 **Interruption.** Steps 9d/9e persist only *after* a message is fully formed. If
 SIGINT / a dropped connection / a provider error occurs mid-stream, the partial
 message is never written; the process dies and the DB holds only completed
-messages (§10). No tool call begins without first persisting its parent
+messages (§11). No tool call begins without first persisting its parent
 assistant message. Tool results are persisted in request order immediately
 after a sequential call or concurrent batch completes, so an uninterrupted
 turn produces API-valid history.
@@ -348,10 +378,25 @@ fall back to temp scripts.
 
 ## 5. Output and rendering
 
-The renderer is the sole writer to stdout/stderr and enforces append-only
-output. It may style output only when stdout is a TTY. It never moves the
-cursor, rewrites a committed line, uses an alternate screen, or emits transient
-status lines. Redirected stdout is always ANSI-free.
+`mu` supports three output formats: `plain`, `terminal`, and `json`. They are
+different renderings of the same agent turn and must not imply different agent
+behavior.
+
+- **Plain text** is for simple scripting and low-friction terminal use. It
+  prioritizes assistant/tool text and avoids terminal-specific control.
+- **Terminal output** is for humans in an interactive terminal. It may use color
+  and may update recent status lines for in-progress activity, but it must keep
+  normal scrollback. It must not use an alternate screen, clear the screen, or
+  require mouse interaction.
+- **JSON output** is for programs, integrations, and the future web UI. It is a
+  delimited serialization of the same turn events used by the other output
+  formats, suitable for incremental consumers (newline-delimited JSON is the V1
+  shape).
+
+The renderer is the sole writer to stdout/stderr and enforces the selected
+format. It may style output only when stdout is a TTY and `--output terminal` is
+selected. It never clears the screen, uses an alternate screen, or requires
+mouse interaction. Plain/JSON output is always ANSI-free.
 
 Assistant Markdown is parsed on TTYs. The renderer buffers only the current
 unstable Markdown block, commits completed blocks once, and flushes the tail at
@@ -393,134 +438,79 @@ stdout, and goes to stderr so it stays out of a captured stdout transcript. It
 is suppressed if stderr is not a TTY (piped/redirected), since it would pollute
 log files.
 
-No spinner, no transient lines, no cursor movement, and no re-rendering — ever.
+Plain and JSON modes avoid terminal-only summaries and control sequences so they
+remain suitable for scripts. Human terminal mode may show progress for
+in-flight work, but committed transcript content is never erased from scrollback.
 
 ---
 
-## 6. The zsh plugin
+## 6. The zsh plugin and `mu-cli`
 
-The plugin is the entire interactive surface. It is a single `.zsh` file,
-sourced last in `.zshrc`, that adds agent mode to ZLE. It must not disturb the
-user's existing configuration.
+The zsh plugin is a small integration surface, not the agent runtime. It is a
+single `.zsh` file, sourced last in `.zshrc`, that binds a configurable key and
+provides a few session helper functions. It must not disturb the user's existing
+configuration.
+
+`mu-cli` is the interactive REPL wrapper. It behaves like a shell whose entered
+commands are prompts submitted to `mu`, but every submitted prompt still spawns a
+fresh `mu` turn through the command-line interface. `mu-cli` should not duplicate
+agent-loop, provider, store, or tool semantics in process.
 
 ### 6.1 Invocation pattern (how a turn runs)
 
-Submitting a prompt does **not** run `mu` from inside a ZLE widget (which would
-make signal and terminal ownership awkward for a long, streaming turn). Instead
-the agent-mode `accept-line` widget stashes the typed prompt, replaces the
-buffer with a call to a small helper function, and accepts the line. zsh then
-runs that helper as an ordinary **foreground command**:
+Pressing the configured key with a non-empty buffer submits that buffer as one
+foreground `mu` turn. Pressing the key with an empty buffer starts `mu-cli`
+instead.
+
+Submitting a non-empty prompt runs `mu` as an ordinary **foreground command**:
 
 ```zsh
 # illustrative only
-_mu_send() {            # runs as a normal command, owns the TTY
+_mu_run_turn() {        # runs as a normal command, owns the TTY
   mu --session "$MU_SESSION_ID" <<< "$_MU_PROMPT"
 }
 ```
 
 Consequences, all desirable:
 
-- `mu` owns the terminal for the turn; streaming output works directly.
+- `mu` or `mu-cli` owns the terminal while it is running; streaming output works
+  directly.
 - Ctrl-C sends SIGINT directly to the `mu` process — no routing to build.
-- After `mu` exits, a `precmd` hook (registered via `add-zsh-hook`, see §6.6)
-  re-arms agent mode: restores the agent prompt and keymap so the user is back
-  at an agent prompt, ready for the next turn.
+- After `mu` or `mu-cli` exits, the user is back in their normal shell prompt.
 
 ### 6.2 Entry and exit
 
-- **Entry (explicit, default):** a dedicated, configurable key binding enters
-  agent mode. This is the default path and has no conflict with typing `mu` as
-  a command.
+- **Entry (explicit, default):** a dedicated, configurable key binding invokes
+  the plugin widget. Empty buffer starts `mu-cli`; non-empty buffer submits a
+  one-shot turn.
 - **Entry (magic space, opt-in):** when enabled, Space is bound to
   `_mu_magic_space`; if the buffer is exactly `mu` it clears the buffer and
-  enters agent mode, otherwise it self-inserts. Off by default (see §2.3 for the
-  `mu <args>` conflict and the leading-space workaround).
-- **Exit (backspace):** in the `mu` keymap, Backspace on an empty buffer
-  (`$#BUFFER == 0`) exits agent mode; otherwise it deletes normally.
-- **Exit (Esc):** also exits agent mode, as a discoverable escape hatch.
+  invokes the plugin widget (therefore starting `mu-cli`). Off by default
+  because it prevents typing `mu <args>` as a normal command without an escape.
 
-Entering agent mode sets an `_MU_AGENT_MODE` flag, swaps `PROMPT`/`RPROMPT` to a
-distinct agent prompt, and switches to the `mu` keymap (§6.4). Exiting clears
-the flag and restores the saved prompt and the `main` keymap. The `_MU_AGENT_MODE`
-flag is what the `precmd` re-arm hook (§6.1) checks to decide whether to return
-to an agent prompt after a turn — without it, `precmd` could not tell an
-agent-mode turn from a normal shell command.
-
-Note on Ctrl-C stickiness: interrupting a turn with Ctrl-C lands the user back
-in agent mode (the flag persists), matching the Julia REPL. This is intentional
-— an aborted turn keeps you where you were.
-
-### 6.3 Multi-line prompts
-
-Agent prompts are frequently multi-line, so the plugin supports it natively
-(zsh handles multi-line buffers):
-
-- **Ctrl-J** inserts a literal newline (reliable across all terminals).
-- **Shift-Enter** inserts a newline **where the terminal reports it distinctly**
-  (e.g. terminals supporting the CSI-u / Kitty keyboard protocol such as foot,
-  kitty, recent alacritty). Where Shift-Enter is indistinguishable from Enter,
-  it submits — Ctrl-J remains the guaranteed multi-line key.
-- **Enter** submits the whole buffer.
-
-### 6.4 Keymap isolation
-
-To avoid touching the user's bindings, the plugin clones the active keymap into
-a dedicated `mu` keymap once at load (`bindkey -N mu main`) and overrides only:
-`accept-line` (submit), `^?`/Backspace (exit-on-empty), Esc (exit), Ctrl-J and
-Shift-Enter (newline). All other keys — including the user's custom bindings —
-are inherited. Bindings that make no sense for a prose prompt (e.g. an inherited
-`Esc Esc → sudo-command-line`) are unbound in the `mu` keymap only.
-
-Note (vi mode): if the user runs `bindkey -v`, insert-mode bindings live in
-`viins`, not `main`. The plugin clones from whichever keymap is the user's
-insert keymap (detect via `$KEYMAP`/`bindkey -lL main`), so vi users keep their
-insert bindings; document this and default to `main` when detection is
-ambiguous.
-
-### 6.5 Disabling shell features in agent mode
-
-Syntax highlighting and autosuggestions are meant for shell syntax, not prose,
-so the plugin disables them on entry and restores on exit using each plugin's
-documented off-switch — no patching of third-party internals:
-
-- **zsh-syntax-highlighting:** save and clear `ZSH_HIGHLIGHT_HIGHLIGHTERS`
-  (empty array = no-op), restore on exit.
-- **zsh-autosuggestions:** call its `autosuggest-disable` widget on entry and
-  `autosuggest-enable` on exit.
-- **General fallback:** any stray `line-pre-redraw` hook without an off-switch
-  can be detached with `add-zle-hook-widget -d line-pre-redraw <name>` on entry
-  and re-added on exit.
-
-Tab completion is simply not invoked in agent mode (Tab is left to self-insert
-or unbound in the `mu` keymap), so the completion system is never engaged for
-prose.
-
-### 6.6 Coexistence with the user's `.zshrc`
+### 6.3 Coexistence with the user's `.zshrc`
 
 The plugin is written to layer cleanly on existing setups (validated against the
 target `.zshrc`):
 
-- **Hooks via arrays.** It registers `precmd`/`preexec` work with
-  `add-zsh-hook`, never by redefining `precmd`/`preexec`, so a user-defined
-  `precmd` function continues to run alongside it.
-- **Load order.** Source the mu plugin **after** zsh-autosuggestions and
-  zsh-syntax-highlighting so its widget wrappers and feature-toggles sit on top.
-- **Keymap clone.** Because the `mu` keymap is cloned from `main` at load and
-  only selectively overridden, the user's global `bindkey`s are preserved both
-  in normal mode and (except the deliberate overrides) in agent mode.
+- **No prompt/keymap mode.** The plugin binds only the configured entry key in
+  `main` and `viins`, plus optional magic-space. It does not replace the shell
+  prompt, clone keymaps, or install a long-lived agent mode.
+- **Load order.** Source the mu plugin after other ZLE plugins so the configured
+  key binding wins deliberately.
+- **Normal shell behavior.** Completion, history, job control, aliases, plugins,
+  and interactive programs remain owned by zsh.
 - **No global option changes.** The plugin does not flip `setopt`s that affect
   normal-mode behavior.
 
-### 6.7 Shell history and context (V1 scope)
+### 6.4 Shell history and context (V1 scope)
 
 - **Shell history:** the raw prompt text is pushed into zsh history via
-  `print -s`, so it appears in normal shell history and is recallable with
-  Up-arrow inside agent mode. The internal `_mu_send` wrapper invocation is kept
-  *out* of history (the widget builds it with a leading space under
-  `HIST_IGNORE_SPACE`, or omits it from `accept-line` history recording), so
-  each turn produces exactly one history entry: the prompt itself.
+  `print -s` for one-shot zsh submissions, so it appears in normal shell
+  history. `mu-cli` can maintain its own line history later, but it must not
+  change the persisted agent semantics.
 - **Full structured history:** `mu` independently records the complete prompt,
-  assistant responses, and tool calls in SQLite (§10). Tool output is stored
+  assistant responses, and tool calls in SQLite (§11). Tool output is stored
   with the shared truncation/spill policy, so the DB keeps the structured
   transcript and the spill files hold any oversized raw command output.
 - **No shell-command sharing (V1):** commands you run in *normal* shell mode are
@@ -528,17 +518,16 @@ target `.zshrc`):
   into the session (e.g. via `preexec`/`precmd` capture) is deferred; V1 keeps
   the boundary explicit and private.
 
-### 6.8 Session management commands
+### 6.5 Session management commands
 
-Because there is no in-`mu` REPL, session lifecycle is exposed as plugin-provided
-shell functions (thin wrappers over `mu` subcommands), operating on the
-`MU_SESSION_ID` shell variable (§10):
+Session lifecycle is exposed as plugin-provided shell functions (thin wrappers
+over `mu` subcommands), operating on the `MU_SESSION_ID` shell variable (§11):
 
 - `mu-new` — start a fresh session (clear `MU_SESSION_ID`; next turn creates one).
 - `mu-attach <id>` — bind this shell to an existing session.
 - `mu-sessions` — list recent sessions to pick from.
 
-### 6.9 Distribution
+### 6.6 Distribution
 
 Shipped as a `.zsh` file embedded in the binary and printed by `mu init zsh`,
 installed with a single line in `.zshrc` (the zoxide/starship convention):
@@ -607,7 +596,7 @@ status and a clear message pointing at `config.jsonc` and the expected env var.
 is no silent fallback and no built-in default endpoint.
 
 Because the canonical message history is stored in a provider-neutral form
-(§10), swapping the base URL/model across turns is supported without migration;
+(§11), swapping the base URL/model across turns is supported without migration;
 a future second protocol (e.g. Anthropic-native) can be added behind the same
 trait.
 
@@ -633,24 +622,76 @@ shape and the broader Agent Skills convention.
 
 Progressive disclosure: only short metadata is always in context; full
 instructions are pulled in on demand. No dedicated tool, no registration — skills
-are files discovered on startup (and cached, §12).
+are files discovered on startup (and cached, §13).
 
 ---
 
-## 9. Configuration
+## 9. Project discovery
 
-A flat config directory (resolved via `$MU_CONFIG_DIR`, else `$XDG_CONFIG_HOME/mu`,
-else `~/.config/mu`):
+On startup, `mu` searches upward from the current working directory to find an
+active project.
+
+A directory is a project when it contains `.mu`.
+
+A directory is also a project when it contains `.git`. In that case, `.mu` is
+created adjacent to `.git` only when `mu` needs to write project state. Merely
+discovering or reading project information must not mutate the filesystem.
+
+If the search reaches the user's home directory or the filesystem root without
+finding a project, no project is active for the turn and global state/config is
+used.
+
+Nested project merging is not supported. The first project found while walking
+upward is the active project.
+
+Git worktrees are treated as their own projects. When a worktree is active, the
+worktree root is the project root. The agent should be told both the project
+root and the current working directory. It should also be told relevant worktree
+information when available.
+
+The shell tool's working directory defaults to the process working directory,
+not the project root.
+
+The project-local directory is `.mu`. It contains:
+
+- `config.jsonc`, the project configuration.
+- `AGENTS.md`, the project-local agent instructions.
+- `skills/`, the project-local skills directory.
+- `sessions.db`, the project-local session history and state database.
+- `.gitignore`, which ignores session database files and related SQLite files.
+
+Project state is private to the project. A project should be movable and
+understandable by inspecting its `.mu` directory, while still avoiding committing
+volatile session state by default.
+
+---
+
+## 10. Configuration
+
+`mu` has global configuration and optional project configuration. The global
+configuration directory is `~/.mu` by default (or `$MU_CONFIG_DIR` when set).
+Project configuration lives in the active project's `.mu` directory.
+
+The global and project directories have the same conceptual shape:
 
 ```
-~/.config/mu/
+~/.mu/ or <project>/.mu/
   config.jsonc      # provider base_url + key env var + model; optional tuning
-  AGENTS.md         # global agent instructions, appended to system prompt
+  AGENTS.md         # agent instructions, appended to system prompt
   skills/
     <skill-name>/
       SKILL.md      # front-matter: name, description; body: instructions
       ...           # optional supporting files
 ```
+
+When a project is active, global configuration is loaded first and project
+configuration is merged over it. Project values take precedence. Parent project
+configuration is not merged because nested projects are not supported. When no
+project is active, only global configuration is used.
+
+Configuration and session storage are related but separate concepts. Config is
+merged across scopes; sessions are selected from exactly one scope: project when
+inside a project, global otherwise.
 
 - **config.jsonc** — JSON with comments and trailing commas. Concrete shape
   (field names are normative):
@@ -678,10 +719,10 @@ else `~/.config/mu`):
   Only `provider.*` and `default_model` are required; everything else has the
   defaults shown. `mu` hard-fails on a turn if the required fields are missing
   or the API-key env var is unset (§7). `mu init` can write a starter file.
-- **AGENTS.md** — global system-prompt addendum. A project-local `AGENTS.md` in
-  the process's current working directory (the cwd `mu` was launched in), if
-  present, is appended after the global one. Both are included; only the cwd is
-  checked, not parent directories, in V1.
+- **AGENTS.md** — system-prompt addendum. Global instructions are loaded first;
+  active-project instructions are appended after them when a project is active.
+  Both are included; "project overrides global" means later text wins by
+  convention, not that global instructions are dropped.
 
 The system prompt is intentionally minimal and assembled in this fixed order:
 
@@ -694,16 +735,21 @@ The system prompt is intentionally minimal and assembled in this fixed order:
 2. An environment block, plain `key: value` lines:
    ```
    <env>
-   cwd: /home/user/project
+   cwd: /home/user/project/subdir
+   project: active
+   project_root: /home/user/project
+   session_id: ...
    os: linux
    date: 2026-06-18
    </env>
    ```
-3. The `<available_skills>` block (§8), or omitted if there are no skills.
+   If no project is active, `project: none` is used and `project_root` is
+   omitted. Worktree information is included when available.
+3. The `<available_skills>` block (§8), or omitted if there are no skills. Skill
+   metadata is merged from global and active-project skill directories.
 4. The global `AGENTS.md` contents, if the file exists.
-5. The project-local `AGENTS.md` contents, if present (appended *after* global —
-   both are included; "project overrides global" means later text wins by
-   convention, not that the global is dropped).
+5. The project-local `AGENTS.md` contents, if a project is active and the file
+   exists.
 
 Tool definitions are **not** part of this prompt; they go in the API `tools`
 parameter (§7). Frontier models need little scaffolding, so the fixed parts (1–2)
@@ -711,13 +757,14 @@ stay terse and `AGENTS.md` carries user customization.
 
 ---
 
-## 10. State and persistence
+## 11. State and persistence
 
-A single SQLite database (under `$XDG_STATE_HOME/mu` or `~/.local/state/mu`,
-separate from config so config stays hand-editable and state stays disposable).
-SQLite is chosen for zero-setup embedded storage, transactional durability, fast
-open, and easy querying. **WAL mode** is enabled so per-turn load/append is fast
-and concurrent shells don't block each other.
+State is stored in a SQLite database in exactly one active scope: the project
+database (`<project>/.mu/sessions.db`) when a project is active, or the global
+database (`~/.mu/sessions.db`) otherwise. SQLite is chosen for zero-setup
+embedded storage, transactional durability, fast open, and easy querying. **WAL
+mode** is enabled so per-turn load/append is fast and concurrent shells do not
+block each other unnecessarily.
 
 Conceptual schema (flat and small):
 
@@ -727,13 +774,17 @@ Conceptual schema (flat and small):
   compaction"), `cost_total` (accumulated USD, for the turn summary). `model` is
   set at session creation from the effective model (lifecycle step 2); a later
   `--model` overrides for that turn only and does **not** rewrite the stored
-  value. `title` is set lazily from the first user prompt (first ~60 chars) and
-  is display-only for `mu session list`.
+  value. `cwd` records the last working directory used for that session. `title`
+  is set lazily from the first user prompt (first ~60 chars) and is display-only
+  for `mu session list`.
 - **message** — `id`, `session_id`, `role` (`user`/`assistant`/`tool`/`summary`),
-  `content`, `created_at`, ordering index, and for tool results `tool_call_id`.
-  Provider-neutral representation. A `summary` row is a compaction summary
-  (§"Context window and compaction"); the context builder starts from the latest
-  `summary` row and includes everything after it.
+  `content`, optional full user content JSON for multi-part inputs, `created_at`,
+  ordering index, and for tool results `tool_call_id`. Provider-neutral
+  representation. For user messages with image attachments, `content` remains a
+  textual projection for listing/token estimates, while the full text+image
+  parts are persisted and reloaded for model context. A `summary` row is a
+  compaction summary (§"Context window and compaction"); the context builder
+  starts from the latest `summary` row and includes everything after it.
 - **tool_call** — `id`, `message_id`, `tool`, `args` (JSON), `risk`, `output`,
   `status`, timings. Records the agent's tool invocations for inspection and the
   renderer's truncation pointers. (Tool *results* fed back to the model are stored as
@@ -763,6 +814,30 @@ shell variable owned by the plugin:
 Sessions are append-only logs; resuming replays messages into the context
 window. Multiple shells holding *different* sessions run concurrently (safe under
 WAL).
+
+### Agent environment context
+
+For each turn, the agent should know:
+
+- The current working directory.
+- Whether a project is active.
+- The project root, if one is active.
+- The active session id.
+- Relevant git worktree information, if the project is a worktree.
+
+The current working directory remains important even inside a project because it
+reflects the user's immediate intent. Project root provides broader context, but
+it should not replace `pwd`.
+
+Stable environment information is introduced once, when the session is created.
+This includes project path, active project status, session id, and git worktree
+information. Later turns in the same session should not repeat that full
+environment block.
+
+If the working directory changes after session creation, the next turn should
+include the new `pwd` as additional context and update the session's stored
+`cwd`. This keeps the model aware of meaningful movement without making every
+turn restate the full environment.
 
 ### Message-level persistence and interruption
 
@@ -876,9 +951,19 @@ against a loop silently burning tokens.
 (lock held) or `--session` not found; `130` interrupted by SIGINT (the shell's
 default for Ctrl-C). The summary line is printed only on exit `0`.
 
+### Abort, pause, and resume
+
+Abort means the current language-model request or tool execution is cancelled
+when possible, the turn stops, and `mu` exits. Abort is an explicit interruption
+of work in progress; completed messages remain persisted and partial messages
+are discarded as described above.
+
+Pause and resume are V2 features. The initial design does not promise pausing at
+tool-call boundaries or resuming a partially completed turn.
+
 ---
 
-## 11. Safety posture
+## 12. Safety posture
 
 V1 is deliberately **unsandboxed and unconfirmed** — "yolo" by design. `mu` runs
 whatever the agent asks through `bash`: commands execute directly, files can be
@@ -906,7 +991,7 @@ Sandboxing and an approval/policy layer are explicitly out of scope for now and
 can be layered on later without changing the architecture, should the threat
 model warrant it.
 
-### 11.1 Guardrail (optional)
+### 12.1 Guardrail (optional)
 
 An opt-in review gate for destructive commands. When enabled, a separate model
 call assesses each `bash` call whose declared `risk` is `"destructive"` before
@@ -1001,7 +1086,7 @@ interaction with the concurrent execution path.
 
 ---
 
-## 12. Startup-speed plan
+## 13. Startup-speed plan
 
 Startup latency is paid every turn, so it is defended explicitly:
 
@@ -1021,7 +1106,7 @@ on a warm filesystem, so the only perceptible latency is model time-to-first-tok
 
 ---
 
-## 13. High-level implementation phases
+## 14. High-level implementation phases
 
 Coarse sequencing only (not an execution plan):
 

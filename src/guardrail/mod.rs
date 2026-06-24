@@ -159,7 +159,7 @@ impl Guardrail {
                 content: system_prompt,
             },
             Message::User {
-                content: user_content,
+                content: user_content.into(),
             },
         ];
 
@@ -182,8 +182,7 @@ impl Guardrail {
 
             match result {
                 Err(_elapsed) => {
-                    last_error =
-                        format!("reviewer timed out after {}ms", self.config.timeout_ms);
+                    last_error = format!("reviewer timed out after {}ms", self.config.timeout_ms);
                     continue;
                 }
                 Ok(Err(ProviderError::ContextLength)) => {
@@ -402,9 +401,18 @@ mod tests {
 
     #[test]
     fn bash_risk_valid_values() {
-        assert_eq!(bash_risk(&json!({"risk": "readonly"})), Some("readonly".into()));
-        assert_eq!(bash_risk(&json!({"risk": "reversible"})), Some("reversible".into()));
-        assert_eq!(bash_risk(&json!({"risk": "destructive"})), Some("destructive".into()));
+        assert_eq!(
+            bash_risk(&json!({"risk": "readonly"})),
+            Some("readonly".into())
+        );
+        assert_eq!(
+            bash_risk(&json!({"risk": "reversible"})),
+            Some("reversible".into())
+        );
+        assert_eq!(
+            bash_risk(&json!({"risk": "destructive"})),
+            Some("destructive".into())
+        );
     }
 
     #[test]

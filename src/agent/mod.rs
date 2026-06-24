@@ -8,8 +8,8 @@ use serde_json::Value;
 
 use crate::compaction;
 use crate::config::Config;
-use crate::guardrail::{Guardrail, GuardrailOutcome, bash_risk};
-use crate::provider::{FinishReason, Message, Provider, ProviderError, ToolCall};
+use crate::guardrail::{bash_risk, Guardrail, GuardrailOutcome};
+use crate::provider::{FinishReason, Message, Provider, ProviderError, ToolCall, UserContent};
 use crate::renderer::Renderer;
 use crate::store::Store;
 use crate::tools::{missing_tool_message, ExecutionMode, ToolContext, ToolRegistry, ToolResult};
@@ -30,6 +30,7 @@ pub struct AgentLoop<'a> {
     pub renderer: &'a mut Renderer,
     pub state_dir: &'a Path,
     pub system_prompt: String,
+    pub attachments: Vec<crate::provider::ContentPart>,
 }
 
 impl<'a> AgentLoop<'a> {
@@ -58,8 +59,18 @@ impl<'a> AgentLoop<'a> {
             },
         );
 
-        let user_msg = Message::User {
-            content: prompt.to_string(),
+        let user_msg = if self.attachments.is_empty() {
+            Message::User {
+                content: UserContent::Text(prompt.to_string()),
+            }
+        } else {
+            let mut parts = vec![crate::provider::ContentPart::Text {
+                text: prompt.to_string(),
+            }];
+            parts.extend(self.attachments.clone());
+            Message::User {
+                content: UserContent::Parts(parts),
+            }
         };
         self.store.append_message(self.session_id, &user_msg)?;
         context.push(user_msg);
@@ -167,10 +178,8 @@ impl<'a> AgentLoop<'a> {
                                     }
                                     if g.should_review(risk.as_deref().unwrap_or("")) {
                                         let args_for_review = args.clone();
-                                        let action_json = serde_json::to_string(
-                                            &args_for_review,
-                                        )
-                                        .unwrap_or_default();
+                                        let action_json = serde_json::to_string(&args_for_review)
+                                            .unwrap_or_default();
                                         let script = args_for_review
                                             .get("script")
                                             .and_then(|v| v.as_str())
@@ -229,10 +238,8 @@ impl<'a> AgentLoop<'a> {
                                                     content: format!("error: {deny_err}"),
                                                     tool_call_id: tc.id.clone(),
                                                 };
-                                                self.store.append_message(
-                                                    self.session_id,
-                                                    &deny_msg,
-                                                )?;
+                                                self.store
+                                                    .append_message(self.session_id, &deny_msg)?;
                                                 context.push(deny_msg);
                                                 self.store.record_tool_call(
                                                     msg_id,
@@ -257,9 +264,7 @@ impl<'a> AgentLoop<'a> {
                             self.renderer.tool_start(&tc.function.name, &args)?;
                             let started = Instant::now();
 
-                            let tool_result = if let Some(tool) =
-                                registry.get(&tc.function.name)
-                            {
+                            let tool_result = if let Some(tool) = registry.get(&tc.function.name) {
                                 let mut ctx = ToolContext {
                                     config: self.config,
                                     renderer: Some(self.renderer),

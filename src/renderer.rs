@@ -3,6 +3,7 @@ use std::time::Duration;
 
 use pulldown_cmark::{Event, Options, Parser, Tag, TagEnd};
 
+use crate::cli::OutputFormat;
 use crate::tools::ToolDisplay;
 
 const RESET: &str = "\x1b[0m";
@@ -21,17 +22,23 @@ pub struct Renderer {
     stderr: io::Stderr,
     stdout_at_line_start: bool,
     styled: bool,
+    format: OutputFormat,
     markdown: MarkdownStream,
 }
 
 impl Renderer {
     pub fn new() -> Self {
+        Self::with_format(OutputFormat::Terminal)
+    }
+
+    pub fn with_format(format: OutputFormat) -> Self {
         let stdout = io::stdout();
         Self {
-            styled: stdout.is_terminal(),
+            styled: format == OutputFormat::Terminal && stdout.is_terminal(),
             stdout,
             stderr: io::stderr(),
             stdout_at_line_start: true,
+            format,
             markdown: MarkdownStream::default(),
         }
     }
@@ -39,6 +46,9 @@ impl Renderer {
     pub fn assistant_text(&mut self, text: &str) -> io::Result<()> {
         if text.is_empty() {
             return Ok(());
+        }
+        if self.format == OutputFormat::Json {
+            return self.write_json("assistant_delta", serde_json::json!({ "text": text }));
         }
         if !self.styled {
             return self.write_stdout(text);
@@ -62,6 +72,12 @@ impl Renderer {
     /// Completion-only tools are silent here. Bash is the exception because
     /// its live output needs a visible command header.
     pub fn tool_start(&mut self, name: &str, args: &serde_json::Value) -> io::Result<()> {
+        if self.format == OutputFormat::Json {
+            return self.write_json(
+                "tool_start",
+                serde_json::json!({ "tool": name, "args": args }),
+            );
+        }
         if name != "bash" {
             return Ok(());
         }
@@ -93,10 +109,25 @@ impl Renderer {
         if text.is_empty() {
             return Ok(());
         }
+        if self.format == OutputFormat::Json {
+            return self.write_json(
+                "tool_output",
+                serde_json::json!({ "text": strip_ansi(text) }),
+            );
+        }
         self.write_stdout(&strip_ansi(text))
     }
 
     pub fn tool_finished(&mut self, display: &ToolDisplay, elapsed: Duration) -> io::Result<()> {
+        if self.format == OutputFormat::Json {
+            return self.write_json(
+                "tool_finish",
+                serde_json::json!({
+                    "display": tool_display_json(display),
+                    "elapsed_ms": elapsed.as_millis()
+                }),
+            );
+        }
         let text = format_tool(display, elapsed, self.styled);
         if text.is_empty() {
             return Ok(());
@@ -106,6 +137,16 @@ impl Renderer {
     }
 
     pub fn tool_failed(&mut self, name: &str, error: &str, elapsed: Duration) -> io::Result<()> {
+        if self.format == OutputFormat::Json {
+            return self.write_json(
+                "tool_error",
+                serde_json::json!({
+                    "tool": name,
+                    "error": error,
+                    "elapsed_ms": elapsed.as_millis()
+                }),
+            );
+        }
         self.ensure_line_start()?;
         let elapsed = format_duration(elapsed);
         let line = if self.styled {
@@ -126,6 +167,18 @@ impl Renderer {
         reason: &str,
         script: &str,
     ) -> io::Result<()> {
+        if self.format == OutputFormat::Json {
+            return self.write_json(
+                "guardrail",
+                serde_json::json!({
+                    "allowed": allowed,
+                    "risk_level": risk_level,
+                    "user_auth_level": user_auth_level,
+                    "reason": reason,
+                    "script": script
+                }),
+            );
+        }
         self.ensure_line_start()?;
         let verdict = if allowed { "allow" } else { "deny" };
         let script_preview = script.lines().next().unwrap_or(script);
@@ -152,11 +205,17 @@ impl Renderer {
     }
 
     pub fn error(&mut self, msg: &str) -> io::Result<()> {
+        if self.format == OutputFormat::Json {
+            return self.write_json("error", serde_json::json!({ "message": msg }));
+        }
         writeln!(self.stderr, "error: {msg}")?;
         self.stderr.flush()
     }
 
     pub fn notice(&mut self, msg: &str) -> io::Result<()> {
+        if self.format == OutputFormat::Json {
+            return self.write_json("notice", serde_json::json!({ "message": msg }));
+        }
         self.ensure_line_start()?;
         self.write_stdout(&format!("{msg}\n"))
     }
@@ -165,6 +224,9 @@ impl Renderer {
     /// glue onto the final line of assistant output.
     pub fn finish_turn(&mut self) -> io::Result<()> {
         self.assistant_end()?;
+        if self.format == OutputFormat::Json {
+            return Ok(());
+        }
         self.ensure_line_start()
     }
 
@@ -175,6 +237,17 @@ impl Renderer {
         context_pct: Option<f64>,
         cost: Option<f64>,
     ) -> io::Result<()> {
+        if self.format == OutputFormat::Json {
+            return self.write_json(
+                "turn_summary",
+                serde_json::json!({
+                    "prompt_tokens": prompt_tokens,
+                    "completion_tokens": completion_tokens,
+                    "context_pct": context_pct,
+                    "cost": cost
+                }),
+            );
+        }
         if !self.stderr.is_terminal() {
             return Ok(());
         }
@@ -196,6 +269,16 @@ impl Renderer {
     fn write_stdout(&mut self, text: &str) -> io::Result<()> {
         self.stdout.write_all(text.as_bytes())?;
         self.stdout_at_line_start = text.ends_with('\n');
+        self.stdout.flush()
+    }
+
+    fn write_json(&mut self, event: &str, payload: serde_json::Value) -> io::Result<()> {
+        let line = serde_json::json!({
+            "event": event,
+            "payload": payload,
+        });
+        writeln!(self.stdout, "{line}")?;
+        self.stdout_at_line_start = true;
         self.stdout.flush()
     }
 }
@@ -470,6 +553,15 @@ fn format_tool(display: &ToolDisplay, elapsed: Duration, styled: bool) -> String
             } else {
                 format!("[bash] exit {exit_code} ({elapsed})\n")
             }
+        }
+    }
+}
+
+fn tool_display_json(display: &ToolDisplay) -> serde_json::Value {
+    match display {
+        ToolDisplay::None => serde_json::json!({"kind": "none"}),
+        ToolDisplay::Bash { exit_code } => {
+            serde_json::json!({"kind": "bash", "exit_code": exit_code})
         }
     }
 }
