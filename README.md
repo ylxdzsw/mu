@@ -10,23 +10,20 @@ cargo build --release
 
 Install the binary to your `PATH` (e.g. `target/release/mu`).
 
+`mu` targets Unix-like systems and expects `bash` to be available on `PATH`.
+
 ## Setup
 
 ```bash
-mu init                    # writes ~/.mu/config.jsonc
 export OPENAI_API_KEY=...  # or your provider key
 ```
 
-Add to `~/.zshrc` (after syntax-highlighting / autosuggestions):
+`mu` creates `~/.mu/config.jsonc` automatically with an OpenAI-compatible
+starter provider if the file does not exist. Edit that file to use another
+OpenAI-compatible endpoint, API-key env var, or default model.
 
-```zsh
-eval "$(mu init zsh)"
-```
-
-Press **Alt-M** to enter agent mode. Type a prompt and press Enter.
-
-The zsh integration source lives at `shell-plugins/mu.zsh`; additional shell
-integrations can live next to it with shell-specific suffixes.
+Run a single turn by piping a prompt to `mu`, or start `mu-cli` for an
+interactive prompt that keeps using the same session.
 
 ## CLI
 
@@ -41,18 +38,9 @@ integrations can live next to it with shell-specific suffixes.
 | `mu --output terminal` | Render interactive terminal output |
 | `mu --output json` | Render newline-delimited JSON events |
 | `mu-cli` | Run the thin interactive REPL wrapper |
-| `mu init` | Write starter config |
-| `mu init zsh` | Print zsh plugin |
 | `mu session new` | Create session, print id |
 | `mu session list` | List recent sessions |
 | `mu compact --session <id>` | Force compaction |
-
-## Shell functions
-
-- `mu-new` — start fresh session
-- `mu-attach <id>` — attach to session
-- `mu-sessions` — list sessions
-- `mu-compact` — compact current session
 
 ## Config
 

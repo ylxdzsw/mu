@@ -185,8 +185,6 @@ mod tests {
             },
             default_model: "test-model".into(),
             models: HashMap::new(),
-            agent_mode_key: "\\eM".into(),
-            magic_space: false,
             compaction: CompactionConfig::default(),
             limits: LimitsConfig::default(),
             guardrail: crate::config::GuardrailConfig::default(),

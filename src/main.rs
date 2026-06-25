@@ -6,6 +6,9 @@ use std::sync::Arc;
 use anyhow::{bail, Context, Result};
 use clap::Parser;
 
+#[cfg(not(unix))]
+compile_error!("mu is supported only on Unix-like systems");
+
 mod agent;
 mod cli;
 mod compaction;
@@ -21,14 +24,12 @@ mod store;
 mod system_prompt;
 mod tools;
 
-use cli::{Args, Command, InitSub, SessionSub};
+use cli::{Args, Command, SessionSub};
 use config::Config;
 use provider::openai::OpenAiProvider;
 use provider::Provider;
 use provider::{ContentPart, ImageUrl};
 use renderer::Renderer;
-
-const ZSH_PLUGIN: &str = include_str!("../shell-plugins/mu.zsh");
 
 #[tokio::main]
 async fn main() {
@@ -66,19 +67,6 @@ async fn run() -> Result<()> {
     let scope = paths::discover_scope(&cwd);
 
     match args.command {
-        Some(Command::Init { sub }) => match sub {
-            Some(InitSub::Zsh) => {
-                print!("{ZSH_PLUGIN}");
-                return Ok(());
-            }
-            None => {
-                let config_path = Config::starter_path();
-                Config::write_starter(&config_path)?;
-                eprintln!("wrote starter config to {}", config_path.display());
-                eprintln!("set {} and run a turn", "OPENAI_API_KEY");
-                return Ok(());
-            }
-        },
         Some(Command::Session { sub }) => {
             let db_path = scope.session_db_path();
             match sub {
@@ -169,7 +157,6 @@ async fn run() -> Result<()> {
     }
     let attachments = load_image_attachments(&args.images)?;
 
-    paths::ensure_project_layout(&scope)?;
     let project_config_dir = scope.project().map(|p| p.root.join(".mu"));
     let config = Config::load_for_scope(project_config_dir.as_deref())?;
     let api_key = config.api_key()?;
@@ -178,6 +165,7 @@ async fn run() -> Result<()> {
         api_key,
     )) as Arc<dyn Provider>;
 
+    paths::ensure_project_layout(&scope)?;
     let state_dir = scope.state_dir();
     paths::ensure_dir(&state_dir)?;
     compaction::prune_spills(&state_dir);

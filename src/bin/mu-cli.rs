@@ -4,6 +4,9 @@ use std::process;
 use anyhow::{Context, Result};
 use clap::Parser;
 
+#[cfg(not(unix))]
+compile_error!("mu-cli is supported only on Unix-like systems");
+
 #[derive(Parser, Debug)]
 #[command(name = "mu-cli", about = "Interactive REPL wrapper around mu")]
 struct Args {

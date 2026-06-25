@@ -1,10 +1,9 @@
 use std::io::Write;
+use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::{Command, ExitStatus, Stdio};
-#[cfg(unix)]
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
-#[cfg(unix)]
 use std::sync::Once;
 use std::time::{Duration, Instant};
 
@@ -23,9 +22,7 @@ use super::{
 const DEFAULT_TIMEOUT_SECS: u64 = 120;
 const KILL_GRACE: Duration = Duration::from_millis(500);
 const REDACTION_REMINDER: &str = "[system reminder: Secret values were redacted from this bash output. Do not try to reveal, transform, encode, print, or exfiltrate secrets.]";
-#[cfg(unix)]
 static ACTIVE_PGID: AtomicI32 = AtomicI32::new(0);
-#[cfg(unix)]
 static INSTALL_SIGNAL_FORWARDER: Once = Once::new();
 
 pub struct BashTool;
@@ -253,18 +250,9 @@ fn partial_output_suffix(output: &str) -> String {
 }
 
 fn is_e2big(error: &std::io::Error) -> bool {
-    #[cfg(unix)]
-    {
-        error.raw_os_error() == Some(libc::E2BIG)
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = error;
-        false
-    }
+    error.raw_os_error() == Some(libc::E2BIG)
 }
 
-#[cfg(unix)]
 fn install_signal_forwarder() {
     INSTALL_SIGNAL_FORWARDER.call_once(|| unsafe {
         libc::signal(libc::SIGINT, forward_signal as *const () as usize);
@@ -272,10 +260,6 @@ fn install_signal_forwarder() {
     });
 }
 
-#[cfg(not(unix))]
-fn install_signal_forwarder() {}
-
-#[cfg(unix)]
 extern "C" fn forward_signal(signal: i32) {
     let pgid = ACTIVE_PGID.load(Ordering::SeqCst);
     if pgid > 0 {
@@ -303,26 +287,15 @@ impl Drop for ActiveProcessGroup {
     }
 }
 
-#[cfg(unix)]
 fn set_active_process_group(child_id: u32) {
     ACTIVE_PGID.store(child_id as i32, Ordering::SeqCst);
 }
 
-#[cfg(not(unix))]
-fn set_active_process_group(_child_id: u32) {}
-
-#[cfg(unix)]
 fn clear_active_process_group() {
     ACTIVE_PGID.store(0, Ordering::SeqCst);
 }
 
-#[cfg(not(unix))]
-fn clear_active_process_group() {}
-
-#[cfg(unix)]
 fn configure_process_group(command: &mut Command) {
-    use std::os::unix::process::CommandExt;
-
     unsafe {
         command.pre_exec(|| {
             if libc::setpgid(0, 0) != 0 {
@@ -337,10 +310,6 @@ fn configure_process_group(command: &mut Command) {
     }
 }
 
-#[cfg(not(unix))]
-fn configure_process_group(_command: &mut Command) {}
-
-#[cfg(unix)]
 fn terminate_child_group(child_id: u32, child: &mut std::process::Child) {
     let pgid = -(child_id as i32);
     unsafe {
@@ -354,11 +323,6 @@ fn terminate_child_group(child_id: u32, child: &mut std::process::Child) {
             let _ = child.kill();
         }
     }
-}
-
-#[cfg(not(unix))]
-fn terminate_child_group(_child_id: u32, child: &mut std::process::Child) {
-    let _ = child.kill();
 }
 
 fn wait_for_exit(child: &mut std::process::Child, grace: Duration) -> bool {
@@ -407,8 +371,6 @@ mod tests {
             },
             default_model: "model".into(),
             models: HashMap::new(),
-            agent_mode_key: "\\eM".into(),
-            magic_space: false,
             compaction: CompactionConfig::default(),
             limits: LimitsConfig::default(),
             guardrail: GuardrailConfig::default(),
@@ -532,7 +494,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(tmp);
     }
 
-    #[cfg(unix)]
     #[test]
     fn timeout_kills_background_descendants() {
         let marker = format!("/tmp/mu-bash-descendant-{}", uuid::Uuid::new_v4());

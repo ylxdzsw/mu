@@ -31,11 +31,6 @@ pub enum OutputFormat {
 
 #[derive(Subcommand, Debug)]
 pub enum Command {
-    /// Write starter config and create config directory
-    Init {
-        #[command(subcommand)]
-        sub: Option<InitSub>,
-    },
     /// Session management
     Session {
         #[command(subcommand)]
@@ -46,12 +41,6 @@ pub enum Command {
         #[arg(long)]
         session: String,
     },
-}
-
-#[derive(Subcommand, Debug)]
-pub enum InitSub {
-    /// Print the zsh plugin for eval
-    Zsh,
 }
 
 #[derive(Subcommand, Debug)]

@@ -209,8 +209,6 @@ mod tests {
             },
             default_model: "fake-model".into(),
             models: Default::default(),
-            agent_mode_key: "\\eM".into(),
-            magic_space: false,
             compaction: crate::config::CompactionConfig {
                 fraction: 0.75,
                 keep_recent_turns: 2,
