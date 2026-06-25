@@ -190,6 +190,8 @@ mod tests {
             compaction: CompactionConfig::default(),
             limits: LimitsConfig::default(),
             guardrail: crate::config::GuardrailConfig::default(),
+            redaction: crate::config::RedactionConfig::default(),
+            env: HashMap::new(),
         }
     }
 }

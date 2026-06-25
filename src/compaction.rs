@@ -217,6 +217,8 @@ mod tests {
             },
             limits: crate::config::LimitsConfig::default(),
             guardrail: crate::config::GuardrailConfig::default(),
+            redaction: crate::config::RedactionConfig::default(),
+            env: Default::default(),
         }
     }
 

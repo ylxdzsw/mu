@@ -59,8 +59,13 @@ integrations can live next to it with shell-specific suffixes.
 Global config and state live in `~/.mu`. Project config and state live in
 `.mu` beside the nearest `.git` or existing `.mu` project marker. Global config
 is loaded first; project `config.jsonc` overrides it when a project is active.
+Optional `.env` files in those same directories are also loaded with project
+values overriding global values; the resulting environment is used for provider
+API key lookup and `bash` tool processes.
 
-Optional: `AGENTS.md` (global and project-local), `skills/*/SKILL.md`.
+Optional: `.env`, `AGENTS.md` (global and project-local), `skills/*/SKILL.md`.
+Provider API key values and names listed in `redaction.env` are exact-value
+redacted from `bash` tool output before it is stored or shown to the model.
 
 Sessions are selected from exactly one scope: project sessions when inside a
 project, global sessions otherwise. Project session history is stored in

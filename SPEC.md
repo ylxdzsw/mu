@@ -655,6 +655,7 @@ not the project root.
 The project-local directory is `.mu`. It contains:
 
 - `config.jsonc`, the project configuration.
+- `.env`, optional local environment values.
 - `AGENTS.md`, the project-local agent instructions.
 - `skills/`, the project-local skills directory.
 - `sessions.db`, the project-local session history and state database.
@@ -677,6 +678,7 @@ The global and project directories have the same conceptual shape:
 ```
 ~/.mu/ or <project>/.mu/
   config.jsonc      # provider base_url + key env var + model; optional tuning
+  .env              # optional environment values for provider lookup + bash
   AGENTS.md         # agent instructions, appended to system prompt
   skills/
     <skill-name>/
@@ -688,6 +690,12 @@ When a project is active, global configuration is loaded first and project
 configuration is merged over it. Project values take precedence. Parent project
 configuration is not merged because nested projects are not supported. When no
 project is active, only global configuration is used.
+
+Optional `.env` files are loaded with the same scope precedence:
+process environment first, then global `.env`, then active-project `.env`.
+The resulting effective environment is used for provider API-key lookup and is
+passed to every `bash` tool process. `.env` files are parsed as dotenv data, not
+sourced as shell scripts.
 
 Configuration and session storage are related but separate concepts. Config is
 merged across scopes; sessions are selected from exactly one scope: project when
@@ -712,13 +720,21 @@ inside a project, global otherwise.
     "agent_mode_key": "\\eM",                    // optional, default Alt-M; zsh keybinding
     "magic_space": false,                        // optional, default false
     "compaction": { "fraction": 0.75, "keep_recent_turns": 2 },  // optional
-    "limits": { "max_iterations": 50, "max_lines": 2000, "max_bytes": 51200, "max_line_bytes": 10240 }
+    "limits": { "max_iterations": 50, "max_lines": 2000, "max_bytes": 51200, "max_line_bytes": 10240 },
+    "redaction": {
+      "env": ["GITHUB_TOKEN"]                    // optional; provider api_key_env is implicit
+    }
   }
   ```
 
   Only `provider.*` and `default_model` are required; everything else has the
   defaults shown. `mu` hard-fails on a turn if the required fields are missing
   or the API-key env var is unset (§7). `mu init` can write a starter file.
+- **.env** — optional dotenv data. Values are visible to `bash`; this is
+  convenience, not sandboxing. Values from provider `api_key_env` and
+  `redaction.env` are exact-value redacted from bash output before the output is
+  stored or shown to the model. Empty redaction values are ignored with a
+  warning. Short redaction values are still redacted with a warning.
 - **AGENTS.md** — system-prompt addendum. Global instructions are loaded first;
   active-project instructions are appended after them when a project is active.
   Both are included; "project overrides global" means later text wins by

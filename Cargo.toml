@@ -7,6 +7,7 @@ edition = "2021"
 anyhow = "1"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 clap = { version = "4", features = ["derive"] }
+dotenvy = "0.15"
 fs2 = "0.4"
 futures-util = "0.3"
 jsonc-parser = { version = "0.27", features = ["serde"] }

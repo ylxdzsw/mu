@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 
+use crate::env::EnvMap;
 use crate::paths;
 
 #[derive(Debug, Clone, Deserialize)]
@@ -22,6 +23,10 @@ pub struct Config {
     pub limits: LimitsConfig,
     #[serde(default)]
     pub guardrail: GuardrailConfig,
+    #[serde(default)]
+    pub redaction: RedactionConfig,
+    #[serde(skip)]
+    pub env: EnvMap,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -83,6 +88,12 @@ pub struct CircuitBreakerConfig {
     pub window: usize,
     #[serde(default = "default_cb_window_denials")]
     pub window_denials: u32,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct RedactionConfig {
+    #[serde(default)]
+    pub env: Vec<String>,
 }
 
 fn default_agent_mode_key() -> String {
@@ -176,8 +187,9 @@ impl Config {
             }
         }
 
-        let config: Config =
+        let mut config: Config =
             serde_json::from_value(value).context("invalid config.jsonc structure")?;
+        config.env = crate::env::load_effective(project_config_dir)?;
         Ok(config)
     }
 
@@ -186,12 +198,16 @@ impl Config {
     }
 
     pub fn api_key(&self) -> Result<String> {
-        let key = std::env::var(&self.provider.api_key_env).with_context(|| {
-            format!(
-                "API key env var `{}` is not set (see config.jsonc)",
-                self.provider.api_key_env
-            )
-        })?;
+        let key = self
+            .env
+            .get(&self.provider.api_key_env)
+            .cloned()
+            .with_context(|| {
+                format!(
+                    "API key env var `{}` is not set (see config.jsonc)",
+                    self.provider.api_key_env
+                )
+            })?;
         if key.is_empty() {
             bail!("API key env var `{}` is empty", self.provider.api_key_env);
         }
@@ -270,6 +286,10 @@ const STARTER_CONFIG: &str = r#"{
     "max_bytes": 51200,
     "max_line_bytes": 10240
   },
+  "redaction": {
+    // Provider api_key_env is always included automatically.
+    "env": []
+  },
   "guardrail": {
     "enabled": false,
     // "review_model": "gpt-4o-mini",  // null → same as default_model
@@ -303,5 +323,26 @@ mod tests {
         assert_eq!(base["models"]["two"]["context_window"], 2);
         assert_eq!(base["limits"]["max_iterations"], 5);
         assert_eq!(base["limits"]["max_lines"], 20);
+    }
+
+    #[test]
+    fn api_key_reads_effective_env() {
+        let config = Config {
+            provider: ProviderConfig {
+                base_url: "http://localhost".into(),
+                api_key_env: "TEST_KEY".into(),
+            },
+            default_model: "test-model".into(),
+            models: HashMap::new(),
+            agent_mode_key: "\\eM".into(),
+            magic_space: false,
+            compaction: CompactionConfig::default(),
+            limits: LimitsConfig::default(),
+            guardrail: GuardrailConfig::default(),
+            redaction: RedactionConfig::default(),
+            env: HashMap::from([("TEST_KEY".into(), "secret".into())]),
+        };
+
+        assert_eq!(config.api_key().unwrap(), "secret");
     }
 }

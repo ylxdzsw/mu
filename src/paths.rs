@@ -109,7 +109,10 @@ pub fn ensure_project_layout(scope: &Scope) -> anyhow::Result<()> {
     }
     let gitignore = dir.join(".gitignore");
     if !gitignore.exists() {
-        std::fs::write(&gitignore, "sessions.db\nsessions.db-*\n*.db\n*.db-*\n")?;
+        std::fs::write(
+            &gitignore,
+            ".env\nsessions.db\nsessions.db-*\n*.db\n*.db-*\n",
+        )?;
     }
     Ok(())
 }
