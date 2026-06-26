@@ -15,11 +15,11 @@ use super::{
 pub struct OpenAiProvider {
     client: Client,
     base_url: String,
-    api_key: String,
+    api_key: Option<String>,
 }
 
 impl OpenAiProvider {
-    pub fn new(base_url: String, api_key: String) -> Self {
+    pub fn new(base_url: String, api_key: Option<String>) -> Self {
         Self {
             client: Client::new(),
             base_url: base_url.trim_end_matches('/').to_string(),
@@ -80,14 +80,11 @@ impl Provider for OpenAiProvider {
         let url = format!("{}/chat/completions", self.base_url);
         let body = build_chat_request_body(request, messages, tools);
 
-        let response = self
-            .client
-            .post(&url)
-            .bearer_auth(&self.api_key)
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| ProviderError::Other(e.to_string()))?;
+        let mut req = self.client.post(&url).json(&body);
+        if let Some(ref key) = self.api_key {
+            req = req.bearer_auth(key);
+        }
+        let response = req.send().await.map_err(|e| ProviderError::Other(e.to_string()))?;
 
         if !response.status().is_success() {
             let status = response.status();

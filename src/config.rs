@@ -203,7 +203,10 @@ impl Config {
         Self::load_for_scope(project_config_dir).ok()
     }
 
-    pub fn api_key(&self) -> Result<String> {
+    pub fn api_key(&self) -> Result<Option<String>> {
+        if self.provider.api_key_env.trim().is_empty() {
+            return Ok(None);
+        }
         let key = self
             .env
             .get(&self.provider.api_key_env)
@@ -217,7 +220,7 @@ impl Config {
         if key.is_empty() {
             bail!("API key env var `{}` is empty", self.provider.api_key_env);
         }
-        Ok(key)
+        Ok(Some(key))
     }
 
     pub fn context_window(&self, model: &str) -> Option<u64> {
@@ -225,9 +228,9 @@ impl Config {
     }
 
     fn validate(&self) -> Result<()> {
-        if self.provider.base_url.trim().is_empty() || self.provider.api_key_env.trim().is_empty() {
+        if self.provider.base_url.trim().is_empty() {
             bail!(
-                "no provider configured in config.jsonc: set `provider.base_url` and `provider.api_key_env`"
+                "no provider configured in config.jsonc: set `provider.base_url`"
             );
         }
         if self.default_model.trim().is_empty() {
@@ -356,7 +359,26 @@ mod tests {
             env: HashMap::from([("TEST_KEY".into(), "secret".into())]),
         };
 
-        assert_eq!(config.api_key().unwrap(), "secret");
+        assert_eq!(config.api_key().unwrap(), Some("secret".into()));
+    }
+
+    #[test]
+    fn api_key_returns_none_when_env_not_set() {
+        let config = Config {
+            provider: ProviderConfig {
+                base_url: "http://localhost".into(),
+                api_key_env: String::new(),
+            },
+            default_model: "test-model".into(),
+            models: HashMap::new(),
+            compaction: CompactionConfig::default(),
+            limits: LimitsConfig::default(),
+            guardrail: GuardrailConfig::default(),
+            redaction: RedactionConfig::default(),
+            env: HashMap::new(),
+        };
+
+        assert_eq!(config.api_key().unwrap(), None);
     }
 
     #[test]
@@ -378,8 +400,6 @@ mod tests {
         }))
         .unwrap_err();
 
-        assert!(err
-            .to_string()
-            .contains("no provider configured in config.jsonc"));
+        assert!(err.to_string().contains("no provider configured"));
     }
 }

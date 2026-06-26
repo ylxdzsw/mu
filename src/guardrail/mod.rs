@@ -351,7 +351,7 @@ mod tests {
             },
             provider: Arc::new(crate::provider::openai::OpenAiProvider::new(
                 "http://localhost".into(),
-                "key".into(),
+                Some("key".into()),
             )),
             default_model: "test".into(),
             consecutive_denials: 0,

@@ -152,7 +152,7 @@ async fn run() -> Result<()> {
                     let config = Config::load_for_scope(project_config_dir.as_deref())?;
                     let api_key = config.api_key()?;
                     let catalog =
-                        models::refresh_model_catalog(&config.provider.base_url, &api_key).await?;
+                        models::refresh_model_catalog(&config.provider.base_url, api_key.as_deref()).await?;
                     let path = ModelCatalog::cache_path();
                     catalog.save(&path)?;
                     println!(

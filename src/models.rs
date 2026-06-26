@@ -254,7 +254,7 @@ impl ModelCatalog {
     }
 }
 
-pub async fn refresh_model_catalog(base_url: &str, api_key: &str) -> Result<ModelCatalog> {
+pub async fn refresh_model_catalog(base_url: &str, api_key: Option<&str>) -> Result<ModelCatalog> {
     let client = Client::new();
     let provider_models = fetch_provider_models(&client, base_url, api_key).await?;
 
@@ -495,12 +495,14 @@ fn normalize_base_url(value: &str) -> String {
 async fn fetch_provider_models(
     client: &Client,
     base_url: &str,
-    api_key: &str,
+    api_key: Option<&str>,
 ) -> Result<Vec<RemoteModelRecord>> {
     let url = format!("{}/models", normalize_base_url(base_url));
-    let response = client
-        .get(&url)
-        .bearer_auth(api_key)
+    let mut req = client.get(&url);
+    if let Some(key) = api_key {
+        req = req.bearer_auth(key);
+    }
+    let response = req
         .send()
         .await
         .with_context(|| format!("requesting {url}"))?;
