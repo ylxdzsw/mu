@@ -1,10 +1,7 @@
-use std::path::PathBuf;
-
 use crate::config::LimitsConfig;
 
 pub struct TruncationResult {
     pub text: String,
-    pub spill_path: Option<PathBuf>,
 }
 
 pub fn truncate_output(
@@ -29,7 +26,6 @@ pub fn truncate_output(
     if within_lines && within_bytes && line_ok {
         return Ok(TruncationResult {
             text: output.to_string(),
-            spill_path: None,
         });
     }
 
@@ -54,7 +50,6 @@ pub fn truncate_output(
 
     Ok(TruncationResult {
         text: format!("{preview}{marker}"),
-        spill_path: Some(spill_path),
     })
 }
 

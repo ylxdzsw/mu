@@ -229,9 +229,7 @@ impl Config {
 
     fn validate(&self) -> Result<()> {
         if self.provider.base_url.trim().is_empty() {
-            bail!(
-                "no provider configured in config.jsonc: set `provider.base_url`"
-            );
+            bail!("no provider configured in config.jsonc: set `provider.base_url`");
         }
         if self.default_model.trim().is_empty() {
             bail!("no default model configured in config.jsonc: set `default_model`");

@@ -14,7 +14,6 @@ pub mod truncate;
 #[derive(Debug, Clone)]
 pub struct ToolResult {
     pub output: String,
-    pub spill_path: Option<PathBuf>,
     pub display: ToolDisplay,
 }
 
@@ -106,7 +105,6 @@ pub fn apply_truncation(
     let truncated = truncate::truncate_output(&output, limits, prefix, state_dir, use_tail)?;
     Ok(ToolResult {
         output: truncated.text,
-        spill_path: truncated.spill_path,
         display: ToolDisplay::None,
     })
 }

@@ -84,7 +84,10 @@ impl Provider for OpenAiProvider {
         if let Some(ref key) = self.api_key {
             req = req.bearer_auth(key);
         }
-        let response = req.send().await.map_err(|e| ProviderError::Other(e.to_string()))?;
+        let response = req
+            .send()
+            .await
+            .map_err(|e| ProviderError::Other(e.to_string()))?;
 
         if !response.status().is_success() {
             let status = response.status();

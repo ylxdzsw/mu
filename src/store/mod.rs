@@ -8,7 +8,7 @@ use rusqlite::{params, Connection, OptionalExtension};
 use uuid::Uuid;
 
 use crate::models::EffortLevel;
-use crate::provider::{approx_tokens, Message, ToolCall, UserContent};
+use crate::provider::{approx_tokens, Message, UserContent};
 
 #[derive(Debug, Clone)]
 pub struct Session {
@@ -18,16 +18,12 @@ pub struct Session {
     pub effort: Option<EffortLevel>,
     pub title: Option<String>,
     pub last_total_tokens: u64,
-    pub cost_total: f64,
 }
 
 #[derive(Debug, Clone)]
 pub struct StoredMessage {
-    pub id: i64,
     pub role: String,
     pub content: String,
-    pub tool_call_id: Option<String>,
-    pub tool_calls: Option<Vec<ToolCall>>,
     pub seq: i64,
 }
 
@@ -165,13 +161,12 @@ impl Store {
             effort,
             title: None,
             last_total_tokens: 0,
-            cost_total: 0.0,
         })
     }
 
     pub fn get_session(&self, id: &str) -> Result<Option<Session>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, cwd, model, effort, title, last_total_tokens, cost_total FROM session WHERE id = ?1",
+            "SELECT id, cwd, model, effort, title, last_total_tokens FROM session WHERE id = ?1",
         )?;
         let row = stmt
             .query_row(params![id], |row| {
@@ -183,7 +178,6 @@ impl Store {
                     effort: parse_effort(effort)?,
                     title: row.get(4)?,
                     last_total_tokens: row.get::<_, i64>(5)? as u64,
-                    cost_total: row.get(6)?,
                 })
             })
             .optional()?;
@@ -192,7 +186,7 @@ impl Store {
 
     pub fn list_sessions(&self, limit: usize) -> Result<Vec<(Session, String)>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, cwd, model, effort, title, last_total_tokens, cost_total, updated_at
+            "SELECT id, cwd, model, effort, title, last_total_tokens, updated_at
              FROM session ORDER BY updated_at DESC LIMIT ?1",
         )?;
         let rows = stmt.query_map(params![limit as i64], |row| {
@@ -205,9 +199,8 @@ impl Store {
                     effort: parse_effort(effort)?,
                     title: row.get(4)?,
                     last_total_tokens: row.get::<_, i64>(5)? as u64,
-                    cost_total: row.get(6)?,
                 },
-                row.get::<_, String>(7)?,
+                row.get::<_, String>(6)?,
             ))
         })?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
@@ -216,7 +209,7 @@ impl Store {
 
     pub fn latest_session(&self) -> Result<Option<Session>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, cwd, model, effort, title, last_total_tokens, cost_total
+            "SELECT id, cwd, model, effort, title, last_total_tokens
              FROM session ORDER BY updated_at DESC LIMIT 1",
         )?;
         let row = stmt
@@ -229,7 +222,6 @@ impl Store {
                     effort: parse_effort(effort)?,
                     title: row.get(4)?,
                     last_total_tokens: row.get::<_, i64>(5)? as u64,
-                    cost_total: row.get(6)?,
                 })
             })
             .optional()?;
@@ -369,21 +361,15 @@ impl Store {
 
     fn message_at_seq(&self, session_id: &str, seq: i64) -> Result<Option<StoredMessage>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, role, content, tool_call_id, tool_calls_json, seq FROM message
+            "SELECT role, content, seq FROM message
              WHERE session_id = ?1 AND seq = ?2",
         )?;
         let row = stmt
             .query_row(params![session_id, seq], |row| {
-                let tool_calls_json: Option<String> = row.get(4)?;
                 Ok(StoredMessage {
-                    id: row.get(0)?,
-                    role: row.get(1)?,
-                    content: row.get(2)?,
-                    tool_call_id: row.get(3)?,
-                    tool_calls: tool_calls_json
-                        .as_ref()
-                        .and_then(|j| serde_json::from_str(j).ok()),
-                    seq: row.get(5)?,
+                    role: row.get(0)?,
+                    content: row.get(1)?,
+                    seq: row.get(2)?,
                 })
             })
             .optional()?;
@@ -511,20 +497,14 @@ impl Store {
 
     pub fn all_messages_for_session(&self, session_id: &str) -> Result<Vec<StoredMessage>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, role, content, tool_call_id, tool_calls_json, seq FROM message
+            "SELECT role, content, seq FROM message
              WHERE session_id = ?1 ORDER BY seq ASC",
         )?;
         let rows = stmt.query_map(params![session_id], |row| {
-            let tool_calls_json: Option<String> = row.get(4)?;
             Ok(StoredMessage {
-                id: row.get(0)?,
-                role: row.get(1)?,
-                content: row.get(2)?,
-                tool_call_id: row.get(3)?,
-                tool_calls: tool_calls_json
-                    .as_ref()
-                    .and_then(|j| serde_json::from_str(j).ok()),
-                seq: row.get(5)?,
+                role: row.get(0)?,
+                content: row.get(1)?,
+                seq: row.get(2)?,
             })
         })?;
         rows.collect::<rusqlite::Result<Vec<_>>>()

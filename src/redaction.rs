@@ -94,10 +94,6 @@ impl SecretRedactor {
         self.redact_text(&text)
     }
 
-    pub fn redact_complete(&mut self, text: &str) -> String {
-        self.redact_text(text)
-    }
-
     fn redact_text(&mut self, text: &str) -> String {
         let mut out = text.to_string();
         for secret in &self.secrets {
@@ -179,7 +175,9 @@ mod tests {
             .iter()
             .any(|warning| warning.contains("TOKEN") && warning.contains("short")));
 
-        let out = redactor.redact_complete("empty is  and token is abc");
+        let mut out = String::new();
+        out.push_str(&redactor.redact_chunk("empty is  and token is abc"));
+        out.push_str(&redactor.finish());
         assert_eq!(out, "empty is  and token is [redacted:TOKEN]");
     }
 }
