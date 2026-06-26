@@ -32,6 +32,7 @@ fn main() {
 
 fn run() -> Result<()> {
     let args = Args::parse();
+    preflight_provider(&args)?;
     let mut session_id = args.session;
     let stdin = io::stdin();
     let mut line = String::new();
@@ -53,7 +54,7 @@ fn run() -> Result<()> {
         }
 
         let session_file = std::env::temp_dir().join(format!("mu-cli-{}.session", process::id()));
-        let mut command = process::Command::new("mu");
+        let mut command = mu_command();
         if let Some(id) = &session_id {
             command.arg("-s").arg(id);
         } else {
@@ -84,4 +85,37 @@ fn run() -> Result<()> {
     }
 
     Ok(())
+}
+
+fn preflight_provider(args: &Args) -> Result<()> {
+    let mut command = mu_command();
+    command.arg("--output").arg("plain").arg("status");
+    if let Some(id) = &args.session {
+        command.arg("--session").arg(id);
+    }
+    if let Some(model) = &args.model {
+        command.arg("--model").arg(model);
+    }
+    if let Some(effort) = &args.effort {
+        command.arg("--effort").arg(effort);
+    }
+    command.stdout(process::Stdio::null());
+
+    let status = command
+        .status()
+        .context("checking provider configuration with mu status")?;
+    if !status.success() {
+        process::exit(status.code().unwrap_or(1));
+    }
+    Ok(())
+}
+
+fn mu_command() -> process::Command {
+    if let Ok(mut path) = std::env::current_exe() {
+        path.set_file_name("mu");
+        if path.exists() {
+            return process::Command::new(path);
+        }
+    }
+    process::Command::new("mu")
 }
