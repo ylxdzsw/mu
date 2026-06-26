@@ -17,6 +17,7 @@ typeset -g MU_ZSH_SAVED_BUFFER=${MU_ZSH_SAVED_BUFFER:-}
 typeset -g MU_ZSH_SAVED_CURSOR=${MU_ZSH_SAVED_CURSOR:-0}
 typeset -g MU_ZSH_SAVED_KEYMAP=${MU_ZSH_SAVED_KEYMAP:-main}
 typeset -g MU_ZSH_ORIGINAL_TAB_WIDGET=${MU_ZSH_ORIGINAL_TAB_WIDGET:-}
+typeset -g MU_ZSH_ORIGINAL_STTY=${MU_ZSH_ORIGINAL_STTY:-}
 
 _mu_zsh_widget_for_key() {
   local key=$1
@@ -71,9 +72,27 @@ _mu_zsh_build_command() {
   print -r -- "${(j: :)${(q)command[@]}}"
 }
 
+_mu_zsh_capture_tty_state() {
+  [[ -n "$MU_ZSH_ORIGINAL_STTY" ]] && return 0
+  [[ -t 0 ]] || return 0
+  MU_ZSH_ORIGINAL_STTY=$(stty -g 2>/dev/null || true)
+}
+
+_mu_zsh_restore_tty_state() {
+  [[ -n "$MU_ZSH_ORIGINAL_STTY" ]] || return 0
+  stty "$MU_ZSH_ORIGINAL_STTY" 2>/dev/null || true
+  MU_ZSH_ORIGINAL_STTY=
+}
+
+_mu_zsh_apply_prompt_tty() {
+  [[ -n "$MU_ZSH_ORIGINAL_STTY" ]] || return 0
+  stty eof '^]' 2>/dev/null || true
+}
+
 _mu_zsh_enter_mode() {
   [[ "$MU_ZSH_MODE" == mu ]] && return 0
 
+  _mu_zsh_capture_tty_state
   MU_ZSH_MODE=mu
   MU_ZSH_SAVED_KEYMAP=${KEYMAP:-main}
   MU_ZSH_SAVED_BUFFER=$BUFFER
@@ -130,6 +149,8 @@ _mu_zsh_tab() {
   if [[ -z "$BUFFER" ]]; then
     _mu_zsh_enter_mode
     zle reset-prompt
+    _mu_zsh_apply_prompt_tty
+    zle -K mumode 2>/dev/null || true
     return
   fi
 
@@ -140,6 +161,7 @@ _mu_zsh_backspace() {
   if [[ "$MU_ZSH_MODE" == mu && -z "$BUFFER" && "$CURSOR" -eq 0 ]]; then
     _mu_zsh_exit_mode
     zle reset-prompt
+    zle -K "${MU_ZSH_SAVED_KEYMAP:-main}" 2>/dev/null || zle -K main 2>/dev/null || true
     return
   fi
 
@@ -156,21 +178,34 @@ _mu_zsh_interrupt() {
   zle -I
   print
   zle reset-prompt
+  _mu_zsh_apply_prompt_tty
+  zle -K mumode 2>/dev/null || true
 }
 
 _mu_zsh_eof() {
   if [[ "$MU_ZSH_MODE" != mu ]]; then
-    zle delete-char-or-list
+    if [[ -z "$BUFFER" ]]; then
+      _mu_zsh_restore_tty_state
+      BUFFER=exit
+      zle .accept-line
+      return
+    fi
+
+    if (( CURSOR < ${#BUFFER} )); then
+      zle delete-char
+    fi
     return
   fi
 
   _mu_zsh_exit_mode
   zle reset-prompt
+  zle -K "${MU_ZSH_SAVED_KEYMAP:-main}" 2>/dev/null || zle -K main 2>/dev/null || true
 }
 
 _mu_zsh_accept() {
   if [[ "$MU_ZSH_MODE" != mu ]]; then
-    zle accept-line
+    _mu_zsh_restore_tty_state
+    zle .accept-line
     return
   fi
 
@@ -179,21 +214,36 @@ _mu_zsh_accept() {
     return
   fi
 
-  _mu_zsh_clear_prompt
   zle -I
-  print -r -- "$MU_ZSH_PROMPT$prompt"
+  _mu_zsh_clear_prompt
+  _mu_zsh_restore_tty_state
   _mu_zsh_submit_prompt "$prompt"
-  zle reset-prompt
+  zle .accept-line
+}
+
+_mu_zsh_line_init() {
+  _mu_zsh_capture_tty_state
+  _mu_zsh_apply_prompt_tty
+  if [[ "$MU_ZSH_MODE" == mu ]]; then
+    zle -K mumode 2>/dev/null || true
+  fi
+}
+
+_mu_zsh_cleanup() {
+  _mu_zsh_restore_tty_state
 }
 
 mu-zsh-mode() {
   _mu_zsh_enter_mode
   zle reset-prompt
+  _mu_zsh_apply_prompt_tty
+  zle -K mumode 2>/dev/null || true
 }
 
 mu-zsh-exit-mode() {
   _mu_zsh_exit_mode
   zle reset-prompt
+  zle -K "${MU_ZSH_SAVED_KEYMAP:-main}" 2>/dev/null || zle -K main 2>/dev/null || true
 }
 
 _mu_zsh_configure_keymap() {
@@ -207,6 +257,8 @@ _mu_zsh_configure_keymap() {
 }
 
 if [[ -o zle ]]; then
+  autoload -Uz add-zsh-hook 2>/dev/null || true
+  autoload -Uz add-zle-hook-widget 2>/dev/null || true
   bindkey -N mumode main 2>/dev/null || true
   _mu_zsh_configure_keymap
   _mu_zsh_save_widget_bindings
@@ -215,7 +267,13 @@ if [[ -o zle ]]; then
   zle -N _mu_zsh_backspace
   zle -N _mu_zsh_interrupt
   zle -N _mu_zsh_eof
+  zle -N _mu_zsh_line_init
   zle -N mu-zsh-mode
   zle -N mu-zsh-exit-mode
+  add-zsh-hook zshexit _mu_zsh_cleanup
+  add-zle-hook-widget line-init _mu_zsh_line_init 2>/dev/null || true
+  _mu_zsh_capture_tty_state
+  _mu_zsh_apply_prompt_tty
   bindkey '^I' _mu_zsh_tab
+  bindkey '^D' _mu_zsh_eof
 fi
