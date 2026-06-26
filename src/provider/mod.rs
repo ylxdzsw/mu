@@ -3,6 +3,8 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::models::RequestOptions;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "role", rename_all = "lowercase")]
 pub enum Message {
@@ -118,7 +120,7 @@ pub enum ProviderError {
 pub trait Provider: Send + Sync {
     async fn stream_chat(
         &self,
-        model: &str,
+        request: &RequestOptions,
         messages: &[Message],
         tools: &[Value],
         on_text_delta: &mut dyn FnMut(String) -> Result<(), ProviderError>,

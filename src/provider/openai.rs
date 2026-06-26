@@ -6,6 +6,8 @@ use reqwest::Client;
 use serde::Deserialize;
 use serde_json::Value;
 
+use crate::models::RequestOptions;
+
 use super::{
     FinishReason, FunctionCall, Message, Provider, ProviderError, StreamResult, ToolCall, Usage,
 };
@@ -70,19 +72,13 @@ struct UsageJson {
 impl Provider for OpenAiProvider {
     async fn stream_chat(
         &self,
-        model: &str,
+        request: &RequestOptions,
         messages: &[Message],
         tools: &[Value],
         on_text_delta: &mut dyn FnMut(String) -> Result<(), ProviderError>,
     ) -> Result<StreamResult, ProviderError> {
         let url = format!("{}/chat/completions", self.base_url);
-        let body = serde_json::json!({
-            "model": model,
-            "messages": messages,
-            "tools": tools,
-            "stream": true,
-            "stream_options": { "include_usage": true }
-        });
+        let body = build_chat_request_body(request, messages, tools);
 
         let response = self
             .client
@@ -193,6 +189,24 @@ impl Provider for OpenAiProvider {
     }
 }
 
+fn build_chat_request_body(
+    request: &RequestOptions,
+    messages: &[Message],
+    tools: &[Value],
+) -> Value {
+    let mut body = serde_json::json!({
+        "model": request.model.as_str(),
+        "messages": messages,
+        "tools": tools,
+        "stream": true,
+        "stream_options": { "include_usage": true }
+    });
+    if let Some(effort) = request.effort {
+        body["reasoning"] = serde_json::json!({ "effort": effort });
+    }
+    body
+}
+
 fn consume_sse_buffer(
     buffer: &mut String,
     content: &mut String,
@@ -288,6 +302,7 @@ fn next_event_boundary(buffer: &str) -> Option<(usize, usize)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::models::EffortLevel;
 
     #[test]
     fn streams_deltas_and_accumulates_tool_calls() {
@@ -379,5 +394,34 @@ mod tests {
         assert_eq!(next_event_boundary(&buffer), Some((12, 2)));
         buffer.replace_range(..14, "");
         assert_eq!(next_event_boundary(&buffer), Some((12, 4)));
+    }
+
+    #[test]
+    fn request_omits_reasoning_when_effort_is_unset() {
+        let body = build_chat_request_body(
+            &RequestOptions {
+                model: "gpt-test".into(),
+                effort: None,
+            },
+            &[],
+            &[],
+        );
+
+        assert_eq!(body["model"], "gpt-test");
+        assert!(body.get("reasoning").is_none());
+    }
+
+    #[test]
+    fn request_includes_reasoning_effort_when_set() {
+        let body = build_chat_request_body(
+            &RequestOptions {
+                model: "gpt-test".into(),
+                effort: Some(EffortLevel::High),
+            },
+            &[],
+            &[],
+        );
+
+        assert_eq!(body["reasoning"]["effort"], "high");
     }
 }

@@ -9,6 +9,7 @@ use serde_json::Value;
 use crate::compaction;
 use crate::config::Config;
 use crate::guardrail::{bash_risk, Guardrail, GuardrailOutcome};
+use crate::models::RequestOptions;
 use crate::provider::{FinishReason, Message, Provider, ProviderError, ToolCall, UserContent};
 use crate::renderer::Renderer;
 use crate::store::Store;
@@ -26,7 +27,8 @@ pub struct AgentLoop<'a> {
     pub provider: Arc<dyn Provider>,
     pub store: &'a Store,
     pub session_id: &'a str,
-    pub model: String,
+    pub request: RequestOptions,
+    pub model_context_window: Option<u64>,
     pub renderer: &'a mut Renderer,
     pub state_dir: &'a Path,
     pub system_prompt: String,
@@ -39,7 +41,8 @@ impl<'a> AgentLoop<'a> {
             self.store,
             self.config,
             self.session_id,
-            &self.model,
+            &self.request,
+            self.model_context_window,
             self.provider.as_ref(),
             &self.system_prompt,
         )
@@ -93,7 +96,7 @@ impl<'a> AgentLoop<'a> {
             };
             let result = self
                 .provider
-                .stream_chat(&self.model, &context, &tools, &mut on_text_delta)
+                .stream_chat(&self.request, &context, &tools, &mut on_text_delta)
                 .await;
             self.renderer.assistant_end()?;
 
@@ -105,6 +108,7 @@ impl<'a> AgentLoop<'a> {
                         self.store,
                         self.config,
                         self.session_id,
+                        &self.request,
                         self.provider.as_ref(),
                         &self.system_prompt,
                     )
@@ -341,7 +345,12 @@ impl<'a> AgentLoop<'a> {
             }
         }
 
-        let cost = compute_cost(self.config, &self.model, total_prompt, total_completion);
+        let cost = compute_cost(
+            self.config,
+            &self.request.model,
+            total_prompt,
+            total_completion,
+        );
 
         Ok(TurnResult {
             prompt_tokens: total_prompt,

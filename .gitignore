@@ -1,4 +1,5 @@
 /target/
+/.mu/
 Cargo.lock
 **/*.db
 **/*.db-*

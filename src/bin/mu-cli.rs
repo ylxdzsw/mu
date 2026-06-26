@@ -4,6 +4,9 @@ use std::process;
 use anyhow::{Context, Result};
 use clap::Parser;
 
+#[cfg(not(unix))]
+compile_error!("mu-cli is supported only on Unix-like systems");
+
 #[derive(Parser, Debug)]
 #[command(name = "mu-cli", about = "Interactive REPL wrapper around mu")]
 struct Args {
@@ -12,6 +15,9 @@ struct Args {
 
     #[arg(long)]
     model: Option<String>,
+
+    #[arg(long)]
+    effort: Option<String>,
 
     #[arg(long, default_value = "terminal")]
     output: String,
@@ -55,6 +61,9 @@ fn run() -> Result<()> {
         }
         if let Some(model) = &args.model {
             command.arg("--model").arg(model);
+        }
+        if let Some(effort) = &args.effort {
+            command.arg("--effort").arg(effort);
         }
         command.arg("--output").arg(&args.output);
         command.stdin(process::Stdio::piped());

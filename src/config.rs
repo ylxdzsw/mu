@@ -1,32 +1,37 @@
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 
+use crate::env::EnvMap;
 use crate::paths;
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Config {
+    #[serde(default)]
     pub provider: ProviderConfig,
+    #[serde(default)]
     pub default_model: String,
     #[serde(default)]
     pub models: HashMap<String, ModelConfig>,
-    #[serde(default = "default_agent_mode_key")]
-    pub agent_mode_key: String,
-    #[serde(default)]
-    pub magic_space: bool,
     #[serde(default)]
     pub compaction: CompactionConfig,
     #[serde(default)]
     pub limits: LimitsConfig,
     #[serde(default)]
     pub guardrail: GuardrailConfig,
+    #[serde(default)]
+    pub redaction: RedactionConfig,
+    #[serde(skip)]
+    pub env: EnvMap,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct ProviderConfig {
+    #[serde(default)]
     pub base_url: String,
+    #[serde(default)]
     pub api_key_env: String,
 }
 
@@ -85,9 +90,12 @@ pub struct CircuitBreakerConfig {
     pub window_denials: u32,
 }
 
-fn default_agent_mode_key() -> String {
-    "\\eM".into()
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct RedactionConfig {
+    #[serde(default)]
+    pub env: Vec<String>,
 }
+
 fn default_fraction() -> f64 {
     0.75
 }
@@ -163,9 +171,19 @@ impl Default for CircuitBreakerConfig {
     }
 }
 
+impl Default for ProviderConfig {
+    fn default() -> Self {
+        Self {
+            base_url: String::new(),
+            api_key_env: String::new(),
+        }
+    }
+}
+
 impl Config {
     pub fn load_for_scope(project_config_dir: Option<&Path>) -> Result<Self> {
         let global_path = paths::global_dir().join("config.jsonc");
+        ensure_starter_config(&global_path)?;
         let mut value = read_config_value(&global_path)?;
 
         if let Some(dir) = project_config_dir {
@@ -176,8 +194,8 @@ impl Config {
             }
         }
 
-        let config: Config =
-            serde_json::from_value(value).context("invalid config.jsonc structure")?;
+        let mut config = config_from_value(value)?;
+        config.env = crate::env::load_effective(project_config_dir)?;
         Ok(config)
     }
 
@@ -186,12 +204,16 @@ impl Config {
     }
 
     pub fn api_key(&self) -> Result<String> {
-        let key = std::env::var(&self.provider.api_key_env).with_context(|| {
-            format!(
-                "API key env var `{}` is not set (see config.jsonc)",
-                self.provider.api_key_env
-            )
-        })?;
+        let key = self
+            .env
+            .get(&self.provider.api_key_env)
+            .cloned()
+            .with_context(|| {
+                format!(
+                    "API key env var `{}` is not set (see config.jsonc)",
+                    self.provider.api_key_env
+                )
+            })?;
         if key.is_empty() {
             bail!("API key env var `{}` is empty", self.provider.api_key_env);
         }
@@ -202,28 +224,39 @@ impl Config {
         self.models.get(model).and_then(|m| m.context_window)
     }
 
-    pub fn starter_path() -> PathBuf {
-        paths::global_dir().join("config.jsonc")
-    }
-
-    pub fn write_starter(path: &Path) -> Result<()> {
-        if !path.exists() {
-            if let Some(parent) = path.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-            std::fs::write(path, STARTER_CONFIG)?;
-            return Ok(());
+    fn validate(&self) -> Result<()> {
+        if self.provider.base_url.trim().is_empty() || self.provider.api_key_env.trim().is_empty() {
+            bail!(
+                "no provider configured in config.jsonc: set `provider.base_url` and `provider.api_key_env`"
+            );
         }
-        bail!("config already exists at {}", path.display());
+        if self.default_model.trim().is_empty() {
+            bail!("no default model configured in config.jsonc: set `default_model`");
+        }
+        Ok(())
     }
+}
+
+fn ensure_starter_config(path: &Path) -> Result<()> {
+    if path.exists() {
+        return Ok(());
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(path, STARTER_CONFIG)?;
+    Ok(())
+}
+
+fn config_from_value(value: serde_json::Value) -> Result<Config> {
+    let config: Config = serde_json::from_value(value).context("invalid config.jsonc structure")?;
+    config.validate()?;
+    Ok(config)
 }
 
 fn read_config_value(path: &Path) -> Result<serde_json::Value> {
     if !path.exists() {
-        bail!(
-            "config not found at {} — run `mu init` to create a starter config",
-            path.display()
-        );
+        bail!("config not found at {}", path.display());
     }
     let raw =
         std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
@@ -261,14 +294,16 @@ const STARTER_CONFIG: &str = r#"{
       "price_per_mtok": { "input": 2.5, "output": 10.0 }
     }
   },
-  "agent_mode_key": "\\eM",
-  "magic_space": false,
   "compaction": { "fraction": 0.75, "keep_recent_turns": 2 },
   "limits": {
     "max_iterations": 50,
     "max_lines": 2000,
     "max_bytes": 51200,
     "max_line_bytes": 10240
+  },
+  "redaction": {
+    // Provider api_key_env is always included automatically.
+    "env": []
   },
   "guardrail": {
     "enabled": false,
@@ -303,5 +338,48 @@ mod tests {
         assert_eq!(base["models"]["two"]["context_window"], 2);
         assert_eq!(base["limits"]["max_iterations"], 5);
         assert_eq!(base["limits"]["max_lines"], 20);
+    }
+
+    #[test]
+    fn api_key_reads_effective_env() {
+        let config = Config {
+            provider: ProviderConfig {
+                base_url: "http://localhost".into(),
+                api_key_env: "TEST_KEY".into(),
+            },
+            default_model: "test-model".into(),
+            models: HashMap::new(),
+            compaction: CompactionConfig::default(),
+            limits: LimitsConfig::default(),
+            guardrail: GuardrailConfig::default(),
+            redaction: RedactionConfig::default(),
+            env: HashMap::from([("TEST_KEY".into(), "secret".into())]),
+        };
+
+        assert_eq!(config.api_key().unwrap(), "secret");
+    }
+
+    #[test]
+    fn creates_starter_config_when_global_config_is_missing() {
+        let tmp = std::env::temp_dir().join(format!("mu-config-{}", uuid::Uuid::new_v4()));
+        let path = tmp.join("config.jsonc");
+
+        ensure_starter_config(&path).unwrap();
+
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(raw.contains("\"provider\""));
+        assert!(raw.contains("\"default_model\""));
+    }
+
+    #[test]
+    fn missing_provider_fails_with_clear_message() {
+        let err = config_from_value(serde_json::json!({
+            "default_model": "gpt-4o"
+        }))
+        .unwrap_err();
+
+        assert!(err
+            .to_string()
+            .contains("no provider configured in config.jsonc"));
     }
 }

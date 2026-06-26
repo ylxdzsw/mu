@@ -3,6 +3,7 @@ use std::path::Path;
 use anyhow::Result;
 
 use crate::config::Config;
+use crate::models::RequestOptions;
 use crate::provider::{Message, Provider, ProviderError};
 use crate::store::Store;
 
@@ -10,7 +11,8 @@ pub async fn maybe_compact(
     store: &Store,
     config: &Config,
     session_id: &str,
-    model: &str,
+    request: &RequestOptions,
+    context_window: Option<u64>,
     provider: &dyn Provider,
     system_prompt: &str,
 ) -> Result<()> {
@@ -18,7 +20,6 @@ pub async fn maybe_compact(
         .get_session(session_id)?
         .ok_or_else(|| anyhow::anyhow!("session not found"))?;
 
-    let context_window = config.context_window(model);
     let threshold = config.compaction.fraction;
 
     let tokens = if session.last_total_tokens > 0 {
@@ -33,7 +34,7 @@ pub async fn maybe_compact(
     };
 
     if should_compact {
-        run_compaction(store, config, session_id, provider, system_prompt).await?;
+        run_compaction(store, config, session_id, request, provider, system_prompt).await?;
     }
     Ok(())
 }
@@ -42,6 +43,7 @@ pub async fn run_compaction(
     store: &Store,
     config: &Config,
     session_id: &str,
+    request: &RequestOptions,
     provider: &dyn Provider,
     system_prompt: &str,
 ) -> Result<()> {
@@ -116,14 +118,9 @@ pub async fn run_compaction(
     ];
 
     let tools: Vec<serde_json::Value> = vec![];
-    let model = store
-        .get_session(session_id)?
-        .map(|s| s.model)
-        .unwrap_or_else(|| config.default_model.clone());
-
     let mut ignore_text = |_delta: String| Ok(());
     let result = provider
-        .stream_chat(&model, &msgs, &tools, &mut ignore_text)
+        .stream_chat(request, &msgs, &tools, &mut ignore_text)
         .await;
     match result {
         Ok(r) => {
@@ -173,6 +170,7 @@ mod tests {
     use serde_json::Value;
 
     use super::*;
+    use crate::models::RequestOptions;
     use crate::provider::{FinishReason, StreamResult, Usage};
 
     struct FakeProvider;
@@ -181,7 +179,7 @@ mod tests {
     impl Provider for FakeProvider {
         async fn stream_chat(
             &self,
-            _model: &str,
+            _request: &RequestOptions,
             _messages: &[Message],
             _tools: &[Value],
             _on_text_delta: &mut dyn FnMut(String) -> Result<(), ProviderError>,
@@ -209,14 +207,14 @@ mod tests {
             },
             default_model: "fake-model".into(),
             models: Default::default(),
-            agent_mode_key: "\\eM".into(),
-            magic_space: false,
             compaction: crate::config::CompactionConfig {
                 fraction: 0.75,
                 keep_recent_turns: 2,
             },
             limits: crate::config::LimitsConfig::default(),
             guardrail: crate::config::GuardrailConfig::default(),
+            redaction: crate::config::RedactionConfig::default(),
+            env: Default::default(),
         }
     }
 
@@ -225,7 +223,7 @@ mod tests {
         let tmp = std::env::temp_dir().join(format!("mu-compaction-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&tmp).unwrap();
         let store = Store::open(&tmp.join("mu.db")).unwrap();
-        let session = store.create_session("/tmp", "fake-model").unwrap();
+        let session = store.create_session("/tmp", "fake-model", None).unwrap();
 
         for n in 1..=4 {
             store
@@ -251,6 +249,10 @@ mod tests {
             &store,
             &test_config(),
             &session.id,
+            &RequestOptions {
+                model: "fake-model".into(),
+                effort: None,
+            },
             &FakeProvider,
             "system prompt",
         )
