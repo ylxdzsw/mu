@@ -22,8 +22,28 @@ export OPENAI_API_KEY=...  # or your provider key
 starter provider if the file does not exist. Edit that file to use another
 OpenAI-compatible endpoint, API-key env var, or default model.
 
-Run a single turn by piping a prompt to `mu`, or start `mu-cli` for an
-interactive prompt that keeps using the same session.
+Run a single turn by piping a prompt to `mu`, or source the zsh plugin for an
+integrated shell prompt mode that keeps using the same session. `mu-cli` remains
+available as a temporary standalone REPL wrapper, but the shell plugin is the
+preferred interactive surface.
+
+## zsh plugin
+
+```zsh
+source /path/to/mu/shell-plugins/mu.zsh
+```
+
+Press Tab on an empty prompt to switch into `mu>` mode. Press Enter to submit
+the current buffer as one `mu` turn. Ctrl-C clears the current `mu>` prompt and
+draws a fresh one. Press Ctrl-D, or Backspace on an empty `mu>` prompt, to return
+to the normal shell prompt without adding a new line.
+
+The plugin owns only zsh line editing and prompt mode. Each submission still
+spawns the `mu` binary for one foreground turn, so streaming output, Ctrl-C, and
+session persistence follow the same command-line path as scripted use.
+Ctrl-D is handled as the normal terminal EOT key (`^D`); browser terminals such
+as xterm.js/WebTerm forward it as input when the browser has not intercepted the
+key first.
 
 ## CLI
 
@@ -41,7 +61,7 @@ interactive prompt that keeps using the same session.
 | `mu status --json` | Report the resolved model, effort, session, and context state |
 | `mu models refresh` | Refresh `~/.mu/models.json` from the active provider |
 | `mu models list [--json]` | Inspect the cached provider model catalog |
-| `mu-cli [--model <id>] [--effort <level>]` | Run the thin interactive REPL wrapper |
+| `mu-cli [--model <id>] [--effort <level>]` | Run the temporary standalone REPL wrapper |
 | `mu session new` | Create session, print id |
 | `mu session list` | List recent sessions |
 | `mu compact --session <id>` | Force compaction |
