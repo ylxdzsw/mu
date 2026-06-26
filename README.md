@@ -33,11 +33,15 @@ interactive prompt that keeps using the same session.
 | `mu -s <id>` | Attach to an existing session in the active scope |
 | `mu -c` | Continue the latest session in the active scope, or create one |
 | `mu --model <id>` | Override model for this turn |
+| `mu --effort <low|medium|high|xhigh|max>` | Override reasoning effort for this turn |
 | `mu -i image.png` | Attach an image to the turn |
 | `mu --output plain` | Render plain assistant/tool text |
 | `mu --output terminal` | Render interactive terminal output |
 | `mu --output json` | Render newline-delimited JSON events |
-| `mu-cli` | Run the thin interactive REPL wrapper |
+| `mu status --json` | Report the resolved model, effort, session, and context state |
+| `mu models refresh` | Refresh `~/.mu/models.json` from the active provider |
+| `mu models list [--json]` | Inspect the cached provider model catalog |
+| `mu-cli [--model <id>] [--effort <level>]` | Run the thin interactive REPL wrapper |
 | `mu session new` | Create session, print id |
 | `mu session list` | List recent sessions |
 | `mu compact --session <id>` | Force compaction |
@@ -50,6 +54,10 @@ is loaded first; project `config.jsonc` overrides it when a project is active.
 Optional `.env` files in those same directories are also loaded with project
 values overriding global values; the resulting environment is used for provider
 API key lookup and `bash` tool processes.
+
+User intent stays in `config.jsonc`. Generated model discovery is cached in
+`~/.mu/models.json` and can be refreshed with `mu models refresh`; it never
+rewrites the hand-authored config file.
 
 Optional: `.env`, `AGENTS.md` (global and project-local), `skills/*/SKILL.md`.
 Provider API key values and names listed in `redaction.env` are exact-value

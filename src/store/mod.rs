@@ -1,4 +1,5 @@
 use std::path::Path;
+use std::str::FromStr;
 
 use fs2::FileExt;
 
@@ -6,6 +7,7 @@ use anyhow::{bail, Context, Result};
 use rusqlite::{params, Connection, OptionalExtension};
 use uuid::Uuid;
 
+use crate::models::EffortLevel;
 use crate::provider::{approx_tokens, Message, ToolCall, UserContent};
 
 #[derive(Debug, Clone)]
@@ -13,6 +15,7 @@ pub struct Session {
     pub id: String,
     pub cwd: String,
     pub model: String,
+    pub effort: Option<EffortLevel>,
     pub title: Option<String>,
     pub last_total_tokens: u64,
     pub cost_total: f64,
@@ -47,6 +50,17 @@ impl Store {
         Ok(store)
     }
 
+    pub fn open_memory() -> Result<Self> {
+        let conn = Connection::open_in_memory().context("opening in-memory SQLite database")?;
+        conn.execute_batch(
+            "PRAGMA journal_mode=WAL;
+             PRAGMA busy_timeout=5000;",
+        )?;
+        let store = Self { conn };
+        store.migrate()?;
+        Ok(store)
+    }
+
     fn migrate(&self) -> Result<()> {
         self.conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS session (
@@ -55,6 +69,7 @@ impl Store {
                 updated_at TEXT NOT NULL,
                 cwd TEXT NOT NULL,
                 model TEXT NOT NULL,
+                effort TEXT,
                 title TEXT,
                 last_total_tokens INTEGER NOT NULL DEFAULT 0,
                 cost_total REAL NOT NULL DEFAULT 0
@@ -97,9 +112,14 @@ impl Store {
                 created_at TEXT NOT NULL
             );",
         )?;
+        self.ensure_session_column("effort", "TEXT")?;
         self.ensure_message_column("user_content_json", "TEXT")?;
         self.ensure_tool_call_column("risk", "TEXT")?;
         Ok(())
+    }
+
+    fn ensure_session_column(&self, name: &str, sql_type: &str) -> Result<()> {
+        self.ensure_column("session", name, sql_type)
     }
 
     fn ensure_message_column(&self, name: &str, sql_type: &str) -> Result<()> {
@@ -125,18 +145,24 @@ impl Store {
         Ok(())
     }
 
-    pub fn create_session(&self, cwd: &str, model: &str) -> Result<Session> {
+    pub fn create_session(
+        &self,
+        cwd: &str,
+        model: &str,
+        effort: Option<EffortLevel>,
+    ) -> Result<Session> {
         let id = Uuid::new_v4().to_string();
         let now = chrono::Utc::now().to_rfc3339();
         self.conn.execute(
-            "INSERT INTO session (id, created_at, updated_at, cwd, model, title, last_total_tokens, cost_total)
-             VALUES (?1, ?2, ?2, ?3, ?4, NULL, 0, 0)",
-            params![id, now, cwd, model],
+            "INSERT INTO session (id, created_at, updated_at, cwd, model, effort, title, last_total_tokens, cost_total)
+             VALUES (?1, ?2, ?2, ?3, ?4, ?5, NULL, 0, 0)",
+            params![id, now, cwd, model, effort.map(|level| level.to_string())],
         )?;
         Ok(Session {
             id,
             cwd: cwd.into(),
             model: model.into(),
+            effort,
             title: None,
             last_total_tokens: 0,
             cost_total: 0.0,
@@ -145,17 +171,19 @@ impl Store {
 
     pub fn get_session(&self, id: &str) -> Result<Option<Session>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, cwd, model, title, last_total_tokens, cost_total FROM session WHERE id = ?1",
+            "SELECT id, cwd, model, effort, title, last_total_tokens, cost_total FROM session WHERE id = ?1",
         )?;
         let row = stmt
             .query_row(params![id], |row| {
+                let effort: Option<String> = row.get(3)?;
                 Ok(Session {
                     id: row.get(0)?,
                     cwd: row.get(1)?,
                     model: row.get(2)?,
-                    title: row.get(3)?,
-                    last_total_tokens: row.get::<_, i64>(4)? as u64,
-                    cost_total: row.get(5)?,
+                    effort: parse_effort(effort)?,
+                    title: row.get(4)?,
+                    last_total_tokens: row.get::<_, i64>(5)? as u64,
+                    cost_total: row.get(6)?,
                 })
             })
             .optional()?;
@@ -164,20 +192,22 @@ impl Store {
 
     pub fn list_sessions(&self, limit: usize) -> Result<Vec<(Session, String)>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, cwd, model, title, last_total_tokens, cost_total, updated_at
+            "SELECT id, cwd, model, effort, title, last_total_tokens, cost_total, updated_at
              FROM session ORDER BY updated_at DESC LIMIT ?1",
         )?;
         let rows = stmt.query_map(params![limit as i64], |row| {
+            let effort: Option<String> = row.get(3)?;
             Ok((
                 Session {
                     id: row.get(0)?,
                     cwd: row.get(1)?,
                     model: row.get(2)?,
-                    title: row.get(3)?,
-                    last_total_tokens: row.get::<_, i64>(4)? as u64,
-                    cost_total: row.get(5)?,
+                    effort: parse_effort(effort)?,
+                    title: row.get(4)?,
+                    last_total_tokens: row.get::<_, i64>(5)? as u64,
+                    cost_total: row.get(6)?,
                 },
-                row.get::<_, String>(6)?,
+                row.get::<_, String>(7)?,
             ))
         })?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
@@ -186,18 +216,20 @@ impl Store {
 
     pub fn latest_session(&self) -> Result<Option<Session>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, cwd, model, title, last_total_tokens, cost_total
+            "SELECT id, cwd, model, effort, title, last_total_tokens, cost_total
              FROM session ORDER BY updated_at DESC LIMIT 1",
         )?;
         let row = stmt
             .query_row([], |row| {
+                let effort: Option<String> = row.get(3)?;
                 Ok(Session {
                     id: row.get(0)?,
                     cwd: row.get(1)?,
                     model: row.get(2)?,
-                    title: row.get(3)?,
-                    last_total_tokens: row.get::<_, i64>(4)? as u64,
-                    cost_total: row.get(5)?,
+                    effort: parse_effort(effort)?,
+                    title: row.get(4)?,
+                    last_total_tokens: row.get::<_, i64>(5)? as u64,
+                    cost_total: row.get(6)?,
                 })
             })
             .optional()?;
@@ -210,19 +242,37 @@ impl Store {
         last_total_tokens: u64,
         cost_delta: f64,
         title: Option<&str>,
+        model: &str,
+        effort: Option<EffortLevel>,
     ) -> Result<()> {
         let now = chrono::Utc::now().to_rfc3339();
         if let Some(t) = title {
             self.conn.execute(
                 "UPDATE session SET updated_at = ?1, last_total_tokens = ?2,
-                 cost_total = cost_total + ?3, title = COALESCE(title, ?4) WHERE id = ?5",
-                params![now, last_total_tokens as i64, cost_delta, t, id],
+                 cost_total = cost_total + ?3, title = COALESCE(title, ?4),
+                 model = ?5, effort = ?6 WHERE id = ?7",
+                params![
+                    now,
+                    last_total_tokens as i64,
+                    cost_delta,
+                    t,
+                    model,
+                    effort.map(|level| level.to_string()),
+                    id
+                ],
             )?;
         } else {
             self.conn.execute(
                 "UPDATE session SET updated_at = ?1, last_total_tokens = ?2,
-                 cost_total = cost_total + ?3 WHERE id = ?4",
-                params![now, last_total_tokens as i64, cost_delta, id],
+                 cost_total = cost_total + ?3, model = ?4, effort = ?5 WHERE id = ?6",
+                params![
+                    now,
+                    last_total_tokens as i64,
+                    cost_delta,
+                    model,
+                    effort.map(|level| level.to_string()),
+                    id
+                ],
             )?;
         }
         Ok(())
@@ -559,6 +609,22 @@ fn load_user_content(content: String, user_content_json: Option<String>) -> User
         .unwrap_or(UserContent::Text(content))
 }
 
+fn parse_effort(value: Option<String>) -> rusqlite::Result<Option<EffortLevel>> {
+    match value {
+        None => Ok(None),
+        Some(level) => EffortLevel::from_str(&level).map(Some).map_err(|e| {
+            rusqlite::Error::FromSqlConversionFailure(
+                0,
+                rusqlite::types::Type::Text,
+                Box::new(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    e.to_string(),
+                )),
+            )
+        }),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -573,7 +639,7 @@ mod tests {
     #[test]
     fn reloads_full_user_content_with_images() {
         let (store, tmp) = temp_store();
-        let session = store.create_session("/tmp", "fake-model").unwrap();
+        let session = store.create_session("/tmp", "fake-model", None).unwrap();
         let expected_image_url = "data:image/png;base64,abcd".to_string();
 
         store
@@ -617,7 +683,7 @@ mod tests {
     #[test]
     fn reloads_legacy_text_user_content() {
         let (store, tmp) = temp_store();
-        let session = store.create_session("/tmp", "fake-model").unwrap();
+        let session = store.create_session("/tmp", "fake-model", None).unwrap();
         let now = chrono::Utc::now().to_rfc3339();
         store
             .conn

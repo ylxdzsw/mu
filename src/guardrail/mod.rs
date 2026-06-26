@@ -9,6 +9,7 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use crate::config::{Config, GuardrailConfig};
+use crate::models::RequestOptions;
 use crate::provider::{Message, Provider, ProviderError};
 
 const MAX_ATTEMPTS: u32 = 3;
@@ -175,7 +176,15 @@ impl Guardrail {
             let mut ignore_text = |_delta: String| Ok(());
             let result = tokio::time::timeout(timeout, async {
                 self.provider
-                    .stream_chat(model, &msgs, &[], &mut ignore_text)
+                    .stream_chat(
+                        &RequestOptions {
+                            model: model.to_string(),
+                            effort: None,
+                        },
+                        &msgs,
+                        &[],
+                        &mut ignore_text,
+                    )
                     .await
             })
             .await;

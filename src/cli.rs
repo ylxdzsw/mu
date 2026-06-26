@@ -1,8 +1,21 @@
-use clap::{Parser, Subcommand, ValueEnum};
+use std::path::PathBuf;
+
+use clap::{Args as ClapArgs, Parser, Subcommand, ValueEnum};
+
+use crate::models::EffortLevel;
 
 #[derive(Parser, Debug)]
 #[command(name = "mu", about = "Fast terminal agent harness")]
 pub struct Args {
+    #[command(flatten)]
+    pub turn: TurnArgs,
+
+    #[command(subcommand)]
+    pub command: Option<Command>,
+}
+
+#[derive(ClapArgs, Debug, Clone, Default)]
+pub struct SelectionArgs {
     #[arg(short = 's', long)]
     pub session: Option<String>,
 
@@ -12,14 +25,20 @@ pub struct Args {
     #[arg(long)]
     pub model: Option<String>,
 
+    #[arg(long, value_enum)]
+    pub effort: Option<EffortLevel>,
+}
+
+#[derive(ClapArgs, Debug, Clone)]
+pub struct TurnArgs {
+    #[command(flatten)]
+    pub selection: SelectionArgs,
+
     #[arg(short = 'i', long = "image")]
-    pub images: Vec<std::path::PathBuf>,
+    pub images: Vec<PathBuf>,
 
     #[arg(long, value_enum, default_value_t = OutputFormat::Terminal)]
     pub output: OutputFormat,
-
-    #[command(subcommand)]
-    pub command: Option<Command>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -36,11 +55,27 @@ pub enum Command {
         #[command(subcommand)]
         sub: SessionSub,
     },
+    /// Inspect the resolved model, effort, and context state
+    Status(StatusArgs),
+    /// Refresh or inspect the generated provider model catalog
+    Models {
+        #[command(subcommand)]
+        sub: ModelsSub,
+    },
     /// Force compaction for a session
     Compact {
         #[arg(long)]
         session: String,
     },
+}
+
+#[derive(ClapArgs, Debug, Clone)]
+pub struct StatusArgs {
+    #[command(flatten)]
+    pub selection: SelectionArgs,
+
+    #[arg(long)]
+    pub json: bool,
 }
 
 #[derive(Subcommand, Debug)]
@@ -49,4 +84,15 @@ pub enum SessionSub {
     New,
     /// List recent sessions
     List,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum ModelsSub {
+    /// Refresh the generated provider model catalog
+    Refresh,
+    /// List the cached provider model catalog
+    List {
+        #[arg(long)]
+        json: bool,
+    },
 }

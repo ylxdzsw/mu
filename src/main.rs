@@ -15,21 +15,25 @@ mod compaction;
 mod config;
 mod env;
 mod guardrail;
+mod models;
 mod paths;
 mod provider;
 mod redaction;
 mod renderer;
+mod runtime;
 mod skills;
 mod store;
 mod system_prompt;
 mod tools;
 
-use cli::{Args, Command, SessionSub};
+use cli::{Args, Command, ModelsSub, SessionSub};
 use config::Config;
+use models::{ModelCatalog, RequestOptions};
 use provider::openai::OpenAiProvider;
 use provider::Provider;
 use provider::{ContentPart, ImageUrl};
 use renderer::Renderer;
+use runtime::{build_status_report, resolve_invocation, InvocationOverrides, StatusReport};
 
 #[tokio::main]
 async fn main() {
@@ -43,6 +47,9 @@ async fn main() {
 fn error_output_format() -> cli::OutputFormat {
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
+        if arg == "--json" {
+            return cli::OutputFormat::Json;
+        }
         if arg == "--output" {
             return match args.next().as_deref() {
                 Some("json") => cli::OutputFormat::Json,
@@ -65,6 +72,7 @@ async fn run() -> Result<()> {
     let args = Args::parse();
     let cwd = std::env::current_dir()?;
     let scope = paths::discover_scope(&cwd);
+    let project_config_dir = scope.project().map(|p| p.root.join(".mu"));
 
     match args.command {
         Some(Command::Session { sub }) => {
@@ -73,12 +81,17 @@ async fn run() -> Result<()> {
                 SessionSub::New => {
                     paths::ensure_project_layout(&scope)?;
                     let store = store::Store::open(&db_path)?;
-                    let model = Config::try_load_for_scope(
-                        scope.project().map(|p| p.root.join(".mu")).as_deref(),
-                    )
-                    .map(|c| c.default_model)
-                    .unwrap_or_else(|| "gpt-4o".into());
-                    let session = store.create_session(&cwd.display().to_string(), &model)?;
+                    let latest = store.latest_session()?;
+                    let inherited_model = latest.as_ref().map(|session| session.model.clone());
+                    let inherited_effort = latest.as_ref().and_then(|session| session.effort);
+                    let default_model = Config::try_load_for_scope(project_config_dir.as_deref())
+                        .map(|c| c.default_model)
+                        .unwrap_or_else(|| "gpt-4o".into());
+                    let session = store.create_session(
+                        &cwd.display().to_string(),
+                        inherited_model.as_deref().unwrap_or(default_model.as_str()),
+                        inherited_effort,
+                    )?;
                     store.append_message(
                         &session.id,
                         &provider::Message::User {
@@ -100,14 +113,68 @@ async fn run() -> Result<()> {
                     let sessions = store.list_sessions(20)?;
                     for (s, updated) in sessions {
                         let title = s.title.unwrap_or_else(|| "(untitled)".into());
-                        println!("{}  {}  {}  {}", s.id, title, s.model, updated);
+                        let effort = s
+                            .effort
+                            .map(|level| format!(" [{}]", level))
+                            .unwrap_or_default();
+                        println!("{}  {}  {}{}  {}", s.id, title, s.model, effort, updated);
+                    }
+                }
+            }
+            return Ok(());
+        }
+        Some(Command::Status(status_args)) => {
+            let config = Config::load_for_scope(project_config_dir.as_deref())?;
+            let _api_key = config.api_key()?;
+            let catalog = ModelCatalog::load_matching(&config.provider.base_url)?;
+            let store = open_status_store(scope.session_db_path().as_path())?;
+            let report = build_status_report(
+                &store,
+                &config,
+                &InvocationOverrides {
+                    session: status_args.selection.session,
+                    continue_latest: status_args.selection.continue_latest,
+                    model: status_args.selection.model,
+                    effort: status_args.selection.effort,
+                },
+                catalog.as_ref(),
+            )?;
+            if status_args.json {
+                println!("{}", serde_json::to_string(&report)?);
+            } else {
+                print_status_report(&report);
+            }
+            return Ok(());
+        }
+        Some(Command::Models { sub }) => {
+            match sub {
+                ModelsSub::Refresh => {
+                    let config = Config::load_for_scope(project_config_dir.as_deref())?;
+                    let api_key = config.api_key()?;
+                    let catalog =
+                        models::refresh_model_catalog(&config.provider.base_url, &api_key).await?;
+                    let path = ModelCatalog::cache_path();
+                    catalog.save(&path)?;
+                    println!(
+                        "refreshed {} models into {}",
+                        catalog.models.len(),
+                        path.display()
+                    );
+                }
+                ModelsSub::List { json } => {
+                    let Some(catalog) = ModelCatalog::load(&ModelCatalog::cache_path())? else {
+                        return Ok(());
+                    };
+                    if json {
+                        println!("{}", serde_json::to_string(&catalog)?);
+                    } else {
+                        print_model_catalog(&catalog);
                     }
                 }
             }
             return Ok(());
         }
         Some(Command::Compact { session }) => {
-            let project_config_dir = scope.project().map(|p| p.root.join(".mu"));
             let config = Config::load_for_scope(project_config_dir.as_deref())?;
             let api_key = config.api_key()?;
             let provider = Arc::new(OpenAiProvider::new(
@@ -119,9 +186,9 @@ async fn run() -> Result<()> {
                 bail!("session not found in active scope: {session}");
             }
             let store = store::Store::open(&db_path)?;
-            if store.get_session(&session)?.is_none() {
-                bail!("session not found in active scope: {session}");
-            }
+            let session_state = store
+                .get_session(&session)?
+                .ok_or_else(|| anyhow::anyhow!("session not found in active scope: {session}"))?;
             let _lock = match store::acquire_session_lock(&session) {
                 Ok(lock) => lock,
                 Err(_) => {
@@ -138,6 +205,10 @@ async fn run() -> Result<()> {
                 &store,
                 &config,
                 &session,
+                &RequestOptions {
+                    model: session_state.model,
+                    effort: session_state.effort,
+                },
                 provider.as_ref(),
                 &system_prompt,
             )
@@ -155,11 +226,11 @@ async fn run() -> Result<()> {
     if prompt.is_empty() {
         bail!("empty prompt");
     }
-    let attachments = load_image_attachments(&args.images)?;
+    let attachments = load_image_attachments(&args.turn.images)?;
 
-    let project_config_dir = scope.project().map(|p| p.root.join(".mu"));
     let config = Config::load_for_scope(project_config_dir.as_deref())?;
     let api_key = config.api_key()?;
+    let catalog = ModelCatalog::load_matching(&config.provider.base_url)?;
     let provider = Arc::new(OpenAiProvider::new(
         config.provider.base_url.clone(),
         api_key,
@@ -172,23 +243,29 @@ async fn run() -> Result<()> {
 
     let db_path = scope.session_db_path();
     let store = store::Store::open(&db_path)?;
-
-    let effective_model = args
-        .model
-        .clone()
-        .unwrap_or_else(|| config.default_model.clone());
-
-    let explicit_session = args.session.as_ref();
-    let (session, created) = resolve_session(
+    let resolved = resolve_invocation(
         &store,
-        explicit_session.map(String::as_str),
-        args.continue_latest,
-        &cwd,
-        &effective_model,
-        scope.project(),
+        &config,
+        &InvocationOverrides {
+            session: args.turn.selection.session.clone(),
+            continue_latest: args.turn.selection.continue_latest,
+            model: args.turn.selection.model.clone(),
+            effort: args.turn.selection.effort,
+        },
     )?;
+    let model_info = models::resolve_model_info(&config, catalog.as_ref(), &resolved.request.model);
+    models::validate_effort_support(
+        &resolved.request.model,
+        resolved.request.effort.as_ref(),
+        &model_info,
+    )?;
+
+    let (session, created) = if let Some(session) = resolved.attached_session.clone() {
+        (session, false)
+    } else {
+        create_seeded_session(&store, &cwd, scope.project(), &resolved.session_seed)?
+    };
     let session_id = session.id.clone();
-    let session_model = args.model.clone().unwrap_or(session.model);
 
     let _lock = match store::acquire_session_lock(&session_id) {
         Ok(lock) => lock,
@@ -217,10 +294,11 @@ async fn run() -> Result<()> {
         provider,
         &store,
         &session_id,
-        &session_model,
+        &resolved.request,
+        model_info.context_window,
         &prompt,
         attachments,
-        args.output,
+        args.turn.output,
         &state_dir,
         project_config_dir.as_deref(),
     )
@@ -229,47 +307,13 @@ async fn run() -> Result<()> {
     Ok(())
 }
 
-fn resolve_session(
-    store: &store::Store,
-    explicit: Option<&str>,
-    continue_latest: bool,
-    cwd: &std::path::Path,
-    model: &str,
-    project: Option<&paths::Project>,
-) -> Result<(store::Session, bool)> {
-    if explicit.is_some() && continue_latest {
-        bail!("use either -s/--session or -c/--continue-latest, not both");
-    }
-
-    if let Some(id) = explicit {
-        let session = store
-            .get_session(id)?
-            .ok_or_else(|| anyhow::anyhow!("session not found in active scope: {id}"))?;
-        return Ok((session, false));
-    }
-
-    if continue_latest {
-        if let Some(session) = store.latest_session()? {
-            return Ok((session, false));
-        }
-    }
-
-    let session = store.create_session(&cwd.display().to_string(), model)?;
-    store.append_message(
-        &session.id,
-        &provider::Message::User {
-            content: system_prompt::initial_environment_context(cwd, project, &session.id).into(),
-        },
-    )?;
-    Ok((session, true))
-}
-
 async fn run_turn(
     config: &Config,
     provider: Arc<dyn Provider>,
     store: &store::Store,
     session_id: &str,
-    model: &str,
+    request: &RequestOptions,
+    model_context_window: Option<u64>,
     prompt: &str,
     attachments: Vec<ContentPart>,
     output: cli::OutputFormat,
@@ -286,7 +330,8 @@ async fn run_turn(
         provider,
         store,
         session_id,
-        model: model.to_string(),
+        request: request.clone(),
+        model_context_window,
         renderer: &mut renderer,
         state_dir,
         system_prompt,
@@ -297,10 +342,16 @@ async fn run_turn(
 
     match &result {
         Ok(r) => {
-            let ctx_pct = config
-                .context_window(model)
-                .map(|cw| (r.final_total_tokens as f64 / cw as f64) * 100.0);
-            store.update_session(session_id, r.final_total_tokens, r.cost, Some(&title))?;
+            let ctx_pct =
+                model_context_window.map(|cw| (r.final_total_tokens as f64 / cw as f64) * 100.0);
+            store.update_session(
+                session_id,
+                r.final_total_tokens,
+                r.cost,
+                Some(&title),
+                &request.model,
+                request.effort,
+            )?;
             renderer.finish_turn()?;
             renderer.turn_summary(
                 r.prompt_tokens,
@@ -315,6 +366,99 @@ async fn run_turn(
     }
 
     result.map(|_| ())
+}
+
+fn create_seeded_session(
+    store: &store::Store,
+    cwd: &std::path::Path,
+    project: Option<&paths::Project>,
+    seed: &RequestOptions,
+) -> Result<(store::Session, bool)> {
+    let session = store.create_session(&cwd.display().to_string(), &seed.model, seed.effort)?;
+    store.append_message(
+        &session.id,
+        &provider::Message::User {
+            content: system_prompt::initial_environment_context(cwd, project, &session.id).into(),
+        },
+    )?;
+    Ok((session, true))
+}
+
+fn open_status_store(path: &std::path::Path) -> Result<store::Store> {
+    if path.exists() {
+        store::Store::open(path)
+    } else {
+        store::Store::open_memory()
+    }
+}
+
+fn print_status_report(report: &StatusReport) {
+    let effort = report
+        .effort
+        .map(|level| level.to_string())
+        .unwrap_or_else(|| "unset".into());
+    let session = report
+        .session_id
+        .clone()
+        .unwrap_or_else(|| "(new session)".into());
+    let context = match (report.context_percent, report.context_window) {
+        (Some(percent), Some(window)) => format!("{percent:.2}% of {window}"),
+        _ => "n/a".into(),
+    };
+    let effort_levels = if report.supported_effort_levels.is_empty() {
+        "(none)".into()
+    } else {
+        report
+            .supported_effort_levels
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+
+    println!("model: {}", report.model_id);
+    println!("effort: {effort}");
+    println!("session: {session}");
+    println!("context: {context}");
+    println!(
+        "metadata: {}",
+        match report.model_metadata_source {
+            models::ModelMetadataSource::Cache => "cache",
+            models::ModelMetadataSource::FallbackInference => "fallback_inference",
+        }
+    );
+    println!("supported effort levels: {effort_levels}");
+}
+
+fn print_model_catalog(catalog: &ModelCatalog) {
+    println!("provider: {}", catalog.provider.base_url);
+    println!("fetched_at: {}", catalog.fetched_at);
+    for model in catalog.models.values() {
+        let effort_levels = model
+            .reasoning_effort_levels
+            .as_ref()
+            .map(|levels| {
+                if levels.is_empty() {
+                    "(none)".to_string()
+                } else {
+                    levels
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>()
+                        .join(",")
+                }
+            })
+            .unwrap_or_else(|| "(unknown)".into());
+        println!(
+            "{}  {}  ctx={:?}  out={:?}  reasoning={:?}  effort={}",
+            model.id,
+            model.display_name,
+            model.context_window,
+            model.max_output_tokens,
+            model.reasoning,
+            effort_levels
+        );
+    }
 }
 
 fn load_image_attachments(paths: &[PathBuf]) -> Result<Vec<ContentPart>> {
