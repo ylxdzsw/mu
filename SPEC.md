@@ -4,8 +4,8 @@
 completed agent turn out. The core `mu` binary reads a prompt on stdin, accepts
 attached inputs such as images, runs an agent loop, streams turn events in the
 selected output format, persists completed messages, and exits. Interactive
-shells, REPLs, web daemons, editor integrations, and other surfaces build around
-that simple turn unit instead of changing it.
+shells, a future `mu web` mode, editor integrations, and other surfaces build
+around that simple turn unit instead of changing it.
 
 This document describes the design, the key decisions behind it, and the
 high-level shape of the implementation. It favors prose and decisions over code,
@@ -26,8 +26,9 @@ is unambiguous.
   immediately when a turn completes.
 - **Composable.** The main abstraction is a turn, not a chat app, daemon,
   terminal UI, or project manager. Thin surfaces such as the zsh plugin,
-  temporary `mu-cli`, and a future `mu-web` coordinate and present turns; they
-  do not host a separate agent loop.
+  shell scripts, and a future `mu web` subcommand coordinate and present turns;
+  they do
+  not host a separate agent loop.
 - **Non-magical.** No TUI. The shell owns the terminal and line editing; `mu`
   just reads a prompt and appends output. Output streams as it is produced (a
   tool line may appear before its output), but once a line is printed it is never
@@ -46,13 +47,16 @@ is unambiguous.
 
 - **No TUI, no REPL inside core `mu`.** No alternate screen, no full-screen layout,
   no widgets, no in-place history editing, no mouse, no line editor in the
-  turn binary. `mu` never puts the terminal into raw mode. `mu-cli` may provide
-  a convenience REPL, but each submitted line is still a separate `mu` turn.
+  turn binary. `mu` never puts the terminal into raw mode. Interactive
+  convenience layers live outside the core binary, and each submitted line is
+  still a separate `mu` turn.
 - **No re-rendering.** Lines are written once and never rewritten. Native
   terminal scrollback is the history mechanism.
 - **No daemon in the core path (V1).** Each turn is a fresh, stateless-on-exit
-  process that loads/saves session state from SQLite. A future `mu-web` daemon is
-  a coordinator around this turn boundary, not a separate agent runtime.
+  process that loads/saves session state from SQLite. A future `mu web`
+  subcommand may host a coordinator around this turn boundary, but it remains
+  part of the same executable rather than a separate agent runtime or second
+  binary.
 - **No plugin SDK, no MCP, no sub-agents (initially).** Extensibility is via
   skills (markdown) and `bash` (call any CLI tool).
 - **No core shell emulation.** The core `mu` binary does not ship shell behavior,
@@ -87,28 +91,30 @@ Tradeoff accepted: slower iteration than TypeScript, and no off-the-shelf
 "AI SDK". Provider integration is hand-written against HTTP APIs (see §7); the
 surface is small (chat completions + streaming + tool calls).
 
-### 2.2 Architecture split: turn core + thin surfaces
+### 2.2 Single binary + thin surfaces
 
-`mu`-the-binary is a **turn runner**: prompt and attached inputs in, streamed
-turn events out, completed state persisted, exit. It has no concept of modes,
-prompts, key bindings, web sessions, or long-lived UI state.
+`mu` is one executable with a default **turn runner** mode: prompt and attached
+inputs in, streamed turn events out, completed state persisted, exit. It also
+owns management subcommands, and future entry modes should remain subcommands of
+that same binary. The turn path itself has no concept of prompts, key bindings,
+web sessions, or long-lived UI state.
 
 Interactive surfaces are thin wrappers around that unit:
 
 - The zsh plugin is the preferred interactive surface. It owns zsh line editing,
   prompt mode, and keybindings, then submits each entered prompt by spawning
   `mu` for one foreground turn.
-- `mu-cli` is a temporary standalone REPL convenience wrapper. Each line entered
-  in the REPL is submitted by spawning the `mu` command-line interface for one
-  turn; it is not a second in-process agent host and may be removed once the
-  shell surface is mature.
-- `mu-web` is a future web daemon, similar in spirit to `opencode serve`. It
-  coordinates sessions and presentation, but talks to the same `mu` command-line
-  interface rather than carrying a separate agent loop.
+- The future web surface lives behind `mu web`, similar in spirit to
+  `opencode serve`. It coordinates sessions and presentation, but does so as a
+  subcommand in the same executable rather than a separate binary or second
+  agent loop.
+- Other wrappers are allowed, but they must stay thin: they coordinate prompts
+  and presentation while delegating each agent turn to the `mu` command-line
+  interface.
 
-This split is the central decision (see §3 for the full rationale recap). It
-keeps the agent semantics small and scriptable while letting each surface choose
-the interaction style that fits it.
+This single-binary shape is the central decision (see §3 for the full rationale
+recap). It keeps the agent semantics small and scriptable while letting each
+surface choose the interaction style that fits it.
 
 ### 2.3 Interactive mode lives in the shell surface
 
@@ -147,30 +153,29 @@ in the active global/project scope. See §9, §10, and §11.
 
 ## 3. Architecture overview
 
-`mu` has one core runtime and multiple thin surfaces. There is no client/server
-split in V1; the "glue" is the command-line contract around a completed turn.
+`mu` has one executable, multiple entry modes, and multiple thin external
+surfaces. There is no client/server split in V1; the "glue" is the command-line
+contract around a completed turn, and future web support remains a subcommand of
+the same binary.
 
 ```
-   ┌──────────────────────────── thin surfaces ────────────────────────────────┐
+   ┌──────────────────────────── external surfaces ─────────────────────────────┐
    │  shell scripts / editor tasks: `mu [opts] <<< PROMPT`                     │
    │  zsh plugin: prompt mode; every entered line spawns one `mu` turn         │
-   │  mu-cli: temporary standalone REPL wrapper around one-turn invocations    │
-   │  mu-web (V2): web coordinator around the same CLI turn boundary           │
+   │  browsers / editors (V2): coordinate through future `mu web`              │
    └───────────────────────────────────┬───────────────────────────────────────┘
-                                        │ spawns / coordinates foreground turns
+                                        │ invokes the same executable
                                         ▼
-   ┌──────────────────────────── mu (binary, per turn) ────────────────────────┐
-   │  project/config/session resolution                                        │
-   │  stdin prompt + repeatable `-i` image attachments                         │
-   │     │                                                                     │
-   │     ▼                                                                     │
-   │  Agent loop ──► Provider client (HTTP/SSE)                                │
-   │     │                                                                     │
-   │     ├──► Tool registry: bash                                              │
-   │     │                                                                     │
-   │     ├──► Renderer (plain / terminal / JSON event stream)                  │
-   │     │                                                                     │
-   │     └──► Store (SQLite in active global/project scope)                    │
+   ┌────────────────────────────── mu (single binary) ─────────────────────────┐
+   │  default turn mode: one prompt in, one completed turn out                 │
+   │  management subcommands: session / status / models / compact              │
+   │  future web mode (V2): `mu web` coordinator in the same executable        │
+   │                                                                           │
+   │  shared modules: project/config/session resolution                        │
+   │                  provider client + agent loop                             │
+   │                  tool registry: bash                                      │
+   │                  renderer / event stream                                  │
+   │                  store (SQLite in active global/project scope)            │
    └───────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -212,15 +217,15 @@ small:
 
 - `mu [-s <id>] [-c] [--model <id>] [-i <image>] [--output plain|terminal|json]`
   — run one turn; prompt read from stdin. `-i/--image` is repeatable.
-- `shell-plugins/mu.zsh` — zsh prompt mode; each accepted prompt runs one
-  foreground `mu` turn and keeps using the same session.
-- `mu-cli [-s <id>] [--model <id>] [--output plain|terminal|json]` — temporary
-  standalone REPL wrapper around repeated `mu` turn invocations.
+- `mu.zsh` — zsh prompt mode; each accepted prompt runs one foreground `mu`
+  turn and keeps using the same session. `MU_ZSH_SESSION_ID=<id>` seeds
+  attachment to an existing session.
 - `mu session new` — create a session and print its id.
 - `mu session list` — list recent sessions.
 - `mu compact --session <id>` — force compaction.
+- `mu web [opts]` — V2 web coordinator subcommand in the same binary.
 
-`mu-web` is explicitly V2.
+`mu web` is explicitly V2.
 
 `mu session new/list` do **not** require a configured provider. Turn invocation
 and `mu compact` require a configured provider because they can contact the
@@ -450,10 +455,6 @@ Enter submits the current buffer as one `mu` turn, Ctrl-C clears the current
 `mu>` prompt returns to the normal shell prompt without printing a new line. The
 plugin must not duplicate agent-loop, provider, store, or tool semantics.
 
-`mu-cli` remains available for now as a temporary standalone REPL wrapper, but it
-is not the architectural owner of interactive use and is expected to disappear
-once the shell surface is mature.
-
 ### 6.1 Invocation pattern
 
 Submitting a non-empty prompt runs `mu` as an ordinary foreground child process.
@@ -472,7 +473,7 @@ Consequences:
 
 ### 6.2 Entry and exit
 
-- Source `shell-plugins/mu.zsh` from `.zshrc`.
+- Source `mu.zsh` from `.zshrc`.
 - Press Tab on an empty shell prompt to enter `mu>` mode.
 - Enter a non-empty line to run one turn.
 - Press Ctrl-C while editing to discard the current buffer and draw a fresh
@@ -500,8 +501,8 @@ Session lifecycle is exposed through CLI commands:
 
 - The zsh plugin without a session lazily creates one on its first submitted
   prompt and reuses that session for later prompts in the same shell.
-- `mu-cli -s <id>` starts the temporary standalone REPL attached to an existing
-  session.
+- Exporting `MU_ZSH_SESSION_ID=<id>` before entering `mu>` attaches the zsh
+  plugin to an existing session.
 - `mu -c` continues the latest session in the active scope for a one-shot turn.
 - `mu session new` creates a session and prints its id.
 - `mu session list` lists recent sessions.
@@ -785,9 +786,9 @@ V1 maps each interactive shell instance to at most one active session:
   creates the session row and writes the new id to that file. After `mu` exits,
   the plugin reads the id and passes `--session <id>` on later prompts. The id is
   never printed to stdout by the turn, so the transcript stays clean.
-- **Attach / continue.** `mu-cli -s <id>` temporarily remains available to attach
-  the standalone REPL to an existing session. `mu -c` continues the latest
-  session for a one-shot turn. `mu session list` lists candidates.
+- **Attach / continue.** `MU_ZSH_SESSION_ID=<id>` seeds the zsh plugin with an
+  existing session, while `mu -s <id>` and `mu -c` handle one-shot re-entry from
+  the command line. `mu session list` lists candidates.
 - **Per-turn lifecycle.** Each turn: open DB → acquire session lock → load
   session messages → run turn (persisting each completed message as it lands) →
   release lock → exit. The connection opens lazily so a turn that errors early
@@ -1102,8 +1103,8 @@ Coarse sequencing only (not an execution plan):
 4. **State.** SQLite store (WAL), message-level persistence, session load,
    `--session`, lazy session creation + runtime-file handshake, per-session
    lock, two-tier compaction, exit turn-summary line.
-5. **mu-cli.** Interactive prompt loop, first-turn session capture, `-s`
-   attach, `--model`, `--output`, and clean exit commands.
+5. **zsh shell surface.** Prompt mode, first-turn session capture, session
+   attach via environment, and clean entry/exit controls.
 6. **Skills.** Skill scan + cache + system-prompt injection, `AGENTS.md`
    (global + project).
 7. **Polish.** Robustness, error-message quality, config surface.

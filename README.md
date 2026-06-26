@@ -23,14 +23,16 @@ starter provider if the file does not exist. Edit that file to use another
 OpenAI-compatible endpoint, API-key env var, or default model.
 
 Run a single turn by piping a prompt to `mu`, or source the zsh plugin for an
-integrated shell prompt mode that keeps using the same session. `mu-cli` remains
-available as a temporary standalone REPL wrapper, but the shell plugin is the
-preferred interactive surface.
+integrated shell prompt mode that keeps using the same session across turns.
+Arch Linux packaging for the current checkout lives in [`PKGBUILD`](PKGBUILD)
+at the repo root.
 
 ## zsh plugin
 
 ```zsh
-source /path/to/mu/shell-plugins/mu.zsh
+source /path/to/mu/mu.zsh
+# Arch package install path:
+# source /usr/share/mu/mu.zsh
 ```
 
 Press Tab on an empty prompt to switch into `mu>` mode. Press Enter to submit
@@ -44,6 +46,9 @@ session persistence follow the same command-line path as scripted use.
 Ctrl-D is handled as the normal terminal EOT key (`^D`); browser terminals such
 as xterm.js/WebTerm forward it as input when the browser has not intercepted the
 key first.
+
+To keep using an existing session in zsh mode, set `MU_ZSH_SESSION_ID=<id>`
+before entering `mu>` mode.
 
 ## CLI
 
@@ -61,7 +66,6 @@ key first.
 | `mu status --json` | Report the resolved model, effort, session, and context state |
 | `mu models refresh` | Refresh `~/.mu/models.json` from the active provider |
 | `mu models list [--json]` | Inspect the cached provider model catalog |
-| `mu-cli [--model <id>] [--effort <level>]` | Run the temporary standalone REPL wrapper |
 | `mu session new` | Create session, print id |
 | `mu session list` | List recent sessions |
 | `mu compact --session <id>` | Force compaction |

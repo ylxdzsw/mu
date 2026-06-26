@@ -1,7 +1,7 @@
 #!/usr/bin/env zsh
 set -eu
 
-source ./shell-plugins/mu.zsh
+source ./mu.zsh
 
 fail() {
   print -u2 -- "FAIL: $*"
