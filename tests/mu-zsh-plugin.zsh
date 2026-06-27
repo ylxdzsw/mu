@@ -52,7 +52,7 @@ _mu_zsh_enter_mode
 [[ "$BUFFER" == "echo hello" ]] || fail "preserves buffer in mu mode"
 [[ "$CURSOR" -eq 0 ]] || fail "preserves cursor in mu mode"
 escaped_pwd=${PWD//\%/%%}
-expected_prompt="%F{green}prompt-test-model%f %F{magenta}25%%%f %F{yellow}${escaped_pwd}%f
+expected_prompt="%F{39}prompt-test-model%f %F{214}25%%%f %F{45}${escaped_pwd}%f
 mu> "
 [[ "$PROMPT" == "$MU_ZSH_PROMPT" ]] || fail "sets mu prompt"
 [[ "$PROMPT" == "$expected_prompt" ]] || fail "renders two-line mu prompt"
@@ -114,7 +114,7 @@ builtin cd "$saved_pwd"
 escaped_root=${root//\%/%%}
 nested_pwd=$root/tests
 escaped_nested_pwd=${nested_pwd//\%/%%}
-[[ "$nested_prompt" == *"%F{yellow}${escaped_nested_pwd}%f %F{cyan}(${escaped_root})%f"* ]] || fail "shows project root when cwd differs"
+[[ "$nested_prompt" == *"%F{45}${escaped_nested_pwd}%f %F{141}(${escaped_root})%f"* ]] || fail "shows project root when cwd differs"
 
 MU_ZSH_ORIGINAL_TAB_WIDGET=
 _mu_zsh_save_widget_bindings
