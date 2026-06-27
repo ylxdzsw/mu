@@ -700,6 +700,7 @@ inside a project, global otherwise.
       "api_key_env": "OPENAI_API_KEY"            // required: env var NAME, not the key
     },
     "default_model": "gpt-4o",                   // required
+    "default_effort": null,                      // optional: null|low|medium|high|xhigh|max
     "models": {                                  // optional per-model tuning
       "gpt-4o": {
         "context_window": 128000,                // needed for Tier-1 compaction & context%

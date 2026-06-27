@@ -84,13 +84,16 @@ async fn run() -> Result<()> {
                     let latest = store.latest_session()?;
                     let inherited_model = latest.as_ref().map(|session| session.model.clone());
                     let inherited_effort = latest.as_ref().and_then(|session| session.effort);
-                    let default_model = Config::try_load_for_scope(project_config_dir.as_deref())
-                        .map(|c| c.default_model)
-                        .unwrap_or_else(|| "gpt-4o".into());
+                    let config = Config::try_load_for_scope(project_config_dir.as_deref());
+                    let default_model = config
+                        .as_ref()
+                        .map(|c| c.default_model.as_str())
+                        .unwrap_or("gpt-4o");
+                    let default_effort = config.as_ref().and_then(|c| c.default_effort);
                     let session = store.create_session(
                         &cwd.display().to_string(),
-                        inherited_model.as_deref().unwrap_or(default_model.as_str()),
-                        inherited_effort,
+                        inherited_model.as_deref().unwrap_or(default_model),
+                        inherited_effort.or(default_effort),
                     )?;
                     store.append_message(
                         &session.id,

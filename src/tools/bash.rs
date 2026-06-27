@@ -370,6 +370,7 @@ mod tests {
                 api_key_env: "OPENAI_API_KEY".into(),
             },
             default_model: "model".into(),
+            default_effort: None,
             models: HashMap::new(),
             compaction: CompactionConfig::default(),
             limits: LimitsConfig::default(),

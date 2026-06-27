@@ -108,6 +108,10 @@ User intent stays in `config.jsonc`. Generated model discovery is cached in
 `~/.mu/models.json` and can be refreshed with `mu models refresh`; it never
 rewrites the hand-authored config file.
 
+Set `default_effort` in `config.jsonc` to apply a reasoning effort when neither
+the session nor the CLI provides one. Accepted values are `null`, `low`,
+`medium`, `high`, `xhigh`, and `max`; `--effort` still wins for a turn.
+
 Optional: `.env`, `AGENTS.md` (global and project-local), `skills/*/SKILL.md`.
 Provider API key values and names listed in `redaction.env` are exact-value
 redacted from `bash` tool output before it is stored or shown to the model.

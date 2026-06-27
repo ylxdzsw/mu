@@ -5,6 +5,7 @@ use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 
 use crate::env::EnvMap;
+use crate::models::EffortLevel;
 use crate::paths;
 
 #[derive(Debug, Clone, Deserialize)]
@@ -13,6 +14,8 @@ pub struct Config {
     pub provider: ProviderConfig,
     #[serde(default)]
     pub default_model: String,
+    #[serde(default)]
+    pub default_effort: Option<EffortLevel>,
     #[serde(default)]
     pub models: HashMap<String, ModelConfig>,
     #[serde(default)]
@@ -289,6 +292,8 @@ const STARTER_CONFIG: &str = r#"{
     "api_key_env": "OPENAI_API_KEY"
   },
   "default_model": "gpt-4o",
+  // Optional default reasoning effort: null, "low", "medium", "high", "xhigh", or "max".
+  "default_effort": null,
   "models": {
     "gpt-4o": {
       "context_window": 128000,
@@ -324,17 +329,20 @@ mod tests {
         let mut base = serde_json::json!({
             "provider": {"base_url": "a", "api_key_env": "KEY"},
             "default_model": "one",
+            "default_effort": "low",
             "models": {"one": {"context_window": 1}},
             "limits": {"max_iterations": 5, "max_lines": 10}
         });
         let overlay = serde_json::json!({
             "default_model": "two",
+            "default_effort": null,
             "models": {"two": {"context_window": 2}},
             "limits": {"max_lines": 20}
         });
         merge_json(&mut base, overlay);
 
         assert_eq!(base["default_model"], "two");
+        assert!(base["default_effort"].is_null());
         assert_eq!(base["models"]["one"]["context_window"], 1);
         assert_eq!(base["models"]["two"]["context_window"], 2);
         assert_eq!(base["limits"]["max_iterations"], 5);
@@ -349,6 +357,7 @@ mod tests {
                 api_key_env: "TEST_KEY".into(),
             },
             default_model: "test-model".into(),
+            default_effort: None,
             models: HashMap::new(),
             compaction: CompactionConfig::default(),
             limits: LimitsConfig::default(),
@@ -368,6 +377,7 @@ mod tests {
                 api_key_env: String::new(),
             },
             default_model: "test-model".into(),
+            default_effort: None,
             models: HashMap::new(),
             compaction: CompactionConfig::default(),
             limits: LimitsConfig::default(),
@@ -389,6 +399,31 @@ mod tests {
         let raw = std::fs::read_to_string(&path).unwrap();
         assert!(raw.contains("\"provider\""));
         assert!(raw.contains("\"default_model\""));
+        assert!(raw.contains("\"default_effort\""));
+    }
+
+    #[test]
+    fn default_effort_accepts_canonical_values() {
+        let config = config_from_value(serde_json::json!({
+            "provider": {"base_url": "http://localhost", "api_key_env": ""},
+            "default_model": "gpt-4o",
+            "default_effort": "high"
+        }))
+        .unwrap();
+
+        assert_eq!(config.default_effort, Some(EffortLevel::High));
+    }
+
+    #[test]
+    fn invalid_default_effort_fails_to_parse() {
+        let err = config_from_value(serde_json::json!({
+            "provider": {"base_url": "http://localhost", "api_key_env": ""},
+            "default_model": "gpt-4o",
+            "default_effort": "extreme"
+        }))
+        .unwrap_err();
+
+        assert!(err.to_string().contains("invalid config.jsonc structure"));
     }
 
     #[test]

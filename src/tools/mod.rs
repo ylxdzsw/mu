@@ -182,6 +182,7 @@ mod tests {
                 api_key_env: "MU_TEST_KEY".into(),
             },
             default_model: "test-model".into(),
+            default_effort: None,
             models: HashMap::new(),
             compaction: CompactionConfig::default(),
             limits: LimitsConfig::default(),

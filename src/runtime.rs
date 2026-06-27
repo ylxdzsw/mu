@@ -64,11 +64,14 @@ pub fn resolve_invocation(
             attached_session: Some(session.clone()),
             request: RequestOptions {
                 model: overrides.model.clone().unwrap_or(session.model.clone()),
-                effort: overrides.effort.or(session.effort),
+                effort: overrides
+                    .effort
+                    .or(session.effort)
+                    .or(config.default_effort),
             },
             session_seed: RequestOptions {
                 model: session.model,
-                effort: session.effort,
+                effort: session.effort.or(config.default_effort),
             },
         });
     }
@@ -87,7 +90,7 @@ pub fn resolve_invocation(
     } else {
         RequestOptions {
             model: config.default_model.clone(),
-            effort: None,
+            effort: config.default_effort,
         }
     };
     let request = RequestOptions {
@@ -182,6 +185,7 @@ mod tests {
                 api_key_env: "MU_TEST_KEY".into(),
             },
             default_model: "default-model".into(),
+            default_effort: None,
             models: HashMap::from([(
                 "default-model".into(),
                 ModelConfig {
@@ -336,16 +340,103 @@ mod tests {
     }
 
     #[test]
+    fn new_session_uses_config_default_effort_without_flags() {
+        let (store, tmp) = temp_store();
+        let mut config = test_config();
+        config.default_effort = Some(EffortLevel::High);
+
+        let resolved =
+            resolve_invocation(&store, &config, &InvocationOverrides::default()).unwrap();
+
+        assert_eq!(resolved.request.model, "default-model");
+        assert_eq!(resolved.request.effort, Some(EffortLevel::High));
+        assert_eq!(resolved.session_seed.effort, Some(EffortLevel::High));
+        let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    #[test]
+    fn model_override_without_effort_uses_config_default_effort() {
+        let (store, tmp) = temp_store();
+        let mut config = test_config();
+        config.default_effort = Some(EffortLevel::Medium);
+        store
+            .create_session("/tmp", "scope-model", Some(EffortLevel::High))
+            .unwrap();
+
+        let resolved = resolve_invocation(
+            &store,
+            &config,
+            &InvocationOverrides {
+                model: Some("flag-model".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(resolved.request.model, "flag-model");
+        assert_eq!(resolved.request.effort, Some(EffortLevel::Medium));
+        assert_eq!(resolved.session_seed.model, "default-model");
+        assert_eq!(resolved.session_seed.effort, Some(EffortLevel::Medium));
+        let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    #[test]
+    fn stored_session_effort_overrides_config_default_effort() {
+        let (store, tmp) = temp_store();
+        let mut config = test_config();
+        config.default_effort = Some(EffortLevel::High);
+        let session = store
+            .create_session("/tmp", "session-model", Some(EffortLevel::Low))
+            .unwrap();
+
+        let resolved = resolve_invocation(
+            &store,
+            &config,
+            &InvocationOverrides {
+                session: Some(session.id.clone()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(resolved.request.effort, Some(EffortLevel::Low));
+        assert_eq!(resolved.session_seed.effort, Some(EffortLevel::Low));
+        let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    #[test]
+    fn explicit_effort_overrides_config_default_effort() {
+        let (store, tmp) = temp_store();
+        let mut config = test_config();
+        config.default_effort = Some(EffortLevel::Low);
+
+        let resolved = resolve_invocation(
+            &store,
+            &config,
+            &InvocationOverrides {
+                effort: Some(EffortLevel::Max),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(resolved.request.effort, Some(EffortLevel::Max));
+        assert_eq!(resolved.session_seed.effort, Some(EffortLevel::Low));
+        let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    #[test]
     fn status_is_valid_without_a_session() {
         let (store, tmp) = temp_store();
-        let config = test_config();
+        let mut config = test_config();
+        config.default_effort = Some(EffortLevel::Medium);
 
         let status =
             build_status_report(&store, &config, &InvocationOverrides::default(), None, None)
                 .unwrap();
 
         assert_eq!(status.model_id, "default-model");
-        assert_eq!(status.effort, None);
+        assert_eq!(status.effort, Some(EffortLevel::Medium));
         assert!(status.session_id.is_none());
         assert!(status.context_percent.is_none());
         assert!(status.project_root.is_none());

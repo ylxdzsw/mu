@@ -206,6 +206,7 @@ mod tests {
                 api_key_env: "TEST_KEY".into(),
             },
             default_model: "fake-model".into(),
+            default_effort: None,
             models: Default::default(),
             compaction: crate::config::CompactionConfig {
                 fraction: 0.75,
