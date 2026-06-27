@@ -3,12 +3,12 @@ use std::str::FromStr;
 
 use fs2::FileExt;
 
-use anyhow::{bail, Context, Result};
-use rusqlite::{params, Connection, OptionalExtension};
+use anyhow::{Context, Result, bail};
+use rusqlite::{Connection, OptionalExtension, params};
 use uuid::Uuid;
 
 use crate::models::EffortLevel;
-use crate::provider::{approx_tokens, Message, UserContent};
+use crate::provider::{Message, UserContent, approx_tokens};
 
 #[derive(Debug, Clone)]
 pub struct Session {
@@ -25,6 +25,26 @@ pub struct StoredMessage {
     pub role: String,
     pub content: String,
     pub seq: i64,
+}
+
+pub struct ToolCallRecord<'a> {
+    pub message_id: i64,
+    pub id: &'a str,
+    pub tool: &'a str,
+    pub args: &'a str,
+    pub risk: Option<&'a str>,
+    pub output: &'a str,
+    pub status: &'a str,
+}
+
+pub struct ReviewRecord<'a> {
+    pub session_id: &'a str,
+    pub tool_call_id: Option<&'a str>,
+    pub action_json: &'a str,
+    pub risk_level: &'a str,
+    pub user_auth_level: &'a str,
+    pub outcome: &'a str,
+    pub reason: Option<&'a str>,
 }
 
 pub struct Store {
@@ -303,18 +323,18 @@ impl Store {
         })?;
 
         let mut messages = Vec::new();
-        if let Some(seq) = summary_seq {
-            if let Some(summary) = self.message_at_seq(session_id, seq)? {
-                // Framed as a user message (not system) so the assembled
-                // context has exactly one leading system message. Servers that
-                // reject a non-first system message would otherwise fail.
-                messages.push(Message::User {
-                    content: UserContent::Text(format!(
-                        "[summary of earlier conversation]\n{}",
-                        summary.content
-                    )),
-                });
-            }
+        if let Some(seq) = summary_seq
+            && let Some(summary) = self.message_at_seq(session_id, seq)?
+        {
+            // Framed as a user message (not system) so the assembled
+            // context has exactly one leading system message. Servers that
+            // reject a non-first system message would otherwise fail.
+            messages.push(Message::User {
+                content: UserContent::Text(format!(
+                    "[summary of earlier conversation]\n{}",
+                    summary.content
+                )),
+            });
         }
 
         for row in rows {
@@ -400,10 +420,7 @@ impl Store {
                 content,
                 tool_calls,
             } => {
-                let tc_json = tool_calls
-                    .as_ref()
-                    .map(|t| serde_json::to_string(t))
-                    .transpose()?;
+                let tc_json = tool_calls.as_ref().map(serde_json::to_string).transpose()?;
                 self.conn.execute(
                     "INSERT INTO message (session_id, role, content, tool_calls_json, seq, created_at)
                      VALUES (?1, 'assistant', ?2, ?3, ?4, ?5)",
@@ -458,39 +475,38 @@ impl Store {
         Ok(())
     }
 
-    pub fn record_tool_call(
-        &self,
-        message_id: i64,
-        id: &str,
-        tool: &str,
-        args: &str,
-        risk: Option<&str>,
-        output: &str,
-        status: &str,
-    ) -> Result<()> {
+    pub fn record_tool_call(&self, record: ToolCallRecord<'_>) -> Result<()> {
         self.conn.execute(
             "INSERT OR REPLACE INTO tool_call (id, message_id, tool, args, risk, output, status)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            params![id, message_id, tool, args, risk, output, status],
+            params![
+                record.id,
+                record.message_id,
+                record.tool,
+                record.args,
+                record.risk,
+                record.output,
+                record.status
+            ],
         )?;
         Ok(())
     }
 
-    pub fn record_review(
-        &self,
-        session_id: &str,
-        tool_call_id: Option<&str>,
-        action_json: &str,
-        risk_level: &str,
-        user_auth_level: &str,
-        outcome: &str,
-        reason: Option<&str>,
-    ) -> Result<()> {
+    pub fn record_review(&self, record: ReviewRecord<'_>) -> Result<()> {
         let now = chrono::Utc::now().to_rfc3339();
         self.conn.execute(
             "INSERT INTO review (session_id, tool_call_id, action_json, risk_level, user_auth_level, outcome, reason, created_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-            params![session_id, tool_call_id, action_json, risk_level, user_auth_level, outcome, reason, now],
+            params![
+                record.session_id,
+                record.tool_call_id,
+                record.action_json,
+                record.risk_level,
+                record.user_auth_level,
+                record.outcome,
+                record.reason,
+                now
+            ],
         )?;
         Ok(())
     }
@@ -568,6 +584,7 @@ pub fn acquire_session_lock(session_id: &str) -> Result<SessionLock> {
     let file = std::fs::OpenOptions::new()
         .create(true)
         .write(true)
+        .truncate(false)
         .open(&lock_path)
         .context("opening session lock file")?;
     file.try_lock_exclusive()

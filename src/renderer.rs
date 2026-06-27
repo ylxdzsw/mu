@@ -707,7 +707,7 @@ fn format_thinking_live(elapsed: Duration, output_tokens: u64) -> String {
 }
 
 fn approx_tokens_from_chars(chars: usize) -> u64 {
-    ((chars as u64) + 3) / 4
+    (chars as u64).div_ceil(4)
 }
 
 fn strip_ansi(input: &str) -> String {

@@ -167,14 +167,18 @@ mod tests {
         let cfg = config(&[("OPENAI_API_KEY", ""), ("TOKEN", "abc")], &["TOKEN"]);
         let mut redactor = SecretRedactor::from_config(&cfg);
 
-        assert!(redactor
-            .warnings()
-            .iter()
-            .any(|warning| warning.contains("OPENAI_API_KEY") && warning.contains("empty")));
-        assert!(redactor
-            .warnings()
-            .iter()
-            .any(|warning| warning.contains("TOKEN") && warning.contains("short")));
+        assert!(
+            redactor
+                .warnings()
+                .iter()
+                .any(|warning| warning.contains("OPENAI_API_KEY") && warning.contains("empty"))
+        );
+        assert!(
+            redactor
+                .warnings()
+                .iter()
+                .any(|warning| warning.contains("TOKEN") && warning.contains("short"))
+        );
 
         let mut out = String::new();
         out.push_str(&redactor.redact_chunk("empty is  and token is abc"));

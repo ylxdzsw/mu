@@ -142,7 +142,7 @@ pub fn missing_tool_message(name: &str) -> String {
 mod tests {
     use serde_json::json;
 
-    use super::{bash::BashTool, Tool, ToolRegistry};
+    use super::{Tool, ToolRegistry, bash::BashTool};
     use crate::config::{CompactionConfig, Config, LimitsConfig, ProviderConfig};
     use std::collections::HashMap;
 

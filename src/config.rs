@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 
 use crate::env::EnvMap;
@@ -30,7 +30,7 @@ pub struct Config {
     pub env: EnvMap,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 pub struct ProviderConfig {
     #[serde(default)]
     pub base_url: String,
@@ -170,15 +170,6 @@ impl Default for CircuitBreakerConfig {
             consecutive: default_cb_consecutive(),
             window: default_cb_window(),
             window_denials: default_cb_window_denials(),
-        }
-    }
-}
-
-impl Default for ProviderConfig {
-    fn default() -> Self {
-        Self {
-            base_url: String::new(),
-            api_key_env: String::new(),
         }
     }
 }

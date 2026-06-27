@@ -2,20 +2,20 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use futures_util::future::join_all;
 use serde_json::Value;
 
 use crate::compaction;
 use crate::config::Config;
-use crate::guardrail::{bash_risk, Guardrail, GuardrailOutcome};
+use crate::guardrail::{Guardrail, GuardrailOutcome, bash_risk};
 use crate::models::RequestOptions;
 use crate::provider::{
     FinishReason, Message, Provider, ProviderError, StreamEvent, ToolCall, UserContent,
 };
 use crate::renderer::Renderer;
-use crate::store::Store;
-use crate::tools::{missing_tool_message, ExecutionMode, ToolContext, ToolRegistry, ToolResult};
+use crate::store::{ReviewRecord, Store, ToolCallRecord};
+use crate::tools::{ExecutionMode, ToolContext, ToolRegistry, ToolResult, missing_tool_message};
 
 pub struct TurnResult {
     pub prompt_tokens: u64,
@@ -178,103 +178,110 @@ impl<'a> AgentLoop<'a> {
 
                             // Guardrail: review destructive bash calls before execution.
                             // Runs before tool_start so denied commands never print a `$` line.
-                            if let Some(g) = guardrail.as_mut() {
-                                if tc.function.name == "bash" {
-                                    let risk = bash_risk(&args);
-                                    if risk.is_none() {
-                                        let err = anyhow::anyhow!(
-                                            "bash tool call missing required `risk` field"
-                                        );
-                                        self.persist_tool_result(
-                                            msg_id,
-                                            tc,
-                                            Err(err),
-                                            Duration::ZERO,
-                                            &mut context,
-                                        )?;
-                                        cursor += 1;
-                                        continue;
-                                    }
-                                    if g.should_review(risk.as_deref().unwrap_or("")) {
-                                        let args_for_review = args.clone();
-                                        let action_json = serde_json::to_string(&args_for_review)
-                                            .unwrap_or_default();
-                                        let script = args_for_review
-                                            .get("script")
-                                            .and_then(|v| v.as_str())
-                                            .unwrap_or("");
-                                        match g.assess(&args_for_review, &context).await {
-                                            GuardrailOutcome::Allow(a) => {
-                                                self.renderer.guardrail_verdict(
-                                                    true,
-                                                    &a.risk_level.to_string(),
-                                                    &a.user_auth_level.to_string(),
-                                                    &a.reason,
-                                                    script,
-                                                )?;
-                                                self.store.record_review(
-                                                    self.session_id,
-                                                    Some(&tc.id),
-                                                    &action_json,
-                                                    &a.risk_level.to_string(),
-                                                    &a.user_auth_level.to_string(),
-                                                    a.outcome(),
-                                                    Some(&a.reason),
-                                                )?;
+                            if let Some(g) = guardrail.as_mut()
+                                && tc.function.name == "bash"
+                            {
+                                let risk = bash_risk(&args);
+                                if risk.is_none() {
+                                    let err = anyhow::anyhow!(
+                                        "bash tool call missing required `risk` field"
+                                    );
+                                    self.persist_tool_result(
+                                        msg_id,
+                                        tc,
+                                        Err(err),
+                                        Duration::ZERO,
+                                        &mut context,
+                                    )?;
+                                    cursor += 1;
+                                    continue;
+                                }
+                                if g.should_review(risk.as_deref().unwrap_or("")) {
+                                    let args_for_review = args.clone();
+                                    let action_json =
+                                        serde_json::to_string(&args_for_review).unwrap_or_default();
+                                    let script = args_for_review
+                                        .get("script")
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or("");
+                                    match g.assess(&args_for_review, &context).await {
+                                        GuardrailOutcome::Allow(a) => {
+                                            let risk_level = a.risk_level.to_string();
+                                            let user_auth_level = a.user_auth_level.to_string();
+                                            self.renderer.guardrail_verdict(
+                                                true,
+                                                &risk_level,
+                                                &user_auth_level,
+                                                &a.reason,
+                                                script,
+                                            )?;
+                                            self.store.record_review(ReviewRecord {
+                                                session_id: self.session_id,
+                                                tool_call_id: Some(&tc.id),
+                                                action_json: &action_json,
+                                                risk_level: &risk_level,
+                                                user_auth_level: &user_auth_level,
+                                                outcome: a.outcome(),
+                                                reason: Some(&a.reason),
+                                            })?;
+                                        }
+                                        GuardrailOutcome::Deny(a) => {
+                                            let risk_level = a.risk_level.to_string();
+                                            let user_auth_level = a.user_auth_level.to_string();
+                                            self.renderer.guardrail_verdict(
+                                                false,
+                                                &risk_level,
+                                                &user_auth_level,
+                                                &a.reason,
+                                                script,
+                                            )?;
+                                            self.store.record_review(ReviewRecord {
+                                                session_id: self.session_id,
+                                                tool_call_id: Some(&tc.id),
+                                                action_json: &action_json,
+                                                risk_level: &risk_level,
+                                                user_auth_level: &user_auth_level,
+                                                outcome: a.outcome(),
+                                                reason: Some(&a.reason),
+                                            })?;
+                                            if let Some((consec, recent)) =
+                                                g.circuit_breaker_tripped()
+                                            {
+                                                self.renderer.notice(&format!(
+                                                    "[mu] guardrail: aborting turn — {consec} consecutive denials ({recent} in recent window)"
+                                                ))?;
+                                                bail!("guardrail circuit breaker tripped");
                                             }
-                                            GuardrailOutcome::Deny(a) => {
-                                                self.renderer.guardrail_verdict(
-                                                    false,
-                                                    &a.risk_level.to_string(),
-                                                    &a.user_auth_level.to_string(),
-                                                    &a.reason,
-                                                    script,
-                                                )?;
-                                                self.store.record_review(
-                                                    self.session_id,
-                                                    Some(&tc.id),
-                                                    &action_json,
-                                                    &a.risk_level.to_string(),
-                                                    &a.user_auth_level.to_string(),
-                                                    a.outcome(),
-                                                    Some(&a.reason),
-                                                )?;
-                                                if let Some((consec, recent)) =
-                                                    g.circuit_breaker_tripped()
-                                                {
-                                                    self.renderer.notice(&format!(
-                                                        "[mu] guardrail: aborting turn — {consec} consecutive denials ({recent} in recent window)"
-                                                    ))?;
-                                                    bail!("guardrail circuit breaker tripped");
-                                                }
-                                                let deny_err = anyhow::anyhow!(
-                                                    "guardrail: action rejected — risk_level {} exceeds user_auth_level {} ({}). \
-                                                     Do not work around this; stop and ask the user to authorize, \
-                                                     or choose a less destructive approach.",
-                                                    a.risk_level, a.user_auth_level, a.reason
-                                                );
-                                                let deny_msg = Message::Tool {
-                                                    content: format!("error: {deny_err}"),
-                                                    tool_call_id: tc.id.clone(),
-                                                };
-                                                self.store
-                                                    .append_message(self.session_id, &deny_msg)?;
-                                                context.push(deny_msg);
-                                                self.store.record_tool_call(
-                                                    msg_id,
-                                                    &tc.id,
-                                                    &tc.function.name,
-                                                    &tc.function.arguments,
-                                                    risk.as_deref(),
-                                                    &format!("error: {deny_err}"),
-                                                    "error",
-                                                )?;
-                                                cursor += 1;
-                                                continue;
-                                            }
-                                            GuardrailOutcome::Failed(e) => {
-                                                bail!("guardrail review failed: {e}");
-                                            }
+                                            let deny_err = anyhow::anyhow!(
+                                                "guardrail: action rejected — risk_level {} exceeds user_auth_level {} ({}). \
+                                                 Do not work around this; stop and ask the user to authorize, \
+                                                 or choose a less destructive approach.",
+                                                a.risk_level,
+                                                a.user_auth_level,
+                                                a.reason
+                                            );
+                                            let deny_msg = Message::Tool {
+                                                content: format!("error: {deny_err}"),
+                                                tool_call_id: tc.id.clone(),
+                                            };
+                                            self.store
+                                                .append_message(self.session_id, &deny_msg)?;
+                                            context.push(deny_msg);
+                                            let output = format!("error: {deny_err}");
+                                            self.store.record_tool_call(ToolCallRecord {
+                                                message_id: msg_id,
+                                                id: &tc.id,
+                                                tool: &tc.function.name,
+                                                args: &tc.function.arguments,
+                                                risk: risk.as_deref(),
+                                                output: &output,
+                                                status: "error",
+                                            })?;
+                                            cursor += 1;
+                                            continue;
+                                        }
+                                        GuardrailOutcome::Failed(e) => {
+                                            bail!("guardrail review failed: {e}");
                                         }
                                     }
                                 }
@@ -397,15 +404,15 @@ impl<'a> AgentLoop<'a> {
         };
 
         let risk = tool_call_risk(&call.function.arguments);
-        self.store.record_tool_call(
+        self.store.record_tool_call(ToolCallRecord {
             message_id,
-            &call.id,
-            &call.function.name,
-            &call.function.arguments,
-            risk.as_deref(),
-            &output,
+            id: &call.id,
+            tool: &call.function.name,
+            args: &call.function.arguments,
+            risk: risk.as_deref(),
+            output: &output,
             status,
-        )?;
+        })?;
 
         let message = Message::Tool {
             content: output,

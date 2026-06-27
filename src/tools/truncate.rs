@@ -60,8 +60,7 @@ fn build_head_preview(
     max_line_bytes: usize,
 ) -> String {
     let mut out = String::new();
-    let mut count = 0usize;
-    for line in lines {
+    for (count, line) in lines.iter().enumerate() {
         if count >= max_lines {
             break;
         }
@@ -73,7 +72,6 @@ fn build_head_preview(
             out.push('\n');
         }
         out.push_str(&truncated_line);
-        count += 1;
     }
     out
 }
@@ -120,12 +118,11 @@ pub fn prune_truncation_spills(state_dir: &std::path::Path, retention_days: u64)
     let cutoff =
         std::time::SystemTime::now() - std::time::Duration::from_secs(retention_days * 24 * 3600);
     for entry in entries.flatten() {
-        if let Ok(meta) = entry.metadata() {
-            if let Ok(modified) = meta.modified() {
-                if modified < cutoff {
-                    let _ = std::fs::remove_file(entry.path());
-                }
-            }
+        if let Ok(meta) = entry.metadata()
+            && let Ok(modified) = meta.modified()
+            && modified < cutoff
+        {
+            let _ = std::fs::remove_file(entry.path());
         }
     }
 }

@@ -70,6 +70,8 @@ struct UsageJson {
     total_tokens: u64,
 }
 
+type ToolCallAccumulator = BTreeMap<usize, (Option<String>, Option<String>, String, String)>;
+
 #[async_trait(?Send)]
 impl Provider for OpenAiProvider {
     async fn stream_chat(
@@ -105,8 +107,7 @@ impl Provider for OpenAiProvider {
 
         let mut response = response;
         let mut content = String::new();
-        let mut tool_accum: BTreeMap<usize, (Option<String>, Option<String>, String, String)> =
-            BTreeMap::new();
+        let mut tool_accum: ToolCallAccumulator = BTreeMap::new();
         let mut finish_reason = FinishReason::Stop;
         let mut usage: Option<Usage> = None;
 
@@ -225,7 +226,7 @@ fn build_chat_request_body(
 fn consume_sse_buffer(
     buffer: &mut String,
     content: &mut String,
-    tool_accum: &mut BTreeMap<usize, (Option<String>, Option<String>, String, String)>,
+    tool_accum: &mut ToolCallAccumulator,
     finish_reason: &mut FinishReason,
     usage: &mut Option<Usage>,
     on_event: &mut dyn FnMut(StreamEvent) -> Result<(), ProviderError>,

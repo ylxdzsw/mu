@@ -134,5 +134,5 @@ pub trait Provider: Send + Sync {
 }
 
 pub fn approx_tokens(s: &str) -> u64 {
-    ((s.len() as u64) + 3) / 4
+    (s.len() as u64).div_ceil(4)
 }

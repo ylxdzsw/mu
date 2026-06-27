@@ -102,11 +102,7 @@ impl Assessment {
     }
 
     pub fn outcome(&self) -> &'static str {
-        if self.is_allowed() {
-            "allow"
-        } else {
-            "deny"
-        }
+        if self.is_allowed() { "allow" } else { "deny" }
     }
 }
 

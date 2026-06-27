@@ -1,10 +1,10 @@
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use serde::Serialize;
 
 use crate::config::Config;
 use crate::models::{
-    validate_effort_support, EffortLevel, ModelCatalog, ModelMetadataSource, RequestOptions,
-    ResolvedModelInfo, SupportedEffortSource,
+    EffortLevel, ModelCatalog, ModelMetadataSource, RequestOptions, ResolvedModelInfo,
+    SupportedEffortSource, validate_effort_support,
 };
 use crate::store::{Session, Store};
 

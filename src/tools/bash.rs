@@ -2,21 +2,21 @@ use std::io::Write;
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::{Command, ExitStatus, Stdio};
+use std::sync::Once;
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
-use std::sync::Once;
 use std::time::{Duration, Instant};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::env::EnvMap;
 use crate::redaction::SecretRedactor;
 
 use super::{
-    apply_truncation, parse_args, resolve_path, BashArgs, Tool, ToolContext, ToolDisplay,
-    ToolResult,
+    BashArgs, Tool, ToolContext, ToolDisplay, ToolResult, apply_truncation, parse_args,
+    resolve_path,
 };
 
 const DEFAULT_TIMEOUT_SECS: u64 = 120;

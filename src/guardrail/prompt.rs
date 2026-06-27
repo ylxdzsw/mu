@@ -1,12 +1,12 @@
 use serde::Deserialize;
 use serde_json::Value;
 
-use crate::provider::{approx_tokens, Message};
+use crate::provider::{Message, approx_tokens};
 
 use super::{
-    RiskLevel, UserAuthLevel, MAX_ACTION_STRING_TOKENS, MAX_MESSAGE_ENTRY_TOKENS,
-    MAX_MESSAGE_TRANSCRIPT_TOKENS, MAX_TOOL_ENTRY_TOKENS, MAX_TOOL_TRANSCRIPT_TOKENS,
-    RECENT_ENTRY_LIMIT, TRUNCATION_TAG,
+    MAX_ACTION_STRING_TOKENS, MAX_MESSAGE_ENTRY_TOKENS, MAX_MESSAGE_TRANSCRIPT_TOKENS,
+    MAX_TOOL_ENTRY_TOKENS, MAX_TOOL_TRANSCRIPT_TOKENS, RECENT_ENTRY_LIMIT, RiskLevel,
+    TRUNCATION_TAG, UserAuthLevel,
 };
 
 const POLICY_PROMPT: &str = include_str!("policy.md");
@@ -144,12 +144,12 @@ fn render_transcript(entries: &[TranscriptEntry]) -> (Vec<String>, Option<String
         msg_tokens += rendered[first].1;
     }
 
-    if let Some(&last) = user_indices.last() {
-        if !included[last] && msg_tokens + rendered[last].1 <= MAX_MESSAGE_TRANSCRIPT_TOKENS as u64
-        {
-            included[last] = true;
-            msg_tokens += rendered[last].1;
-        }
+    if let Some(&last) = user_indices.last()
+        && !included[last]
+        && msg_tokens + rendered[last].1 <= MAX_MESSAGE_TRANSCRIPT_TOKENS as u64
+    {
+        included[last] = true;
+        msg_tokens += rendered[last].1;
     }
 
     for &i in user_indices.iter().rev() {
@@ -210,7 +210,7 @@ fn truncate_text(content: &str, token_cap: usize) -> (String, bool) {
         return (content.to_string(), false);
     }
 
-    let omitted_tokens = (content.len() - max_bytes + 3) / 4;
+    let omitted_tokens = (content.len() - max_bytes).div_ceil(4);
     let marker = format!("<{TRUNCATION_TAG} omitted_approx_tokens=\"{omitted_tokens}\" />");
     if max_bytes <= marker.len() {
         return (marker, true);
@@ -417,7 +417,7 @@ mod tests {
 
     #[test]
     fn truncate_text_keeps_prefix_and_suffix() {
-        let content: String = std::iter::repeat('X').take(300).collect();
+        let content = "X".repeat(300);
         let (truncated, did_truncate) = truncate_text(&content, 50);
         assert!(did_truncate);
         assert!(truncated.contains(&format!("<{TRUNCATION_TAG}")));

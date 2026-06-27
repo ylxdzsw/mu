@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use std::process;
 use std::sync::Arc;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use clap::Parser;
 
 #[cfg(not(unix))]
@@ -29,11 +29,25 @@ mod tools;
 use cli::{Args, Command, ModelsSub, SessionSub};
 use config::Config;
 use models::{ModelCatalog, RequestOptions};
-use provider::openai::OpenAiProvider;
 use provider::Provider;
+use provider::openai::OpenAiProvider;
 use provider::{ContentPart, ImageUrl};
 use renderer::Renderer;
-use runtime::{build_status_report, resolve_invocation, InvocationOverrides, StatusReport};
+use runtime::{InvocationOverrides, StatusReport, build_status_report, resolve_invocation};
+
+struct RunTurnArgs<'a> {
+    config: &'a Config,
+    provider: Arc<dyn Provider>,
+    store: &'a store::Store,
+    session_id: &'a str,
+    request: &'a RequestOptions,
+    model_context_window: Option<u64>,
+    prompt: &'a str,
+    attachments: Vec<ContentPart>,
+    output: cli::OutputFormat,
+    state_dir: &'a std::path::Path,
+    project_config_dir: Option<&'a std::path::Path>,
+}
 
 #[tokio::main]
 async fn main() {
@@ -296,37 +310,38 @@ async fn run() -> Result<()> {
         store.update_session_cwd(&session_id, &cwd.display().to_string())?;
     }
 
-    run_turn(
-        &config,
+    run_turn(RunTurnArgs {
+        config: &config,
         provider,
-        &store,
-        &session_id,
-        &resolved.request,
-        model_info.context_window,
-        &prompt,
+        store: &store,
+        session_id: &session_id,
+        request: &resolved.request,
+        model_context_window: model_info.context_window,
+        prompt: &prompt,
         attachments,
-        args.turn.output,
-        &state_dir,
-        project_config_dir.as_deref(),
-    )
+        output: args.turn.output,
+        state_dir: &state_dir,
+        project_config_dir: project_config_dir.as_deref(),
+    })
     .await?;
 
     Ok(())
 }
 
-async fn run_turn(
-    config: &Config,
-    provider: Arc<dyn Provider>,
-    store: &store::Store,
-    session_id: &str,
-    request: &RequestOptions,
-    model_context_window: Option<u64>,
-    prompt: &str,
-    attachments: Vec<ContentPart>,
-    output: cli::OutputFormat,
-    state_dir: &std::path::Path,
-    project_config_dir: Option<&std::path::Path>,
-) -> Result<()> {
+async fn run_turn(args: RunTurnArgs<'_>) -> Result<()> {
+    let RunTurnArgs {
+        config,
+        provider,
+        store,
+        session_id,
+        request,
+        model_context_window,
+        prompt,
+        attachments,
+        output,
+        state_dir,
+        project_config_dir,
+    } = args;
     let system_prompt =
         system_prompt::build_system_prompt(&paths::global_dir(), project_config_dir, Some(store))?;
     let title: String = prompt.chars().take(60).collect();

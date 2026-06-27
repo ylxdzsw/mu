@@ -3,7 +3,7 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use clap::ValueEnum;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -598,7 +598,7 @@ mod tests {
             catalog.models.get("alpha").unwrap().display_name,
             "Exact Alpha"
         );
-        assert!(catalog.models.get("gamma").is_none());
+        assert!(!catalog.models.contains_key("gamma"));
     }
 
     #[test]

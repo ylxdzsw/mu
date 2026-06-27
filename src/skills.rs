@@ -20,12 +20,11 @@ pub fn scan_skills(
 
     let mtime = dir_mtime(&skills_dir)?;
 
-    if let Some(store) = store {
-        if let Ok(Some(cached)) = store.get_skill_cache(mtime) {
-            if let Ok(skills) = serde_json::from_str(&cached) {
-                return Ok(skills);
-            }
-        }
+    if let Some(store) = store
+        && let Ok(Some(cached)) = store.get_skill_cache(mtime)
+        && let Ok(skills) = serde_json::from_str(&cached)
+    {
+        return Ok(skills);
     }
 
     let mut skills = Vec::new();
@@ -67,10 +66,10 @@ pub fn scan_skills(
         }
     }
 
-    if let Some(store) = store {
-        if let Ok(json) = serde_json::to_string(&skills) {
-            let _ = store.set_skill_cache(mtime, &json);
-        }
+    if let Some(store) = store
+        && let Ok(json) = serde_json::to_string(&skills)
+    {
+        let _ = store.set_skill_cache(mtime, &json);
     }
 
     Ok(skills)

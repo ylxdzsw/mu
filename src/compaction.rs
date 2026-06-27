@@ -92,8 +92,7 @@ pub async fn run_compaction(
 
     let prior_summary = messages
         .iter()
-        .filter(|m| m.role == "summary")
-        .last()
+        .rfind(|m| m.role == "summary")
         .map(|m| m.content.as_str());
 
     let summarize_prompt = if let Some(prior) = prior_summary {

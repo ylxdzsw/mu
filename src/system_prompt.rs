@@ -3,7 +3,7 @@ use std::path::Path;
 use chrono::Local;
 
 use crate::paths::Project;
-use crate::skills::{format_skills_block, read_agents_md, scan_skills, SkillMeta};
+use crate::skills::{SkillMeta, format_skills_block, read_agents_md, scan_skills};
 
 pub const ROLE_PREAMBLE: &str = "You are mu, a terminal agent. Exactly one tool is available: `bash`. Do not invent or call `read`, `write`, `edit`, `fetch`, `search`, `apply_patch`, `view_image`, or any other tool name. If a skill or `AGENTS.md` mentions another tool, treat it as historical shorthand and accomplish the task with `bash` and ordinary CLI programs instead. Use `bash` for local search, file reads, writes, edits, web fetches, tests, and any other CLI work. Each bash call is isolated: pass `cwd` explicitly when needed, and do not expect `cd` or environment changes to persist. Include a short `title`, an advisory `risk` label, and the `script`. Keep responses concise.";
 
@@ -42,10 +42,10 @@ pub fn assemble_prompt(
     if let Some(global) = read_agents_md(&global_config_dir.join("AGENTS.md")) {
         parts.push(global);
     }
-    if let Some(project_config_dir) = project_config_dir {
-        if let Some(local) = read_agents_md(&project_config_dir.join("AGENTS.md")) {
-            parts.push(local);
-        }
+    if let Some(project_config_dir) = project_config_dir
+        && let Some(local) = read_agents_md(&project_config_dir.join("AGENTS.md"))
+    {
+        parts.push(local);
     }
 
     parts.join("\n\n")
@@ -91,7 +91,7 @@ pub fn cwd_changed_context(cwd: &Path) -> String {
 mod tests {
     use std::path::Path;
 
-    use super::{assemble_prompt, ROLE_PREAMBLE};
+    use super::{ROLE_PREAMBLE, assemble_prompt};
 
     #[test]
     fn role_preamble_explicitly_limits_tools() {
