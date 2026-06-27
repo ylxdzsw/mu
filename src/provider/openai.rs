@@ -1,7 +1,6 @@
 use std::collections::BTreeMap;
 
 use async_trait::async_trait;
-use futures_util::StreamExt;
 use reqwest::Client;
 use serde::Deserialize;
 use serde_json::Value;
@@ -101,7 +100,7 @@ impl Provider for OpenAiProvider {
             return Err(ProviderError::Other(format!("HTTP {status}: {text}")));
         }
 
-        let mut stream = response.bytes_stream();
+        let mut response = response;
         let mut content = String::new();
         let mut tool_accum: BTreeMap<usize, (Option<String>, Option<String>, String, String)> =
             BTreeMap::new();
@@ -110,8 +109,11 @@ impl Provider for OpenAiProvider {
 
         let mut buffer = String::new();
         let mut byte_buf: Vec<u8> = Vec::new();
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk.map_err(|e| ProviderError::Other(e.to_string()))?;
+        while let Some(chunk) = response
+            .chunk()
+            .await
+            .map_err(|e| ProviderError::Other(e.to_string()))?
+        {
             byte_buf.extend_from_slice(&chunk);
             // Decode only the longest valid UTF-8 prefix; keep trailing bytes
             // of a split multi-byte codepoint for the next chunk.

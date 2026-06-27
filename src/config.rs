@@ -264,7 +264,7 @@ fn read_config_value(path: &Path) -> Result<serde_json::Value> {
     }
     let raw =
         std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
-    jsonc_parser::parse_to_serde_value(&raw, &Default::default())
+    jsonc_parser::parse_to_serde_value::<Option<serde_json::Value>>(&raw, &Default::default())
         .map_err(|e| anyhow::anyhow!("parsing {}: {e}", path.display()))?
         .ok_or_else(|| anyhow::anyhow!("{} is empty", path.display()))
 }
