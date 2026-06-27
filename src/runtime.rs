@@ -29,6 +29,7 @@ pub struct StatusReport {
     pub effort: Option<EffortLevel>,
     pub session_id: Option<String>,
     pub context_percent: Option<f64>,
+    pub project_root: Option<String>,
     pub context_window: Option<u64>,
     pub max_output_tokens: Option<u64>,
     pub reasoning: Option<bool>,
@@ -109,6 +110,7 @@ pub fn build_status_report(
     config: &Config,
     overrides: &InvocationOverrides,
     catalog: Option<&ModelCatalog>,
+    project: Option<&crate::paths::Project>,
 ) -> Result<StatusReport> {
     let resolved = resolve_invocation(store, config, overrides)?;
     let model_info = crate::models::resolve_model_info(config, catalog, &resolved.request.model);
@@ -126,6 +128,7 @@ pub fn build_status_report(
             .as_ref()
             .map(|session| session.id.clone()),
         context_percent: context_percent(store, resolved.attached_session.as_ref(), &model_info),
+        project_root: project.map(|project| project.root.display().to_string()),
         context_window: model_info.context_window,
         max_output_tokens: model_info.max_output_tokens,
         reasoning: model_info.reasoning,
@@ -164,6 +167,7 @@ mod tests {
         CachedMetadataSource, CachedMetadataSourceKind, CachedModel, CachedProviderInfo,
         EffortLevelsSource,
     };
+    use crate::paths::{Project, ProjectMarker};
 
     fn temp_store() -> (Store, std::path::PathBuf) {
         let tmp = std::env::temp_dir().join(format!("mu-runtime-{}", uuid::Uuid::new_v4()));
@@ -337,12 +341,14 @@ mod tests {
         let config = test_config();
 
         let status =
-            build_status_report(&store, &config, &InvocationOverrides::default(), None).unwrap();
+            build_status_report(&store, &config, &InvocationOverrides::default(), None, None)
+                .unwrap();
 
         assert_eq!(status.model_id, "default-model");
         assert_eq!(status.effort, None);
         assert!(status.session_id.is_none());
         assert!(status.context_percent.is_none());
+        assert!(status.project_root.is_none());
         let _ = std::fs::remove_dir_all(tmp);
     }
 
@@ -372,10 +378,16 @@ mod tests {
                 ..Default::default()
             },
             None,
+            Some(&Project {
+                root: std::path::PathBuf::from("/tmp/project"),
+                marker: ProjectMarker::Git,
+                worktree: None,
+            }),
         )
         .unwrap();
 
         assert_eq!(status.context_percent, Some(25.0));
+        assert_eq!(status.project_root.as_deref(), Some("/tmp/project"));
         let _ = std::fs::remove_dir_all(tmp);
     }
 
@@ -402,6 +414,7 @@ mod tests {
                 ..Default::default()
             },
             Some(&catalog),
+            None,
         )
         .unwrap_err();
 
@@ -432,6 +445,7 @@ mod tests {
                 ..Default::default()
             },
             Some(&catalog),
+            None,
         )
         .unwrap_err();
 
@@ -452,6 +466,7 @@ mod tests {
                 effort: Some(EffortLevel::Max),
                 ..Default::default()
             },
+            None,
             None,
         )
         .unwrap();

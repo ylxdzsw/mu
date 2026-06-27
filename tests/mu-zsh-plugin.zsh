@@ -9,6 +9,38 @@ fail() {
   exit 1
 }
 
+tmpdir=$(mktemp -d)
+TRAPEXIT() {
+  local exit_code=$?
+  if (( ZSH_SUBSHELL == 0 )); then
+    if (( exit_code )); then
+      print -u2 -- "test artifacts: $tmpdir"
+    else
+      rm -rf -- "$tmpdir"
+    fi
+  fi
+  return $exit_code
+}
+
+prompt_fake_bin=$tmpdir/prompt-bin
+mkdir -p -- "$prompt_fake_bin"
+export MU_ZSH_TEST_PROJECT_ROOT=$root
+cat > "$prompt_fake_bin/mu" <<'EOF'
+#!/usr/bin/env zsh
+if [[ "$1" == "status" ]]; then
+  print -r -- "{\"model_id\":\"prompt-test-model\",\"context_percent\":25.0,\"project_root\":\"$MU_ZSH_TEST_PROJECT_ROOT\"}"
+  exit 0
+fi
+print -r -- "$*" >> "$MU_ZSH_FAKE_LOG"
+prompt=$(cat)
+print -r -- "prompt=$prompt" >> "$MU_ZSH_FAKE_LOG"
+if [[ -n "$MU_SESSION_FILE" ]]; then
+  print -r -- "created-session" > "$MU_SESSION_FILE"
+fi
+EOF
+chmod +x "$prompt_fake_bin/mu"
+MU_ZSH_BIN=$prompt_fake_bin/mu
+
 [[ "$MU_ZSH_MODE" == shell ]] || fail "starts in shell mode"
 
 BUFFER="echo hello"
@@ -19,7 +51,11 @@ _mu_zsh_enter_mode
 [[ "$MU_ZSH_MODE" == mu ]] || fail "enters mu mode"
 [[ "$BUFFER" == "echo hello" ]] || fail "preserves buffer in mu mode"
 [[ "$CURSOR" -eq 0 ]] || fail "preserves cursor in mu mode"
+escaped_pwd=${PWD//\%/%%}
+expected_prompt="%F{green}prompt-test-model%f %F{magenta}25%%%f %F{yellow}${escaped_pwd}%f
+mu> "
 [[ "$PROMPT" == "$MU_ZSH_PROMPT" ]] || fail "sets mu prompt"
+[[ "$PROMPT" == "$expected_prompt" ]] || fail "renders two-line mu prompt"
 
 BUFFER="edited in mu"
 CURSOR=3
@@ -71,6 +107,15 @@ _mu_zsh_exit_mode
 [[ "$MU_ZSH_MODE" == shell ]] || fail "mode exit path returns to shell"
 [[ "$BUFFER" == "draft prompt" ]] || fail "mode exit path preserves shell buffer"
 
+saved_pwd=$PWD
+builtin cd "$root/tests"
+nested_prompt=$(_mu_zsh_build_mode_prompt)
+builtin cd "$saved_pwd"
+escaped_root=${root//\%/%%}
+nested_pwd=$root/tests
+escaped_nested_pwd=${nested_pwd//\%/%%}
+[[ "$nested_prompt" == *"%F{yellow}${escaped_nested_pwd}%f %F{cyan}(${escaped_root})%f"* ]] || fail "shows project root when cwd differs"
+
 MU_ZSH_ORIGINAL_TAB_WIDGET=
 _mu_zsh_save_widget_bindings
 [[ -n "$MU_ZSH_ORIGINAL_TAB_WIDGET" ]] || fail "saves tab widget fallback"
@@ -96,6 +141,7 @@ cmd=$(_mu_zsh_build_command)
 MU_ZSH_SESSION_ID=
 cmd=$(_mu_zsh_build_command)
 [[ "$cmd" == "mu --output terminal" ]] || fail "builds new-session command: $cmd"
+MU_ZSH_BIN=$prompt_fake_bin/mu
 
 quoted=$(_mu_zsh_quote_prompt $'quote " dollar $ backslash \\ newline\nnext')
 eval "roundtrip=$quoted"
@@ -109,22 +155,8 @@ _mu_zsh_read_session_file
 [[ "$MU_ZSH_SESSION_ID" == "session-from-file" ]] || fail "reads session file"
 rm -f "$tmp"
 
-fake_dir=${TMPDIR:-/tmp}/mu-zsh-test-bin-${$}
-mkdir -p "$fake_dir"
-cat > "$fake_dir/mu" <<'EOF'
-#!/usr/bin/env zsh
-print -r -- "$*" >> "$MU_ZSH_FAKE_LOG"
-prompt=$(cat)
-print -r -- "prompt=$prompt" >> "$MU_ZSH_FAKE_LOG"
-if [[ -n "$MU_SESSION_FILE" ]]; then
-  print -r -- "created-session" > "$MU_SESSION_FILE"
-fi
-EOF
-chmod +x "$fake_dir/mu"
-
 export MU_ZSH_FAKE_LOG=${TMPDIR:-/tmp}/mu-zsh-test-${$}.log
 rm -f "$MU_ZSH_FAKE_LOG"
-MU_ZSH_BIN=$fake_dir/mu
 MU_ZSH_OUTPUT=plain
 MU_ZSH_SESSION_FILE=${TMPDIR:-/tmp}/mu-zsh-test-submit-${$}.session
 MU_ZSH_SESSION_ID=
@@ -137,24 +169,11 @@ grep -q -- "-s created-session" "$MU_ZSH_FAKE_LOG" || fail "passes session id on
 grep -q -- "prompt=first prompt" "$MU_ZSH_FAKE_LOG" || fail "sends first prompt on stdin"
 grep -q -- "prompt=second prompt" "$MU_ZSH_FAKE_LOG" || fail "sends second prompt on stdin"
 
-rm -rf "$fake_dir" "$MU_ZSH_FAKE_LOG" "$MU_ZSH_SESSION_FILE"
+rm -f "$MU_ZSH_FAKE_LOG" "$MU_ZSH_SESSION_FILE"
 
 for dependency in script timeout perl col cmp; do
   command -v "$dependency" >/dev/null || fail "missing test dependency: $dependency"
 done
-
-tmpdir=$(mktemp -d)
-TRAPEXIT() {
-  local exit_code=$?
-  if (( ZSH_SUBSHELL == 0 )); then
-    if (( exit_code )); then
-      print -u2 -- "test artifacts: $tmpdir"
-    else
-      rm -rf -- "$tmpdir"
-    fi
-  fi
-  return $exit_code
-}
 
 interactive_fake_bin=$tmpdir/bin
 interactive_capture_args=$tmpdir/args
@@ -164,6 +183,10 @@ mkdir -p -- "$interactive_fake_bin"
 
 cat > "$interactive_fake_bin/mu" <<'EOF'
 #!/bin/sh
+if [ "$1" = "status" ]; then
+  printf '%s\n' "{\"model_id\":\"prompt-test-model\",\"context_percent\":25.0,\"project_root\":\"$MU_ZSH_TEST_PROJECT_ROOT\"}"
+  exit 0
+fi
 printf x >> "$TEST_CAPTURE_CALLS"
 printf '%s\n' "$@" > "$TEST_CAPTURE_ARGS"
 cat > "$TEST_CAPTURE_STDIN"

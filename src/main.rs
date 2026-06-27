@@ -138,6 +138,7 @@ async fn run() -> Result<()> {
                     effort: status_args.selection.effort,
                 },
                 catalog.as_ref(),
+                scope.project(),
             )?;
             if status_args.json {
                 println!("{}", serde_json::to_string(&report)?);
@@ -408,6 +409,10 @@ fn print_status_report(report: &StatusReport) {
         (Some(percent), Some(window)) => format!("{percent:.2}% of {window}"),
         _ => "n/a".into(),
     };
+    let project = report
+        .project_root
+        .clone()
+        .unwrap_or_else(|| "(none)".into());
     let effort_levels = if report.supported_effort_levels.is_empty() {
         "(none)".into()
     } else {
@@ -423,6 +428,7 @@ fn print_status_report(report: &StatusReport) {
     println!("effort: {effort}");
     println!("session: {session}");
     println!("context: {context}");
+    println!("project: {project}");
     println!(
         "metadata: {}",
         match report.model_metadata_source {

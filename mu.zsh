@@ -11,7 +11,12 @@ typeset -g MU_ZSH_SESSION_ID=${MU_ZSH_SESSION_ID:-}
 typeset -g MU_ZSH_SESSION_FILE=${MU_ZSH_SESSION_FILE:-${TMPDIR:-/tmp}/mu-zsh-${$}.session}
 typeset -g MU_ZSH_BIN=${MU_ZSH_BIN:-mu}
 typeset -g MU_ZSH_OUTPUT=${MU_ZSH_OUTPUT:-terminal}
-typeset -g MU_ZSH_PROMPT=${MU_ZSH_PROMPT:-'mu> '}
+typeset -g MU_ZSH_PROMPT_INPUT=${MU_ZSH_PROMPT_INPUT:-${MU_ZSH_PROMPT:-'mu> '}}
+typeset -g MU_ZSH_PROMPT=${MU_ZSH_PROMPT:-$MU_ZSH_PROMPT_INPUT}
+typeset -g MU_ZSH_PROMPT_MODEL_COLOR=${MU_ZSH_PROMPT_MODEL_COLOR:-green}
+typeset -g MU_ZSH_PROMPT_CONTEXT_COLOR=${MU_ZSH_PROMPT_CONTEXT_COLOR:-magenta}
+typeset -g MU_ZSH_PROMPT_PWD_COLOR=${MU_ZSH_PROMPT_PWD_COLOR:-yellow}
+typeset -g MU_ZSH_PROMPT_PROJECT_COLOR=${MU_ZSH_PROMPT_PROJECT_COLOR:-cyan}
 typeset -g MU_ZSH_ORIGINAL_PROMPT=${MU_ZSH_ORIGINAL_PROMPT:-}
 typeset -g MU_ZSH_ORIGINAL_RPROMPT=${MU_ZSH_ORIGINAL_RPROMPT:-}
 typeset -g MU_ZSH_SAVED_KEYMAP=${MU_ZSH_SAVED_KEYMAP:-main}
@@ -109,6 +114,82 @@ _mu_zsh_build_command() {
   print -r -- "${(j: :)${(q)command[@]}}"
 }
 
+_mu_zsh_escape_prompt_text() {
+  local text=$1
+  text=${text//\%/%%}
+  print -r -- "$text"
+}
+
+_mu_zsh_status_json() {
+  local -a command
+  command=("$MU_ZSH_BIN" status --json)
+  [[ -n "$MU_ZSH_SESSION_ID" ]] && command+=(-s "$MU_ZSH_SESSION_ID")
+  "${command[@]}" 2>/dev/null
+}
+
+_mu_zsh_status_field() {
+  local json=$1
+  local key=$2
+  local remainder
+
+  remainder=${json#*\"$key\":}
+  [[ "$remainder" == "$json" ]] && return 1
+
+  if [[ "$remainder" == \"* ]]; then
+    remainder=${remainder#\"}
+    print -r -- "${remainder%%\"*}"
+    return 0
+  fi
+
+  remainder=${remainder%%,*}
+  remainder=${remainder%%\}*}
+  print -r -- "$remainder"
+}
+
+_mu_zsh_format_context_percent() {
+  local raw=$1
+  local formatted
+
+  if [[ -z "$raw" || "$raw" == null ]]; then
+    print -r -- "0%"
+    return 0
+  fi
+
+  formatted=$(printf '%.0f%%' "$raw" 2>/dev/null) || {
+    print -r -- "0%"
+    return 0
+  }
+  print -r -- "$formatted"
+}
+
+_mu_zsh_build_mode_prompt() {
+  local status_json model context_raw context cwd project_root project_segment
+
+  status_json=$(_mu_zsh_status_json) || status_json=
+  model=$(_mu_zsh_status_field "$status_json" model_id 2>/dev/null) || model=mu
+  context_raw=$(_mu_zsh_status_field "$status_json" context_percent 2>/dev/null) || context_raw=
+  project_root=$(_mu_zsh_status_field "$status_json" project_root 2>/dev/null) || project_root=
+  [[ "$project_root" == null ]] && project_root=
+  context=$(_mu_zsh_format_context_percent "$context_raw")
+  cwd=$(_mu_zsh_escape_prompt_text "$PWD")
+  if [[ -n "$project_root" && "$project_root" != "$PWD" ]]; then
+    project_segment=" %F{$MU_ZSH_PROMPT_PROJECT_COLOR}($(_mu_zsh_escape_prompt_text "$project_root"))%f"
+  else
+    project_segment=
+  fi
+
+  print -r -- "%F{$MU_ZSH_PROMPT_MODEL_COLOR}$(_mu_zsh_escape_prompt_text "$model")%f %F{$MU_ZSH_PROMPT_CONTEXT_COLOR}$(_mu_zsh_escape_prompt_text "$context")%f %F{$MU_ZSH_PROMPT_PWD_COLOR}${cwd}%f${project_segment}
+${MU_ZSH_PROMPT_INPUT}"
+}
+
+_mu_zsh_refresh_prompt() {
+  local mode_prompt
+
+  mode_prompt=$(_mu_zsh_build_mode_prompt) || mode_prompt=$MU_ZSH_PROMPT_INPUT
+  MU_ZSH_PROMPT=$mode_prompt
+  [[ "$MU_ZSH_MODE" == mu ]] && PROMPT=$mode_prompt
+}
+
 _mu_zsh_disable_editor_plugins() {
   if (( $+ZSH_HIGHLIGHT_HIGHLIGHTERS )); then
     MU_ZSH_HAD_HIGHLIGHTERS=1
@@ -176,6 +257,7 @@ _mu_zsh_clear_history_return() {
 }
 
 _mu_zsh_reset_mode_prompt() {
+  [[ "$MU_ZSH_MODE" == mu ]] && _mu_zsh_refresh_prompt
   zle reset-prompt
   _mu_zsh_apply_prompt_tty
   zle -K mumode 2>/dev/null || true
@@ -197,7 +279,7 @@ _mu_zsh_enter_mode() {
   MU_ZSH_SAVED_KEYMAP=${KEYMAP:-main}
   MU_ZSH_ORIGINAL_PROMPT=$PROMPT
   MU_ZSH_ORIGINAL_RPROMPT=$RPROMPT
-  PROMPT=$MU_ZSH_PROMPT
+  _mu_zsh_refresh_prompt
   RPROMPT=
   _mu_zsh_disable_editor_plugins
   _mu_zsh_run_hooks "${MU_ZSH_ENTER_HOOKS[@]}"
@@ -373,6 +455,7 @@ _mu_zsh_shell_down() {
 
 _mu_zsh_line_init() {
   _mu_zsh_capture_tty_state
+  [[ "$MU_ZSH_MODE" == mu ]] && _mu_zsh_refresh_prompt
   _mu_zsh_apply_prompt_tty
   if [[ "$MU_ZSH_MODE" == mu ]]; then
     zle -K mumode 2>/dev/null || true
