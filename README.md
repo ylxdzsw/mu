@@ -35,10 +35,15 @@ source /path/to/mu/mu.zsh
 # source /usr/share/mu/mu.zsh
 ```
 
-Press Tab on an empty prompt to switch into `mu>` mode. Press Enter to submit
-the current buffer as one `mu` turn. Ctrl-C clears the current `mu>` prompt and
-draws a fresh one. Press Ctrl-D, or Backspace on an empty `mu>` prompt, to return
-to the normal shell prompt without adding a new line.
+Press Tab with the cursor at the beginning of the line to toggle into or out of
+`mu>` mode without losing the current buffer. Press Enter to submit the current
+buffer as one `mu` turn when it contains non-whitespace text; empty or
+whitespace-only Enter just draws a fresh `mu>` prompt. Ctrl-C cancels the
+current `mu>` draft, leaves the cancelled line in scrollback, and draws a fresh
+prompt. Backspace always deletes. Ctrl-D keeps normal shell EOF behavior even in
+`mu>` mode, so an empty `mu>` prompt exits the shell. Press Up in `mu>` mode to
+detour through normal shell history recall; when you return to the saved draft,
+Down re-enters `mu>` mode with that draft restored.
 
 The plugin owns only zsh line editing and prompt mode. Each submission still
 spawns the `mu` binary for one foreground turn, so streaming output, Ctrl-C, and

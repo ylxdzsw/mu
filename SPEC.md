@@ -449,11 +449,16 @@ in-flight work, but committed transcript content is never erased from scrollback
 ## 6. zsh shell surface
 
 The zsh plugin is the preferred interactive surface. It behaves like a shell
-editing mode: Tab on an empty shell prompt switches the current prompt to `mu>`,
-Enter submits the current buffer as one `mu` turn, Ctrl-C clears the current
-`mu>` buffer and draws a fresh `mu>` prompt, and Ctrl-D or Backspace on an empty
-`mu>` prompt returns to the normal shell prompt without printing a new line. The
-plugin must not duplicate agent-loop, provider, store, or tool semantics.
+editing mode: Tab with the cursor at the beginning of the line toggles the
+current prompt into or out of `mu>` mode while preserving the current buffer;
+Enter submits the current buffer as one `mu` turn when it contains non-whitespace
+text and otherwise just draws a fresh `mu>` prompt; Ctrl-C cancels the current
+`mu>` draft but leaves the cancelled line in scrollback; Backspace remains an
+ordinary delete key; and Ctrl-D keeps normal shell EOF behavior even while
+`mu>` mode is active. Up-arrow history recall should temporarily detour out of
+`mu>` mode, and Down should restore the saved draft and re-enter `mu>` mode
+when the user returns to that point in history. The plugin must not duplicate
+agent-loop, provider, store, or tool semantics.
 
 ### 6.1 Invocation pattern
 
@@ -466,20 +471,28 @@ Consequences:
 
 - `mu` owns the terminal while each turn is running; streaming output works
   directly.
-- Ctrl-C while editing in `mu>` mode clears the current buffer and redraws
-  `mu>` like a shell prompt interrupt. Ctrl-C while a foreground `mu` turn is
-  running uses ordinary Unix signal behavior for the foreground process.
+- Ctrl-C while editing in `mu>` mode cancels the current draft, leaves that
+  prompt line visible in scrollback, and redraws `mu>` like a shell prompt
+  interrupt. Ctrl-C while a foreground `mu` turn is running uses ordinary Unix
+  signal behavior for the foreground process.
 - After each turn exits, zsh returns to `mu>` mode with the same session id.
 
 ### 6.2 Entry and exit
 
 - Source `mu.zsh` from `.zshrc`.
-- Press Tab on an empty shell prompt to enter `mu>` mode.
-- Enter a non-empty line to run one turn.
-- Press Ctrl-C while editing to discard the current buffer and draw a fresh
-  `mu>` prompt.
-- Press Ctrl-D, or Backspace on an empty `mu>` prompt, to leave `mu>` mode and
-  restore the normal shell prompt in place.
+- Press Tab with the cursor at the beginning of the line to enter `mu>` mode;
+  press Tab at the beginning of a `mu>` line to leave it again. In both
+  directions, keep the current buffer and cursor position intact.
+- Enter a non-whitespace line to run one turn. Empty or whitespace-only Enter
+  should draw a fresh `mu>` prompt without submitting anything.
+- Press Ctrl-C while editing to cancel the current draft, keep the cancelled
+  line in scrollback, clear the live buffer, and draw a fresh `mu>` prompt.
+- Backspace should always delete backward; it is not a mode-exit key.
+- Ctrl-D should keep normal shell EOF semantics even inside `mu>` mode, so an
+  empty `mu>` prompt exits the shell rather than merely leaving prompt mode.
+- Press Up while editing in `mu>` mode to recall shell history and temporarily
+  leave prompt mode; if the user returns to the saved draft with Down, re-enter
+  `mu>` mode with that draft restored.
 - While `mu>` mode is active, conflicting line-editor plugins should be
   suspended. Common ZLE helpers such as syntax highlighting and autosuggestions
   may be disabled automatically; additional plugin toggles may be attached with

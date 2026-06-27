@@ -12,17 +12,21 @@ fail() {
 [[ "$MU_ZSH_MODE" == shell ]] || fail "starts in shell mode"
 
 BUFFER="echo hello"
-CURSOR=${#BUFFER}
+CURSOR=0
 PROMPT="%# "
 RPROMPT="right"
 _mu_zsh_enter_mode
 [[ "$MU_ZSH_MODE" == mu ]] || fail "enters mu mode"
-[[ "$BUFFER" == "" ]] || fail "clears buffer in mu mode"
+[[ "$BUFFER" == "echo hello" ]] || fail "preserves buffer in mu mode"
+[[ "$CURSOR" -eq 0 ]] || fail "preserves cursor in mu mode"
 [[ "$PROMPT" == "$MU_ZSH_PROMPT" ]] || fail "sets mu prompt"
 
+BUFFER="edited in mu"
+CURSOR=3
 _mu_zsh_exit_mode
 [[ "$MU_ZSH_MODE" == shell ]] || fail "exits mu mode"
-[[ "$BUFFER" == "echo hello" ]] || fail "restores shell buffer"
+[[ "$BUFFER" == "edited in mu" ]] || fail "preserves current buffer when exiting mu mode"
+[[ "$CURSOR" -eq 3 ]] || fail "preserves current cursor when exiting mu mode"
 [[ "$PROMPT" == "%# " ]] || fail "restores prompt"
 [[ "$RPROMPT" == "right" ]] || fail "restores right prompt"
 
@@ -64,12 +68,24 @@ KEYMAP=main
 _mu_zsh_enter_mode
 [[ "$MU_ZSH_SAVED_KEYMAP" == main ]] || fail "saves current keymap"
 _mu_zsh_exit_mode
-[[ "$MU_ZSH_MODE" == shell ]] || fail "ctrl-d path can exit mu mode"
-[[ "$BUFFER" == "draft prompt" ]] || fail "ctrl-d path restores shell buffer"
+[[ "$MU_ZSH_MODE" == shell ]] || fail "mode exit path returns to shell"
+[[ "$BUFFER" == "draft prompt" ]] || fail "mode exit path preserves shell buffer"
 
 MU_ZSH_ORIGINAL_TAB_WIDGET=
 _mu_zsh_save_widget_bindings
 [[ -n "$MU_ZSH_ORIGINAL_TAB_WIDGET" ]] || fail "saves tab widget fallback"
+up_key=$'\e[A'
+down_key=$'\e[B'
+[[ -n "${MU_ZSH_SHELL_UP_WIDGETS[$up_key]:-}" ]] || fail "saves up-arrow widget fallback"
+[[ -n "${MU_ZSH_SHELL_DOWN_WIDGETS[$down_key]:-}" ]] || fail "saves down-arrow widget fallback"
+
+MU_ZSH_HISTORY_BUFFER="draft"
+MU_ZSH_HISTORY_CURSOR=2
+MU_ZSH_HISTORY_HISTNO=7
+_mu_zsh_clear_history_return
+[[ -z "$MU_ZSH_HISTORY_BUFFER" ]] || fail "clears saved history return buffer"
+[[ "$MU_ZSH_HISTORY_CURSOR" -eq 0 ]] || fail "clears saved history return cursor"
+[[ "$MU_ZSH_HISTORY_HISTNO" -eq 0 ]] || fail "clears saved history return histno"
 
 MU_ZSH_BIN=mu
 MU_ZSH_OUTPUT=terminal
@@ -144,7 +160,6 @@ interactive_fake_bin=$tmpdir/bin
 interactive_capture_args=$tmpdir/args
 interactive_capture_stdin=$tmpdir/stdin
 interactive_capture_calls=$tmpdir/calls
-interactive_transcript=$tmpdir/transcript
 mkdir -p -- "$interactive_fake_bin"
 
 cat > "$interactive_fake_bin/mu" <<'EOF'
@@ -159,22 +174,23 @@ printf '%s\n\n' "Hello! I'm your terminal agent. How can I assist you today? Fee
 EOF
 chmod +x "$interactive_fake_bin/mu"
 
-interactive_setup="PS1='> '; PATH=${(q)interactive_fake_bin}:\$PATH; export TEST_CAPTURE_ARGS=${(q)interactive_capture_args} TEST_CAPTURE_STDIN=${(q)interactive_capture_stdin} TEST_CAPTURE_CALLS=${(q)interactive_capture_calls}; source ${(q)root}/mu.zsh"
+interactive_setup="PS1='> '; PATH=${(q)interactive_fake_bin}:\$PATH; export TEST_CAPTURE_ARGS=${(q)interactive_capture_args} TEST_CAPTURE_STDIN=${(q)interactive_capture_stdin} TEST_CAPTURE_CALLS=${(q)interactive_capture_calls}; source ${(q)root}/mu.zsh; bindkey -M mumode '^G' _mu_zsh_interrupt"
+
+interactive_transcript=$tmpdir/transcript
+rm -f -- "$interactive_capture_args" "$interactive_capture_stdin" "$interactive_capture_calls"
 interactive_status=0
 {
   print -r -- "$interactive_setup"
   sleep 0.2
-  print -rn -- $'\t''hello'$'\r'
+  print -rn -- $'\t\r'
+  sleep 0.2
+  print -rn -- '   '$'\r'
+  sleep 0.2
+  print -rn -- 'cancel-me'$'\x07'
+  sleep 0.4
+  print -rn -- 'hello'$'\r'
   sleep 0.4
   print -rn -- $'\x04'
-  sleep 0.2
-  print -rn -- 'echo shell-after'
-  sleep 0.2
-  print -rn -- $'\r'
-  sleep 0.2
-  print -rn -- 'exit'
-  sleep 0.2
-  print -rn -- $'\r'
 } | timeout 5 script -qfec 'TERM=xterm-256color zsh -df' "$interactive_transcript" >/dev/null || interactive_status=$?
 (( interactive_status == 0 )) || fail "interactive transcript exited with status $interactive_status"
 
@@ -184,11 +200,8 @@ for line in "${(@f)normalized}"; do
   [[ "$line" == 'mu> hello' ]] && (( hello_count += 1 ))
 done
 (( hello_count == 1 )) || fail "submitted prompt should appear once, saw $hello_count copies"
-[[ "$normalized" != *$'mu>\nmu> hello'* ]] || fail "should not print a blank mu prompt before the submitted line"
-[[ "$normalized" != *$'\nhello\n'* ]] || fail "submitted prompt should not be echoed again after the agent finishes"
 [[ "$normalized" == *"Hello! I'm your terminal agent."* ]] || fail "interactive response should be rendered"
-[[ "$normalized" == *'echo shell-after'* ]] || fail "Ctrl-D should return to the shell prompt"
-[[ "$normalized" == *$'\nshell-after\n'* ]] || fail "shell command after Ctrl-D should run"
+[[ "$normalized" == *'mu> cancel-me'* ]] || fail "Ctrl-C should leave the cancelled mu line in scrollback"
 [[ $(<"$interactive_capture_calls") == x ]] || fail "interactive fake mu should run exactly once"
 
 interactive_expected_stdin=$tmpdir/expected-stdin
@@ -198,5 +211,49 @@ cmp -- "$interactive_expected_stdin" "$interactive_capture_stdin" || fail "inter
 interactive_args=("${(@f)$(<"$interactive_capture_args")}")
 expected_interactive_args=(--output terminal)
 [[ "${(j:\0:)interactive_args}" == "${(j:\0:)expected_interactive_args}" ]] || fail "unexpected interactive args: ${interactive_args[*]}"
+
+toggle_transcript=$tmpdir/toggle-transcript
+toggle_setup="$interactive_setup; _mu_test_tab_roundtrip() { BUFFER='echo toggled'; CURSOR=0; _mu_zsh_tab; _mu_zsh_tab; }; zle -N _mu_test_tab_roundtrip; bindkey '^T' _mu_test_tab_roundtrip"
+rm -f -- "$interactive_capture_args" "$interactive_capture_stdin" "$interactive_capture_calls"
+interactive_status=0
+{
+  print -r -- "$toggle_setup"
+  sleep 0.2
+  print -rn -- $'\x14\r'
+  sleep 0.2
+  print -rn -- 'exit'
+  sleep 0.2
+  print -rn -- $'\r'
+} | timeout 5 script -qfec 'TERM=xterm-256color zsh -df' "$toggle_transcript" >/dev/null || interactive_status=$?
+(( interactive_status == 0 )) || fail "toggle transcript exited with status $interactive_status"
+
+normalized=$(perl -pe 's/\e\[[0-?]*[ -\/]*[@-~]//g' "$toggle_transcript" | col -b)
+[[ "$normalized" == *$'\ntoggled\n'* ]] || fail "Tab at cursor start should preserve the buffer when returning to shell mode"
+[[ ! -e "$interactive_capture_calls" || ! -s "$interactive_capture_calls" ]] || fail "Tab toggle transcript should not call fake mu"
+
+history_return_replay=$tmpdir/history-return-replay
+history_return_file=$tmpdir/history-return
+history_return_transcript=$tmpdir/history-return-transcript
+history_return_prompt='agent after history'
+print -r -- "print -rn -- shell-history > ${(q)history_return_replay}" > "$history_return_file"
+rm -f -- "$history_return_replay" "$interactive_capture_args" "$interactive_capture_stdin" "$interactive_capture_calls"
+
+history_return_setup=" setopt HIST_IGNORE_SPACE; PS1='> '; PATH=${(q)interactive_fake_bin}:\$PATH; export TEST_CAPTURE_ARGS=${(q)interactive_capture_args} TEST_CAPTURE_STDIN=${(q)interactive_capture_stdin} TEST_CAPTURE_CALLS=${(q)interactive_capture_calls}; HISTFILE=${(q)history_return_file}; HISTSIZE=100; SAVEHIST=100; fc -R ${(q)history_return_file}; source ${(q)root}/mu.zsh"
+interactive_status=0
+{
+  print -r -- "$history_return_setup"
+  sleep 0.2
+  print -rn -- $'\t'"$history_return_prompt"$'\e[A\e[B\r'
+  sleep 0.4
+  print -rn -- $'\x04'
+} | timeout 5 script -qfec 'TERM=xterm-256color zsh -df' "$history_return_transcript" >/dev/null || interactive_status=$?
+(( interactive_status == 0 )) || fail "history return transcript exited with status $interactive_status"
+[[ ! -e "$history_return_replay" ]] || fail "history detour should not execute the recalled shell history entry"
+[[ $(<"$interactive_capture_calls") == x ]] || fail "history detour should still submit exactly one mu prompt"
+
+interactive_args=("${(@f)$(<"$interactive_capture_args")}")
+[[ "${(j:\0:)interactive_args}" == "${(j:\0:)expected_interactive_args}" ]] || fail "unexpected history-detour args: ${interactive_args[*]}"
+print -rn -- "$history_return_prompt"$'\n' > "$interactive_expected_stdin"
+cmp -- "$interactive_expected_stdin" "$interactive_capture_stdin" || fail "history detour should restore the mu draft before submit"
 
 print -- "ok"
