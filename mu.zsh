@@ -406,7 +406,9 @@ _mu_zsh_accept() {
   _mu_zsh_clear_prompt
   _mu_zsh_restore_tty_state
   _mu_zsh_submit_prompt "$prompt"
-  zle .accept-line
+  _mu_zsh_capture_tty_state
+  _mu_zsh_apply_prompt_tty
+  _mu_zsh_reset_mode_prompt
 }
 
 _mu_zsh_history_up() {
