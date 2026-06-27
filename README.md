@@ -50,6 +50,26 @@ key first.
 To keep using an existing session in zsh mode, set `MU_ZSH_SESSION_ID=<id>`
 before entering `mu>` mode.
 
+While `mu>` mode is active, the plugin automatically suspends common editor
+helpers such as `zsh-syntax-highlighting` and `zsh-autosuggestions`, then
+restores their prior state when you return to the shell prompt. For any other
+conflicting plugin, register zsh functions in `MU_ZSH_ENTER_HOOKS` and
+`MU_ZSH_EXIT_HOOKS`; the enter hooks run after `mu>` mode is activated, and the
+exit hooks run after the shell prompt has been restored.
+
+```zsh
+mu_disable_conflicts() {
+  my-plugin-disable
+}
+
+mu_restore_conflicts() {
+  my-plugin-enable
+}
+
+MU_ZSH_ENTER_HOOKS+=(mu_disable_conflicts)
+MU_ZSH_EXIT_HOOKS+=(mu_restore_conflicts)
+```
+
 ## CLI
 
 | Command | Description |

@@ -18,6 +18,11 @@ typeset -g MU_ZSH_SAVED_CURSOR=${MU_ZSH_SAVED_CURSOR:-0}
 typeset -g MU_ZSH_SAVED_KEYMAP=${MU_ZSH_SAVED_KEYMAP:-main}
 typeset -g MU_ZSH_ORIGINAL_TAB_WIDGET=${MU_ZSH_ORIGINAL_TAB_WIDGET:-}
 typeset -g MU_ZSH_ORIGINAL_STTY=${MU_ZSH_ORIGINAL_STTY:-}
+typeset -gi MU_ZSH_HAD_HIGHLIGHTERS=${MU_ZSH_HAD_HIGHLIGHTERS:-0}
+typeset -gi MU_ZSH_DISABLED_AUTOSUGGESTIONS=${MU_ZSH_DISABLED_AUTOSUGGESTIONS:-0}
+typeset -ga MU_ZSH_SAVED_HIGHLIGHTERS
+typeset -ga MU_ZSH_ENTER_HOOKS
+typeset -ga MU_ZSH_EXIT_HOOKS
 
 _mu_zsh_widget_for_key() {
   local key=$1
@@ -72,6 +77,49 @@ _mu_zsh_build_command() {
   print -r -- "${(j: :)${(q)command[@]}}"
 }
 
+_mu_zsh_disable_editor_plugins() {
+  if (( $+ZSH_HIGHLIGHT_HIGHLIGHTERS )); then
+    MU_ZSH_HAD_HIGHLIGHTERS=1
+    MU_ZSH_SAVED_HIGHLIGHTERS=("${ZSH_HIGHLIGHT_HIGHLIGHTERS[@]}")
+    ZSH_HIGHLIGHT_HIGHLIGHTERS=()
+  else
+    MU_ZSH_HAD_HIGHLIGHTERS=0
+    MU_ZSH_SAVED_HIGHLIGHTERS=()
+  fi
+
+  MU_ZSH_DISABLED_AUTOSUGGESTIONS=0
+  if (( ! ${+_ZSH_AUTOSUGGEST_DISABLED} )) && zle -l autosuggest-disable >/dev/null 2>&1; then
+    if zle autosuggest-disable; then
+      MU_ZSH_DISABLED_AUTOSUGGESTIONS=1
+    fi
+  fi
+}
+
+_mu_zsh_restore_editor_plugins() {
+  if (( MU_ZSH_HAD_HIGHLIGHTERS )); then
+    ZSH_HIGHLIGHT_HIGHLIGHTERS=("${MU_ZSH_SAVED_HIGHLIGHTERS[@]}")
+  else
+    unset ZSH_HIGHLIGHT_HIGHLIGHTERS
+  fi
+
+  if (( MU_ZSH_DISABLED_AUTOSUGGESTIONS )) && zle -l autosuggest-enable >/dev/null 2>&1; then
+    zle autosuggest-enable
+  fi
+  MU_ZSH_DISABLED_AUTOSUGGESTIONS=0
+}
+
+_mu_zsh_run_hooks() {
+  local hook
+  for hook in "$@"; do
+    [[ -z "$hook" ]] && continue
+    if (( $+functions[$hook] )); then
+      "$hook"
+    else
+      print -u2 -- "mu.zsh: hook function not found: $hook"
+    fi
+  done
+}
+
 _mu_zsh_capture_tty_state() {
   [[ -n "$MU_ZSH_ORIGINAL_STTY" ]] && return 0
   [[ -t 0 ]] || return 0
@@ -103,6 +151,8 @@ _mu_zsh_enter_mode() {
   RPROMPT=
   BUFFER=
   CURSOR=0
+  _mu_zsh_disable_editor_plugins
+  _mu_zsh_run_hooks "${MU_ZSH_ENTER_HOOKS[@]}"
   zle -K mumode 2>/dev/null || true
 }
 
@@ -115,6 +165,8 @@ _mu_zsh_exit_mode() {
   RPROMPT=$MU_ZSH_ORIGINAL_RPROMPT
   BUFFER=$MU_ZSH_SAVED_BUFFER
   CURSOR=$MU_ZSH_SAVED_CURSOR
+  _mu_zsh_restore_editor_plugins
+  _mu_zsh_run_hooks "${MU_ZSH_EXIT_HOOKS[@]}"
 }
 
 _mu_zsh_clear_prompt() {

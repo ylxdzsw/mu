@@ -26,6 +26,30 @@ _mu_zsh_exit_mode
 [[ "$PROMPT" == "%# " ]] || fail "restores prompt"
 [[ "$RPROMPT" == "right" ]] || fail "restores right prompt"
 
+typeset -ga mu_test_hooks=()
+_mu_zsh_test_enter_hook() {
+  mu_test_hooks+=("enter:$MU_ZSH_MODE")
+}
+_mu_zsh_test_exit_hook() {
+  mu_test_hooks+=("exit:$MU_ZSH_MODE")
+}
+
+MU_ZSH_ENTER_HOOKS=(_mu_zsh_test_enter_hook)
+MU_ZSH_EXIT_HOOKS=(_mu_zsh_test_exit_hook)
+ZSH_HIGHLIGHT_HIGHLIGHTERS=(main brackets)
+BUFFER="hook prompt"
+CURSOR=${#BUFFER}
+PROMPT="%# "
+RPROMPT="right"
+_mu_zsh_enter_mode
+[[ "${#ZSH_HIGHLIGHT_HIGHLIGHTERS[@]}" -eq 0 ]] || fail "disables syntax highlighters in mu mode"
+[[ "${(j:,:)mu_test_hooks}" == "enter:mu" ]] || fail "runs enter hooks after switching modes"
+_mu_zsh_exit_mode
+[[ "${(j:,:)ZSH_HIGHLIGHT_HIGHLIGHTERS}" == "main,brackets" ]] || fail "restores syntax highlighters after exit"
+[[ "${(j:,:)mu_test_hooks}" == "enter:mu,exit:shell" ]] || fail "runs exit hooks after restoring shell mode"
+MU_ZSH_ENTER_HOOKS=()
+MU_ZSH_EXIT_HOOKS=()
+
 BUFFER="draft prompt"
 CURSOR=${#BUFFER}
 _mu_zsh_clear_prompt

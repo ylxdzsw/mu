@@ -480,6 +480,10 @@ Consequences:
   `mu>` prompt.
 - Press Ctrl-D, or Backspace on an empty `mu>` prompt, to leave `mu>` mode and
   restore the normal shell prompt in place.
+- While `mu>` mode is active, conflicting line-editor plugins should be
+  suspended. Common ZLE helpers such as syntax highlighting and autosuggestions
+  may be disabled automatically; additional plugin toggles may be attached with
+  mode enter/exit hooks.
 - Ctrl-D is the normal terminal EOT key (`^D`). xterm-style terminals, including
   WebTerm's xterm.js input path, forward it as input when the browser or OS has
   not intercepted the key before the terminal receives it.
