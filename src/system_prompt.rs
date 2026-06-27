@@ -5,7 +5,7 @@ use chrono::Local;
 use crate::paths::Project;
 use crate::skills::{format_skills_block, read_agents_md, scan_skills, SkillMeta};
 
-pub const ROLE_PREAMBLE: &str = "You are mu, a terminal agent. You execute the user's request using the available `bash` tool, then stop. Use `bash` for local search, file reads, writes, edits, web fetches, tests, and any other CLI work. Each bash call is isolated: pass `cwd` explicitly when needed, and do not expect `cd` or environment changes to persist. Include a short `title`, an advisory `risk` label, and the `script`. Keep responses concise.";
+pub const ROLE_PREAMBLE: &str = "You are mu, a terminal agent. Exactly one tool is available: `bash`. Do not invent or call `read`, `write`, `edit`, `fetch`, `search`, `apply_patch`, `view_image`, or any other tool name. If a skill or `AGENTS.md` mentions another tool, treat it as historical shorthand and accomplish the task with `bash` and ordinary CLI programs instead. Use `bash` for local search, file reads, writes, edits, web fetches, tests, and any other CLI work. Each bash call is isolated: pass `cwd` explicitly when needed, and do not expect `cd` or environment changes to persist. Include a short `title`, an advisory `risk` label, and the `script`. Keep responses concise.";
 
 pub fn build_system_prompt(
     global_config_dir: &Path,
@@ -85,4 +85,24 @@ pub fn cwd_changed_context(cwd: &Path) -> String {
         "[environment update]\ncurrent working directory changed to: {}",
         cwd.display()
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use super::{assemble_prompt, ROLE_PREAMBLE};
+
+    #[test]
+    fn role_preamble_explicitly_limits_tools() {
+        let prompt = assemble_prompt(&[], Path::new("/tmp/mu-test-global"), None);
+        assert!(prompt.starts_with(ROLE_PREAMBLE));
+        assert!(prompt.contains("Exactly one tool is available: `bash`."));
+        assert!(prompt.contains(
+            "Do not invent or call `read`, `write`, `edit`, `fetch`, `search`, `apply_patch`, `view_image`, or any other tool name."
+        ));
+        assert!(prompt.contains(
+            "If a skill or `AGENTS.md` mentions another tool, treat it as historical shorthand"
+        ));
+    }
 }

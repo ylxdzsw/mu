@@ -718,10 +718,14 @@ inside a project, global otherwise.
 The system prompt is intentionally minimal and assembled in this fixed order:
 
 1. A short role/behavior preamble (a few sentences). Illustrative:
-   > You are mu, a terminal agent. You execute the user's request using the
-   > available `bash` tool, then stop. Use `bash` for local search, file reads,
-   > writes, edits, web fetches, tests, and any other CLI work. Each bash call is
-   > isolated; pass `cwd` explicitly when needed. Keep responses concise.
+   > You are mu, a terminal agent. Exactly one tool is available: `bash`. Do
+   > not invent or call `read`, `write`, `edit`, `fetch`, `search`,
+   > `apply_patch`, `view_image`, or any other tool name. If a skill or
+   > `AGENTS.md` mentions another tool, treat it as historical shorthand and
+   > accomplish the task with `bash` and ordinary CLI programs instead. Use
+   > `bash` for local search, file reads, writes, edits, web fetches, tests,
+   > and any other CLI work. Each bash call is isolated; pass `cwd` explicitly
+   > when needed. Keep responses concise.
    The exact wording lives in one constant in the binary; keep it short.
 2. An environment block, plain `key: value` lines:
    ```
