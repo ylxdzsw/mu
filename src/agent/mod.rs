@@ -10,7 +10,9 @@ use crate::compaction;
 use crate::config::Config;
 use crate::guardrail::{bash_risk, Guardrail, GuardrailOutcome};
 use crate::models::RequestOptions;
-use crate::provider::{FinishReason, Message, Provider, ProviderError, ToolCall, UserContent};
+use crate::provider::{
+    FinishReason, Message, Provider, ProviderError, StreamEvent, ToolCall, UserContent,
+};
 use crate::renderer::Renderer;
 use crate::store::Store;
 use crate::tools::{missing_tool_message, ExecutionMode, ToolContext, ToolRegistry, ToolResult};
@@ -89,16 +91,29 @@ impl<'a> AgentLoop<'a> {
         const MAX_OVERFLOW_RETRIES: u32 = 3;
 
         for iteration in 0..max_iter {
-            let mut on_text_delta = |text: String| -> Result<(), ProviderError> {
-                self.renderer
-                    .assistant_text(&text)
-                    .map_err(|e| ProviderError::Other(e.to_string()))
+            self.renderer.thinking_start()?;
+            let mut on_stream_event = |event: StreamEvent| -> Result<(), ProviderError> {
+                let result = match event {
+                    StreamEvent::TextDelta(text) => self.renderer.assistant_text(&text),
+                    StreamEvent::Tick => self.renderer.thinking_tick(),
+                };
+                result.map_err(|e| ProviderError::Other(e.to_string()))
             };
             let result = self
                 .provider
-                .stream_chat(&self.request, &context, &tools, &mut on_text_delta)
+                .stream_chat(&self.request, &context, &tools, &mut on_stream_event)
                 .await;
             self.renderer.assistant_end()?;
+            match &result {
+                Ok(stream_result) => {
+                    let usage = stream_result
+                        .usage
+                        .as_ref()
+                        .map(|u| (u.prompt_tokens, u.completion_tokens));
+                    self.renderer.thinking_finish(usage)?;
+                }
+                Err(_) => self.renderer.thinking_cancel()?,
+            }
 
             let stream_result = match result {
                 Ok(r) => r,

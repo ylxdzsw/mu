@@ -1,5 +1,5 @@
 use std::io::{self, IsTerminal, Write};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use pulldown_cmark::{Event, Options, Parser, Tag, TagEnd};
 
@@ -16,6 +16,7 @@ const RED: &str = "\x1b[91m";
 const GREEN: &str = "\x1b[92m";
 const YELLOW: &str = "\x1b[93m";
 const CYAN: &str = "\x1b[96m";
+const GRAY: &str = "\x1b[90m";
 
 pub struct Renderer {
     stdout: io::Stdout,
@@ -24,6 +25,7 @@ pub struct Renderer {
     styled: bool,
     format: OutputFormat,
     markdown: MarkdownStream,
+    thinking: Option<ThinkingLine>,
 }
 
 impl Renderer {
@@ -40,6 +42,7 @@ impl Renderer {
             stdout_at_line_start: true,
             format,
             markdown: MarkdownStream::default(),
+            thinking: None,
         }
     }
 
@@ -47,6 +50,7 @@ impl Renderer {
         if text.is_empty() {
             return Ok(());
         }
+        self.thinking_text_delta(text);
         if self.format == OutputFormat::Json {
             return self.write_json("assistant_delta", serde_json::json!({ "text": text }));
         }
@@ -54,19 +58,71 @@ impl Renderer {
             return self.write_stdout(text);
         }
 
-        for block in self.markdown.push(text) {
+        let blocks = self.markdown.push(text);
+        if blocks.is_empty() {
+            return self.render_thinking_line();
+        }
+
+        self.clear_thinking_line()?;
+        for block in blocks {
             let rendered = render_markdown(&block);
             self.write_stdout(&rendered)?;
         }
-        Ok(())
+        self.render_thinking_line()
     }
 
     pub fn assistant_end(&mut self) -> io::Result<()> {
         let Some(block) = self.markdown.finish() else {
             return Ok(());
         };
+        self.clear_thinking_line()?;
         let rendered = render_markdown(&block);
-        self.write_stdout(&rendered)
+        self.write_stdout(&rendered)?;
+        self.render_thinking_line()
+    }
+
+    pub fn thinking_start(&mut self) -> io::Result<()> {
+        if !self.styled {
+            return Ok(());
+        }
+        self.clear_thinking_line()?;
+        self.thinking = Some(ThinkingLine {
+            started: Instant::now(),
+            output_chars: 0,
+            rendered: false,
+        });
+        self.render_thinking_line()
+    }
+
+    pub fn thinking_tick(&mut self) -> io::Result<()> {
+        self.render_thinking_line()
+    }
+
+    pub fn thinking_finish(&mut self, usage: Option<(u64, u64)>) -> io::Result<()> {
+        let Some(thinking) = self.thinking.take() else {
+            return Ok(());
+        };
+        if !thinking.rendered {
+            return Ok(());
+        }
+        self.clear_rendered_thinking_line()?;
+        let elapsed = format_duration(thinking.started.elapsed());
+        let line = match usage {
+            Some((prompt_tokens, completion_tokens)) => format!(
+                "{GRAY}thought {elapsed}  in {prompt_tokens} tok  out {completion_tokens} tok{RESET}\n"
+            ),
+            None => format!(
+                "{GRAY}thought {elapsed}  out ~{} tok{RESET}\n",
+                approx_tokens_from_chars(thinking.output_chars)
+            ),
+        };
+        self.write_stdout(&line)
+    }
+
+    pub fn thinking_cancel(&mut self) -> io::Result<()> {
+        self.clear_thinking_line()?;
+        self.thinking = None;
+        Ok(())
     }
 
     /// Completion-only tools are silent here. Bash is the exception because
@@ -260,10 +316,61 @@ impl Renderer {
     }
 
     fn ensure_line_start(&mut self) -> io::Result<()> {
+        self.clear_thinking_line()?;
         if self.stdout_at_line_start {
             return Ok(());
         }
         self.write_stdout("\n")
+    }
+
+    fn thinking_text_delta(&mut self, text: &str) {
+        if let Some(thinking) = self.thinking.as_mut() {
+            thinking.output_chars = thinking.output_chars.saturating_add(text.chars().count());
+        }
+    }
+
+    fn render_thinking_line(&mut self) -> io::Result<()> {
+        let Some(thinking) = self.thinking.as_ref() else {
+            return Ok(());
+        };
+        if !self.styled {
+            return Ok(());
+        }
+        let line = format_thinking_live(
+            thinking.started.elapsed(),
+            approx_tokens_from_chars(thinking.output_chars),
+        );
+        if thinking.rendered {
+            self.stdout.write_all(b"\r\x1b[2K")?;
+        } else if !self.stdout_at_line_start {
+            self.write_stdout("\n")?;
+        }
+        self.stdout.write_all(line.as_bytes())?;
+        self.stdout_at_line_start = false;
+        if let Some(thinking) = self.thinking.as_mut() {
+            thinking.rendered = true;
+        }
+        self.stdout.flush()
+    }
+
+    fn clear_thinking_line(&mut self) -> io::Result<()> {
+        let rendered = self
+            .thinking
+            .as_ref()
+            .is_some_and(|thinking| thinking.rendered);
+        if rendered {
+            self.clear_rendered_thinking_line()?;
+            if let Some(thinking) = self.thinking.as_mut() {
+                thinking.rendered = false;
+            }
+        }
+        Ok(())
+    }
+
+    fn clear_rendered_thinking_line(&mut self) -> io::Result<()> {
+        self.stdout.write_all(b"\r\x1b[2K")?;
+        self.stdout_at_line_start = true;
+        self.stdout.flush()
     }
 
     fn write_stdout(&mut self, text: &str) -> io::Result<()> {
@@ -292,6 +399,12 @@ impl Default for Renderer {
 #[derive(Default)]
 struct MarkdownStream {
     pending: String,
+}
+
+struct ThinkingLine {
+    started: Instant,
+    output_chars: usize,
+    rendered: bool,
 }
 
 impl MarkdownStream {
@@ -585,6 +698,18 @@ fn format_duration(duration: Duration) -> String {
     format!("{:.1}s", duration.as_secs_f64())
 }
 
+fn format_thinking_live(elapsed: Duration, output_tokens: u64) -> String {
+    format!(
+        "{GRAY}thinking {}  out ~{} tok{RESET}",
+        format_duration(elapsed),
+        output_tokens
+    )
+}
+
+fn approx_tokens_from_chars(chars: usize) -> u64 {
+    ((chars as u64) + 3) / 4
+}
+
 fn strip_ansi(input: &str) -> String {
     let mut out = String::with_capacity(input.len());
     let mut chars = input.chars().peekable();
@@ -702,6 +827,12 @@ mod tests {
         );
         assert!(line.contains("exit 0"));
         assert!(line.contains(GREEN));
+    }
+
+    #[test]
+    fn thinking_live_line_is_gray_and_uses_approx_output_tokens() {
+        let line = format_thinking_live(Duration::from_millis(1250), approx_tokens_from_chars(17));
+        assert_eq!(line, "\x1b[90mthinking 1.2s  out ~5 tok\x1b[0m");
     }
 
     #[test]

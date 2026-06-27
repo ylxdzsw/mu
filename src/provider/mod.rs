@@ -101,6 +101,12 @@ pub struct StreamResult {
     pub usage: Option<Usage>,
 }
 
+#[derive(Debug, Clone)]
+pub enum StreamEvent {
+    TextDelta(String),
+    Tick,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FinishReason {
     Stop,
@@ -123,7 +129,7 @@ pub trait Provider: Send + Sync {
         request: &RequestOptions,
         messages: &[Message],
         tools: &[Value],
-        on_text_delta: &mut dyn FnMut(String) -> Result<(), ProviderError>,
+        on_event: &mut dyn FnMut(StreamEvent) -> Result<(), ProviderError>,
     ) -> Result<StreamResult, ProviderError>;
 }
 

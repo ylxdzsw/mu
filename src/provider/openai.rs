@@ -1,14 +1,17 @@
 use std::collections::BTreeMap;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use reqwest::Client;
 use serde::Deserialize;
 use serde_json::Value;
+use tokio::time::{self, MissedTickBehavior};
 
 use crate::models::RequestOptions;
 
 use super::{
-    FinishReason, FunctionCall, Message, Provider, ProviderError, StreamResult, ToolCall, Usage,
+    FinishReason, FunctionCall, Message, Provider, ProviderError, StreamEvent, StreamResult,
+    ToolCall, Usage,
 };
 
 pub struct OpenAiProvider {
@@ -74,7 +77,7 @@ impl Provider for OpenAiProvider {
         request: &RequestOptions,
         messages: &[Message],
         tools: &[Value],
-        on_text_delta: &mut dyn FnMut(String) -> Result<(), ProviderError>,
+        on_event: &mut dyn FnMut(StreamEvent) -> Result<(), ProviderError>,
     ) -> Result<StreamResult, ProviderError> {
         let url = format!("{}/chat/completions", self.base_url);
         let body = build_chat_request_body(request, messages, tools);
@@ -109,11 +112,21 @@ impl Provider for OpenAiProvider {
 
         let mut buffer = String::new();
         let mut byte_buf: Vec<u8> = Vec::new();
-        while let Some(chunk) = response
-            .chunk()
-            .await
-            .map_err(|e| ProviderError::Other(e.to_string()))?
-        {
+        let mut tick = time::interval(Duration::from_millis(250));
+        tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        loop {
+            let chunk = tokio::select! {
+                chunk = response.chunk() => {
+                    chunk.map_err(|e| ProviderError::Other(e.to_string()))?
+                }
+                _ = tick.tick() => {
+                    on_event(StreamEvent::Tick)?;
+                    continue;
+                }
+            };
+            let Some(chunk) = chunk else {
+                break;
+            };
             byte_buf.extend_from_slice(&chunk);
             // Decode only the longest valid UTF-8 prefix; keep trailing bytes
             // of a split multi-byte codepoint for the next chunk.
@@ -136,7 +149,7 @@ impl Provider for OpenAiProvider {
                 &mut tool_accum,
                 &mut finish_reason,
                 &mut usage,
-                on_text_delta,
+                on_event,
             )?;
         }
         // Flush any remaining undecodable trailing bytes (lossy) so a final
@@ -152,7 +165,7 @@ impl Provider for OpenAiProvider {
                 &mut tool_accum,
                 &mut finish_reason,
                 &mut usage,
-                on_text_delta,
+                on_event,
             )?;
         }
 
@@ -215,7 +228,7 @@ fn consume_sse_buffer(
     tool_accum: &mut BTreeMap<usize, (Option<String>, Option<String>, String, String)>,
     finish_reason: &mut FinishReason,
     usage: &mut Option<Usage>,
-    on_text_delta: &mut dyn FnMut(String) -> Result<(), ProviderError>,
+    on_event: &mut dyn FnMut(StreamEvent) -> Result<(), ProviderError>,
 ) -> Result<(), ProviderError> {
     while let Some((pos, sep_len)) = next_event_boundary(buffer) {
         let event = buffer[..pos].to_string();
@@ -243,7 +256,7 @@ fn consume_sse_buffer(
 
             if let Some(choice) = parsed.choices.first() {
                 if let Some(text) = choice.delta.content.clone() {
-                    on_text_delta(text.clone())?;
+                    on_event(StreamEvent::TextDelta(text.clone()))?;
                     content.push_str(&text);
                 }
                 if let Some(ref tcs) = choice.delta.tool_calls {
@@ -309,8 +322,10 @@ mod tests {
     #[test]
     fn streams_deltas_and_accumulates_tool_calls() {
         let mut seen = String::new();
-        let mut on_text = |delta: String| -> Result<(), ProviderError> {
-            seen.push_str(&delta);
+        let mut on_event = |event: StreamEvent| -> Result<(), ProviderError> {
+            if let StreamEvent::TextDelta(delta) = event {
+                seen.push_str(&delta);
+            }
             Ok(())
         };
 
@@ -333,7 +348,7 @@ mod tests {
                 &mut tool_accum,
                 &mut finish_reason,
                 &mut usage,
-                &mut on_text,
+                &mut on_event,
             )
             .unwrap();
         }
@@ -361,8 +376,10 @@ mod tests {
     #[test]
     fn handles_crlf_event_framing() {
         let mut seen = String::new();
-        let mut on_text = |delta: String| -> Result<(), ProviderError> {
-            seen.push_str(&delta);
+        let mut on_event = |event: StreamEvent| -> Result<(), ProviderError> {
+            if let StreamEvent::TextDelta(delta) = event {
+                seen.push_str(&delta);
+            }
             Ok(())
         };
 
@@ -381,7 +398,7 @@ mod tests {
             &mut tool_accum,
             &mut finish_reason,
             &mut usage,
-            &mut on_text,
+            &mut on_event,
         )
         .unwrap();
 

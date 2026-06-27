@@ -173,7 +173,7 @@ impl Guardrail {
                 tokio::time::sleep(backoff).await;
             }
 
-            let mut ignore_text = |_delta: String| Ok(());
+            let mut ignore_event = |_event: crate::provider::StreamEvent| Ok(());
             let result = tokio::time::timeout(timeout, async {
                 self.provider
                     .stream_chat(
@@ -183,7 +183,7 @@ impl Guardrail {
                         },
                         &msgs,
                         &[],
-                        &mut ignore_text,
+                        &mut ignore_event,
                     )
                     .await
             })

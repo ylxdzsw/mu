@@ -118,9 +118,9 @@ pub async fn run_compaction(
     ];
 
     let tools: Vec<serde_json::Value> = vec![];
-    let mut ignore_text = |_delta: String| Ok(());
+    let mut ignore_event = |_event: crate::provider::StreamEvent| Ok(());
     let result = provider
-        .stream_chat(request, &msgs, &tools, &mut ignore_text)
+        .stream_chat(request, &msgs, &tools, &mut ignore_event)
         .await;
     match result {
         Ok(r) => {
@@ -182,7 +182,7 @@ mod tests {
             _request: &RequestOptions,
             _messages: &[Message],
             _tools: &[Value],
-            _on_text_delta: &mut dyn FnMut(String) -> Result<(), ProviderError>,
+            _on_event: &mut dyn FnMut(crate::provider::StreamEvent) -> Result<(), ProviderError>,
         ) -> Result<StreamResult, ProviderError> {
             Ok(StreamResult {
                 message: Message::Assistant {
