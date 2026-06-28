@@ -17,8 +17,10 @@ const GREEN: &str = "\x1b[92m";
 const YELLOW: &str = "\x1b[93m";
 const CYAN: &str = "\x1b[96m";
 const GRAY: &str = "\x1b[90m";
-const BASH_HEAD_LINE_BUDGET: usize = 32;
-const BASH_HEAD_BYTE_BUDGET: usize = 8192;
+const BASH_COMMAND_PREVIEW_BYTES: usize = 160;
+const BASH_HEAD_LINE_BUDGET: usize = 3;
+const BASH_HEAD_BYTE_BUDGET: usize = 1024;
+const BASH_HEAD_LINE_CAP_BYTES: usize = 256;
 const BASH_TAIL_LINE_RESERVE: usize = 2;
 const BASH_TAIL_FALLBACK_BYTES: usize = 512;
 const BASH_TAIL_LINE_CAP_BYTES: usize = 256;
@@ -441,6 +443,13 @@ impl Renderer {
         let snapshot = compute_bash_preview_snapshot(&preview.raw, true);
         self.clear_live_line()?;
         self.live_line = None;
+        if snapshot.head_rendered.len() > preview.committed_head_len {
+            let next = snapshot.head_rendered[preview.committed_head_len..].to_string();
+            self.write_stdout(&format!(
+                "{GRAY}{}{RESET}",
+                terminal_trim_committed_text(&next)
+            ))?;
+        }
         if snapshot.omitted_lines > 0 || snapshot.omitted_bytes > 0 {
             self.write_stdout(&terminal_trim_committed_text(&format!(
                 "{}\n",
@@ -796,8 +805,8 @@ fn tool_display_json(display: &ToolDisplay) -> serde_json::Value {
 }
 
 fn format_bash_header(title: &str, script: &str, risk: Option<&str>, styled: bool) -> String {
+    let command = preview_first_line(script, BASH_COMMAND_PREVIEW_BYTES);
     if !styled {
-        let command = if title.is_empty() { script } else { title };
         return match risk {
             Some(risk) => format!("$ {} {command}\n", format_risk_label(risk, false)),
             None => format!("$ {command}\n"),
@@ -811,20 +820,11 @@ fn format_bash_header(title: &str, script: &str, risk: Option<&str>, styled: boo
         out.push_str(RESET);
         out.push('\n');
     }
-    let color = bash_risk_color(risk);
-    let mut lines = script.lines();
-    if let Some(first) = lines.next() {
-        out.push_str(color);
-        out.push_str("$ ");
-        out.push_str(first);
-        out.push('\n');
-        for line in lines {
-            out.push_str("  ");
-            out.push_str(line);
-            out.push('\n');
-        }
-        out.push_str(RESET);
-    }
+    out.push_str(bash_risk_color(risk));
+    out.push_str("$ ");
+    out.push_str(&command);
+    out.push('\n');
+    out.push_str(RESET);
     out
 }
 
@@ -908,6 +908,19 @@ fn terminal_trim_committed_text(text: &str) -> String {
     out
 }
 
+fn preview_first_line(text: &str, max_bytes: usize) -> String {
+    let mut lines = text.lines();
+    let first = lines.next().unwrap_or_default();
+    let mut preview = truncate_prefix(first, max_bytes, false).rendered;
+    if preview.is_empty() {
+        return preview;
+    }
+    if lines.next().is_some() || first.len() > preview.len() {
+        append_ellipsis_in_place(&mut preview, max_bytes);
+    }
+    preview
+}
+
 fn compute_bash_preview_snapshot(text: &str, finalizing: bool) -> BashPreviewSnapshot {
     let mut complete_lines = Vec::new();
     let mut trailing = String::new();
@@ -919,44 +932,56 @@ fn compute_bash_preview_snapshot(text: &str, finalizing: bool) -> BashPreviewSna
         }
     }
 
-    let reserve_start = complete_lines.len().saturating_sub(BASH_TAIL_LINE_RESERVE);
-    let head_candidates = &complete_lines[..reserve_start];
     let mut head_rendered = String::new();
-    let mut head_lines = 0usize;
+    let mut head_count = 0usize;
     let mut head_bytes = 0usize;
-    for line in head_candidates {
-        let next_lines = head_lines + 1;
-        let next_bytes = head_bytes + line.len();
-        if next_lines > BASH_HEAD_LINE_BUDGET || next_bytes > BASH_HEAD_BYTE_BUDGET {
+    let mut hidden_head_bytes = 0usize;
+    for line in &complete_lines {
+        if head_count >= BASH_HEAD_LINE_BUDGET {
             break;
         }
-        head_lines = next_lines;
+        let preview = truncate_prefix(line, BASH_HEAD_LINE_CAP_BYTES, true);
+        let next_bytes = head_bytes + preview.rendered.len();
+        if next_bytes > BASH_HEAD_BYTE_BUDGET {
+            break;
+        }
         head_bytes = next_bytes;
-        head_rendered.push_str(line);
+        hidden_head_bytes += line.len().saturating_sub(preview.raw_kept_bytes);
+        head_rendered.push_str(&preview.rendered);
+        head_count += 1;
     }
 
-    let omitted_complete = &head_candidates[head_lines..];
+    let tail_start = if finalizing {
+        complete_lines
+            .len()
+            .saturating_sub(BASH_TAIL_LINE_RESERVE)
+            .max(head_count)
+    } else {
+        complete_lines.len()
+    };
+    let omitted_complete = &complete_lines[head_count..tail_start];
     let omitted_lines = omitted_complete.len();
     let omitted_line_bytes = omitted_complete
         .iter()
         .map(|line| line.len())
         .sum::<usize>();
-    let reserved_complete = &complete_lines[reserve_start..];
+    let reserved_complete = &complete_lines[tail_start..];
 
     let trimmed_trailing = if finalizing {
         trim_final_tail_fragment(&trailing)
     } else {
         trailing.clone()
     };
-    let fallback_reserved = if complete_lines.is_empty() && !trimmed_trailing.is_empty() {
+    let mut head_fragment_kept = 0usize;
+    if finalizing && head_count == 0 && !trimmed_trailing.is_empty() {
+        let preview = truncate_prefix(&trimmed_trailing, BASH_HEAD_LINE_CAP_BYTES, false);
+        head_fragment_kept = preview.raw_kept_bytes;
+        head_rendered.push_str(&preview.rendered);
+    }
+    let fallback_reserved = if !trimmed_trailing.is_empty() {
         trim_to_last_bytes(&trimmed_trailing, BASH_TAIL_FALLBACK_BYTES)
     } else {
-        trimmed_trailing.clone()
-    };
-    let hidden_trailing_bytes = if fallback_reserved.len() < trimmed_trailing.len() {
-        trimmed_trailing.len() - fallback_reserved.len()
-    } else {
-        0
+        String::new()
     };
 
     if !finalizing {
@@ -964,7 +989,7 @@ fn compute_bash_preview_snapshot(text: &str, finalizing: bool) -> BashPreviewSna
             head_rendered,
             tail_rendered: String::new(),
             omitted_lines,
-            omitted_bytes: omitted_line_bytes + hidden_trailing_bytes,
+            omitted_bytes: omitted_line_bytes + hidden_head_bytes + trimmed_trailing.len(),
         };
     }
 
@@ -977,14 +1002,20 @@ fn compute_bash_preview_snapshot(text: &str, finalizing: bool) -> BashPreviewSna
     }
     if !fallback_reserved.is_empty() {
         let (rendered, kept) = cap_tail_line(&fallback_reserved, false);
-        hidden_tail_bytes += fallback_reserved.len().saturating_sub(kept);
+        let overlap = head_fragment_kept
+            .saturating_add(kept)
+            .saturating_sub(trimmed_trailing.len());
+        hidden_tail_bytes += trimmed_trailing
+            .len()
+            .saturating_sub(head_fragment_kept)
+            .saturating_sub(kept.saturating_sub(overlap));
         tail_segments.push(rendered);
     }
     BashPreviewSnapshot {
         head_rendered,
         tail_rendered: tail_segments.concat(),
         omitted_lines,
-        omitted_bytes: omitted_line_bytes + hidden_trailing_bytes + hidden_tail_bytes,
+        omitted_bytes: omitted_line_bytes + hidden_head_bytes + hidden_tail_bytes,
     }
 }
 
@@ -1035,6 +1066,64 @@ fn cap_tail_line(line: &str, complete_line: bool) -> (String, usize) {
         out.push('\n');
     }
     (out, suffix.len() + usize::from(newline))
+}
+
+fn truncate_prefix(text: &str, max_bytes: usize, preserve_newline: bool) -> LinePreview {
+    let newline = preserve_newline && text.ends_with('\n');
+    let body = if newline {
+        text.strip_suffix('\n').unwrap_or(text)
+    } else {
+        text
+    };
+    if body.len() <= max_bytes {
+        let mut rendered = body.to_string();
+        if newline {
+            rendered.push('\n');
+        }
+        return LinePreview {
+            rendered,
+            raw_kept_bytes: body.len() + usize::from(newline),
+        };
+    }
+
+    let kept = max_bytes.saturating_sub(ELLIPSIS.len());
+    let prefix = trim_to_first_bytes(body, kept);
+    let mut rendered = prefix.clone();
+    rendered.push_str(ELLIPSIS);
+    if newline {
+        rendered.push('\n');
+    }
+    LinePreview {
+        rendered,
+        raw_kept_bytes: prefix.len() + usize::from(newline),
+    }
+}
+
+fn trim_to_first_bytes(text: &str, max_bytes: usize) -> String {
+    if text.len() <= max_bytes {
+        return text.to_string();
+    }
+    let end = text
+        .char_indices()
+        .take_while(|(idx, ch)| idx + ch.len_utf8() <= max_bytes)
+        .last()
+        .map(|(idx, ch)| idx + ch.len_utf8())
+        .unwrap_or(0);
+    text[..end].to_string()
+}
+
+fn append_ellipsis_in_place(text: &mut String, max_bytes: usize) {
+    if text.is_empty() {
+        return;
+    }
+    if text.ends_with(ELLIPSIS) {
+        return;
+    }
+    let budget = max_bytes.saturating_sub(ELLIPSIS.len());
+    if text.len() > budget {
+        *text = trim_to_first_bytes(text, budget);
+    }
+    text.push_str(ELLIPSIS);
 }
 
 fn strip_ansi(input: &str) -> String {
@@ -1168,7 +1257,8 @@ mod tests {
     fn bash_header_renders_title_and_risk_colored_script_without_risk_label() {
         let header = format_bash_header("List files", "printf 'a'\npwd", Some("readonly"), true);
         assert!(header.starts_with(&format!("{BOLD}List files{RESET}\n")));
-        assert!(header.contains(&format!("{CYAN}$ printf 'a'\n  pwd\n{RESET}")));
+        assert!(header.contains(&format!("{CYAN}$ printf 'a'…\n{RESET}")));
+        assert!(!header.contains("  pwd\n"));
         assert!(!header.contains("[readonly]"));
     }
 
@@ -1182,8 +1272,8 @@ mod tests {
     #[test]
     fn short_bash_output_has_no_omitted_counter() {
         let snapshot = compute_bash_preview_snapshot("one\n two \nthree\n", true);
-        assert_eq!(snapshot.head_rendered, "one\n");
-        assert_eq!(snapshot.tail_rendered, " two\nthree\n");
+        assert_eq!(snapshot.head_rendered, "one\n two\nthree\n");
+        assert_eq!(snapshot.tail_rendered, "");
         assert_eq!(snapshot.omitted_lines, 0);
         assert_eq!(snapshot.omitted_bytes, 0);
     }
@@ -1197,25 +1287,26 @@ mod tests {
         let final_snapshot = compute_bash_preview_snapshot(&text, true);
 
         assert!(streaming.head_rendered.contains("line01\n"));
-        assert!(streaming.head_rendered.contains("line32\n"));
-        assert!(!streaming.head_rendered.contains("line33\n"));
-        assert_eq!(streaming.omitted_lines, 6);
+        assert!(streaming.head_rendered.contains("line03\n"));
+        assert!(!streaming.head_rendered.contains("line04\n"));
+        assert_eq!(streaming.omitted_lines, 37);
         assert!(streaming.omitted_bytes > 0);
 
-        assert_eq!(final_snapshot.omitted_lines, 6);
+        assert_eq!(final_snapshot.omitted_lines, 35);
         assert!(final_snapshot.tail_rendered.contains("line39\n"));
         assert!(final_snapshot.tail_rendered.contains("line40\n"));
-        assert!(!final_snapshot.tail_rendered.contains("line32\n"));
+        assert!(!final_snapshot.tail_rendered.contains("line03\n"));
     }
 
     #[test]
     fn huge_single_line_output_uses_byte_tail_fallback() {
         let text = "x".repeat(900);
         let snapshot = compute_bash_preview_snapshot(&text, true);
-        assert_eq!(snapshot.head_rendered, "");
+        assert_eq!(snapshot.head_rendered.len(), BASH_HEAD_LINE_CAP_BYTES);
         assert_eq!(snapshot.omitted_lines, 0);
-        assert_eq!(snapshot.omitted_bytes, 647);
+        assert_eq!(snapshot.omitted_bytes, 394);
         assert_eq!(snapshot.tail_rendered.len(), BASH_TAIL_LINE_CAP_BYTES);
+        assert!(snapshot.head_rendered.ends_with(ELLIPSIS));
         assert!(snapshot.tail_rendered.starts_with('…'));
     }
 
@@ -1242,9 +1333,11 @@ mod tests {
         assert!(raw.contains("\x1b[90mline01"));
         assert!(normalized.contains("thought"));
         assert!(normalized.contains("Stream demo"));
-        assert!(normalized.contains("$ i=1"));
-        assert!(normalized.contains("  while [ $i -le 40 ]; do"));
-        assert!(normalized.contains("[… omitted 6 lines, 42 bytes]"));
+        assert!(normalized.contains("$ i=1…"));
+        assert!(!normalized.contains("  while [ $i -le 40 ]; do"));
+        assert!(normalized.contains("[… omitted 35 lines, 245 bytes]"));
+        assert!(normalized.contains("line03"));
+        assert!(!normalized.contains("line04"));
         assert!(normalized.contains("line39"));
         assert!(normalized.contains("line40"));
         assert!(!normalized.contains("\n$\n"));
@@ -1340,4 +1433,9 @@ mod tests {
             String::from_utf8_lossy(&out).into_owned()
         }
     }
+}
+
+struct LinePreview {
+    rendered: String,
+    raw_kept_bytes: usize,
 }
