@@ -18,6 +18,41 @@ pub struct Session {
     pub effort: Option<EffortLevel>,
     pub title: Option<String>,
     pub last_total_tokens: u64,
+    pub origin: SessionOrigin,
+    pub archived: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionOrigin {
+    Cli,
+    Web,
+}
+
+impl SessionOrigin {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SessionOrigin::Cli => "cli",
+            SessionOrigin::Web => "web",
+        }
+    }
+}
+
+impl std::fmt::Display for SessionOrigin {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for SessionOrigin {
+    type Err = anyhow::Error;
+
+    fn from_str(value: &str) -> Result<Self> {
+        match value {
+            "cli" => Ok(SessionOrigin::Cli),
+            "web" => Ok(SessionOrigin::Web),
+            other => bail!("unknown session origin: {other}"),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -88,7 +123,9 @@ impl Store {
                 effort TEXT,
                 title TEXT,
                 last_total_tokens INTEGER NOT NULL DEFAULT 0,
-                cost_total REAL NOT NULL DEFAULT 0
+                cost_total REAL NOT NULL DEFAULT 0,
+                origin TEXT NOT NULL DEFAULT 'cli',
+                archived INTEGER NOT NULL DEFAULT 0
             );
             CREATE TABLE IF NOT EXISTS message (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -129,6 +166,8 @@ impl Store {
             );",
         )?;
         self.ensure_session_column("effort", "TEXT")?;
+        self.ensure_session_column("origin", "TEXT NOT NULL DEFAULT 'cli'")?;
+        self.ensure_session_column("archived", "INTEGER NOT NULL DEFAULT 0")?;
         self.ensure_message_column("user_content_json", "TEXT")?;
         self.ensure_tool_call_column("risk", "TEXT")?;
         Ok(())
@@ -167,12 +206,29 @@ impl Store {
         model: &str,
         effort: Option<EffortLevel>,
     ) -> Result<Session> {
+        self.create_session_with_origin(cwd, model, effort, SessionOrigin::Cli)
+    }
+
+    pub fn create_session_with_origin(
+        &self,
+        cwd: &str,
+        model: &str,
+        effort: Option<EffortLevel>,
+        origin: SessionOrigin,
+    ) -> Result<Session> {
         let id = Uuid::new_v4().to_string();
         let now = chrono::Utc::now().to_rfc3339();
         self.conn.execute(
-            "INSERT INTO session (id, created_at, updated_at, cwd, model, effort, title, last_total_tokens, cost_total)
-             VALUES (?1, ?2, ?2, ?3, ?4, ?5, NULL, 0, 0)",
-            params![id, now, cwd, model, effort.map(|level| level.to_string())],
+            "INSERT INTO session (id, created_at, updated_at, cwd, model, effort, title, last_total_tokens, cost_total, origin, archived)
+             VALUES (?1, ?2, ?2, ?3, ?4, ?5, NULL, 0, 0, ?6, 0)",
+            params![
+                id,
+                now,
+                cwd,
+                model,
+                effort.map(|level| level.to_string()),
+                origin.as_str()
+            ],
         )?;
         Ok(Session {
             id,
@@ -181,16 +237,20 @@ impl Store {
             effort,
             title: None,
             last_total_tokens: 0,
+            origin,
+            archived: false,
         })
     }
 
     pub fn get_session(&self, id: &str) -> Result<Option<Session>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, cwd, model, effort, title, last_total_tokens FROM session WHERE id = ?1",
+            "SELECT id, cwd, model, effort, title, last_total_tokens, origin, archived
+             FROM session WHERE id = ?1",
         )?;
         let row = stmt
             .query_row(params![id], |row| {
                 let effort: Option<String> = row.get(3)?;
+                let origin: String = row.get(6)?;
                 Ok(Session {
                     id: row.get(0)?,
                     cwd: row.get(1)?,
@@ -198,6 +258,8 @@ impl Store {
                     effort: parse_effort(effort)?,
                     title: row.get(4)?,
                     last_total_tokens: row.get::<_, i64>(5)? as u64,
+                    origin: parse_origin(origin)?,
+                    archived: row.get::<_, i64>(7)? != 0,
                 })
             })
             .optional()?;
@@ -205,12 +267,23 @@ impl Store {
     }
 
     pub fn list_sessions(&self, limit: usize) -> Result<Vec<(Session, String)>> {
+        self.list_sessions_by_origin(SessionOrigin::Cli, limit)
+    }
+
+    pub fn list_sessions_by_origin(
+        &self,
+        origin: SessionOrigin,
+        limit: usize,
+    ) -> Result<Vec<(Session, String)>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, cwd, model, effort, title, last_total_tokens, updated_at
-             FROM session ORDER BY updated_at DESC LIMIT ?1",
+            "SELECT id, cwd, model, effort, title, last_total_tokens, origin, archived, updated_at
+             FROM session
+             WHERE origin = ?1 AND archived = 0
+             ORDER BY updated_at DESC LIMIT ?2",
         )?;
-        let rows = stmt.query_map(params![limit as i64], |row| {
+        let rows = stmt.query_map(params![origin.as_str(), limit as i64], |row| {
             let effort: Option<String> = row.get(3)?;
+            let origin: String = row.get(6)?;
             Ok((
                 Session {
                     id: row.get(0)?,
@@ -219,8 +292,10 @@ impl Store {
                     effort: parse_effort(effort)?,
                     title: row.get(4)?,
                     last_total_tokens: row.get::<_, i64>(5)? as u64,
+                    origin: parse_origin(origin)?,
+                    archived: row.get::<_, i64>(7)? != 0,
                 },
-                row.get::<_, String>(6)?,
+                row.get::<_, String>(8)?,
             ))
         })?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
@@ -229,12 +304,13 @@ impl Store {
 
     pub fn latest_session(&self) -> Result<Option<Session>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, cwd, model, effort, title, last_total_tokens
+            "SELECT id, cwd, model, effort, title, last_total_tokens, origin, archived
              FROM session ORDER BY updated_at DESC LIMIT 1",
         )?;
         let row = stmt
             .query_row([], |row| {
                 let effort: Option<String> = row.get(3)?;
+                let origin: String = row.get(6)?;
                 Ok(Session {
                     id: row.get(0)?,
                     cwd: row.get(1)?,
@@ -242,10 +318,20 @@ impl Store {
                     effort: parse_effort(effort)?,
                     title: row.get(4)?,
                     last_total_tokens: row.get::<_, i64>(5)? as u64,
+                    origin: parse_origin(origin)?,
+                    archived: row.get::<_, i64>(7)? != 0,
                 })
             })
             .optional()?;
         Ok(row)
+    }
+
+    pub fn set_session_archived(&self, id: &str, archived: bool) -> Result<()> {
+        self.conn.execute(
+            "UPDATE session SET archived = ?1 WHERE id = ?2",
+            params![if archived { 1 } else { 0 }, id],
+        )?;
+        Ok(())
     }
 
     pub fn update_session(
@@ -622,6 +708,19 @@ fn parse_effort(value: Option<String>) -> rusqlite::Result<Option<EffortLevel>> 
     }
 }
 
+fn parse_origin(value: String) -> rusqlite::Result<SessionOrigin> {
+    SessionOrigin::from_str(&value).map_err(|e| {
+        rusqlite::Error::FromSqlConversionFailure(
+            0,
+            rusqlite::types::Type::Text,
+            Box::new(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                e.to_string(),
+            )),
+        )
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -700,6 +799,44 @@ mod tests {
         };
 
         assert_eq!(text, "legacy text");
+        let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    #[test]
+    fn new_sessions_default_to_cli_origin_and_unarchived() {
+        let (store, tmp) = temp_store();
+        let session = store.create_session("/tmp", "fake-model", None).unwrap();
+        let loaded = store.get_session(&session.id).unwrap().unwrap();
+
+        assert_eq!(loaded.origin, SessionOrigin::Cli);
+        assert!(!loaded.archived);
+        let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    #[test]
+    fn list_sessions_defaults_to_cli_origin_and_skips_archived() {
+        let (store, tmp) = temp_store();
+        let cli = store.create_session("/tmp", "cli-model", None).unwrap();
+        let web = store
+            .create_session_with_origin("/tmp", "web-model", None, SessionOrigin::Web)
+            .unwrap();
+        let archived = store
+            .create_session("/tmp", "archived-model", None)
+            .unwrap();
+        store.set_session_archived(&archived.id, true).unwrap();
+
+        let sessions = store.list_sessions(20).unwrap();
+
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].0.id, cli.id);
+        assert_eq!(sessions[0].0.origin, SessionOrigin::Cli);
+        assert!(!sessions[0].0.archived);
+
+        let web_sessions = store
+            .list_sessions_by_origin(SessionOrigin::Web, 20)
+            .unwrap();
+        assert_eq!(web_sessions.len(), 1);
+        assert_eq!(web_sessions[0].0.id, web.id);
         let _ = std::fs::remove_dir_all(tmp);
     }
 }

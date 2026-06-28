@@ -129,6 +129,8 @@ async fn run() -> Result<()> {
                     let store = store::Store::open(&db_path)?;
                     let sessions = store.list_sessions(20)?;
                     for (s, updated) in sessions {
+                        debug_assert_eq!(s.origin, store::SessionOrigin::Cli);
+                        debug_assert!(!s.archived);
                         let title = s.title.unwrap_or_else(|| "(untitled)".into());
                         let effort = s
                             .effort
@@ -136,6 +138,26 @@ async fn run() -> Result<()> {
                             .unwrap_or_default();
                         println!("{}  {}  {}{}  {}", s.id, title, s.model, effort, updated);
                     }
+                }
+                SessionSub::Archive { session } => {
+                    if !db_path.exists() {
+                        bail!("session not found in active scope: {session}");
+                    }
+                    let store = store::Store::open(&db_path)?;
+                    if store.get_session(&session)?.is_none() {
+                        bail!("session not found in active scope: {session}");
+                    }
+                    store.set_session_archived(&session, true)?;
+                }
+                SessionSub::Unarchive { session } => {
+                    if !db_path.exists() {
+                        bail!("session not found in active scope: {session}");
+                    }
+                    let store = store::Store::open(&db_path)?;
+                    if store.get_session(&session)?.is_none() {
+                        bail!("session not found in active scope: {session}");
+                    }
+                    store.set_session_archived(&session, false)?;
                 }
             }
             return Ok(());

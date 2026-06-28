@@ -105,9 +105,11 @@ Interactive surfaces are thin wrappers around that unit:
   prompt mode, and keybindings, then submits each entered prompt by spawning
   `mu` for one foreground turn.
 - The future web surface lives behind `mu web`, similar in spirit to
-  `opencode serve`. It coordinates sessions and presentation, but does so as a
-  subcommand in the same executable rather than a separate binary or second
-  agent loop.
+  `opencode serve`. It is packaged as a subcommand in the same executable, but
+  conceptually behaves like a separate web wrapper: it coordinates HTTP,
+  browser state, and presentation while calling the normal `mu` command path for
+  agent/session work. It does not host a separate agent loop, and it should not
+  create sessions by inserting directly into the store.
 - Other wrappers are allowed, but they must stay thin: they coordinate prompts
   and presentation while delegating each agent turn to the `mu` command-line
   interface.
@@ -164,18 +166,18 @@ the same binary.
    │  zsh plugin: prompt mode; every entered line spawns one `mu` turn         │
    │  browsers / editors (V2): coordinate through future `mu web`              │
    └───────────────────────────────────┬───────────────────────────────────────┘
-                                        │ invokes the same executable
+                                        │ invokes the same executable / command path
                                         ▼
    ┌────────────────────────────── mu (single binary) ─────────────────────────┐
    │  default turn mode: one prompt in, one completed turn out                 │
    │  management subcommands: session / status / models / compact              │
-   │  future web mode (V2): `mu web` coordinator in the same executable        │
+   │  future web mode (V2): command-wrapping web coordinator                  │
    │                                                                           │
-   │  shared modules: project/config/session resolution                        │
-   │                  provider client + agent loop                             │
-   │                  tool registry: bash                                      │
-   │                  renderer / event stream                                  │
-   │                  store (SQLite in active global/project scope)            │
+   │  turn/management command modules: project/config/session resolution       │
+   │                           provider client + agent loop                    │
+   │                           tool registry: bash                             │
+   │                           renderer / event stream                         │
+   │                           store (SQLite in active global/project scope)   │
    └───────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -221,7 +223,10 @@ small:
   turn and keeps using the same session. `MU_ZSH_SESSION_ID=<id>` seeds
   attachment to an existing session.
 - `mu session new` — create a session and print its id.
-- `mu session list` — list recent sessions.
+- `mu session list` — list recent non-archived CLI-origin sessions.
+- `mu session archive --session <id>` — hide a session from default lists.
+- `mu session unarchive --session <id>` — restore an archived session to
+  default lists.
 - `mu compact --session <id>` — force compaction.
 - `mu web [opts]` — V2 web coordinator subcommand in the same binary.
 
@@ -522,7 +527,12 @@ Session lifecycle is exposed through CLI commands:
   plugin to an existing session.
 - `mu -c` continues the latest session in the active scope for a one-shot turn.
 - `mu session new` creates a session and prints its id.
-- `mu session list` lists recent sessions.
+- `mu session list` lists recent non-archived CLI-origin sessions. Web-origin
+  sessions are reserved for `mu web` listing.
+- `mu session archive --session <id>` hides a session from default lists without
+  deleting it.
+- `mu session unarchive --session <id>` restores an archived session to default
+  lists.
 - `mu compact --session <id>` compacts a session on demand.
 
 ---
@@ -777,15 +787,18 @@ block each other unnecessarily.
 
 Conceptual schema (flat and small):
 
-- **session** — `id`, `created_at`, `updated_at`, `cwd`, `model`, `title`,
+- **session** — `id`, `created_at`, `updated_at`, `cwd`, `model`, `origin`,
+  `archived`, `title`,
   `last_total_tokens` (the most recent `usage.total_tokens` reported by the
   provider; used for the pre-turn overflow check, §"Context window and
-  compaction"), `cost_total` (accumulated USD, for the turn summary). `model` is
-  set at session creation from the effective model (lifecycle step 2); a later
-  `--model` overrides for that turn only and does **not** rewrite the stored
-  value. `cwd` records the last working directory used for that session. `title`
-  is set lazily from the first user prompt (first ~60 chars) and is display-only
-  for `mu session list`.
+  compaction"), `cost_total` (accumulated USD, for the turn summary). `origin`
+  is `cli` or `web` depending on which surface created the session. `archived`
+  is a boolean listing filter; archived sessions remain resumable by explicit
+  id. `model` is set at session creation from the effective model (lifecycle
+  step 2); a later `--model` overrides for that turn only and does **not**
+  rewrite the stored value. `cwd` records the last working directory used for
+  that session. `title` is set lazily from the first user prompt (first ~60
+  chars) and is display-only for `mu session list`.
 - **message** — `id`, `session_id`, `role` (`user`/`assistant`/`tool`/`summary`),
   `content`, optional full user content JSON for multi-part inputs, `created_at`,
   ordering index, and for tool results `tool_call_id`. Provider-neutral
@@ -810,7 +823,7 @@ V1 maps each interactive shell instance to at most one active session:
   never printed to stdout by the turn, so the transcript stays clean.
 - **Attach / continue.** `MU_ZSH_SESSION_ID=<id>` seeds the zsh plugin with an
   existing session, while `mu -s <id>` and `mu -c` handle one-shot re-entry from
-  the command line. `mu session list` lists candidates.
+  the command line. `mu session list` lists non-archived CLI-origin candidates.
 - **Per-turn lifecycle.** Each turn: open DB → acquire session lock → load
   session messages → run turn (persisting each completed message as it lands) →
   release lock → exit. The connection opens lazily so a turn that errors early

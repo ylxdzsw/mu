@@ -84,6 +84,16 @@ pub enum SessionSub {
     New,
     /// List recent sessions
     List,
+    /// Hide a session from default lists
+    Archive {
+        #[arg(long)]
+        session: String,
+    },
+    /// Restore an archived session to default lists
+    Unarchive {
+        #[arg(long)]
+        session: String,
+    },
 }
 
 #[derive(Subcommand, Debug)]

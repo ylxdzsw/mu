@@ -92,7 +92,9 @@ MU_ZSH_EXIT_HOOKS+=(mu_restore_conflicts)
 | `mu models refresh` | Refresh `~/.mu/models.json` from the active provider |
 | `mu models list [--json]` | Inspect the cached provider model catalog |
 | `mu session new` | Create session, print id |
-| `mu session list` | List recent sessions |
+| `mu session list` | List recent non-archived CLI sessions |
+| `mu session archive --session <id>` | Hide a session from default lists |
+| `mu session unarchive --session <id>` | Restore an archived session to default lists |
 | `mu compact --session <id>` | Force compaction |
 
 ## Config
