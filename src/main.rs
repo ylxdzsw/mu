@@ -543,7 +543,7 @@ async fn run_turn_from_source(
         store.append_message(
             &session_id,
             &provider::Message::User {
-                content: system_prompt::cwd_changed_context(&cwd).into(),
+                content: system_prompt::cwd_changed_context(cwd).into(),
             },
         )?;
         store.update_session_cwd(&session_id, &cwd.display().to_string())?;
@@ -735,18 +735,18 @@ fn print_status_report(report: &StatusReport) {
     println!("session: {session}");
     println!("context: {context}");
     println!("project: {project}");
-    if let Some(git) = &report.git {
-        if let Some(branch) = &git.branch {
-            println!(
-                "git: {}{}",
-                branch,
-                if git.dirty.unwrap_or(false) {
-                    " (dirty)"
-                } else {
-                    " (clean)"
-                }
-            );
-        }
+    if let Some(git) = &report.git
+        && let Some(branch) = &git.branch
+    {
+        println!(
+            "git: {}{}",
+            branch,
+            if git.dirty.unwrap_or(false) {
+                " (dirty)"
+            } else {
+                " (clean)"
+            }
+        );
     }
     if let Some(session) = &report.session {
         println!(

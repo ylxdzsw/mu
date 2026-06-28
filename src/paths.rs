@@ -106,7 +106,7 @@ pub fn ensure_project_layout_at(root: &Path) -> anyhow::Result<()> {
 }
 
 fn ensure_state_layout(dir: &Path, project: bool) -> anyhow::Result<()> {
-    ensure_dir(&dir)?;
+    ensure_dir(dir)?;
     ensure_dir(&dir.join("skills"))?;
     if project {
         let config = dir.join("config.jsonc");
@@ -220,5 +220,27 @@ mod tests {
             scope.session_db_path(),
             PathBuf::from("/tmp/work/.mu/sessions.db")
         );
+    }
+
+    #[test]
+    fn ensure_project_layout_at_creates_expected_scaffold() {
+        let root = std::env::temp_dir().join(format!("mu-layout-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+
+        ensure_project_layout_at(&root).unwrap();
+
+        let state_dir = root.join(".mu");
+        assert!(state_dir.is_dir());
+        assert!(state_dir.join("skills").is_dir());
+        assert_eq!(
+            std::fs::read_to_string(state_dir.join("config.jsonc")).unwrap(),
+            "{\n}\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(state_dir.join(".gitignore")).unwrap(),
+            ".env\nsessions.db\nsessions.db-*\n*.db\n*.db-*\n"
+        );
+
+        let _ = std::fs::remove_dir_all(root);
     }
 }

@@ -223,8 +223,8 @@ small:
 - `mu.zsh` — zsh prompt mode; each accepted prompt runs one foreground `mu`
   turn and keeps using the same session. `MU_ZSH_SESSION_ID=<id>` seeds
   attachment to an existing session.
-- `mu project inspect --path <dir>` — report whether a directory is already a
-  `mu` project.
+- `mu project inspect --path <dir>` — report whether a directory resolves to a
+  project scope, and which marker (`.mu` or `.git`) was found.
 - `mu project init --path <dir>` — create `.mu/` project metadata in an
   explicitly chosen directory.
 - `mu session new` — create a session and print its id.
@@ -525,8 +525,10 @@ Once a request reaches the Unix socket, `mu web` treats it as authorized.
 #### Status contract
 
 The web UI depends on `mu status` as the canonical metadata contract. To support
-multi-project web operation, status must be usable for an explicit project path
-and optional session id, not just the process cwd.
+multi-project web operation, status must be invocable for a specific project
+context and optional session id, not just whichever directory launched `mu web`.
+The current implementation achieves that by spawning `mu status` with the
+target project as `cwd` rather than by passing an explicit `--path` flag.
 
 The status contract should be extended whenever the UI needs new metadata. Good
 candidates include:
@@ -1439,47 +1441,3 @@ sequential (concurrent batches only run `readonly` tools). There is no
 interaction with the concurrent execution path.
 
 ---
-
-## 13. Startup-speed plan
-
-Startup latency is paid every turn, so it is defended explicitly:
-
-- Single binary; no runtime bootstrap; no line-editor/terminal library to
-  initialize.
-- Lazy initialization: open the DB, scan skills, and construct the provider
-  client only when first needed for the turn.
-- Skill scanning reads only front-matter, not bodies, and is cached in the DB
-  keyed by directory mtime to skip re-parsing on subsequent launches.
-- SQLite in WAL mode; a small prepared-statement set; minimal schema.
-- No network calls before the prompt is read; the provider connection opens once
-  the turn actually starts.
-- Config parsing is a single small file.
-
-Target: process-ready (DB + config + skills resolved) within a few milliseconds
-on a warm filesystem, so the only perceptible latency is model time-to-first-token.
-
----
-
-## 14. High-level implementation phases
-
-Coarse sequencing only (not an execution plan):
-
-1. **Binary skeleton.** Arg parsing, stdin prompt read, config loading,
-   plain append-only renderer, fail-fast when no provider configured. Echoes
-   prompt; no model.
-2. **Provider + loop.** OpenAI-protocol chat-completions (base URL + API key),
-   streaming, the agent loop with `bash`, max-iterations guard.
-3. **Shell-only tool surface.** Keep `bash` as the sole model-visible tool;
-   implement shared output truncation + spill files, literal stdin, per-call
-   cwd, timeout cleanup, and process-group teardown.
-4. **State.** SQLite store (WAL), message-level persistence, session load,
-   `--session`, lazy session creation + runtime-file handshake, per-session
-   lock, two-tier compaction, exit turn-summary line.
-5. **zsh shell surface.** Prompt mode, first-turn session capture, session
-   attach via environment, and clean entry/exit controls.
-6. **Web surface.** Unix-socket server, project picker/init flows, explicit
-   project `cwd` routing, browser session metadata via `mu status`, and
-   stream-through turn execution via `mu --output json`.
-7. **Skills.** Skill scan + cache + system-prompt injection, `AGENTS.md`
-   (global + project).
-8. **Polish.** Robustness, error-message quality, config surface.

@@ -62,18 +62,15 @@ pub fn initial_environment_context(
         format!("active session id: {session_id}"),
     ];
 
-    match project {
-        Some(project) => {
-            lines.push(format!("project root: {}", project.root.display()));
-            if let Some(worktree) = &project.worktree {
-                lines.push(format!("git dir: {}", worktree.git_dir.display()));
-                if let Some(common_dir) = &worktree.common_dir {
-                    lines.push(format!("git common dir: {}", common_dir.display()));
-                    lines.push("git worktree: yes".into());
-                }
+    if let Some(project) = project {
+        lines.push(format!("project root: {}", project.root.display()));
+        if let Some(worktree) = &project.worktree {
+            lines.push(format!("git dir: {}", worktree.git_dir.display()));
+            if let Some(common_dir) = &worktree.common_dir {
+                lines.push(format!("git common dir: {}", common_dir.display()));
+                lines.push("git worktree: yes".into());
             }
         }
-        None => {}
     }
 
     lines.join("\n")

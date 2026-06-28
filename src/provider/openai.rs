@@ -73,6 +73,28 @@ struct UsageJson {
 
 type ToolCallAccumulator = BTreeMap<usize, (Option<String>, Option<String>, String, String)>;
 
+struct StreamParseState {
+    content: String,
+    tool_accum: ToolCallAccumulator,
+    finish_reason: FinishReason,
+    usage: Option<Usage>,
+    reasoning_active: bool,
+    tool_call_started: bool,
+}
+
+impl Default for StreamParseState {
+    fn default() -> Self {
+        Self {
+            content: String::new(),
+            tool_accum: BTreeMap::new(),
+            finish_reason: FinishReason::Stop,
+            usage: None,
+            reasoning_active: false,
+            tool_call_started: false,
+        }
+    }
+}
+
 #[async_trait(?Send)]
 impl Provider for OpenAiProvider {
     async fn stream_chat(
@@ -107,12 +129,7 @@ impl Provider for OpenAiProvider {
         }
 
         let mut response = response;
-        let mut content = String::new();
-        let mut tool_accum: ToolCallAccumulator = BTreeMap::new();
-        let mut finish_reason = FinishReason::Stop;
-        let mut usage: Option<Usage> = None;
-        let mut reasoning_active = false;
-        let mut tool_call_started = false;
+        let mut stream_state = StreamParseState::default();
 
         let mut buffer = String::new();
         let mut byte_buf: Vec<u8> = Vec::new();
@@ -147,16 +164,7 @@ impl Provider for OpenAiProvider {
                 }
             };
             byte_buf.drain(..valid_up_to);
-            consume_sse_buffer(
-                &mut buffer,
-                &mut content,
-                &mut tool_accum,
-                &mut finish_reason,
-                &mut usage,
-                &mut reasoning_active,
-                &mut tool_call_started,
-                on_event,
-            )?;
+            consume_sse_buffer(&mut buffer, &mut stream_state, on_event)?;
         }
         // Flush any remaining undecodable trailing bytes (lossy) so a final
         // event without a trailing blank line is not silently dropped.
@@ -165,26 +173,19 @@ impl Provider for OpenAiProvider {
         }
         if !buffer.trim().is_empty() {
             buffer.push_str("\n\n");
-            consume_sse_buffer(
-                &mut buffer,
-                &mut content,
-                &mut tool_accum,
-                &mut finish_reason,
-                &mut usage,
-                &mut reasoning_active,
-                &mut tool_call_started,
-                on_event,
-            )?;
+            consume_sse_buffer(&mut buffer, &mut stream_state, on_event)?;
         }
-        if reasoning_active {
+        if stream_state.reasoning_active {
             on_event(StreamEvent::ReasoningEnd)?;
+            stream_state.reasoning_active = false;
         }
 
-        let tool_calls = if tool_accum.is_empty() {
+        let tool_calls = if stream_state.tool_accum.is_empty() {
             None
         } else {
             Some(
-                tool_accum
+                stream_state
+                    .tool_accum
                     .into_values()
                     .map(|(id, name, args, call_type)| ToolCall {
                         id: id.unwrap_or_else(|| "call".into()),
@@ -199,18 +200,18 @@ impl Provider for OpenAiProvider {
         };
 
         let message = Message::Assistant {
-            content: if content.is_empty() {
+            content: if stream_state.content.is_empty() {
                 None
             } else {
-                Some(content)
+                Some(stream_state.content)
             },
             tool_calls,
         };
 
         Ok(StreamResult {
             message,
-            finish_reason,
-            usage,
+            finish_reason: stream_state.finish_reason,
+            usage: stream_state.usage,
         })
     }
 }
@@ -235,12 +236,7 @@ fn build_chat_request_body(
 
 fn consume_sse_buffer(
     buffer: &mut String,
-    content: &mut String,
-    tool_accum: &mut ToolCallAccumulator,
-    finish_reason: &mut FinishReason,
-    usage: &mut Option<Usage>,
-    reasoning_active: &mut bool,
-    tool_call_started: &mut bool,
+    state: &mut StreamParseState,
     on_event: &mut dyn FnMut(StreamEvent) -> Result<(), ProviderError>,
 ) -> Result<(), ProviderError> {
     while let Some((pos, sep_len)) = next_event_boundary(buffer) {
@@ -260,7 +256,7 @@ fn consume_sse_buffer(
                 .map_err(|e| ProviderError::Other(format!("SSE parse: {e}")))?;
 
             if let Some(u) = parsed.usage {
-                *usage = Some(Usage {
+                state.usage = Some(Usage {
                     prompt_tokens: u.prompt_tokens,
                     completion_tokens: u.completion_tokens,
                     total_tokens: u.total_tokens,
@@ -274,31 +270,32 @@ fn consume_sse_buffer(
                     .as_ref()
                     .and_then(reasoning_text_from_value);
                 if let Some(text) = reasoning_delta {
-                    if !*reasoning_active {
+                    if !state.reasoning_active {
                         on_event(StreamEvent::ReasoningStart)?;
-                        *reasoning_active = true;
+                        state.reasoning_active = true;
                     }
                     on_event(StreamEvent::ReasoningDelta(text))?;
-                } else if *reasoning_active
+                } else if state.reasoning_active
                     && (choice.delta.content.is_some()
                         || choice.delta.tool_calls.is_some()
                         || choice.finish_reason.is_some())
                 {
                     on_event(StreamEvent::ReasoningEnd)?;
-                    *reasoning_active = false;
+                    state.reasoning_active = false;
                 }
 
                 if let Some(text) = choice.delta.content.clone() {
                     on_event(StreamEvent::TextDelta(text.clone()))?;
-                    content.push_str(&text);
+                    state.content.push_str(&text);
                 }
                 if let Some(ref tcs) = choice.delta.tool_calls {
-                    if !*tool_call_started && !tcs.is_empty() {
+                    if !state.tool_call_started && !tcs.is_empty() {
                         on_event(StreamEvent::ToolCallStart)?;
-                        *tool_call_started = true;
+                        state.tool_call_started = true;
                     }
                     for tc in tcs {
-                        let entry = tool_accum
+                        let entry = state
+                            .tool_accum
                             .entry(tc.index)
                             .or_insert_with(|| (None, None, String::new(), "function".into()));
                         if let Some(ref id) = tc.id {
@@ -318,7 +315,7 @@ fn consume_sse_buffer(
                     }
                 }
                 if let Some(ref reason) = choice.finish_reason {
-                    *finish_reason = match reason.as_str() {
+                    state.finish_reason = match reason.as_str() {
                         "stop" => FinishReason::Stop,
                         "tool_calls" => FinishReason::ToolCalls,
                         other => FinishReason::Other(other.to_string()),
@@ -412,12 +409,7 @@ mod tests {
         };
 
         let mut buffer = String::new();
-        let mut content = String::new();
-        let mut tool_accum = BTreeMap::new();
-        let mut finish_reason = FinishReason::Stop;
-        let mut usage = None;
-        let mut reasoning_active = false;
-        let mut tool_call_started = false;
+        let mut state = StreamParseState::default();
 
         for chunk in [
             "data: {\"choices\":[{\"delta\":{\"content\":\"hel\"},\"finish_reason\":null}]}\n\n",
@@ -426,25 +418,16 @@ mod tests {
             "data: [DONE]\n\n",
         ] {
             buffer.push_str(chunk);
-            consume_sse_buffer(
-                &mut buffer,
-                &mut content,
-                &mut tool_accum,
-                &mut finish_reason,
-                &mut usage,
-                &mut reasoning_active,
-                &mut tool_call_started,
-                &mut on_event,
-            )
-            .unwrap();
+            consume_sse_buffer(&mut buffer, &mut state, &mut on_event).unwrap();
         }
 
         assert_eq!(seen, "hello");
         assert_eq!(tool_call_starts, 1);
-        assert_eq!(content, "hello");
-        assert_eq!(finish_reason, FinishReason::ToolCalls);
-        assert_eq!(usage.unwrap().total_tokens, 17);
-        let calls: Vec<_> = tool_accum
+        assert_eq!(state.content, "hello");
+        assert_eq!(state.finish_reason, FinishReason::ToolCalls);
+        assert_eq!(state.usage.unwrap().total_tokens, 17);
+        let calls: Vec<_> = state
+            .tool_accum
             .into_values()
             .map(|(id, name, args, call_type)| ToolCall {
                 id: id.unwrap_or_default(),
@@ -476,31 +459,16 @@ mod tests {
         };
 
         let mut buffer = String::new();
-        let mut content = String::new();
-        let mut tool_accum = BTreeMap::new();
-        let mut finish_reason = FinishReason::Stop;
-        let mut usage = None;
-        let mut reasoning_active = false;
-        let mut tool_call_started = false;
+        let mut state = StreamParseState::default();
 
         buffer.push_str(
             "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"},\"finish_reason\":\"stop\"}]}\r\n\r\n",
         );
-        consume_sse_buffer(
-            &mut buffer,
-            &mut content,
-            &mut tool_accum,
-            &mut finish_reason,
-            &mut usage,
-            &mut reasoning_active,
-            &mut tool_call_started,
-            &mut on_event,
-        )
-        .unwrap();
+        consume_sse_buffer(&mut buffer, &mut state, &mut on_event).unwrap();
 
         assert_eq!(seen, "hi");
         assert!(!saw_reasoning);
-        assert_eq!(finish_reason, FinishReason::Stop);
+        assert_eq!(state.finish_reason, FinishReason::Stop);
     }
 
     #[test]
@@ -520,12 +488,7 @@ mod tests {
         };
 
         let mut buffer = String::new();
-        let mut content = String::new();
-        let mut tool_accum = BTreeMap::new();
-        let mut finish_reason = FinishReason::Stop;
-        let mut usage = None;
-        let mut reasoning_active = false;
-        let mut tool_call_started = false;
+        let mut state = StreamParseState::default();
 
         for chunk in [
             "data: {\"choices\":[{\"delta\":{\"reasoning_content\":[{\"type\":\"reasoning_text\",\"text\":\"step 1\"}]},\"finish_reason\":null}]}\n\n",
@@ -533,17 +496,7 @@ mod tests {
             "data: [DONE]\n\n",
         ] {
             buffer.push_str(chunk);
-            consume_sse_buffer(
-                &mut buffer,
-                &mut content,
-                &mut tool_accum,
-                &mut finish_reason,
-                &mut usage,
-                &mut reasoning_active,
-                &mut tool_call_started,
-                &mut on_event,
-            )
-            .unwrap();
+            consume_sse_buffer(&mut buffer, &mut state, &mut on_event).unwrap();
         }
 
         assert_eq!(
@@ -555,7 +508,7 @@ mod tests {
                 "text:done".to_string(),
             ]
         );
-        assert!(!reasoning_active);
+        assert!(!state.reasoning_active);
     }
 
     #[test]

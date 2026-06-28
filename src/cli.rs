@@ -224,8 +224,9 @@ mod tests {
     }
 
     #[test]
-    fn keeps_existing_subcommands() {
+    fn exact_subcommand_names_take_priority_over_prompt_files() {
         let args = Args::try_parse_from(["mu", "status", "--json"]).unwrap();
+        assert!(args.prompt_file.is_none());
         match args.command {
             Some(Command::Status(status)) => {
                 assert!(status.json);
@@ -235,12 +236,23 @@ mod tests {
     }
 
     #[test]
-    fn exact_subcommand_names_take_priority_over_prompt_files() {
-        let args = Args::try_parse_from(["mu", "status", "--json"]).unwrap();
-        assert!(args.prompt_file.is_none());
+    fn global_origin_flag_applies_to_subcommands() {
+        let args = Args::try_parse_from(["mu", "--origin", "web", "session", "list"]).unwrap();
+        assert_eq!(args.origin, SessionOriginArg::Web);
         match args.command {
-            Some(Command::Status(status)) => assert!(status.json),
-            other => panic!("expected status command, got {other:?}"),
+            Some(Command::Session {
+                sub:
+                    SessionSub::List {
+                        json,
+                        limit,
+                        all_origins,
+                    },
+            }) => {
+                assert!(!json);
+                assert_eq!(limit, 20);
+                assert!(!all_origins);
+            }
+            other => panic!("expected session list command, got {other:?}"),
         }
     }
 
