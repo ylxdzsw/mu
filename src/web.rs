@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -9,13 +9,14 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::UnixListener;
-use tokio::process::Command;
-use tokio::sync::Mutex;
+use tokio::process::{Child, ChildStderr, ChildStdout, Command};
+use tokio::sync::{Mutex, watch};
 
 use crate::cli::WebArgs;
 use crate::paths;
 
 const MAX_REQUEST_BYTES: usize = 32 * 1024 * 1024;
+const MAX_TURN_EVENT_BUFFER: usize = 512;
 
 pub async fn serve(args: WebArgs, launch_cwd: PathBuf) -> Result<()> {
     let mode = parse_socket_mode(&args.socket_mode)?;
@@ -35,7 +36,7 @@ pub async fn serve(args: WebArgs, launch_cwd: PathBuf) -> Result<()> {
         launch_cwd,
         launch_project,
         recent_projects: Mutex::new(recent_projects),
-        active_turns: Mutex::new(HashMap::new()),
+        turns: Mutex::new(HashMap::new()),
         upload_root,
     });
 
@@ -57,7 +58,7 @@ struct WebState {
     launch_cwd: PathBuf,
     launch_project: Option<ProjectSummary>,
     recent_projects: Mutex<Vec<ProjectSummary>>,
-    active_turns: Mutex<HashMap<String, ActiveTurn>>,
+    turns: Mutex<HashMap<String, Arc<TurnRuntime>>>,
     upload_root: PathBuf,
 }
 
@@ -74,6 +75,107 @@ struct ActiveTurn {
     session_id: Option<String>,
     started_at: String,
     pgid: i32,
+}
+
+#[derive(Serialize)]
+struct TurnAcceptedResponse {
+    turn: ActiveTurn,
+}
+
+#[derive(Clone)]
+struct TurnEventEnvelope {
+    seq: u64,
+    event: String,
+    payload: serde_json::Value,
+}
+
+struct TurnRuntime {
+    turn: ActiveTurn,
+    state: Mutex<TurnRuntimeState>,
+    signal: watch::Sender<u64>,
+}
+
+struct TurnRuntimeState {
+    events: VecDeque<TurnEventEnvelope>,
+    next_seq: u64,
+    completed: bool,
+}
+
+enum ReplayWindow {
+    Ready {
+        events: Vec<TurnEventEnvelope>,
+        completed: bool,
+    },
+    Reset {
+        next_seq: u64,
+    },
+}
+
+impl TurnRuntime {
+    fn new(turn: ActiveTurn) -> Arc<Self> {
+        let initial = TurnEventEnvelope {
+            seq: 1,
+            event: "turn_start".into(),
+            payload: json!({ "turn": turn.clone() }),
+        };
+        let (signal, _) = watch::channel(initial.seq);
+        Arc::new(Self {
+            turn,
+            state: Mutex::new(TurnRuntimeState {
+                events: VecDeque::from([initial]),
+                next_seq: 1,
+                completed: false,
+            }),
+            signal,
+        })
+    }
+
+    async fn push_event(&self, event: impl Into<String>, payload: serde_json::Value) -> u64 {
+        let seq = {
+            let mut state = self.state.lock().await;
+            state.next_seq += 1;
+            let seq = state.next_seq;
+            state.events.push_back(TurnEventEnvelope {
+                seq,
+                event: event.into(),
+                payload,
+            });
+            while state.events.len() > MAX_TURN_EVENT_BUFFER {
+                state.events.pop_front();
+            }
+            seq
+        };
+        let _ = self.signal.send(seq);
+        seq
+    }
+
+    async fn mark_completed(&self) {
+        self.state.lock().await.completed = true;
+    }
+
+    async fn is_completed(&self) -> bool {
+        self.state.lock().await.completed
+    }
+
+    async fn replay_after(&self, after: u64) -> ReplayWindow {
+        let state = self.state.lock().await;
+        if let Some(first) = state.events.front()
+            && first.seq > after.saturating_add(1)
+        {
+            return ReplayWindow::Reset {
+                next_seq: first.seq,
+            };
+        }
+        ReplayWindow::Ready {
+            events: state
+                .events
+                .iter()
+                .filter(|event| event.seq > after)
+                .cloned()
+                .collect(),
+            completed: state.completed,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -136,6 +238,9 @@ where
 
     let result = route_request(&mut stream, state, request).await;
     if let Err(error) = result {
+        if is_client_disconnect(&error) {
+            return Ok(());
+        }
         write_json_response(
             &mut stream,
             500,
@@ -145,6 +250,19 @@ where
         .await?;
     }
     Ok(())
+}
+
+fn is_client_disconnect(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause.downcast_ref::<std::io::Error>().is_some_and(|io| {
+            matches!(
+                io.kind(),
+                std::io::ErrorKind::BrokenPipe
+                    | std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::UnexpectedEof
+            )
+        })
+    })
 }
 
 async fn route_request(
@@ -233,7 +351,7 @@ async fn route_request(
                 run_json_command(&state, Some(&project), &["models", "list", "--json"]).await?;
             write_json_response(stream, 200, "OK", &value).await
         }
-        ("POST", "/api/turns") => stream_turn(stream, state, request).await,
+        ("POST", "/api/turns") => create_turn(stream, state, request).await,
         _ => {
             if request.method == "GET"
                 && request.path.starts_with("/api/sessions/")
@@ -252,6 +370,18 @@ async fn route_request(
                 )
                 .await?;
                 return write_json_response(stream, 200, "OK", &value).await;
+            }
+            if request.method == "GET"
+                && request.path.starts_with("/api/turns/")
+                && request.path.ends_with("/events")
+            {
+                let id = request
+                    .path
+                    .trim_start_matches("/api/turns/")
+                    .trim_end_matches("/events")
+                    .trim_matches('/')
+                    .to_string();
+                return stream_turn_events(stream, state, request, id).await;
             }
             if request.method == "POST"
                 && request.path.starts_with("/api/turns/")
@@ -326,7 +456,7 @@ async fn create_session(
     write_json_response(stream, 200, "OK", &value).await
 }
 
-async fn stream_turn(
+async fn create_turn(
     stream: &mut (impl AsyncRead + AsyncWrite + Unpin),
     state: Arc<WebState>,
     request: HttpRequest,
@@ -348,7 +478,12 @@ async fn stream_turn(
         return write_json_response(stream, 409, "Conflict", &json!({ "error": "session busy" }))
             .await;
     }
+    let turn = launch_turn(state, input).await?;
+    write_json_response(stream, 200, "OK", &TurnAcceptedResponse { turn }).await
+}
 
+async fn launch_turn(state: Arc<WebState>, input: TurnRequest) -> Result<ActiveTurn> {
+    let project = require_project(&input.project)?;
     let turn_id = uuid::Uuid::new_v4().to_string();
     let upload_dir = state.upload_root.join(&turn_id);
     let image_paths = save_uploads(&upload_dir, &input.images)?;
@@ -386,23 +521,13 @@ async fn stream_turn(
 
     let mut child = command.spawn().context("spawning mu turn")?;
     let pid = child.id().unwrap_or_default() as i32;
-    let active = ActiveTurn {
-        id: turn_id.clone(),
-        project: project.display().to_string(),
-        session_id: input.session_id.clone(),
-        started_at: chrono::Utc::now().to_rfc3339(),
-        pgid: pid,
-    };
-    state
-        .active_turns
-        .lock()
-        .await
-        .insert(turn_id.clone(), active.clone());
-
     if let Some(mut stdin) = child.stdin.take() {
-        stdin.write_all(input.prompt.as_bytes()).await?;
+        if let Err(error) = stdin.write_all(input.prompt.as_bytes()).await {
+            let _ = child.start_kill();
+            let _ = std::fs::remove_dir_all(&upload_dir);
+            return Err(error).context("writing prompt to mu turn stdin");
+        }
     }
-
     let stdout = child
         .stdout
         .take()
@@ -411,6 +536,26 @@ async fn stream_turn(
         .stderr
         .take()
         .ok_or_else(|| anyhow::anyhow!("missing child stderr"))?;
+    let turn = ActiveTurn {
+        id: turn_id.clone(),
+        project: project.display().to_string(),
+        session_id: input.session_id.clone(),
+        started_at: chrono::Utc::now().to_rfc3339(),
+        pgid: pid,
+    };
+    let runtime = TurnRuntime::new(turn.clone());
+    state.turns.lock().await.insert(turn_id, runtime.clone());
+    tokio::spawn(run_turn_task(runtime, child, stdout, stderr, upload_dir));
+    Ok(turn)
+}
+
+async fn run_turn_task(
+    runtime: Arc<TurnRuntime>,
+    mut child: Child,
+    stdout: ChildStdout,
+    stderr: ChildStderr,
+    upload_dir: PathBuf,
+) {
     let stderr_task = tokio::spawn(async move {
         let mut reader = BufReader::new(stderr);
         let mut text = String::new();
@@ -418,44 +563,90 @@ async fn stream_turn(
         text
     });
 
-    write_stream_headers(stream).await?;
-    write_json_line(stream, "turn_start", &json!({ "turn": active })).await?;
-
+    let mut stream_error = None;
     let mut lines = BufReader::new(stdout).lines();
-    while let Some(line) = lines.next_line().await? {
-        stream.write_all(line.as_bytes()).await?;
-        stream.write_all(b"\n").await?;
-        stream.flush().await?;
+    loop {
+        match lines.next_line().await {
+            Ok(Some(line)) => match parse_child_turn_event(&line) {
+                Ok((event, payload)) => {
+                    runtime.push_event(event, payload).await;
+                }
+                Err(error) => {
+                    stream_error = Some(error);
+                    break;
+                }
+            },
+            Ok(None) => break,
+            Err(error) => {
+                stream_error = Some(error.into());
+                break;
+            }
+        }
     }
 
-    let status = child.wait().await?;
-    let stderr_text = stderr_task.await.unwrap_or_default();
-    if !stderr_text.trim().is_empty() {
-        write_json_line(
-            stream,
-            "stderr",
-            &json!({ "text": stderr_text.trim_end_matches('\n') }),
-        )
-        .await?;
+    if let Some(error) = stream_error {
+        runtime
+            .push_event("error", json!({ "message": error.to_string() }))
+            .await;
     }
-    write_json_line(
-        stream,
-        "turn_finish",
-        &json!({ "exit_code": status.code().unwrap_or(1) }),
-    )
-    .await?;
-    state.active_turns.lock().await.remove(&turn_id);
+
+    match child.wait().await {
+        Ok(status) => {
+            let stderr_text = stderr_task.await.unwrap_or_default();
+            if !stderr_text.trim().is_empty() {
+                runtime
+                    .push_event(
+                        "stderr",
+                        json!({ "text": stderr_text.trim_end_matches('\n') }),
+                    )
+                    .await;
+            }
+            runtime
+                .push_event(
+                    "turn_finish",
+                    json!({ "exit_code": status.code().unwrap_or(1) }),
+                )
+                .await;
+        }
+        Err(error) => {
+            runtime
+                .push_event("error", json!({ "message": error.to_string() }))
+                .await;
+            runtime
+                .push_event("turn_finish", json!({ "exit_code": 1 }))
+                .await;
+        }
+    }
+
+    runtime.mark_completed().await;
     let _ = std::fs::remove_dir_all(upload_dir);
-    Ok(())
 }
 
-async fn abort_turn(
+fn parse_child_turn_event(line: &str) -> Result<(String, serde_json::Value)> {
+    let event: serde_json::Value =
+        serde_json::from_str(line).context("parsing child JSON event")?;
+    let event_name = event
+        .get("event")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("child JSON event missing event name"))?;
+    let payload = event.get("payload").cloned().unwrap_or_else(|| json!({}));
+    Ok((event_name.to_string(), payload))
+}
+
+async fn stream_turn_events(
     stream: &mut (impl AsyncRead + AsyncWrite + Unpin),
     state: Arc<WebState>,
-    id: &str,
+    request: HttpRequest,
+    id: String,
 ) -> Result<()> {
-    let active = state.active_turns.lock().await.get(id).cloned();
-    let Some(active) = active else {
+    let after = request
+        .query
+        .get("after")
+        .map(|value| value.parse::<u64>().context("invalid after"))
+        .transpose()?
+        .unwrap_or(0);
+    let runtime = state.turns.lock().await.get(&id).cloned();
+    let Some(runtime) = runtime else {
         return write_json_response(
             stream,
             404,
@@ -464,7 +655,64 @@ async fn abort_turn(
         )
         .await;
     };
-    let result = unsafe { libc::kill(-active.pgid, libc::SIGTERM) };
+
+    write_sse_headers(stream).await?;
+    let mut last_seq = after;
+    let mut changes = runtime.signal.subscribe();
+    loop {
+        match runtime.replay_after(last_seq).await {
+            ReplayWindow::Ready { events, completed } => {
+                for event in events {
+                    write_sse_event(stream, Some(event.seq), &event.event, &event.payload).await?;
+                    last_seq = event.seq;
+                }
+                if completed {
+                    return Ok(());
+                }
+            }
+            ReplayWindow::Reset { next_seq } => {
+                write_sse_event(
+                    stream,
+                    None,
+                    "reset",
+                    &json!({ "reason": "replay_missed", "next_seq": next_seq }),
+                )
+                .await?;
+                return Ok(());
+            }
+        }
+
+        if changes.changed().await.is_err() {
+            return Ok(());
+        }
+    }
+}
+
+async fn abort_turn(
+    stream: &mut (impl AsyncRead + AsyncWrite + Unpin),
+    state: Arc<WebState>,
+    id: &str,
+) -> Result<()> {
+    let runtime = state.turns.lock().await.get(id).cloned();
+    let Some(runtime) = runtime else {
+        return write_json_response(
+            stream,
+            404,
+            "Not Found",
+            &json!({ "error": "turn not found" }),
+        )
+        .await;
+    };
+    if runtime.is_completed().await {
+        return write_json_response(
+            stream,
+            404,
+            "Not Found",
+            &json!({ "error": "turn not found" }),
+        )
+        .await;
+    }
+    let result = unsafe { libc::kill(-runtime.turn.pgid, libc::SIGTERM) };
     if result == -1 {
         return write_json_response(
             stream,
@@ -479,12 +727,25 @@ async fn abort_turn(
 
 async fn active_session(state: &WebState, project: &Path, session_id: &str) -> bool {
     let project = project.display().to_string();
-    state
-        .active_turns
+    let turns = state
+        .turns
         .lock()
         .await
         .values()
-        .any(|turn| turn.project == project && turn.session_id.as_deref() == Some(session_id))
+        .cloned()
+        .collect::<Vec<_>>();
+    for turn in turns {
+        if turn.turn.project != project {
+            continue;
+        }
+        if turn.turn.session_id.as_deref() != Some(session_id) {
+            continue;
+        }
+        if !turn.is_completed().await {
+            return true;
+        }
+    }
+    false
 }
 
 async fn remember_project(state: &WebState, summary: ProjectSummary) {
@@ -821,26 +1082,36 @@ async fn write_response(
     Ok(())
 }
 
-async fn write_stream_headers(stream: &mut (impl AsyncWrite + Unpin)) -> Result<()> {
+async fn write_sse_headers(stream: &mut (impl AsyncWrite + Unpin)) -> Result<()> {
     stream
         .write_all(
-            b"HTTP/1.1 200 OK\r\ncontent-type: application/x-ndjson; charset=utf-8\r\nconnection: close\r\ncache-control: no-store\r\nx-accel-buffering: no\r\nx-content-type-options: nosniff\r\n\r\n",
+            b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream; charset=utf-8\r\nconnection: close\r\ncache-control: no-cache, no-transform\r\nx-accel-buffering: no\r\nx-content-type-options: nosniff\r\n\r\n",
         )
         .await?;
     stream.flush().await?;
     Ok(())
 }
 
-async fn write_json_line<T: Serialize + ?Sized>(
+async fn write_sse_event<T: Serialize + ?Sized>(
     stream: &mut (impl AsyncWrite + Unpin),
+    id: Option<u64>,
     event: &str,
     payload: &T,
 ) -> Result<()> {
-    let line = json!({ "event": event, "payload": payload });
-    stream
-        .write_all(serde_json::to_string(&line)?.as_bytes())
-        .await?;
-    stream.write_all(b"\n").await?;
+    let data = serde_json::to_string(payload)?;
+    let mut frame = String::new();
+    if let Some(id) = id {
+        frame.push_str("id: ");
+        frame.push_str(&id.to_string());
+        frame.push('\n');
+    }
+    frame.push_str("event: ");
+    frame.push_str(event);
+    frame.push('\n');
+    frame.push_str("data: ");
+    frame.push_str(&data);
+    frame.push_str("\n\n");
+    stream.write_all(frame.as_bytes()).await?;
     stream.flush().await?;
     Ok(())
 }
@@ -1476,6 +1747,8 @@ function toast(message) {
   toast.timer = setTimeout(() => node.classList.add("hidden"), 4200);
 }
 
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
 async function api(path, options = {}) {
   const response = await fetch(path, {
     ...options,
@@ -1776,54 +2049,113 @@ async function submitPrompt(event) {
   };
   state.attachments = [];
   renderAttachments();
-  await readTurnStream(body);
+  try {
+    await launchTurn(body);
+  } catch (error) {
+    toast(error.message);
+    state.activeTurn = null;
+    el("submit").disabled = false;
+    el("abort").classList.add("hidden");
+    el("busy-pill").classList.add("hidden");
+  }
 }
 
-async function readTurnStream(body) {
+async function launchTurn(body) {
+  const launched = await api("/api/turns", {
+    method: "POST",
+    body: JSON.stringify(body),
+  });
+  if (!launched?.turn?.id) throw new Error("missing turn id");
+  await watchTurn(launched.turn);
+}
+
+async function watchTurn(turn) {
   el("submit").disabled = true;
   el("abort").classList.remove("hidden");
   el("busy-pill").classList.remove("hidden");
+  state.activeTurn = turn;
   let assistant = null;
   let tool = null;
+  let lastSeq = 0;
+  let finished = false;
+  let needsRefresh = false;
+  let reconnecting = false;
+  const handleTurnEvent = (event) => {
+    if (event.id != null) lastSeq = event.id;
+    if (event.event === "turn_start") {
+      state.activeTurn = event.payload.turn;
+    } else if (event.event === "assistant_delta") {
+      if (!assistant) assistant = appendMessage("assistant", "");
+      assistant.textContent += event.payload.text || "";
+    } else if (event.event === "tool_start") {
+      const args = event.payload.args || {};
+      tool = appendTool(args.title || args.script || event.payload.tool);
+    } else if (event.event === "tool_output") {
+      if (!tool) tool = appendTool("bash");
+      tool.output.textContent += event.payload.text || "";
+    } else if (event.event === "tool_finish") {
+      if (tool) tool.head.textContent += " done";
+    } else if (event.event === "tool_error" || event.event === "error" || event.event === "stderr") {
+      appendMessage("system", event.payload.message || event.payload.error || event.payload.text || "");
+    } else if (event.event === "reset") {
+      needsRefresh = true;
+    } else if (event.event === "turn_finish") {
+      finished = true;
+      state.activeTurn = null;
+    }
+  };
   try {
-    const response = await fetch("/api/turns", {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify(body),
-    });
-    if (!response.ok) throw new Error(await response.text());
-    const reader = response.body.getReader();
-    const decoder = new TextDecoder();
-    let buffer = "";
     while (true) {
-      const { value, done } = await reader.read();
-      if (done) break;
-      buffer += decoder.decode(value, { stream: true });
-      let index;
-      while ((index = buffer.indexOf("\n")) !== -1) {
-        const line = buffer.slice(0, index).trim();
-        buffer = buffer.slice(index + 1);
-        if (!line) continue;
-        const event = JSON.parse(line);
-        if (event.event === "turn_start") {
-          state.activeTurn = event.payload.turn;
-        } else if (event.event === "assistant_delta") {
-          if (!assistant) assistant = appendMessage("assistant", "");
-          assistant.textContent += event.payload.text || "";
-        } else if (event.event === "tool_start") {
-          const args = event.payload.args || {};
-          tool = appendTool(args.title || args.script || event.payload.tool);
-        } else if (event.event === "tool_output") {
-          if (!tool) tool = appendTool("bash");
-          tool.output.textContent += event.payload.text || "";
-        } else if (event.event === "tool_finish") {
-          if (tool) tool.head.textContent += " done";
-        } else if (event.event === "tool_error" || event.event === "error" || event.event === "stderr") {
-          appendMessage("system", event.payload.message || event.payload.error || event.payload.text || "");
-        } else if (event.event === "turn_finish") {
-          state.activeTurn = null;
+      try {
+        const response = await fetch(`/api/turns/${encodeURIComponent(turn.id)}/events?after=${encodeURIComponent(String(lastSeq))}`);
+        if (!response.ok) {
+          let text = await response.text();
+          try {
+            text = JSON.parse(text).error || text;
+          } catch (_) {}
+          const error = new Error(text || response.statusText);
+          error.status = response.status;
+          throw error;
+        }
+        if (!response.body) throw new Error("missing response body");
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = "";
+        while (true) {
+          const { value, done } = await reader.read();
+          buffer += decoder.decode(value || new Uint8Array(), { stream: !done });
+          let boundary;
+          while ((boundary = buffer.search(/\r?\n\r?\n/)) !== -1) {
+            const match = buffer.slice(boundary).match(/^\r?\n\r?\n/);
+            const separatorWidth = match ? match[0].length : 2;
+            const frame = buffer.slice(0, boundary);
+            buffer = buffer.slice(boundary + separatorWidth);
+            handleTurnEvent(parseSseFrame(frame));
+            reconnecting = false;
+            if (needsRefresh || finished) break;
+          }
+          if (needsRefresh || finished || done) break;
+        }
+        if (!needsRefresh && !finished && buffer.trim()) {
+          handleTurnEvent(parseSseFrame(buffer));
+        }
+        if (needsRefresh || finished || !state.activeTurn || state.activeTurn.id !== turn.id) break;
+        if (!reconnecting) {
+          reconnecting = true;
+          toast("Turn stream disconnected, reconnecting");
+        }
+      } catch (error) {
+        if (!state.activeTurn || state.activeTurn.id !== turn.id) break;
+        if (error.status === 404) {
+          needsRefresh = true;
+          break;
+        }
+        if (!reconnecting) {
+          reconnecting = true;
+          toast("Turn stream disconnected, reconnecting");
         }
       }
+      await sleep(500);
     }
   } catch (error) {
     toast(error.message);
@@ -1835,9 +2167,39 @@ async function readTurnStream(body) {
     await Promise.all([loadSessions(), loadStatus().catch(() => {})]);
     if (state.session) {
       const refreshed = state.sessions.find((item) => item.id === state.session.id);
-      if (refreshed) state.session = refreshed;
+      if (refreshed) {
+        state.session = refreshed;
+        if (finished || needsRefresh) {
+          const messages = await api(`/api/sessions/${encodeURIComponent(refreshed.id)}/messages?project=${encodeURIComponent(state.project.path)}`);
+          renderTimeline(messages);
+          renderSessions();
+        }
+      }
+    }
+    if (needsRefresh) toast("Turn stream fell behind, refreshed from transcript");
+  }
+}
+
+function parseSseFrame(frame) {
+  let id = null;
+  let event = "message";
+  const data = [];
+  for (const rawLine of frame.split(/\r?\n/)) {
+    if (!rawLine || rawLine.startsWith(":")) continue;
+    if (rawLine.startsWith("id:")) {
+      const value = Number.parseInt(rawLine.slice(3).trimStart(), 10);
+      id = Number.isFinite(value) ? value : null;
+      continue;
+    }
+    if (rawLine.startsWith("event:")) {
+      event = rawLine.slice(6).trimStart();
+      continue;
+    }
+    if (rawLine.startsWith("data:")) {
+      data.push(rawLine.slice(5).trimStart());
     }
   }
+  return { id, event, payload: data.length ? JSON.parse(data.join("\n")) : {} };
 }
 
 async function abortTurn() {
@@ -1943,7 +2305,7 @@ mod tests {
             launch_cwd,
             launch_project,
             recent_projects: Mutex::new(recent_projects),
-            active_turns: Mutex::new(HashMap::new()),
+            turns: Mutex::new(HashMap::new()),
             upload_root: std::env::temp_dir()
                 .join(format!("mu-web-test-uploads-{}", uuid::Uuid::new_v4())),
         })
@@ -1964,6 +2326,10 @@ mod tests {
 
     fn response_body(response: &str) -> &str {
         response.split_once("\r\n\r\n").unwrap().1
+    }
+
+    fn response_json(response: &str) -> serde_json::Value {
+        serde_json::from_str(response_body(response)).unwrap()
     }
 
     #[tokio::test]
@@ -1995,7 +2361,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn streams_turn_events_from_child_process() {
+    async fn launches_turn_then_replays_events_over_sse() {
         let root = std::env::temp_dir().join(format!("mu-web-turn-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(root.join(".git")).unwrap();
         let fake = root.join("fake-mu");
@@ -2018,14 +2384,69 @@ mod tests {
             body
         );
 
-        let response = http_roundtrip(state, &request).await;
+        let launch = http_roundtrip(state.clone(), &request).await;
+        let launched = response_json(&launch);
+        let turn_id = launched["turn"]["id"].as_str().unwrap();
+        let events = http_roundtrip(
+            state,
+            &format!("GET /api/turns/{turn_id}/events?after=0 HTTP/1.1\r\nhost: mu\r\n\r\n"),
+        )
+        .await;
 
-        assert!(response.starts_with("HTTP/1.1 200 OK"));
-        assert!(response.contains("content-type: application/x-ndjson; charset=utf-8"));
-        assert!(response.contains("x-accel-buffering: no"));
-        assert!(response_body(&response).contains(r#""event":"turn_start""#));
-        assert!(response_body(&response).contains(r#""event":"assistant_delta""#));
-        assert!(response_body(&response).contains(r#""event":"turn_finish""#));
+        assert!(launch.starts_with("HTTP/1.1 200 OK"));
+        assert_eq!(launched["turn"]["session_id"], "session-1");
+        assert!(events.starts_with("HTTP/1.1 200 OK"));
+        assert!(events.contains("content-type: text/event-stream; charset=utf-8"));
+        assert!(events.contains("x-accel-buffering: no"));
+        assert!(response_body(&events).contains("event: turn_start"));
+        assert!(response_body(&events).contains("event: assistant_delta"));
+        assert!(response_body(&events).contains("event: turn_finish"));
+        assert!(response_body(&events).contains("id: 1"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn turn_event_replay_respects_after_cursor() {
+        let root = std::env::temp_dir().join(format!("mu-web-turn-after-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        let fake = root.join("fake-mu");
+        std::fs::write(
+            &fake,
+            "#!/bin/sh\ncat >/dev/null\nprintf '%s\\n' '{\"event\":\"assistant_delta\",\"payload\":{\"text\":\"first\"}}'\nprintf '%s\\n' '{\"event\":\"assistant_delta\",\"payload\":{\"text\":\"second\"}}'\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let state = test_state_with_exe(root.clone(), fake);
+        let body = json!({
+            "project": root.display().to_string(),
+            "session_id": "session-1",
+            "prompt": "hello"
+        })
+        .to_string();
+        let launch = http_roundtrip(
+            state.clone(),
+            &format!(
+                "POST /api/turns HTTP/1.1\r\nhost: mu\r\ncontent-length: {}\r\ncontent-type: application/json\r\n\r\n{}",
+                body.len(),
+                body
+            ),
+        )
+        .await;
+        let turn_id = response_json(&launch)["turn"]["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let replay = http_roundtrip(
+            state,
+            &format!("GET /api/turns/{turn_id}/events?after=2 HTTP/1.1\r\nhost: mu\r\n\r\n"),
+        )
+        .await;
+
+        assert!(replay.starts_with("HTTP/1.1 200 OK"));
+        assert!(!response_body(&replay).contains("event: turn_start"));
+        assert!(!response_body(&replay).contains("\"text\":\"first\""));
+        assert!(response_body(&replay).contains("\"text\":\"second\""));
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -2034,15 +2455,15 @@ mod tests {
         let root = std::env::temp_dir().join(format!("mu-web-busy-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(root.join(".git")).unwrap();
         let state = test_state(root.clone());
-        state.active_turns.lock().await.insert(
+        state.turns.lock().await.insert(
             "turn-1".into(),
-            ActiveTurn {
+            TurnRuntime::new(ActiveTurn {
                 id: "turn-1".into(),
                 project: root.display().to_string(),
                 session_id: Some("session-1".into()),
                 started_at: "2026-06-28T00:00:00Z".into(),
                 pgid: 1,
-            },
+            }),
         );
         let body = json!({
             "project": root.display().to_string(),

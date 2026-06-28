@@ -245,8 +245,8 @@ shebang line when present. Exact subcommand names win at the top level, so a
 prompt file that collides with a subcommand name must be passed with a
 disambiguating path such as `./status`. `mu web` is the long-lived wrapper
 surface: it accepts browser requests, starts project-scoped sessions, shells
-out to the same turn runner with `--output json`, and streams those JSON events
-to the browser. `mu session new/list`, `mu session transcript`, and project
+out to the same turn runner with `--output json`, accepts prompts asynchronously,
+and exposes replayable browser event streams over SSE rather than WebSockets. `mu session new/list`, `mu session transcript`, and project
 inspection/init do **not** require a configured provider. Turn invocation and
 `mu compact` require a configured provider because they can contact the
 provider (§7).
@@ -458,7 +458,9 @@ surface whenever practical:
 
 - session creation uses the same session command or turn invocation path as CLI
   creation, with an explicit `web` origin;
-- turns are run by calling the `mu` turn runner and streaming its JSON events;
+- turns are run by calling the `mu` turn runner, returning from prompt submission
+  as soon as the turn is launched, and replaying the resulting JSON events over
+  a separate SSE subscription surface;
 - status comes from `mu status --json`;
 - model lists come from `mu models list --json`;
 - archive/list behavior comes from session commands rather than web-only SQL.
