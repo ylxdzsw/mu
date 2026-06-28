@@ -98,10 +98,17 @@ pub fn ensure_dir(path: &std::path::Path) -> anyhow::Result<()> {
 }
 
 pub fn ensure_project_layout(scope: &Scope) -> anyhow::Result<()> {
-    let dir = scope.state_dir();
+    ensure_state_layout(&scope.state_dir(), matches!(scope, Scope::Project(_)))
+}
+
+pub fn ensure_project_layout_at(root: &Path) -> anyhow::Result<()> {
+    ensure_state_layout(&root.join(".mu"), true)
+}
+
+fn ensure_state_layout(dir: &Path, project: bool) -> anyhow::Result<()> {
     ensure_dir(&dir)?;
     ensure_dir(&dir.join("skills"))?;
-    if matches!(scope, Scope::Project(_)) {
+    if project {
         let config = dir.join("config.jsonc");
         if !config.exists() {
             std::fs::write(&config, "{\n}\n")?;

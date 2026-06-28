@@ -4,8 +4,8 @@
 completed agent turn out. The core `mu` binary reads a prompt on stdin, accepts
 attached inputs such as images, runs an agent loop, streams turn events in the
 selected output format, persists completed messages, and exits. Interactive
-shells, a future `mu web` mode, editor integrations, and other surfaces build
-around that simple turn unit instead of changing it.
+shells, `mu web`, editor integrations, and other surfaces build around that
+simple turn unit instead of changing it.
 
 This document describes the design, the key decisions behind it, and the
 high-level shape of the implementation. It favors prose and decisions over code,
@@ -26,9 +26,8 @@ is unambiguous.
   immediately when a turn completes.
 - **Composable.** The main abstraction is a turn, not a chat app, daemon,
   terminal UI, or project manager. Thin surfaces such as the zsh plugin,
-  shell scripts, and a future `mu web` subcommand coordinate and present turns;
-  they do
-  not host a separate agent loop.
+  shell scripts, and `mu web` coordinate and present turns; they do not host a
+  separate agent loop.
 - **Non-magical.** No TUI. The shell owns the terminal and line editing; `mu`
   just reads a prompt and appends output. Output streams as it is produced (a
   tool line may appear before its output), but once a line is printed it is never
@@ -52,11 +51,10 @@ is unambiguous.
   still a separate `mu` turn.
 - **No re-rendering.** Lines are written once and never rewritten. Native
   terminal scrollback is the history mechanism.
-- **No daemon in the core path (V1).** Each turn is a fresh, stateless-on-exit
-  process that loads/saves session state from SQLite. A future `mu web`
-  subcommand may host a coordinator around this turn boundary, but it remains
-  part of the same executable rather than a separate agent runtime or second
-  binary.
+- **No daemon in the core turn path.** Each turn is a fresh, stateless-on-exit
+  process that loads/saves session state from SQLite. `mu web` may host a local
+  coordinator around this turn boundary, but it remains part of the same
+  executable rather than a separate agent runtime or second binary.
 - **No plugin SDK, no MCP, no sub-agents (initially).** Extensibility is via
   skills (markdown) and `bash` (call any CLI tool).
 - **No core shell emulation.** The core `mu` binary does not ship shell behavior,
@@ -104,12 +102,12 @@ Interactive surfaces are thin wrappers around that unit:
 - The zsh plugin is the preferred interactive surface. It owns zsh line editing,
   prompt mode, and keybindings, then submits each entered prompt by spawning
   `mu` for one foreground turn.
-- The future web surface lives behind `mu web`, similar in spirit to
-  `opencode serve`. It is packaged as a subcommand in the same executable, but
-  conceptually behaves like a separate web wrapper: it coordinates HTTP,
-  browser state, and presentation while calling the normal `mu` command path for
-  agent/session work. It does not host a separate agent loop, and it should not
-  create sessions by inserting directly into the store.
+- The web surface lives behind `mu web`, similar in spirit to `opencode serve`.
+  It is packaged as a subcommand in the same executable, but conceptually
+  behaves like a separate web wrapper: it coordinates HTTP, browser state, and
+  presentation while calling the normal `mu` command path for agent/session
+  work. It does not host a separate agent loop, and it should not create
+  sessions by inserting directly into the store.
 - Other wrappers are allowed, but they must stay thin: they coordinate prompts
   and presentation while delegating each agent turn to the `mu` command-line
   interface.
@@ -156,22 +154,22 @@ in the active global/project scope. See §9, §10, and §11.
 ## 3. Architecture overview
 
 `mu` has one executable, multiple entry modes, and multiple thin external
-surfaces. There is no client/server split in V1; the "glue" is the command-line
-contract around a completed turn, and future web support remains a subcommand of
-the same binary.
+surfaces. The CLI turn runner remains the core unit; `mu web` is a local browser
+wrapper in the same binary, not a separate agent runtime with different turn
+semantics.
 
 ```
    ┌──────────────────────────── external surfaces ─────────────────────────────┐
    │  shell scripts / editor tasks: `mu [opts] <<< PROMPT`                     │
    │  zsh plugin: prompt mode; every entered line spawns one `mu` turn         │
-   │  browsers / editors (V2): coordinate through future `mu web`              │
+   │  browsers / editors: coordinate through `mu web`                          │
    └───────────────────────────────────┬───────────────────────────────────────┘
                                         │ invokes the same executable / command path
                                         ▼
    ┌────────────────────────────── mu (single binary) ─────────────────────────┐
    │  default turn mode: one prompt in, one completed turn out                 │
    │  management subcommands: session / status / models / compact              │
-   │  future web mode (V2): command-wrapping web coordinator                  │
+   │  web mode: command-wrapping web coordinator                              │
    │                                                                           │
    │  turn/management command modules: project/config/session resolution       │
    │                           provider client + agent loop                    │
@@ -222,19 +220,332 @@ small:
 - `mu.zsh` — zsh prompt mode; each accepted prompt runs one foreground `mu`
   turn and keeps using the same session. `MU_ZSH_SESSION_ID=<id>` seeds
   attachment to an existing session.
+- `mu --project <dir> <subcommand>` — run project-scoped management commands
+  against an explicit directory instead of the process cwd.
+- `mu project inspect --path <dir>` — report whether a directory is already a
+  `mu` project.
+- `mu project init --path <dir>` — create `.mu/` project metadata in an
+  explicitly chosen directory.
 - `mu session new` — create a session and print its id.
-- `mu session list` — list recent non-archived CLI-origin sessions.
+- `mu session list` — list recent non-archived CLI-origin sessions by default;
+  wrappers may widen this to all origins.
+- `mu session transcript --session <id>` — print a persisted session
+  transcript.
 - `mu session archive --session <id>` — hide a session from default lists.
 - `mu session unarchive --session <id>` — restore an archived session to
   default lists.
 - `mu compact --session <id>` — force compaction.
-- `mu web [opts]` — V2 web coordinator subcommand in the same binary.
+- `mu web [--socket <path>] [--socket-mode <octal>]` — serve the local browser
+  UI on a Unix socket.
 
-`mu web` is explicitly V2.
+The turn runner remains stdin-driven and exits after one completed turn. `mu
+web` is the long-lived wrapper surface: it accepts browser requests, starts
+project-scoped sessions, shells out to the same turn runner with `--output
+json`, and streams those JSON events to the browser. `mu session new/list`,
+`mu session transcript`, and project inspection/init do **not** require a
+configured provider. Turn invocation and `mu compact` require a configured
+provider because they can contact the provider (§7).
 
-`mu session new/list` do **not** require a configured provider. Turn invocation
-and `mu compact` require a configured provider because they can contact the
-provider (§7).
+### Web surface
+
+`mu web` is the browser surface for `mu`: a local, self-hosted web UI for
+starting, resuming, monitoring, and reviewing `mu` sessions across multiple
+projects. It should feel visually and interaction-wise like opencode's web UI,
+while preserving `mu`'s simpler model: command-driven turns, project-scoped
+state, and the normal `mu` CLI as the authority for agent work.
+
+#### Goals
+
+- **Opencode visual parity.** V1 should copy opencode's visual design as exactly
+  as practical: font family, font sizes, spacing, colors, button sizes, border
+  radii, shadows, icons, hover/focus states, layout density, and responsive
+  behavior. A distinct `mu` visual design can come later.
+- **Mu-native semantics.** Visual design may be copied from opencode, but the
+  product model is `mu`: projects, sessions, turns, status, and the single
+  `bash` tool. The UI must not inherit opencode concepts that do not exist in
+  `mu`.
+- **Multi-project first.** A running `mu web` instance can browse and work
+  across many projects. The launch directory is only the initial/default
+  project.
+- **Secure by deployment boundary.** `mu web` does not implement
+  browser-facing authentication. It listens only on a Unix domain socket, and
+  nginx or another trusted reverse proxy owns TLS and authentication.
+- **Status is canonical.** Session/project metadata shown in the UI should come
+  from `mu status`. If the web UI needs more metadata, that metadata belongs in
+  the status contract, not in web-only database parsing.
+- **Command wrapper, not agent host.** The web surface coordinates HTTP,
+  browser state, static assets, and presentation. It should call the normal
+  `mu` command path for nearly all agent/session work instead of hosting the
+  agent loop or mutating session state directly.
+
+#### Non-goals
+
+- No application-level login, cookie auth, OAuth, RBAC, or per-user permission
+  model inside `mu web`.
+- No public TCP listener. Production and normal local service mode use a Unix
+  socket only.
+- No hidden project creation. Merely browsing or selecting a directory must not
+  create `.mu`.
+- No direct session creation in the web server. Web-origin sessions are created
+  by invoking `mu` with an explicit web-origin context, not by inserting rows.
+- No duplicate database interpretation in the web server for status/sidebar
+  metadata or listing filters.
+- No global-scope sessions in the web surface. CLI and shell use may still
+  support global sessions, but `mu web` requires an explicit project.
+- No attempt to make `mu web` a shell replacement. The shell remains the best
+  place for terminal-native interaction.
+- No file review or IDE replacement requirement for V1. Those can be added only
+  when they are backed by truthful `mu` data.
+
+#### Visual and interaction direction
+
+The design reference is the local opencode checkout at `/root/opencode`,
+especially its app shell, home/session views, prompt composer, and v2 design
+tokens. V1 should target visual parity with opencode, not a `mu`-branded
+reinterpretation. The expected result is that buttons, inputs, sidebars,
+composer surfaces, tabs, menus, dialogs, text styles, icons, colors, shadows,
+row heights, and spacing match opencode unless a `mu` semantic difference makes
+the exact element inappropriate.
+
+Direct component reuse is allowed when it is high quality and reduces work, but
+it is not a requirement. If components are rebuilt, their rendered geometry and
+visual states should still match opencode's implementation as closely as
+possible.
+
+The UI should preserve these opencode-like qualities:
+
+- A compact, left-navigation app shell with projects, recent sessions, and
+  active session state.
+- A home screen focused on recent work rather than marketing or onboarding.
+- A session timeline that streams assistant text and tool activity as the turn
+  runs.
+- A docked composer with model/effort controls, attachments, submit, and abort.
+- Keyboard-friendly search and selection flows.
+- Quiet system feedback: small spinners, inline status, badges, and toasts
+  rather than modal-heavy workflows.
+- Light/dark theme behavior and the same general spacing, typography, border,
+  and icon tone as opencode.
+
+V1 should avoid introducing new colors, spacing scales, button variants, card
+styles, typography, icon systems, or brand treatments unless opencode has no
+matching pattern for the required `mu` concept. Future versions may introduce a
+more distinct `mu` design after the opencode-parity version is working.
+
+The UI should translate vocabulary to `mu` terms where visible labels matter:
+
+- "Project" means a directory with `.mu` or `.git`.
+- "Session" means a `mu` session in a specific project scope.
+- "Turn" means one submitted prompt and its resulting agent loop.
+- "Status" means the canonical `mu status` metadata for the selected
+  project/session.
+
+#### Multi-project model
+
+`mu web` must support multiple projects in one browser session.
+
+A directory is already a project when `mu` discovery would treat it as a
+project:
+
+- it contains `.mu`; or
+- it contains `.git`.
+
+The app should keep a recent/project list. The launch cwd is the initial
+selected project when it is a project. If launch cwd is not a project, the app
+may open with no selected project and offer a project picker.
+
+`mu web` does not show or create global-scope sessions in V1. If it launches
+outside a project, it should show a friendly empty state with actions to open an
+existing project or create a `.mu` project at an explicitly confirmed
+directory. This keeps every web session anchored to a project path, which makes
+routing, status, git metadata, and session lists unambiguous.
+
+Opening a project should use a directory picker/search flow similar to
+opencode:
+
+- Choosing an existing project opens it immediately.
+- Choosing a non-project directory must show a confirmation explaining that
+  `mu` will create `.mu` in that directory and make it a project.
+- Only an explicit confirmation creates `.mu`.
+- Canceling returns to the picker without changing the filesystem.
+
+Creating a `.mu` project should use the same layout rules as the CLI:
+
+- create `.mu/`;
+- create `.mu/config.jsonc` only when needed by existing project-layout rules;
+- create `.mu/skills/`;
+- create `.mu/.gitignore` that ignores session databases and secret/env files.
+
+The web UI should not invent a separate project registry as the source of
+truth. It may keep a convenience list of recently opened paths, but project
+identity is the directory path plus `mu`'s existing project discovery rules.
+
+#### Session experience
+
+The primary loop is:
+
+1. Pick or create a project.
+2. Pick or create a session in that project.
+3. Submit prompts through the docked composer.
+4. Watch streamed text/tool events in the timeline.
+5. Inspect project/session metadata in the right sidebar.
+6. Resume later from the project/session home.
+
+Sessions are scoped to their project. A session id is meaningful inside its
+project scope, and the UI must always carry the project path when addressing a
+session.
+
+Concurrent turns against the same session should behave like the CLI: one active
+turn per session. The UI should show a session as busy instead of allowing
+interleaved writes. Different sessions may run concurrently.
+
+The composer should support:
+
+- multiline prompt entry;
+- image attachment parity with CLI image inputs;
+- model selection;
+- effort selection;
+- submit;
+- abort/interrupt while a turn is active;
+- prompt history for the current browser/user context.
+
+#### Right sidebar
+
+The session view includes a right sidebar for metadata only. It is not a file
+browser, review panel, terminal, or editor.
+
+The sidebar should primarily display canonical status data:
+
+- selected model;
+- effort;
+- active session id;
+- project root;
+- context window;
+- context usage percentage;
+- max output tokens;
+- reasoning support;
+- model metadata source;
+- supported effort levels.
+
+The sidebar may also include metadata that is useful while working:
+
+- git branch and dirty/clean state when the project is in git;
+- current session turn count;
+- last updated time;
+- total token or context estimate;
+- cost total if available;
+- compaction state or last summary marker;
+- active turn duration/status.
+
+If any of these require database reads or project inspection, they should be
+added to `mu status` first. The web server should call that status path. It must
+not grow its own ad-hoc SQLite queries for sidebar data.
+
+#### Backend and data ownership
+
+`mu web` is packaged as a subcommand of the `mu` binary, but conceptually it is
+a separate web wrapper that happens to ship in the same executable. Its job is
+to coordinate HTTP, static assets, project selection, browser subscriptions, and
+presentation. It should not share the agent loop as an in-process library path
+or become another way to mutate session state.
+
+For agent/session operations, `mu web` should invoke the ordinary `mu` command
+surface whenever practical:
+
+- session creation uses the same session command or turn invocation path as CLI
+  creation, with an explicit `web` origin;
+- turns are run by calling the `mu` turn runner and streaming its JSON events;
+- status comes from `mu status --json`;
+- model lists come from `mu models list --json`;
+- archive/list behavior comes from session commands rather than web-only SQL.
+
+This keeps `mu web` conceptually close to a separate binary such as `mu-web`
+that shells out to `mu`, while still allowing us to distribute it as
+`mu web`.
+
+The web API is allowed to expose browser-shaped endpoints, but they must map to
+existing `mu` concepts:
+
+- projects;
+- sessions;
+- turns;
+- events;
+- status;
+- models;
+- attachments.
+
+The API should carry project path explicitly for project-scoped operations. The
+current process cwd must not be the hidden global selector for all web requests,
+because a single `mu web` process serves multiple projects.
+
+The web server may keep ephemeral in-memory state for child processes, active
+streams, browser subscriptions, and recently opened projects. Persistent session
+state remains owned by the invoked `mu` commands and their existing stores.
+
+#### Security and deployment
+
+`mu web` trusts the local reverse-proxy boundary.
+
+Requirements:
+
+- listen only on a Unix domain socket;
+- default socket permissions should be private (`0600`) when no group sharing is
+  requested;
+- deployment behind nginx should support group-readable/connectable sockets
+  (`0660`) for the nginx user/group;
+- no built-in authentication or authorization screens;
+- no direct TCP listener;
+- no CORS surface for arbitrary origins;
+- long-running streaming responses must work through nginx without buffering.
+
+This server already uses two relevant deployment patterns:
+
+- `codex-webui.service` runs a normal service and points it at
+  `/run/codex-webui/codex-webui.sock` with socket mode `0660`.
+- `webterm@.socket` uses systemd socket activation with
+  `SocketGroup=http`, `SocketMode=0660`, and nginx proxies to
+  `http://unix:/run/webterm/$slot.sock`.
+
+`mu web` should follow that family of deployment:
+
+- socket under `/run/mu-web/`;
+- runtime directory owned by root and connectable by nginx's `http` group when
+  deployed behind nginx;
+- nginx owns TLS and cookie/login gating;
+- nginx proxies to `http://unix:/run/mu-web/mu-web.sock`;
+- streaming endpoints disable proxy buffering and caching.
+
+The application should be safe to expose only to whoever nginx authenticates.
+Once a request reaches the Unix socket, `mu web` treats it as authorized.
+
+#### Status contract
+
+The web UI depends on `mu status` as the canonical metadata contract. To support
+multi-project web operation, status must be usable for an explicit project path
+and optional session id, not just the process cwd.
+
+The status contract should be extended whenever the UI needs new metadata. Good
+candidates include:
+
+- git branch;
+- git dirty state;
+- git worktree/common-dir metadata;
+- session updated time;
+- session turn/message counts;
+- active/busy state;
+- accumulated cost;
+- compaction summary state.
+
+The design constraint is simple: if the right sidebar shows it, `mu status`
+should be able to report it.
+
+#### Open questions
+
+- Should the first `mu web` URL open directly into the launch project, or always
+  show the multi-project home with the launch project selected?
+- Should recent projects be stored globally in `~/.mu`, or should they remain
+  browser-local until there is a stronger need for cross-browser persistence?
+- Should non-project directory confirmation create only `.mu` metadata, or also
+  offer to initialize a git repo when no `.git` exists?
 
 ### Turn lifecycle (authoritative end-to-end flow)
 
@@ -395,7 +706,7 @@ behavior.
   and may update recent status lines for in-progress activity, but it must keep
   normal scrollback. It must not use an alternate screen, clear the screen, or
   require mouse interaction.
-- **JSON output** is for programs, integrations, and the future web UI. It is a
+- **JSON output** is for programs, integrations, and the web UI. It is a
   delimited serialization of the same turn events used by the other output
   formats, suitable for incremental consumers (newline-delimited JSON is the V1
   shape).
@@ -527,8 +838,9 @@ Session lifecycle is exposed through CLI commands:
   plugin to an existing session.
 - `mu -c` continues the latest session in the active scope for a one-shot turn.
 - `mu session new` creates a session and prints its id.
-- `mu session list` lists recent non-archived CLI-origin sessions. Web-origin
-  sessions are reserved for `mu web` listing.
+- `mu session list` lists recent non-archived CLI-origin sessions by default;
+  wrappers may request all origins or explicitly create/list web-origin
+  sessions.
 - `mu session archive --session <id>` hides a session from default lists without
   deleting it.
 - `mu session unarchive --session <id>` restores an archived session to default
@@ -1140,6 +1452,9 @@ Coarse sequencing only (not an execution plan):
    lock, two-tier compaction, exit turn-summary line.
 5. **zsh shell surface.** Prompt mode, first-turn session capture, session
    attach via environment, and clean entry/exit controls.
-6. **Skills.** Skill scan + cache + system-prompt injection, `AGENTS.md`
+6. **Web surface.** Unix-socket server, project picker/init flows, explicit
+   `--project` routing, browser session metadata via `mu status`, and
+   stream-through turn execution via `mu --output json`.
+7. **Skills.** Skill scan + cache + system-prompt injection, `AGENTS.md`
    (global + project).
-7. **Polish.** Robustness, error-message quality, config surface.
+8. **Polish.** Robustness, error-message quality, config surface.

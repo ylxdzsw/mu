@@ -1,5 +1,6 @@
 use anyhow::{Result, bail};
 use serde::Serialize;
+use std::process::Command;
 
 use crate::config::Config;
 use crate::models::{
@@ -36,6 +37,43 @@ pub struct StatusReport {
     pub model_metadata_source: ModelMetadataSource,
     pub supported_effort_levels_source: SupportedEffortSource,
     pub supported_effort_levels: Vec<EffortLevel>,
+    pub git: Option<GitStatus>,
+    pub session: Option<StatusSession>,
+    pub active: StatusActiveTurn,
+    pub compaction: Option<CompactionStatus>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct GitStatus {
+    pub branch: Option<String>,
+    pub dirty: Option<bool>,
+    pub git_dir: Option<String>,
+    pub common_dir: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct StatusSession {
+    pub id: String,
+    pub title: Option<String>,
+    pub cwd: String,
+    pub origin: crate::store::SessionOrigin,
+    pub archived: bool,
+    pub created_at: String,
+    pub updated_at: String,
+    pub message_count: u64,
+    pub turn_count: u64,
+    pub last_total_tokens: u64,
+    pub cost_total: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct StatusActiveTurn {
+    pub busy: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CompactionStatus {
+    pub latest_summary_seq: Option<i64>,
 }
 
 pub fn resolve_invocation(
@@ -122,6 +160,25 @@ pub fn build_status_report(
         resolved.request.effort.as_ref(),
         &model_info,
     )?;
+    let session_summary = resolved
+        .attached_session
+        .as_ref()
+        .map(|session| store.session_summary(&session.id))
+        .transpose()?
+        .flatten();
+    let active = resolved
+        .attached_session
+        .as_ref()
+        .is_some_and(|session| crate::store::is_session_busy(&session.id));
+    let compaction = resolved
+        .attached_session
+        .as_ref()
+        .map(|session| {
+            store
+                .latest_summary_sequence(&session.id)
+                .map(|latest_summary_seq| CompactionStatus { latest_summary_seq })
+        })
+        .transpose()?;
 
     Ok(StatusReport {
         model_id: resolved.request.model.clone(),
@@ -138,6 +195,10 @@ pub fn build_status_report(
         model_metadata_source: model_info.metadata_source,
         supported_effort_levels_source: model_info.supported_effort_source,
         supported_effort_levels: model_info.supported_effort_levels,
+        git: project.map(git_status),
+        session: session_summary.map(status_session),
+        active: StatusActiveTurn { busy: active },
+        compaction,
     })
 }
 
@@ -154,6 +215,63 @@ fn context_percent(
         store.estimate_context_tokens(&session.id)
     };
     Some((tokens as f64 / context_window as f64) * 100.0)
+}
+
+fn status_session(summary: crate::store::SessionSummary) -> StatusSession {
+    StatusSession {
+        id: summary.id,
+        title: summary.title,
+        cwd: summary.cwd,
+        origin: summary.origin,
+        archived: summary.archived,
+        created_at: summary.created_at,
+        updated_at: summary.updated_at,
+        message_count: summary.message_count,
+        turn_count: summary.turn_count,
+        last_total_tokens: summary.last_total_tokens,
+        cost_total: summary.cost_total,
+    }
+}
+
+fn git_status(project: &crate::paths::Project) -> GitStatus {
+    GitStatus {
+        branch: git_branch(&project.root),
+        dirty: git_dirty(&project.root),
+        git_dir: project
+            .worktree
+            .as_ref()
+            .map(|worktree| worktree.git_dir.display().to_string()),
+        common_dir: project
+            .worktree
+            .as_ref()
+            .and_then(|worktree| worktree.common_dir.as_ref())
+            .map(|path| path.display().to_string()),
+    }
+}
+
+fn git_branch(root: &std::path::Path) -> Option<String> {
+    let branch = git_output(root, &["branch", "--show-current"])?;
+    if !branch.is_empty() {
+        return Some(branch);
+    }
+    git_output(root, &["rev-parse", "--short", "HEAD"]).filter(|value| !value.is_empty())
+}
+
+fn git_dirty(root: &std::path::Path) -> Option<bool> {
+    git_output(root, &["status", "--porcelain=v1"]).map(|output| !output.is_empty())
+}
+
+fn git_output(root: &std::path::Path, args: &[&str]) -> Option<String> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(args)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
 #[cfg(test)]

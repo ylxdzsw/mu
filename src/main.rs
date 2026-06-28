@@ -1,10 +1,11 @@
 use std::io::{self, Read};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process;
 use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
 use clap::Parser;
+use serde::Serialize;
 
 #[cfg(not(unix))]
 compile_error!("mu is supported only on Unix-like systems");
@@ -25,8 +26,9 @@ mod skills;
 mod store;
 mod system_prompt;
 mod tools;
+mod web;
 
-use cli::{Args, Command, ModelsSub, SessionSub};
+use cli::{Args, Command, ModelsSub, ProjectSub, SessionOriginArg, SessionSub};
 use config::Config;
 use models::{ModelCatalog, RequestOptions};
 use provider::Provider;
@@ -82,17 +84,140 @@ fn error_output_format() -> cli::OutputFormat {
     cli::OutputFormat::Terminal
 }
 
+#[derive(Debug, Serialize)]
+struct ProjectInfo {
+    path: String,
+    is_project: bool,
+    marker: Option<&'static str>,
+    project_root: Option<String>,
+    discovered_marker: Option<&'static str>,
+    needs_confirmation: bool,
+}
+
+fn session_origin(origin: SessionOriginArg) -> store::SessionOrigin {
+    match origin {
+        SessionOriginArg::Cli => store::SessionOrigin::Cli,
+        SessionOriginArg::Web => store::SessionOrigin::Web,
+    }
+}
+
+fn resolve_existing_dir(base: &Path, path: &Path) -> Result<PathBuf> {
+    let path = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        base.join(path)
+    };
+    let path = std::fs::canonicalize(&path)
+        .with_context(|| format!("resolving directory {}", path.display()))?;
+    if !path.is_dir() {
+        bail!("not a directory: {}", path.display());
+    }
+    Ok(path)
+}
+
+fn inspect_project_path(base: &Path, path: &Path) -> Result<ProjectInfo> {
+    let path = resolve_existing_dir(base, path)?;
+    let marker = project_marker_at(&path);
+    let discovered = paths::discover_project(&path);
+    Ok(ProjectInfo {
+        path: path.display().to_string(),
+        is_project: marker.is_some(),
+        marker,
+        project_root: discovered
+            .as_ref()
+            .map(|project| project.root.display().to_string()),
+        discovered_marker: discovered
+            .as_ref()
+            .map(|project| project_marker_name(project.marker)),
+        needs_confirmation: marker.is_none(),
+    })
+}
+
+fn project_marker_at(path: &Path) -> Option<&'static str> {
+    if path.join(".mu").is_dir() {
+        Some("mu")
+    } else if path.join(".git").exists() {
+        Some("git")
+    } else {
+        None
+    }
+}
+
+fn project_marker_name(marker: paths::ProjectMarker) -> &'static str {
+    match marker {
+        paths::ProjectMarker::Mu => "mu",
+        paths::ProjectMarker::Git => "git",
+    }
+}
+
+fn print_project_info(info: &ProjectInfo) {
+    println!("path: {}", info.path);
+    println!("is_project: {}", info.is_project);
+    println!(
+        "marker: {}",
+        info.marker.unwrap_or(if info.needs_confirmation {
+            "(none)"
+        } else {
+            "unknown"
+        })
+    );
+    println!(
+        "project_root: {}",
+        info.project_root.as_deref().unwrap_or("(none)")
+    );
+}
+
 async fn run() -> Result<()> {
     let args = Args::parse();
-    let cwd = std::env::current_dir()?;
+    let process_cwd = std::env::current_dir()?;
+    let cwd = match args.project.as_deref() {
+        Some(project) => resolve_existing_dir(&process_cwd, project)?,
+        None => process_cwd,
+    };
     let scope = paths::discover_scope(&cwd);
+    if args.project.is_some()
+        && scope.project().is_none()
+        && !matches!(
+            args.command,
+            Some(Command::Project { .. }) | Some(Command::Web(_))
+        )
+    {
+        bail!(
+            "--project must point inside an existing project: {}",
+            cwd.display()
+        );
+    }
     let project_config_dir = scope.project().map(|p| p.root.join(".mu"));
+    let origin = session_origin(args.origin);
 
     match args.command {
+        Some(Command::Project { sub }) => {
+            match sub {
+                ProjectSub::Inspect { path, json } => {
+                    let info = inspect_project_path(&cwd, &path)?;
+                    if json {
+                        println!("{}", serde_json::to_string(&info)?);
+                    } else {
+                        print_project_info(&info);
+                    }
+                }
+                ProjectSub::Init { path, json } => {
+                    let root = resolve_existing_dir(&cwd, &path)?;
+                    paths::ensure_project_layout_at(&root)?;
+                    let info = inspect_project_path(&cwd, &root)?;
+                    if json {
+                        println!("{}", serde_json::to_string(&info)?);
+                    } else {
+                        print_project_info(&info);
+                    }
+                }
+            }
+            return Ok(());
+        }
         Some(Command::Session { sub }) => {
             let db_path = scope.session_db_path();
             match sub {
-                SessionSub::New => {
+                SessionSub::New { json } => {
                     paths::ensure_project_layout(&scope)?;
                     let store = store::Store::open(&db_path)?;
                     let latest = store.latest_session()?;
@@ -104,10 +229,11 @@ async fn run() -> Result<()> {
                         .map(|c| c.default_model.as_str())
                         .unwrap_or("gpt-4o");
                     let default_effort = config.as_ref().and_then(|c| c.default_effort);
-                    let session = store.create_session(
+                    let session = store.create_session_with_origin(
                         &cwd.display().to_string(),
                         inherited_model.as_deref().unwrap_or(default_model),
                         inherited_effort.or(default_effort),
+                        origin,
                     )?;
                     store.append_message(
                         &session.id,
@@ -120,23 +246,93 @@ async fn run() -> Result<()> {
                             .into(),
                         },
                     )?;
-                    println!("{}", session.id);
+                    if json {
+                        let summary = store
+                            .session_summary(&session.id)?
+                            .ok_or_else(|| anyhow::anyhow!("session not found after create"))?;
+                        println!("{}", serde_json::to_string(&summary)?);
+                    } else {
+                        println!("{}", session.id);
+                    }
                 }
-                SessionSub::List => {
+                SessionSub::List {
+                    json,
+                    limit,
+                    all_origins,
+                } => {
                     if !db_path.exists() {
+                        if json {
+                            println!("[]");
+                        }
                         return Ok(());
                     }
                     let store = store::Store::open(&db_path)?;
-                    let sessions = store.list_sessions(20)?;
+                    if json {
+                        let sessions = if all_origins {
+                            store.list_all_session_summaries(limit)?
+                        } else {
+                            store.list_session_summaries_by_origin(origin, limit)?
+                        };
+                        println!("{}", serde_json::to_string(&sessions)?);
+                        return Ok(());
+                    }
+                    if all_origins {
+                        for s in store.list_all_session_summaries(limit)? {
+                            let title = s.title.unwrap_or_else(|| "(untitled)".into());
+                            let origin = if s.origin == store::SessionOrigin::Cli {
+                                String::new()
+                            } else {
+                                format!(" [{}]", s.origin)
+                            };
+                            let effort = s
+                                .effort
+                                .map(|level| format!(" [{}]", level))
+                                .unwrap_or_default();
+                            println!(
+                                "{}  {}  {}{}{}  {}",
+                                s.id, title, s.model, effort, origin, s.updated_at
+                            );
+                        }
+                        return Ok(());
+                    }
+                    let sessions = if origin == store::SessionOrigin::Cli {
+                        store.list_sessions(limit)?
+                    } else {
+                        store.list_sessions_by_origin(origin, limit)?
+                    };
                     for (s, updated) in sessions {
-                        debug_assert_eq!(s.origin, store::SessionOrigin::Cli);
                         debug_assert!(!s.archived);
                         let title = s.title.unwrap_or_else(|| "(untitled)".into());
+                        let origin = if s.origin == store::SessionOrigin::Cli {
+                            String::new()
+                        } else {
+                            format!(" [{}]", s.origin)
+                        };
                         let effort = s
                             .effort
                             .map(|level| format!(" [{}]", level))
                             .unwrap_or_default();
-                        println!("{}  {}  {}{}  {}", s.id, title, s.model, effort, updated);
+                        println!(
+                            "{}  {}  {}{}{}  {}",
+                            s.id, title, s.model, effort, origin, updated
+                        );
+                    }
+                }
+                SessionSub::Transcript { session, json } => {
+                    if !db_path.exists() {
+                        bail!("session not found in active scope: {session}");
+                    }
+                    let store = store::Store::open(&db_path)?;
+                    if store.get_session(&session)?.is_none() {
+                        bail!("session not found in active scope: {session}");
+                    }
+                    let transcript = store.transcript(&session)?;
+                    if json {
+                        println!("{}", serde_json::to_string(&transcript)?);
+                    } else {
+                        for message in transcript {
+                            println!("[{}:{}] {}", message.seq, message.role, message.content);
+                        }
                     }
                 }
                 SessionSub::Archive { session } => {
@@ -160,6 +356,10 @@ async fn run() -> Result<()> {
                     store.set_session_archived(&session, false)?;
                 }
             }
+            return Ok(());
+        }
+        Some(Command::Web(web_args)) => {
+            web::serve(web_args, cwd).await?;
             return Ok(());
         }
         Some(Command::Status(status_args)) => {
@@ -206,6 +406,17 @@ async fn run() -> Result<()> {
                 }
                 ModelsSub::List { json } => {
                     let Some(catalog) = ModelCatalog::load(&ModelCatalog::cache_path())? else {
+                        if json {
+                            println!(
+                                "{}",
+                                serde_json::json!({
+                                    "version": 1,
+                                    "fetched_at": null,
+                                    "provider": null,
+                                    "models": {}
+                                })
+                            );
+                        }
                         return Ok(());
                     };
                     if json {
@@ -306,7 +517,13 @@ async fn run() -> Result<()> {
     let (session, created) = if let Some(session) = resolved.attached_session.clone() {
         (session, false)
     } else {
-        create_seeded_session(&store, &cwd, scope.project(), &resolved.session_seed)?
+        create_seeded_session(
+            &store,
+            &cwd,
+            scope.project(),
+            &resolved.session_seed,
+            origin,
+        )?
     };
     let session_id = session.id.clone();
 
@@ -417,8 +634,14 @@ fn create_seeded_session(
     cwd: &std::path::Path,
     project: Option<&paths::Project>,
     seed: &RequestOptions,
+    origin: store::SessionOrigin,
 ) -> Result<(store::Session, bool)> {
-    let session = store.create_session(&cwd.display().to_string(), &seed.model, seed.effort)?;
+    let session = store.create_session_with_origin(
+        &cwd.display().to_string(),
+        &seed.model,
+        seed.effort,
+        origin,
+    )?;
     store.append_message(
         &session.id,
         &provider::Message::User {
@@ -469,6 +692,31 @@ fn print_status_report(report: &StatusReport) {
     println!("session: {session}");
     println!("context: {context}");
     println!("project: {project}");
+    if let Some(git) = &report.git {
+        if let Some(branch) = &git.branch {
+            println!(
+                "git: {}{}",
+                branch,
+                if git.dirty.unwrap_or(false) {
+                    " (dirty)"
+                } else {
+                    " (clean)"
+                }
+            );
+        }
+    }
+    if let Some(session) = &report.session {
+        println!(
+            "turns: {}  messages: {}  updated: {}",
+            session.turn_count, session.message_count, session.updated_at
+        );
+        if session.cost_total > 0.0 {
+            println!("cost total: ${:.4}", session.cost_total);
+        }
+    }
+    if report.active.busy {
+        println!("active: busy");
+    }
     println!(
         "metadata: {}",
         match report.model_metadata_source {

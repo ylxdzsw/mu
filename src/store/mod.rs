@@ -5,6 +5,7 @@ use fs2::FileExt;
 
 use anyhow::{Context, Result, bail};
 use rusqlite::{Connection, OptionalExtension, params};
+use serde::Serialize;
 use uuid::Uuid;
 
 use crate::models::EffortLevel;
@@ -22,7 +23,8 @@ pub struct Session {
     pub archived: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
 pub enum SessionOrigin {
     Cli,
     Web,
@@ -60,6 +62,32 @@ pub struct StoredMessage {
     pub role: String,
     pub content: String,
     pub seq: i64,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SessionSummary {
+    pub id: String,
+    pub created_at: String,
+    pub updated_at: String,
+    pub cwd: String,
+    pub model: String,
+    pub effort: Option<EffortLevel>,
+    pub title: Option<String>,
+    pub last_total_tokens: u64,
+    pub cost_total: f64,
+    pub origin: SessionOrigin,
+    pub archived: bool,
+    pub message_count: u64,
+    pub turn_count: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TranscriptMessage {
+    pub role: String,
+    pub content: String,
+    pub seq: i64,
+    pub created_at: String,
 }
 
 pub struct ToolCallRecord<'a> {
@@ -200,6 +228,7 @@ impl Store {
         Ok(())
     }
 
+    #[cfg(test)]
     pub fn create_session(
         &self,
         cwd: &str,
@@ -300,6 +329,108 @@ impl Store {
         })?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
             .context("listing sessions")
+    }
+
+    pub fn list_session_summaries_by_origin(
+        &self,
+        origin: SessionOrigin,
+        limit: usize,
+    ) -> Result<Vec<SessionSummary>> {
+        self.list_session_summaries(Some(origin), limit)
+    }
+
+    pub fn list_all_session_summaries(&self, limit: usize) -> Result<Vec<SessionSummary>> {
+        self.list_session_summaries(None, limit)
+    }
+
+    fn list_session_summaries(
+        &self,
+        origin: Option<SessionOrigin>,
+        limit: usize,
+    ) -> Result<Vec<SessionSummary>> {
+        let (where_origin, limit_param) = if origin.is_some() {
+            ("s.origin = ?1 AND s.archived = 0", "?2")
+        } else {
+            ("s.archived = 0", "?1")
+        };
+        let sql = format!(
+            "SELECT
+                s.id, s.created_at, s.updated_at, s.cwd, s.model, s.effort, s.title,
+                s.last_total_tokens, s.cost_total, s.origin, s.archived,
+                COUNT(m.id) AS message_count,
+                COALESCE(SUM(CASE WHEN m.role = 'user' THEN 1 ELSE 0 END), 0) AS user_count
+             FROM session s
+             LEFT JOIN message m ON m.session_id = s.id
+             WHERE {where_origin}
+             GROUP BY s.id
+             ORDER BY s.updated_at DESC LIMIT {limit_param}"
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let mut rows = match origin {
+            Some(origin) => stmt.query(params![origin.as_str(), limit as i64])?,
+            None => stmt.query(params![limit as i64])?,
+        };
+        let mut summaries = Vec::new();
+        while let Some(row) = rows.next()? {
+            let effort: Option<String> = row.get(5)?;
+            let origin: String = row.get(9)?;
+            let message_count = row.get::<_, i64>(11)? as u64;
+            let user_count = row.get::<_, i64>(12)? as u64;
+            summaries.push(SessionSummary {
+                id: row.get(0)?,
+                created_at: row.get(1)?,
+                updated_at: row.get(2)?,
+                cwd: row.get(3)?,
+                model: row.get(4)?,
+                effort: parse_effort(effort)?,
+                title: row.get(6)?,
+                last_total_tokens: row.get::<_, i64>(7)? as u64,
+                cost_total: row.get(8)?,
+                origin: parse_origin(origin)?,
+                archived: row.get::<_, i64>(10)? != 0,
+                message_count,
+                turn_count: user_count.saturating_sub(1),
+            });
+        }
+        Ok(summaries)
+    }
+
+    pub fn session_summary(&self, id: &str) -> Result<Option<SessionSummary>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT
+                s.id, s.created_at, s.updated_at, s.cwd, s.model, s.effort, s.title,
+                s.last_total_tokens, s.cost_total, s.origin, s.archived,
+                COUNT(m.id) AS message_count,
+                COALESCE(SUM(CASE WHEN m.role = 'user' THEN 1 ELSE 0 END), 0) AS user_count
+             FROM session s
+             LEFT JOIN message m ON m.session_id = s.id
+             WHERE s.id = ?1
+             GROUP BY s.id",
+        )?;
+        let row = stmt
+            .query_row(params![id], |row| {
+                let effort: Option<String> = row.get(5)?;
+                let origin: String = row.get(9)?;
+                let message_count = row.get::<_, i64>(11)? as u64;
+                let user_count = row.get::<_, i64>(12)? as u64;
+                Ok(SessionSummary {
+                    id: row.get(0)?,
+                    created_at: row.get(1)?,
+                    updated_at: row.get(2)?,
+                    cwd: row.get(3)?,
+                    model: row.get(4)?,
+                    effort: parse_effort(effort)?,
+                    title: row.get(6)?,
+                    last_total_tokens: row.get::<_, i64>(7)? as u64,
+                    cost_total: row.get(8)?,
+                    origin: parse_origin(origin)?,
+                    archived: row.get::<_, i64>(10)? != 0,
+                    message_count,
+                    turn_count: user_count.saturating_sub(1),
+                })
+            })
+            .optional()?;
+        Ok(row)
     }
 
     pub fn latest_session(&self) -> Result<Option<Session>> {
@@ -467,7 +598,7 @@ impl Store {
 
     fn message_at_seq(&self, session_id: &str, seq: i64) -> Result<Option<StoredMessage>> {
         let mut stmt = self.conn.prepare(
-            "SELECT role, content, seq FROM message
+            "SELECT role, content, seq, created_at FROM message
              WHERE session_id = ?1 AND seq = ?2",
         )?;
         let row = stmt
@@ -476,6 +607,7 @@ impl Store {
                     role: row.get(0)?,
                     content: row.get(1)?,
                     seq: row.get(2)?,
+                    created_at: row.get(3)?,
                 })
             })
             .optional()?;
@@ -599,7 +731,7 @@ impl Store {
 
     pub fn all_messages_for_session(&self, session_id: &str) -> Result<Vec<StoredMessage>> {
         let mut stmt = self.conn.prepare(
-            "SELECT role, content, seq FROM message
+            "SELECT role, content, seq, created_at FROM message
              WHERE session_id = ?1 ORDER BY seq ASC",
         )?;
         let rows = stmt.query_map(params![session_id], |row| {
@@ -607,10 +739,28 @@ impl Store {
                 role: row.get(0)?,
                 content: row.get(1)?,
                 seq: row.get(2)?,
+                created_at: row.get(3)?,
             })
         })?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
             .context("loading messages")
+    }
+
+    pub fn transcript(&self, session_id: &str) -> Result<Vec<TranscriptMessage>> {
+        let messages = self.all_messages_for_session(session_id)?;
+        Ok(messages
+            .into_iter()
+            .map(|message| TranscriptMessage {
+                role: message.role,
+                content: message.content,
+                seq: message.seq,
+                created_at: message.created_at,
+            })
+            .collect())
+    }
+
+    pub fn latest_summary_sequence(&self, session_id: &str) -> Result<Option<i64>> {
+        self.latest_summary_seq(session_id)
     }
 
     pub fn estimate_context_tokens(&self, session_id: &str) -> u64 {
@@ -664,9 +814,7 @@ pub struct SessionLock {
 }
 
 pub fn acquire_session_lock(session_id: &str) -> Result<SessionLock> {
-    let lock_dir = crate::paths::runtime_dir();
-    crate::paths::ensure_dir(&lock_dir)?;
-    let lock_path = lock_dir.join(format!("{session_id}.lock"));
+    let lock_path = session_lock_path(session_id)?;
     let file = std::fs::OpenOptions::new()
         .create(true)
         .write(true)
@@ -676,6 +824,23 @@ pub fn acquire_session_lock(session_id: &str) -> Result<SessionLock> {
     file.try_lock_exclusive()
         .map_err(|_| anyhow::anyhow!("session busy"))?;
     Ok(SessionLock { _file: file })
+}
+
+pub fn is_session_busy(session_id: &str) -> bool {
+    let lock_path = crate::paths::runtime_dir().join(format!("{session_id}.lock"));
+    if !lock_path.exists() {
+        return false;
+    }
+    let Ok(file) = std::fs::OpenOptions::new().write(true).open(&lock_path) else {
+        return true;
+    };
+    file.try_lock_exclusive().is_err()
+}
+
+pub fn session_lock_path(session_id: &str) -> Result<std::path::PathBuf> {
+    let lock_dir = crate::paths::runtime_dir();
+    crate::paths::ensure_dir(&lock_dir)?;
+    Ok(lock_dir.join(format!("{session_id}.lock")))
 }
 
 pub fn write_session_id(path: &Path, id: &str) -> Result<()> {
@@ -837,6 +1002,25 @@ mod tests {
             .unwrap();
         assert_eq!(web_sessions.len(), 1);
         assert_eq!(web_sessions[0].0.id, web.id);
+        let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    #[test]
+    fn all_session_summaries_include_cli_and_web_origins() {
+        let (store, tmp) = temp_store();
+        let cli = store.create_session("/tmp", "cli-model", None).unwrap();
+        let web = store
+            .create_session_with_origin("/tmp", "web-model", None, SessionOrigin::Web)
+            .unwrap();
+
+        let summaries = store.list_all_session_summaries(20).unwrap();
+        let ids = summaries
+            .iter()
+            .map(|summary| (summary.id.as_str(), summary.origin))
+            .collect::<Vec<_>>();
+
+        assert!(ids.contains(&(cli.id.as_str(), SessionOrigin::Cli)));
+        assert!(ids.contains(&(web.id.as_str(), SessionOrigin::Web)));
         let _ = std::fs::remove_dir_all(tmp);
     }
 }

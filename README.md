@@ -96,6 +96,26 @@ MU_ZSH_EXIT_HOOKS+=(mu_restore_conflicts)
 | `mu session archive --session <id>` | Hide a session from default lists |
 | `mu session unarchive --session <id>` | Restore an archived session to default lists |
 | `mu compact --session <id>` | Force compaction |
+| `mu web [--socket /run/mu-web/mu-web.sock]` | Serve the local browser UI on a Unix socket |
+
+Use `--project <dir>` with status/session/model commands when a wrapper needs
+to address a project explicitly instead of relying on the process cwd.
+
+## Web UI
+
+`mu web` serves the local browser UI from the same `mu` binary. It listens on a
+Unix domain socket only; it does not implement browser-facing auth, cookies,
+OAuth, RBAC, CORS, or a TCP listener. Put nginx or another trusted reverse proxy
+in front of it for TLS and authentication.
+
+```bash
+mu web --socket /run/mu-web/mu-web.sock --socket-mode 0660
+```
+
+The default socket is `/run/mu-web/mu-web.sock` with private `0600`
+permissions. Use `--socket-mode 0660` when the reverse proxy connects through a
+shared group. Streaming turn responses set `X-Accel-Buffering: no`, so nginx
+locations proxying this socket should also disable buffering and caching.
 
 ## Config
 
