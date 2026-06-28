@@ -171,6 +171,71 @@ grep -q -- "prompt=second prompt" "$MU_ZSH_FAKE_LOG" || fail "sends second promp
 
 rm -f "$MU_ZSH_FAKE_LOG" "$MU_ZSH_SESSION_FILE"
 
+scope_root=$tmpdir/scope-projects
+project_a=$scope_root/project-a
+project_b=$scope_root/project-b
+mkdir -p "$project_a/.mu" "$project_b/.mu" "$project_a/subdir" "$project_b/subdir"
+scope_fake_bin=$tmpdir/scope-bin
+mkdir -p -- "$scope_fake_bin"
+cat > "$scope_fake_bin/mu" <<'EOF'
+#!/usr/bin/env zsh
+scope_root=$PWD
+while [[ "$scope_root" != "/" && ! -d "$scope_root/.mu" && ! -e "$scope_root/.git" ]]; do
+  scope_root=${scope_root:h}
+done
+scope_name=${scope_root:t}
+if [[ "$1" == "status" ]]; then
+  print -r -- "$*" >> "$MU_ZSH_SCOPE_LOG"
+  print -r -- "{\"model_id\":\"scope-model\",\"context_percent\":10.0,\"project_root\":\"$scope_root\"}"
+  exit 0
+fi
+print -r -- "$PWD :: $*" >> "$MU_ZSH_SCOPE_LOG"
+prompt=$(cat)
+print -r -- "prompt=$prompt" >> "$MU_ZSH_SCOPE_LOG"
+if [[ -n "$MU_SESSION_FILE" ]]; then
+  print -r -- "session-$scope_name" > "$MU_SESSION_FILE"
+fi
+EOF
+chmod +x "$scope_fake_bin/mu"
+MU_ZSH_BIN=$scope_fake_bin/mu
+MU_ZSH_OUTPUT=plain
+MU_ZSH_SESSION_FILE=${TMPDIR:-/tmp}/mu-zsh-scope-submit-${$}.session
+export MU_ZSH_SCOPE_LOG=${TMPDIR:-/tmp}/mu-zsh-scope-${$}.log
+rm -f "$MU_ZSH_SCOPE_LOG" "$MU_ZSH_SESSION_FILE"
+MU_ZSH_SESSION_ID=
+MU_ZSH_SESSION_SCOPE=
+MU_ZSH_EFFECTIVE_SESSION_ID=
+
+saved_pwd=$PWD
+builtin cd "$project_a/subdir"
+_mu_zsh_submit_prompt "project a prompt"
+[[ "$MU_ZSH_SESSION_ID" == "session-project-a" ]] || fail "creates a scoped session for the first project"
+
+builtin cd "$project_b/subdir"
+cmd=$(_mu_zsh_build_command)
+[[ "$cmd" == "$scope_fake_bin/mu --output plain" ]] || fail "does not reuse another project's session before submitting there: $cmd"
+: > "$MU_ZSH_SCOPE_LOG"
+status_json=$(_mu_zsh_status_json)
+[[ "$status_json" == *"\"project_root\":\"$project_b\""* ]] || fail "status follows the current project"
+! grep -q -- "-s session-project-a" "$MU_ZSH_SCOPE_LOG" || fail "status should not attach the first project's session in a different project"
+
+builtin cd "$project_a/subdir"
+cmd=$(_mu_zsh_build_command)
+[[ "$cmd" == "$scope_fake_bin/mu --output plain -s session-project-a" ]] || fail "returns to the original scoped session after cd-ing back: $cmd"
+
+builtin cd "$project_b/subdir"
+_mu_zsh_submit_prompt "project b prompt"
+[[ "$MU_ZSH_SESSION_ID" == "session-project-b" ]] || fail "creates a new scoped session after submitting in the second project"
+[[ "$MU_ZSH_SESSION_SCOPE" == "project:$project_b" ]] || fail "moves the tracked session scope after starting in the second project"
+
+builtin cd "$project_a/subdir"
+cmd=$(_mu_zsh_build_command)
+[[ "$cmd" == "$scope_fake_bin/mu --output plain" ]] || fail "forgets the first project's session once a new one starts elsewhere: $cmd"
+
+builtin cd "$saved_pwd"
+MU_ZSH_BIN=$prompt_fake_bin/mu
+rm -f "$MU_ZSH_SCOPE_LOG" "$MU_ZSH_SESSION_FILE"
+
 for dependency in script timeout perl col cmp; do
   command -v "$dependency" >/dev/null || fail "missing test dependency: $dependency"
 done

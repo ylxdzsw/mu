@@ -9,6 +9,8 @@
 typeset -g MU_ZSH_MODE=${MU_ZSH_MODE:-shell}
 typeset -g MU_ZSH_SESSION_ID=${MU_ZSH_SESSION_ID:-}
 typeset -g MU_ZSH_SESSION_FILE=${MU_ZSH_SESSION_FILE:-${TMPDIR:-/tmp}/mu-zsh-${$}.session}
+typeset -g MU_ZSH_SESSION_SCOPE=${MU_ZSH_SESSION_SCOPE:-}
+typeset -g MU_ZSH_EFFECTIVE_SESSION_ID=${MU_ZSH_EFFECTIVE_SESSION_ID:-}
 typeset -g MU_ZSH_BIN=${MU_ZSH_BIN:-mu}
 typeset -g MU_ZSH_OUTPUT=${MU_ZSH_OUTPUT:-terminal}
 typeset -g MU_ZSH_PROMPT_INPUT=${MU_ZSH_PROMPT_INPUT:-${MU_ZSH_PROMPT:-'mu> '}}
@@ -86,31 +88,97 @@ _mu_zsh_quote_prompt() {
   print -r -- "${(qqq)1}"
 }
 
+_mu_zsh_scope_key_for_dir() {
+  local dir=$1
+  local home=${HOME:-}
+  local parent
+
+  while [[ -n "$dir" ]]; do
+    if [[ -n "$home" && "$dir" == "$home" ]]; then
+      break
+    fi
+    if [[ "$dir" == "/" ]]; then
+      break
+    fi
+    if [[ -d "$dir/.mu" || -e "$dir/.git" ]]; then
+      print -r -- "project:$dir"
+      return 0
+    fi
+    parent=${dir:h}
+    [[ -z "$parent" || "$parent" == "$dir" ]] && break
+    dir=$parent
+  done
+
+  print -r -- "global"
+}
+
+_mu_zsh_current_scope_key() {
+  _mu_zsh_scope_key_for_dir "$PWD"
+}
+
+_mu_zsh_sync_session_state() {
+  local scope
+  scope=$(_mu_zsh_current_scope_key)
+
+  if [[ -z "$MU_ZSH_SESSION_ID" ]]; then
+    MU_ZSH_SESSION_SCOPE=
+    MU_ZSH_EFFECTIVE_SESSION_ID=
+    return 0
+  fi
+
+  if [[ -z "$MU_ZSH_SESSION_SCOPE" ]]; then
+    MU_ZSH_SESSION_SCOPE=$scope
+  fi
+
+  if [[ "$MU_ZSH_SESSION_SCOPE" == "$scope" ]]; then
+    MU_ZSH_EFFECTIVE_SESSION_ID=$MU_ZSH_SESSION_ID
+  else
+    MU_ZSH_EFFECTIVE_SESSION_ID=
+  fi
+}
+
+_mu_zsh_remember_session_for_scope() {
+  local id=$1
+  local scope=${2:-$(_mu_zsh_current_scope_key)}
+
+  [[ -n "$id" ]] || return 0
+  MU_ZSH_SESSION_ID=$id
+  MU_ZSH_SESSION_SCOPE=$scope
+  MU_ZSH_EFFECTIVE_SESSION_ID=$id
+}
+
 _mu_zsh_record_history() {
   local prompt=$1
   local quoted
+  local session_id
   quoted=$(_mu_zsh_quote_prompt "$prompt")
+  _mu_zsh_sync_session_state
+  session_id=$MU_ZSH_EFFECTIVE_SESSION_ID
 
-  if [[ -n "$MU_ZSH_SESSION_ID" ]]; then
-    print -sr -- "$MU_ZSH_BIN -s ${(q)MU_ZSH_SESSION_ID} --output ${(q)MU_ZSH_OUTPUT} <<< $quoted"
+  if [[ -n "$session_id" ]]; then
+    print -sr -- "$MU_ZSH_BIN -s ${(q)session_id} --output ${(q)MU_ZSH_OUTPUT} <<< $quoted"
   else
     print -sr -- "$MU_ZSH_BIN --output ${(q)MU_ZSH_OUTPUT} <<< $quoted"
   fi
 }
 
 _mu_zsh_read_session_file() {
+  local scope=${1:-$(_mu_zsh_current_scope_key)}
   [[ -r "$MU_ZSH_SESSION_FILE" ]] || return 0
 
   local id
   id=$(<"$MU_ZSH_SESSION_FILE")
   id=${id//$'\n'/}
-  [[ -n "$id" ]] && MU_ZSH_SESSION_ID=$id
+  [[ -n "$id" ]] && _mu_zsh_remember_session_for_scope "$id" "$scope"
 }
 
 _mu_zsh_build_command() {
   local -a command
+  local session_id
+  _mu_zsh_sync_session_state
+  session_id=$MU_ZSH_EFFECTIVE_SESSION_ID
   command=("$MU_ZSH_BIN" --output "$MU_ZSH_OUTPUT")
-  [[ -n "$MU_ZSH_SESSION_ID" ]] && command+=(-s "$MU_ZSH_SESSION_ID")
+  [[ -n "$session_id" ]] && command+=(-s "$session_id")
   print -r -- "${(j: :)${(q)command[@]}}"
 }
 
@@ -122,8 +190,11 @@ _mu_zsh_escape_prompt_text() {
 
 _mu_zsh_status_json() {
   local -a command
+  local session_id
+  _mu_zsh_sync_session_state
+  session_id=$MU_ZSH_EFFECTIVE_SESSION_ID
   command=("$MU_ZSH_BIN" status --json)
-  [[ -n "$MU_ZSH_SESSION_ID" ]] && command+=(-s "$MU_ZSH_SESSION_ID")
+  [[ -n "$session_id" ]] && command+=(-s "$session_id")
   "${command[@]}" 2>/dev/null
 }
 
@@ -305,16 +376,22 @@ _mu_zsh_clear_prompt() {
 _mu_zsh_submit_prompt() {
   local prompt=$1
   local exit_status
+  local scope session_id
+
+  scope=$(_mu_zsh_current_scope_key)
 
   _mu_zsh_record_history "$prompt"
+  _mu_zsh_sync_session_state
+  session_id=$MU_ZSH_EFFECTIVE_SESSION_ID
 
-  if [[ -n "$MU_ZSH_SESSION_ID" ]]; then
-    "$MU_ZSH_BIN" -s "$MU_ZSH_SESSION_ID" --output "$MU_ZSH_OUTPUT" <<< "$prompt"
+  if [[ -n "$session_id" ]]; then
+    "$MU_ZSH_BIN" -s "$session_id" --output "$MU_ZSH_OUTPUT" <<< "$prompt"
     exit_status=$?
   else
+    rm -f -- "$MU_ZSH_SESSION_FILE" 2>/dev/null || true
     MU_SESSION_FILE=$MU_ZSH_SESSION_FILE "$MU_ZSH_BIN" --output "$MU_ZSH_OUTPUT" <<< "$prompt"
     exit_status=$?
-    _mu_zsh_read_session_file
+    _mu_zsh_read_session_file "$scope"
   fi
 
   return $exit_status
@@ -493,6 +570,8 @@ _mu_zsh_configure_keymap() {
   bindkey -M mumode '^C' _mu_zsh_interrupt
   bindkey -M mumode '^D' _mu_zsh_eof
 }
+
+_mu_zsh_sync_session_state
 
 if [[ -o zle ]]; then
   autoload -Uz add-zsh-hook 2>/dev/null || true
