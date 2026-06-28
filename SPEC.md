@@ -596,9 +596,12 @@ it in this order:
    e. If `finish_reason` is `tool_calls`: execute `bash` calls one at a time in
       request order. Render and **persist tool result messages** (`role:
       "tool"`, with their `tool_call_id`) in the model's original call order,
-      then loop back to (a). A future version may run contiguous
-      `risk:"readonly"` calls concurrently once renderer interleaving and
-      cancellation semantics are explicitly designed.
+      then loop back to (a). In V1 this remains true for every output mode, and
+      both `plain` and `terminal` outputs are explicitly sequential-only. A
+      future version may add concurrent execution for contiguous
+      `risk:"readonly"` calls in `json` output mode, primarily for the web UI,
+      once renderer interleaving, event ordering, and cancellation semantics
+      are explicitly designed.
    f. If `finish_reason` is `stop`: the loop ends.
 10. **Update the session row:** `last_total_tokens` = the `total_tokens` from the
     *final* provider response of the turn (this already reflects the full context
@@ -648,10 +651,11 @@ the child process so the agent can write bytes containing `$`, backticks,
 quotes, or heredoc delimiters without shell expansion.
 
 **Execution ordering.** V1 executes every `bash` call sequentially in request
-order. This keeps filesystem effects, terminal output, and cancellation simple
-while the tool is unsandboxed. A future version may run contiguous
-`risk:"readonly"` calls concurrently because per-call bash processes are
-isolated.
+order. This keeps filesystem effects, `plain`/`terminal` output, and
+cancellation simple while the tool is unsandboxed. `plain` and `terminal`
+therefore remain sequential-only presentations of the turn. A future version
+may run contiguous `risk:"readonly"` calls concurrently in `json` output mode,
+primarily for the web UI, because per-call bash processes are isolated.
 
 **Terminal visibility.** `bash` prints `$ [risk] <title>`, streams combined
 output, and finishes with exit status/duration. Every tool error is visible.
@@ -711,6 +715,13 @@ behavior.
   formats, suitable for incremental consumers (newline-delimited JSON is the V1
   shape).
 
+**Concurrency contract.** In V1, all three formats observe the same sequential
+tool execution. `plain` and `terminal` are intentionally sequential-only and
+must not interleave live tool output from multiple calls. If concurrent
+execution is added later, it should first surface through `json` output mode so
+the web UI can consume ordered machine events without weakening terminal
+transcript guarantees.
+
 The renderer is the sole writer to stdout/stderr and enforces the selected
 format. It may style output only when stdout is a TTY and `--output terminal` is
 selected. It never clears the screen, uses an alternate screen, or requires
@@ -732,7 +743,8 @@ stderr TTY detection suppresses the summary when redirected.
 
 - **Tool presentation.** Bash prints `$ [risk] <title>`, streams ANSI-sanitized output,
   and prints its final exit status. Full tool results still follow the shared
-  model-context truncation policy (§4).
+  model-context truncation policy (§4). In `plain` and `terminal`, this
+  streaming is always for exactly one active tool call at a time.
 - **Assistant text.** Raw deltas stream unchanged when redirected. TTY display
   commits parsed Markdown blocks as soon as they are stable; only the current
   incomplete block is delayed.

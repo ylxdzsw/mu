@@ -85,9 +85,9 @@ MU_ZSH_EXIT_HOOKS+=(mu_restore_conflicts)
 | `mu --model <id>` | Override model for this turn |
 | `mu --effort <low|medium|high|xhigh|max>` | Override reasoning effort for this turn |
 | `mu -i image.png` | Attach an image to the turn |
-| `mu --output plain` | Render plain assistant/tool text |
-| `mu --output terminal` | Render interactive terminal output |
-| `mu --output json` | Render newline-delimited JSON events |
+| `mu --output plain` | Render sequential plain assistant/tool text |
+| `mu --output terminal` | Render sequential interactive terminal output |
+| `mu --output json` | Render newline-delimited JSON events for integrations/web UI |
 | `mu status --json` | Report the resolved model, effort, session, and context state |
 | `mu models refresh` | Refresh `~/.mu/models.json` from the active provider |
 | `mu models list [--json]` | Inspect the cached provider model catalog |
