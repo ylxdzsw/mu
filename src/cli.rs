@@ -49,6 +49,15 @@ pub struct TurnArgs {
     pub output: OutputFormat,
 }
 
+#[derive(ClapArgs, Debug, Clone)]
+pub struct RunArgs {
+    #[command(flatten)]
+    pub turn: TurnArgs,
+
+    #[arg(value_name = "PROMPT_FILE")]
+    pub prompt_file: PathBuf,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum OutputFormat {
     Plain,
@@ -58,6 +67,8 @@ pub enum OutputFormat {
 
 #[derive(Subcommand, Debug)]
 pub enum Command {
+    /// Run one turn from a prompt file
+    Run(RunArgs),
     /// Project management
     Project {
         #[command(subcommand)]
@@ -177,4 +188,69 @@ pub struct WebArgs {
     /// Unix socket permissions, written as an octal mode such as 0600 or 0660
     #[arg(long, default_value = "0600")]
     pub socket_mode: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::Parser;
+
+    use super::*;
+
+    #[test]
+    fn parses_run_with_prompt_file() {
+        let args = Args::try_parse_from(["mu", "run", "prompt.md"]).unwrap();
+        match args.command {
+            Some(Command::Run(run)) => {
+                assert_eq!(run.prompt_file, PathBuf::from("prompt.md"));
+                assert_eq!(run.turn.output, OutputFormat::Terminal);
+                assert!(run.turn.images.is_empty());
+                assert!(run.turn.selection.session.is_none());
+                assert!(!run.turn.selection.continue_latest);
+            }
+            other => panic!("expected run command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_run_with_turn_options() {
+        let args = Args::try_parse_from([
+            "mu",
+            "run",
+            "--output",
+            "plain",
+            "--model",
+            "gpt-test",
+            "-i",
+            "image.png",
+            "prompt.md",
+        ])
+        .unwrap();
+        match args.command {
+            Some(Command::Run(run)) => {
+                assert_eq!(run.prompt_file, PathBuf::from("prompt.md"));
+                assert_eq!(run.turn.output, OutputFormat::Plain);
+                assert_eq!(run.turn.selection.model.as_deref(), Some("gpt-test"));
+                assert_eq!(run.turn.images, vec![PathBuf::from("image.png")]);
+            }
+            other => panic!("expected run command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_default_turn_without_run() {
+        let args = Args::try_parse_from(["mu", "--output", "plain"]).unwrap();
+        assert!(args.command.is_none());
+        assert_eq!(args.turn.output, OutputFormat::Plain);
+    }
+
+    #[test]
+    fn keeps_existing_subcommands() {
+        let args = Args::try_parse_from(["mu", "status", "--json"]).unwrap();
+        match args.command {
+            Some(Command::Status(status)) => {
+                assert!(status.json);
+            }
+            other => panic!("expected status command, got {other:?}"),
+        }
+    }
 }

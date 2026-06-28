@@ -37,6 +37,11 @@ use provider::{ContentPart, ImageUrl};
 use renderer::Renderer;
 use runtime::{InvocationOverrides, StatusReport, build_status_report, resolve_invocation};
 
+enum PromptSource {
+    Stdin,
+    File(PathBuf),
+}
+
 struct RunTurnArgs<'a> {
     config: &'a Config,
     provider: Arc<dyn Provider>,
@@ -189,8 +194,20 @@ async fn run() -> Result<()> {
     }
     let project_config_dir = scope.project().map(|p| p.root.join(".mu"));
     let origin = session_origin(args.origin);
+    let default_turn = args.turn;
 
     match args.command {
+        Some(Command::Run(run_args)) => {
+            return run_turn_from_source(
+                &cwd,
+                &scope,
+                project_config_dir.as_deref(),
+                origin,
+                run_args.turn,
+                PromptSource::File(run_args.prompt_file),
+            )
+            .await;
+        }
         Some(Command::Project { sub }) => {
             match sub {
                 ProjectSub::Inspect { path, json } => {
@@ -473,16 +490,29 @@ async fn run() -> Result<()> {
         None => {}
     }
 
-    // Turn invocation
-    let mut stdin = String::new();
-    io::stdin().read_to_string(&mut stdin)?;
-    let prompt = stdin.trim_end_matches('\n').to_string();
-    if prompt.is_empty() {
-        bail!("empty prompt");
-    }
-    let attachments = load_image_attachments(&args.turn.images)?;
+    run_turn_from_source(
+        &cwd,
+        &scope,
+        project_config_dir.as_deref(),
+        origin,
+        default_turn,
+        PromptSource::Stdin,
+    )
+    .await
+}
 
-    let config = Config::load_for_scope(project_config_dir.as_deref())?;
+async fn run_turn_from_source(
+    cwd: &Path,
+    scope: &paths::Scope,
+    project_config_dir: Option<&Path>,
+    origin: store::SessionOrigin,
+    turn: cli::TurnArgs,
+    prompt_source: PromptSource,
+) -> Result<()> {
+    let prompt = load_prompt(prompt_source)?;
+    let attachments = load_image_attachments(&turn.images)?;
+
+    let config = Config::load_for_scope(project_config_dir)?;
     let api_key = config.api_key()?;
     let catalog = ModelCatalog::load_matching(&config.provider.base_url)?;
     let provider = Arc::new(OpenAiProvider::new(
@@ -490,7 +520,7 @@ async fn run() -> Result<()> {
         api_key,
     )) as Arc<dyn Provider>;
 
-    paths::ensure_project_layout(&scope)?;
+    paths::ensure_project_layout(scope)?;
     let state_dir = scope.state_dir();
     paths::ensure_dir(&state_dir)?;
     compaction::prune_spills(&state_dir);
@@ -501,10 +531,10 @@ async fn run() -> Result<()> {
         &store,
         &config,
         &InvocationOverrides {
-            session: args.turn.selection.session.clone(),
-            continue_latest: args.turn.selection.continue_latest,
-            model: args.turn.selection.model.clone(),
-            effort: args.turn.selection.effort,
+            session: turn.selection.session.clone(),
+            continue_latest: turn.selection.continue_latest,
+            model: turn.selection.model.clone(),
+            effort: turn.selection.effort,
         },
     )?;
     let model_info = models::resolve_model_info(&config, catalog.as_ref(), &resolved.request.model);
@@ -517,13 +547,7 @@ async fn run() -> Result<()> {
     let (session, created) = if let Some(session) = resolved.attached_session.clone() {
         (session, false)
     } else {
-        create_seeded_session(
-            &store,
-            &cwd,
-            scope.project(),
-            &resolved.session_seed,
-            origin,
-        )?
+        create_seeded_session(&store, cwd, scope.project(), &resolved.session_seed, origin)?
     };
     let session_id = session.id.clone();
 
@@ -558,13 +582,47 @@ async fn run() -> Result<()> {
         model_context_window: model_info.context_window,
         prompt: &prompt,
         attachments,
-        output: args.turn.output,
+        output: turn.output,
         state_dir: &state_dir,
-        project_config_dir: project_config_dir.as_deref(),
+        project_config_dir,
     })
     .await?;
 
     Ok(())
+}
+
+fn load_prompt(source: PromptSource) -> Result<String> {
+    let raw = match source {
+        PromptSource::Stdin => {
+            let mut stdin = String::new();
+            io::stdin().read_to_string(&mut stdin)?;
+            stdin
+        }
+        PromptSource::File(path) => {
+            let raw = std::fs::read_to_string(&path)
+                .with_context(|| format!("reading prompt file {}", path.display()))?;
+            trim_shebang_line(&raw).to_string()
+        }
+    };
+    let prompt = trim_trailing_newlines(&raw).to_string();
+    if prompt.is_empty() {
+        bail!("empty prompt");
+    }
+    Ok(prompt)
+}
+
+fn trim_shebang_line(text: &str) -> &str {
+    if !text.starts_with("#!") {
+        return text;
+    }
+    match text.find('\n') {
+        Some(idx) => &text[idx + 1..],
+        None => "",
+    }
+}
+
+fn trim_trailing_newlines(text: &str) -> &str {
+    text.trim_end_matches(['\r', '\n'])
 }
 
 async fn run_turn(args: RunTurnArgs<'_>) -> Result<()> {
@@ -811,4 +869,65 @@ fn base64_encode(bytes: &[u8]) -> String {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use super::*;
+
+    fn temp_file_path(name: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("mu-{name}-{nanos}.tmp"))
+    }
+
+    #[test]
+    fn load_prompt_file_preserves_body() {
+        let path = temp_file_path("prompt");
+        std::fs::write(&path, "hello\nworld\n").unwrap();
+        let prompt = load_prompt(PromptSource::File(path.clone())).unwrap();
+        std::fs::remove_file(path).unwrap();
+        assert_eq!(prompt, "hello\nworld");
+    }
+
+    #[test]
+    fn load_prompt_file_trims_shebang_line() {
+        let path = temp_file_path("shebang");
+        std::fs::write(&path, "#!/usr/bin/env -S mu run --output plain\nhello\n").unwrap();
+        let prompt = load_prompt(PromptSource::File(path.clone())).unwrap();
+        std::fs::remove_file(path).unwrap();
+        assert_eq!(prompt, "hello");
+    }
+
+    #[test]
+    fn load_prompt_file_trims_crlf_shebang_line() {
+        let path = temp_file_path("shebang-crlf");
+        std::fs::write(&path, "#!/usr/bin/env -S mu run\r\nhello\r\n").unwrap();
+        let prompt = load_prompt(PromptSource::File(path.clone())).unwrap();
+        std::fs::remove_file(path).unwrap();
+        assert_eq!(prompt, "hello");
+    }
+
+    #[test]
+    fn load_prompt_file_rejects_shebang_only() {
+        let path = temp_file_path("shebang-only");
+        std::fs::write(&path, "#!/usr/bin/env -S mu run --output plain\n").unwrap();
+        let err = load_prompt(PromptSource::File(path.clone())).unwrap_err();
+        std::fs::remove_file(path).unwrap();
+        assert_eq!(err.to_string(), "empty prompt");
+    }
+
+    #[test]
+    fn load_prompt_file_reports_utf8_errors_with_path() {
+        let path = temp_file_path("invalid-utf8");
+        std::fs::write(&path, [0xff, 0xfe, 0xfd]).unwrap();
+        let err = load_prompt(PromptSource::File(path.clone())).unwrap_err();
+        std::fs::remove_file(&path).unwrap();
+        assert!(err.to_string().contains("reading prompt file"));
+        assert!(err.to_string().contains(path.to_string_lossy().as_ref()));
+    }
 }
