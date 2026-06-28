@@ -217,7 +217,7 @@ small:
 
 - `mu [-s <id>] [-c] [--model <id>] [-i <image>] [--output plain|terminal|json]`
   — run one turn; prompt read from stdin. `-i/--image` is repeatable.
-- `mu run [-s <id>] [-c] [--model <id>] [-i <image>] [--output plain|terminal|json] <prompt-file>`
+- `mu [-s <id>] [-c] [--model <id>] [-i <image>] [--output plain|terminal|json] <prompt-file>`
   — run one turn from a prompt file; if the first line starts with `#!`, drop
   it before sending the prompt. `-i/--image` is repeatable.
 - `mu.zsh` — zsh prompt mode; each accepted prompt runs one foreground `mu`
@@ -242,13 +242,16 @@ small:
   UI on a Unix socket.
 
 The turn runner remains one completed turn per invocation. Bare `mu` reads the
-prompt from stdin; `mu run` reads it from a file and trims a leading shebang
-line when present. `mu web` is the long-lived wrapper surface: it accepts
-browser requests, starts project-scoped sessions, shells out to the same turn
-runner with `--output json`, and streams those JSON events to the browser. `mu
-session new/list`, `mu session transcript`, and project inspection/init do
-**not** require a configured provider. Turn invocation and `mu compact` require
-a configured provider because they can contact the provider (§7).
+prompt from stdin; `mu <prompt-file>` reads it from a file and trims a leading
+shebang line when present. Exact subcommand names win at the top level, so a
+prompt file that collides with a subcommand name must be passed with a
+disambiguating path such as `./status`. `mu web` is the long-lived wrapper
+surface: it accepts browser requests, starts project-scoped sessions, shells
+out to the same turn runner with `--output json`, and streams those JSON events
+to the browser. `mu session new/list`, `mu session transcript`, and project
+inspection/init do **not** require a configured provider. Turn invocation and
+`mu compact` require a configured provider because they can contact the
+provider (§7).
 
 ### Web surface
 

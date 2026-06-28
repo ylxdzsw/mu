@@ -22,8 +22,8 @@ export OPENAI_API_KEY=...  # or your provider key
 starter provider if the file does not exist. Edit that file to use another
 OpenAI-compatible endpoint, API-key env var, or default model.
 
-Run a single turn by piping a prompt to `mu`, use `mu run` for prompt files and
-executable prompt scripts, or source the zsh plugin for an integrated shell
+Run a single turn by piping a prompt to `mu`, pass a prompt file directly to
+`mu` for file-backed prompts and executable prompt scripts, or source the zsh plugin for an integrated shell
 prompt mode that keeps using the same session across turns. Arch Linux
 packaging for the current checkout lives in [`PKGBUILD`](PKGBUILD) at the repo
 root.
@@ -81,7 +81,7 @@ MU_ZSH_EXIT_HOOKS+=(mu_restore_conflicts)
 | Command | Description |
 |---------|-------------|
 | `mu` | Run one turn (prompt on stdin) |
-| `mu run prompt.md` | Run one turn from a prompt file; trims a shebang line automatically |
+| `mu prompt.md` | Run one turn from a prompt file; trims a shebang line automatically |
 | `mu -s <id>` | Attach to an existing session in the active scope |
 | `mu -c` | Continue the latest session in the active scope, or create one |
 | `mu --model <id>` | Override model for this turn |
@@ -103,18 +103,23 @@ MU_ZSH_EXIT_HOOKS+=(mu_restore_conflicts)
 Use `--project <dir>` with status/session/model commands when a wrapper needs
 to address a project explicitly instead of relying on the process cwd.
 
-`mu run` accepts the same turn options as bare `mu`; put those options after
-`run`, for example `mu run --output plain --model gpt-5 prompt.md`.
+Prompt-file mode accepts the same turn options as stdin mode. Put the prompt
+file last, for example `mu --output plain --model gpt-5 prompt.md`.
+
+Top-level subcommands win on exact name matches. If you want to use a prompt
+file named like a subcommand such as `status`, prepend `./` to disambiguate:
+`mu ./status`.
 
 Executable prompt files work directly with a shebang and `chmod +x`:
 
 ```markdown
-#!/usr/bin/env -S mu run --output plain
+#!/usr/bin/env -S mu --output plain
 Write a concise release note for the current checkout.
 ```
 
-`mu run` removes the shebang line before sending the prompt to the model. It
-keeps the caller's current working directory unless you pass `--project`.
+Prompt-file mode removes the shebang line before sending the prompt to the
+model. Stdin mode does not trim shebang-like input. Prompt-file mode keeps the
+caller's current working directory unless you pass `--project`.
 
 ## Web UI
 

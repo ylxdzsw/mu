@@ -18,6 +18,10 @@ pub struct Args {
     #[command(flatten)]
     pub turn: TurnArgs,
 
+    /// Run one turn from a prompt file
+    #[arg(value_name = "PROMPT_FILE")]
+    pub prompt_file: Option<PathBuf>,
+
     #[command(subcommand)]
     pub command: Option<Command>,
 }
@@ -49,15 +53,6 @@ pub struct TurnArgs {
     pub output: OutputFormat,
 }
 
-#[derive(ClapArgs, Debug, Clone)]
-pub struct RunArgs {
-    #[command(flatten)]
-    pub turn: TurnArgs,
-
-    #[arg(value_name = "PROMPT_FILE")]
-    pub prompt_file: PathBuf,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum OutputFormat {
     Plain,
@@ -67,8 +62,6 @@ pub enum OutputFormat {
 
 #[derive(Subcommand, Debug)]
 pub enum Command {
-    /// Run one turn from a prompt file
-    Run(RunArgs),
     /// Project management
     Project {
         #[command(subcommand)]
@@ -197,25 +190,20 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parses_run_with_prompt_file() {
-        let args = Args::try_parse_from(["mu", "run", "prompt.md"]).unwrap();
-        match args.command {
-            Some(Command::Run(run)) => {
-                assert_eq!(run.prompt_file, PathBuf::from("prompt.md"));
-                assert_eq!(run.turn.output, OutputFormat::Terminal);
-                assert!(run.turn.images.is_empty());
-                assert!(run.turn.selection.session.is_none());
-                assert!(!run.turn.selection.continue_latest);
-            }
-            other => panic!("expected run command, got {other:?}"),
-        }
+    fn parses_prompt_file_without_run() {
+        let args = Args::try_parse_from(["mu", "prompt.md"]).unwrap();
+        assert_eq!(args.prompt_file, Some(PathBuf::from("prompt.md")));
+        assert!(args.command.is_none());
+        assert_eq!(args.turn.output, OutputFormat::Terminal);
+        assert!(args.turn.images.is_empty());
+        assert!(args.turn.selection.session.is_none());
+        assert!(!args.turn.selection.continue_latest);
     }
 
     #[test]
-    fn parses_run_with_turn_options() {
+    fn parses_prompt_file_with_turn_options() {
         let args = Args::try_parse_from([
             "mu",
-            "run",
             "--output",
             "plain",
             "--model",
@@ -225,15 +213,11 @@ mod tests {
             "prompt.md",
         ])
         .unwrap();
-        match args.command {
-            Some(Command::Run(run)) => {
-                assert_eq!(run.prompt_file, PathBuf::from("prompt.md"));
-                assert_eq!(run.turn.output, OutputFormat::Plain);
-                assert_eq!(run.turn.selection.model.as_deref(), Some("gpt-test"));
-                assert_eq!(run.turn.images, vec![PathBuf::from("image.png")]);
-            }
-            other => panic!("expected run command, got {other:?}"),
-        }
+        assert_eq!(args.prompt_file, Some(PathBuf::from("prompt.md")));
+        assert!(args.command.is_none());
+        assert_eq!(args.turn.output, OutputFormat::Plain);
+        assert_eq!(args.turn.selection.model.as_deref(), Some("gpt-test"));
+        assert_eq!(args.turn.images, vec![PathBuf::from("image.png")]);
     }
 
     #[test]
@@ -252,5 +236,22 @@ mod tests {
             }
             other => panic!("expected status command, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn exact_subcommand_names_take_priority_over_prompt_files() {
+        let args = Args::try_parse_from(["mu", "status", "--json"]).unwrap();
+        assert!(args.prompt_file.is_none());
+        match args.command {
+            Some(Command::Status(status)) => assert!(status.json),
+            other => panic!("expected status command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn disambiguated_prompt_file_with_dot_slash_is_allowed() {
+        let args = Args::try_parse_from(["mu", "./status"]).unwrap();
+        assert_eq!(args.prompt_file, Some(PathBuf::from("./status")));
+        assert!(args.command.is_none());
     }
 }

@@ -194,20 +194,12 @@ async fn run() -> Result<()> {
     }
     let project_config_dir = scope.project().map(|p| p.root.join(".mu"));
     let origin = session_origin(args.origin);
+    let prompt_source = args
+        .prompt_file
+        .map_or(PromptSource::Stdin, PromptSource::File);
     let default_turn = args.turn;
 
     match args.command {
-        Some(Command::Run(run_args)) => {
-            return run_turn_from_source(
-                &cwd,
-                &scope,
-                project_config_dir.as_deref(),
-                origin,
-                run_args.turn,
-                PromptSource::File(run_args.prompt_file),
-            )
-            .await;
-        }
         Some(Command::Project { sub }) => {
             match sub {
                 ProjectSub::Inspect { path, json } => {
@@ -496,7 +488,7 @@ async fn run() -> Result<()> {
         project_config_dir.as_deref(),
         origin,
         default_turn,
-        PromptSource::Stdin,
+        prompt_source,
     )
     .await
 }
@@ -596,15 +588,24 @@ fn load_prompt(source: PromptSource) -> Result<String> {
         PromptSource::Stdin => {
             let mut stdin = String::new();
             io::stdin().read_to_string(&mut stdin)?;
-            stdin
+            normalize_prompt(&stdin, false)?
         }
         PromptSource::File(path) => {
             let raw = std::fs::read_to_string(&path)
                 .with_context(|| format!("reading prompt file {}", path.display()))?;
-            trim_shebang_line(&raw).to_string()
+            normalize_prompt(&raw, true)?
         }
     };
-    let prompt = trim_trailing_newlines(&raw).to_string();
+    Ok(raw)
+}
+
+fn normalize_prompt(raw: &str, trim_shebang: bool) -> Result<String> {
+    let raw = if trim_shebang {
+        trim_shebang_line(raw)
+    } else {
+        raw
+    };
+    let prompt = trim_trailing_newlines(raw).to_string();
     if prompt.is_empty() {
         bail!("empty prompt");
     }
@@ -897,7 +898,7 @@ mod tests {
     #[test]
     fn load_prompt_file_trims_shebang_line() {
         let path = temp_file_path("shebang");
-        std::fs::write(&path, "#!/usr/bin/env -S mu run --output plain\nhello\n").unwrap();
+        std::fs::write(&path, "#!/usr/bin/env -S mu --output plain\nhello\n").unwrap();
         let prompt = load_prompt(PromptSource::File(path.clone())).unwrap();
         std::fs::remove_file(path).unwrap();
         assert_eq!(prompt, "hello");
@@ -906,7 +907,7 @@ mod tests {
     #[test]
     fn load_prompt_file_trims_crlf_shebang_line() {
         let path = temp_file_path("shebang-crlf");
-        std::fs::write(&path, "#!/usr/bin/env -S mu run\r\nhello\r\n").unwrap();
+        std::fs::write(&path, "#!/usr/bin/env -S mu\r\nhello\r\n").unwrap();
         let prompt = load_prompt(PromptSource::File(path.clone())).unwrap();
         std::fs::remove_file(path).unwrap();
         assert_eq!(prompt, "hello");
@@ -915,10 +916,24 @@ mod tests {
     #[test]
     fn load_prompt_file_rejects_shebang_only() {
         let path = temp_file_path("shebang-only");
-        std::fs::write(&path, "#!/usr/bin/env -S mu run --output plain\n").unwrap();
+        std::fs::write(&path, "#!/usr/bin/env -S mu --output plain\n").unwrap();
         let err = load_prompt(PromptSource::File(path.clone())).unwrap_err();
         std::fs::remove_file(path).unwrap();
         assert_eq!(err.to_string(), "empty prompt");
+    }
+
+    #[test]
+    fn normalize_prompt_keeps_stdin_shebang_text() {
+        let prompt =
+            normalize_prompt("#!/usr/bin/env -S mu --output plain\nhello\n", false).unwrap();
+        assert_eq!(prompt, "#!/usr/bin/env -S mu --output plain\nhello");
+    }
+
+    #[test]
+    fn normalize_prompt_trims_file_shebang_text() {
+        let prompt =
+            normalize_prompt("#!/usr/bin/env -S mu --output plain\nhello\n", true).unwrap();
+        assert_eq!(prompt, "hello");
     }
 
     #[test]
