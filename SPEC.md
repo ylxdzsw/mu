@@ -223,8 +223,6 @@ small:
 - `mu.zsh` — zsh prompt mode; each accepted prompt runs one foreground `mu`
   turn and keeps using the same session. `MU_ZSH_SESSION_ID=<id>` seeds
   attachment to an existing session.
-- `mu --project <dir> <subcommand>` — run project-scoped management commands
-  against an explicit directory instead of the process cwd.
 - `mu project inspect --path <dir>` — report whether a directory is already a
   `mu` project.
 - `mu project init --path <dir>` — create `.mu/` project metadata in an
@@ -559,14 +557,15 @@ should be able to report it.
 This is the exact sequence the binary follows for one turn invocation. Implement
 it in this order:
 
-1. **Parse args**, resolve the active project (§9), read the entire prompt from
+1. **Parse args**, resolve the active scope from the invoking `pwd` (§9), read
+   the entire prompt from
    stdin into a string, and load any attached inputs such as repeatable
    `-i/--image` image files.
 2. **Load config** (§9): global first, then project config over it when a
    project is active. If the provider's required fields are missing, print an
    error to stderr and exit non-zero (§7). Resolve the effective model:
-   `--model` if given, else the session's stored `model`, else the merged config
-   default.
+   `--model` if given, else the session's stored `model`, else the merged
+   config default.
 3. **Open the active-scope SQLite DB** (create + run migrations if absent):
    project-local when inside a project, global otherwise.
 4. **Resolve the session:**
@@ -958,26 +957,26 @@ are files discovered on startup (and cached, §13).
 
 ## 9. Project discovery
 
-On startup, `mu` searches upward from the current working directory to find an
-active project.
+On startup, `mu` treats the invoking current working directory as authoritative
+for the turn, then searches upward from that `pwd` to resolve the active scope.
 
-A directory is a project when it contains `.mu`.
+A directory is a project when it contains `.mu` or `.git`.
 
-A directory is also a project when it contains `.git`. In that case, `.mu` is
-created adjacent to `.git` only when `mu` needs to write project state. Merely
-discovering or reading project information must not mutate the filesystem.
+If a directory contains only a `.git` marker, `.mu` is created there only when
+`mu` needs to write project state. Merely discovering or reading project
+information must not mutate the filesystem.
 
 If the search reaches the user's home directory or the filesystem root without
-finding a project, no project is active for the turn and global state/config is
-used.
+finding a project, `mu` uses the global scope rooted at `~/.mu`.
 
 Nested project merging is not supported. The first project found while walking
 upward is the active project.
 
-Git worktrees are treated as their own projects. When a worktree is active, the
-worktree root is the project root. The agent should be told both the project
-root and the current working directory. It should also be told relevant worktree
-information when available.
+Git worktrees are treated as their own projects. If the discovered `.git`
+marker is a worktree pointer file and there is no closer `.mu`, the directory
+containing that `.git` file is the project root. The agent should be told both
+the project root and the current working directory. It should also be told
+relevant worktree information when available.
 
 The shell tool's working directory defaults to the process working directory,
 not the project root.
@@ -1018,8 +1017,9 @@ The global and project directories have the same conceptual shape:
 
 When a project is active, global configuration is loaded first and project
 configuration is merged over it. Project values take precedence. Parent project
-configuration is not merged because nested projects are not supported. When no
-project is active, only global configuration is used.
+configuration is not merged because nested projects are not supported. When the
+upwalk reaches home or root without finding a project, only global
+configuration is used.
 
 Optional `.env` files are loaded with the same scope precedence:
 process environment first, then global `.env`, then active-project `.env`.
@@ -1028,8 +1028,9 @@ passed to every `bash` tool process. `.env` files are parsed as dotenv data, not
 sourced as shell scripts.
 
 Configuration and session storage are related but separate concepts. Config is
-merged across scopes; sessions are selected from exactly one scope: project when
-inside a project, global otherwise.
+merged across scopes; sessions live in exactly one scope: the discovered
+project's `.mu/sessions.db` or the global `~/.mu/sessions.db`. Sessions from
+one scope are not visible in another.
 
 - **config.jsonc** — JSON with comments and trailing commas. Concrete shape
   (field names are normative):
@@ -1086,15 +1087,14 @@ The system prompt is intentionally minimal and assembled in this fixed order:
    ```
    <env>
    cwd: /home/user/project/subdir
-   project: active
    project_root: /home/user/project
    session_id: ...
    os: linux
    date: 2026-06-18
    </env>
    ```
-   If no project is active, `project: none` is used and `project_root` is
-   omitted. Worktree information is included when available.
+   If the active scope is global, `project_root` is omitted. Worktree
+   information is included when available.
 3. The `<available_skills>` block (§8), or omitted if there are no skills. Skill
    metadata is merged from global and active-project skill directories.
 4. The global `AGENTS.md` contents, if the file exists.
@@ -1169,8 +1169,7 @@ WAL).
 For each turn, the agent should know:
 
 - The current working directory.
-- Whether a project is active.
-- The project root, if one is active.
+- The project root, if the session is project-scoped.
 - The active session id.
 - Relevant git worktree information, if the project is a worktree.
 
@@ -1179,14 +1178,21 @@ reflects the user's immediate intent. Project root provides broader context, but
 it should not replace `pwd`.
 
 Stable environment information is introduced once, when the session is created.
-This includes project path, active project status, session id, and git worktree
+This includes project path when present, session id, and git worktree
 information. Later turns in the same session should not repeat that full
 environment block.
 
 If the working directory changes after session creation, the next turn should
-include the new `pwd` as additional context and update the session's stored
-`cwd`. This keeps the model aware of meaningful movement without making every
-turn restate the full environment.
+append a short XML reminder and update the session's stored `cwd`:
+
+```
+<system-reminder>
+current working directory changed to: /new/pwd
+</system-reminder>
+```
+
+This reminder is emitted only on a submitted turn whose `pwd` differs from the
+stored session `cwd`. It does not restate project information.
 
 ### Message-level persistence and interruption
 
@@ -1472,7 +1478,7 @@ Coarse sequencing only (not an execution plan):
 5. **zsh shell surface.** Prompt mode, first-turn session capture, session
    attach via environment, and clean entry/exit controls.
 6. **Web surface.** Unix-socket server, project picker/init flows, explicit
-   `--project` routing, browser session metadata via `mu status`, and
+   project `cwd` routing, browser session metadata via `mu status`, and
    stream-through turn execution via `mu --output json`.
 7. **Skills.** Skill scan + cache + system-prompt injection, `AGENTS.md`
    (global + project).

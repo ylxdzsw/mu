@@ -180,6 +180,35 @@ mod tests {
     }
 
     #[test]
+    fn treats_git_worktree_root_as_the_project_root() {
+        let root = std::env::temp_dir().join(format!("mu-worktree-{}", uuid::Uuid::new_v4()));
+        let worktree = root.join("feature");
+        let nested = worktree.join("src");
+        let git_dir = worktree.join("../repo/.git/worktrees/feature");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::create_dir_all(&git_dir).unwrap();
+        std::fs::write(
+            worktree.join(".git"),
+            "gitdir: ../repo/.git/worktrees/feature\n",
+        )
+        .unwrap();
+        std::fs::write(git_dir.join("commondir"), "../..\n").unwrap();
+
+        let project = discover_project(&nested).unwrap();
+        assert_eq!(project.root, worktree);
+        assert_eq!(project.marker, ProjectMarker::Git);
+        assert_eq!(
+            project.worktree,
+            Some(GitWorktreeInfo {
+                git_dir: git_dir.clone(),
+                common_dir: Some(git_dir.join("../..")),
+            })
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn project_scope_uses_dot_mu_sessions_db() {
         let project = Project {
             root: PathBuf::from("/tmp/work"),

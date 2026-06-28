@@ -355,8 +355,6 @@ async fn stream_turn(
 
     let mut command = Command::new(&state.exe);
     command
-        .arg("--project")
-        .arg(&project)
         .arg("--origin")
         .arg("web")
         .arg("--output")
@@ -503,7 +501,6 @@ async fn run_json_command(
 ) -> Result<serde_json::Value> {
     let mut command = Command::new(&state.exe);
     if let Some(project) = project {
-        command.arg("--project").arg(project);
         command.current_dir(project);
     }
     command

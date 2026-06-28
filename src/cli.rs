@@ -7,10 +7,6 @@ use crate::models::EffortLevel;
 #[derive(Parser, Debug)]
 #[command(name = "mu", about = "Fast terminal agent harness")]
 pub struct Args {
-    /// Run project-scoped commands against an explicit directory
-    #[arg(long, global = true)]
-    pub project: Option<PathBuf>,
-
     /// Mark newly created sessions as coming from a surface
     #[arg(long, global = true, value_enum, default_value_t = SessionOriginArg::Cli)]
     pub origin: SessionOriginArg,
@@ -253,5 +249,19 @@ mod tests {
         let args = Args::try_parse_from(["mu", "./status"]).unwrap();
         assert_eq!(args.prompt_file, Some(PathBuf::from("./status")));
         assert!(args.command.is_none());
+    }
+
+    #[test]
+    fn project_subcommand_keeps_explicit_path_argument() {
+        let args = Args::try_parse_from(["mu", "project", "inspect", "--path", "repo"]).unwrap();
+        match args.command {
+            Some(Command::Project {
+                sub: ProjectSub::Inspect { path, json },
+            }) => {
+                assert_eq!(path, PathBuf::from("repo"));
+                assert!(!json);
+            }
+            other => panic!("expected project inspect command, got {other:?}"),
+        }
     }
 }

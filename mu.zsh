@@ -243,7 +243,9 @@ _mu_zsh_build_mode_prompt() {
   [[ "$project_root" == null ]] && project_root=
   context=$(_mu_zsh_format_context_percent "$context_raw")
   cwd=$(_mu_zsh_escape_prompt_text "$PWD")
-  if [[ -n "$project_root" && "$project_root" != "$PWD" ]]; then
+  if [[ -z "$project_root" ]]; then
+    project_segment=" %F{$MU_ZSH_PROMPT_PROJECT_COLOR}(global)%f"
+  elif [[ "$project_root" != "$PWD" ]]; then
     project_segment=" %F{$MU_ZSH_PROMPT_PROJECT_COLOR}($(_mu_zsh_escape_prompt_text "$project_root"))%f"
   else
     project_segment=

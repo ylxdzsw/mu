@@ -116,6 +116,28 @@ nested_pwd=$root/tests
 escaped_nested_pwd=${nested_pwd//\%/%%}
 [[ "$nested_prompt" == *"%F{45}${escaped_nested_pwd}%f %F{141}(${escaped_root})%f"* ]] || fail "shows project root when cwd differs"
 
+global_fake_bin=$tmpdir/global-bin
+mkdir -p -- "$global_fake_bin"
+cat > "$global_fake_bin/mu" <<'EOF'
+#!/usr/bin/env zsh
+if [[ "$1" == "status" ]]; then
+  print -r -- '{"model_id":"global-model","context_percent":5.0,"project_root":null}'
+  exit 0
+fi
+exit 1
+EOF
+chmod +x "$global_fake_bin/mu"
+global_pwd=$tmpdir/global-scope
+mkdir -p -- "$global_pwd"
+saved_pwd=$PWD
+MU_ZSH_BIN=$global_fake_bin/mu
+builtin cd "$global_pwd"
+global_prompt=$(_mu_zsh_build_mode_prompt)
+builtin cd "$saved_pwd"
+MU_ZSH_BIN=$prompt_fake_bin/mu
+escaped_global_pwd=${global_pwd//\%/%%}
+[[ "$global_prompt" == *"%F{45}${escaped_global_pwd}%f %F{141}(global)%f"* ]] || fail "shows global marker outside project scope"
+
 MU_ZSH_ORIGINAL_TAB_WIDGET=
 _mu_zsh_save_widget_bindings
 [[ -n "$MU_ZSH_ORIGINAL_TAB_WIDGET" ]] || fail "saves tab widget fallback"

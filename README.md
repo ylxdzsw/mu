@@ -100,9 +100,6 @@ MU_ZSH_EXIT_HOOKS+=(mu_restore_conflicts)
 | `mu compact --session <id>` | Force compaction |
 | `mu web [--socket /run/mu-web/mu-web.sock]` | Serve the local browser UI on a Unix socket |
 
-Use `--project <dir>` with status/session/model commands when a wrapper needs
-to address a project explicitly instead of relying on the process cwd.
-
 Prompt-file mode accepts the same turn options as stdin mode. Put the prompt
 file last, for example `mu --output plain --model gpt-5 prompt.md`.
 
@@ -119,7 +116,7 @@ Write a concise release note for the current checkout.
 
 Prompt-file mode removes the shebang line before sending the prompt to the
 model. Stdin mode does not trim shebang-like input. Prompt-file mode keeps the
-caller's current working directory unless you pass `--project`.
+same working directory as the invoking shell.
 
 ## Web UI
 
@@ -139,12 +136,22 @@ locations proxying this socket should also disable buffering and caching.
 
 ## Config
 
-Global config and state live in `~/.mu`. Project config and state live in
-`.mu` beside the nearest `.git` or existing `.mu` project marker. Global config
-is loaded first; project `config.jsonc` overrides it when a project is active.
-Optional `.env` files in those same directories are also loaded with project
-values overriding global values; the resulting environment is used for provider
-API key lookup and `bash` tool processes.
+Projects are discovered by upwalking from the invoking `pwd`. A project is the
+nearest ancestor directory containing `.git` or `.mu`. For a git worktree with
+only a `.git` pointer file, the worktree root itself is the project. If the
+walk reaches your home directory or `/` without finding a project, `mu` uses
+the global scope in `~/.mu`.
+
+The invoking `pwd` stays authoritative even inside a project. Sessions record
+that `pwd`, the agent sees that `pwd`, and the `bash` tool defaults to that
+same `pwd`; `mu` does not silently replace it with the project root.
+
+Global config and state live in `~/.mu`. Project config and state live in the
+active project's `.mu`. Global config is loaded first; project `config.jsonc`
+overrides it when a project is active. Optional `.env` files in those same
+directories are also loaded with project values overriding global values; the
+resulting environment is used for provider API key lookup and `bash` tool
+processes.
 
 User intent stays in `config.jsonc`. Generated model discovery is cached in
 `~/.mu/models.json` and can be refreshed with `mu models refresh`; it never
@@ -158,9 +165,10 @@ Optional: `.env`, `AGENTS.md` (global and project-local), `skills/*/SKILL.md`.
 Provider API key values and names listed in `redaction.env` are exact-value
 redacted from `bash` tool output before it is stored or shown to the model.
 
-Sessions are selected from exactly one scope: project sessions when inside a
-project, global sessions otherwise. Project session history is stored in
-`.mu/sessions.db` and ignored by the generated `.mu/.gitignore`.
+Sessions live in exactly one scope: the nearest discovered project or the
+global scope. Project session history is stored in `<project>/.mu/sessions.db`;
+global session history is stored in `~/.mu/sessions.db`. Sessions from one
+scope are not visible in another.
 
 ## Architecture
 

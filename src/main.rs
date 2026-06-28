@@ -174,24 +174,8 @@ fn print_project_info(info: &ProjectInfo) {
 
 async fn run() -> Result<()> {
     let args = Args::parse();
-    let process_cwd = std::env::current_dir()?;
-    let cwd = match args.project.as_deref() {
-        Some(project) => resolve_existing_dir(&process_cwd, project)?,
-        None => process_cwd,
-    };
+    let cwd = std::env::current_dir()?;
     let scope = paths::discover_scope(&cwd);
-    if args.project.is_some()
-        && scope.project().is_none()
-        && !matches!(
-            args.command,
-            Some(Command::Project { .. }) | Some(Command::Web(_))
-        )
-    {
-        bail!(
-            "--project must point inside an existing project: {}",
-            cwd.display()
-        );
-    }
     let project_config_dir = scope.project().map(|p| p.root.join(".mu"));
     let origin = session_origin(args.origin);
     let prompt_source = args
@@ -734,7 +718,7 @@ fn print_status_report(report: &StatusReport) {
     let project = report
         .project_root
         .clone()
-        .unwrap_or_else(|| "(none)".into());
+        .unwrap_or_else(|| "(global)".into());
     let effort_levels = if report.supported_effort_levels.is_empty() {
         "(none)".into()
     } else {
