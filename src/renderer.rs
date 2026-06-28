@@ -17,6 +17,12 @@ const GREEN: &str = "\x1b[92m";
 const YELLOW: &str = "\x1b[93m";
 const CYAN: &str = "\x1b[96m";
 const GRAY: &str = "\x1b[90m";
+const BASH_HEAD_LINE_BUDGET: usize = 32;
+const BASH_HEAD_BYTE_BUDGET: usize = 8192;
+const BASH_TAIL_LINE_RESERVE: usize = 2;
+const BASH_TAIL_FALLBACK_BYTES: usize = 512;
+const BASH_TAIL_LINE_CAP_BYTES: usize = 256;
+const ELLIPSIS: &str = "…";
 
 pub struct Renderer {
     stdout: io::Stdout,
@@ -25,7 +31,10 @@ pub struct Renderer {
     styled: bool,
     format: OutputFormat,
     markdown: MarkdownStream,
-    thinking: Option<ThinkingLine>,
+    live_line: Option<LiveLine>,
+    live_line_rendered: bool,
+    reasoning: Option<ReasoningState>,
+    bash_preview: Option<BashPreviewState>,
 }
 
 impl Renderer {
@@ -42,7 +51,10 @@ impl Renderer {
             stdout_at_line_start: true,
             format,
             markdown: MarkdownStream::default(),
-            thinking: None,
+            live_line: None,
+            live_line_rendered: false,
+            reasoning: None,
+            bash_preview: None,
         }
     }
 
@@ -50,7 +62,6 @@ impl Renderer {
         if text.is_empty() {
             return Ok(());
         }
-        self.thinking_text_delta(text);
         if self.format == OutputFormat::Json {
             return self.write_json("assistant_delta", serde_json::json!({ "text": text }));
         }
@@ -60,68 +71,91 @@ impl Renderer {
 
         let blocks = self.markdown.push(text);
         if blocks.is_empty() {
-            return self.render_thinking_line();
+            return self.render_live_line();
         }
 
-        self.clear_thinking_line()?;
         for block in blocks {
             let rendered = render_markdown(&block);
-            self.write_stdout(&rendered)?;
+            self.write_committed(&rendered)?;
         }
-        self.render_thinking_line()
+        self.render_live_line()
     }
 
     pub fn assistant_end(&mut self) -> io::Result<()> {
         let Some(block) = self.markdown.finish() else {
             return Ok(());
         };
-        self.clear_thinking_line()?;
         let rendered = render_markdown(&block);
-        self.write_stdout(&rendered)?;
-        self.render_thinking_line()
+        self.write_committed(&rendered)?;
+        self.render_live_line()
     }
 
-    pub fn thinking_start(&mut self) -> io::Result<()> {
+    pub fn reasoning_start(&mut self) -> io::Result<()> {
         if !self.styled {
             return Ok(());
         }
-        self.clear_thinking_line()?;
-        self.thinking = Some(ThinkingLine {
+        self.reasoning = Some(ReasoningState {
             started: Instant::now(),
-            output_chars: 0,
-            rendered: false,
+            reasoning_chars: 0,
+            committed: false,
         });
-        self.render_thinking_line()
+        Ok(())
+    }
+
+    pub fn reasoning_delta(&mut self, text: &str) -> io::Result<()> {
+        if text.is_empty() || !self.styled {
+            return Ok(());
+        }
+        let Some(reasoning) = self.reasoning.as_mut() else {
+            return Ok(());
+        };
+        reasoning.reasoning_chars = reasoning
+            .reasoning_chars
+            .saturating_add(text.chars().count());
+        if reasoning.committed {
+            return Ok(());
+        }
+        self.live_line = Some(LiveLine::Thinking);
+        self.render_live_line()
     }
 
     pub fn thinking_tick(&mut self) -> io::Result<()> {
-        self.render_thinking_line()
-    }
-
-    pub fn thinking_finish(&mut self, usage: Option<(u64, u64)>) -> io::Result<()> {
-        let Some(thinking) = self.thinking.take() else {
-            return Ok(());
-        };
-        if !thinking.rendered {
+        if !matches!(self.live_line, Some(LiveLine::Thinking)) {
             return Ok(());
         }
-        self.clear_rendered_thinking_line()?;
-        let elapsed = format_duration(thinking.started.elapsed());
-        let line = match usage {
-            Some((prompt_tokens, completion_tokens)) => format!(
-                "{GRAY}thought {elapsed}  in {prompt_tokens} tok  out {completion_tokens} tok{RESET}\n"
-            ),
-            None => format!(
-                "{GRAY}thought {elapsed}  out ~{} tok{RESET}\n",
-                approx_tokens_from_chars(thinking.output_chars)
-            ),
-        };
-        self.write_stdout(&line)
+        self.render_live_line()
     }
 
-    pub fn thinking_cancel(&mut self) -> io::Result<()> {
-        self.clear_thinking_line()?;
-        self.thinking = None;
+    pub fn reasoning_end(&mut self, usage: Option<(u64, u64)>) -> io::Result<()> {
+        let Some(reasoning) = self.reasoning.as_mut() else {
+            return Ok(());
+        };
+        if reasoning.committed || reasoning.reasoning_chars == 0 {
+            return Ok(());
+        }
+        let line = format_thought_line(
+            reasoning.started.elapsed(),
+            reasoning.reasoning_chars,
+            usage,
+        );
+        reasoning.committed = true;
+        self.live_line = None;
+        self.write_committed(&line)
+    }
+
+    pub fn tool_call_composition_start(&mut self) -> io::Result<()> {
+        if !self.styled {
+            return Ok(());
+        }
+        self.live_line = Some(LiveLine::ToolComposition);
+        self.render_live_line()
+    }
+
+    pub fn cancel_live_state(&mut self) -> io::Result<()> {
+        self.clear_live_line()?;
+        self.live_line = None;
+        self.reasoning = None;
+        self.bash_preview = None;
         Ok(())
     }
 
@@ -137,28 +171,24 @@ impl Renderer {
         if name != "bash" {
             return Ok(());
         }
+        if self.styled {
+            self.reasoning_end(None)?;
+        }
         self.ensure_line_start()?;
-        let command = args
+        let title = args
             .get("title")
             .and_then(|value| value.as_str())
-            .or_else(|| args.get("script").and_then(|value| value.as_str()))
             .unwrap_or_default();
-        let risk = args
-            .get("risk")
+        let script = args
+            .get("script")
             .and_then(|value| value.as_str())
-            .map(|risk| format_risk_label(risk, self.styled));
-        let line = if self.styled {
-            match risk {
-                Some(risk) => format!("{CYAN}${RESET} {risk} {BOLD}{command}{RESET}\n"),
-                None => format!("{CYAN}${RESET} {BOLD}{command}{RESET}\n"),
-            }
-        } else {
-            match risk {
-                Some(risk) => format!("$ {risk} {command}\n"),
-                None => format!("$ {command}\n"),
-            }
-        };
-        self.write_stdout(&line)
+            .unwrap_or_default();
+        let risk = args.get("risk").and_then(|value| value.as_str());
+        let line = format_bash_header(title, script, risk, self.styled);
+        if self.styled {
+            self.bash_preview = Some(BashPreviewState::default());
+        }
+        self.write_committed(&line)
     }
 
     pub fn bash_output(&mut self, text: &str) -> io::Result<()> {
@@ -171,7 +201,21 @@ impl Renderer {
                 serde_json::json!({ "text": strip_ansi(text) }),
             );
         }
-        self.write_stdout(&strip_ansi(text))
+        let sanitized = strip_ansi(text);
+        if !self.styled {
+            return self.write_stdout(&sanitized);
+        }
+        let Some(preview) = self.bash_preview.as_mut() else {
+            return self.write_committed(&format!("{GRAY}{sanitized}{RESET}"));
+        };
+        preview.raw.push_str(&sanitized);
+        let snapshot = compute_bash_preview_snapshot(&preview.raw, false);
+        if snapshot.head_rendered.len() > preview.committed_head_len {
+            let next = snapshot.head_rendered[preview.committed_head_len..].to_string();
+            preview.committed_head_len = snapshot.head_rendered.len();
+            self.write_committed(&format!("{GRAY}{next}{RESET}"))?;
+        }
+        self.set_omitted_live_line(snapshot.omitted_lines, snapshot.omitted_bytes)
     }
 
     pub fn tool_finished(&mut self, display: &ToolDisplay, elapsed: Duration) -> io::Result<()> {
@@ -184,12 +228,13 @@ impl Renderer {
                 }),
             );
         }
+        self.finalize_bash_preview()?;
         let text = format_tool(display, elapsed, self.styled);
         if text.is_empty() {
             return Ok(());
         }
         self.ensure_line_start()?;
-        self.write_stdout(&text)
+        self.write_stdout(&terminal_trim_committed_text(&text))
     }
 
     pub fn tool_failed(&mut self, name: &str, error: &str, elapsed: Duration) -> io::Result<()> {
@@ -203,6 +248,7 @@ impl Renderer {
                 }),
             );
         }
+        self.finalize_bash_preview()?;
         self.ensure_line_start()?;
         let elapsed = format_duration(elapsed);
         let line = if self.styled {
@@ -212,7 +258,7 @@ impl Renderer {
         } else {
             format!("[error] {name} failed: {error} ({elapsed})\n")
         };
-        self.write_stdout(&line)
+        self.write_stdout(&terminal_trim_committed_text(&line))
     }
 
     pub fn guardrail_verdict(
@@ -257,7 +303,7 @@ impl Renderer {
                 "[guardrail: {verdict}] risk={risk_level} auth={user_auth_level} — {reason}\n  {script_preview}\n"
             )
         };
-        self.write_stdout(&line)
+        self.write_stdout(&terminal_trim_committed_text(&line))
     }
 
     pub fn error(&mut self, msg: &str) -> io::Result<()> {
@@ -273,7 +319,7 @@ impl Renderer {
             return self.write_json("notice", serde_json::json!({ "message": msg }));
         }
         self.ensure_line_start()?;
-        self.write_stdout(&format!("{msg}\n"))
+        self.write_stdout(&terminal_trim_committed_text(&format!("{msg}\n")))
     }
 
     /// Ensure stdout ends on a fresh line so the next shell prompt does not
@@ -316,61 +362,107 @@ impl Renderer {
     }
 
     fn ensure_line_start(&mut self) -> io::Result<()> {
-        self.clear_thinking_line()?;
+        self.clear_live_line()?;
         if self.stdout_at_line_start {
             return Ok(());
         }
         self.write_stdout("\n")
     }
 
-    fn thinking_text_delta(&mut self, text: &str) {
-        if let Some(thinking) = self.thinking.as_mut() {
-            thinking.output_chars = thinking.output_chars.saturating_add(text.chars().count());
-        }
-    }
-
-    fn render_thinking_line(&mut self) -> io::Result<()> {
-        let Some(thinking) = self.thinking.as_ref() else {
+    fn render_live_line(&mut self) -> io::Result<()> {
+        let Some(line) = self.format_live_line() else {
             return Ok(());
         };
         if !self.styled {
             return Ok(());
         }
-        let line = format_thinking_live(
-            thinking.started.elapsed(),
-            approx_tokens_from_chars(thinking.output_chars),
-        );
-        if thinking.rendered {
+        if self.live_line_rendered {
             self.stdout.write_all(b"\r\x1b[2K")?;
         } else if !self.stdout_at_line_start {
             self.write_stdout("\n")?;
         }
         self.stdout.write_all(line.as_bytes())?;
         self.stdout_at_line_start = false;
-        if let Some(thinking) = self.thinking.as_mut() {
-            thinking.rendered = true;
-        }
+        self.live_line_rendered = true;
         self.stdout.flush()
     }
 
-    fn clear_thinking_line(&mut self) -> io::Result<()> {
-        let rendered = self
-            .thinking
-            .as_ref()
-            .is_some_and(|thinking| thinking.rendered);
-        if rendered {
-            self.clear_rendered_thinking_line()?;
-            if let Some(thinking) = self.thinking.as_mut() {
-                thinking.rendered = false;
-            }
+    fn clear_live_line(&mut self) -> io::Result<()> {
+        if self.live_line_rendered {
+            self.stdout.write_all(b"\r\x1b[2K")?;
+            self.stdout_at_line_start = true;
+            self.stdout.flush()?;
+            self.live_line_rendered = false;
         }
         Ok(())
     }
 
-    fn clear_rendered_thinking_line(&mut self) -> io::Result<()> {
-        self.stdout.write_all(b"\r\x1b[2K")?;
-        self.stdout_at_line_start = true;
-        self.stdout.flush()
+    fn format_live_line(&self) -> Option<String> {
+        match self.live_line {
+            Some(LiveLine::Thinking) => {
+                let reasoning = self.reasoning.as_ref()?;
+                Some(format_thinking_live(
+                    reasoning.started.elapsed(),
+                    approx_tokens_from_chars(reasoning.reasoning_chars),
+                ))
+            }
+            Some(LiveLine::ToolComposition) => Some(format!("{CYAN}${RESET}")),
+            Some(LiveLine::BashOmitted {
+                omitted_lines,
+                omitted_bytes,
+            }) => Some(format_omitted_line(omitted_lines, omitted_bytes)),
+            None => None,
+        }
+    }
+
+    fn set_omitted_live_line(
+        &mut self,
+        omitted_lines: usize,
+        omitted_bytes: usize,
+    ) -> io::Result<()> {
+        if omitted_lines == 0 && omitted_bytes == 0 {
+            if matches!(self.live_line, Some(LiveLine::BashOmitted { .. })) {
+                self.clear_live_line()?;
+                self.live_line = None;
+            }
+            return Ok(());
+        }
+        self.live_line = Some(LiveLine::BashOmitted {
+            omitted_lines,
+            omitted_bytes,
+        });
+        self.render_live_line()
+    }
+
+    fn finalize_bash_preview(&mut self) -> io::Result<()> {
+        let Some(preview) = self.bash_preview.take() else {
+            return Ok(());
+        };
+        let snapshot = compute_bash_preview_snapshot(&preview.raw, true);
+        self.clear_live_line()?;
+        self.live_line = None;
+        if snapshot.omitted_lines > 0 || snapshot.omitted_bytes > 0 {
+            self.write_stdout(&terminal_trim_committed_text(&format!(
+                "{}\n",
+                format_omitted_line(snapshot.omitted_lines, snapshot.omitted_bytes)
+            )))?;
+        }
+        if !snapshot.tail_rendered.is_empty() {
+            self.write_stdout(&format!(
+                "{GRAY}{}{RESET}",
+                terminal_trim_committed_text(&snapshot.tail_rendered)
+            ))?;
+        }
+        Ok(())
+    }
+
+    fn write_committed(&mut self, text: &str) -> io::Result<()> {
+        if !self.styled {
+            return self.write_stdout(text);
+        }
+        self.clear_live_line()?;
+        self.write_stdout(&terminal_trim_committed_text(text))?;
+        self.render_live_line()
     }
 
     fn write_stdout(&mut self, text: &str) -> io::Result<()> {
@@ -401,10 +493,34 @@ struct MarkdownStream {
     pending: String,
 }
 
-struct ThinkingLine {
+#[derive(Clone, Copy)]
+enum LiveLine {
+    Thinking,
+    ToolComposition,
+    BashOmitted {
+        omitted_lines: usize,
+        omitted_bytes: usize,
+    },
+}
+
+struct ReasoningState {
     started: Instant,
-    output_chars: usize,
-    rendered: bool,
+    reasoning_chars: usize,
+    committed: bool,
+}
+
+#[derive(Default)]
+struct BashPreviewState {
+    raw: String,
+    committed_head_len: usize,
+}
+
+#[derive(Default, Debug, PartialEq, Eq)]
+struct BashPreviewSnapshot {
+    head_rendered: String,
+    tail_rendered: String,
+    omitted_lines: usize,
+    omitted_bytes: usize,
 }
 
 impl MarkdownStream {
@@ -679,6 +795,39 @@ fn tool_display_json(display: &ToolDisplay) -> serde_json::Value {
     }
 }
 
+fn format_bash_header(title: &str, script: &str, risk: Option<&str>, styled: bool) -> String {
+    if !styled {
+        let command = if title.is_empty() { script } else { title };
+        return match risk {
+            Some(risk) => format!("$ {} {command}\n", format_risk_label(risk, false)),
+            None => format!("$ {command}\n"),
+        };
+    }
+
+    let mut out = String::new();
+    if !title.is_empty() {
+        out.push_str(BOLD);
+        out.push_str(title);
+        out.push_str(RESET);
+        out.push('\n');
+    }
+    let color = bash_risk_color(risk);
+    let mut lines = script.lines();
+    if let Some(first) = lines.next() {
+        out.push_str(color);
+        out.push_str("$ ");
+        out.push_str(first);
+        out.push('\n');
+        for line in lines {
+            out.push_str("  ");
+            out.push_str(line);
+            out.push('\n');
+        }
+        out.push_str(RESET);
+    }
+    out
+}
+
 fn format_risk_label(risk: &str, styled: bool) -> String {
     if !styled {
         return format!("[{risk}]");
@@ -688,6 +837,15 @@ fn format_risk_label(risk: &str, styled: bool) -> String {
         "reversible" => format!("{YELLOW}[{risk}]{RESET}"),
         "destructive" => format!("{RED}[{risk}]{RESET}"),
         _ => format!("{DIM}[{risk}]{RESET}"),
+    }
+}
+
+fn bash_risk_color(risk: Option<&str>) -> &'static str {
+    match risk {
+        Some("readonly") => CYAN,
+        Some("reversible") => YELLOW,
+        Some("destructive") => RED,
+        _ => DIM,
     }
 }
 
@@ -706,8 +864,177 @@ fn format_thinking_live(elapsed: Duration, output_tokens: u64) -> String {
     )
 }
 
+fn format_thought_line(
+    elapsed: Duration,
+    reasoning_chars: usize,
+    usage: Option<(u64, u64)>,
+) -> String {
+    let elapsed = format_duration(elapsed);
+    match usage {
+        Some((prompt_tokens, completion_tokens)) => format!(
+            "{GRAY}thought {elapsed}  in {prompt_tokens} tok  out {completion_tokens} tok{RESET}\n"
+        ),
+        None => format!(
+            "{GRAY}thought {elapsed}  out ~{} tok{RESET}\n",
+            approx_tokens_from_chars(reasoning_chars)
+        ),
+    }
+}
+
+fn format_omitted_line(omitted_lines: usize, omitted_bytes: usize) -> String {
+    format!("{GRAY}[… omitted {omitted_lines} lines, {omitted_bytes} bytes]{RESET}")
+}
+
 fn approx_tokens_from_chars(chars: usize) -> u64 {
     (chars as u64).div_ceil(4)
+}
+
+fn terminal_trim_committed_text(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut pending = String::new();
+    for ch in text.chars() {
+        if ch == '\n' {
+            while pending.ends_with(' ') || pending.ends_with('\t') {
+                pending.pop();
+            }
+            out.push_str(&pending);
+            out.push('\n');
+            pending.clear();
+        } else {
+            pending.push(ch);
+        }
+    }
+    out.push_str(&pending);
+    out
+}
+
+fn compute_bash_preview_snapshot(text: &str, finalizing: bool) -> BashPreviewSnapshot {
+    let mut complete_lines = Vec::new();
+    let mut trailing = String::new();
+    for part in text.split_inclusive('\n') {
+        if part.ends_with('\n') {
+            complete_lines.push(trim_complete_terminal_line(part));
+        } else {
+            trailing.push_str(part);
+        }
+    }
+
+    let reserve_start = complete_lines.len().saturating_sub(BASH_TAIL_LINE_RESERVE);
+    let head_candidates = &complete_lines[..reserve_start];
+    let mut head_rendered = String::new();
+    let mut head_lines = 0usize;
+    let mut head_bytes = 0usize;
+    for line in head_candidates {
+        let next_lines = head_lines + 1;
+        let next_bytes = head_bytes + line.len();
+        if next_lines > BASH_HEAD_LINE_BUDGET || next_bytes > BASH_HEAD_BYTE_BUDGET {
+            break;
+        }
+        head_lines = next_lines;
+        head_bytes = next_bytes;
+        head_rendered.push_str(line);
+    }
+
+    let omitted_complete = &head_candidates[head_lines..];
+    let omitted_lines = omitted_complete.len();
+    let omitted_line_bytes = omitted_complete
+        .iter()
+        .map(|line| line.len())
+        .sum::<usize>();
+    let reserved_complete = &complete_lines[reserve_start..];
+
+    let trimmed_trailing = if finalizing {
+        trim_final_tail_fragment(&trailing)
+    } else {
+        trailing.clone()
+    };
+    let fallback_reserved = if complete_lines.is_empty() && !trimmed_trailing.is_empty() {
+        trim_to_last_bytes(&trimmed_trailing, BASH_TAIL_FALLBACK_BYTES)
+    } else {
+        trimmed_trailing.clone()
+    };
+    let hidden_trailing_bytes = if fallback_reserved.len() < trimmed_trailing.len() {
+        trimmed_trailing.len() - fallback_reserved.len()
+    } else {
+        0
+    };
+
+    if !finalizing {
+        return BashPreviewSnapshot {
+            head_rendered,
+            tail_rendered: String::new(),
+            omitted_lines,
+            omitted_bytes: omitted_line_bytes + hidden_trailing_bytes,
+        };
+    }
+
+    let mut tail_segments = Vec::new();
+    let mut hidden_tail_bytes = 0usize;
+    for line in reserved_complete {
+        let (rendered, kept) = cap_tail_line(line, true);
+        hidden_tail_bytes += line.len().saturating_sub(kept);
+        tail_segments.push(rendered);
+    }
+    if !fallback_reserved.is_empty() {
+        let (rendered, kept) = cap_tail_line(&fallback_reserved, false);
+        hidden_tail_bytes += fallback_reserved.len().saturating_sub(kept);
+        tail_segments.push(rendered);
+    }
+    BashPreviewSnapshot {
+        head_rendered,
+        tail_rendered: tail_segments.concat(),
+        omitted_lines,
+        omitted_bytes: omitted_line_bytes + hidden_trailing_bytes + hidden_tail_bytes,
+    }
+}
+
+fn trim_complete_terminal_line(line: &str) -> String {
+    let line = line.strip_suffix('\n').unwrap_or(line);
+    let trimmed = line.trim_end_matches([' ', '\t']);
+    format!("{trimmed}\n")
+}
+
+fn trim_final_tail_fragment(fragment: &str) -> String {
+    fragment.trim_end().to_string()
+}
+
+fn trim_to_last_bytes(text: &str, max_bytes: usize) -> String {
+    if text.len() <= max_bytes {
+        return text.to_string();
+    }
+    let start = text
+        .char_indices()
+        .find(|(idx, _)| text.len() - idx <= max_bytes)
+        .map(|(idx, _)| idx)
+        .unwrap_or(text.len());
+    text[start..].to_string()
+}
+
+fn cap_tail_line(line: &str, complete_line: bool) -> (String, usize) {
+    let newline = complete_line && line.ends_with('\n');
+    let body = if newline {
+        line.strip_suffix('\n').unwrap_or(line)
+    } else {
+        line
+    };
+    let body_bytes = body.len();
+    if body_bytes <= BASH_TAIL_LINE_CAP_BYTES {
+        let mut out = body.to_string();
+        if newline {
+            out.push('\n');
+        }
+        return (out, body_bytes + usize::from(newline));
+    }
+    let kept = BASH_TAIL_LINE_CAP_BYTES
+        .saturating_sub(ELLIPSIS.len())
+        .saturating_sub(usize::from(newline));
+    let suffix = trim_to_last_bytes(body, kept);
+    let mut out = String::from(ELLIPSIS);
+    out.push_str(&suffix);
+    if newline {
+        out.push('\n');
+    }
+    (out, suffix.len() + usize::from(newline))
 }
 
 fn strip_ansi(input: &str) -> String {
@@ -761,6 +1088,8 @@ fn format_turn_summary(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
+    use std::os::fd::RawFd;
 
     #[test]
     fn markdown_stream_holds_incomplete_block() {
@@ -836,6 +1165,93 @@ mod tests {
     }
 
     #[test]
+    fn bash_header_renders_title_and_risk_colored_script_without_risk_label() {
+        let header = format_bash_header("List files", "printf 'a'\npwd", Some("readonly"), true);
+        assert!(header.starts_with(&format!("{BOLD}List files{RESET}\n")));
+        assert!(header.contains(&format!("{CYAN}$ printf 'a'\n  pwd\n{RESET}")));
+        assert!(!header.contains("[readonly]"));
+    }
+
+    #[test]
+    fn short_reasoning_trace_still_formats_a_thought_line() {
+        let line = format_thought_line(Duration::from_millis(300), 3, None);
+        assert!(line.contains("thought 300ms"));
+        assert!(line.contains("out ~1 tok"));
+    }
+
+    #[test]
+    fn short_bash_output_has_no_omitted_counter() {
+        let snapshot = compute_bash_preview_snapshot("one\n two \nthree\n", true);
+        assert_eq!(snapshot.head_rendered, "one\n");
+        assert_eq!(snapshot.tail_rendered, " two\nthree\n");
+        assert_eq!(snapshot.omitted_lines, 0);
+        assert_eq!(snapshot.omitted_bytes, 0);
+    }
+
+    #[test]
+    fn long_bash_output_preserves_head_and_tail_without_duplication() {
+        let text = (1..=40)
+            .map(|idx| format!("line{idx:02}\n"))
+            .collect::<String>();
+        let streaming = compute_bash_preview_snapshot(&text, false);
+        let final_snapshot = compute_bash_preview_snapshot(&text, true);
+
+        assert!(streaming.head_rendered.contains("line01\n"));
+        assert!(streaming.head_rendered.contains("line32\n"));
+        assert!(!streaming.head_rendered.contains("line33\n"));
+        assert_eq!(streaming.omitted_lines, 6);
+        assert!(streaming.omitted_bytes > 0);
+
+        assert_eq!(final_snapshot.omitted_lines, 6);
+        assert!(final_snapshot.tail_rendered.contains("line39\n"));
+        assert!(final_snapshot.tail_rendered.contains("line40\n"));
+        assert!(!final_snapshot.tail_rendered.contains("line32\n"));
+    }
+
+    #[test]
+    fn huge_single_line_output_uses_byte_tail_fallback() {
+        let text = "x".repeat(900);
+        let snapshot = compute_bash_preview_snapshot(&text, true);
+        assert_eq!(snapshot.head_rendered, "");
+        assert_eq!(snapshot.omitted_lines, 0);
+        assert_eq!(snapshot.omitted_bytes, 647);
+        assert_eq!(snapshot.tail_rendered.len(), BASH_TAIL_LINE_CAP_BYTES);
+        assert!(snapshot.tail_rendered.starts_with('…'));
+    }
+
+    #[test]
+    fn terminal_trimming_only_removes_committed_line_suffixes() {
+        assert_eq!(
+            terminal_trim_committed_text("a  \n b\t\t\nc  "),
+            "a\n b\nc  "
+        );
+        assert_eq!(trim_final_tail_fragment("tail \t\n\n"), "tail");
+    }
+
+    #[test]
+    fn pty_transcript_shows_live_placeholder_and_omission_updates() {
+        let raw = capture_renderer_pty_transcript();
+        let normalized = strip_ansi(&raw.replace('\r', ""))
+            .lines()
+            .map(|line| line.trim_end())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(raw.contains("\x1b[96m$\x1b[0m"));
+        assert!(raw.matches("[… omitted").count() > 1);
+        assert!(raw.contains("\x1b[90mline01"));
+        assert!(normalized.contains("thought"));
+        assert!(normalized.contains("Stream demo"));
+        assert!(normalized.contains("$ i=1"));
+        assert!(normalized.contains("  while [ $i -le 40 ]; do"));
+        assert!(normalized.contains("[… omitted 6 lines, 42 bytes]"));
+        assert!(normalized.contains("line39"));
+        assert!(normalized.contains("line40"));
+        assert!(!normalized.contains("\n$\n"));
+        assert!(!normalized.ends_with("\n\n"));
+    }
+
+    #[test]
     fn omits_cost_when_not_available() {
         let summary = format_turn_summary(12, 5, Some(25.0), None);
         assert_eq!(summary, "[mu] tokens: 12 in / 5 out  context: 25%");
@@ -848,5 +1264,80 @@ mod tests {
             summary,
             "[mu] tokens: 12 in / 5 out  context: ?  cost: $0.0034"
         );
+    }
+
+    fn capture_renderer_pty_transcript() -> String {
+        let mut master: RawFd = -1;
+        let mut slave: RawFd = -1;
+        unsafe {
+            assert_eq!(
+                libc::openpty(
+                    &mut master,
+                    &mut slave,
+                    std::ptr::null_mut(),
+                    std::ptr::null(),
+                    std::ptr::null(),
+                ),
+                0
+            );
+            let pid = libc::fork();
+            assert!(pid >= 0);
+            if pid == 0 {
+                libc::close(master);
+                assert_eq!(libc::dup2(slave, libc::STDOUT_FILENO), libc::STDOUT_FILENO);
+                assert_eq!(libc::dup2(slave, libc::STDERR_FILENO), libc::STDERR_FILENO);
+                if slave > libc::STDERR_FILENO {
+                    libc::close(slave);
+                }
+
+                let mut renderer = Renderer::new();
+                renderer.reasoning_start().unwrap();
+                renderer.reasoning_delta("plan").unwrap();
+                std::thread::sleep(Duration::from_millis(40));
+                renderer.reasoning_end(Some((12, 5))).unwrap();
+
+                renderer.tool_call_composition_start().unwrap();
+                std::thread::sleep(Duration::from_millis(20));
+                renderer
+                    .tool_start(
+                        "bash",
+                        &json!({
+                            "title": "Stream demo",
+                            "risk": "readonly",
+                            "script": "i=1\nwhile [ $i -le 40 ]; do\n  printf 'line%02d\\n' \"$i\"\n  i=$((i+1))\n  sleep 0.02\ndone",
+                        }),
+                    )
+                    .unwrap();
+                for idx in 1..=40 {
+                    renderer.bash_output(&format!("line{idx:02}\n")).unwrap();
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                renderer
+                    .tool_finished(
+                        &ToolDisplay::Bash { exit_code: 0 },
+                        Duration::from_millis(250),
+                    )
+                    .unwrap();
+                renderer.finish_turn().unwrap();
+                libc::_exit(0);
+            }
+
+            libc::close(slave);
+            let mut out = Vec::new();
+            let mut buf = [0u8; 4096];
+            loop {
+                let n = libc::read(master, buf.as_mut_ptr().cast(), buf.len());
+                if n <= 0 {
+                    break;
+                }
+                out.extend_from_slice(&buf[..n as usize]);
+            }
+            libc::close(master);
+            let mut status = 0;
+            assert_eq!(libc::waitpid(pid, &mut status, 0), pid);
+            assert!(libc::WIFEXITED(status));
+            assert_eq!(libc::WEXITSTATUS(status), 0);
+            String::from_utf8_lossy(&out).into_owned()
+        }
     }
 }

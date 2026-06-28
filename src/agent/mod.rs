@@ -91,10 +91,13 @@ impl<'a> AgentLoop<'a> {
         const MAX_OVERFLOW_RETRIES: u32 = 3;
 
         for iteration in 0..max_iter {
-            self.renderer.thinking_start()?;
             let mut on_stream_event = |event: StreamEvent| -> Result<(), ProviderError> {
                 let result = match event {
                     StreamEvent::TextDelta(text) => self.renderer.assistant_text(&text),
+                    StreamEvent::ReasoningStart => self.renderer.reasoning_start(),
+                    StreamEvent::ReasoningDelta(text) => self.renderer.reasoning_delta(&text),
+                    StreamEvent::ReasoningEnd => self.renderer.reasoning_end(None),
+                    StreamEvent::ToolCallStart => self.renderer.tool_call_composition_start(),
                     StreamEvent::Tick => self.renderer.thinking_tick(),
                 };
                 result.map_err(|e| ProviderError::Other(e.to_string()))
@@ -110,9 +113,9 @@ impl<'a> AgentLoop<'a> {
                         .usage
                         .as_ref()
                         .map(|u| (u.prompt_tokens, u.completion_tokens));
-                    self.renderer.thinking_finish(usage)?;
+                    self.renderer.reasoning_end(usage)?;
                 }
-                Err(_) => self.renderer.thinking_cancel()?,
+                Err(_) => self.renderer.cancel_live_state()?,
             }
 
             let stream_result = match result {

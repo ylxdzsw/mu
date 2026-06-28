@@ -104,6 +104,10 @@ pub struct StreamResult {
 #[derive(Debug, Clone)]
 pub enum StreamEvent {
     TextDelta(String),
+    ReasoningStart,
+    ReasoningDelta(String),
+    ReasoningEnd,
+    ToolCallStart,
     Tick,
 }
 

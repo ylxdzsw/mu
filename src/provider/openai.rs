@@ -45,6 +45,7 @@ struct ChunkChoice {
 #[derive(Debug, Deserialize, Default)]
 struct ChunkDelta {
     content: Option<String>,
+    reasoning_content: Option<Value>,
     tool_calls: Option<Vec<ToolCallDelta>>,
 }
 
@@ -110,6 +111,8 @@ impl Provider for OpenAiProvider {
         let mut tool_accum: ToolCallAccumulator = BTreeMap::new();
         let mut finish_reason = FinishReason::Stop;
         let mut usage: Option<Usage> = None;
+        let mut reasoning_active = false;
+        let mut tool_call_started = false;
 
         let mut buffer = String::new();
         let mut byte_buf: Vec<u8> = Vec::new();
@@ -150,6 +153,8 @@ impl Provider for OpenAiProvider {
                 &mut tool_accum,
                 &mut finish_reason,
                 &mut usage,
+                &mut reasoning_active,
+                &mut tool_call_started,
                 on_event,
             )?;
         }
@@ -166,8 +171,13 @@ impl Provider for OpenAiProvider {
                 &mut tool_accum,
                 &mut finish_reason,
                 &mut usage,
+                &mut reasoning_active,
+                &mut tool_call_started,
                 on_event,
             )?;
+        }
+        if reasoning_active {
+            on_event(StreamEvent::ReasoningEnd)?;
         }
 
         let tool_calls = if tool_accum.is_empty() {
@@ -229,6 +239,8 @@ fn consume_sse_buffer(
     tool_accum: &mut ToolCallAccumulator,
     finish_reason: &mut FinishReason,
     usage: &mut Option<Usage>,
+    reasoning_active: &mut bool,
+    tool_call_started: &mut bool,
     on_event: &mut dyn FnMut(StreamEvent) -> Result<(), ProviderError>,
 ) -> Result<(), ProviderError> {
     while let Some((pos, sep_len)) = next_event_boundary(buffer) {
@@ -256,11 +268,35 @@ fn consume_sse_buffer(
             }
 
             if let Some(choice) = parsed.choices.first() {
+                let reasoning_delta = choice
+                    .delta
+                    .reasoning_content
+                    .as_ref()
+                    .and_then(reasoning_text_from_value);
+                if let Some(text) = reasoning_delta {
+                    if !*reasoning_active {
+                        on_event(StreamEvent::ReasoningStart)?;
+                        *reasoning_active = true;
+                    }
+                    on_event(StreamEvent::ReasoningDelta(text))?;
+                } else if *reasoning_active
+                    && (choice.delta.content.is_some()
+                        || choice.delta.tool_calls.is_some()
+                        || choice.finish_reason.is_some())
+                {
+                    on_event(StreamEvent::ReasoningEnd)?;
+                    *reasoning_active = false;
+                }
+
                 if let Some(text) = choice.delta.content.clone() {
                     on_event(StreamEvent::TextDelta(text.clone()))?;
                     content.push_str(&text);
                 }
                 if let Some(ref tcs) = choice.delta.tool_calls {
+                    if !*tool_call_started && !tcs.is_empty() {
+                        on_event(StreamEvent::ToolCallStart)?;
+                        *tool_call_started = true;
+                    }
                     for tc in tcs {
                         let entry = tool_accum
                             .entry(tc.index)
@@ -295,6 +331,48 @@ fn consume_sse_buffer(
     Ok(())
 }
 
+fn reasoning_text_from_value(value: &Value) -> Option<String> {
+    match value {
+        Value::String(text) => (!text.is_empty()).then(|| text.clone()),
+        Value::Array(parts) => {
+            let mut out = String::new();
+            for part in parts {
+                collect_reasoning_text(part, &mut out);
+            }
+            (!out.is_empty()).then_some(out)
+        }
+        Value::Object(map) => {
+            let mut out = String::new();
+            collect_reasoning_text(&Value::Object(map.clone()), &mut out);
+            (!out.is_empty()).then_some(out)
+        }
+        _ => None,
+    }
+}
+
+fn collect_reasoning_text(value: &Value, out: &mut String) {
+    match value {
+        Value::String(text) => out.push_str(text),
+        Value::Array(parts) => {
+            for part in parts {
+                collect_reasoning_text(part, out);
+            }
+        }
+        Value::Object(map) => {
+            if let Some(text) = map.get("text").and_then(|value| value.as_str()) {
+                out.push_str(text);
+            }
+            if let Some(value) = map.get("content") {
+                collect_reasoning_text(value, out);
+            }
+            if let Some(value) = map.get("reasoning") {
+                collect_reasoning_text(value, out);
+            }
+        }
+        _ => {}
+    }
+}
+
 /// Find the next SSE event boundary, accepting both `\n\n` (LF) and
 /// `\r\n\r\n` (CRLF) framing. Returns the byte offset of the boundary and
 /// the separator length.
@@ -323,9 +401,12 @@ mod tests {
     #[test]
     fn streams_deltas_and_accumulates_tool_calls() {
         let mut seen = String::new();
+        let mut tool_call_starts = 0usize;
         let mut on_event = |event: StreamEvent| -> Result<(), ProviderError> {
-            if let StreamEvent::TextDelta(delta) = event {
-                seen.push_str(&delta);
+            match event {
+                StreamEvent::TextDelta(delta) => seen.push_str(&delta),
+                StreamEvent::ToolCallStart => tool_call_starts += 1,
+                _ => {}
             }
             Ok(())
         };
@@ -335,6 +416,8 @@ mod tests {
         let mut tool_accum = BTreeMap::new();
         let mut finish_reason = FinishReason::Stop;
         let mut usage = None;
+        let mut reasoning_active = false;
+        let mut tool_call_started = false;
 
         for chunk in [
             "data: {\"choices\":[{\"delta\":{\"content\":\"hel\"},\"finish_reason\":null}]}\n\n",
@@ -349,12 +432,15 @@ mod tests {
                 &mut tool_accum,
                 &mut finish_reason,
                 &mut usage,
+                &mut reasoning_active,
+                &mut tool_call_started,
                 &mut on_event,
             )
             .unwrap();
         }
 
         assert_eq!(seen, "hello");
+        assert_eq!(tool_call_starts, 1);
         assert_eq!(content, "hello");
         assert_eq!(finish_reason, FinishReason::ToolCalls);
         assert_eq!(usage.unwrap().total_tokens, 17);
@@ -377,9 +463,14 @@ mod tests {
     #[test]
     fn handles_crlf_event_framing() {
         let mut seen = String::new();
+        let mut saw_reasoning = false;
         let mut on_event = |event: StreamEvent| -> Result<(), ProviderError> {
-            if let StreamEvent::TextDelta(delta) = event {
-                seen.push_str(&delta);
+            match event {
+                StreamEvent::TextDelta(delta) => seen.push_str(&delta),
+                StreamEvent::ReasoningStart
+                | StreamEvent::ReasoningDelta(_)
+                | StreamEvent::ReasoningEnd => saw_reasoning = true,
+                _ => {}
             }
             Ok(())
         };
@@ -389,6 +480,8 @@ mod tests {
         let mut tool_accum = BTreeMap::new();
         let mut finish_reason = FinishReason::Stop;
         let mut usage = None;
+        let mut reasoning_active = false;
+        let mut tool_call_started = false;
 
         buffer.push_str(
             "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"},\"finish_reason\":\"stop\"}]}\r\n\r\n",
@@ -399,12 +492,70 @@ mod tests {
             &mut tool_accum,
             &mut finish_reason,
             &mut usage,
+            &mut reasoning_active,
+            &mut tool_call_started,
             &mut on_event,
         )
         .unwrap();
 
         assert_eq!(seen, "hi");
+        assert!(!saw_reasoning);
         assert_eq!(finish_reason, FinishReason::Stop);
+    }
+
+    #[test]
+    fn reasoning_content_emits_start_delta_and_end() {
+        let mut seen_events = Vec::new();
+        let mut on_event = |event: StreamEvent| -> Result<(), ProviderError> {
+            match event {
+                StreamEvent::ReasoningStart => seen_events.push("reasoning_start".to_string()),
+                StreamEvent::ReasoningDelta(text) => {
+                    seen_events.push(format!("reasoning_delta:{text}"))
+                }
+                StreamEvent::ReasoningEnd => seen_events.push("reasoning_end".to_string()),
+                StreamEvent::TextDelta(text) => seen_events.push(format!("text:{text}")),
+                StreamEvent::ToolCallStart | StreamEvent::Tick => {}
+            }
+            Ok(())
+        };
+
+        let mut buffer = String::new();
+        let mut content = String::new();
+        let mut tool_accum = BTreeMap::new();
+        let mut finish_reason = FinishReason::Stop;
+        let mut usage = None;
+        let mut reasoning_active = false;
+        let mut tool_call_started = false;
+
+        for chunk in [
+            "data: {\"choices\":[{\"delta\":{\"reasoning_content\":[{\"type\":\"reasoning_text\",\"text\":\"step 1\"}]},\"finish_reason\":null}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"done\"},\"finish_reason\":\"stop\"}]}\n\n",
+            "data: [DONE]\n\n",
+        ] {
+            buffer.push_str(chunk);
+            consume_sse_buffer(
+                &mut buffer,
+                &mut content,
+                &mut tool_accum,
+                &mut finish_reason,
+                &mut usage,
+                &mut reasoning_active,
+                &mut tool_call_started,
+                &mut on_event,
+            )
+            .unwrap();
+        }
+
+        assert_eq!(
+            seen_events,
+            vec![
+                "reasoning_start".to_string(),
+                "reasoning_delta:step 1".to_string(),
+                "reasoning_end".to_string(),
+                "text:done".to_string(),
+            ]
+        );
+        assert!(!reasoning_active);
     }
 
     #[test]
