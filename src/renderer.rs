@@ -1,7 +1,7 @@
 use std::io::{self, IsTerminal, Write};
 use std::time::{Duration, Instant};
 
-use pulldown_cmark::{Event, Options, Parser, Tag, TagEnd};
+use pulldown_cmark::{Event, HeadingLevel, Options, Parser, Tag, TagEnd};
 
 use crate::cli::OutputFormat;
 use crate::tools::ToolDisplay;
@@ -12,9 +12,13 @@ const DIM: &str = "\x1b[2m";
 const ITALIC: &str = "\x1b[3m";
 const UNDERLINE: &str = "\x1b[4m";
 const STRIKE: &str = "\x1b[9m";
+const OSC8_OPEN: &str = "\x1b]8;;";
+const OSC8_CLOSE: &str = "\x1b]8;;\x1b\\";
+const OSC8_ST: &str = "\x1b\\";
 const RED: &str = "\x1b[91m";
 const GREEN: &str = "\x1b[92m";
 const YELLOW: &str = "\x1b[93m";
+const BLUE: &str = "\x1b[94m";
 const CYAN: &str = "\x1b[96m";
 const GRAY: &str = "\x1b[90m";
 const BASH_COMMAND_PREVIEW_BYTES: usize = 160;
@@ -654,7 +658,9 @@ enum MdStyle {
     Italic,
     Underline,
     Strike,
+    Blue,
     Cyan,
+    Green,
 }
 
 impl MdStyle {
@@ -665,7 +671,9 @@ impl MdStyle {
             Self::Italic => ITALIC,
             Self::Underline => UNDERLINE,
             Self::Strike => STRIKE,
+            Self::Blue => BLUE,
             Self::Cyan => CYAN,
+            Self::Green => GREEN,
         }
     }
 }
@@ -697,13 +705,22 @@ fn render_markdown(markdown: &str) -> String {
             out.push_str(style.ansi());
         }
     };
+    let push_styles = |out: &mut String, styles: &mut Vec<MdStyle>, applied: &[MdStyle]| {
+        for style in applied {
+            push_style(out, styles, *style);
+        }
+    };
+    let pop_styles = |out: &mut String, styles: &mut Vec<MdStyle>, count: usize| {
+        for _ in 0..count {
+            pop_style(out, styles);
+        }
+    };
 
     for event in parser {
         match event {
             Event::Start(tag) => match tag {
-                Tag::Heading { .. } => {
-                    push_style(&mut out, &mut styles, MdStyle::Bold);
-                    push_style(&mut out, &mut styles, MdStyle::Cyan);
+                Tag::Heading { level, .. } => {
+                    push_styles(&mut out, &mut styles, heading_styles(level));
                 }
                 Tag::BlockQuote(_) => {
                     out.push_str("│ ");
@@ -713,7 +730,7 @@ fn render_markdown(markdown: &str) -> String {
                     if !out.ends_with('\n') && !out.is_empty() {
                         out.push('\n');
                     }
-                    push_style(&mut out, &mut styles, MdStyle::Cyan);
+                    push_styles(&mut out, &mut styles, code_block_styles());
                 }
                 Tag::List(start) => lists.push(ListState { next: start }),
                 Tag::Item => {
@@ -737,12 +754,13 @@ fn render_markdown(markdown: &str) -> String {
                     }
                     table_cell += 1;
                 }
-                Tag::Emphasis => push_style(&mut out, &mut styles, MdStyle::Italic),
-                Tag::Strong => push_style(&mut out, &mut styles, MdStyle::Bold),
+                Tag::Emphasis => push_styles(&mut out, &mut styles, emphasis_styles()),
+                Tag::Strong => push_styles(&mut out, &mut styles, strong_styles()),
                 Tag::Strikethrough => push_style(&mut out, &mut styles, MdStyle::Strike),
                 Tag::Link { dest_url, .. } => {
                     links.push(dest_url.to_string());
-                    push_style(&mut out, &mut styles, MdStyle::Underline);
+                    push_styles(&mut out, &mut styles, link_styles());
+                    out.push_str(&open_hyperlink(&dest_url));
                 }
                 _ => {}
             },
@@ -752,13 +770,12 @@ fn render_markdown(markdown: &str) -> String {
                         out.push_str("\n\n");
                     }
                 }
-                TagEnd::Heading(_) => {
-                    pop_style(&mut out, &mut styles);
-                    pop_style(&mut out, &mut styles);
+                TagEnd::Heading(level) => {
+                    pop_styles(&mut out, &mut styles, heading_styles(level).len());
                     out.push_str("\n\n");
                 }
                 TagEnd::BlockQuote(_) | TagEnd::CodeBlock => {
-                    pop_style(&mut out, &mut styles);
+                    pop_styles(&mut out, &mut styles, code_block_styles().len());
                     out.push_str("\n\n");
                 }
                 TagEnd::List(_) => {
@@ -773,15 +790,16 @@ fn render_markdown(markdown: &str) -> String {
                 }
                 TagEnd::TableHead | TagEnd::TableRow => out.push_str(" |\n"),
                 TagEnd::Table => out.push('\n'),
-                TagEnd::Emphasis | TagEnd::Strong | TagEnd::Strikethrough => {
-                    pop_style(&mut out, &mut styles)
-                }
+                TagEnd::Emphasis => pop_styles(&mut out, &mut styles, emphasis_styles().len()),
+                TagEnd::Strong => pop_styles(&mut out, &mut styles, strong_styles().len()),
+                TagEnd::Strikethrough => pop_style(&mut out, &mut styles),
                 TagEnd::Link => {
-                    pop_style(&mut out, &mut styles);
+                    out.push_str(OSC8_CLOSE);
+                    pop_styles(&mut out, &mut styles, link_styles().len());
                     if let Some(url) = links.pop() {
                         out.push_str(DIM);
                         out.push_str(" (");
-                        out.push_str(&url);
+                        out.push_str(&hyperlink_text(&url, &url));
                         out.push(')');
                         out.push_str(RESET);
                         for style in &styles {
@@ -793,7 +811,9 @@ fn render_markdown(markdown: &str) -> String {
             },
             Event::Text(text) => out.push_str(&text),
             Event::Code(code) => {
-                out.push_str(CYAN);
+                for style in inline_code_styles() {
+                    out.push_str(style.ansi());
+                }
                 out.push_str(&code);
                 out.push_str(RESET);
                 for style in &styles {
@@ -817,6 +837,45 @@ fn render_markdown(markdown: &str) -> String {
         out.push_str(RESET);
     }
     out
+}
+
+fn heading_styles(level: HeadingLevel) -> &'static [MdStyle] {
+    match level {
+        HeadingLevel::H1 => &[MdStyle::Bold, MdStyle::Underline, MdStyle::Cyan],
+        HeadingLevel::H2 => &[MdStyle::Bold, MdStyle::Blue],
+        HeadingLevel::H3 => &[MdStyle::Bold, MdStyle::Green],
+        HeadingLevel::H4 => &[MdStyle::Underline, MdStyle::Green],
+        HeadingLevel::H5 => &[MdStyle::Bold, MdStyle::Dim],
+        HeadingLevel::H6 => &[MdStyle::Italic, MdStyle::Dim],
+    }
+}
+
+fn emphasis_styles() -> &'static [MdStyle] {
+    &[MdStyle::Italic, MdStyle::Dim]
+}
+
+fn strong_styles() -> &'static [MdStyle] {
+    &[MdStyle::Bold]
+}
+
+fn link_styles() -> &'static [MdStyle] {
+    &[MdStyle::Underline, MdStyle::Blue]
+}
+
+fn inline_code_styles() -> &'static [MdStyle] {
+    &[MdStyle::Green]
+}
+
+fn code_block_styles() -> &'static [MdStyle] {
+    inline_code_styles()
+}
+
+fn open_hyperlink(url: &str) -> String {
+    format!("{OSC8_OPEN}{url}{OSC8_ST}")
+}
+
+fn hyperlink_text(url: &str, text: &str) -> String {
+    format!("{}{text}{OSC8_CLOSE}", open_hyperlink(url))
 }
 
 fn format_tool(display: &ToolDisplay, elapsed: Duration, styled: bool) -> String {
@@ -858,17 +917,23 @@ fn format_bash_header(title: &str, script: &str, risk: Option<&str>, styled: boo
 
     let mut out = String::new();
     if !title.is_empty() {
-        out.push_str(BOLD);
+        out.push_str(GRAY);
         out.push_str("# ");
+        out.push_str(RESET);
+        out.push_str(BOLD);
         out.push_str(title);
         out.push_str(RESET);
         out.push('\n');
     }
-    out.push_str(bash_risk_color(risk));
-    out.push_str("$ ");
-    out.push_str(&command);
-    out.push('\n');
+    out.push_str(DIM);
+    out.push('$');
     out.push_str(RESET);
+    out.push(' ');
+    out.push_str(bash_risk_color(risk));
+    out.push_str(BOLD);
+    out.push_str(&command);
+    out.push_str(RESET);
+    out.push('\n');
     out
 }
 
@@ -1263,11 +1328,16 @@ mod tests {
 
     #[test]
     fn markdown_renderer_styles_common_constructs() {
-        let rendered =
-            render_markdown("# Title\n\nA **bold** and `code` [link](https://example.com).\n");
+        let rendered = render_markdown(
+            "# Title\n\nA *soft* **bold** and `code` [link](https://example.com).\n",
+        );
         assert!(rendered.contains(BOLD));
+        assert!(rendered.contains(ITALIC));
+        assert!(rendered.contains(DIM));
         assert!(rendered.contains(CYAN));
+        assert!(rendered.contains(GREEN));
         assert!(rendered.contains("https://example.com"));
+        assert!(rendered.contains(&hyperlink_text("https://example.com", "link")));
         assert!(rendered.ends_with(RESET));
     }
 
@@ -1279,6 +1349,17 @@ mod tests {
         assert!(rendered.contains("• two"));
         assert!(rendered.contains("| Name | Value |"));
         assert!(rendered.contains("| a | b |"));
+    }
+
+    #[test]
+    fn markdown_renderer_uses_distinct_heading_levels_and_code_styles() {
+        let rendered =
+            render_markdown("# Top\n## Mid\n### Low\n\n`inline`\n\n```rust\nblock\n```\n");
+        assert!(rendered.contains(&format!("{BOLD}{UNDERLINE}{CYAN}Top")));
+        assert!(rendered.contains(&format!("{BOLD}{BLUE}Mid")));
+        assert!(rendered.contains(&format!("{BOLD}{GREEN}Low")));
+        assert!(rendered.contains(&format!("{GREEN}inline{RESET}")));
+        assert!(rendered.contains(&format!("{GREEN}block")));
     }
 
     #[test]
@@ -1321,8 +1402,8 @@ mod tests {
     #[test]
     fn bash_header_renders_title_and_risk_colored_script_without_risk_label() {
         let header = format_bash_header("List files", "printf 'a'\npwd", Some("readonly"), true);
-        assert!(header.starts_with(&format!("{BOLD}# List files{RESET}\n")));
-        assert!(header.contains(&format!("{CYAN}$ printf 'a'…\n{RESET}")));
+        assert!(header.starts_with(&format!("{GRAY}# {RESET}{BOLD}List files{RESET}\n")));
+        assert!(header.contains(&format!("{DIM}${RESET} {CYAN}{BOLD}printf 'a'…{RESET}\n")));
         assert!(!header.contains("  pwd\n"));
         assert!(!header.contains("[readonly]"));
     }
@@ -1401,7 +1482,7 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
 
-        assert!(raw.contains("\x1b[96m$\x1b[0m"));
+        assert!(raw.contains(&format!("{DIM}${RESET}")));
         assert!(raw.matches("[… omitted").count() > 1);
         assert!(raw.contains("\x1b[90mline01"));
         assert!(normalized.contains("[thought"));
