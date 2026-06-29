@@ -161,6 +161,10 @@ Set `default_effort` in `config.jsonc` to apply a reasoning effort when neither
 the session nor the CLI provides one. Accepted values are `null`, `low`,
 `medium`, `high`, `xhigh`, and `max`; `--effort` still wins for a turn.
 
+`terminal_bell.enabled` defaults to `true`. When enabled, `mu --output terminal`
+rings the terminal bell after a successful turn that ran for at least
+`terminal_bell.min_duration_ms` (default `10000`).
+
 Optional: `.env`, `AGENTS.md` (global and project-local), `skills/*/SKILL.md`.
 Provider API key values and names listed in `redaction.env` are exact-value
 redacted from `bash` tool output before it is stored or shown to the model.

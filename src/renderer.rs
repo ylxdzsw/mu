@@ -38,6 +38,7 @@ pub struct Renderer {
     live_line_rendered: bool,
     reasoning: Option<ReasoningState>,
     bash_preview: Option<BashPreviewState>,
+    turn_done_bell_min_duration: Option<Duration>,
 }
 
 impl Renderer {
@@ -46,6 +47,13 @@ impl Renderer {
     }
 
     pub fn with_format(format: OutputFormat) -> Self {
+        Self::with_terminal_bell(format, None)
+    }
+
+    pub fn with_terminal_bell(
+        format: OutputFormat,
+        turn_done_bell_min_duration: Option<Duration>,
+    ) -> Self {
         let stdout = io::stdout();
         Self {
             styled: format == OutputFormat::Terminal && stdout.is_terminal(),
@@ -59,6 +67,7 @@ impl Renderer {
             live_line_rendered: false,
             reasoning: None,
             bash_preview: None,
+            turn_done_bell_min_duration,
         }
     }
 
@@ -367,6 +376,17 @@ impl Renderer {
             "{}",
             format_turn_summary(prompt_tokens, completion_tokens, context_pct, cost)
         )?;
+        self.stderr.flush()
+    }
+
+    pub fn turn_done_bell(&mut self, elapsed: Duration) -> io::Result<()> {
+        let Some(min_duration) = self.turn_done_bell_min_duration else {
+            return Ok(());
+        };
+        if elapsed < min_duration || !self.styled || !self.stderr.is_terminal() {
+            return Ok(());
+        }
+        self.stderr.write_all(b"\x07")?;
         self.stderr.flush()
     }
 
@@ -1374,7 +1394,7 @@ mod tests {
 
     #[test]
     fn pty_transcript_shows_live_placeholder_and_omission_updates() {
-        let raw = capture_renderer_pty_transcript();
+        let raw = capture_renderer_pty_transcript(false, Duration::from_secs(12));
         let normalized = strip_ansi(&raw.replace('\r', ""))
             .lines()
             .map(|line| line.trim_end())
@@ -1415,7 +1435,23 @@ mod tests {
         );
     }
 
-    fn capture_renderer_pty_transcript() -> String {
+    #[test]
+    fn terminal_bell_is_emitted_after_summary_when_enabled() {
+        let raw = capture_renderer_pty_transcript(true, Duration::from_secs(12));
+
+        assert!(raw.contains("[mu] tokens: 12 in / 5 out  context: 25%"));
+        assert!(raw.ends_with("\r\n\x07"));
+    }
+
+    #[test]
+    fn terminal_bell_is_suppressed_below_threshold() {
+        let raw = capture_renderer_pty_transcript(true, Duration::from_secs(2));
+
+        assert!(raw.contains("[mu] tokens: 12 in / 5 out  context: 25%"));
+        assert!(!raw.ends_with("\x07"));
+    }
+
+    fn capture_renderer_pty_transcript(bell_enabled: bool, turn_elapsed: Duration) -> String {
         let mut master: RawFd = -1;
         let mut slave: RawFd = -1;
         unsafe {
@@ -1439,7 +1475,10 @@ mod tests {
                     libc::close(slave);
                 }
 
-                let mut renderer = Renderer::new();
+                let mut renderer = Renderer::with_terminal_bell(
+                    OutputFormat::Terminal,
+                    bell_enabled.then_some(Duration::from_secs(10)),
+                );
                 renderer.reasoning_start().unwrap();
                 renderer.reasoning_delta("plan").unwrap();
                 std::thread::sleep(Duration::from_millis(40));
@@ -1468,6 +1507,8 @@ mod tests {
                     )
                     .unwrap();
                 renderer.finish_turn().unwrap();
+                renderer.turn_summary(12, 5, Some(25.0), None).unwrap();
+                renderer.turn_done_bell(turn_elapsed).unwrap();
                 libc::_exit(0);
             }
 

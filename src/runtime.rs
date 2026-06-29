@@ -314,6 +314,7 @@ mod tests {
             compaction: CompactionConfig::default(),
             limits: LimitsConfig::default(),
             guardrail: GuardrailConfig::default(),
+            terminal_bell: crate::config::TerminalBellConfig::default(),
             redaction: RedactionConfig::default(),
             env: HashMap::new(),
         }

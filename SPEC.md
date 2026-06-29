@@ -781,6 +781,9 @@ log files.
 Plain and JSON modes avoid terminal-only summaries and control sequences so they
 remain suitable for scripts. Human terminal mode may show progress for
 in-flight work, but committed transcript content is never erased from scrollback.
+When `terminal_bell.enabled` is true, terminal mode also emits a BEL (`\a`)
+after a successful turn's summary once total turn duration meets
+`terminal_bell.min_duration_ms` (default 10s).
 
 ---
 
@@ -1047,6 +1050,10 @@ one scope are not visible in another.
     },
     "default_model": "gpt-4o",                   // required
     "default_effort": null,                      // optional: null|low|medium|high|xhigh|max
+    "terminal_bell": {                           // optional terminal notification policy
+      "enabled": true,
+      "min_duration_ms": 10000
+    },
     "models": {                                  // optional per-model tuning
       "gpt-4o": {
         "context_window": 128000,                // needed for Tier-1 compaction & context%

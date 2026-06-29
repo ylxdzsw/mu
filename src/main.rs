@@ -2,6 +2,7 @@ use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::process;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use clap::Parser;
@@ -628,7 +629,12 @@ async fn run_turn(args: RunTurnArgs<'_>) -> Result<()> {
         system_prompt::build_system_prompt(&paths::global_dir(), project_config_dir, Some(store))?;
     let title: String = prompt.chars().take(60).collect();
 
-    let mut renderer = Renderer::with_format(output);
+    let turn_done_bell_min_duration = config
+        .terminal_bell
+        .enabled
+        .then_some(Duration::from_millis(config.terminal_bell.min_duration_ms));
+    let mut renderer = Renderer::with_terminal_bell(output, turn_done_bell_min_duration);
+    let turn_started = Instant::now();
     let mut agent = agent::AgentLoop {
         config,
         provider,
@@ -663,6 +669,7 @@ async fn run_turn(args: RunTurnArgs<'_>) -> Result<()> {
                 ctx_pct,
                 if r.cost > 0.0 { Some(r.cost) } else { None },
             )?;
+            renderer.turn_done_bell(turn_started.elapsed())?;
         }
         Err(_) => {
             // completed messages already persisted

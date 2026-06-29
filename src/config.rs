@@ -25,6 +25,8 @@ pub struct Config {
     #[serde(default)]
     pub guardrail: GuardrailConfig,
     #[serde(default)]
+    pub terminal_bell: TerminalBellConfig,
+    #[serde(default)]
     pub redaction: RedactionConfig,
     #[serde(skip)]
     pub env: EnvMap,
@@ -93,6 +95,14 @@ pub struct CircuitBreakerConfig {
     pub window_denials: u32,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub struct TerminalBellConfig {
+    #[serde(default = "default_terminal_bell_enabled")]
+    pub enabled: bool,
+    #[serde(default = "default_terminal_bell_min_duration_ms")]
+    pub min_duration_ms: u64,
+}
+
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct RedactionConfig {
     #[serde(default)]
@@ -122,6 +132,12 @@ fn default_guardrail_enabled() -> bool {
 }
 fn default_guardrail_timeout_ms() -> u64 {
     90_000
+}
+fn default_terminal_bell_enabled() -> bool {
+    true
+}
+fn default_terminal_bell_min_duration_ms() -> u64 {
+    10_000
 }
 fn default_cb_consecutive() -> u32 {
     3
@@ -170,6 +186,15 @@ impl Default for CircuitBreakerConfig {
             consecutive: default_cb_consecutive(),
             window: default_cb_window(),
             window_denials: default_cb_window_denials(),
+        }
+    }
+}
+
+impl Default for TerminalBellConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_terminal_bell_enabled(),
+            min_duration_ms: default_terminal_bell_min_duration_ms(),
         }
     }
 }
@@ -285,6 +310,10 @@ const STARTER_CONFIG: &str = r#"{
   "default_model": "gpt-4o",
   // Optional default reasoning effort: null, "low", "medium", "high", "xhigh", or "max".
   "default_effort": null,
+  "terminal_bell": {
+    "enabled": true,
+    "min_duration_ms": 10000
+  },
   "models": {
     "gpt-4o": {
       "context_window": 128000,
@@ -353,6 +382,7 @@ mod tests {
             compaction: CompactionConfig::default(),
             limits: LimitsConfig::default(),
             guardrail: GuardrailConfig::default(),
+            terminal_bell: TerminalBellConfig::default(),
             redaction: RedactionConfig::default(),
             env: HashMap::from([("TEST_KEY".into(), "secret".into())]),
         };
@@ -373,6 +403,7 @@ mod tests {
             compaction: CompactionConfig::default(),
             limits: LimitsConfig::default(),
             guardrail: GuardrailConfig::default(),
+            terminal_bell: TerminalBellConfig::default(),
             redaction: RedactionConfig::default(),
             env: HashMap::new(),
         };
@@ -391,6 +422,7 @@ mod tests {
         assert!(raw.contains("\"provider\""));
         assert!(raw.contains("\"default_model\""));
         assert!(raw.contains("\"default_effort\""));
+        assert!(raw.contains("\"terminal_bell\""));
     }
 
     #[test]
@@ -425,5 +457,17 @@ mod tests {
         .unwrap_err();
 
         assert!(err.to_string().contains("no provider configured"));
+    }
+
+    #[test]
+    fn terminal_bell_defaults_to_enabled_with_ten_second_threshold() {
+        let config = config_from_value(serde_json::json!({
+            "provider": {"base_url": "http://localhost", "api_key_env": ""},
+            "default_model": "gpt-4o"
+        }))
+        .unwrap();
+
+        assert!(config.terminal_bell.enabled);
+        assert_eq!(config.terminal_bell.min_duration_ms, 10_000);
     }
 }

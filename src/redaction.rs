@@ -138,6 +138,7 @@ mod tests {
             compaction: CompactionConfig::default(),
             limits: LimitsConfig::default(),
             guardrail: GuardrailConfig::default(),
+            terminal_bell: crate::config::TerminalBellConfig::default(),
             redaction: RedactionConfig {
                 env: redaction_env.iter().map(|name| name.to_string()).collect(),
             },
