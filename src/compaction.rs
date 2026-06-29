@@ -47,6 +47,7 @@ pub async fn run_compaction(
     provider: &dyn Provider,
     system_prompt: &str,
 ) -> Result<()> {
+    crate::tools::bash::install_signal_forwarder();
     let messages = store.all_messages_for_session(session_id)?;
     let keep = config.compaction.keep_recent_turns;
 

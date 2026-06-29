@@ -603,15 +603,14 @@ it in this order:
       running totals; see "usage accounting" below).
    d. **Persist the completed assistant message** (including any `tool_calls`)
       to the DB and append it to the context list.
-   e. If `finish_reason` is `tool_calls`: execute `bash` calls one at a time in
-      request order. Render and **persist tool result messages** (`role:
-      "tool"`, with their `tool_call_id`) in the model's original call order,
-      then loop back to (a). In V1 this remains true for every output mode, and
-      both `plain` and `terminal` outputs are explicitly sequential-only. A
-      future version may add concurrent execution for contiguous
-      `risk:"readonly"` calls in `json` output mode, primarily for the web UI,
-      once renderer interleaving, event ordering, and cancellation semantics
-      are explicitly designed.
+   e. If `finish_reason` is `tool_calls`: split the calls into maximal
+      contiguous batches of eligible readonly work. `plain` output remains
+      sequential. `terminal` and `json` may execute contiguous
+      `risk:"readonly"` `bash` calls concurrently, but **persist tool result
+      messages** (`role: "tool"`, with their `tool_call_id`) in the model's
+      original call order before looping back to (a). Any non-readonly call,
+      unknown tool, or call that requires guardrail review is a sequential
+      barrier.
    f. If `finish_reason` is `stop`: the loop ends.
 10. **Update the session row:** `last_total_tokens` = the `total_tokens` from the
     *final* provider response of the turn (this already reflects the full context
@@ -629,11 +628,12 @@ for each round-trip).
 
 **Interruption.** Steps 9d/9e persist only *after* a message is fully formed. If
 SIGINT / a dropped connection / a provider error occurs mid-stream, the partial
-message is never written; the process dies and the DB holds only completed
-messages (§11). No tool call begins without first persisting its parent
-assistant message. Tool results are persisted in request order immediately
-after a sequential call or concurrent batch completes, so an uninterrupted
-turn produces API-valid history.
+assistant message is never written; the DB holds only completed messages (§11).
+No tool call begins without first persisting its parent assistant message. Once
+tool execution has started, interrupts fan out to every active tool process
+group, stop launching new tools, drain partial output, and still persist tool
+results in request order, so Ctrl-C stops work without making already-produced
+tool output disappear.
 
 ---
 
@@ -660,12 +660,12 @@ do not persist to later bash calls. `stdin`, when present, is piped literally to
 the child process so the agent can write bytes containing `$`, backticks,
 quotes, or heredoc delimiters without shell expansion.
 
-**Execution ordering.** V1 executes every `bash` call sequentially in request
-order. This keeps filesystem effects, `plain`/`terminal` output, and
-cancellation simple while the tool is unsandboxed. `plain` and `terminal`
-therefore remain sequential-only presentations of the turn. A future version
-may run contiguous `risk:"readonly"` calls concurrently in `json` output mode,
-primarily for the web UI, because per-call bash processes are isolated.
+**Execution ordering.** `plain` output executes every `bash` call sequentially
+in request order. `terminal` and `json` may execute maximal contiguous batches
+of `risk:"readonly"` `bash` calls concurrently because each call runs in its
+own process group with isolated `cwd`, environment, timeout, and stdin. This is
+an execution optimization only: stored tool-call records, stored tool messages,
+and the next model request still see the original assistant tool-call order.
 
 **Terminal visibility.** `bash` prints `$ [risk] <title>`, streams combined
 output, and finishes with exit status/duration. Every tool error is visible.
@@ -725,12 +725,13 @@ behavior.
   formats, suitable for incremental consumers (newline-delimited JSON is the V1
   shape).
 
-**Concurrency contract.** In V1, all three formats observe the same sequential
-tool execution. `plain` and `terminal` are intentionally sequential-only and
-must not interleave live tool output from multiple calls. If concurrent
-execution is added later, it should first surface through `json` output mode so
-the web UI can consume ordered machine events without weakening terminal
-transcript guarantees.
+**Concurrency contract.** `plain` is intentionally sequential-only. `terminal`
+and `json` may run contiguous readonly `bash` calls concurrently. `json`
+streams per-tool `tool_start`/`tool_output`/`tool_finish`/`tool_error` events
+with `tool_call_id` so consumers can associate interleaved machine events with
+the right call. `terminal` keeps append-only scrollback and the one-live-line
+rule: at most one bash call owns live terminal streaming at a time, even while
+later readonly calls are already running in the background.
 
 The renderer is the sole writer to stdout/stderr and enforces the selected
 format. It may style output only when stdout is a TTY and `--output terminal` is
@@ -741,8 +742,11 @@ Assistant Markdown is parsed on TTYs. The renderer buffers only the current
 unstable Markdown block, commits completed blocks once, and flushes the tail at
 the response boundary. Headings, emphasis, links, lists, quotes, tables, inline
 code, and fenced code receive terminal styling without modifying prior output.
-When stdout is piped or redirected, assistant deltas pass through byte-for-byte
-as the model produced them, preserving raw Markdown for downstream consumers.
+Markdown tables are buffered until the table is complete enough to align and
+commit once; fenced code keeps pipes isolated so code fences do not become
+tables. When stdout is piped or redirected, assistant deltas pass through
+byte-for-byte as the model produced them, preserving raw Markdown for
+downstream consumers.
 
 **Stream routing (explicit).** The conversation transcript goes to **stdout**:
 tool presentation, tool failures, Bash output, and assistant text. Fatal process
@@ -751,10 +755,13 @@ captures the complete portable transcript while fatal diagnostics/summary
 remain visible. Stdout TTY detection selects rich versus portable rendering;
 stderr TTY detection suppresses the summary when redirected.
 
-- **Tool presentation.** Bash prints `$ [risk] <title>`, streams ANSI-sanitized output,
-  and prints its final exit status. Full tool results still follow the shared
-  model-context truncation policy (§4). In `plain` and `terminal`, this
-  streaming is always for exactly one active tool call at a time.
+- **Tool presentation.** Bash prints `$ [risk] <title>`, streams ANSI-sanitized
+  output, and prints its final exit status. Full tool results still follow the
+  shared model-context truncation policy (§4). In `plain`, streaming is always
+  sequential. In `terminal`, concurrent readonly batches still present exactly
+  one active live bash stream at a time in original tool order; later calls may
+  already be running, but their presentation is buffered until they become the
+  active slot.
 - **Assistant text.** Raw deltas stream unchanged when redirected. TTY display
   commits parsed Markdown blocks as soon as they are stable; only the current
   incomplete block is delayed.
@@ -1343,9 +1350,10 @@ The protections that remain are cheap and non-intrusive:
 - **Visibility is the safeguard.** Output is non-magical and append-only, so the
   user sees exactly what ran and what it produced — scrollback plus the SQLite
   transcript are the audit trail. Nothing happens off-screen.
-- **Interruptibility.** Because `mu` runs as a foreground job, Ctrl-C aborts the
-  turn (and the in-flight tool) immediately, which is the practical "stop"
-  button.
+- **Interruptibility.** Because `mu` runs as a foreground job, Ctrl-C is the
+  practical "stop" button: it stops launching new work, interrupts every active
+  tool process group, and flushes the partial transcript before the turn exits
+  non-zero.
 - **Secrets** are never persisted by `mu`; provider keys come from the
   environment or `config.jsonc`, never the database.
 - **External content** (file contents, command output, fetched pages, web search

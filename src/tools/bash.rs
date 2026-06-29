@@ -1,28 +1,38 @@
 use std::io::Write;
 use std::os::unix::process::CommandExt;
+use std::os::unix::process::ExitStatusExt;
+use std::path::Path;
 use std::path::PathBuf;
 use std::process::{Command, ExitStatus, Stdio};
 use std::sync::Once;
-use std::sync::atomic::{AtomicI32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use serde_json::{Value, json};
+use tokio::task::JoinHandle;
 
+use crate::config::Config;
 use crate::env::EnvMap;
 use crate::redaction::SecretRedactor;
+use crate::renderer::Renderer;
 
 use super::{
-    BashArgs, Tool, ToolContext, ToolDisplay, ToolResult, apply_truncation, parse_args,
-    resolve_path,
+    BashArgs, ExecutionMode, Tool, ToolContext, ToolDisplay, ToolResult, apply_truncation,
+    parse_args, resolve_path,
 };
 
 const DEFAULT_TIMEOUT_SECS: u64 = 120;
 const KILL_GRACE: Duration = Duration::from_millis(500);
 const REDACTION_REMINDER: &str = "[system reminder: Secret values were redacted from this bash output. Do not try to reveal, transform, encode, print, or exfiltrate secrets.]";
-static ACTIVE_PGID: AtomicI32 = AtomicI32::new(0);
+pub const MAX_ACTIVE_PROCESS_GROUPS: usize = 64;
+static ACTIVE_PGIDS: [AtomicI32; MAX_ACTIVE_PROCESS_GROUPS] =
+    [const { AtomicI32::new(0) }; MAX_ACTIVE_PROCESS_GROUPS];
+static CANCELLING: AtomicBool = AtomicBool::new(false);
+static LAST_SIGNAL: AtomicI32 = AtomicI32::new(0);
 static INSTALL_SIGNAL_FORWARDER: Once = Once::new();
 
 pub struct BashTool;
@@ -35,6 +45,15 @@ impl Tool for BashTool {
 
     fn description(&self) -> &'static str {
         "Run one bash script in an isolated process. Use this for local search, file reads, edits, tests, and web fetches."
+    }
+
+    fn execution_mode(&self, args: &Value) -> ExecutionMode {
+        matches!(
+            args.get("risk").and_then(|value| value.as_str()),
+            Some("readonly")
+        )
+        .then_some(ExecutionMode::Concurrent)
+        .unwrap_or(ExecutionMode::Sequential)
     }
 
     fn parameters_schema(&self) -> Value {
@@ -95,12 +114,163 @@ struct BashRunResult {
     redacted: bool,
 }
 
+#[derive(Default)]
+struct SharedBashState {
+    output: Mutex<String>,
+    finished: AtomicBool,
+}
+
+impl SharedBashState {
+    fn push_output(&self, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        if let Ok(mut output) = self.output.lock() {
+            output.push_str(text);
+        }
+    }
+
+    fn snapshot_output(&self) -> String {
+        self.output
+            .lock()
+            .map(|output| output.clone())
+            .unwrap_or_default()
+    }
+
+    fn mark_finished(&self) {
+        self.finished.store(true, Ordering::SeqCst);
+    }
+
+    fn is_finished(&self) -> bool {
+        self.finished.load(Ordering::SeqCst)
+    }
+}
+
+pub struct RunningBash {
+    warnings: Vec<String>,
+    shared: Arc<SharedBashState>,
+    task: JoinHandle<(Result<ToolResult>, Duration)>,
+}
+
+impl RunningBash {
+    pub fn warnings(&self) -> &[String] {
+        &self.warnings
+    }
+
+    pub fn snapshot_output(&self) -> String {
+        self.shared.snapshot_output()
+    }
+
+    pub fn is_finished(&self) -> bool {
+        self.shared.is_finished()
+    }
+
+    pub async fn finish(self) -> (Result<ToolResult>, Duration, String) {
+        let RunningBash {
+            warnings: _,
+            shared,
+            task,
+        } = self;
+        let final_output = shared.snapshot_output();
+        match task.await {
+            Ok((result, elapsed)) => (result, elapsed, shared.snapshot_output()),
+            Err(error) => (
+                Err(anyhow::anyhow!("bash worker failed: {error}")),
+                Duration::ZERO,
+                final_output,
+            ),
+        }
+    }
+}
+
+trait BashOutputTarget {
+    fn push_output(&mut self, text: &str) -> Result<()>;
+}
+
+impl BashOutputTarget for Renderer {
+    fn push_output(&mut self, text: &str) -> Result<()> {
+        self.bash_output(None, "bash", text).map_err(Into::into)
+    }
+}
+
+struct BufferedBashTarget {
+    shared: Arc<SharedBashState>,
+}
+
+impl BufferedBashTarget {
+    fn new(shared: Arc<SharedBashState>) -> Self {
+        Self { shared }
+    }
+}
+
+impl BashOutputTarget for BufferedBashTarget {
+    fn push_output(&mut self, text: &str) -> Result<()> {
+        self.shared.push_output(text);
+        Ok(())
+    }
+}
+
+pub fn start_bash_task(args: BashArgs, config: &Config, state_dir: &Path) -> RunningBash {
+    let warnings = SecretRedactor::from_config(config).warnings().to_vec();
+    let config = config.clone();
+    let state_dir = state_dir.to_path_buf();
+    let shared = Arc::new(SharedBashState::default());
+    let shared_for_task = Arc::clone(&shared);
+    let task = tokio::task::spawn_blocking(move || {
+        let started = Instant::now();
+        let result = execute_bash_task(args, &config, &state_dir, Arc::clone(&shared_for_task));
+        shared_for_task.mark_finished();
+        (result, started.elapsed())
+    });
+    RunningBash {
+        warnings,
+        shared,
+        task,
+    }
+}
+
 fn run_bash(
     args: BashArgs,
     timeout_secs: u64,
-    renderer: &mut crate::renderer::Renderer,
+    renderer: &mut Renderer,
     env: &EnvMap,
     mut redactor: SecretRedactor,
+) -> Result<BashRunResult> {
+    run_bash_inner(args, timeout_secs, renderer, env, &mut redactor)
+}
+
+fn execute_bash_task(
+    args: BashArgs,
+    config: &Config,
+    state_dir: &Path,
+    shared: Arc<SharedBashState>,
+) -> Result<ToolResult> {
+    let timeout = args.timeout.unwrap_or(DEFAULT_TIMEOUT_SECS);
+    if timeout == 0 {
+        bail!("timeout must be greater than 0");
+    }
+
+    let mut redactor = SecretRedactor::from_config(config);
+    let mut target = BufferedBashTarget::new(shared);
+    let result = run_bash_inner(args, timeout, &mut target, &config.env, &mut redactor)?;
+    let exit_code = result.exit_code;
+    let output = if result.redacted {
+        format!("{}\n\n{}", result.output, REDACTION_REMINDER)
+    } else {
+        result.output
+    };
+    let full = format!("{output}\n[exit code: {exit_code}]");
+    let mut result = apply_truncation(full, &config.limits, "bash", state_dir, true)?;
+    result.display = ToolDisplay::Bash { exit_code };
+    Ok(result)
+}
+
+fn run_bash_inner(
+    args: BashArgs,
+    timeout_secs: u64,
+    target: &mut impl BashOutputTarget,
+    env: &EnvMap,
+    redactor: &mut SecretRedactor,
 ) -> Result<BashRunResult> {
     install_signal_forwarder();
     let cwd = args
@@ -164,12 +334,22 @@ fn run_bash(
     let mut output = String::new();
     let mut status: Option<ExitStatus> = None;
     let mut stdout_closed = false;
+    let mut interrupted = false;
 
     loop {
+        if cancellation_requested() {
+            interrupted = true;
+            terminate_child_group(child_id, &mut child);
+            drain_available(&rx, target, &mut output, redactor)?;
+            flush_redactor(target, &mut output, redactor)?;
+            let _ = child.wait();
+            break;
+        }
+
         if Instant::now() >= deadline {
             terminate_child_group(child_id, &mut child);
-            drain_available(&rx, renderer, &mut output, &mut redactor)?;
-            flush_redactor(renderer, &mut output, &mut redactor)?;
+            drain_available(&rx, target, &mut output, redactor)?;
+            flush_redactor(target, &mut output, redactor)?;
             let _ = child.wait();
             let reminder = if redactor.did_redact() {
                 format!("\n\n{REDACTION_REMINDER}")
@@ -192,7 +372,7 @@ fn run_bash(
                 let text = String::from_utf8_lossy(&bytes);
                 let redacted = redactor.redact_chunk(&text);
                 output.push_str(&redacted);
-                renderer.bash_output(&redacted)?;
+                target.push_output(&redacted)?;
             }
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => {
@@ -206,7 +386,20 @@ fn run_bash(
     }
 
     let status = status.unwrap_or_else(|| child.wait().expect("bash status"));
-    flush_redactor(renderer, &mut output, &mut redactor)?;
+    flush_redactor(target, &mut output, redactor)?;
+    if interrupted || (cancellation_requested() && status.signal().is_some()) {
+        let reminder = if redactor.did_redact() {
+            format!("\n\n{REDACTION_REMINDER}")
+        } else {
+            String::new()
+        };
+        bail!(
+            "script interrupted by {}{}{}",
+            signal_name(last_signal()),
+            partial_output_suffix(&output),
+            reminder
+        );
+    }
     Ok(BashRunResult {
         output: output.trim_end_matches('\n').to_string(),
         exit_code: status.code().unwrap_or(1),
@@ -216,7 +409,7 @@ fn run_bash(
 
 fn drain_available(
     rx: &mpsc::Receiver<Vec<u8>>,
-    renderer: &mut crate::renderer::Renderer,
+    target: &mut impl BashOutputTarget,
     output: &mut String,
     redactor: &mut SecretRedactor,
 ) -> Result<()> {
@@ -224,19 +417,19 @@ fn drain_available(
         let text = String::from_utf8_lossy(&bytes);
         let redacted = redactor.redact_chunk(&text);
         output.push_str(&redacted);
-        renderer.bash_output(&redacted)?;
+        target.push_output(&redacted)?;
     }
     Ok(())
 }
 
 fn flush_redactor(
-    renderer: &mut crate::renderer::Renderer,
+    target: &mut impl BashOutputTarget,
     output: &mut String,
     redactor: &mut SecretRedactor,
 ) -> Result<()> {
     let redacted = redactor.finish();
     output.push_str(&redacted);
-    renderer.bash_output(&redacted)?;
+    target.push_output(&redacted)?;
     Ok(())
 }
 
@@ -253,7 +446,7 @@ fn is_e2big(error: &std::io::Error) -> bool {
     error.raw_os_error() == Some(libc::E2BIG)
 }
 
-fn install_signal_forwarder() {
+pub fn install_signal_forwarder() {
     INSTALL_SIGNAL_FORWARDER.call_once(|| unsafe {
         libc::signal(libc::SIGINT, forward_signal as *const () as usize);
         libc::signal(libc::SIGTERM, forward_signal as *const () as usize);
@@ -261,38 +454,85 @@ fn install_signal_forwarder() {
 }
 
 extern "C" fn forward_signal(signal: i32) {
-    let pgid = ACTIVE_PGID.load(Ordering::SeqCst);
-    if pgid > 0 {
-        unsafe {
-            libc::kill(-pgid, signal);
+    LAST_SIGNAL.store(signal, Ordering::SeqCst);
+    let already_cancelling = CANCELLING.swap(true, Ordering::SeqCst);
+    for pgid in &ACTIVE_PGIDS {
+        let pgid = pgid.load(Ordering::SeqCst);
+        if pgid > 0 {
+            unsafe {
+                libc::kill(-pgid, signal);
+            }
         }
     }
-    unsafe {
-        libc::_exit(128 + signal);
+    if already_cancelling || !has_active_process_groups() {
+        unsafe {
+            libc::_exit(128 + signal);
+        }
     }
 }
 
-struct ActiveProcessGroup;
+pub fn reset_cancellation_state() {
+    CANCELLING.store(false, Ordering::SeqCst);
+    LAST_SIGNAL.store(0, Ordering::SeqCst);
+}
+
+pub fn cancellation_requested() -> bool {
+    CANCELLING.load(Ordering::SeqCst)
+}
+
+fn last_signal() -> i32 {
+    LAST_SIGNAL.load(Ordering::SeqCst)
+}
+
+fn has_active_process_groups() -> bool {
+    ACTIVE_PGIDS
+        .iter()
+        .any(|pgid| pgid.load(Ordering::SeqCst) > 0)
+}
+
+fn signal_name(signal: i32) -> &'static str {
+    match signal {
+        libc::SIGINT => "SIGINT",
+        libc::SIGTERM => "SIGTERM",
+        _ => "signal",
+    }
+}
+
+struct ActiveProcessGroup {
+    slot: Option<usize>,
+}
 
 impl ActiveProcessGroup {
     fn new(child_id: u32) -> Self {
-        set_active_process_group(child_id);
-        Self
+        Self {
+            slot: set_active_process_group(child_id),
+        }
     }
 }
 
 impl Drop for ActiveProcessGroup {
     fn drop(&mut self) {
-        clear_active_process_group();
+        clear_active_process_group(self.slot);
     }
 }
 
-fn set_active_process_group(child_id: u32) {
-    ACTIVE_PGID.store(child_id as i32, Ordering::SeqCst);
+fn set_active_process_group(child_id: u32) -> Option<usize> {
+    let pgid = child_id as i32;
+    for (idx, slot) in ACTIVE_PGIDS.iter().enumerate() {
+        if slot
+            .compare_exchange(0, pgid, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+        {
+            return Some(idx);
+        }
+    }
+    None
 }
 
-fn clear_active_process_group() {
-    ACTIVE_PGID.store(0, Ordering::SeqCst);
+fn clear_active_process_group(slot: Option<usize>) {
+    if let Some(slot) = slot {
+        ACTIVE_PGIDS[slot].store(0, Ordering::SeqCst);
+    }
 }
 
 fn configure_process_group(command: &mut Command) {

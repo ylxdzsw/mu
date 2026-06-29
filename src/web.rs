@@ -722,6 +722,14 @@ async fn abort_turn(
         )
         .await;
     }
+    let runtime_for_kill = runtime.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(750)).await;
+        if runtime_for_kill.is_completed().await {
+            return;
+        }
+        let _ = unsafe { libc::kill(-runtime_for_kill.turn.pgid, libc::SIGKILL) };
+    });
     write_json_response(stream, 200, "OK", &json!({ "ok": true })).await
 }
 
@@ -2075,11 +2083,29 @@ async function watchTurn(turn) {
   el("busy-pill").classList.remove("hidden");
   state.activeTurn = turn;
   let assistant = null;
-  let tool = null;
+  const tools = new Map();
+  let lastTool = null;
   let lastSeq = 0;
   let finished = false;
   let needsRefresh = false;
   let reconnecting = false;
+  const ensureTool = (event) => {
+    const toolId = event.payload?.tool_call_id || lastTool;
+    const args = event.payload?.args || {};
+    const title = args.title || args.script || event.payload?.tool || "bash";
+    if (toolId && tools.has(toolId)) {
+      lastTool = toolId;
+      return tools.get(toolId);
+    }
+    const created = appendTool(title);
+    if (toolId) {
+      tools.set(toolId, created);
+      lastTool = toolId;
+    } else {
+      lastTool = null;
+    }
+    return created;
+  };
   const handleTurnEvent = (event) => {
     if (event.id != null) lastSeq = event.id;
     if (event.event === "turn_start") {
@@ -2088,15 +2114,21 @@ async function watchTurn(turn) {
       if (!assistant) assistant = appendMessage("assistant", "");
       assistant.textContent += event.payload.text || "";
     } else if (event.event === "tool_start") {
-      const args = event.payload.args || {};
-      tool = appendTool(args.title || args.script || event.payload.tool);
+      ensureTool(event);
     } else if (event.event === "tool_output") {
-      if (!tool) tool = appendTool("bash");
+      const tool = ensureTool(event);
       tool.output.textContent += event.payload.text || "";
     } else if (event.event === "tool_finish") {
-      if (tool) tool.head.textContent += " done";
+      const tool = ensureTool(event);
+      if (tool && !tool.head.textContent.endsWith(" done")) tool.head.textContent += " done";
     } else if (event.event === "tool_error" || event.event === "error" || event.event === "stderr") {
-      appendMessage("system", event.payload.message || event.payload.error || event.payload.text || "");
+      if (event.event === "tool_error") {
+        const tool = ensureTool(event);
+        tool.output.textContent += `${tool.output.textContent ? "\n" : ""}${event.payload.error || event.payload.message || ""}`;
+        if (!tool.head.textContent.endsWith(" failed")) tool.head.textContent += " failed";
+      } else {
+        appendMessage("system", event.payload.message || event.payload.error || event.payload.text || "");
+      }
     } else if (event.event === "reset") {
       needsRefresh = true;
     } else if (event.event === "turn_finish") {
@@ -2550,5 +2582,7 @@ mod tests {
     fn static_app_contains_prompt_history_and_project_confirmation_copy() {
         assert!(INDEX_HTML.contains("mu will create .mu in this directory."));
         assert!(APP_JS.contains("mu-web-prompt-history"));
+        assert!(APP_JS.contains("tool_call_id"));
+        assert!(APP_JS.contains("const tools = new Map()"));
     }
 }

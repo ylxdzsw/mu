@@ -3,9 +3,10 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Result, bail};
-use futures_util::future::join_all;
 use serde_json::Value;
+use tokio::time::sleep;
 
+use crate::cli::OutputFormat;
 use crate::compaction;
 use crate::config::Config;
 use crate::guardrail::{Guardrail, GuardrailOutcome, bash_risk};
@@ -15,6 +16,7 @@ use crate::provider::{
 };
 use crate::renderer::Renderer;
 use crate::store::{ReviewRecord, Store, ToolCallRecord};
+use crate::tools::bash::{self, RunningBash};
 use crate::tools::{ExecutionMode, ToolContext, ToolRegistry, ToolResult, missing_tool_message};
 
 pub struct TurnResult {
@@ -22,6 +24,14 @@ pub struct TurnResult {
     pub completion_tokens: u64,
     pub final_total_tokens: u64,
     pub cost: f64,
+}
+
+struct ConcurrentBashExecution<'a> {
+    call: &'a ToolCall,
+    args: Value,
+    running: Option<RunningBash>,
+    streamed_len: usize,
+    completed: Option<(Result<ToolResult>, Duration)>,
 }
 
 pub struct AgentLoop<'a> {
@@ -39,6 +49,8 @@ pub struct AgentLoop<'a> {
 
 impl<'a> AgentLoop<'a> {
     pub async fn run_turn(&mut self, prompt: &str) -> Result<TurnResult> {
+        bash::reset_cancellation_state();
+        bash::install_signal_forwarder();
         compaction::maybe_compact(
             self.store,
             self.config,
@@ -169,12 +181,16 @@ impl<'a> AgentLoop<'a> {
 
                     let mut cursor = 0;
                     while cursor < tool_calls.len() {
+                        if bash::cancellation_requested() {
+                            bail!("turn interrupted");
+                        }
                         let args = parse_tool_args(&tool_calls[cursor]);
-                        let concurrent = registry
-                            .get(&tool_calls[cursor].function.name)
-                            .is_some_and(|tool| {
-                                tool.execution_mode(&args) == ExecutionMode::Concurrent
-                            });
+                        let concurrent = self.concurrent_tool_call_eligible(
+                            &registry,
+                            guardrail.as_ref(),
+                            &tool_calls[cursor],
+                            &args,
+                        );
 
                         if !concurrent {
                             let tc = &tool_calls[cursor];
@@ -195,6 +211,7 @@ impl<'a> AgentLoop<'a> {
                                         Err(err),
                                         Duration::ZERO,
                                         &mut context,
+                                        true,
                                     )?;
                                     cursor += 1;
                                     continue;
@@ -290,7 +307,8 @@ impl<'a> AgentLoop<'a> {
                                 }
                             }
 
-                            self.renderer.tool_start(&tc.function.name, &args)?;
+                            self.renderer
+                                .tool_start(Some(&tc.id), &tc.function.name, &args)?;
                             let started = Instant::now();
 
                             let tool_result = if let Some(tool) = registry.get(&tc.function.name) {
@@ -310,6 +328,7 @@ impl<'a> AgentLoop<'a> {
                                 tool_result,
                                 started.elapsed(),
                                 &mut context,
+                                true,
                             )?;
                             cursor += 1;
                             continue;
@@ -318,11 +337,12 @@ impl<'a> AgentLoop<'a> {
                         let mut end = cursor + 1;
                         while end < tool_calls.len() {
                             let next_args = parse_tool_args(&tool_calls[end]);
-                            let next_concurrent = registry
-                                .get(&tool_calls[end].function.name)
-                                .is_some_and(|tool| {
-                                    tool.execution_mode(&next_args) == ExecutionMode::Concurrent
-                                });
+                            let next_concurrent = self.concurrent_tool_call_eligible(
+                                &registry,
+                                guardrail.as_ref(),
+                                &tool_calls[end],
+                                &next_args,
+                            );
                             if !next_concurrent {
                                 break;
                             }
@@ -330,28 +350,12 @@ impl<'a> AgentLoop<'a> {
                         }
 
                         let batch = &tool_calls[cursor..end];
-                        let config = self.config;
-                        let state_dir = self.state_dir;
-                        let executions = batch.iter().map(|tc| {
-                            let args = parse_tool_args(tc);
-                            let tool = registry
-                                .get(&tc.function.name)
-                                .expect("concurrent batch contains a registered tool");
-                            async move {
-                                let started = Instant::now();
-                                let mut ctx = ToolContext {
-                                    config,
-                                    renderer: None,
-                                    state_dir,
-                                };
-                                let result = tool.execute(args, &mut ctx).await;
-                                (result, started.elapsed())
+                        for chunk in batch.chunks(bash::MAX_ACTIVE_PROCESS_GROUPS) {
+                            self.execute_concurrent_bash_batch(msg_id, chunk, &mut context)
+                                .await?;
+                            if bash::cancellation_requested() {
+                                bail!("turn interrupted");
                             }
-                        });
-                        let results = join_all(executions).await;
-
-                        for (tc, (result, elapsed)) in batch.iter().zip(results) {
-                            self.persist_tool_result(msg_id, tc, result, elapsed, &mut context)?;
                         }
                         cursor = end;
                     }
@@ -392,16 +396,30 @@ impl<'a> AgentLoop<'a> {
         result: Result<ToolResult>,
         elapsed: Duration,
         context: &mut Vec<Message>,
+        emit_renderer: bool,
     ) -> Result<()> {
         let (output, status) = match result {
             Ok(result) => {
-                self.renderer.tool_finished(&result.display, elapsed)?;
+                if emit_renderer {
+                    self.renderer.tool_finished(
+                        Some(&call.id),
+                        &call.function.name,
+                        &result.display,
+                        elapsed,
+                    )?;
+                }
                 (result.output, "ok")
             }
             Err(error) => {
                 let message = format!("error: {error}");
-                self.renderer
-                    .tool_failed(&call.function.name, &error.to_string(), elapsed)?;
+                if emit_renderer {
+                    self.renderer.tool_failed(
+                        Some(&call.id),
+                        &call.function.name,
+                        &error.to_string(),
+                        elapsed,
+                    )?;
+                }
                 (message, "error")
             }
         };
@@ -425,6 +443,177 @@ impl<'a> AgentLoop<'a> {
         context.push(message);
         Ok(())
     }
+
+    fn concurrent_tool_call_eligible(
+        &self,
+        registry: &ToolRegistry,
+        guardrail: Option<&Guardrail>,
+        call: &ToolCall,
+        args: &Value,
+    ) -> bool {
+        if self.renderer.output_format() == OutputFormat::Plain {
+            return false;
+        }
+        let Some(tool) = registry.get(&call.function.name) else {
+            return false;
+        };
+        if tool.execution_mode(args) != ExecutionMode::Concurrent {
+            return false;
+        }
+        !guardrail_review_required(guardrail, call, args)
+    }
+
+    async fn execute_concurrent_bash_batch(
+        &mut self,
+        message_id: i64,
+        batch: &[ToolCall],
+        context: &mut Vec<Message>,
+    ) -> Result<()> {
+        let mut executions = Vec::new();
+        for call in batch {
+            let args = parse_tool_args(call);
+            let bash_args = crate::tools::parse_args(&args)?;
+            executions.push(ConcurrentBashExecution {
+                call,
+                args,
+                running: Some(bash::start_bash_task(
+                    bash_args,
+                    self.config,
+                    self.state_dir,
+                )),
+                streamed_len: 0,
+                completed: None,
+            });
+        }
+
+        match self.renderer.output_format() {
+            OutputFormat::Terminal => {
+                for exec in &mut executions {
+                    if let Some(running) = exec.running.as_ref() {
+                        for warning in running.warnings() {
+                            self.renderer.notice(&format!("[redaction] {warning}"))?;
+                        }
+                    }
+                    self.renderer.tool_start(
+                        Some(&exec.call.id),
+                        &exec.call.function.name,
+                        &exec.args,
+                    )?;
+                    self.stream_running_bash(exec).await?;
+                    let (result, elapsed, final_output) = exec
+                        .running
+                        .take()
+                        .expect("running bash present")
+                        .finish()
+                        .await;
+                    self.flush_buffered_bash_output(exec, &final_output)?;
+                    self.persist_tool_result(
+                        message_id, exec.call, result, elapsed, context, true,
+                    )?;
+                }
+            }
+            OutputFormat::Json => {
+                for exec in &mut executions {
+                    if let Some(running) = exec.running.as_ref() {
+                        for warning in running.warnings() {
+                            self.renderer.notice(&format!("[redaction] {warning}"))?;
+                        }
+                    }
+                    self.renderer.tool_start(
+                        Some(&exec.call.id),
+                        &exec.call.function.name,
+                        &exec.args,
+                    )?;
+                }
+
+                while executions.iter().any(|exec| exec.completed.is_none()) {
+                    let mut progressed = false;
+                    for exec in &mut executions {
+                        if exec.completed.is_some() {
+                            continue;
+                        }
+                        let (snapshot, finished) = if let Some(running) = exec.running.as_ref() {
+                            (running.snapshot_output(), running.is_finished())
+                        } else {
+                            (String::new(), false)
+                        };
+                        if self.flush_buffered_bash_output(exec, &snapshot)? {
+                            progressed = true;
+                        }
+                        if finished {
+                            let (result, elapsed, final_output) = exec
+                                .running
+                                .take()
+                                .expect("running bash present")
+                                .finish()
+                                .await;
+                            let _ = self.flush_buffered_bash_output(exec, &final_output)?;
+                            match result.as_ref() {
+                                Ok(result) => self.renderer.tool_finished(
+                                    Some(&exec.call.id),
+                                    &exec.call.function.name,
+                                    &result.display,
+                                    elapsed,
+                                )?,
+                                Err(error) => self.renderer.tool_failed(
+                                    Some(&exec.call.id),
+                                    &exec.call.function.name,
+                                    &error.to_string(),
+                                    elapsed,
+                                )?,
+                            }
+                            exec.completed = Some((result, elapsed));
+                            progressed = true;
+                        }
+                    }
+                    if executions.iter().any(|exec| exec.completed.is_none()) && !progressed {
+                        sleep(Duration::from_millis(25)).await;
+                    }
+                }
+
+                for exec in executions {
+                    let (result, elapsed) = exec.completed.expect("completed bash result");
+                    self.persist_tool_result(
+                        message_id, exec.call, result, elapsed, context, false,
+                    )?;
+                }
+            }
+            OutputFormat::Plain => unreachable!("plain mode stays sequential"),
+        }
+
+        Ok(())
+    }
+
+    async fn stream_running_bash(&mut self, exec: &mut ConcurrentBashExecution<'_>) -> Result<()> {
+        loop {
+            let (snapshot, finished) = if let Some(running) = exec.running.as_ref() {
+                (running.snapshot_output(), running.is_finished())
+            } else {
+                (String::new(), false)
+            };
+            self.flush_buffered_bash_output(exec, &snapshot)?;
+            if finished {
+                break;
+            }
+            sleep(Duration::from_millis(25)).await;
+        }
+        Ok(())
+    }
+
+    fn flush_buffered_bash_output(
+        &mut self,
+        exec: &mut ConcurrentBashExecution<'_>,
+        snapshot: &str,
+    ) -> Result<bool> {
+        if snapshot.len() <= exec.streamed_len {
+            return Ok(false);
+        }
+        let next = snapshot[exec.streamed_len..].to_string();
+        exec.streamed_len = snapshot.len();
+        self.renderer
+            .bash_output(Some(&exec.call.id), &exec.call.function.name, &next)?;
+        Ok(true)
+    }
 }
 
 fn parse_tool_args(call: &ToolCall) -> Value {
@@ -440,6 +629,19 @@ fn tool_call_risk(args: &str) -> Option<String> {
     }
 }
 
+fn guardrail_review_required(guardrail: Option<&Guardrail>, call: &ToolCall, args: &Value) -> bool {
+    if call.function.name != "bash" {
+        return false;
+    }
+    let Some(guardrail) = guardrail else {
+        return false;
+    };
+    let Some(risk) = bash_risk(args) else {
+        return false;
+    };
+    guardrail.should_review(risk.as_str())
+}
+
 fn unknown_tool_result(name: &str) -> Result<ToolResult> {
     Err(anyhow::anyhow!(missing_tool_message(name)))
 }
@@ -452,4 +654,211 @@ fn compute_cost(config: &Config, model: &str, prompt: u64, completion: u64) -> f
         return 0.0;
     };
     (prompt as f64 / 1_000_000.0) * prices.input + (completion as f64 / 1_000_000.0) * prices.output
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+
+    use async_trait::async_trait;
+    use serde_json::Value;
+
+    use super::*;
+    use crate::config::{
+        CompactionConfig, GuardrailConfig, LimitsConfig, ProviderConfig, RedactionConfig,
+        TerminalBellConfig,
+    };
+    use crate::provider::{FinishReason, FunctionCall, ProviderError, StreamResult, Usage};
+
+    struct ToolThenStopProvider {
+        step: Mutex<usize>,
+        cwd: String,
+    }
+
+    #[async_trait(?Send)]
+    impl Provider for ToolThenStopProvider {
+        async fn stream_chat(
+            &self,
+            _request: &RequestOptions,
+            messages: &[Message],
+            _tools: &[Value],
+            _on_event: &mut dyn FnMut(crate::provider::StreamEvent) -> Result<(), ProviderError>,
+        ) -> Result<StreamResult, ProviderError> {
+            let mut step = self.step.lock().unwrap();
+            let current = *step;
+            *step += 1;
+            match current {
+                0 => Ok(StreamResult {
+                    message: Message::Assistant {
+                        content: None,
+                        tool_calls: Some(vec![
+                            bash_call(
+                                "call-a",
+                                "First",
+                                "date +%s%N > a-start\nsleep 0.5\ndate +%s%N > a-end\nprintf 'first'",
+                                "readonly",
+                                Some(&self.cwd),
+                            ),
+                            bash_call(
+                                "call-b",
+                                "Second",
+                                "date +%s%N > b-start\nsleep 0.5\ndate +%s%N > b-end\nprintf 'second'",
+                                "readonly",
+                                Some(&self.cwd),
+                            ),
+                        ]),
+                    },
+                    finish_reason: FinishReason::ToolCalls,
+                    usage: Some(Usage {
+                        prompt_tokens: 1,
+                        completion_tokens: 1,
+                        total_tokens: 2,
+                    }),
+                }),
+                1 => {
+                    let tool_ids = messages
+                        .iter()
+                        .filter_map(|message| match message {
+                            Message::Tool { tool_call_id, .. } => Some(tool_call_id.as_str()),
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>();
+                    assert_eq!(tool_ids, vec!["call-a", "call-b"]);
+                    Ok(StreamResult {
+                        message: Message::Assistant {
+                            content: Some("done".into()),
+                            tool_calls: None,
+                        },
+                        finish_reason: FinishReason::Stop,
+                        usage: Some(Usage {
+                            prompt_tokens: 1,
+                            completion_tokens: 1,
+                            total_tokens: 2,
+                        }),
+                    })
+                }
+                other => panic!("unexpected provider step {other}"),
+            }
+        }
+    }
+
+    fn bash_call(id: &str, title: &str, script: &str, risk: &str, cwd: Option<&str>) -> ToolCall {
+        ToolCall {
+            id: id.to_string(),
+            call_type: "function".into(),
+            function: FunctionCall {
+                name: "bash".into(),
+                arguments: serde_json::json!({
+                    "title": title,
+                    "risk": risk,
+                    "script": script,
+                    "cwd": cwd,
+                })
+                .to_string(),
+            },
+        }
+    }
+
+    fn test_config() -> Config {
+        Config {
+            provider: ProviderConfig {
+                base_url: "http://localhost".into(),
+                api_key_env: "MU_TEST_KEY".into(),
+            },
+            default_model: "fake-model".into(),
+            default_effort: None,
+            models: HashMap::new(),
+            compaction: CompactionConfig::default(),
+            limits: LimitsConfig::default(),
+            guardrail: GuardrailConfig::default(),
+            terminal_bell: TerminalBellConfig::default(),
+            redaction: RedactionConfig::default(),
+            env: HashMap::new(),
+        }
+    }
+
+    async fn run_tool_batch(output: OutputFormat, cwd: &Path) -> (Store, String) {
+        let tmp = std::env::temp_dir().join(format!("mu-agent-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let store = Store::open(&tmp.join("mu.db")).unwrap();
+        let session = store
+            .create_session(&cwd.display().to_string(), "fake-model", None)
+            .unwrap();
+        let config = test_config();
+        let provider = Arc::new(ToolThenStopProvider {
+            step: Mutex::new(0),
+            cwd: cwd.display().to_string(),
+        });
+        let mut renderer = Renderer::with_format(output);
+        let mut agent = AgentLoop {
+            config: &config,
+            provider,
+            store: &store,
+            session_id: &session.id,
+            request: RequestOptions {
+                model: "fake-model".into(),
+                effort: None,
+            },
+            model_context_window: None,
+            renderer: &mut renderer,
+            state_dir: &tmp,
+            system_prompt: "system".into(),
+            attachments: Vec::new(),
+        };
+
+        agent.run_turn("run both").await.unwrap();
+        (store, session.id)
+    }
+
+    #[tokio::test]
+    async fn readonly_bash_batch_runs_concurrently_and_keeps_tool_results_ordered() {
+        let cwd = std::env::temp_dir().join(format!("mu-agent-cwd-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&cwd).unwrap();
+        let (store, session_id) = run_tool_batch(OutputFormat::Json, &cwd).await;
+
+        let tool_messages = store
+            .load_context_messages(&session_id)
+            .unwrap()
+            .into_iter()
+            .filter_map(|message| match message {
+                Message::Tool {
+                    tool_call_id,
+                    content,
+                } => Some((tool_call_id, content)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(tool_messages.len(), 2);
+        assert_eq!(tool_messages[0].0, "call-a");
+        assert_eq!(tool_messages[1].0, "call-b");
+        assert!(tool_messages[0].1.contains("first"));
+        assert!(tool_messages[1].1.contains("second"));
+
+        let a_start: u128 = std::fs::read_to_string(cwd.join("a-start"))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let a_end: u128 = std::fs::read_to_string(cwd.join("a-end"))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let b_start: u128 = std::fs::read_to_string(cwd.join("b-start"))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let b_end: u128 = std::fs::read_to_string(cwd.join("b-end"))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        assert!(
+            a_start < b_end && b_start < a_end,
+            "readonly bash batch did not overlap"
+        );
+        let _ = std::fs::remove_dir_all(cwd);
+    }
 }

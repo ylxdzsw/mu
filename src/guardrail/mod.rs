@@ -142,6 +142,7 @@ impl Guardrail {
     /// should abort the turn — re-authorizing would likely fail again since
     /// the reviewer itself is malfunctioning).
     pub async fn assess(&mut self, action: &Value, context: &[Message]) -> GuardrailOutcome {
+        crate::tools::bash::install_signal_forwarder();
         let model = self
             .config
             .review_model

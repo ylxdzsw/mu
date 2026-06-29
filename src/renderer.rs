@@ -1,7 +1,7 @@
 use std::io::{self, IsTerminal, Write};
 use std::time::{Duration, Instant};
 
-use pulldown_cmark::{Event, HeadingLevel, Options, Parser, Tag, TagEnd};
+use pulldown_cmark::{Alignment, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
 
 use crate::cli::OutputFormat;
 use crate::tools::ToolDisplay;
@@ -42,6 +42,7 @@ pub struct Renderer {
     live_line_rendered: bool,
     reasoning: Option<ReasoningState>,
     bash_preview: Option<BashPreviewState>,
+    active_bash_tool_call_id: Option<String>,
     turn_done_bell_min_duration: Option<Duration>,
 }
 
@@ -71,8 +72,13 @@ impl Renderer {
             live_line_rendered: false,
             reasoning: None,
             bash_preview: None,
+            active_bash_tool_call_id: None,
             turn_done_bell_min_duration,
         }
+    }
+
+    pub fn output_format(&self) -> OutputFormat {
+        self.format
     }
 
     pub fn assistant_text(&mut self, text: &str) -> io::Result<()> {
@@ -174,16 +180,26 @@ impl Renderer {
         self.live_line = None;
         self.reasoning = None;
         self.bash_preview = None;
+        self.active_bash_tool_call_id = None;
         Ok(())
     }
 
     /// Completion-only tools are silent here. Bash is the exception because
     /// its live output needs a visible command header.
-    pub fn tool_start(&mut self, name: &str, args: &serde_json::Value) -> io::Result<()> {
+    pub fn tool_start(
+        &mut self,
+        tool_call_id: Option<&str>,
+        name: &str,
+        args: &serde_json::Value,
+    ) -> io::Result<()> {
         if self.format == OutputFormat::Json {
             return self.write_json(
                 "tool_start",
-                serde_json::json!({ "tool": name, "args": args }),
+                serde_json::json!({
+                    "tool_call_id": tool_call_id,
+                    "tool": name,
+                    "args": args
+                }),
             );
         }
         if name != "bash" {
@@ -207,20 +223,31 @@ impl Renderer {
             .unwrap_or_default();
         let risk = args.get("risk").and_then(|value| value.as_str());
         let line = format_bash_header(title, script, risk, self.styled);
+        self.active_bash_tool_call_id = tool_call_id.map(ToOwned::to_owned);
         if self.styled {
             self.bash_preview = Some(BashPreviewState::default());
         }
         self.write_committed(&line)
     }
 
-    pub fn bash_output(&mut self, text: &str) -> io::Result<()> {
+    pub fn bash_output(
+        &mut self,
+        tool_call_id: Option<&str>,
+        tool: &str,
+        text: &str,
+    ) -> io::Result<()> {
         if text.is_empty() {
             return Ok(());
         }
+        let tool_call_id = tool_call_id.or(self.active_bash_tool_call_id.as_deref());
         if self.format == OutputFormat::Json {
             return self.write_json(
                 "tool_output",
-                serde_json::json!({ "text": strip_ansi(text) }),
+                serde_json::json!({
+                    "tool_call_id": tool_call_id,
+                    "tool": tool,
+                    "text": strip_ansi(text)
+                }),
             );
         }
         let sanitized = strip_ansi(text);
@@ -240,11 +267,22 @@ impl Renderer {
         self.set_omitted_live_line(snapshot.omitted_lines, snapshot.omitted_bytes)
     }
 
-    pub fn tool_finished(&mut self, display: &ToolDisplay, elapsed: Duration) -> io::Result<()> {
+    pub fn tool_finished(
+        &mut self,
+        tool_call_id: Option<&str>,
+        tool: &str,
+        display: &ToolDisplay,
+        elapsed: Duration,
+    ) -> io::Result<()> {
+        if tool == "bash" {
+            self.active_bash_tool_call_id = None;
+        }
         if self.format == OutputFormat::Json {
             return self.write_json(
                 "tool_finish",
                 serde_json::json!({
+                    "tool_call_id": tool_call_id,
+                    "tool": tool,
                     "display": tool_display_json(display),
                     "elapsed_ms": elapsed.as_millis()
                 }),
@@ -259,11 +297,21 @@ impl Renderer {
         self.write_stdout(&terminal_trim_committed_text(&text))
     }
 
-    pub fn tool_failed(&mut self, name: &str, error: &str, elapsed: Duration) -> io::Result<()> {
+    pub fn tool_failed(
+        &mut self,
+        tool_call_id: Option<&str>,
+        name: &str,
+        error: &str,
+        elapsed: Duration,
+    ) -> io::Result<()> {
+        if name == "bash" {
+            self.active_bash_tool_call_id = None;
+        }
         if self.format == OutputFormat::Json {
             return self.write_json(
                 "tool_error",
                 serde_json::json!({
+                    "tool_call_id": tool_call_id,
                     "tool": name,
                     "error": error,
                     "elapsed_ms": elapsed.as_millis()
@@ -683,6 +731,47 @@ struct ListState {
     next: Option<u64>,
 }
 
+struct TableState {
+    alignments: Vec<Alignment>,
+    header: Vec<String>,
+    rows: Vec<Vec<String>>,
+    current_row: Vec<String>,
+    current_cell: Option<String>,
+}
+
+impl TableState {
+    fn new(alignments: Vec<Alignment>) -> Self {
+        Self {
+            alignments,
+            header: Vec::new(),
+            rows: Vec::new(),
+            current_row: Vec::new(),
+            current_cell: None,
+        }
+    }
+
+    fn start_row(&mut self) {
+        self.current_row.clear();
+    }
+
+    fn start_cell(&mut self) {
+        self.current_cell = Some(String::new());
+    }
+
+    fn finish_cell(&mut self) {
+        let cell = self.current_cell.take().unwrap_or_default();
+        self.current_row.push(normalize_table_cell(&cell));
+    }
+
+    fn finish_header(&mut self) {
+        self.header = std::mem::take(&mut self.current_row);
+    }
+
+    fn finish_row(&mut self) {
+        self.rows.push(std::mem::take(&mut self.current_row));
+    }
+}
+
 fn render_markdown(markdown: &str) -> String {
     let options =
         Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TABLES | Options::ENABLE_TASKLISTS;
@@ -692,142 +781,204 @@ fn render_markdown(markdown: &str) -> String {
     let mut lists: Vec<ListState> = Vec::new();
     let mut links: Vec<String> = Vec::new();
     let mut in_item = 0usize;
-    let mut table_cell = 0usize;
-
-    let push_style = |out: &mut String, styles: &mut Vec<MdStyle>, style| {
-        styles.push(style);
-        out.push_str(style.ansi());
-    };
-    let pop_style = |out: &mut String, styles: &mut Vec<MdStyle>| {
-        styles.pop();
-        out.push_str(RESET);
-        for style in styles.iter() {
-            out.push_str(style.ansi());
-        }
-    };
-    let push_styles = |out: &mut String, styles: &mut Vec<MdStyle>, applied: &[MdStyle]| {
-        for style in applied {
-            push_style(out, styles, *style);
-        }
-    };
-    let pop_styles = |out: &mut String, styles: &mut Vec<MdStyle>, count: usize| {
-        for _ in 0..count {
-            pop_style(out, styles);
-        }
-    };
+    let mut table_state: Option<TableState> = None;
 
     for event in parser {
         match event {
             Event::Start(tag) => match tag {
                 Tag::Heading { level, .. } => {
-                    push_styles(&mut out, &mut styles, heading_styles(level));
+                    push_styles(
+                        current_render_target(&mut out, &mut table_state),
+                        &mut styles,
+                        heading_styles(level),
+                    );
                 }
                 Tag::BlockQuote(_) => {
-                    out.push_str("│ ");
-                    push_style(&mut out, &mut styles, MdStyle::Dim);
+                    current_render_target(&mut out, &mut table_state).push_str("│ ");
+                    push_style(
+                        current_render_target(&mut out, &mut table_state),
+                        &mut styles,
+                        MdStyle::Dim,
+                    );
                 }
                 Tag::CodeBlock(_) => {
                     if !out.ends_with('\n') && !out.is_empty() {
                         out.push('\n');
                     }
-                    push_styles(&mut out, &mut styles, code_block_styles());
+                    push_styles(
+                        current_render_target(&mut out, &mut table_state),
+                        &mut styles,
+                        code_block_styles(),
+                    );
                 }
                 Tag::List(start) => lists.push(ListState { next: start }),
                 Tag::Item => {
                     in_item += 1;
-                    out.push_str(&"  ".repeat(lists.len().saturating_sub(1)));
+                    current_render_target(&mut out, &mut table_state)
+                        .push_str(&"  ".repeat(lists.len().saturating_sub(1)));
                     let marker = lists.last_mut().and_then(|list| {
                         let current = list.next?;
                         list.next = Some(current + 1);
                         Some(format!("{current}. "))
                     });
-                    out.push_str(marker.as_deref().unwrap_or("• "));
+                    current_render_target(&mut out, &mut table_state)
+                        .push_str(marker.as_deref().unwrap_or("• "));
                 }
-                Tag::Table(_) => {}
+                Tag::Table(alignments) => {
+                    table_state = Some(TableState::new(alignments));
+                }
                 Tag::TableHead | Tag::TableRow => {
-                    table_cell = 0;
-                    out.push_str("| ");
+                    if let Some(table) = table_state.as_mut() {
+                        table.start_row();
+                    }
                 }
                 Tag::TableCell => {
-                    if table_cell > 0 {
-                        out.push_str(" | ");
+                    if let Some(table) = table_state.as_mut() {
+                        table.start_cell();
                     }
-                    table_cell += 1;
                 }
-                Tag::Emphasis => push_styles(&mut out, &mut styles, emphasis_styles()),
-                Tag::Strong => push_styles(&mut out, &mut styles, strong_styles()),
-                Tag::Strikethrough => push_style(&mut out, &mut styles, MdStyle::Strike),
+                Tag::Emphasis => push_styles(
+                    current_render_target(&mut out, &mut table_state),
+                    &mut styles,
+                    emphasis_styles(),
+                ),
+                Tag::Strong => push_styles(
+                    current_render_target(&mut out, &mut table_state),
+                    &mut styles,
+                    strong_styles(),
+                ),
+                Tag::Strikethrough => push_style(
+                    current_render_target(&mut out, &mut table_state),
+                    &mut styles,
+                    MdStyle::Strike,
+                ),
                 Tag::Link { dest_url, .. } => {
                     links.push(dest_url.to_string());
-                    push_styles(&mut out, &mut styles, link_styles());
-                    out.push_str(&open_hyperlink(&dest_url));
+                    push_styles(
+                        current_render_target(&mut out, &mut table_state),
+                        &mut styles,
+                        link_styles(),
+                    );
+                    current_render_target(&mut out, &mut table_state)
+                        .push_str(&open_hyperlink(&dest_url));
                 }
                 _ => {}
             },
             Event::End(tag) => match tag {
                 TagEnd::Paragraph => {
                     if in_item == 0 {
-                        out.push_str("\n\n");
+                        current_render_target(&mut out, &mut table_state).push_str("\n\n");
                     }
                 }
                 TagEnd::Heading(level) => {
-                    pop_styles(&mut out, &mut styles, heading_styles(level).len());
-                    out.push_str("\n\n");
+                    pop_styles(
+                        current_render_target(&mut out, &mut table_state),
+                        &mut styles,
+                        heading_styles(level).len(),
+                    );
+                    current_render_target(&mut out, &mut table_state).push_str("\n\n");
                 }
                 TagEnd::BlockQuote(_) | TagEnd::CodeBlock => {
-                    pop_styles(&mut out, &mut styles, code_block_styles().len());
-                    out.push_str("\n\n");
+                    pop_styles(
+                        current_render_target(&mut out, &mut table_state),
+                        &mut styles,
+                        code_block_styles().len(),
+                    );
+                    current_render_target(&mut out, &mut table_state).push_str("\n\n");
                 }
                 TagEnd::List(_) => {
                     lists.pop();
                     if lists.is_empty() {
-                        out.push('\n');
+                        current_render_target(&mut out, &mut table_state).push('\n');
                     }
                 }
                 TagEnd::Item => {
                     in_item = in_item.saturating_sub(1);
-                    out.push('\n');
+                    current_render_target(&mut out, &mut table_state).push('\n');
                 }
-                TagEnd::TableHead | TagEnd::TableRow => out.push_str(" |\n"),
-                TagEnd::Table => out.push('\n'),
-                TagEnd::Emphasis => pop_styles(&mut out, &mut styles, emphasis_styles().len()),
-                TagEnd::Strong => pop_styles(&mut out, &mut styles, strong_styles().len()),
-                TagEnd::Strikethrough => pop_style(&mut out, &mut styles),
+                TagEnd::TableHead => {
+                    if let Some(table) = table_state.as_mut() {
+                        table.finish_header();
+                    }
+                }
+                TagEnd::TableRow => {
+                    if let Some(table) = table_state.as_mut() {
+                        table.finish_row();
+                    }
+                }
+                TagEnd::TableCell => {
+                    if let Some(table) = table_state.as_mut() {
+                        table.finish_cell();
+                    }
+                }
+                TagEnd::Table => {
+                    if let Some(table) = table_state.take() {
+                        out.push_str(&render_table(&table));
+                    }
+                }
+                TagEnd::Emphasis => pop_styles(
+                    current_render_target(&mut out, &mut table_state),
+                    &mut styles,
+                    emphasis_styles().len(),
+                ),
+                TagEnd::Strong => pop_styles(
+                    current_render_target(&mut out, &mut table_state),
+                    &mut styles,
+                    strong_styles().len(),
+                ),
+                TagEnd::Strikethrough => pop_style(
+                    current_render_target(&mut out, &mut table_state),
+                    &mut styles,
+                ),
                 TagEnd::Link => {
-                    out.push_str(OSC8_CLOSE);
-                    pop_styles(&mut out, &mut styles, link_styles().len());
+                    current_render_target(&mut out, &mut table_state).push_str(OSC8_CLOSE);
+                    pop_styles(
+                        current_render_target(&mut out, &mut table_state),
+                        &mut styles,
+                        link_styles().len(),
+                    );
                     if let Some(url) = links.pop() {
-                        out.push_str(DIM);
-                        out.push_str(" (");
-                        out.push_str(&hyperlink_text(&url, &url));
-                        out.push(')');
-                        out.push_str(RESET);
+                        let target = current_render_target(&mut out, &mut table_state);
+                        target.push_str(DIM);
+                        target.push_str(" (");
+                        target.push_str(&hyperlink_text(&url, &url));
+                        target.push(')');
+                        target.push_str(RESET);
                         for style in &styles {
-                            out.push_str(style.ansi());
+                            current_render_target(&mut out, &mut table_state)
+                                .push_str(style.ansi());
                         }
                     }
                 }
                 _ => {}
             },
-            Event::Text(text) => out.push_str(&text),
+            Event::Text(text) => current_render_target(&mut out, &mut table_state).push_str(&text),
             Event::Code(code) => {
+                let target = current_render_target(&mut out, &mut table_state);
                 for style in inline_code_styles() {
-                    out.push_str(style.ansi());
+                    target.push_str(style.ansi());
                 }
-                out.push_str(&code);
-                out.push_str(RESET);
+                target.push_str(&code);
+                target.push_str(RESET);
                 for style in &styles {
-                    out.push_str(style.ansi());
+                    current_render_target(&mut out, &mut table_state).push_str(style.ansi());
                 }
             }
-            Event::SoftBreak | Event::HardBreak => out.push('\n'),
-            Event::Rule => out.push_str("────────────────────────────────────────\n\n"),
-            Event::TaskListMarker(done) => out.push_str(if done { "[✓] " } else { "[ ] " }),
-            Event::Html(html) | Event::InlineHtml(html) => out.push_str(&html),
+            Event::SoftBreak | Event::HardBreak => {
+                current_render_target(&mut out, &mut table_state).push('\n')
+            }
+            Event::Rule => current_render_target(&mut out, &mut table_state)
+                .push_str("────────────────────────────────────────\n\n"),
+            Event::TaskListMarker(done) => current_render_target(&mut out, &mut table_state)
+                .push_str(if done { "[✓] " } else { "[ ] " }),
+            Event::Html(html) | Event::InlineHtml(html) => {
+                current_render_target(&mut out, &mut table_state).push_str(&html)
+            }
             Event::FootnoteReference(name) => {
-                out.push('[');
-                out.push_str(&name);
-                out.push(']');
+                let target = current_render_target(&mut out, &mut table_state);
+                target.push('[');
+                target.push_str(&name);
+                target.push(']');
             }
             _ => {}
         }
@@ -837,6 +988,134 @@ fn render_markdown(markdown: &str) -> String {
         out.push_str(RESET);
     }
     out
+}
+
+fn current_render_target<'a>(
+    out: &'a mut String,
+    table_state: &'a mut Option<TableState>,
+) -> &'a mut String {
+    match table_state {
+        Some(table) => match table.current_cell.as_mut() {
+            Some(cell) => cell,
+            None => out,
+        },
+        None => out,
+    }
+}
+
+fn push_style(out: &mut String, styles: &mut Vec<MdStyle>, style: MdStyle) {
+    styles.push(style);
+    out.push_str(style.ansi());
+}
+
+fn pop_style(out: &mut String, styles: &mut Vec<MdStyle>) {
+    styles.pop();
+    out.push_str(RESET);
+    for style in styles.iter() {
+        out.push_str(style.ansi());
+    }
+}
+
+fn push_styles(out: &mut String, styles: &mut Vec<MdStyle>, applied: &[MdStyle]) {
+    for style in applied {
+        push_style(out, styles, *style);
+    }
+}
+
+fn pop_styles(out: &mut String, styles: &mut Vec<MdStyle>, count: usize) {
+    for _ in 0..count {
+        pop_style(out, styles);
+    }
+}
+
+fn normalize_table_cell(cell: &str) -> String {
+    cell.lines()
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn render_table(table: &TableState) -> String {
+    let cols = table
+        .header
+        .len()
+        .max(table.rows.iter().map(Vec::len).max().unwrap_or(0))
+        .max(table.alignments.len());
+    if cols == 0 {
+        return String::new();
+    }
+
+    let mut widths = vec![3usize; cols];
+    for row in std::iter::once(&table.header).chain(table.rows.iter()) {
+        for (idx, cell) in row.iter().enumerate() {
+            widths[idx] = widths[idx].max(visible_text_width(cell));
+        }
+    }
+
+    let mut out = String::new();
+    out.push_str(&render_table_row(&table.header, &widths, &table.alignments));
+    out.push_str(&render_table_separator(&widths, &table.alignments));
+    for row in &table.rows {
+        out.push_str(&render_table_row(row, &widths, &table.alignments));
+    }
+    out.push('\n');
+    out
+}
+
+fn render_table_row(row: &[String], widths: &[usize], alignments: &[Alignment]) -> String {
+    let mut out = String::from("|");
+    for (idx, width) in widths.iter().copied().enumerate() {
+        let cell = row.get(idx).map(String::as_str).unwrap_or("");
+        out.push(' ');
+        out.push_str(&pad_table_cell(
+            cell,
+            width,
+            alignments.get(idx).copied().unwrap_or(Alignment::None),
+        ));
+        out.push(' ');
+        out.push('|');
+    }
+    out.push('\n');
+    out
+}
+
+fn render_table_separator(widths: &[usize], alignments: &[Alignment]) -> String {
+    let mut out = String::from("|");
+    for (idx, width) in widths.iter().copied().enumerate() {
+        let width = width.max(3);
+        let segment = match alignments.get(idx).copied().unwrap_or(Alignment::None) {
+            Alignment::Left => format!(":{:-<width$}", "", width = width.saturating_sub(1)),
+            Alignment::Center => {
+                if width <= 2 {
+                    ":|".to_string()
+                } else {
+                    format!(":{:-<inner$}:", "", inner = width.saturating_sub(2))
+                }
+            }
+            Alignment::Right => format!("{:-<width$}:", "", width = width.saturating_sub(1)),
+            Alignment::None => format!("{:-<width$}", "", width = width),
+        };
+        out.push_str(&segment);
+        out.push('|');
+    }
+    out.push('\n');
+    out
+}
+
+fn pad_table_cell(cell: &str, width: usize, alignment: Alignment) -> String {
+    let visible = visible_text_width(cell);
+    let padding = width.saturating_sub(visible);
+    let (left, right) = match alignment {
+        Alignment::Right => (padding, 0),
+        Alignment::Center => (padding / 2, padding - (padding / 2)),
+        Alignment::Left | Alignment::None => (0, padding),
+    };
+    format!("{}{}{}", " ".repeat(left), cell, " ".repeat(right))
+}
+
+fn visible_text_width(text: &str) -> usize {
+    strip_ansi(text).chars().count()
 }
 
 fn heading_styles(level: HeadingLevel) -> &'static [MdStyle] {
@@ -1348,7 +1627,11 @@ mod tests {
         assert!(rendered.contains("• one"));
         assert!(rendered.contains("• two"));
         assert!(rendered.contains("| Name | Value |"));
-        assert!(rendered.contains("| a | b |"));
+        assert!(rendered.contains("---"));
+        assert!(rendered.lines().any(|line| line.starts_with('|')
+            && line.ends_with('|')
+            && line.contains('a')
+            && line.contains('b')));
     }
 
     #[test]
@@ -1569,6 +1852,7 @@ mod tests {
                 std::thread::sleep(Duration::from_millis(20));
                 renderer
                     .tool_start(
+                        None,
                         "bash",
                         &json!({
                             "title": "Stream demo",
@@ -1578,11 +1862,15 @@ mod tests {
                     )
                     .unwrap();
                 for idx in 1..=40 {
-                    renderer.bash_output(&format!("line{idx:02}\n")).unwrap();
+                    renderer
+                        .bash_output(None, "bash", &format!("line{idx:02}\n"))
+                        .unwrap();
                     std::thread::sleep(Duration::from_millis(5));
                 }
                 renderer
                     .tool_finished(
+                        None,
+                        "bash",
                         &ToolDisplay::Bash { exit_code: 0 },
                         Duration::from_millis(250),
                     )
