@@ -30,6 +30,7 @@ pub struct Renderer {
     stdout: io::Stdout,
     stderr: io::Stderr,
     stdout_at_line_start: bool,
+    trailing_newlines: usize,
     styled: bool,
     format: OutputFormat,
     markdown: MarkdownStream,
@@ -51,6 +52,7 @@ impl Renderer {
             stdout,
             stderr: io::stderr(),
             stdout_at_line_start: true,
+            trailing_newlines: 0,
             format,
             markdown: MarkdownStream::default(),
             live_line: None,
@@ -142,6 +144,7 @@ impl Renderer {
         );
         reasoning.committed = true;
         self.live_line = None;
+        self.ensure_blank_line_before_next_block()?;
         self.write_committed(&line)
     }
 
@@ -176,7 +179,11 @@ impl Renderer {
         if self.styled {
             self.reasoning_end(None)?;
         }
-        self.ensure_line_start()?;
+        if self.styled {
+            self.ensure_blank_line_before_next_block()?;
+        } else {
+            self.ensure_line_start()?;
+        }
         let title = args
             .get("title")
             .and_then(|value| value.as_str())
@@ -371,6 +378,19 @@ impl Renderer {
         self.write_stdout("\n")
     }
 
+    fn ensure_blank_line_before_next_block(&mut self) -> io::Result<()> {
+        self.clear_live_line()?;
+        let needed = if self.stdout_at_line_start {
+            2usize.saturating_sub(self.trailing_newlines)
+        } else {
+            2
+        };
+        if needed == 0 {
+            return Ok(());
+        }
+        self.write_stdout(&"\n".repeat(needed))
+    }
+
     fn render_live_line(&mut self) -> io::Result<()> {
         let Some(line) = self.format_live_line() else {
             return Ok(());
@@ -380,6 +400,8 @@ impl Renderer {
         }
         if self.live_line_rendered {
             self.stdout.write_all(b"\r\x1b[2K")?;
+        } else if matches!(self.live_line, Some(LiveLine::Thinking)) {
+            self.ensure_blank_line_before_next_block()?;
         } else if !self.stdout_at_line_start {
             self.write_stdout("\n")?;
         }
@@ -477,6 +499,7 @@ impl Renderer {
     fn write_stdout(&mut self, text: &str) -> io::Result<()> {
         self.stdout.write_all(text.as_bytes())?;
         self.stdout_at_line_start = text.ends_with('\n');
+        self.trailing_newlines = text.chars().rev().take_while(|ch| *ch == '\n').count();
         self.stdout.flush()
     }
 
@@ -816,6 +839,7 @@ fn format_bash_header(title: &str, script: &str, risk: Option<&str>, styled: boo
     let mut out = String::new();
     if !title.is_empty() {
         out.push_str(BOLD);
+        out.push_str("# ");
         out.push_str(title);
         out.push_str(RESET);
         out.push('\n');
@@ -858,7 +882,7 @@ fn format_duration(duration: Duration) -> String {
 
 fn format_thinking_live(elapsed: Duration, output_tokens: u64) -> String {
     format!(
-        "{GRAY}thinking {}  out ~{} tok{RESET}",
+        "{GRAY}[thought {}, ~{} tokens]{RESET}",
         format_duration(elapsed),
         output_tokens
     )
@@ -870,15 +894,10 @@ fn format_thought_line(
     usage: Option<(u64, u64)>,
 ) -> String {
     let elapsed = format_duration(elapsed);
-    match usage {
-        Some((prompt_tokens, completion_tokens)) => format!(
-            "{GRAY}thought {elapsed}  in {prompt_tokens} tok  out {completion_tokens} tok{RESET}\n"
-        ),
-        None => format!(
-            "{GRAY}thought {elapsed}  out ~{} tok{RESET}\n",
-            approx_tokens_from_chars(reasoning_chars)
-        ),
-    }
+    let tokens = usage
+        .map(|(_, completion_tokens)| completion_tokens.to_string())
+        .unwrap_or_else(|| format!("~{}", approx_tokens_from_chars(reasoning_chars)));
+    format!("{GRAY}[thought {elapsed}, {tokens} tokens]{RESET}\n\n")
 }
 
 fn format_omitted_line(omitted_lines: usize, omitted_bytes: usize) -> String {
@@ -932,6 +951,23 @@ fn compute_bash_preview_snapshot(text: &str, finalizing: bool) -> BashPreviewSna
         }
     }
 
+    while complete_lines
+        .first()
+        .is_some_and(|line| is_blank_output_line(line))
+    {
+        complete_lines.remove(0);
+    }
+
+    let trimmed_trailing = normalize_trailing_fragment(&trailing, finalizing);
+    if trimmed_trailing.is_empty() {
+        while complete_lines
+            .last()
+            .is_some_and(|line| is_blank_output_line(line))
+        {
+            complete_lines.pop();
+        }
+    }
+
     let mut head_rendered = String::new();
     let mut head_count = 0usize;
     let mut head_bytes = 0usize;
@@ -967,11 +1003,6 @@ fn compute_bash_preview_snapshot(text: &str, finalizing: bool) -> BashPreviewSna
         .sum::<usize>();
     let reserved_complete = &complete_lines[tail_start..];
 
-    let trimmed_trailing = if finalizing {
-        trim_final_tail_fragment(&trailing)
-    } else {
-        trailing.clone()
-    };
     let mut head_fragment_kept = 0usize;
     if finalizing && head_count == 0 && !trimmed_trailing.is_empty() {
         let preview = truncate_prefix(&trimmed_trailing, BASH_HEAD_LINE_CAP_BYTES, false);
@@ -1025,8 +1056,22 @@ fn trim_complete_terminal_line(line: &str) -> String {
     format!("{trimmed}\n")
 }
 
+fn normalize_trailing_fragment(fragment: &str, finalizing: bool) -> String {
+    if fragment.trim().is_empty() {
+        return String::new();
+    }
+    if finalizing {
+        return trim_final_tail_fragment(fragment);
+    }
+    fragment.to_string()
+}
+
 fn trim_final_tail_fragment(fragment: &str) -> String {
     fragment.trim_end().to_string()
+}
+
+fn is_blank_output_line(line: &str) -> bool {
+    line.trim().is_empty()
 }
 
 fn trim_to_last_bytes(text: &str, max_bytes: usize) -> String {
@@ -1250,13 +1295,13 @@ mod tests {
     #[test]
     fn thinking_live_line_is_gray_and_uses_approx_output_tokens() {
         let line = format_thinking_live(Duration::from_millis(1250), approx_tokens_from_chars(17));
-        assert_eq!(line, "\x1b[90mthinking 1.2s  out ~5 tok\x1b[0m");
+        assert_eq!(line, "\x1b[90m[thought 1.2s, ~5 tokens]\x1b[0m");
     }
 
     #[test]
     fn bash_header_renders_title_and_risk_colored_script_without_risk_label() {
         let header = format_bash_header("List files", "printf 'a'\npwd", Some("readonly"), true);
-        assert!(header.starts_with(&format!("{BOLD}List files{RESET}\n")));
+        assert!(header.starts_with(&format!("{BOLD}# List files{RESET}\n")));
         assert!(header.contains(&format!("{CYAN}$ printf 'a'…\n{RESET}")));
         assert!(!header.contains("  pwd\n"));
         assert!(!header.contains("[readonly]"));
@@ -1265,14 +1310,22 @@ mod tests {
     #[test]
     fn short_reasoning_trace_still_formats_a_thought_line() {
         let line = format_thought_line(Duration::from_millis(300), 3, None);
-        assert!(line.contains("thought 300ms"));
-        assert!(line.contains("out ~1 tok"));
+        assert_eq!(line, "\x1b[90m[thought 300ms, ~1 tokens]\x1b[0m\n\n");
     }
 
     #[test]
     fn short_bash_output_has_no_omitted_counter() {
         let snapshot = compute_bash_preview_snapshot("one\n two \nthree\n", true);
         assert_eq!(snapshot.head_rendered, "one\n two\nthree\n");
+        assert_eq!(snapshot.tail_rendered, "");
+        assert_eq!(snapshot.omitted_lines, 0);
+        assert_eq!(snapshot.omitted_bytes, 0);
+    }
+
+    #[test]
+    fn boundary_blank_lines_are_trimmed_from_bash_output() {
+        let snapshot = compute_bash_preview_snapshot("\n\t\none\n\n two\n \n", true);
+        assert_eq!(snapshot.head_rendered, "one\n\n two\n");
         assert_eq!(snapshot.tail_rendered, "");
         assert_eq!(snapshot.omitted_lines, 0);
         assert_eq!(snapshot.omitted_bytes, 0);
@@ -1331,8 +1384,9 @@ mod tests {
         assert!(raw.contains("\x1b[96m$\x1b[0m"));
         assert!(raw.matches("[… omitted").count() > 1);
         assert!(raw.contains("\x1b[90mline01"));
-        assert!(normalized.contains("thought"));
+        assert!(normalized.contains("[thought"));
         assert!(normalized.contains("Stream demo"));
+        assert!(normalized.contains("# Stream demo"));
         assert!(normalized.contains("$ i=1…"));
         assert!(!normalized.contains("  while [ $i -le 40 ]; do"));
         assert!(normalized.contains("[… omitted 35 lines, 245 bytes]"));
@@ -1342,6 +1396,8 @@ mod tests {
         assert!(normalized.contains("line40"));
         assert!(!normalized.contains("\n$\n"));
         assert!(!normalized.ends_with("\n\n"));
+        assert!(normalized.contains("\n\n[thought"));
+        assert!(normalized.contains("5 tokens]"));
     }
 
     #[test]
