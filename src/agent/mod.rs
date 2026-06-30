@@ -646,8 +646,13 @@ fn unknown_tool_result(name: &str) -> Result<ToolResult> {
     Err(anyhow::anyhow!(missing_tool_message(name)))
 }
 
-fn compute_cost(config: &Config, model: &str, prompt: u64, completion: u64) -> f64 {
-    let Some(model_cfg) = config.models.get(model) else {
+fn compute_cost(
+    config: &Config,
+    model: &crate::models::ResolvedModelRef,
+    prompt: u64,
+    completion: u64,
+) -> f64 {
+    let Some(model_cfg) = config.model_config(&model.provider_id, &model.model_id) else {
         return 0.0;
     };
     let Some(prices) = &model_cfg.price_per_mtok else {
@@ -762,13 +767,22 @@ mod tests {
 
     fn test_config() -> Config {
         Config {
-            provider: ProviderConfig {
-                base_url: "http://localhost".into(),
-                api_key_env: "MU_TEST_KEY".into(),
-            },
-            default_model: "fake-model".into(),
-            default_effort: None,
-            models: HashMap::new(),
+            providers: HashMap::from([(
+                "test".into(),
+                ProviderConfig {
+                    base_url: "http://localhost".into(),
+                    api_key_env: "MU_TEST_KEY".into(),
+                    models: HashMap::from([(
+                        "fake-model".into(),
+                        crate::config::ModelConfig {
+                            context_window: None,
+                            price_per_mtok: None,
+                            supported_efforts: None,
+                        },
+                    )]),
+                },
+            )]),
+            default_model: "test/fake-model".into(),
             compaction: CompactionConfig::default(),
             limits: LimitsConfig::default(),
             guardrail: GuardrailConfig::default(),
@@ -783,9 +797,10 @@ mod tests {
         std::fs::create_dir_all(&tmp).unwrap();
         let store = Store::open(&tmp.join("mu.db")).unwrap();
         let session = store
-            .create_session(&cwd.display().to_string(), "fake-model", None)
+            .create_session(&cwd.display().to_string(), "test/fake-model")
             .unwrap();
         let config = test_config();
+        let request_model = crate::models::resolve_model_ref(&config, "test/fake-model").unwrap();
         let provider = Arc::new(ToolThenStopProvider {
             step: Mutex::new(0),
             cwd: cwd.display().to_string(),
@@ -797,8 +812,7 @@ mod tests {
             store: &store,
             session_id: &session.id,
             request: RequestOptions {
-                model: "fake-model".into(),
-                effort: None,
+                model: request_model,
             },
             model_context_window: None,
             renderer: &mut renderer,

@@ -1,8 +1,11 @@
 pub mod openai;
+use std::sync::Arc;
+
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::config::Config;
 use crate::models::RequestOptions;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -139,4 +142,13 @@ pub trait Provider: Send + Sync {
 
 pub fn approx_tokens(s: &str) -> u64 {
     (s.len() as u64).div_ceil(4)
+}
+
+pub fn build_provider(config: &Config, provider_id: &str) -> anyhow::Result<Arc<dyn Provider>> {
+    let provider = config.provider(provider_id)?;
+    let api_key = config.api_key_for_provider(provider_id)?;
+    Ok(Arc::new(openai::OpenAiProvider::new(
+        provider.base_url.clone(),
+        api_key,
+    )) as Arc<dyn Provider>)
 }

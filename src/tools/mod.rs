@@ -177,13 +177,15 @@ mod tests {
 
     fn test_config() -> Config {
         Config {
-            provider: ProviderConfig {
-                base_url: "http://localhost".into(),
-                api_key_env: "MU_TEST_KEY".into(),
-            },
-            default_model: "test-model".into(),
-            default_effort: None,
-            models: HashMap::new(),
+            providers: HashMap::from([(
+                "test".into(),
+                ProviderConfig {
+                    base_url: "http://localhost".into(),
+                    api_key_env: "MU_TEST_KEY".into(),
+                    models: HashMap::new(),
+                },
+            )]),
+            default_model: "test/test-model".into(),
             compaction: CompactionConfig::default(),
             limits: LimitsConfig::default(),
             guardrail: crate::config::GuardrailConfig::default(),

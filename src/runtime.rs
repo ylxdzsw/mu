@@ -4,8 +4,8 @@ use std::process::Command;
 
 use crate::config::Config;
 use crate::models::{
-    EffortLevel, ModelCatalog, ModelMetadataSource, RequestOptions, ResolvedModelInfo,
-    SupportedEffortSource, validate_effort_support,
+    AvailableModelsPayload, RequestOptions, ResolvedModelInfo, ResolvedModelRef, available_models,
+    resolve_model_info, resolve_model_ref,
 };
 use crate::store::{Session, Store};
 
@@ -14,7 +14,6 @@ pub struct InvocationOverrides {
     pub session: Option<String>,
     pub continue_latest: bool,
     pub model: Option<String>,
-    pub effort: Option<EffortLevel>,
 }
 
 #[derive(Debug, Clone)]
@@ -25,22 +24,28 @@ pub struct ResolvedInvocation {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct StatusModel {
+    pub provider_id: String,
+    pub model_id: String,
+    pub effort: Option<crate::models::EffortLevel>,
+    pub canonical: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct StatusReport {
     pub model_id: String,
-    pub effort: Option<EffortLevel>,
+    pub model: StatusModel,
     pub session_id: Option<String>,
     pub context_percent: Option<f64>,
     pub project_root: Option<String>,
     pub context_window: Option<u64>,
-    pub max_output_tokens: Option<u64>,
-    pub reasoning: Option<bool>,
-    pub model_metadata_source: ModelMetadataSource,
-    pub supported_effort_levels_source: SupportedEffortSource,
-    pub supported_effort_levels: Vec<EffortLevel>,
+    pub supported_effort_levels: Vec<crate::models::EffortLevel>,
     pub git: Option<GitStatus>,
     pub session: Option<StatusSession>,
     pub active: StatusActiveTurn,
     pub compaction: Option<CompactionStatus>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub available_models: Option<AvailableModelsPayload>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -98,51 +103,38 @@ pub fn resolve_invocation(
     };
 
     if let Some(session) = attached_session.clone() {
+        let request_ref = overrides.model.as_deref().unwrap_or(&session.model);
         return Ok(ResolvedInvocation {
             attached_session: Some(session.clone()),
             request: RequestOptions {
-                model: overrides.model.clone().unwrap_or(session.model.clone()),
-                effort: overrides
-                    .effort
-                    .or(session.effort)
-                    .or(config.default_effort),
+                model: resolve_model_ref(config, request_ref)?,
             },
             session_seed: RequestOptions {
-                model: session.model,
-                effort: session.effort.or(config.default_effort),
+                model: resolve_model_ref(config, &session.model)?,
             },
         });
     }
 
-    let has_explicit_overrides = overrides.model.is_some() || overrides.effort.is_some();
-    let latest_scope_session = if has_explicit_overrides {
-        None
-    } else {
-        store.latest_session()?
-    };
-    let session_seed = if let Some(session) = latest_scope_session {
-        RequestOptions {
-            model: session.model,
-            effort: session.effort,
-        }
-    } else {
-        RequestOptions {
-            model: config.default_model.clone(),
-            effort: config.default_effort,
-        }
-    };
-    let request = RequestOptions {
-        model: overrides
-            .model
-            .clone()
-            .unwrap_or_else(|| session_seed.model.clone()),
-        effort: overrides.effort.or(session_seed.effort),
-    };
+    let latest_scope_session = store.latest_session()?;
+    let seed_ref = overrides
+        .model
+        .as_deref()
+        .or_else(|| {
+            latest_scope_session
+                .as_ref()
+                .map(|session| session.model.as_str())
+        })
+        .unwrap_or(config.default_model.as_str());
+    let request_ref = overrides.model.as_deref().unwrap_or(seed_ref);
 
     Ok(ResolvedInvocation {
         attached_session: None,
-        request,
-        session_seed,
+        request: RequestOptions {
+            model: resolve_model_ref(config, request_ref)?,
+        },
+        session_seed: RequestOptions {
+            model: resolve_model_ref(config, seed_ref)?,
+        },
     })
 }
 
@@ -150,16 +142,11 @@ pub fn build_status_report(
     store: &Store,
     config: &Config,
     overrides: &InvocationOverrides,
-    catalog: Option<&ModelCatalog>,
     project: Option<&crate::paths::Project>,
+    include_models: bool,
 ) -> Result<StatusReport> {
     let resolved = resolve_invocation(store, config, overrides)?;
-    let model_info = crate::models::resolve_model_info(config, catalog, &resolved.request.model);
-    validate_effort_support(
-        &resolved.request.model,
-        resolved.request.effort.as_ref(),
-        &model_info,
-    )?;
+    let model_info = resolve_model_info(config, &resolved.request.model);
     let session_summary = resolved
         .attached_session
         .as_ref()
@@ -179,10 +166,11 @@ pub fn build_status_report(
                 .map(|latest_summary_seq| CompactionStatus { latest_summary_seq })
         })
         .transpose()?;
+    let model = status_model(&resolved.request.model);
 
     Ok(StatusReport {
-        model_id: resolved.request.model.clone(),
-        effort: resolved.request.effort,
+        model_id: model.canonical.clone(),
+        model,
         session_id: resolved
             .attached_session
             .as_ref()
@@ -190,16 +178,22 @@ pub fn build_status_report(
         context_percent: context_percent(store, resolved.attached_session.as_ref(), &model_info),
         project_root: project.map(|project| project.root.display().to_string()),
         context_window: model_info.context_window,
-        max_output_tokens: model_info.max_output_tokens,
-        reasoning: model_info.reasoning,
-        model_metadata_source: model_info.metadata_source,
-        supported_effort_levels_source: model_info.supported_effort_source,
         supported_effort_levels: model_info.supported_effort_levels,
         git: project.map(git_status),
         session: session_summary.map(status_session),
         active: StatusActiveTurn { busy: active },
         compaction,
+        available_models: include_models.then(|| available_models(config)),
     })
+}
+
+fn status_model(model: &ResolvedModelRef) -> StatusModel {
+    StatusModel {
+        provider_id: model.provider_id.clone(),
+        model_id: model.model_id.clone(),
+        effort: model.effort,
+        canonical: model.canonical.clone(),
+    }
 }
 
 fn context_percent(
@@ -240,456 +234,155 @@ fn git_status(project: &crate::paths::Project) -> GitStatus {
         git_dir: project
             .worktree
             .as_ref()
-            .map(|worktree| worktree.git_dir.display().to_string()),
+            .map(|info| info.git_dir.display().to_string()),
         common_dir: project
             .worktree
             .as_ref()
-            .and_then(|worktree| worktree.common_dir.as_ref())
+            .and_then(|info| info.common_dir.as_ref())
             .map(|path| path.display().to_string()),
     }
 }
 
-fn git_branch(root: &std::path::Path) -> Option<String> {
-    let branch = git_output(root, &["branch", "--show-current"])?;
-    if !branch.is_empty() {
-        return Some(branch);
-    }
-    git_output(root, &["rev-parse", "--short", "HEAD"]).filter(|value| !value.is_empty())
-}
-
-fn git_dirty(root: &std::path::Path) -> Option<bool> {
-    git_output(root, &["status", "--porcelain=v1"]).map(|output| !output.is_empty())
-}
-
-fn git_output(root: &std::path::Path, args: &[&str]) -> Option<String> {
+fn git_branch(project_root: &std::path::Path) -> Option<String> {
     let output = Command::new("git")
-        .arg("-C")
-        .arg(root)
-        .args(args)
+        .arg("branch")
+        .arg("--show-current")
+        .current_dir(project_root)
         .output()
         .ok()?;
     if !output.status.success() {
         return None;
     }
-    Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    let branch = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    (!branch.is_empty()).then_some(branch)
+}
+
+fn git_dirty(project_root: &std::path::Path) -> Option<bool> {
+    let output = Command::new("git")
+        .arg("status")
+        .arg("--porcelain")
+        .current_dir(project_root)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    Some(!output.stdout.is_empty())
 }
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
     use std::collections::HashMap;
 
-    use super::*;
     use crate::config::{
         CompactionConfig, Config, GuardrailConfig, LimitsConfig, ModelConfig, ProviderConfig,
-        RedactionConfig,
+        RedactionConfig, TerminalBellConfig,
     };
-    use crate::models::{
-        CachedMetadataSource, CachedMetadataSourceKind, CachedModel, CachedProviderInfo,
-        EffortLevelsSource,
-    };
-    use crate::paths::{Project, ProjectMarker};
+    use crate::models::EffortLevel;
 
-    fn temp_store() -> (Store, std::path::PathBuf) {
-        let tmp = std::env::temp_dir().join(format!("mu-runtime-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&tmp).unwrap();
-        (Store::open(&tmp.join("mu.db")).unwrap(), tmp)
-    }
+    use super::*;
 
     fn test_config() -> Config {
         Config {
-            provider: ProviderConfig {
-                base_url: "https://example.test/v1".into(),
-                api_key_env: "MU_TEST_KEY".into(),
-            },
-            default_model: "default-model".into(),
-            default_effort: None,
-            models: HashMap::from([(
-                "default-model".into(),
-                ModelConfig {
-                    context_window: Some(100),
-                    price_per_mtok: None,
+            providers: HashMap::from([(
+                "alpha".into(),
+                ProviderConfig {
+                    base_url: "http://localhost".into(),
+                    api_key_env: "MU_TEST_KEY".into(),
+                    models: HashMap::from([(
+                        "default-model".into(),
+                        ModelConfig {
+                            context_window: Some(100),
+                            price_per_mtok: None,
+                            supported_efforts: Some(vec![EffortLevel::Low, EffortLevel::High]),
+                        },
+                    )]),
                 },
             )]),
+            default_model: "alpha/default-model:low".into(),
             compaction: CompactionConfig::default(),
             limits: LimitsConfig::default(),
             guardrail: GuardrailConfig::default(),
-            terminal_bell: crate::config::TerminalBellConfig::default(),
+            terminal_bell: TerminalBellConfig::default(),
             redaction: RedactionConfig::default(),
             env: HashMap::new(),
         }
     }
 
-    fn cached_model(
-        id: &str,
-        reasoning: Option<bool>,
-        levels: Vec<EffortLevel>,
-        levels_source: EffortLevelsSource,
-    ) -> CachedModel {
-        CachedModel {
-            id: id.into(),
-            display_name: id.into(),
-            context_window: Some(100),
-            max_output_tokens: None,
-            reasoning,
-            reasoning_effort_levels: Some(levels),
-            reasoning_effort_levels_source: levels_source,
-            metadata_source: CachedMetadataSource {
-                kind: CachedMetadataSourceKind::ProviderModelsEndpoint,
-                provider_id: None,
-                api_url: None,
-            },
-        }
-    }
-
-    fn catalog(models: impl IntoIterator<Item = (String, CachedModel)>) -> ModelCatalog {
-        ModelCatalog {
-            version: 1,
-            fetched_at: "2026-06-26T00:00:00Z".into(),
-            provider: CachedProviderInfo {
-                base_url: "https://example.test/v1".into(),
-            },
-            models: BTreeMap::from_iter(models),
-        }
-    }
-
     #[test]
-    fn explicit_flags_override_session_and_scope() {
-        let (store, tmp) = temp_store();
-        let config = test_config();
-        let latest = store
-            .create_session("/tmp", "scope-model", Some(EffortLevel::High))
-            .unwrap();
-        store
-            .update_session(
-                &latest.id,
-                0,
-                0.0,
-                None,
-                "scope-model",
-                Some(EffortLevel::High),
+    fn attached_session_reuses_last_model() {
+        let store = Store::open_memory().unwrap();
+        let session = store
+            .create_session_with_origin(
+                "/tmp",
+                "alpha/default-model:high",
+                crate::store::SessionOrigin::Cli,
             )
             .unwrap();
-        let attached = store
-            .create_session("/tmp", "session-model", Some(EffortLevel::Low))
-            .unwrap();
-
         let resolved = resolve_invocation(
             &store,
-            &config,
+            &test_config(),
             &InvocationOverrides {
-                session: Some(attached.id.clone()),
+                session: Some(session.id.clone()),
                 continue_latest: false,
-                model: Some("flag-model".into()),
-                effort: Some(EffortLevel::Max),
+                model: None,
             },
         )
         .unwrap();
 
-        assert_eq!(resolved.request.model, "flag-model");
-        assert_eq!(resolved.request.effort, Some(EffortLevel::Max));
-        let _ = std::fs::remove_dir_all(tmp);
+        assert_eq!(resolved.request.model.canonical, "alpha/default-model:high");
+        assert_eq!(
+            resolved.session_seed.model.canonical,
+            "alpha/default-model:high"
+        );
     }
 
     #[test]
-    fn attached_session_reuses_last_model_and_effort() {
-        let (store, tmp) = temp_store();
-        let config = test_config();
-        let session = store
-            .create_session("/tmp", "session-model", Some(EffortLevel::Medium))
-            .unwrap();
-
-        let resolved = resolve_invocation(
-            &store,
-            &config,
-            &InvocationOverrides {
-                session: Some(session.id.clone()),
-                ..Default::default()
-            },
-        )
-        .unwrap();
-
-        assert_eq!(resolved.request.model, "session-model");
-        assert_eq!(resolved.request.effort, Some(EffortLevel::Medium));
-        assert!(resolved.attached_session.is_some());
-        let _ = std::fs::remove_dir_all(tmp);
-    }
-
-    #[test]
-    fn new_session_inherits_from_latest_scope_when_no_flags_are_set() {
-        let (store, tmp) = temp_store();
-        let config = test_config();
-        let latest = store
-            .create_session("/tmp", "scope-model", Some(EffortLevel::High))
-            .unwrap();
-
-        let resolved =
-            resolve_invocation(&store, &config, &InvocationOverrides::default()).unwrap();
-
-        assert_eq!(resolved.request.model, latest.model);
-        assert_eq!(resolved.request.effort, latest.effort);
-        assert_eq!(resolved.session_seed.model, latest.model);
-        assert!(resolved.attached_session.is_none());
-        let _ = std::fs::remove_dir_all(tmp);
-    }
-
-    #[test]
-    fn explicit_new_session_flags_fall_back_to_default_seed_and_unset_effort() {
-        let (store, tmp) = temp_store();
-        let config = test_config();
+    fn explicit_model_override_seeds_new_session_with_override() {
+        let store = Store::open_memory().unwrap();
         store
-            .create_session("/tmp", "scope-model", Some(EffortLevel::High))
-            .unwrap();
-
-        let resolved = resolve_invocation(
-            &store,
-            &config,
-            &InvocationOverrides {
-                model: Some("flag-model".into()),
-                ..Default::default()
-            },
-        )
-        .unwrap();
-
-        assert_eq!(resolved.request.model, "flag-model");
-        assert_eq!(resolved.request.effort, None);
-        assert_eq!(resolved.session_seed.model, "default-model");
-        assert_eq!(resolved.session_seed.effort, None);
-        let _ = std::fs::remove_dir_all(tmp);
-    }
-
-    #[test]
-    fn new_session_uses_config_default_effort_without_flags() {
-        let (store, tmp) = temp_store();
-        let mut config = test_config();
-        config.default_effort = Some(EffortLevel::High);
-
-        let resolved =
-            resolve_invocation(&store, &config, &InvocationOverrides::default()).unwrap();
-
-        assert_eq!(resolved.request.model, "default-model");
-        assert_eq!(resolved.request.effort, Some(EffortLevel::High));
-        assert_eq!(resolved.session_seed.effort, Some(EffortLevel::High));
-        let _ = std::fs::remove_dir_all(tmp);
-    }
-
-    #[test]
-    fn model_override_without_effort_uses_config_default_effort() {
-        let (store, tmp) = temp_store();
-        let mut config = test_config();
-        config.default_effort = Some(EffortLevel::Medium);
-        store
-            .create_session("/tmp", "scope-model", Some(EffortLevel::High))
-            .unwrap();
-
-        let resolved = resolve_invocation(
-            &store,
-            &config,
-            &InvocationOverrides {
-                model: Some("flag-model".into()),
-                ..Default::default()
-            },
-        )
-        .unwrap();
-
-        assert_eq!(resolved.request.model, "flag-model");
-        assert_eq!(resolved.request.effort, Some(EffortLevel::Medium));
-        assert_eq!(resolved.session_seed.model, "default-model");
-        assert_eq!(resolved.session_seed.effort, Some(EffortLevel::Medium));
-        let _ = std::fs::remove_dir_all(tmp);
-    }
-
-    #[test]
-    fn stored_session_effort_overrides_config_default_effort() {
-        let (store, tmp) = temp_store();
-        let mut config = test_config();
-        config.default_effort = Some(EffortLevel::High);
-        let session = store
-            .create_session("/tmp", "session-model", Some(EffortLevel::Low))
-            .unwrap();
-
-        let resolved = resolve_invocation(
-            &store,
-            &config,
-            &InvocationOverrides {
-                session: Some(session.id.clone()),
-                ..Default::default()
-            },
-        )
-        .unwrap();
-
-        assert_eq!(resolved.request.effort, Some(EffortLevel::Low));
-        assert_eq!(resolved.session_seed.effort, Some(EffortLevel::Low));
-        let _ = std::fs::remove_dir_all(tmp);
-    }
-
-    #[test]
-    fn explicit_effort_overrides_config_default_effort() {
-        let (store, tmp) = temp_store();
-        let mut config = test_config();
-        config.default_effort = Some(EffortLevel::Low);
-
-        let resolved = resolve_invocation(
-            &store,
-            &config,
-            &InvocationOverrides {
-                effort: Some(EffortLevel::Max),
-                ..Default::default()
-            },
-        )
-        .unwrap();
-
-        assert_eq!(resolved.request.effort, Some(EffortLevel::Max));
-        assert_eq!(resolved.session_seed.effort, Some(EffortLevel::Low));
-        let _ = std::fs::remove_dir_all(tmp);
-    }
-
-    #[test]
-    fn status_is_valid_without_a_session() {
-        let (store, tmp) = temp_store();
-        let mut config = test_config();
-        config.default_effort = Some(EffortLevel::Medium);
-
-        let status =
-            build_status_report(&store, &config, &InvocationOverrides::default(), None, None)
-                .unwrap();
-
-        assert_eq!(status.model_id, "default-model");
-        assert_eq!(status.effort, Some(EffortLevel::Medium));
-        assert!(status.session_id.is_none());
-        assert!(status.context_percent.is_none());
-        assert!(status.project_root.is_none());
-        let _ = std::fs::remove_dir_all(tmp);
-    }
-
-    #[test]
-    fn status_reports_context_percent_for_existing_session() {
-        let (store, tmp) = temp_store();
-        let config = test_config();
-        let session = store
-            .create_session("/tmp", "default-model", Some(EffortLevel::Low))
-            .unwrap();
-        store
-            .update_session(
-                &session.id,
-                25,
-                0.0,
-                None,
-                "default-model",
-                Some(EffortLevel::Low),
+            .create_session_with_origin(
+                "/tmp",
+                "alpha/default-model:high",
+                crate::store::SessionOrigin::Cli,
             )
             .unwrap();
 
-        let status = build_status_report(
+        let resolved = resolve_invocation(
             &store,
-            &config,
+            &test_config(),
             &InvocationOverrides {
-                session: Some(session.id.clone()),
-                ..Default::default()
+                session: None,
+                continue_latest: false,
+                model: Some("alpha/default-model:low".into()),
             },
-            None,
-            Some(&Project {
-                root: std::path::PathBuf::from("/tmp/project"),
-                marker: ProjectMarker::Git,
-                worktree: None,
-            }),
         )
         .unwrap();
 
-        assert_eq!(status.context_percent, Some(25.0));
-        assert_eq!(status.project_root.as_deref(), Some("/tmp/project"));
-        let _ = std::fs::remove_dir_all(tmp);
+        assert_eq!(resolved.request.model.canonical, "alpha/default-model:low");
+        assert_eq!(
+            resolved.session_seed.model.canonical,
+            "alpha/default-model:low"
+        );
     }
 
     #[test]
-    fn explicit_effort_is_rejected_for_known_non_reasoning_models() {
-        let (store, tmp) = temp_store();
-        let config = test_config();
-        let catalog = catalog([(
-            "text-only".into(),
-            cached_model(
-                "text-only",
-                Some(false),
-                vec![],
-                EffortLevelsSource::Inferred,
-            ),
-        )]);
-
-        let err = build_status_report(
+    fn status_report_can_include_available_models() {
+        let store = Store::open_memory().unwrap();
+        let report = build_status_report(
             &store,
-            &config,
-            &InvocationOverrides {
-                model: Some("text-only".into()),
-                effort: Some(EffortLevel::Low),
-                ..Default::default()
-            },
-            Some(&catalog),
+            &test_config(),
+            &InvocationOverrides::default(),
             None,
-        )
-        .unwrap_err();
-
-        assert!(err.to_string().contains("non-reasoning"));
-        let _ = std::fs::remove_dir_all(tmp);
-    }
-
-    #[test]
-    fn explicit_effort_is_rejected_when_cached_levels_exclude_it() {
-        let (store, tmp) = temp_store();
-        let config = test_config();
-        let catalog = catalog([(
-            "reasoner".into(),
-            cached_model(
-                "reasoner",
-                Some(true),
-                vec![EffortLevel::Medium, EffortLevel::High],
-                EffortLevelsSource::Explicit,
-            ),
-        )]);
-
-        let err = build_status_report(
-            &store,
-            &config,
-            &InvocationOverrides {
-                model: Some("reasoner".into()),
-                effort: Some(EffortLevel::Low),
-                ..Default::default()
-            },
-            Some(&catalog),
-            None,
-        )
-        .unwrap_err();
-
-        assert!(err.to_string().contains("supported levels: medium, high"));
-        let _ = std::fs::remove_dir_all(tmp);
-    }
-
-    #[test]
-    fn inferred_support_accepts_effort_when_metadata_is_missing() {
-        let (store, tmp) = temp_store();
-        let config = test_config();
-
-        let status = build_status_report(
-            &store,
-            &config,
-            &InvocationOverrides {
-                model: Some("custom-model".into()),
-                effort: Some(EffortLevel::Max),
-                ..Default::default()
-            },
-            None,
-            None,
+            true,
         )
         .unwrap();
 
-        assert_eq!(status.effort, Some(EffortLevel::Max));
+        assert_eq!(report.model_id, "alpha/default-model:low");
+        assert!(report.available_models.is_some());
         assert_eq!(
-            status.model_metadata_source,
-            ModelMetadataSource::FallbackInference
+            report.supported_effort_levels,
+            vec![EffortLevel::Low, EffortLevel::High]
         );
-        assert_eq!(
-            status.supported_effort_levels,
-            EffortLevel::canonical().to_vec()
-        );
-        let _ = std::fs::remove_dir_all(tmp);
     }
 }

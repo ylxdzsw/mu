@@ -1,0 +1,113 @@
+.conversation-body {
+  flex: 1;
+  min-height: 0;
+  padding: 24px 16px 0;
+  overflow: auto;
+}
+
+.conversation-empty {
+  max-width: 720px;
+  margin: 0 auto;
+  min-height: 100%;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  gap: 12px;
+  padding-bottom: 120px;
+}
+
+.conversation-kicker {
+  margin: 0;
+  color: var(--v2-text-text-faint);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.conversation-title {
+  margin: 0;
+  color: var(--v2-text-text-base);
+  font-size: clamp(24px, 6vw, 36px);
+  line-height: 1.05;
+  font-weight: 560;
+  letter-spacing: -0.04em;
+}
+
+.conversation-copy,
+.conversation-project {
+  margin: 0;
+  color: var(--v2-text-text-faint);
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.conversation-thread {
+  width: min(100%, 960px);
+  margin: 0 auto;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding-bottom: 120px;
+}
+
+.conversation-status {
+  margin: 0;
+  color: var(--v2-text-text-faint);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.conversation-card {
+  border: 1px solid var(--v2-border-border-weaker-base);
+  border-radius: 12px;
+  background: var(--v2-background-bg-layer-01);
+  overflow: hidden;
+}
+
+.conversation-card[data-kind="live"] {
+  border-color: var(--v2-border-border-muted);
+  background: #fcfcfc;
+}
+
+.conversation-card-header {
+  padding: 10px 12px 0;
+  color: var(--v2-text-text-faint);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.conversation-card-body {
+  margin: 0;
+  padding: 10px 12px 12px;
+  color: var(--v2-text-text-base);
+  font-size: 12px;
+  line-height: 1.55;
+  white-space: pre-wrap;
+  word-break: break-word;
+  overflow-wrap: anywhere;
+}
+
+.conversation-card-body[data-mono="true"] {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+  font-size: 11px;
+  background: rgba(0, 0, 0, 0.02);
+}
+
+.conversation-error {
+  color: #8f3434;
+  background: #fff4f4;
+  border-color: rgba(143, 52, 52, 0.18);
+}
+
+@media (max-width: 640px) {
+  .conversation-body {
+    padding: 20px 12px 0;
+  }
+
+  .conversation-empty {
+    padding-bottom: 136px;
+  }
+}

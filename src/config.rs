@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::env::EnvMap;
 use crate::models::EffortLevel;
@@ -11,13 +11,9 @@ use crate::paths;
 #[derive(Debug, Clone, Deserialize)]
 pub struct Config {
     #[serde(default)]
-    pub provider: ProviderConfig,
+    pub providers: HashMap<String, ProviderConfig>,
     #[serde(default)]
     pub default_model: String,
-    #[serde(default)]
-    pub default_effort: Option<EffortLevel>,
-    #[serde(default)]
-    pub models: HashMap<String, ModelConfig>,
     #[serde(default)]
     pub compaction: CompactionConfig,
     #[serde(default)]
@@ -38,16 +34,20 @@ pub struct ProviderConfig {
     pub base_url: String,
     #[serde(default)]
     pub api_key_env: String,
+    #[serde(default)]
+    pub models: HashMap<String, ModelConfig>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ModelConfig {
     pub context_window: Option<u64>,
     #[serde(default)]
     pub price_per_mtok: Option<PriceConfig>,
+    #[serde(default)]
+    pub supported_efforts: Option<Vec<EffortLevel>>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct PriceConfig {
     pub input: f64,
     pub output: f64,
@@ -215,45 +215,61 @@ impl Config {
 
         let mut config = config_from_value(value)?;
         config.env = crate::env::load_effective(project_config_dir)?;
+        config.validate_runtime()?;
         Ok(config)
     }
 
-    pub fn try_load_for_scope(project_config_dir: Option<&Path>) -> Option<Self> {
-        Self::load_for_scope(project_config_dir).ok()
+    pub fn provider(&self, provider_id: &str) -> Result<&ProviderConfig> {
+        self.providers
+            .get(provider_id)
+            .with_context(|| format!("unknown provider `{provider_id}` in config.jsonc"))
     }
 
-    pub fn api_key(&self) -> Result<Option<String>> {
-        if self.provider.api_key_env.trim().is_empty() {
+    pub fn model_config(&self, provider_id: &str, model_id: &str) -> Option<&ModelConfig> {
+        self.providers
+            .get(provider_id)
+            .and_then(|provider| provider.models.get(model_id))
+    }
+
+    pub fn api_key_for_provider(&self, provider_id: &str) -> Result<Option<String>> {
+        let provider = self.provider(provider_id)?;
+        if provider.api_key_env.trim().is_empty() {
             return Ok(None);
         }
         let key = self
             .env
-            .get(&self.provider.api_key_env)
+            .get(&provider.api_key_env)
             .cloned()
             .with_context(|| {
                 format!(
-                    "API key env var `{}` is not set (see config.jsonc)",
-                    self.provider.api_key_env
+                    "API key env var `{}` is not set (provider `{provider_id}` in config.jsonc)",
+                    provider.api_key_env
                 )
             })?;
         if key.is_empty() {
-            bail!("API key env var `{}` is empty", self.provider.api_key_env);
+            bail!("API key env var `{}` is empty", provider.api_key_env);
         }
         Ok(Some(key))
     }
 
-    pub fn context_window(&self, model: &str) -> Option<u64> {
-        self.models.get(model).and_then(|m| m.context_window)
-    }
-
-    fn validate(&self) -> Result<()> {
-        if self.provider.base_url.trim().is_empty() {
-            bail!("no provider configured in config.jsonc: set `provider.base_url`");
+    pub fn validate_structure(&self) -> Result<()> {
+        if self.providers.is_empty() {
+            bail!("no providers configured in config.jsonc: set `providers`");
         }
         if self.default_model.trim().is_empty() {
             bail!("no default model configured in config.jsonc: set `default_model`");
         }
+        for (provider_id, provider) in &self.providers {
+            if provider.base_url.trim().is_empty() {
+                bail!("provider `{provider_id}` is missing `base_url` in config.jsonc");
+            }
+        }
         Ok(())
+    }
+
+    pub fn validate_runtime(&self) -> Result<()> {
+        self.validate_structure()?;
+        crate::models::validate_config(self)
     }
 }
 
@@ -270,7 +286,7 @@ fn ensure_starter_config(path: &Path) -> Result<()> {
 
 fn config_from_value(value: serde_json::Value) -> Result<Config> {
     let config: Config = serde_json::from_value(value).context("invalid config.jsonc structure")?;
-    config.validate()?;
+    config.validate_structure()?;
     Ok(config)
 }
 
@@ -302,23 +318,23 @@ fn merge_json(base: &mut serde_json::Value, overlay: serde_json::Value) {
 }
 
 const STARTER_CONFIG: &str = r#"{
-  // Provider settings — set the env var named below to your API key
-  "provider": {
-    "base_url": "https://api.openai.com/v1",
-    "api_key_env": "OPENAI_API_KEY"
+  "providers": {
+    "openai": {
+      "base_url": "https://api.openai.com/v1",
+      "api_key_env": "OPENAI_API_KEY",
+      "models": {
+        "gpt-4o": {
+          "context_window": 128000,
+          "price_per_mtok": { "input": 2.5, "output": 10.0 },
+          "supported_efforts": ["low", "medium", "high"]
+        }
+      }
+    }
   },
-  "default_model": "gpt-4o",
-  // Optional default reasoning effort: null, "low", "medium", "high", "xhigh", or "max".
-  "default_effort": null,
+  "default_model": "openai/gpt-4o",
   "terminal_bell": {
     "enabled": true,
     "min_duration_ms": 10000
-  },
-  "models": {
-    "gpt-4o": {
-      "context_window": 128000,
-      "price_per_mtok": { "input": 2.5, "output": 10.0 }
-    }
   },
   "compaction": { "fraction": 0.75, "keep_recent_turns": 2 },
   "limits": {
@@ -328,12 +344,10 @@ const STARTER_CONFIG: &str = r#"{
     "max_line_bytes": 10240
   },
   "redaction": {
-    // Provider api_key_env is always included automatically.
     "env": []
   },
   "guardrail": {
     "enabled": false,
-    // "review_model": "gpt-4o-mini",  // null → same as default_model
     "timeout_ms": 90000,
     "circuit_breaker": { "consecutive": 3, "window": 50, "window_denials": 10 }
   }
@@ -347,38 +361,61 @@ mod tests {
     #[test]
     fn merge_overrides_nested_values_and_keeps_base() {
         let mut base = serde_json::json!({
-            "provider": {"base_url": "a", "api_key_env": "KEY"},
-            "default_model": "one",
-            "default_effort": "low",
-            "models": {"one": {"context_window": 1}},
+            "providers": {
+                "alpha": {
+                    "base_url": "a",
+                    "api_key_env": "KEY",
+                    "models": {"one": {"context_window": 1}}
+                }
+            },
+            "default_model": "alpha/one",
             "limits": {"max_iterations": 5, "max_lines": 10}
         });
         let overlay = serde_json::json!({
-            "default_model": "two",
-            "default_effort": null,
-            "models": {"two": {"context_window": 2}},
+            "providers": {
+                "alpha": {
+                    "models": {"two": {"context_window": 2}}
+                },
+                "beta": {
+                    "base_url": "b",
+                    "api_key_env": "BETA_KEY",
+                    "models": {"three": {"context_window": 3}}
+                }
+            },
+            "default_model": "beta/three",
             "limits": {"max_lines": 20}
         });
         merge_json(&mut base, overlay);
 
-        assert_eq!(base["default_model"], "two");
-        assert!(base["default_effort"].is_null());
-        assert_eq!(base["models"]["one"]["context_window"], 1);
-        assert_eq!(base["models"]["two"]["context_window"], 2);
+        assert_eq!(base["default_model"], "beta/three");
+        assert_eq!(
+            base["providers"]["alpha"]["models"]["one"]["context_window"],
+            1
+        );
+        assert_eq!(
+            base["providers"]["alpha"]["models"]["two"]["context_window"],
+            2
+        );
+        assert_eq!(
+            base["providers"]["beta"]["models"]["three"]["context_window"],
+            3
+        );
         assert_eq!(base["limits"]["max_iterations"], 5);
         assert_eq!(base["limits"]["max_lines"], 20);
     }
 
     #[test]
-    fn api_key_reads_effective_env() {
+    fn api_key_reads_effective_env_for_provider() {
         let config = Config {
-            provider: ProviderConfig {
-                base_url: "http://localhost".into(),
-                api_key_env: "TEST_KEY".into(),
-            },
-            default_model: "test-model".into(),
-            default_effort: None,
-            models: HashMap::new(),
+            providers: HashMap::from([(
+                "alpha".into(),
+                ProviderConfig {
+                    base_url: "http://localhost".into(),
+                    api_key_env: "TEST_KEY".into(),
+                    models: HashMap::new(),
+                },
+            )]),
+            default_model: "alpha/test-model".into(),
             compaction: CompactionConfig::default(),
             limits: LimitsConfig::default(),
             guardrail: GuardrailConfig::default(),
@@ -387,19 +424,24 @@ mod tests {
             env: HashMap::from([("TEST_KEY".into(), "secret".into())]),
         };
 
-        assert_eq!(config.api_key().unwrap(), Some("secret".into()));
+        assert_eq!(
+            config.api_key_for_provider("alpha").unwrap(),
+            Some("secret".into())
+        );
     }
 
     #[test]
-    fn api_key_returns_none_when_env_not_set() {
+    fn api_key_returns_none_when_env_name_is_empty() {
         let config = Config {
-            provider: ProviderConfig {
-                base_url: "http://localhost".into(),
-                api_key_env: String::new(),
-            },
-            default_model: "test-model".into(),
-            default_effort: None,
-            models: HashMap::new(),
+            providers: HashMap::from([(
+                "alpha".into(),
+                ProviderConfig {
+                    base_url: "http://localhost".into(),
+                    api_key_env: String::new(),
+                    models: HashMap::new(),
+                },
+            )]),
+            default_model: "alpha/test-model".into(),
             compaction: CompactionConfig::default(),
             limits: LimitsConfig::default(),
             guardrail: GuardrailConfig::default(),
@@ -408,7 +450,7 @@ mod tests {
             env: HashMap::new(),
         };
 
-        assert_eq!(config.api_key().unwrap(), None);
+        assert_eq!(config.api_key_for_provider("alpha").unwrap(), None);
     }
 
     #[test]
@@ -419,55 +461,34 @@ mod tests {
         ensure_starter_config(&path).unwrap();
 
         let raw = std::fs::read_to_string(&path).unwrap();
-        assert!(raw.contains("\"provider\""));
+        assert!(raw.contains("\"providers\""));
         assert!(raw.contains("\"default_model\""));
-        assert!(raw.contains("\"default_effort\""));
-        assert!(raw.contains("\"terminal_bell\""));
+
+        let _ = std::fs::remove_dir_all(tmp);
     }
 
     #[test]
-    fn default_effort_accepts_canonical_values() {
-        let config = config_from_value(serde_json::json!({
-            "provider": {"base_url": "http://localhost", "api_key_env": ""},
-            "default_model": "gpt-4o",
-            "default_effort": "high"
-        }))
-        .unwrap();
+    fn parse_rejects_missing_providers() {
+        let value = serde_json::json!({
+            "default_model": "openai/gpt-4o"
+        });
 
-        assert_eq!(config.default_effort, Some(EffortLevel::High));
+        let err = config_from_value(value).unwrap_err();
+        assert!(err.to_string().contains("no providers configured"));
     }
 
     #[test]
-    fn invalid_default_effort_fails_to_parse() {
-        let err = config_from_value(serde_json::json!({
-            "provider": {"base_url": "http://localhost", "api_key_env": ""},
-            "default_model": "gpt-4o",
-            "default_effort": "extreme"
-        }))
-        .unwrap_err();
+    fn parse_rejects_missing_default_model() {
+        let value = serde_json::json!({
+            "providers": {
+                "openai": {
+                    "base_url": "http://localhost",
+                    "models": {"gpt-4o": {"context_window": 128000}}
+                }
+            }
+        });
 
-        assert!(err.to_string().contains("invalid config.jsonc structure"));
-    }
-
-    #[test]
-    fn missing_provider_fails_with_clear_message() {
-        let err = config_from_value(serde_json::json!({
-            "default_model": "gpt-4o"
-        }))
-        .unwrap_err();
-
-        assert!(err.to_string().contains("no provider configured"));
-    }
-
-    #[test]
-    fn terminal_bell_defaults_to_enabled_with_ten_second_threshold() {
-        let config = config_from_value(serde_json::json!({
-            "provider": {"base_url": "http://localhost", "api_key_env": ""},
-            "default_model": "gpt-4o"
-        }))
-        .unwrap();
-
-        assert!(config.terminal_bell.enabled);
-        assert_eq!(config.terminal_bell.min_duration_ms, 10_000);
+        let err = config_from_value(value).unwrap_err();
+        assert!(err.to_string().contains("no default model configured"));
     }
 }

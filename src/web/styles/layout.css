@@ -1,0 +1,115 @@
+.app {
+  display: flex;
+  flex-direction: column;
+  height: 100dvh;
+  padding: 1px;
+  background: var(--v2-background-bg-deep);
+  overflow: hidden;
+}
+
+.titlebar {
+  display: flex;
+  align-items: center;
+  flex: 0 0 40px;
+  min-height: 40px;
+  background: var(--v2-background-bg-base);
+  overflow: hidden;
+}
+
+.titlebar-menu-slot {
+  width: 48px;
+  min-width: 48px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.titlebar-fill {
+  flex: 1;
+  min-width: 0;
+}
+
+.titlebar-icon {
+  width: 32px;
+  height: 24px;
+  padding: 0;
+  border-radius: 6px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--v2-icon-icon-base);
+  background: transparent;
+  cursor: pointer;
+  appearance: none;
+}
+
+.titlebar-icon:hover {
+  background: var(--v2-overlay-simple-overlay-hover);
+}
+
+.titlebar-icon:active {
+  background: var(--v2-overlay-simple-overlay-pressed);
+}
+
+.titlebar-icon svg {
+  width: 16px;
+  height: 16px;
+}
+
+.shell {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+  background: var(--v2-background-bg-base);
+  border-top: 1px solid var(--v2-border-border-weak-base);
+  overflow: hidden;
+}
+
+.chat-view {
+  position: absolute;
+  inset: 0;
+  background: var(--v2-background-bg-base);
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+
+.conversation-shell {
+  display: flex;
+  flex: 1;
+  min-height: 0;
+  flex-direction: column;
+}
+
+.sidebar-hitbox {
+  position: absolute;
+  inset: 0;
+  opacity: 0;
+  pointer-events: none;
+}
+
+.sidebar {
+  position: absolute;
+  inset: 0 auto 0 0;
+  width: min(100%, 400px);
+  max-width: 100%;
+  overflow: hidden;
+  border-right: 1px solid var(--v2-border-border-weaker-base);
+  background: var(--v2-background-bg-base);
+  transform: translateX(-100%);
+  transition: transform 200ms ease-out;
+}
+
+.app[data-sidebar-open="true"] .sidebar-hitbox {
+  pointer-events: auto;
+}
+
+.app[data-sidebar-open="true"] .sidebar {
+  transform: translateX(0);
+}
+
+@media (max-width: 640px) {
+  .sidebar {
+    width: min(100%, 360px);
+  }
+}

@@ -84,15 +84,12 @@ MU_ZSH_EXIT_HOOKS+=(mu_restore_conflicts)
 | `mu prompt.md` | Run one turn from a prompt file; trims a shebang line automatically |
 | `mu -s <id>` | Attach to an existing session in the active scope |
 | `mu -c` | Continue the latest session in the active scope, or create one |
-| `mu --model <id>` | Override model for this turn |
-| `mu --effort <low|medium|high|xhigh|max>` | Override reasoning effort for this turn |
+| `mu --model <provider>/<model>[:effort]` | Override model for this turn |
 | `mu -i image.png` | Attach an image to the turn |
 | `mu --output plain` | Render sequential plain assistant/tool text |
 | `mu --output terminal` | Render sequential interactive terminal output |
 | `mu --output json` | Render newline-delimited JSON events for integrations/web UI |
-| `mu status --json` | Report the resolved model, effort, session, and context state |
-| `mu models refresh` | Refresh `~/.mu/models.json` from the active provider |
-| `mu models list [--json]` | Inspect the cached provider model catalog |
+| `mu status --json [--include-models]` | Report the resolved model, session, context state, and optional configured model list |
 | `mu session new` | Create session, print id |
 | `mu session list` | List recent non-archived CLI sessions |
 | `mu session archive --session <id>` | Hide a session from default lists |
@@ -101,7 +98,7 @@ MU_ZSH_EXIT_HOOKS+=(mu_restore_conflicts)
 | `mu web [--socket /run/mu-web/mu-web.sock]` | Serve the local browser UI on a Unix socket |
 
 Prompt-file mode accepts the same turn options as stdin mode. Put the prompt
-file last, for example `mu --output plain --model gpt-5 prompt.md`.
+file last, for example `mu --output plain --model openai/gpt-5:high prompt.md`.
 
 Top-level subcommands win on exact name matches. If you want to use a prompt
 file named like a subcommand such as `status`, prepend `./` to disambiguate:
@@ -153,13 +150,10 @@ directories are also loaded with project values overriding global values; the
 resulting environment is used for provider API key lookup and `bash` tool
 processes.
 
-User intent stays in `config.jsonc`. Generated model discovery is cached in
-`~/.mu/models.json` and can be refreshed with `mu models refresh`; it never
-rewrites the hand-authored config file.
-
-Set `default_effort` in `config.jsonc` to apply a reasoning effort when neither
-the session nor the CLI provides one. Accepted values are `null`, `low`,
-`medium`, `high`, `xhigh`, and `max`; `--effort` still wins for a turn.
+Providers and models are configured directly in `config.jsonc`. Model
+references use the same format everywhere: `provider/model[:effort]`, where the
+effort suffix is optional. A bare `model[:effort]` is also accepted when that
+model id is provided by exactly one configured provider.
 
 `terminal_bell.enabled` defaults to `true`. When enabled, `mu --output terminal`
 rings the terminal bell after a successful turn that ran for at least

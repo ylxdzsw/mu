@@ -30,100 +30,20 @@
     </header>
 
     <section class="shell">
-      <main id="chat-view" class="chat-view" data-slot="empty-chat-view" aria-label="Empty main chat view">
+      <main class="chat-view" aria-label="Conversation view">
         <div class="conversation-shell">
-          <div class="conversation-body">
-            <div class="conversation-empty">
-              <p class="conversation-kicker">mu web</p>
-              <h1 class="conversation-title">What should mu help with next?</h1>
-              <p class="conversation-copy">
-                The prompt dock lives at the bottom of the conversation, matching the opencode sizing
-                and control rhythm while keeping the model and variant selectors merged into one row.
-              </p>
-              <p id="launch-project" class="conversation-project"></p>
-            </div>
-          </div>
-
-          <div class="composer-dock">
-            <form id="composer-form" class="composer-card">
-              <div class="composer-input-wrap">
-                <textarea
-                  id="composer-input"
-                  class="composer-input"
-                  rows="1"
-                  placeholder="Ask mu to inspect, edit, or run something"
-                  aria-label="Prompt"
-                ></textarea>
-              </div>
-
-              <div class="composer-toolbar">
-                <div class="composer-toolbar-main">
-                  <button
-                    id="composer-attach"
-                    class="composer-icon-button"
-                    type="button"
-                    aria-label="Add attachment"
-                  >
-                    <svg viewBox="0 0 16 16" aria-hidden="true">
-                      <path
-                        d="M8 3v10M3 8h10"
-                        fill="none"
-                        stroke="currentColor"
-                        stroke-linecap="round"
-                        stroke-width="1.25"
-                      />
-                    </svg>
-                  </button>
-
-                  <label class="composer-select-shell">
-                    <span class="sr-only">Model</span>
-                    <select id="composer-model" class="composer-select" aria-label="Model">
-                      <option>Loading models...</option>
-                    </select>
-                  </label>
-
-                  <label class="composer-select-shell">
-                    <span class="sr-only">Variant</span>
-                    <select id="composer-variant" class="composer-select" aria-label="Variant">
-                      <option>Default</option>
-                    </select>
-                  </label>
-                </div>
-
-                <button id="composer-submit" class="composer-submit" type="submit" aria-label="Send prompt">
-                  <svg viewBox="0 0 16 16" aria-hidden="true">
-                    <path
-                      d="M3.5 8h7.75M8.25 4.25 12 8l-3.75 3.75"
-                      fill="none"
-                      stroke="currentColor"
-                      stroke-linecap="round"
-                      stroke-linejoin="round"
-                      stroke-width="1.25"
-                    />
-                  </svg>
-                </button>
-              </div>
-            </form>
-          </div>
+          <mu-conversation-view id="conversation-view" data-slot="empty-chat-view"></mu-conversation-view>
+          <mu-composer id="composer"></mu-composer>
         </div>
       </main>
 
       <div id="sidebar-hitbox" class="sidebar-hitbox" aria-hidden="true"></div>
-
-      <nav id="sidebar" class="sidebar" aria-label="Left panel">
-        <div class="sidebar-shell">
-          <div class="sidebar-rail">
-            <div class="sidebar-rail-body"></div>
-            <div class="sidebar-rail-footer"></div>
-          </div>
-          <div class="sidebar-panel">
-            <div class="sidebar-panel-frame"></div>
-          </div>
-        </div>
-      </nav>
+      <mu-sidebar id="sidebar" class="sidebar" aria-label="Left panel"></mu-sidebar>
     </section>
   </div>
 
-  <script src="/app.js"></script>
+  <mu-project-modal id="project-modal"></mu-project-modal>
+
+  <script type="module" src="/app.js"></script>
 </body>
 </html>

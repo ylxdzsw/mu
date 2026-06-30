@@ -1,0 +1,5 @@
+.env
+sessions.db
+sessions.db-*
+*.db
+*.db-*

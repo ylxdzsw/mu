@@ -8,7 +8,6 @@ use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
 use uuid::Uuid;
 
-use crate::models::EffortLevel;
 use crate::provider::{Message, UserContent, approx_tokens};
 
 #[derive(Debug, Clone)]
@@ -16,7 +15,6 @@ pub struct Session {
     pub id: String,
     pub cwd: String,
     pub model: String,
-    pub effort: Option<EffortLevel>,
     pub title: Option<String>,
     pub last_total_tokens: u64,
     pub origin: SessionOrigin,
@@ -72,7 +70,6 @@ pub struct SessionSummary {
     pub updated_at: String,
     pub cwd: String,
     pub model: String,
-    pub effort: Option<EffortLevel>,
     pub title: Option<String>,
     pub last_total_tokens: u64,
     pub cost_total: f64,
@@ -229,20 +226,14 @@ impl Store {
     }
 
     #[cfg(test)]
-    pub fn create_session(
-        &self,
-        cwd: &str,
-        model: &str,
-        effort: Option<EffortLevel>,
-    ) -> Result<Session> {
-        self.create_session_with_origin(cwd, model, effort, SessionOrigin::Cli)
+    pub fn create_session(&self, cwd: &str, model: &str) -> Result<Session> {
+        self.create_session_with_origin(cwd, model, SessionOrigin::Cli)
     }
 
     pub fn create_session_with_origin(
         &self,
         cwd: &str,
         model: &str,
-        effort: Option<EffortLevel>,
         origin: SessionOrigin,
     ) -> Result<Session> {
         let id = Uuid::new_v4().to_string();
@@ -255,7 +246,7 @@ impl Store {
                 now,
                 cwd,
                 model,
-                effort.map(|level| level.to_string()),
+                Option::<String>::None,
                 origin.as_str()
             ],
         )?;
@@ -263,7 +254,6 @@ impl Store {
             id,
             cwd: cwd.into(),
             model: model.into(),
-            effort,
             title: None,
             last_total_tokens: 0,
             origin,
@@ -273,22 +263,20 @@ impl Store {
 
     pub fn get_session(&self, id: &str) -> Result<Option<Session>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, cwd, model, effort, title, last_total_tokens, origin, archived
+            "SELECT id, cwd, model, title, last_total_tokens, origin, archived
              FROM session WHERE id = ?1",
         )?;
         let row = stmt
             .query_row(params![id], |row| {
-                let effort: Option<String> = row.get(3)?;
-                let origin: String = row.get(6)?;
+                let origin: String = row.get(5)?;
                 Ok(Session {
                     id: row.get(0)?,
                     cwd: row.get(1)?,
                     model: row.get(2)?,
-                    effort: parse_effort(effort)?,
-                    title: row.get(4)?,
-                    last_total_tokens: row.get::<_, i64>(5)? as u64,
+                    title: row.get(3)?,
+                    last_total_tokens: row.get::<_, i64>(4)? as u64,
                     origin: parse_origin(origin)?,
-                    archived: row.get::<_, i64>(7)? != 0,
+                    archived: row.get::<_, i64>(6)? != 0,
                 })
             })
             .optional()?;
@@ -305,26 +293,24 @@ impl Store {
         limit: usize,
     ) -> Result<Vec<(Session, String)>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, cwd, model, effort, title, last_total_tokens, origin, archived, updated_at
+            "SELECT id, cwd, model, title, last_total_tokens, origin, archived, updated_at
              FROM session
              WHERE origin = ?1 AND archived = 0
              ORDER BY updated_at DESC LIMIT ?2",
         )?;
         let rows = stmt.query_map(params![origin.as_str(), limit as i64], |row| {
-            let effort: Option<String> = row.get(3)?;
-            let origin: String = row.get(6)?;
+            let origin: String = row.get(5)?;
             Ok((
                 Session {
                     id: row.get(0)?,
                     cwd: row.get(1)?,
                     model: row.get(2)?,
-                    effort: parse_effort(effort)?,
-                    title: row.get(4)?,
-                    last_total_tokens: row.get::<_, i64>(5)? as u64,
+                    title: row.get(3)?,
+                    last_total_tokens: row.get::<_, i64>(4)? as u64,
                     origin: parse_origin(origin)?,
-                    archived: row.get::<_, i64>(7)? != 0,
+                    archived: row.get::<_, i64>(6)? != 0,
                 },
-                row.get::<_, String>(8)?,
+                row.get::<_, String>(7)?,
             ))
         })?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
@@ -355,7 +341,7 @@ impl Store {
         };
         let sql = format!(
             "SELECT
-                s.id, s.created_at, s.updated_at, s.cwd, s.model, s.effort, s.title,
+                s.id, s.created_at, s.updated_at, s.cwd, s.model, s.title,
                 s.last_total_tokens, s.cost_total, s.origin, s.archived,
                 COUNT(m.id) AS message_count,
                 COALESCE(SUM(CASE WHEN m.role = 'user' THEN 1 ELSE 0 END), 0) AS user_count
@@ -372,22 +358,20 @@ impl Store {
         };
         let mut summaries = Vec::new();
         while let Some(row) = rows.next()? {
-            let effort: Option<String> = row.get(5)?;
-            let origin: String = row.get(9)?;
-            let message_count = row.get::<_, i64>(11)? as u64;
-            let user_count = row.get::<_, i64>(12)? as u64;
+            let origin: String = row.get(8)?;
+            let message_count = row.get::<_, i64>(10)? as u64;
+            let user_count = row.get::<_, i64>(11)? as u64;
             summaries.push(SessionSummary {
                 id: row.get(0)?,
                 created_at: row.get(1)?,
                 updated_at: row.get(2)?,
                 cwd: row.get(3)?,
                 model: row.get(4)?,
-                effort: parse_effort(effort)?,
-                title: row.get(6)?,
-                last_total_tokens: row.get::<_, i64>(7)? as u64,
-                cost_total: row.get(8)?,
+                title: row.get(5)?,
+                last_total_tokens: row.get::<_, i64>(6)? as u64,
+                cost_total: row.get(7)?,
                 origin: parse_origin(origin)?,
-                archived: row.get::<_, i64>(10)? != 0,
+                archived: row.get::<_, i64>(9)? != 0,
                 message_count,
                 turn_count: user_count.saturating_sub(1),
             });
@@ -398,7 +382,7 @@ impl Store {
     pub fn session_summary(&self, id: &str) -> Result<Option<SessionSummary>> {
         let mut stmt = self.conn.prepare(
             "SELECT
-                s.id, s.created_at, s.updated_at, s.cwd, s.model, s.effort, s.title,
+                s.id, s.created_at, s.updated_at, s.cwd, s.model, s.title,
                 s.last_total_tokens, s.cost_total, s.origin, s.archived,
                 COUNT(m.id) AS message_count,
                 COALESCE(SUM(CASE WHEN m.role = 'user' THEN 1 ELSE 0 END), 0) AS user_count
@@ -409,22 +393,20 @@ impl Store {
         )?;
         let row = stmt
             .query_row(params![id], |row| {
-                let effort: Option<String> = row.get(5)?;
-                let origin: String = row.get(9)?;
-                let message_count = row.get::<_, i64>(11)? as u64;
-                let user_count = row.get::<_, i64>(12)? as u64;
+                let origin: String = row.get(8)?;
+                let message_count = row.get::<_, i64>(10)? as u64;
+                let user_count = row.get::<_, i64>(11)? as u64;
                 Ok(SessionSummary {
                     id: row.get(0)?,
                     created_at: row.get(1)?,
                     updated_at: row.get(2)?,
                     cwd: row.get(3)?,
                     model: row.get(4)?,
-                    effort: parse_effort(effort)?,
-                    title: row.get(6)?,
-                    last_total_tokens: row.get::<_, i64>(7)? as u64,
-                    cost_total: row.get(8)?,
+                    title: row.get(5)?,
+                    last_total_tokens: row.get::<_, i64>(6)? as u64,
+                    cost_total: row.get(7)?,
                     origin: parse_origin(origin)?,
-                    archived: row.get::<_, i64>(10)? != 0,
+                    archived: row.get::<_, i64>(9)? != 0,
                     message_count,
                     turn_count: user_count.saturating_sub(1),
                 })
@@ -435,22 +417,20 @@ impl Store {
 
     pub fn latest_session(&self) -> Result<Option<Session>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, cwd, model, effort, title, last_total_tokens, origin, archived
+            "SELECT id, cwd, model, title, last_total_tokens, origin, archived
              FROM session ORDER BY updated_at DESC LIMIT 1",
         )?;
         let row = stmt
             .query_row([], |row| {
-                let effort: Option<String> = row.get(3)?;
-                let origin: String = row.get(6)?;
+                let origin: String = row.get(5)?;
                 Ok(Session {
                     id: row.get(0)?,
                     cwd: row.get(1)?,
                     model: row.get(2)?,
-                    effort: parse_effort(effort)?,
-                    title: row.get(4)?,
-                    last_total_tokens: row.get::<_, i64>(5)? as u64,
+                    title: row.get(3)?,
+                    last_total_tokens: row.get::<_, i64>(4)? as u64,
                     origin: parse_origin(origin)?,
-                    archived: row.get::<_, i64>(7)? != 0,
+                    archived: row.get::<_, i64>(6)? != 0,
                 })
             })
             .optional()?;
@@ -472,36 +452,20 @@ impl Store {
         cost_delta: f64,
         title: Option<&str>,
         model: &str,
-        effort: Option<EffortLevel>,
     ) -> Result<()> {
         let now = chrono::Utc::now().to_rfc3339();
         if let Some(t) = title {
             self.conn.execute(
                 "UPDATE session SET updated_at = ?1, last_total_tokens = ?2,
                  cost_total = cost_total + ?3, title = COALESCE(title, ?4),
-                 model = ?5, effort = ?6 WHERE id = ?7",
-                params![
-                    now,
-                    last_total_tokens as i64,
-                    cost_delta,
-                    t,
-                    model,
-                    effort.map(|level| level.to_string()),
-                    id
-                ],
+                 model = ?5 WHERE id = ?6",
+                params![now, last_total_tokens as i64, cost_delta, t, model, id],
             )?;
         } else {
             self.conn.execute(
                 "UPDATE session SET updated_at = ?1, last_total_tokens = ?2,
-                 cost_total = cost_total + ?3, model = ?4, effort = ?5 WHERE id = ?6",
-                params![
-                    now,
-                    last_total_tokens as i64,
-                    cost_delta,
-                    model,
-                    effort.map(|level| level.to_string()),
-                    id
-                ],
+                 cost_total = cost_total + ?3, model = ?4 WHERE id = ?5",
+                params![now, last_total_tokens as i64, cost_delta, model, id],
             )?;
         }
         Ok(())
@@ -857,22 +821,6 @@ fn load_user_content(content: String, user_content_json: Option<String>) -> User
         .unwrap_or(UserContent::Text(content))
 }
 
-fn parse_effort(value: Option<String>) -> rusqlite::Result<Option<EffortLevel>> {
-    match value {
-        None => Ok(None),
-        Some(level) => EffortLevel::from_str(&level).map(Some).map_err(|e| {
-            rusqlite::Error::FromSqlConversionFailure(
-                0,
-                rusqlite::types::Type::Text,
-                Box::new(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    e.to_string(),
-                )),
-            )
-        }),
-    }
-}
-
 fn parse_origin(value: String) -> rusqlite::Result<SessionOrigin> {
     SessionOrigin::from_str(&value).map_err(|e| {
         rusqlite::Error::FromSqlConversionFailure(
@@ -900,7 +848,7 @@ mod tests {
     #[test]
     fn reloads_full_user_content_with_images() {
         let (store, tmp) = temp_store();
-        let session = store.create_session("/tmp", "fake-model", None).unwrap();
+        let session = store.create_session("/tmp", "fake-model").unwrap();
         let expected_image_url = "data:image/png;base64,abcd".to_string();
 
         store
@@ -944,7 +892,7 @@ mod tests {
     #[test]
     fn reloads_legacy_text_user_content() {
         let (store, tmp) = temp_store();
-        let session = store.create_session("/tmp", "fake-model", None).unwrap();
+        let session = store.create_session("/tmp", "fake-model").unwrap();
         let now = chrono::Utc::now().to_rfc3339();
         store
             .conn
@@ -970,7 +918,7 @@ mod tests {
     #[test]
     fn new_sessions_default_to_cli_origin_and_unarchived() {
         let (store, tmp) = temp_store();
-        let session = store.create_session("/tmp", "fake-model", None).unwrap();
+        let session = store.create_session("/tmp", "fake-model").unwrap();
         let loaded = store.get_session(&session.id).unwrap().unwrap();
 
         assert_eq!(loaded.origin, SessionOrigin::Cli);
@@ -981,13 +929,11 @@ mod tests {
     #[test]
     fn list_sessions_defaults_to_cli_origin_and_skips_archived() {
         let (store, tmp) = temp_store();
-        let cli = store.create_session("/tmp", "cli-model", None).unwrap();
+        let cli = store.create_session("/tmp", "cli-model").unwrap();
         let web = store
-            .create_session_with_origin("/tmp", "web-model", None, SessionOrigin::Web)
+            .create_session_with_origin("/tmp", "web-model", SessionOrigin::Web)
             .unwrap();
-        let archived = store
-            .create_session("/tmp", "archived-model", None)
-            .unwrap();
+        let archived = store.create_session("/tmp", "archived-model").unwrap();
         store.set_session_archived(&archived.id, true).unwrap();
 
         let sessions = store.list_sessions(20).unwrap();
@@ -1008,9 +954,9 @@ mod tests {
     #[test]
     fn all_session_summaries_include_cli_and_web_origins() {
         let (store, tmp) = temp_store();
-        let cli = store.create_session("/tmp", "cli-model", None).unwrap();
+        let cli = store.create_session("/tmp", "cli-model").unwrap();
         let web = store
-            .create_session_with_origin("/tmp", "web-model", None, SessionOrigin::Web)
+            .create_session_with_origin("/tmp", "web-model", SessionOrigin::Web)
             .unwrap();
 
         let summaries = store.list_all_session_summaries(20).unwrap();

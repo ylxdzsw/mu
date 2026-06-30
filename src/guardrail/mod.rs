@@ -114,19 +114,17 @@ pub enum GuardrailOutcome {
 
 pub struct Guardrail {
     config: GuardrailConfig,
-    provider: Arc<dyn Provider>,
-    default_model: String,
+    runtime: Config,
     consecutive_denials: u32,
     recent_denials: VecDeque<bool>,
     interrupt_triggered: bool,
 }
 
 impl Guardrail {
-    pub fn new(config: &Config, provider: Arc<dyn Provider>) -> Self {
+    pub fn new(config: &Config, _provider: Arc<dyn Provider>) -> Self {
         Self {
             config: config.guardrail.clone(),
-            provider,
-            default_model: config.default_model.clone(),
+            runtime: config.clone(),
             consecutive_denials: 0,
             recent_denials: VecDeque::new(),
             interrupt_triggered: false,
@@ -143,11 +141,20 @@ impl Guardrail {
     /// the reviewer itself is malfunctioning).
     pub async fn assess(&mut self, action: &Value, context: &[Message]) -> GuardrailOutcome {
         crate::tools::bash::install_signal_forwarder();
-        let model = self
+        let model_ref = self
             .config
             .review_model
             .as_deref()
-            .unwrap_or(&self.default_model);
+            .unwrap_or(&self.runtime.default_model);
+        let request_model = match crate::models::resolve_model_ref(&self.runtime, model_ref) {
+            Ok(model) => model,
+            Err(error) => return GuardrailOutcome::Failed(error),
+        };
+        let provider =
+            match crate::provider::build_provider(&self.runtime, &request_model.provider_id) {
+                Ok(provider) => provider,
+                Err(error) => return GuardrailOutcome::Failed(error),
+            };
 
         let system_prompt = prompt::policy_prompt().to_string();
         let user_content = prompt::build_reviewer_user_content(context, action);
@@ -172,11 +179,10 @@ impl Guardrail {
 
             let mut ignore_event = |_event: crate::provider::StreamEvent| Ok(());
             let result = tokio::time::timeout(timeout, async {
-                self.provider
+                provider
                     .stream_chat(
                         &RequestOptions {
-                            model: model.to_string(),
-                            effort: None,
+                            model: request_model.clone(),
                         },
                         &msgs,
                         &[],
@@ -346,11 +352,16 @@ mod tests {
                     window_denials,
                 },
             },
-            provider: Arc::new(crate::provider::openai::OpenAiProvider::new(
-                "http://localhost".into(),
-                Some("key".into()),
-            )),
-            default_model: "test".into(),
+            runtime: Config {
+                providers: Default::default(),
+                default_model: String::new(),
+                compaction: crate::config::CompactionConfig::default(),
+                limits: crate::config::LimitsConfig::default(),
+                guardrail: GuardrailConfig::default(),
+                terminal_bell: crate::config::TerminalBellConfig::default(),
+                redaction: crate::config::RedactionConfig::default(),
+                env: Default::default(),
+            },
             consecutive_denials: 0,
             recent_denials: VecDeque::new(),
             interrupt_triggered: false,

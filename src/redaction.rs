@@ -22,7 +22,9 @@ pub struct SecretRedactor {
 impl SecretRedactor {
     pub fn from_config(config: &Config) -> Self {
         let mut names = BTreeSet::new();
-        names.insert(config.provider.api_key_env.clone());
+        for provider in config.providers.values() {
+            names.insert(provider.api_key_env.clone());
+        }
         names.extend(config.redaction.env.iter().cloned());
 
         let mut warnings = Vec::new();
@@ -128,13 +130,15 @@ mod tests {
 
     fn config(env: &[(&str, &str)], redaction_env: &[&str]) -> Config {
         Config {
-            provider: ProviderConfig {
-                base_url: "https://example.test".into(),
-                api_key_env: "OPENAI_API_KEY".into(),
-            },
-            default_model: "model".into(),
-            default_effort: None,
-            models: HashMap::new(),
+            providers: HashMap::from([(
+                "test".into(),
+                ProviderConfig {
+                    base_url: "https://example.test".into(),
+                    api_key_env: "OPENAI_API_KEY".into(),
+                    models: HashMap::new(),
+                },
+            )]),
+            default_model: "test/model".into(),
             compaction: CompactionConfig::default(),
             limits: LimitsConfig::default(),
             guardrail: GuardrailConfig::default(),

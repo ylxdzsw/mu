@@ -605,13 +605,15 @@ mod tests {
 
     fn test_config(env: &[(&str, &str)], redaction_env: &[&str]) -> Config {
         Config {
-            provider: ProviderConfig {
-                base_url: "https://example.test".into(),
-                api_key_env: "OPENAI_API_KEY".into(),
-            },
-            default_model: "model".into(),
-            default_effort: None,
-            models: HashMap::new(),
+            providers: HashMap::from([(
+                "test".into(),
+                ProviderConfig {
+                    base_url: "https://example.test".into(),
+                    api_key_env: "OPENAI_API_KEY".into(),
+                    models: HashMap::new(),
+                },
+            )]),
+            default_model: "test/model".into(),
             compaction: CompactionConfig::default(),
             limits: LimitsConfig::default(),
             guardrail: GuardrailConfig::default(),

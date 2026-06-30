@@ -2,8 +2,6 @@ use std::path::PathBuf;
 
 use clap::{Args as ClapArgs, Parser, Subcommand, ValueEnum};
 
-use crate::models::EffortLevel;
-
 #[derive(Parser, Debug)]
 #[command(name = "mu", about = "Fast terminal agent harness")]
 pub struct Args {
@@ -32,9 +30,6 @@ pub struct SelectionArgs {
 
     #[arg(long)]
     pub model: Option<String>,
-
-    #[arg(long, value_enum)]
-    pub effort: Option<EffortLevel>,
 }
 
 #[derive(ClapArgs, Debug, Clone)]
@@ -68,13 +63,8 @@ pub enum Command {
         #[command(subcommand)]
         sub: SessionSub,
     },
-    /// Inspect the resolved model, effort, and context state
+    /// Inspect the resolved model and context state
     Status(StatusArgs),
-    /// Refresh or inspect the generated provider model catalog
-    Models {
-        #[command(subcommand)]
-        sub: ModelsSub,
-    },
     /// Force compaction for a session
     Compact {
         #[arg(long)]
@@ -91,6 +81,9 @@ pub struct StatusArgs {
 
     #[arg(long)]
     pub json: bool,
+
+    #[arg(long)]
+    pub include_models: bool,
 }
 
 #[derive(Subcommand, Debug)]
@@ -146,17 +139,6 @@ pub enum ProjectSub {
         #[arg(long)]
         path: PathBuf,
 
-        #[arg(long)]
-        json: bool,
-    },
-}
-
-#[derive(Subcommand, Debug)]
-pub enum ModelsSub {
-    /// Refresh the generated provider model catalog
-    Refresh,
-    /// List the cached provider model catalog
-    List {
         #[arg(long)]
         json: bool,
     },

@@ -29,12 +29,11 @@ mod system_prompt;
 mod tools;
 mod web;
 
-use cli::{Args, Command, ModelsSub, ProjectSub, SessionOriginArg, SessionSub};
+use cli::{Args, Command, ProjectSub, SessionOriginArg, SessionSub};
 use config::Config;
-use models::{ModelCatalog, RequestOptions};
-use provider::Provider;
-use provider::openai::OpenAiProvider;
+use models::RequestOptions;
 use provider::{ContentPart, ImageUrl};
+use provider::{Provider, build_provider};
 use renderer::Renderer;
 use runtime::{InvocationOverrides, StatusReport, build_status_report, resolve_invocation};
 
@@ -216,17 +215,16 @@ async fn run() -> Result<()> {
                     let store = store::Store::open(&db_path)?;
                     let latest = store.latest_session()?;
                     let inherited_model = latest.as_ref().map(|session| session.model.clone());
-                    let inherited_effort = latest.as_ref().and_then(|session| session.effort);
-                    let config = Config::try_load_for_scope(project_config_dir.as_deref());
-                    let default_model = config
-                        .as_ref()
-                        .map(|c| c.default_model.as_str())
-                        .unwrap_or("gpt-4o");
-                    let default_effort = config.as_ref().and_then(|c| c.default_effort);
+                    let default_model = if inherited_model.is_some() {
+                        None
+                    } else {
+                        Some(Config::load_for_scope(project_config_dir.as_deref())?.default_model)
+                    };
                     let session = store.create_session_with_origin(
                         &cwd.display().to_string(),
-                        inherited_model.as_deref().unwrap_or(default_model),
-                        inherited_effort.or(default_effort),
+                        inherited_model
+                            .as_deref()
+                            .unwrap_or(default_model.as_deref().unwrap()),
                         origin,
                     )?;
                     store.append_message(
@@ -278,13 +276,9 @@ async fn run() -> Result<()> {
                             } else {
                                 format!(" [{}]", s.origin)
                             };
-                            let effort = s
-                                .effort
-                                .map(|level| format!(" [{}]", level))
-                                .unwrap_or_default();
                             println!(
-                                "{}  {}  {}{}{}  {}",
-                                s.id, title, s.model, effort, origin, s.updated_at
+                                "{}  {}  {}{}  {}",
+                                s.id, title, s.model, origin, s.updated_at
                             );
                         }
                         return Ok(());
@@ -302,14 +296,7 @@ async fn run() -> Result<()> {
                         } else {
                             format!(" [{}]", s.origin)
                         };
-                        let effort = s
-                            .effort
-                            .map(|level| format!(" [{}]", level))
-                            .unwrap_or_default();
-                        println!(
-                            "{}  {}  {}{}{}  {}",
-                            s.id, title, s.model, effort, origin, updated
-                        );
+                        println!("{}  {}  {}{}  {}", s.id, title, s.model, origin, updated);
                     }
                 }
                 SessionSub::Transcript { session, json } => {
@@ -358,8 +345,6 @@ async fn run() -> Result<()> {
         }
         Some(Command::Status(status_args)) => {
             let config = Config::load_for_scope(project_config_dir.as_deref())?;
-            let _api_key = config.api_key()?;
-            let catalog = ModelCatalog::load_matching(&config.provider.base_url)?;
             let store = open_status_store(scope.session_db_path().as_path())?;
             let report = build_status_report(
                 &store,
@@ -368,10 +353,9 @@ async fn run() -> Result<()> {
                     session: status_args.selection.session,
                     continue_latest: status_args.selection.continue_latest,
                     model: status_args.selection.model,
-                    effort: status_args.selection.effort,
                 },
-                catalog.as_ref(),
                 scope.project(),
+                status_args.include_models,
             )?;
             if status_args.json {
                 println!("{}", serde_json::to_string(&report)?);
@@ -380,55 +364,8 @@ async fn run() -> Result<()> {
             }
             return Ok(());
         }
-        Some(Command::Models { sub }) => {
-            match sub {
-                ModelsSub::Refresh => {
-                    let config = Config::load_for_scope(project_config_dir.as_deref())?;
-                    let api_key = config.api_key()?;
-                    let catalog = models::refresh_model_catalog(
-                        &config.provider.base_url,
-                        api_key.as_deref(),
-                    )
-                    .await?;
-                    let path = ModelCatalog::cache_path();
-                    catalog.save(&path)?;
-                    println!(
-                        "refreshed {} models into {}",
-                        catalog.models.len(),
-                        path.display()
-                    );
-                }
-                ModelsSub::List { json } => {
-                    let Some(catalog) = ModelCatalog::load(&ModelCatalog::cache_path())? else {
-                        if json {
-                            println!(
-                                "{}",
-                                serde_json::json!({
-                                    "version": 1,
-                                    "fetched_at": null,
-                                    "provider": null,
-                                    "models": {}
-                                })
-                            );
-                        }
-                        return Ok(());
-                    };
-                    if json {
-                        println!("{}", serde_json::to_string(&catalog)?);
-                    } else {
-                        print_model_catalog(&catalog);
-                    }
-                }
-            }
-            return Ok(());
-        }
         Some(Command::Compact { session }) => {
             let config = Config::load_for_scope(project_config_dir.as_deref())?;
-            let api_key = config.api_key()?;
-            let provider = Arc::new(OpenAiProvider::new(
-                config.provider.base_url.clone(),
-                api_key,
-            )) as Arc<dyn Provider>;
             let db_path = scope.session_db_path();
             if !db_path.exists() {
                 bail!("session not found in active scope: {session}");
@@ -437,6 +374,10 @@ async fn run() -> Result<()> {
             let session_state = store
                 .get_session(&session)?
                 .ok_or_else(|| anyhow::anyhow!("session not found in active scope: {session}"))?;
+            let request = RequestOptions {
+                model: models::resolve_model_ref(&config, &session_state.model)?,
+            };
+            let provider = build_provider(&config, &request.model.provider_id)?;
             let _lock = match store::acquire_session_lock(&session) {
                 Ok(lock) => lock,
                 Err(_) => {
@@ -453,10 +394,7 @@ async fn run() -> Result<()> {
                 &store,
                 &config,
                 &session,
-                &RequestOptions {
-                    model: session_state.model,
-                    effort: session_state.effort,
-                },
+                &request,
                 provider.as_ref(),
                 &system_prompt,
             )
@@ -490,12 +428,6 @@ async fn run_turn_from_source(
     let attachments = load_image_attachments(&turn.images)?;
 
     let config = Config::load_for_scope(project_config_dir)?;
-    let api_key = config.api_key()?;
-    let catalog = ModelCatalog::load_matching(&config.provider.base_url)?;
-    let provider = Arc::new(OpenAiProvider::new(
-        config.provider.base_url.clone(),
-        api_key,
-    )) as Arc<dyn Provider>;
 
     paths::ensure_project_layout(scope)?;
     let state_dir = scope.state_dir();
@@ -511,15 +443,10 @@ async fn run_turn_from_source(
             session: turn.selection.session.clone(),
             continue_latest: turn.selection.continue_latest,
             model: turn.selection.model.clone(),
-            effort: turn.selection.effort,
         },
     )?;
-    let model_info = models::resolve_model_info(&config, catalog.as_ref(), &resolved.request.model);
-    models::validate_effort_support(
-        &resolved.request.model,
-        resolved.request.effort.as_ref(),
-        &model_info,
-    )?;
+    let model_info = models::resolve_model_info(&config, &resolved.request.model);
+    let provider = build_provider(&config, &resolved.request.model.provider_id)?;
 
     let (session, created) = if let Some(session) = resolved.attached_session.clone() {
         (session, false)
@@ -659,8 +586,7 @@ async fn run_turn(args: RunTurnArgs<'_>) -> Result<()> {
                 r.final_total_tokens,
                 r.cost,
                 Some(&title),
-                &request.model,
-                request.effort,
+                &request.model.canonical,
             )?;
             renderer.finish_turn()?;
             renderer.turn_summary(
@@ -688,8 +614,7 @@ fn create_seeded_session(
 ) -> Result<(store::Session, bool)> {
     let session = store.create_session_with_origin(
         &cwd.display().to_string(),
-        &seed.model,
-        seed.effort,
+        &seed.model.canonical,
         origin,
     )?;
     store.append_message(
@@ -710,10 +635,6 @@ fn open_status_store(path: &std::path::Path) -> Result<store::Store> {
 }
 
 fn print_status_report(report: &StatusReport) {
-    let effort = report
-        .effort
-        .map(|level| level.to_string())
-        .unwrap_or_else(|| "unset".into());
     let session = report
         .session_id
         .clone()
@@ -738,7 +659,6 @@ fn print_status_report(report: &StatusReport) {
     };
 
     println!("model: {}", report.model_id);
-    println!("effort: {effort}");
     println!("session: {session}");
     println!("context: {context}");
     println!("project: {project}");
@@ -767,45 +687,7 @@ fn print_status_report(report: &StatusReport) {
     if report.active.busy {
         println!("active: busy");
     }
-    println!(
-        "metadata: {}",
-        match report.model_metadata_source {
-            models::ModelMetadataSource::Cache => "cache",
-            models::ModelMetadataSource::FallbackInference => "fallback_inference",
-        }
-    );
     println!("supported effort levels: {effort_levels}");
-}
-
-fn print_model_catalog(catalog: &ModelCatalog) {
-    println!("provider: {}", catalog.provider.base_url);
-    println!("fetched_at: {}", catalog.fetched_at);
-    for model in catalog.models.values() {
-        let effort_levels = model
-            .reasoning_effort_levels
-            .as_ref()
-            .map(|levels| {
-                if levels.is_empty() {
-                    "(none)".to_string()
-                } else {
-                    levels
-                        .iter()
-                        .map(ToString::to_string)
-                        .collect::<Vec<_>>()
-                        .join(",")
-                }
-            })
-            .unwrap_or_else(|| "(unknown)".into());
-        println!(
-            "{}  {}  ctx={:?}  out={:?}  reasoning={:?}  effort={}",
-            model.id,
-            model.display_name,
-            model.context_window,
-            model.max_output_tokens,
-            model.reasoning,
-            effort_levels
-        );
-    }
 }
 
 fn load_image_attachments(paths: &[PathBuf]) -> Result<Vec<ContentPart>> {

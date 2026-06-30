@@ -222,13 +222,13 @@ fn build_chat_request_body(
     tools: &[Value],
 ) -> Value {
     let mut body = serde_json::json!({
-        "model": request.model.as_str(),
+        "model": request.model.model_id.as_str(),
         "messages": messages,
         "tools": tools,
         "stream": true,
         "stream_options": { "include_usage": true }
     });
-    if let Some(effort) = request.effort {
+    if let Some(effort) = request.model.effort {
         body["reasoning"] = serde_json::json!({ "effort": effort });
     }
     body
@@ -393,6 +393,19 @@ fn next_event_boundary(buffer: &str) -> Option<(usize, usize)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::models::ResolvedModelRef;
+
+    fn test_model(effort: Option<EffortLevel>) -> ResolvedModelRef {
+        ResolvedModelRef {
+            canonical: match effort {
+                Some(level) => format!("test/gpt-test:{level}"),
+                None => "test/gpt-test".into(),
+            },
+            provider_id: "test".into(),
+            model_id: "gpt-test".into(),
+            effort,
+        }
+    }
     use crate::models::EffortLevel;
 
     #[test]
@@ -524,8 +537,7 @@ mod tests {
     fn request_omits_reasoning_when_effort_is_unset() {
         let body = build_chat_request_body(
             &RequestOptions {
-                model: "gpt-test".into(),
-                effort: None,
+                model: test_model(None),
             },
             &[],
             &[],
@@ -539,8 +551,7 @@ mod tests {
     fn request_includes_reasoning_effort_when_set() {
         let body = build_chat_request_body(
             &RequestOptions {
-                model: "gpt-test".into(),
-                effort: Some(EffortLevel::High),
+                model: test_model(Some(EffortLevel::High)),
             },
             &[],
             &[],

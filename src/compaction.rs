@@ -164,6 +164,7 @@ pub fn prune_spills(state_dir: &Path) {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
     use std::path::Path;
 
     use async_trait::async_trait;
@@ -201,13 +202,22 @@ mod tests {
 
     fn test_config() -> Config {
         Config {
-            provider: crate::config::ProviderConfig {
-                base_url: "http://localhost".into(),
-                api_key_env: "TEST_KEY".into(),
-            },
-            default_model: "fake-model".into(),
-            default_effort: None,
-            models: Default::default(),
+            providers: HashMap::from([(
+                "test".into(),
+                crate::config::ProviderConfig {
+                    base_url: "http://localhost".into(),
+                    api_key_env: "TEST_KEY".into(),
+                    models: HashMap::from([(
+                        "fake-model".into(),
+                        crate::config::ModelConfig {
+                            context_window: None,
+                            price_per_mtok: None,
+                            supported_efforts: None,
+                        },
+                    )]),
+                },
+            )]),
+            default_model: "test/fake-model".into(),
             compaction: crate::config::CompactionConfig {
                 fraction: 0.75,
                 keep_recent_turns: 2,
@@ -225,7 +235,9 @@ mod tests {
         let tmp = std::env::temp_dir().join(format!("mu-compaction-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&tmp).unwrap();
         let store = Store::open(&tmp.join("mu.db")).unwrap();
-        let session = store.create_session("/tmp", "fake-model", None).unwrap();
+        let session = store.create_session("/tmp", "test/fake-model").unwrap();
+        let request_model =
+            crate::models::resolve_model_ref(&test_config(), "test/fake-model").unwrap();
 
         for n in 1..=4 {
             store
@@ -252,8 +264,7 @@ mod tests {
             &test_config(),
             &session.id,
             &RequestOptions {
-                model: "fake-model".into(),
-                effort: None,
+                model: request_model,
             },
             &FakeProvider,
             "system prompt",

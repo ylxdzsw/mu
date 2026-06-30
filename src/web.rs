@@ -17,6 +17,7 @@ use crate::paths;
 
 const MAX_REQUEST_BYTES: usize = 32 * 1024 * 1024;
 const MAX_TURN_EVENT_BUFFER: usize = 512;
+const GLOBAL_PROJECT_ID: &str = "__mu_global__";
 
 pub async fn serve(args: WebArgs, launch_cwd: PathBuf) -> Result<()> {
     let mode = parse_socket_mode(&args.socket_mode)?;
@@ -30,11 +31,13 @@ pub async fn serve(args: WebArgs, launch_cwd: PathBuf) -> Result<()> {
     let recent_projects = launch_project.iter().cloned().collect();
     let upload_root = paths::runtime_dir().join("web-uploads");
     paths::ensure_dir(&upload_root)?;
+    let global_home = global_scope_cwd();
 
     let state = Arc::new(WebState {
         exe: std::env::current_exe().context("resolving current executable")?,
         launch_cwd,
         launch_project,
+        global_home,
         recent_projects: Mutex::new(recent_projects),
         turns: Mutex::new(HashMap::new()),
         upload_root,
@@ -57,6 +60,7 @@ struct WebState {
     exe: PathBuf,
     launch_cwd: PathBuf,
     launch_project: Option<ProjectSummary>,
+    global_home: PathBuf,
     recent_projects: Mutex<Vec<ProjectSummary>>,
     turns: Mutex<HashMap<String, Arc<TurnRuntime>>>,
     upload_root: PathBuf,
@@ -82,6 +86,23 @@ struct TurnAcceptedResponse {
     turn: ActiveTurn,
 }
 
+#[derive(Clone, Default, Serialize)]
+struct PlainTurnSnapshot {
+    prompt: String,
+    assistant_text: String,
+    raw_events: Vec<serde_json::Value>,
+    stderr: String,
+    exit_code: Option<i32>,
+}
+
+#[derive(Clone, Serialize)]
+struct ActiveTurnView {
+    turn: ActiveTurn,
+    last_seq: u64,
+    completed: bool,
+    snapshot: PlainTurnSnapshot,
+}
+
 #[derive(Clone)]
 struct TurnEventEnvelope {
     seq: u64,
@@ -96,9 +117,33 @@ struct TurnRuntime {
 }
 
 struct TurnRuntimeState {
+    turn: ActiveTurn,
     events: VecDeque<TurnEventEnvelope>,
     next_seq: u64,
     completed: bool,
+    snapshot: PlainTurnSnapshot,
+}
+
+#[derive(Clone)]
+enum ScopeTarget {
+    Global,
+    Project(PathBuf),
+}
+
+impl ScopeTarget {
+    fn key(&self) -> String {
+        match self {
+            ScopeTarget::Global => GLOBAL_PROJECT_ID.into(),
+            ScopeTarget::Project(path) => path.display().to_string(),
+        }
+    }
+
+    fn current_dir<'a>(&'a self, state: &'a WebState) -> &'a Path {
+        match self {
+            ScopeTarget::Global => &state.global_home,
+            ScopeTarget::Project(path) => path.as_path(),
+        }
+    }
 }
 
 enum ReplayWindow {
@@ -112,19 +157,28 @@ enum ReplayWindow {
 }
 
 impl TurnRuntime {
-    fn new(turn: ActiveTurn) -> Arc<Self> {
+    fn new(turn: ActiveTurn, prompt: String) -> Arc<Self> {
         let initial = TurnEventEnvelope {
             seq: 1,
             event: "turn_start".into(),
             payload: json!({ "turn": turn.clone() }),
         };
+        let mut snapshot = PlainTurnSnapshot {
+            prompt,
+            ..PlainTurnSnapshot::default()
+        };
+        snapshot
+            .raw_events
+            .push(event_json(initial.seq, &initial.event, &initial.payload));
         let (signal, _) = watch::channel(initial.seq);
         Arc::new(Self {
-            turn,
+            turn: turn.clone(),
             state: Mutex::new(TurnRuntimeState {
+                turn,
                 events: VecDeque::from([initial]),
                 next_seq: 1,
                 completed: false,
+                snapshot,
             }),
             signal,
         })
@@ -135,9 +189,11 @@ impl TurnRuntime {
             let mut state = self.state.lock().await;
             state.next_seq += 1;
             let seq = state.next_seq;
+            let event = event.into();
+            apply_snapshot_event(&mut state.snapshot, seq, &event, &payload);
             state.events.push_back(TurnEventEnvelope {
                 seq,
-                event: event.into(),
+                event,
                 payload,
             });
             while state.events.len() > MAX_TURN_EVENT_BUFFER {
@@ -155,6 +211,16 @@ impl TurnRuntime {
 
     async fn is_completed(&self) -> bool {
         self.state.lock().await.completed
+    }
+
+    async fn current_view(&self) -> ActiveTurnView {
+        let state = self.state.lock().await;
+        ActiveTurnView {
+            turn: state.turn.clone(),
+            last_seq: state.next_seq,
+            completed: state.completed,
+            snapshot: state.snapshot.clone(),
+        }
     }
 
     async fn replay_after(&self, after: u64) -> ReplayWindow {
@@ -206,8 +272,6 @@ struct TurnRequest {
     prompt: String,
     #[serde(default)]
     model: Option<String>,
-    #[serde(default)]
-    effort: Option<String>,
     #[serde(default)]
     images: Vec<ImageUpload>,
 }
@@ -270,6 +334,19 @@ async fn route_request(
     state: Arc<WebState>,
     request: HttpRequest,
 ) -> Result<()> {
+    if request.method == "GET"
+        && let Some(asset) = static_asset(request.path.as_str())
+    {
+        return write_response(
+            stream,
+            200,
+            "OK",
+            &[("content-type", asset.content_type)],
+            asset.body.as_bytes(),
+        )
+        .await;
+    }
+
     match (request.method.as_str(), request.path.as_str()) {
         ("GET", "/") => {
             write_response(
@@ -281,26 +358,6 @@ async fn route_request(
             )
             .await
         }
-        ("GET", "/app.css") => {
-            write_response(
-                stream,
-                200,
-                "OK",
-                &[("content-type", "text/css; charset=utf-8")],
-                APP_CSS.as_bytes(),
-            )
-            .await
-        }
-        ("GET", "/app.js") => {
-            write_response(
-                stream,
-                200,
-                "OK",
-                &[("content-type", "text/javascript; charset=utf-8")],
-                APP_JS.as_bytes(),
-            )
-            .await
-        }
         ("GET", "/api/bootstrap") => {
             let recent = state.recent_projects.lock().await.clone();
             write_json_response(
@@ -309,6 +366,7 @@ async fn route_request(
                 "OK",
                 &json!({
                     "launch_cwd": state.launch_cwd.display().to_string(),
+                    "global_home": state.global_home.display().to_string(),
                     "launch_project": state.launch_project,
                     "recent_projects": recent,
                 }),
@@ -325,10 +383,10 @@ async fn route_request(
         }
         ("POST", "/api/projects/open") => open_project(stream, state, request).await,
         ("GET", "/api/sessions") => {
-            let project = project_query(&request)?;
+            let scope = scope_query(&request)?;
             let value = run_json_command(
                 &state,
-                Some(&project),
+                Some(&scope),
                 &["session", "list", "--all-origins", "--json"],
             )
             .await?;
@@ -336,28 +394,26 @@ async fn route_request(
         }
         ("POST", "/api/sessions") => create_session(stream, state, request).await,
         ("GET", "/api/status") => {
-            let project = project_query(&request)?;
+            let scope = scope_query(&request)?;
             let mut args = vec!["status", "--json"];
+            if query_flag(&request.query, "include_models") {
+                args.push("--include-models");
+            }
             if let Some(session) = request.query.get("session") {
                 args.push("--session");
                 args.push(session);
             }
-            let value = run_json_command(&state, Some(&project), &args).await?;
+            let value = run_json_command(&state, Some(&scope), &args).await?;
             write_json_response(stream, 200, "OK", &value).await
         }
-        ("GET", "/api/models") => {
-            let project = project_query(&request)?;
-            let value =
-                run_json_command(&state, Some(&project), &["models", "list", "--json"]).await?;
-            write_json_response(stream, 200, "OK", &value).await
-        }
+        ("GET", "/api/turns/active") => active_turn(stream, state, request).await,
         ("POST", "/api/turns") => create_turn(stream, state, request).await,
         _ => {
             if request.method == "GET"
                 && request.path.starts_with("/api/sessions/")
                 && request.path.ends_with("/messages")
             {
-                let project = project_query(&request)?;
+                let scope = scope_query(&request)?;
                 let session = request
                     .path
                     .trim_start_matches("/api/sessions/")
@@ -365,7 +421,7 @@ async fn route_request(
                     .trim_matches('/');
                 let value = run_json_command(
                     &state,
-                    Some(&project),
+                    Some(&scope),
                     &["session", "transcript", "--session", session, "--json"],
                 )
                 .await?;
@@ -446,13 +502,8 @@ async fn create_session(
     request: HttpRequest,
 ) -> Result<()> {
     let input: CreateSessionRequest = parse_json_body(&request)?;
-    let project = require_project(&input.project)?;
-    let value = run_json_command(
-        &state,
-        Some(&project),
-        &["session", "new", "--origin", "web", "--json"],
-    )
-    .await?;
+    let scope = parse_scope_target(&input.project)?;
+    let value = create_web_session(&state, &scope).await?;
     write_json_response(stream, 200, "OK", &value).await
 }
 
@@ -461,7 +512,7 @@ async fn create_turn(
     state: Arc<WebState>,
     request: HttpRequest,
 ) -> Result<()> {
-    let input: TurnRequest = parse_json_body(&request)?;
+    let mut input: TurnRequest = parse_json_body(&request)?;
     if input.prompt.trim().is_empty() {
         return write_json_response(
             stream,
@@ -471,9 +522,27 @@ async fn create_turn(
         )
         .await;
     }
-    let project = require_project(&input.project)?;
+    let scope = parse_scope_target(&input.project)?;
+    if let Some(session_id) = input.session_id.as_deref() {
+        if active_session(&state, &scope, session_id).await {
+            return write_json_response(
+                stream,
+                409,
+                "Conflict",
+                &json!({ "error": "session busy" }),
+            )
+            .await;
+        }
+    } else {
+        let session = create_web_session(&state, &scope).await?;
+        let session_id = session
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| anyhow::anyhow!("session creation response missing id"))?;
+        input.session_id = Some(session_id.to_string());
+    }
     if let Some(session_id) = input.session_id.as_deref()
-        && active_session(&state, &project, session_id).await
+        && active_session(&state, &scope, session_id).await
     {
         return write_json_response(stream, 409, "Conflict", &json!({ "error": "session busy" }))
             .await;
@@ -483,10 +552,14 @@ async fn create_turn(
 }
 
 async fn launch_turn(state: Arc<WebState>, input: TurnRequest) -> Result<ActiveTurn> {
-    let project = require_project(&input.project)?;
+    let scope = parse_scope_target(&input.project)?;
     let turn_id = uuid::Uuid::new_v4().to_string();
     let upload_dir = state.upload_root.join(&turn_id);
     let image_paths = save_uploads(&upload_dir, &input.images)?;
+    let session_id = input
+        .session_id
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("missing session id for turn launch"))?;
 
     let mut command = Command::new(&state.exe);
     command
@@ -494,18 +567,13 @@ async fn launch_turn(state: Arc<WebState>, input: TurnRequest) -> Result<ActiveT
         .arg("web")
         .arg("--output")
         .arg("json")
-        .current_dir(&project)
+        .current_dir(scope.current_dir(&state))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    if let Some(session_id) = input.session_id.as_deref() {
-        command.arg("--session").arg(session_id);
-    }
+    command.arg("--session").arg(&session_id);
     if let Some(model) = input.model.as_deref().filter(|value| !value.is_empty()) {
         command.arg("--model").arg(model);
-    }
-    if let Some(effort) = input.effort.as_deref().filter(|value| !value.is_empty()) {
-        command.arg("--effort").arg(effort);
     }
     for image in &image_paths {
         command.arg("--image").arg(image);
@@ -538,12 +606,12 @@ async fn launch_turn(state: Arc<WebState>, input: TurnRequest) -> Result<ActiveT
         .ok_or_else(|| anyhow::anyhow!("missing child stderr"))?;
     let turn = ActiveTurn {
         id: turn_id.clone(),
-        project: project.display().to_string(),
-        session_id: input.session_id.clone(),
+        project: scope.key(),
+        session_id: Some(session_id),
         started_at: chrono::Utc::now().to_rfc3339(),
         pgid: pid,
     };
-    let runtime = TurnRuntime::new(turn.clone());
+    let runtime = TurnRuntime::new(turn.clone(), input.prompt.clone());
     state.turns.lock().await.insert(turn_id, runtime.clone());
     tokio::spawn(run_turn_task(runtime, child, stdout, stderr, upload_dir));
     Ok(turn)
@@ -631,6 +699,24 @@ fn parse_child_turn_event(line: &str) -> Result<(String, serde_json::Value)> {
         .ok_or_else(|| anyhow::anyhow!("child JSON event missing event name"))?;
     let payload = event.get("payload").cloned().unwrap_or_else(|| json!({}));
     Ok((event_name.to_string(), payload))
+}
+
+async fn active_turn(
+    stream: &mut (impl AsyncRead + AsyncWrite + Unpin),
+    state: Arc<WebState>,
+    request: HttpRequest,
+) -> Result<()> {
+    let scope = scope_query(&request)?;
+    let session_id = request
+        .query
+        .get("session")
+        .ok_or_else(|| anyhow::anyhow!("missing session"))?;
+    let runtime = find_active_turn(&state, &scope, session_id).await;
+    let view = match runtime {
+        Some(runtime) => Some(runtime.current_view().await),
+        None => None,
+    };
+    write_json_response(stream, 200, "OK", &view).await
 }
 
 async fn stream_turn_events(
@@ -733,8 +819,54 @@ async fn abort_turn(
     write_json_response(stream, 200, "OK", &json!({ "ok": true })).await
 }
 
-async fn active_session(state: &WebState, project: &Path, session_id: &str) -> bool {
-    let project = project.display().to_string();
+async fn active_session(state: &WebState, scope: &ScopeTarget, session_id: &str) -> bool {
+    find_active_turn(state, scope, session_id).await.is_some()
+}
+
+async fn remember_project(state: &WebState, summary: ProjectSummary) {
+    let mut recent = state.recent_projects.lock().await;
+    recent.retain(|project| project.path != summary.path);
+    recent.insert(0, summary);
+    recent.truncate(20);
+}
+
+async fn run_json_command(
+    state: &WebState,
+    scope: Option<&ScopeTarget>,
+    args: &[&str],
+) -> Result<serde_json::Value> {
+    let mut command = Command::new(&state.exe);
+    if let Some(scope) = scope {
+        command.current_dir(scope.current_dir(state));
+    }
+    command
+        .args(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let output = command.output().await.context("running mu command")?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        bail!("{}", if stderr.is_empty() { stdout } else { stderr });
+    }
+    serde_json::from_slice(&output.stdout).context("parsing mu JSON output")
+}
+
+async fn create_web_session(state: &WebState, scope: &ScopeTarget) -> Result<serde_json::Value> {
+    run_json_command(
+        state,
+        Some(scope),
+        &["session", "new", "--origin", "web", "--json"],
+    )
+    .await
+}
+
+async fn find_active_turn(
+    state: &WebState,
+    scope: &ScopeTarget,
+    session_id: &str,
+) -> Option<Arc<TurnRuntime>> {
+    let project = scope.key();
     let turns = state
         .turns
         .lock()
@@ -750,51 +882,68 @@ async fn active_session(state: &WebState, project: &Path, session_id: &str) -> b
             continue;
         }
         if !turn.is_completed().await {
-            return true;
+            return Some(turn);
         }
     }
-    false
+    None
 }
 
-async fn remember_project(state: &WebState, summary: ProjectSummary) {
-    let mut recent = state.recent_projects.lock().await;
-    recent.retain(|project| project.path != summary.path);
-    recent.insert(0, summary);
-    recent.truncate(20);
+fn event_json(seq: u64, event: &str, payload: &serde_json::Value) -> serde_json::Value {
+    json!({
+        "seq": seq,
+        "event": event,
+        "payload": payload,
+    })
 }
 
-async fn run_json_command(
-    state: &WebState,
-    project: Option<&Path>,
-    args: &[&str],
-) -> Result<serde_json::Value> {
-    let mut command = Command::new(&state.exe);
-    if let Some(project) = project {
-        command.current_dir(project);
+fn apply_snapshot_event(
+    snapshot: &mut PlainTurnSnapshot,
+    seq: u64,
+    event: &str,
+    payload: &serde_json::Value,
+) {
+    snapshot.raw_events.push(event_json(seq, event, payload));
+    match event {
+        "assistant_delta" => {
+            if let Some(text) = payload.get("text").and_then(serde_json::Value::as_str) {
+                snapshot.assistant_text.push_str(text);
+            }
+        }
+        "stderr" => {
+            if let Some(text) = payload.get("text").and_then(serde_json::Value::as_str) {
+                if !snapshot.stderr.is_empty() {
+                    snapshot.stderr.push('\n');
+                }
+                snapshot.stderr.push_str(text);
+            }
+        }
+        "turn_finish" => {
+            snapshot.exit_code = payload
+                .get("exit_code")
+                .and_then(serde_json::Value::as_i64)
+                .map(|value| value as i32);
+        }
+        _ => {}
     }
-    command
-        .args(args)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    let output = command.output().await.context("running mu command")?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        bail!("{}", if stderr.is_empty() { stdout } else { stderr });
-    }
-    serde_json::from_slice(&output.stdout).context("parsing mu JSON output")
 }
 
 fn parse_json_body<T: for<'de> Deserialize<'de>>(request: &HttpRequest) -> Result<T> {
     serde_json::from_slice(&request.body).context("parsing request JSON")
 }
 
-fn project_query(request: &HttpRequest) -> Result<PathBuf> {
+fn scope_query(request: &HttpRequest) -> Result<ScopeTarget> {
     let project = request
         .query
         .get("project")
         .ok_or_else(|| anyhow::anyhow!("missing project"))?;
-    require_project(project)
+    parse_scope_target(project)
+}
+
+fn parse_scope_target(value: &str) -> Result<ScopeTarget> {
+    if value == GLOBAL_PROJECT_ID {
+        return Ok(ScopeTarget::Global);
+    }
+    Ok(ScopeTarget::Project(require_project(value)?))
 }
 
 fn require_project(path: &str) -> Result<PathBuf> {
@@ -847,6 +996,12 @@ fn marker_name(marker: paths::ProjectMarker) -> &'static str {
         paths::ProjectMarker::Mu => "mu",
         paths::ProjectMarker::Git => "git",
     }
+}
+
+fn global_scope_cwd() -> PathBuf {
+    std::env::var("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("/tmp"))
 }
 
 fn resolve_existing_dir(path: &Path) -> Result<PathBuf> {
@@ -1020,6 +1175,15 @@ fn parse_uri(uri: &str) -> (String, HashMap<String, String>) {
     (percent_decode(path), map)
 }
 
+fn query_flag(query: &HashMap<String, String>, key: &str) -> bool {
+    query.get(key).is_some_and(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    })
+}
+
 fn percent_decode(input: &str) -> String {
     let bytes = input.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
@@ -1127,6 +1291,131 @@ async fn write_sse_event<T: Serialize + ?Sized>(
 const INDEX_HTML: &str = include_str!("web/index.html");
 const APP_CSS: &str = include_str!("web/app.css");
 const APP_JS: &str = include_str!("web/app.js");
+const LIB_API_JS: &str = include_str!("web/lib/api.js");
+const LIB_CONSTANTS_JS: &str = include_str!("web/lib/constants.js");
+const LIB_DOM_JS: &str = include_str!("web/lib/dom.js");
+const LIB_ICONS_JS: &str = include_str!("web/lib/icons.js");
+const LIB_PROJECTS_JS: &str = include_str!("web/lib/projects.js");
+const LIB_STORE_JS: &str = include_str!("web/lib/store.js");
+const COMPONENT_COMPOSER_JS: &str = include_str!("web/components/mu-composer.js");
+const COMPONENT_CONVERSATION_JS: &str = include_str!("web/components/mu-conversation-view.js");
+const COMPONENT_MODAL_JS: &str = include_str!("web/components/mu-project-modal.js");
+const COMPONENT_SIDEBAR_JS: &str = include_str!("web/components/mu-sidebar.js");
+const STYLE_BASE_CSS: &str = include_str!("web/styles/base.css");
+const STYLE_COMPOSER_CSS: &str = include_str!("web/styles/composer.css");
+const STYLE_CONVERSATION_CSS: &str = include_str!("web/styles/conversation.css");
+const STYLE_LAYOUT_CSS: &str = include_str!("web/styles/layout.css");
+const STYLE_MODAL_CSS: &str = include_str!("web/styles/modal.css");
+const STYLE_SIDEBAR_CSS: &str = include_str!("web/styles/sidebar.css");
+const STYLE_TOKENS_CSS: &str = include_str!("web/styles/tokens.css");
+
+struct StaticAsset {
+    path: &'static str,
+    content_type: &'static str,
+    body: &'static str,
+}
+
+const STATIC_ASSETS: &[StaticAsset] = &[
+    StaticAsset {
+        path: "/app.css",
+        content_type: "text/css; charset=utf-8",
+        body: APP_CSS,
+    },
+    StaticAsset {
+        path: "/app.js",
+        content_type: "text/javascript; charset=utf-8",
+        body: APP_JS,
+    },
+    StaticAsset {
+        path: "/lib/api.js",
+        content_type: "text/javascript; charset=utf-8",
+        body: LIB_API_JS,
+    },
+    StaticAsset {
+        path: "/lib/constants.js",
+        content_type: "text/javascript; charset=utf-8",
+        body: LIB_CONSTANTS_JS,
+    },
+    StaticAsset {
+        path: "/lib/dom.js",
+        content_type: "text/javascript; charset=utf-8",
+        body: LIB_DOM_JS,
+    },
+    StaticAsset {
+        path: "/lib/icons.js",
+        content_type: "text/javascript; charset=utf-8",
+        body: LIB_ICONS_JS,
+    },
+    StaticAsset {
+        path: "/lib/projects.js",
+        content_type: "text/javascript; charset=utf-8",
+        body: LIB_PROJECTS_JS,
+    },
+    StaticAsset {
+        path: "/lib/store.js",
+        content_type: "text/javascript; charset=utf-8",
+        body: LIB_STORE_JS,
+    },
+    StaticAsset {
+        path: "/components/mu-composer.js",
+        content_type: "text/javascript; charset=utf-8",
+        body: COMPONENT_COMPOSER_JS,
+    },
+    StaticAsset {
+        path: "/components/mu-conversation-view.js",
+        content_type: "text/javascript; charset=utf-8",
+        body: COMPONENT_CONVERSATION_JS,
+    },
+    StaticAsset {
+        path: "/components/mu-project-modal.js",
+        content_type: "text/javascript; charset=utf-8",
+        body: COMPONENT_MODAL_JS,
+    },
+    StaticAsset {
+        path: "/components/mu-sidebar.js",
+        content_type: "text/javascript; charset=utf-8",
+        body: COMPONENT_SIDEBAR_JS,
+    },
+    StaticAsset {
+        path: "/styles/base.css",
+        content_type: "text/css; charset=utf-8",
+        body: STYLE_BASE_CSS,
+    },
+    StaticAsset {
+        path: "/styles/composer.css",
+        content_type: "text/css; charset=utf-8",
+        body: STYLE_COMPOSER_CSS,
+    },
+    StaticAsset {
+        path: "/styles/conversation.css",
+        content_type: "text/css; charset=utf-8",
+        body: STYLE_CONVERSATION_CSS,
+    },
+    StaticAsset {
+        path: "/styles/layout.css",
+        content_type: "text/css; charset=utf-8",
+        body: STYLE_LAYOUT_CSS,
+    },
+    StaticAsset {
+        path: "/styles/modal.css",
+        content_type: "text/css; charset=utf-8",
+        body: STYLE_MODAL_CSS,
+    },
+    StaticAsset {
+        path: "/styles/sidebar.css",
+        content_type: "text/css; charset=utf-8",
+        body: STYLE_SIDEBAR_CSS,
+    },
+    StaticAsset {
+        path: "/styles/tokens.css",
+        content_type: "text/css; charset=utf-8",
+        body: STYLE_TOKENS_CSS,
+    },
+];
+
+fn static_asset(path: &str) -> Option<&'static StaticAsset> {
+    STATIC_ASSETS.iter().find(|asset| asset.path == path)
+}
 
 #[cfg(test)]
 mod tests {
@@ -1144,6 +1433,7 @@ mod tests {
             exe,
             launch_cwd,
             launch_project,
+            global_home: global_scope_cwd(),
             recent_projects: Mutex::new(recent_projects),
             turns: Mutex::new(HashMap::new()),
             upload_root: std::env::temp_dir()
@@ -1184,6 +1474,10 @@ mod tests {
 
         assert!(response.starts_with("HTTP/1.1 200 OK"));
         assert_eq!(body["launch_cwd"], root.display().to_string());
+        assert_eq!(
+            body["global_home"],
+            global_scope_cwd().display().to_string()
+        );
         assert_eq!(body["launch_project"]["path"], root.display().to_string());
         assert_eq!(body["launch_project"]["marker"], "git");
         let _ = std::fs::remove_dir_all(root);
@@ -1197,10 +1491,30 @@ mod tests {
 
         assert!(response.starts_with("HTTP/1.1 200 OK"));
         assert!(response.contains("content-type: text/html; charset=utf-8"));
-        assert!(
-            response_body(&response)
-                .contains(r#"<div id="app" class="app" data-sidebar-open="false">"#)
-        );
+        assert!(response_body(&response).contains(
+            r#"<mu-sidebar id="sidebar" class="sidebar" aria-label="Left panel"></mu-sidebar>"#
+        ));
+    }
+
+    #[tokio::test]
+    async fn serves_split_static_assets_over_http_handler() {
+        let state = test_state(std::env::temp_dir());
+
+        let js = http_roundtrip(
+            state.clone(),
+            "GET /components/mu-sidebar.js HTTP/1.1\r\nhost: mu\r\n\r\n",
+        )
+        .await;
+        let css =
+            http_roundtrip(state, "GET /styles/layout.css HTTP/1.1\r\nhost: mu\r\n\r\n").await;
+
+        assert!(js.starts_with("HTTP/1.1 200 OK"));
+        assert!(js.contains("content-type: text/javascript; charset=utf-8"));
+        assert!(response_body(&js).contains("customElements.define(\"mu-sidebar\""));
+
+        assert!(css.starts_with("HTTP/1.1 200 OK"));
+        assert!(css.contains("content-type: text/css; charset=utf-8"));
+        assert!(response_body(&css).contains(".conversation-shell"));
     }
 
     #[tokio::test]
@@ -1300,13 +1614,16 @@ mod tests {
         let state = test_state(root.clone());
         state.turns.lock().await.insert(
             "turn-1".into(),
-            TurnRuntime::new(ActiveTurn {
-                id: "turn-1".into(),
-                project: root.display().to_string(),
-                session_id: Some("session-1".into()),
-                started_at: "2026-06-28T00:00:00Z".into(),
-                pgid: 1,
-            }),
+            TurnRuntime::new(
+                ActiveTurn {
+                    id: "turn-1".into(),
+                    project: root.display().to_string(),
+                    session_id: Some("session-1".into()),
+                    started_at: "2026-06-28T00:00:00Z".into(),
+                    pgid: 1,
+                },
+                "busy".into(),
+            ),
         );
         let body = json!({
             "project": root.display().to_string(),
@@ -1324,6 +1641,94 @@ mod tests {
 
         assert!(response.starts_with("HTTP/1.1 409 Conflict"));
         assert!(response_body(&response).contains("session busy"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn global_session_creation_uses_home_scope() {
+        let root = std::env::temp_dir().join(format!("mu-web-global-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        let fake = root.join("fake-mu");
+        std::fs::write(
+            &fake,
+            "#!/bin/sh\nprintf '{\"cwd\":\"%s\",\"ok\":true}\\n' \"$(pwd)\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let state = test_state_with_exe(root.clone(), fake);
+        let body = json!({ "project": GLOBAL_PROJECT_ID }).to_string();
+        let request = format!(
+            "POST /api/sessions HTTP/1.1\r\nhost: mu\r\ncontent-length: {}\r\ncontent-type: application/json\r\n\r\n{}",
+            body.len(),
+            body
+        );
+
+        let response = http_roundtrip(state, &request).await;
+        let payload = response_json(&response);
+
+        assert!(response.starts_with("HTTP/1.1 200 OK"));
+        assert_eq!(payload["cwd"], global_scope_cwd().display().to_string());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn create_turn_without_session_precreates_web_session_and_exposes_active_snapshot() {
+        let root = std::env::temp_dir().join(format!("mu-web-active-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        let fake = root.join("fake-mu");
+        std::fs::write(
+            &fake,
+            r#"#!/bin/sh
+if [ "$1" = "session" ] && [ "$2" = "new" ]; then
+  printf '%s\n' '{"id":"session-new","created_at":"2026-06-30T00:00:00Z","updated_at":"2026-06-30T00:00:00Z","cwd":"/tmp/work","model":"fake-model","effort":null,"title":null,"last_total_tokens":0,"cost_total":0,"origin":"web","archived":false,"message_count":1,"turn_count":0}'
+  exit 0
+fi
+cat >/dev/null
+printf '%s\n' '{"event":"assistant_delta","payload":{"text":"live"}}'
+sleep 0.2
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let state = test_state_with_exe(root.clone(), fake);
+        let prompt = "hello from web";
+        let body = json!({
+            "project": root.display().to_string(),
+            "prompt": prompt
+        })
+        .to_string();
+        let launch = http_roundtrip(
+            state.clone(),
+            &format!(
+                "POST /api/turns HTTP/1.1\r\nhost: mu\r\ncontent-length: {}\r\ncontent-type: application/json\r\n\r\n{}",
+                body.len(),
+                body
+            ),
+        )
+        .await;
+        let launched = response_json(&launch);
+        let active = http_roundtrip(
+            state,
+            &format!(
+                "GET /api/turns/active?project={}&session=session-new HTTP/1.1\r\nhost: mu\r\n\r\n",
+                percent_encode_component(&root.display().to_string())
+            ),
+        )
+        .await;
+        let payload = response_json(&active);
+
+        assert!(launch.starts_with("HTTP/1.1 200 OK"));
+        assert_eq!(launched["turn"]["session_id"], "session-new");
+        assert!(active.starts_with("HTTP/1.1 200 OK"));
+        assert_eq!(payload["turn"]["session_id"], "session-new");
+        assert_eq!(payload["snapshot"]["prompt"], prompt);
+        assert!(
+            payload["snapshot"]["raw_events"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|event| event["event"] == "turn_start")
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -1354,6 +1759,19 @@ mod tests {
         assert_eq!(path, "/api/status");
         assert_eq!(query.get("project").map(String::as_str), Some("/tmp/work"));
         assert_eq!(query.get("session").map(String::as_str), Some("a b"));
+    }
+
+    fn percent_encode_component(value: &str) -> String {
+        let mut out = String::new();
+        for byte in value.bytes() {
+            match byte {
+                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                    out.push(byte as char)
+                }
+                _ => out.push_str(&format!("%{:02X}", byte)),
+            }
+        }
+        out
     }
 
     #[test]
@@ -1391,9 +1809,14 @@ mod tests {
 
     #[test]
     fn static_app_contains_minimal_shell_and_bootstrap_hook() {
-        assert!(INDEX_HTML.contains(r#"data-slot="empty-chat-view""#));
+        assert!(INDEX_HTML.contains(r#"mu-conversation-view"#));
         assert!(INDEX_HTML.contains(r#"aria-label="Left panel""#));
-        assert!(APP_CSS.contains("width: min(100%, 400px)"));
+        assert!(APP_CSS.contains("@import url(\"/styles/layout.css\")"));
+        assert!(APP_JS.contains("components/mu-sidebar.js"));
+        assert!(INDEX_HTML.contains(r#"type="module" src="/app.js""#));
         assert!(APP_JS.contains("/api/bootstrap"));
+        assert!(INDEX_HTML.contains(r#"id="project-modal""#));
+        assert!(LIB_CONSTANTS_JS.contains(GLOBAL_PROJECT_ID));
+        assert!(COMPONENT_SIDEBAR_JS.contains("customElements.define(\"mu-sidebar\""));
     }
 }
