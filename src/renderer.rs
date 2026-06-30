@@ -35,9 +35,11 @@ pub struct Renderer {
     stderr: io::Stderr,
     stdout_at_line_start: bool,
     trailing_newlines: usize,
+    has_committed_stdout: bool,
     styled: bool,
     format: OutputFormat,
     markdown: MarkdownStream,
+    assistant_block_open: bool,
     live_line: Option<LiveLine>,
     live_line_rendered: bool,
     reasoning: Option<ReasoningState>,
@@ -66,8 +68,10 @@ impl Renderer {
             stderr: io::stderr(),
             stdout_at_line_start: true,
             trailing_newlines: 0,
+            has_committed_stdout: false,
             format,
             markdown: MarkdownStream::default(),
+            assistant_block_open: false,
             live_line: None,
             live_line_rendered: false,
             reasoning: None,
@@ -89,7 +93,7 @@ impl Renderer {
             return self.write_json("assistant_delta", serde_json::json!({ "text": text }));
         }
         if !self.styled {
-            return self.write_stdout(text);
+            return self.write_stdout_committed(text);
         }
 
         let blocks = self.markdown.push(text);
@@ -98,6 +102,10 @@ impl Renderer {
         }
 
         for block in blocks {
+            if !self.assistant_block_open {
+                self.ensure_block_separator_if_needed()?;
+                self.assistant_block_open = true;
+            }
             let rendered = render_markdown(&block);
             self.write_committed(&rendered)?;
         }
@@ -106,8 +114,13 @@ impl Renderer {
 
     pub fn assistant_end(&mut self) -> io::Result<()> {
         let Some(block) = self.markdown.finish() else {
+            self.assistant_block_open = false;
             return Ok(());
         };
+        if self.styled && !self.assistant_block_open {
+            self.ensure_block_separator_if_needed()?;
+        }
+        self.assistant_block_open = false;
         let rendered = render_markdown(&block);
         self.write_committed(&rendered)?;
         self.render_live_line()
@@ -117,6 +130,7 @@ impl Renderer {
         if !self.styled {
             return Ok(());
         }
+        self.assistant_block_open = false;
         self.reasoning = Some(ReasoningState {
             started: Instant::now(),
             reasoning_chars: 0,
@@ -163,7 +177,7 @@ impl Renderer {
         );
         reasoning.committed = true;
         self.live_line = None;
-        self.ensure_blank_line_before_next_block()?;
+        self.ensure_block_separator_if_needed()?;
         self.write_committed(&line)
     }
 
@@ -171,6 +185,7 @@ impl Renderer {
         if !self.styled {
             return Ok(());
         }
+        self.assistant_block_open = false;
         self.live_line = Some(LiveLine::ToolComposition);
         self.render_live_line()
     }
@@ -205,11 +220,12 @@ impl Renderer {
         if name != "bash" {
             return Ok(());
         }
+        self.assistant_block_open = false;
         if self.styled {
             self.reasoning_end(None)?;
         }
         if self.styled {
-            self.ensure_blank_line_before_next_block()?;
+            self.ensure_block_separator_if_needed()?;
         } else {
             self.ensure_line_start()?;
         }
@@ -252,7 +268,7 @@ impl Renderer {
         }
         let sanitized = strip_ansi(text);
         if !self.styled {
-            return self.write_stdout(&sanitized);
+            return self.write_stdout_committed(&sanitized);
         }
         let Some(preview) = self.bash_preview.as_mut() else {
             return self.write_committed(&format!("{GRAY}{sanitized}{RESET}"));
@@ -294,7 +310,7 @@ impl Renderer {
             return Ok(());
         }
         self.ensure_line_start()?;
-        self.write_stdout(&terminal_trim_committed_text(&text))
+        self.write_stdout_committed(&terminal_trim_committed_text(&text))
     }
 
     pub fn tool_failed(
@@ -328,7 +344,7 @@ impl Renderer {
         } else {
             format!("[error] {name} failed: {error} ({elapsed})\n")
         };
-        self.write_stdout(&terminal_trim_committed_text(&line))
+        self.write_stdout_committed(&terminal_trim_committed_text(&line))
     }
 
     pub fn guardrail_verdict(
@@ -351,7 +367,12 @@ impl Renderer {
                 }),
             );
         }
-        self.ensure_line_start()?;
+        self.assistant_block_open = false;
+        if self.styled {
+            self.ensure_block_separator_if_needed()?;
+        } else {
+            self.ensure_line_start()?;
+        }
         let verdict = if allowed { "allow" } else { "deny" };
         let script_preview = script.lines().next().unwrap_or(script);
         let script_preview = if script_preview.len() > 120 {
@@ -373,7 +394,7 @@ impl Renderer {
                 "[guardrail: {verdict}] risk={risk_level} auth={user_auth_level} — {reason}\n  {script_preview}\n"
             )
         };
-        self.write_stdout(&terminal_trim_committed_text(&line))
+        self.write_stdout_committed(&terminal_trim_committed_text(&line))
     }
 
     pub fn error(&mut self, msg: &str) -> io::Result<()> {
@@ -388,8 +409,13 @@ impl Renderer {
         if self.format == OutputFormat::Json {
             return self.write_json("notice", serde_json::json!({ "message": msg }));
         }
-        self.ensure_line_start()?;
-        self.write_stdout(&terminal_trim_committed_text(&format!("{msg}\n")))
+        self.assistant_block_open = false;
+        if self.styled {
+            self.ensure_block_separator_if_needed()?;
+        } else {
+            self.ensure_line_start()?;
+        }
+        self.write_stdout_committed(&terminal_trim_committed_text(&format!("{msg}\n")))
     }
 
     /// Ensure stdout ends on a fresh line so the next shell prompt does not
@@ -423,11 +449,19 @@ impl Renderer {
         if !self.stderr.is_terminal() {
             return Ok(());
         }
-        writeln!(
-            self.stderr,
-            "{}",
-            format_turn_summary(prompt_tokens, completion_tokens, context_pct, cost)
-        )?;
+        if self.styled {
+            write!(
+                self.stderr,
+                "{}\n\n",
+                format_turn_summary(prompt_tokens, completion_tokens, context_pct, cost)
+            )?;
+        } else {
+            writeln!(
+                self.stderr,
+                "{}",
+                format_turn_summary(prompt_tokens, completion_tokens, context_pct, cost)
+            )?;
+        }
         self.stderr.flush()
     }
 
@@ -463,6 +497,14 @@ impl Renderer {
         self.write_stdout(&"\n".repeat(needed))
     }
 
+    fn ensure_block_separator_if_needed(&mut self) -> io::Result<()> {
+        self.clear_live_line()?;
+        if !self.has_committed_stdout {
+            return Ok(());
+        }
+        self.ensure_blank_line_before_next_block()
+    }
+
     fn render_live_line(&mut self) -> io::Result<()> {
         let Some(line) = self.format_live_line() else {
             return Ok(());
@@ -472,8 +514,11 @@ impl Renderer {
         }
         if self.live_line_rendered {
             self.stdout.write_all(b"\r\x1b[2K")?;
-        } else if matches!(self.live_line, Some(LiveLine::Thinking)) {
-            self.ensure_blank_line_before_next_block()?;
+        } else if matches!(
+            self.live_line,
+            Some(LiveLine::Thinking | LiveLine::ToolComposition)
+        ) {
+            self.ensure_block_separator_if_needed()?;
         } else if !self.stdout_at_line_start {
             self.write_stdout("\n")?;
         }
@@ -539,19 +584,19 @@ impl Renderer {
         self.live_line = None;
         if snapshot.head_rendered.len() > preview.committed_head_len {
             let next = snapshot.head_rendered[preview.committed_head_len..].to_string();
-            self.write_stdout(&format!(
+            self.write_stdout_committed(&format!(
                 "{GRAY}{}{RESET}",
                 terminal_trim_committed_text(&next)
             ))?;
         }
         if snapshot.omitted_lines > 0 || snapshot.omitted_bytes > 0 {
-            self.write_stdout(&terminal_trim_committed_text(&format!(
+            self.write_stdout_committed(&terminal_trim_committed_text(&format!(
                 "{}\n",
                 format_omitted_line(snapshot.omitted_lines, snapshot.omitted_bytes)
             )))?;
         }
         if !snapshot.tail_rendered.is_empty() {
-            self.write_stdout(&format!(
+            self.write_stdout_committed(&format!(
                 "{GRAY}{}{RESET}",
                 terminal_trim_committed_text(&snapshot.tail_rendered)
             ))?;
@@ -561,11 +606,19 @@ impl Renderer {
 
     fn write_committed(&mut self, text: &str) -> io::Result<()> {
         if !self.styled {
-            return self.write_stdout(text);
+            return self.write_stdout_committed(text);
         }
         self.clear_live_line()?;
-        self.write_stdout(&terminal_trim_committed_text(text))?;
+        self.write_stdout_committed(&terminal_trim_committed_text(text))?;
         self.render_live_line()
+    }
+
+    fn write_stdout_committed(&mut self, text: &str) -> io::Result<()> {
+        self.write_stdout(text)?;
+        if !text.is_empty() {
+            self.has_committed_stdout = true;
+        }
+        Ok(())
     }
 
     fn write_stdout(&mut self, text: &str) -> io::Result<()> {
@@ -1261,7 +1314,7 @@ fn format_thought_line(
     let tokens = usage
         .map(|(_, completion_tokens)| completion_tokens.to_string())
         .unwrap_or_else(|| format!("~{}", approx_tokens_from_chars(reasoning_chars)));
-    format!("{GRAY}[thought {elapsed}, {tokens} tokens]{RESET}\n\n")
+    format!("{GRAY}[thought {elapsed}, {tokens} tokens]{RESET}\n")
 }
 
 fn format_omitted_line(omitted_lines: usize, omitted_bytes: usize) -> String {

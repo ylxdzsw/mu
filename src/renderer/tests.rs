@@ -1,4 +1,5 @@
 use std::os::fd::RawFd;
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 use serde_json::json;
@@ -108,7 +109,7 @@ fn bash_header_renders_title_and_risk_colored_script_without_risk_label() {
 #[test]
 fn short_reasoning_trace_still_formats_a_thought_line() {
     let line = format_thought_line(Duration::from_millis(300), 3, None);
-    assert_eq!(line, "\x1b[90m[thought 300ms, ~1 tokens]\x1b[0m\n\n");
+    assert_eq!(line, "\x1b[90m[thought 300ms, ~1 tokens]\x1b[0m\n");
 }
 
 #[test]
@@ -172,7 +173,7 @@ fn terminal_trimming_only_removes_committed_line_suffixes() {
 
 #[test]
 fn pty_transcript_shows_live_placeholder_and_omission_updates() {
-    let raw = capture_renderer_pty_transcript(false, Duration::from_secs(12));
+    let raw = capture_renderer_pty_transcript(false, Duration::from_secs(12), None);
     let normalized = strip_ansi(&raw.replace('\r', ""))
         .lines()
         .map(|line| line.trim_end())
@@ -192,9 +193,9 @@ fn pty_transcript_shows_live_placeholder_and_omission_updates() {
     assert!(!normalized.contains("line04"));
     assert!(normalized.contains("line39"));
     assert!(normalized.contains("line40"));
-    assert!(!normalized.contains("\n$\n"));
+    assert!(normalized.contains("\n\n$"));
     assert!(!normalized.ends_with("\n\n"));
-    assert!(normalized.contains("\n\n[thought"));
+    assert!(normalized.starts_with("[thought"));
     assert!(normalized.contains("5 tokens]"));
 }
 
@@ -215,21 +216,45 @@ fn includes_cost_when_available() {
 
 #[test]
 fn terminal_bell_is_emitted_after_summary_when_enabled() {
-    let raw = capture_renderer_pty_transcript(true, Duration::from_secs(12));
+    let raw = capture_renderer_pty_transcript(true, Duration::from_secs(12), None);
 
     assert!(raw.contains("[mu] tokens: 12 in / 5 out  context: 25%"));
-    assert!(raw.ends_with("\r\n\x07"));
+    assert!(raw.ends_with("\r\n\r\n\x07"));
 }
 
 #[test]
 fn terminal_bell_is_suppressed_below_threshold() {
-    let raw = capture_renderer_pty_transcript(true, Duration::from_secs(2));
+    let raw = capture_renderer_pty_transcript(true, Duration::from_secs(2), None);
 
     assert!(raw.contains("[mu] tokens: 12 in / 5 out  context: 25%"));
     assert!(!raw.ends_with("\x07"));
 }
 
-fn capture_renderer_pty_transcript(bell_enabled: bool, turn_elapsed: Duration) -> String {
+#[test]
+fn pty_transcript_keeps_one_blank_line_between_thought_and_assistant() {
+    let raw = capture_assistant_after_thought_transcript();
+    let normalized = strip_ansi(&raw);
+
+    assert!(normalized.contains("[thought"));
+    assert!(normalized.contains("5 tokens]"));
+    assert!(normalized.contains("\r\n\r\nHello world"));
+}
+
+#[test]
+fn terminal_summary_leaves_a_blank_line_before_the_next_prompt() {
+    let raw = capture_renderer_pty_transcript(false, Duration::from_secs(12), Some("mu> "));
+    let normalized = strip_ansi(&raw.replace('\r', ""));
+
+    assert!(normalized.contains("[mu] tokens: 12 in / 5 out  context: 25%\n\nmu> "));
+    assert!(!normalized.contains("[mu] tokens: 12 in / 5 out  context: 25%\n\n\nmu> "));
+}
+
+fn capture_renderer_pty_transcript(
+    bell_enabled: bool,
+    turn_elapsed: Duration,
+    trailing_prompt: Option<&str>,
+) -> String {
+    let _guard = pty_test_lock().lock().unwrap();
     let mut master: RawFd = -1;
     let mut slave: RawFd = -1;
     unsafe {
@@ -292,6 +317,13 @@ fn capture_renderer_pty_transcript(bell_enabled: bool, turn_elapsed: Duration) -
             renderer.finish_turn().unwrap();
             renderer.turn_summary(12, 5, Some(25.0), None).unwrap();
             renderer.turn_done_bell(turn_elapsed).unwrap();
+            if let Some(prompt) = trailing_prompt {
+                let bytes = prompt.as_bytes();
+                assert_eq!(
+                    libc::write(libc::STDOUT_FILENO, bytes.as_ptr().cast(), bytes.len()),
+                    bytes.len() as isize
+                );
+            }
             libc::_exit(0);
         }
 
@@ -312,4 +344,63 @@ fn capture_renderer_pty_transcript(bell_enabled: bool, turn_elapsed: Duration) -
         assert_eq!(libc::WEXITSTATUS(status), 0);
         String::from_utf8_lossy(&out).into_owned()
     }
+}
+
+fn capture_assistant_after_thought_transcript() -> String {
+    let _guard = pty_test_lock().lock().unwrap();
+    let mut master: RawFd = -1;
+    let mut slave: RawFd = -1;
+    unsafe {
+        assert_eq!(
+            libc::openpty(
+                &mut master,
+                &mut slave,
+                std::ptr::null_mut(),
+                std::ptr::null(),
+                std::ptr::null(),
+            ),
+            0
+        );
+        let pid = libc::fork();
+        assert!(pid >= 0);
+        if pid == 0 {
+            libc::close(master);
+            assert_eq!(libc::dup2(slave, libc::STDOUT_FILENO), libc::STDOUT_FILENO);
+            assert_eq!(libc::dup2(slave, libc::STDERR_FILENO), libc::STDERR_FILENO);
+            if slave > libc::STDERR_FILENO {
+                libc::close(slave);
+            }
+
+            let mut renderer = Renderer::with_format(OutputFormat::Terminal);
+            renderer.reasoning_start().unwrap();
+            renderer.reasoning_delta("plan").unwrap();
+            std::thread::sleep(Duration::from_millis(40));
+            renderer.reasoning_end(Some((12, 5))).unwrap();
+            renderer.assistant_text("Hello world\n").unwrap();
+            renderer.finish_turn().unwrap();
+            libc::_exit(0);
+        }
+
+        libc::close(slave);
+        let mut out = Vec::new();
+        let mut buf = [0u8; 4096];
+        loop {
+            let n = libc::read(master, buf.as_mut_ptr().cast(), buf.len());
+            if n <= 0 {
+                break;
+            }
+            out.extend_from_slice(&buf[..n as usize]);
+        }
+        libc::close(master);
+        let mut status = 0;
+        assert_eq!(libc::waitpid(pid, &mut status, 0), pid);
+        assert!(libc::WIFEXITED(status));
+        assert_eq!(libc::WEXITSTATUS(status), 0);
+        String::from_utf8_lossy(&out).into_owned()
+    }
+}
+
+fn pty_test_lock() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
 }

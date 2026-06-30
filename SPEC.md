@@ -748,6 +748,29 @@ tables. When stdout is piped or redirected, assistant deltas pass through
 byte-for-byte as the model produced them, preserving raw Markdown for
 downstream consumers.
 
+### 5.1 TTY block-spacing contract
+
+Terminal output is structured as a sequence of top-level transcript blocks:
+assistant text, committed thought lines, bash tool blocks, notices, and similar
+human-facing sections. The renderer owns the spacing contract for those blocks.
+
+- Top-level transcript blocks are separated by exactly one empty line.
+- The *next* top-level block owns that separator. Committed block formatters
+  should end with exactly one newline; they must not rely on trailing blank
+  lines baked into their own text.
+- Live status lines such as the updating `[thought ...]` line or the tool
+  composition placeholder may reserve the top separator on first render, but
+  subsequent ticks only redraw that one mutable trailing line.
+- A bash tool block includes its header, streamed preview/output, omission
+  marker, and final exit line; those pieces are not separated from each other by
+  extra blank lines.
+- At normal turn completion, the renderer leaves exactly one empty line between
+  the final turn output (including the stderr summary line) and the next shell
+  prompt.
+
+This contract is terminal-only. Plain and JSON output remain sequential,
+portable renderings without terminal spacing rules or control sequences.
+
 **Stream routing (explicit).** The conversation transcript goes to **stdout**:
 tool presentation, tool failures, Bash output, and assistant text. Fatal process
 errors and the turn summary go to **stderr**. Thus `mu <<< prompt > out.txt`
@@ -783,7 +806,8 @@ optional per-model rates in `config.jsonc` (omitted if no rates configured).
 This is the *only* stderr output in the normal case. It appears after all
 stdout, and goes to stderr so it stays out of a captured stdout transcript. It
 is suppressed if stderr is not a TTY (piped/redirected), since it would pollute
-log files.
+log files. In terminal mode it is followed by one blank line so the next shell
+prompt is visually separated from the completed turn.
 
 Plain and JSON modes avoid terminal-only summaries and control sequences so they
 remain suitable for scripts. Human terminal mode may show progress for
