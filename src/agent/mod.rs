@@ -11,9 +11,7 @@ use crate::compaction;
 use crate::config::Config;
 use crate::guardrail::{Guardrail, GuardrailOutcome, bash_risk};
 use crate::models::RequestOptions;
-use crate::provider::{
-    FinishReason, Message, Provider, ProviderError, StreamEvent, ToolCall, UserContent,
-};
+use crate::provider::{FinishReason, Message, Provider, ProviderError, StreamEvent, ToolCall};
 use crate::renderer::Renderer;
 use crate::store::{ReviewRecord, Store, ToolCallRecord};
 use crate::tools::bash::{self, RunningBash};
@@ -44,11 +42,10 @@ pub struct AgentLoop<'a> {
     pub renderer: &'a mut Renderer,
     pub state_dir: &'a Path,
     pub system_prompt: String,
-    pub attachments: Vec<crate::provider::ContentPart>,
 }
 
 impl<'a> AgentLoop<'a> {
-    pub async fn run_turn(&mut self, prompt: &str) -> Result<TurnResult> {
+    pub async fn run_turn(&mut self) -> Result<TurnResult> {
         bash::reset_cancellation_state();
         bash::install_signal_forwarder();
         compaction::maybe_compact(
@@ -68,29 +65,7 @@ impl<'a> AgentLoop<'a> {
             None
         };
 
-        let mut context = self.store.load_context_messages(self.session_id)?;
-        context.insert(
-            0,
-            Message::System {
-                content: self.system_prompt.clone(),
-            },
-        );
-
-        let user_msg = if self.attachments.is_empty() {
-            Message::User {
-                content: UserContent::Text(prompt.to_string()),
-            }
-        } else {
-            let mut parts = vec![crate::provider::ContentPart::Text {
-                text: prompt.to_string(),
-            }];
-            parts.extend(self.attachments.clone());
-            Message::User {
-                content: UserContent::Parts(parts),
-            }
-        };
-        self.store.append_message(self.session_id, &user_msg)?;
-        context.push(user_msg);
+        let mut context = self.load_pending_context()?;
 
         let registry = ToolRegistry::new(self.config);
         let tools = registry.definitions();
@@ -100,62 +75,82 @@ impl<'a> AgentLoop<'a> {
         let mut total_completion: u64 = 0;
         let mut final_total: u64 = 0;
         let mut overflow_retries: u32 = 0;
+        let mut live_provider_retries: u32 = 0;
         const MAX_OVERFLOW_RETRIES: u32 = 3;
+        const MAX_LIVE_PROVIDER_RETRIES: u32 = 3;
 
         for iteration in 0..max_iter {
-            let mut on_stream_event = |event: StreamEvent| -> Result<(), ProviderError> {
-                let result = match event {
-                    StreamEvent::TextDelta(text) => self.renderer.assistant_text(&text),
-                    StreamEvent::ReasoningStart => self.renderer.reasoning_start(),
-                    StreamEvent::ReasoningDelta(text) => self.renderer.reasoning_delta(&text),
-                    StreamEvent::ReasoningEnd => self.renderer.reasoning_end(None),
-                    StreamEvent::ToolCallStart => self.renderer.tool_call_composition_start(),
-                    StreamEvent::Tick => self.renderer.thinking_tick(),
+            let stream_result = loop {
+                let mut on_stream_event = |event: StreamEvent| -> Result<(), ProviderError> {
+                    let result = match event {
+                        StreamEvent::TextDelta(text) => self.renderer.assistant_text(&text),
+                        StreamEvent::ReasoningStart => self.renderer.reasoning_start(),
+                        StreamEvent::ReasoningDelta(text) => self.renderer.reasoning_delta(&text),
+                        StreamEvent::ReasoningEnd => self.renderer.reasoning_end(None),
+                        StreamEvent::ToolCallStart => self.renderer.tool_call_composition_start(),
+                        StreamEvent::Tick => self.renderer.thinking_tick(),
+                    };
+                    result.map_err(|e| ProviderError::Other(e.to_string()))
                 };
-                result.map_err(|e| ProviderError::Other(e.to_string()))
-            };
-            let result = self
-                .provider
-                .stream_chat(&self.request, &context, &tools, &mut on_stream_event)
-                .await;
-            self.renderer.assistant_end()?;
-            match &result {
-                Ok(stream_result) => {
-                    let usage = stream_result
-                        .usage
-                        .as_ref()
-                        .map(|u| (u.prompt_tokens, u.completion_tokens));
-                    self.renderer.reasoning_end(usage)?;
+                let result = self
+                    .provider
+                    .stream_chat(&self.request, &context, &tools, &mut on_stream_event)
+                    .await;
+                self.renderer.assistant_end()?;
+                match &result {
+                    Ok(stream_result) => {
+                        let usage = stream_result
+                            .usage
+                            .as_ref()
+                            .map(|u| (u.prompt_tokens, u.completion_tokens));
+                        self.renderer.reasoning_end(usage)?;
+                    }
+                    Err(_) => self.renderer.cancel_live_state()?,
                 }
-                Err(_) => self.renderer.cancel_live_state()?,
-            }
-
-            let stream_result = match result {
-                Ok(r) => r,
-                Err(ProviderError::ContextLength) if overflow_retries < MAX_OVERFLOW_RETRIES => {
-                    overflow_retries += 1;
-                    compaction::run_compaction(
-                        self.store,
-                        self.config,
-                        self.session_id,
-                        &self.request,
-                        self.provider.as_ref(),
-                        &self.system_prompt,
-                    )
-                    .await?;
-                    context = self.store.load_context_messages(self.session_id)?;
-                    context.insert(
-                        0,
-                        Message::System {
-                            content: self.system_prompt.clone(),
-                        },
-                    );
-                    continue;
+                match result {
+                    Ok(r) => break r,
+                    Err(ProviderError::ContextLength)
+                        if overflow_retries < MAX_OVERFLOW_RETRIES =>
+                    {
+                        overflow_retries += 1;
+                        compaction::run_compaction(
+                            self.store,
+                            self.config,
+                            self.session_id,
+                            &self.request,
+                            self.provider.as_ref(),
+                            &self.system_prompt,
+                        )
+                        .await?;
+                        context = self.load_pending_context()?;
+                    }
+                    Err(ProviderError::ContextLength) => {
+                        bail!("context length exceeded even after compaction");
+                    }
+                    Err(error)
+                        if error.retryable_for_live_turn()
+                            && live_provider_retries < MAX_LIVE_PROVIDER_RETRIES =>
+                    {
+                        live_provider_retries += 1;
+                        let retry_count =
+                            self.store.increment_pending_retry_count(self.session_id)?;
+                        let pending =
+                            self.store.pending_turn(self.session_id)?.ok_or_else(|| {
+                                anyhow::anyhow!(
+                                    "session missing pending turn during provider retry recovery"
+                                )
+                            })?;
+                        self.renderer.turn_retry(
+                            "auto",
+                            retry_count,
+                            Some(MAX_LIVE_PROVIDER_RETRIES as u64),
+                            pending.checkpoint_message_id,
+                            &error.to_string(),
+                        )?;
+                        context = self.load_pending_context()?;
+                    }
+                    Err(e) => bail!("provider error: {e}"),
                 }
-                Err(ProviderError::ContextLength) => {
-                    bail!("context length exceeded even after compaction");
-                }
-                Err(e) => bail!("provider error: {e}"),
             };
 
             if let Some(u) = &stream_result.usage {
@@ -166,7 +161,7 @@ impl<'a> AgentLoop<'a> {
 
             let msg_id = self
                 .store
-                .append_message(self.session_id, &stream_result.message)?;
+                .advance_pending_checkpoint_with_message(self.session_id, &stream_result.message)?;
             context.push(stream_result.message.clone());
 
             match stream_result.finish_reason {
@@ -389,6 +384,23 @@ impl<'a> AgentLoop<'a> {
         })
     }
 
+    fn load_pending_context(&self) -> Result<Vec<Message>> {
+        let checkpoint_message_id = self
+            .store
+            .pending_turn(self.session_id)?
+            .map(|pending| pending.checkpoint_message_id);
+        let mut context = self
+            .store
+            .load_context_messages_until(self.session_id, checkpoint_message_id)?;
+        context.insert(
+            0,
+            Message::System {
+                content: self.system_prompt.clone(),
+            },
+        );
+        Ok(context)
+    }
+
     fn persist_tool_result(
         &mut self,
         message_id: i64,
@@ -425,21 +437,23 @@ impl<'a> AgentLoop<'a> {
         };
 
         let risk = tool_call_risk(&call.function.arguments);
-        self.store.record_tool_call(ToolCallRecord {
-            message_id,
-            id: &call.id,
-            tool: &call.function.name,
-            args: &call.function.arguments,
-            risk: risk.as_deref(),
-            output: &output,
-            status,
-        })?;
-
         let message = Message::Tool {
-            content: output,
+            content: output.clone(),
             tool_call_id: call.id.clone(),
         };
-        self.store.append_message(self.session_id, &message)?;
+        self.store.persist_tool_result(
+            self.session_id,
+            ToolCallRecord {
+                message_id,
+                id: &call.id,
+                tool: &call.function.name,
+                args: &call.function.arguments,
+                risk: risk.as_deref(),
+                output: &output,
+                status,
+            },
+            &output,
+        )?;
         context.push(message);
         Ok(())
     }
@@ -674,11 +688,17 @@ mod tests {
         CompactionConfig, GuardrailConfig, LimitsConfig, ProviderConfig, RedactionConfig,
         TerminalBellConfig,
     };
-    use crate::provider::{FinishReason, FunctionCall, ProviderError, StreamResult, Usage};
+    use crate::provider::{
+        FinishReason, FunctionCall, ProviderError, StreamResult, Usage, UserContent,
+    };
 
     struct ToolThenStopProvider {
         step: Mutex<usize>,
         cwd: String,
+    }
+
+    struct RetryThenStopProvider {
+        step: Mutex<usize>,
     }
 
     #[async_trait(?Send)]
@@ -744,6 +764,39 @@ mod tests {
                     })
                 }
                 other => panic!("unexpected provider step {other}"),
+            }
+        }
+    }
+
+    #[async_trait(?Send)]
+    impl Provider for RetryThenStopProvider {
+        async fn stream_chat(
+            &self,
+            _request: &RequestOptions,
+            _messages: &[Message],
+            _tools: &[Value],
+            _on_event: &mut dyn FnMut(crate::provider::StreamEvent) -> Result<(), ProviderError>,
+        ) -> Result<StreamResult, ProviderError> {
+            let mut step = self.step.lock().unwrap();
+            let current = *step;
+            *step += 1;
+            match current {
+                0 => Err(ProviderError::RateLimit {
+                    message: "slow down".into(),
+                }),
+                1 => Ok(StreamResult {
+                    message: Message::Assistant {
+                        content: Some("done".into()),
+                        tool_calls: None,
+                    },
+                    finish_reason: FinishReason::Stop,
+                    usage: Some(Usage {
+                        prompt_tokens: 1,
+                        completion_tokens: 1,
+                        total_tokens: 2,
+                    }),
+                }),
+                other => panic!("unexpected retry provider step {other}"),
             }
         }
     }
@@ -818,11 +871,65 @@ mod tests {
             renderer: &mut renderer,
             state_dir: &tmp,
             system_prompt: "system".into(),
-            attachments: Vec::new(),
         };
 
-        agent.run_turn("run both").await.unwrap();
+        store
+            .begin_pending_turn(&session.id, &UserContent::Text("run both".into()))
+            .unwrap();
+
+        agent.run_turn().await.unwrap();
         (store, session.id)
+    }
+
+    #[tokio::test]
+    async fn live_provider_retry_reuses_pending_checkpoint() {
+        let tmp = std::env::temp_dir().join(format!("mu-agent-retry-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let store = Store::open(&tmp.join("mu.db")).unwrap();
+        let session = store.create_session("/tmp", "test/fake-model").unwrap();
+        let config = test_config();
+        let request_model = crate::models::resolve_model_ref(&config, "test/fake-model").unwrap();
+        store
+            .begin_pending_turn(&session.id, &UserContent::Text("retry me".into()))
+            .unwrap();
+        let provider = Arc::new(RetryThenStopProvider {
+            step: Mutex::new(0),
+        });
+        let mut renderer = Renderer::with_format(OutputFormat::Json);
+        let mut agent = AgentLoop {
+            config: &config,
+            provider,
+            store: &store,
+            session_id: &session.id,
+            request: RequestOptions {
+                model: request_model,
+            },
+            model_context_window: None,
+            renderer: &mut renderer,
+            state_dir: &tmp,
+            system_prompt: "system".into(),
+        };
+
+        agent.run_turn().await.unwrap();
+
+        let pending = store.pending_turn(&session.id).unwrap().unwrap();
+        assert_eq!(pending.retry_count, 1);
+        let messages = store.load_context_messages(&session.id).unwrap();
+        assert_eq!(
+            messages
+                .iter()
+                .filter(|message| matches!(message, Message::User { .. }))
+                .count(),
+            1
+        );
+        assert!(matches!(
+            messages.last(),
+            Some(Message::Assistant {
+                content: Some(content),
+                tool_calls: None,
+            }) if content == "done"
+        ));
+        let _ = std::fs::remove_dir_all(tmp);
     }
 
     #[tokio::test]

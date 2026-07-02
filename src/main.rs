@@ -31,7 +31,7 @@ mod tools;
 use cli::{Args, Command, ProjectSub, SessionOriginArg, SessionSub};
 use config::Config;
 use models::RequestOptions;
-use provider::{ContentPart, ImageUrl};
+use provider::{ContentPart, ImageUrl, UserContent};
 use provider::{Provider, build_provider};
 use renderer::Renderer;
 use runtime::{InvocationOverrides, StatusReport, build_status_report, resolve_invocation};
@@ -49,10 +49,16 @@ struct RunTurnArgs<'a> {
     request: &'a RequestOptions,
     model_context_window: Option<u64>,
     prompt: &'a str,
-    attachments: Vec<ContentPart>,
     output: cli::OutputFormat,
     state_dir: &'a std::path::Path,
     project_config_dir: Option<&'a std::path::Path>,
+    retry_notice: Option<RetryNotice<'a>>,
+}
+
+struct RetryNotice<'a> {
+    retry_count: u64,
+    checkpoint_message_id: i64,
+    reason: &'a str,
 }
 
 #[tokio::main]
@@ -387,6 +393,68 @@ async fn run() -> Result<()> {
             }
             return Ok(());
         }
+        Some(Command::Retry(retry_args)) => {
+            let config = Config::load_for_scope(project_config_dir.as_deref())?;
+
+            paths::ensure_project_layout(&scope)?;
+            let state_dir = scope.state_dir();
+            paths::ensure_dir(&state_dir)?;
+            compaction::prune_spills(&state_dir);
+
+            let db_path = scope.session_db_path();
+            let store = store::Store::open(&db_path)?;
+            let session = resolve_retry_session(&store, &retry_args)?
+                .ok_or_else(|| anyhow::anyhow!("no sessions found in active scope"))?;
+            store.reconcile_pending_turn(&session.id)?;
+            let pending = store
+                .pending_turn(&session.id)?
+                .ok_or_else(|| anyhow::anyhow!("latest session has no incomplete turn to retry"))?;
+            if pending.state != store::PendingState::Incomplete {
+                bail!("session does not have an incomplete turn to retry");
+            }
+            let prompt_content = store
+                .prompt_user_content(&session.id, pending.prompt_message_id)?
+                .ok_or_else(|| anyhow::anyhow!("pending prompt is missing from session history"))?;
+            let prompt = prompt_content.text();
+
+            let request = RequestOptions {
+                model: models::resolve_model_ref(&config, &session.model)?,
+            };
+            let model_info = models::resolve_model_info(&config, &request.model);
+            let provider = build_provider(&config, &request.model.provider_id)?;
+
+            let _lock = match store::acquire_session_lock(&session.id) {
+                Ok(lock) => lock,
+                Err(_) => {
+                    eprintln!("session busy");
+                    process::exit(2);
+                }
+            };
+
+            store.resume_pending_turn(&session.id)?;
+            let retry_count = store.increment_pending_retry_count(&session.id)?;
+
+            run_turn(RunTurnArgs {
+                config: &config,
+                provider,
+                store: &store,
+                session_id: &session.id,
+                request: &request,
+                model_context_window: model_info.context_window,
+                prompt: &prompt,
+                output: retry_args.output,
+                state_dir: &state_dir,
+                project_config_dir: project_config_dir.as_deref(),
+                retry_notice: Some(RetryNotice {
+                    retry_count,
+                    checkpoint_message_id: pending.checkpoint_message_id,
+                    reason: pending.error_message.as_deref().unwrap_or("manual retry"),
+                }),
+            })
+            .await?;
+
+            return Ok(());
+        }
         Some(Command::Compact { session }) => {
             let config = Config::load_for_scope(project_config_dir.as_deref())?;
             let db_path = scope.session_db_path();
@@ -478,6 +546,8 @@ async fn run_turn_from_source(
     };
     let session_id = session.id.clone();
 
+    store.reconcile_pending_turn(&session_id)?;
+
     let _lock = match store::acquire_session_lock(&session_id) {
         Ok(lock) => lock,
         Err(_) => {
@@ -485,6 +555,13 @@ async fn run_turn_from_source(
             process::exit(2);
         }
     };
+
+    if let Some(pending) = store.pending_turn(&session_id)? {
+        let reason = pending
+            .error_message
+            .unwrap_or_else(|| "latest turn is still incomplete".to_string());
+        bail!("session has an incomplete turn: {reason}. Run `mu retry` to continue.");
+    }
 
     if created {
         if let Ok(session_file) = std::env::var("MU_SESSION_FILE") {
@@ -500,6 +577,9 @@ async fn run_turn_from_source(
         store.update_session_cwd(&session_id, &cwd.display().to_string())?;
     }
 
+    let prompt_content = build_prompt_content(&prompt, attachments);
+    store.begin_pending_turn(&session_id, &prompt_content)?;
+
     run_turn(RunTurnArgs {
         config: &config,
         provider,
@@ -508,10 +588,10 @@ async fn run_turn_from_source(
         request: &resolved.request,
         model_context_window: model_info.context_window,
         prompt: &prompt,
-        attachments,
         output: turn.output,
         state_dir: &state_dir,
         project_config_dir,
+        retry_notice: None,
     })
     .await?;
 
@@ -570,10 +650,10 @@ async fn run_turn(args: RunTurnArgs<'_>) -> Result<()> {
         request,
         model_context_window,
         prompt,
-        attachments,
         output,
         state_dir,
         project_config_dir,
+        retry_notice,
     } = args;
     let system_prompt =
         system_prompt::build_system_prompt(&paths::global_dir(), project_config_dir, Some(store))?;
@@ -585,6 +665,15 @@ async fn run_turn(args: RunTurnArgs<'_>) -> Result<()> {
         .then_some(Duration::from_millis(config.terminal_bell.min_duration_ms));
     let mut renderer = Renderer::with_terminal_bell(output, turn_done_bell_min_duration);
     let turn_started = Instant::now();
+    if let Some(retry_notice) = retry_notice {
+        renderer.turn_retry(
+            "manual",
+            retry_notice.retry_count,
+            None,
+            retry_notice.checkpoint_message_id,
+            retry_notice.reason,
+        )?;
+    }
     let mut agent = agent::AgentLoop {
         config,
         provider,
@@ -595,10 +684,9 @@ async fn run_turn(args: RunTurnArgs<'_>) -> Result<()> {
         renderer: &mut renderer,
         state_dir,
         system_prompt,
-        attachments,
     };
 
-    let result = agent.run_turn(prompt).await;
+    let result = agent.run_turn().await;
 
     match &result {
         Ok(r) => {
@@ -611,6 +699,7 @@ async fn run_turn(args: RunTurnArgs<'_>) -> Result<()> {
                 Some(&title),
                 &request.model.canonical,
             )?;
+            store.clear_pending_turn(session_id)?;
             renderer.finish_turn()?;
             renderer.turn_summary(
                 r.prompt_tokens,
@@ -620,8 +709,18 @@ async fn run_turn(args: RunTurnArgs<'_>) -> Result<()> {
             )?;
             renderer.turn_done_bell(turn_started.elapsed())?;
         }
-        Err(_) => {
-            // completed messages already persisted
+        Err(error) => {
+            store.mark_pending_incomplete(session_id, &error.to_string())?;
+            if let Some(pending) = store.pending_turn(session_id)? {
+                renderer.turn_incomplete(
+                    pending.retry_count,
+                    pending.checkpoint_message_id,
+                    pending
+                        .error_message
+                        .as_deref()
+                        .unwrap_or("turn interrupted"),
+                )?;
+            }
         }
     }
 
@@ -647,6 +746,32 @@ fn create_seeded_session(
         },
     )?;
     Ok((session, true))
+}
+
+fn build_prompt_content(prompt: &str, attachments: Vec<ContentPart>) -> UserContent {
+    if attachments.is_empty() {
+        return UserContent::Text(prompt.to_string());
+    }
+    let mut parts = vec![ContentPart::Text {
+        text: prompt.to_string(),
+    }];
+    parts.extend(attachments);
+    UserContent::Parts(parts)
+}
+
+fn resolve_retry_session(
+    store: &store::Store,
+    retry: &cli::RetryArgs,
+) -> Result<Option<store::Session>> {
+    if retry.session.is_some() && retry.continue_latest {
+        bail!("use either -s/--session or -c/--continue-latest, not both");
+    }
+    if let Some(id) = retry.session.as_deref() {
+        return Ok(Some(store.get_session(id)?.ok_or_else(|| {
+            anyhow::anyhow!("session not found in active scope: {id}")
+        })?));
+    }
+    store.latest_session()
 }
 
 fn open_status_store(path: &std::path::Path) -> Result<store::Store> {
@@ -709,6 +834,18 @@ fn print_status_report(report: &StatusReport) {
     }
     if report.active.busy {
         println!("active: busy");
+    }
+    if let Some(incomplete) = &report.incomplete_turn {
+        println!(
+            "incomplete turn: retry_count={}{}",
+            incomplete.retry_count,
+            incomplete
+                .error_message
+                .as_deref()
+                .map(|message| format!("  reason: {message}"))
+                .unwrap_or_default()
+        );
+        println!("retry: mu retry");
     }
     println!("supported effort levels: {effort_levels}");
 }

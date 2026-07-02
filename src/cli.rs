@@ -44,6 +44,18 @@ pub struct TurnArgs {
     pub output: OutputFormat,
 }
 
+#[derive(ClapArgs, Debug, Clone)]
+pub struct RetryArgs {
+    #[arg(short = 's', long)]
+    pub session: Option<String>,
+
+    #[arg(short = 'c', long)]
+    pub continue_latest: bool,
+
+    #[arg(long, value_enum, default_value_t = OutputFormat::Terminal)]
+    pub output: OutputFormat,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum OutputFormat {
     Plain,
@@ -65,6 +77,8 @@ pub enum Command {
     },
     /// Inspect the resolved model and context state
     Status(StatusArgs),
+    /// Retry the latest incomplete turn in a session
+    Retry(RetryArgs),
     /// Force compaction for a session
     Compact {
         #[arg(long)]
@@ -204,6 +218,19 @@ mod tests {
                 assert!(status.json);
             }
             other => panic!("expected status command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn retry_subcommand_parses_output_and_selection() {
+        let args = Args::try_parse_from(["mu", "retry", "-c", "--output", "json"]).unwrap();
+        match args.command {
+            Some(Command::Retry(retry)) => {
+                assert!(retry.continue_latest);
+                assert!(retry.session.is_none());
+                assert_eq!(retry.output, OutputFormat::Json);
+            }
+            other => panic!("expected retry command, got {other:?}"),
         }
     }
 

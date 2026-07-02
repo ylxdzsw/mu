@@ -43,6 +43,8 @@ pub struct StatusReport {
     pub git: Option<GitStatus>,
     pub session: Option<StatusSession>,
     pub active: StatusActiveTurn,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub incomplete_turn: Option<IncompleteTurnStatus>,
     pub compaction: Option<CompactionStatus>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub available_models: Option<AvailableModelsPayload>,
@@ -74,6 +76,12 @@ pub struct StatusSession {
 #[derive(Debug, Clone, Serialize, Default)]
 pub struct StatusActiveTurn {
     pub busy: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct IncompleteTurnStatus {
+    pub retry_count: u64,
+    pub error_message: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -146,6 +154,9 @@ pub fn build_status_report(
     include_models: bool,
 ) -> Result<StatusReport> {
     let resolved = resolve_invocation(store, config, overrides)?;
+    if let Some(session) = resolved.attached_session.as_ref() {
+        store.reconcile_pending_turn(&session.id)?;
+    }
     let model_info = resolve_model_info(config, &resolved.request.model);
     let session_summary = resolved
         .attached_session
@@ -157,6 +168,21 @@ pub fn build_status_report(
         .attached_session
         .as_ref()
         .is_some_and(|session| crate::store::is_session_busy(&session.id));
+    let incomplete_turn = resolved
+        .attached_session
+        .as_ref()
+        .map(|session| {
+            store.pending_turn(&session.id).map(|pending| {
+                pending
+                    .filter(|pending| pending.state == crate::store::PendingState::Incomplete)
+                    .map(|pending| IncompleteTurnStatus {
+                        retry_count: pending.retry_count,
+                        error_message: pending.error_message,
+                    })
+            })
+        })
+        .transpose()?
+        .flatten();
     let compaction = resolved
         .attached_session
         .as_ref()
@@ -182,6 +208,7 @@ pub fn build_status_report(
         git: project.map(git_status),
         session: session_summary.map(status_session),
         active: StatusActiveTurn { busy: active },
+        incomplete_turn,
         compaction,
         available_models: include_models.then(|| available_models(config)),
     })
@@ -383,6 +410,47 @@ mod tests {
         assert_eq!(
             report.supported_effort_levels,
             vec![EffortLevel::Low, EffortLevel::High]
+        );
+    }
+
+    #[test]
+    fn status_report_surfaces_incomplete_turn() {
+        let store = Store::open_memory().unwrap();
+        let session = store
+            .create_session_with_origin(
+                "/tmp",
+                "alpha/default-model:high",
+                crate::store::SessionOrigin::Cli,
+            )
+            .unwrap();
+        store
+            .begin_pending_turn(
+                &session.id,
+                &crate::provider::UserContent::Text("retry".into()),
+            )
+            .unwrap();
+        store
+            .mark_pending_incomplete(&session.id, "previous turn was interrupted")
+            .unwrap();
+
+        let report = build_status_report(
+            &store,
+            &test_config(),
+            &InvocationOverrides {
+                session: Some(session.id.clone()),
+                continue_latest: false,
+                model: None,
+            },
+            None,
+            false,
+        )
+        .unwrap();
+
+        let incomplete = report.incomplete_turn.expect("incomplete turn");
+        assert_eq!(incomplete.retry_count, 0);
+        assert_eq!(
+            incomplete.error_message.as_deref(),
+            Some("previous turn was interrupted")
         );
     }
 }

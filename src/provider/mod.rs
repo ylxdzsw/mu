@@ -125,8 +125,29 @@ pub enum FinishReason {
 pub enum ProviderError {
     #[error("context length exceeded")]
     ContextLength,
+    #[error("HTTP 429: {message}")]
+    RateLimit { message: String },
+    #[error("HTTP {status}: {body}")]
+    HttpStatus { status: u16, body: String },
+    #[error("transport error: {0}")]
+    Transport(String),
+    #[error("SSE parse: {0}")]
+    SseParse(String),
     #[error("{0}")]
     Other(String),
+}
+
+impl ProviderError {
+    pub fn retryable_for_live_turn(&self) -> bool {
+        match self {
+            ProviderError::RateLimit { .. } => true,
+            ProviderError::HttpStatus { status, .. } => *status >= 500,
+            ProviderError::Transport(_) => true,
+            ProviderError::ContextLength | ProviderError::SseParse(_) | ProviderError::Other(_) => {
+                false
+            }
+        }
+    }
 }
 
 #[async_trait(?Send)]

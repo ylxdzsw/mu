@@ -202,8 +202,8 @@ impl Guardrail {
                         "reviewer context length exceeded"
                     ));
                 }
-                Ok(Err(ProviderError::Other(e))) => {
-                    last_error = e;
+                Ok(Err(error)) => {
+                    last_error = error.to_string();
                     continue;
                 }
                 Ok(Ok(stream_result)) => {

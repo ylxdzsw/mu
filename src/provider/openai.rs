@@ -114,7 +114,7 @@ impl Provider for OpenAiProvider {
         let response = req
             .send()
             .await
-            .map_err(|e| ProviderError::Other(e.to_string()))?;
+            .map_err(|e| ProviderError::Transport(e.to_string()))?;
 
         if !response.status().is_success() {
             let status = response.status();
@@ -125,7 +125,13 @@ impl Provider for OpenAiProvider {
             {
                 return Err(ProviderError::ContextLength);
             }
-            return Err(ProviderError::Other(format!("HTTP {status}: {text}")));
+            if status.as_u16() == 429 {
+                return Err(ProviderError::RateLimit { message: text });
+            }
+            return Err(ProviderError::HttpStatus {
+                status: status.as_u16(),
+                body: text,
+            });
         }
 
         let mut response = response;
@@ -138,7 +144,7 @@ impl Provider for OpenAiProvider {
         loop {
             let chunk = tokio::select! {
                 chunk = response.chunk() => {
-                    chunk.map_err(|e| ProviderError::Other(e.to_string()))?
+                    chunk.map_err(|e| ProviderError::Transport(e.to_string()))?
                 }
                 _ = tick.tick() => {
                     on_event(StreamEvent::Tick)?;
@@ -252,8 +258,8 @@ fn consume_sse_buffer(
             if data == "[DONE]" {
                 continue;
             }
-            let parsed: ChunkResponse = serde_json::from_str(data)
-                .map_err(|e| ProviderError::Other(format!("SSE parse: {e}")))?;
+            let parsed: ChunkResponse =
+                serde_json::from_str(data).map_err(|e| ProviderError::SseParse(e.to_string()))?;
 
             if let Some(u) = parsed.usage {
                 state.usage = Some(Usage {

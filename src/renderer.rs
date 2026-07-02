@@ -427,6 +427,69 @@ impl Renderer {
         self.write_stdout_committed(&terminal_trim_committed_text(&format!("{msg}\n")))
     }
 
+    pub fn turn_retry(
+        &mut self,
+        mode: &str,
+        retry_count: u64,
+        max_auto_retries: Option<u64>,
+        checkpoint_message_id: i64,
+        reason: &str,
+    ) -> io::Result<()> {
+        if self.format == OutputFormat::Json {
+            return self.write_json(
+                "turn_retry",
+                serde_json::json!({
+                    "mode": mode,
+                    "retry_count": retry_count,
+                    "max_auto_retries": max_auto_retries,
+                    "checkpoint_message_id": checkpoint_message_id,
+                    "reason": reason,
+                }),
+            );
+        }
+        let mut message = format!(
+            "[mu] retrying from last completed checkpoint (message {checkpoint_message_id})"
+        );
+        if mode == "auto" {
+            if let Some(max_auto_retries) = max_auto_retries {
+                message.push_str(&format!(" [{retry_count}/{max_auto_retries}]"));
+            }
+            message.push_str(&format!(" after {reason}"));
+        } else {
+            message.push_str(&format!(" [retry #{retry_count}]"));
+            if !reason.is_empty() {
+                message.push_str(&format!(" after {reason}"));
+            }
+        }
+        self.notice(&message)
+    }
+
+    pub fn turn_incomplete(
+        &mut self,
+        retry_count: u64,
+        checkpoint_message_id: i64,
+        reason: &str,
+    ) -> io::Result<()> {
+        if self.format == OutputFormat::Json {
+            return self.write_json(
+                "turn_incomplete",
+                serde_json::json!({
+                    "retry_count": retry_count,
+                    "checkpoint_message_id": checkpoint_message_id,
+                    "reason": reason,
+                    "retry_available": true,
+                }),
+            );
+        }
+        self.notice(&format!(
+            "[mu] turn interrupted at checkpoint message {checkpoint_message_id}: {reason}"
+        ))?;
+        self.notice("[mu] partial streamed text shown above was discarded from session history")?;
+        self.notice(&format!(
+            "[mu] run `mu retry` to continue from the last completed checkpoint (retry count: {retry_count})"
+        ))
+    }
+
     /// Ensure stdout ends on a fresh line so the next shell prompt does not
     /// glue onto the final line of assistant output.
     pub fn finish_turn(&mut self) -> io::Result<()> {
