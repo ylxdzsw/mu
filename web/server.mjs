@@ -12,6 +12,8 @@ const publicRoot = path.join(__dirname, "public");
 const MAX_REQUEST_BYTES = 32 * 1024 * 1024;
 const MAX_TURN_EVENT_BUFFER = 512;
 const GLOBAL_PROJECT_ID = "__mu_global__";
+const SOCKET_MODE = 0o660;
+const MU_EXE = "mu";
 const BASE_HEADERS = {
   "cache-control": "no-store",
   "content-security-policy":
@@ -91,11 +93,10 @@ class TurnRuntime {
 }
 
 async function main() {
-  const options = parseArgs(process.argv.slice(2));
-  const socketMode = parseSocketMode(options.socketMode);
-  await prepareSocketPath(options.socket);
+  const socketPath = socketPathFromArgv(process.argv);
+  await prepareSocketPath(socketPath);
 
-  const state = await createState(options);
+  const state = await createState();
   const server = createServer((request, response) => {
     handleRequest(request, response, state).catch((error) => {
       if (response.headersSent || response.destroyed) {
@@ -107,62 +108,25 @@ async function main() {
 
   await new Promise((resolve, reject) => {
     server.once("error", reject);
-    server.listen(options.socket, resolve);
+    server.listen(socketPath, resolve);
   });
-  await chmod(options.socket, socketMode);
-  console.error(`mu web listening on unix://${options.socket}`);
+  await chmod(socketPath, SOCKET_MODE);
+  console.error(`mu web listening on unix://${socketPath}`);
 
   const shutdown = async () => {
     await new Promise((resolve) => server.close(() => resolve()));
-    await rm(options.socket, { force: true }).catch(() => {});
+    await rm(socketPath, { force: true }).catch(() => {});
     process.exit(0);
   };
   process.on("SIGINT", shutdown);
   process.on("SIGTERM", shutdown);
 }
 
-function parseArgs(argv) {
-  const values = {
-    socket: process.env.MU_WEB_SOCKET || "/run/mu-web/mu-web.sock",
-    socketMode: process.env.MU_WEB_SOCKET_MODE || "0600",
-    muExe: process.env.MU_WEB_MU_EXE || "mu",
-    launchCwd: process.env.MU_WEB_LAUNCH_CWD || process.cwd(),
-  };
-  for (let index = 0; index < argv.length; index += 1) {
-    const arg = argv[index];
-    const next = argv[index + 1];
-    if (arg === "--socket" && next) {
-      values.socket = next;
-      index += 1;
-      continue;
-    }
-    if (arg === "--socket-mode" && next) {
-      values.socketMode = next;
-      index += 1;
-      continue;
-    }
-    if (arg === "--mu-exe" && next) {
-      values.muExe = next;
-      index += 1;
-      continue;
-    }
-    if (arg === "--launch-cwd" && next) {
-      values.launchCwd = next;
-      index += 1;
-      continue;
-    }
-    throw new Error(`unknown argument: ${arg}`);
+function socketPathFromArgv(argv) {
+  if (argv.length !== 3 || !argv[2]) {
+    throw new Error("expected exactly one argument: <socket-path>");
   }
-  return values;
-}
-
-function parseSocketMode(value) {
-  const normalized = value.replace(/^0+/, "") || "0";
-  const mode = Number.parseInt(normalized, 8);
-  if (!Number.isInteger(mode)) {
-    throw new Error(`invalid socket mode \`${value}\``);
-  }
-  return mode;
+  return argv[2];
 }
 
 async function prepareSocketPath(socketPath) {
@@ -181,13 +145,12 @@ async function prepareSocketPath(socketPath) {
   }
 }
 
-async function createState(options) {
-  const launchCwd = await realpath(options.launchCwd);
-  const launchProject = await discoverProject(options.muExe, launchCwd);
+async function createState() {
+  const launchCwd = await realpath(process.cwd());
+  const launchProject = await discoverProject(launchCwd);
   const uploadRoot = path.join(runtimeDir(), "web-uploads");
   await mkdir(uploadRoot, { recursive: true });
   return {
-    muExe: options.muExe,
     launchCwd,
     launchProject,
     globalHome: process.env.HOME || "/tmp",
@@ -204,9 +167,9 @@ function runtimeDir() {
   return path.join(tmpdir(), "mu");
 }
 
-async function discoverProject(muExe, cwd) {
+async function discoverProject(cwd) {
   const info = await runJsonCommand(
-    { muExe, globalHome: process.env.HOME || "/tmp" },
+    { globalHome: process.env.HOME || "/tmp" },
     null,
     ["project", "inspect", "--path", cwd, "--json"],
     cwd,
@@ -531,7 +494,7 @@ function rememberProject(state, summary) {
 
 async function runJsonCommand(state, scope, args, overrideCwd = null) {
   const cwd = overrideCwd || (scope ? currentDirForScope(state, scope) : undefined);
-  const { stdout } = await execFileResult(state.muExe, args, { cwd });
+  const { stdout } = await execFileResult(MU_EXE, args, { cwd });
   try {
     return JSON.parse(stdout);
   } catch (error) {
@@ -588,7 +551,7 @@ async function launchTurn(state, scope, input) {
     args.push("--image", imagePath);
   }
 
-  const child = spawn(state.muExe, args, {
+  const child = spawn(MU_EXE, args, {
     cwd: currentDirForScope(state, scope),
     detached: true,
     stdio: ["pipe", "pipe", "pipe"],

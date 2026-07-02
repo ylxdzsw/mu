@@ -184,6 +184,7 @@ function testingEnv({ runRoot, globalDir }) {
     HOME: path.join(runRoot, "home"),
     MU_CONFIG_DIR: globalDir,
     MU_WEB_E2E_API_KEY: "mu-web-e2e-secret",
+    PATH: `${path.dirname(muBinary)}${path.delimiter}${process.env.PATH || ""}`,
     XDG_RUNTIME_DIR: path.join(runRoot, "runtime"),
   };
 }
@@ -223,7 +224,7 @@ export async function startHarness() {
 
   const socketPath = path.join(runRoot, "mu-web.sock");
   log("starting web server", socketPath);
-  const mu = spawn(process.execPath, [webServer, "--socket", socketPath, "--mu-exe", muBinary], {
+  const mu = spawn(process.execPath, [webServer, socketPath], {
     cwd: projectDir,
     env,
     stdio: ["ignore", "pipe", "pipe"],

@@ -236,8 +236,8 @@ small:
 - `mu session unarchive --session <id>` — restore an archived session to
   default lists.
 - `mu compact --session <id>` — force compaction.
-- `npm --prefix web start -- [--socket <path>] [--socket-mode <octal>] [--mu-exe <path>]`
-  — serve the local browser UI on a Unix socket.
+- `npm --prefix web start -- <socket-path>` — serve the local browser UI on a
+  Unix socket.
 
 The turn runner remains one completed turn per invocation. Bare `mu` reads the
 prompt from stdin; `mu <prompt-file>` reads it from a file and trims a leading
@@ -494,10 +494,8 @@ The web service trusts the local reverse-proxy boundary.
 Requirements:
 
 - listen only on a Unix domain socket;
-- default socket permissions should be private (`0600`) when no group sharing is
-  requested;
-- deployment behind nginx should support group-readable/connectable sockets
-  (`0660`) for the nginx user/group;
+- apply fixed socket permissions of `0660` after bind so nginx can connect via
+  a shared user/group boundary;
 - no built-in authentication or authorization screens;
 - no direct TCP listener;
 - no CORS surface for arbitrary origins;

@@ -125,15 +125,16 @@ RBAC, CORS, or a documented TCP listener. Put nginx or another trusted reverse
 proxy in front of it for TLS and authentication.
 
 ```bash
-npm --prefix web start -- --socket /run/mu-web/mu-web.sock --socket-mode 0660 --mu-exe /path/to/mu
+npm --prefix web start -- /run/mu-web/mu-web.sock
 ```
 
-The default socket is `/run/mu-web/mu-web.sock` with private `0600`
-permissions. Set `MU_WEB_MU_EXE` or pass `--mu-exe` when the `mu` binary is not
-already on `PATH`. Streaming turn responses set `X-Accel-Buffering: no`, so
-nginx locations proxying this socket should also disable buffering and caching.
-The browser-side e2e suite also lives in `web/` and can be run with
-`npm --prefix web run test:e2e`.
+The socket path is required. The service chmods the socket to `0660`, resolves
+its launch cwd from its own `pwd`, and shells out to `mu` from `PATH`. For
+systemd deployment, set `WorkingDirectory=/root` and ensure the service `PATH`
+includes the desired `mu` binary. Streaming turn responses set
+`X-Accel-Buffering: no`, so nginx locations proxying this socket should also
+disable buffering and caching. The browser-side e2e suite also lives in `web/`
+and can be run with `npm --prefix web run test:e2e`.
 
 ## Config
 
