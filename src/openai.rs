@@ -8,8 +8,7 @@ use serde_json::Value;
 use tokio::time::{self, MissedTickBehavior};
 
 use crate::models::RequestOptions;
-
-use super::{
+use crate::provider::{
     FinishReason, FunctionCall, Message, Provider, ProviderError, StreamEvent, StreamResult,
     ToolCall, ToolCallDelta as ProviderToolCallDelta, Usage,
 };

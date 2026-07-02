@@ -11,7 +11,6 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
-use async_trait::async_trait;
 use serde_json::{Value, json};
 use tokio::task::JoinHandle;
 
@@ -20,9 +19,9 @@ use crate::env::EnvMap;
 use crate::redaction::SecretRedactor;
 use crate::renderer::Renderer;
 
-use super::{
-    BashArgs, ExecutionMode, Tool, ToolContext, ToolDisplay, ToolResult, apply_truncation,
-    parse_args, resolve_path,
+use crate::tools::{
+    BashArgs, ExecutionMode, ToolContext, ToolDisplay, ToolResult, apply_truncation, parse_args,
+    resolve_path,
 };
 
 const DEFAULT_TIMEOUT_SECS: u64 = 120;
@@ -35,76 +34,67 @@ static CANCELLING: AtomicBool = AtomicBool::new(false);
 static LAST_SIGNAL: AtomicI32 = AtomicI32::new(0);
 static INSTALL_SIGNAL_FORWARDER: Once = Once::new();
 
-pub struct BashTool;
+pub fn description() -> &'static str {
+    "Run one bash script in an isolated process. Use this for local search, file reads, edits, tests, and web fetches."
+}
 
-#[async_trait]
-impl Tool for BashTool {
-    fn name(&self) -> &'static str {
-        "bash"
-    }
+pub fn execution_mode(args: &Value) -> ExecutionMode {
+    matches!(
+        args.get("risk").and_then(|value| value.as_str()),
+        Some("readonly")
+    )
+    .then_some(ExecutionMode::Concurrent)
+    .unwrap_or(ExecutionMode::Sequential)
+}
 
-    fn description(&self) -> &'static str {
-        "Run one bash script in an isolated process. Use this for local search, file reads, edits, tests, and web fetches."
-    }
-
-    fn execution_mode(&self, args: &Value) -> ExecutionMode {
-        matches!(
-            args.get("risk").and_then(|value| value.as_str()),
-            Some("readonly")
-        )
-        .then_some(ExecutionMode::Concurrent)
-        .unwrap_or(ExecutionMode::Sequential)
-    }
-
-    fn parameters_schema(&self) -> Value {
-        json!({
-            "type": "object",
-            "properties": {
-                "title": { "type": "string", "description": "Short human-readable title for the action" },
-                "risk": {
-                    "type": "string",
-                    "enum": ["readonly", "reversible", "destructive"],
-                    "description": "Advisory risk label for UI and audit only"
-                },
-                "script": { "type": "string", "description": "Bash script to run with bash -lc" },
-                "cwd": { "type": "string", "description": "Working directory for this invocation" },
-                "timeout": { "type": "integer", "minimum": 1, "description": "Timeout in seconds (default 120)" },
-                "stdin": { "type": "string", "description": "Literal stdin bytes to pipe to the script" }
+pub fn parameters_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "title": { "type": "string", "description": "Short human-readable title for the action" },
+            "risk": {
+                "type": "string",
+                "enum": ["readonly", "reversible", "destructive"],
+                "description": "Advisory risk label for UI and audit only"
             },
-            "required": ["title", "risk", "script"]
-        })
+            "script": { "type": "string", "description": "Bash script to run with bash -lc" },
+            "cwd": { "type": "string", "description": "Working directory for this invocation" },
+            "timeout": { "type": "integer", "minimum": 1, "description": "Timeout in seconds (default 120)" },
+            "stdin": { "type": "string", "description": "Literal stdin bytes to pipe to the script" }
+        },
+        "required": ["title", "risk", "script"]
+    })
+}
+
+pub async fn execute(args: Value, ctx: &mut ToolContext<'_>) -> Result<ToolResult> {
+    let args: BashArgs = parse_args(&args)?;
+    let _ = (&args.title, args.risk);
+    let timeout = args.timeout.unwrap_or(DEFAULT_TIMEOUT_SECS);
+    if timeout == 0 {
+        bail!("timeout must be greater than 0");
     }
 
-    async fn execute(&self, args: Value, ctx: &mut ToolContext<'_>) -> Result<ToolResult> {
-        let args: BashArgs = parse_args(&args)?;
-        let _ = (&args.title, args.risk);
-        let timeout = args.timeout.unwrap_or(DEFAULT_TIMEOUT_SECS);
-        if timeout == 0 {
-            bail!("timeout must be greater than 0");
-        }
-
-        let renderer = ctx
-            .renderer
-            .as_deref_mut()
-            .ok_or_else(|| anyhow::anyhow!("bash requires sequential execution"))?;
-        let redactor = SecretRedactor::from_config(ctx.config);
-        for warning in redactor.warnings() {
-            renderer.notice(&format!("[redaction] {warning}"))?;
-        }
-
-        let result = run_bash(args, timeout, renderer, &ctx.config.env, redactor)?;
-        let exit_code = result.exit_code;
-
-        let output = if result.redacted {
-            format!("{}\n\n{}", result.output, REDACTION_REMINDER)
-        } else {
-            result.output
-        };
-        let full = format!("{}\n[exit code: {}]", output, exit_code);
-        let mut result = apply_truncation(full, &ctx.config.limits, "bash", ctx.state_dir, true)?;
-        result.display = ToolDisplay::Bash { exit_code };
-        Ok(result)
+    let renderer = ctx
+        .renderer
+        .as_deref_mut()
+        .ok_or_else(|| anyhow::anyhow!("bash requires sequential execution"))?;
+    let redactor = SecretRedactor::from_config(ctx.config);
+    for warning in redactor.warnings() {
+        renderer.notice(&format!("[redaction] {warning}"))?;
     }
+
+    let result = run_bash(args, timeout, renderer, &ctx.config.env, redactor)?;
+    let exit_code = result.exit_code;
+
+    let output = if result.redacted {
+        format!("{}\n\n{}", result.output, REDACTION_REMINDER)
+    } else {
+        result.output
+    };
+    let full = format!("{}\n[exit code: {}]", output, exit_code);
+    let mut result = apply_truncation(full, &ctx.config.limits, "bash", ctx.state_dir, true)?;
+    result.display = ToolDisplay::Bash { exit_code };
+    Ok(result)
 }
 
 #[derive(Debug)]
@@ -587,7 +577,7 @@ mod tests {
     use crate::env::EnvMap;
     use crate::redaction::SecretRedactor;
     use crate::renderer::Renderer;
-    use crate::tools::{BashArgs, BashRisk, Tool, ToolContext};
+    use crate::tools::{BashArgs, BashRisk, ToolContext};
 
     fn args(script: &str) -> BashArgs {
         BashArgs {
@@ -687,7 +677,7 @@ mod tests {
             "script": "printf '%s|%s' \"$OPENAI_API_KEY\" \"$CUSTOM_SECRET\""
         });
 
-        let result = super::BashTool.execute(args, &mut ctx).await.unwrap();
+        let result = super::execute(args, &mut ctx).await.unwrap();
 
         assert!(result.output.contains("[redacted:OPENAI_API_KEY]"));
         assert!(result.output.contains("[redacted:CUSTOM_SECRET]"));

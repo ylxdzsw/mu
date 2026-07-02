@@ -1,15 +1,14 @@
 use serde::Deserialize;
 use serde_json::Value;
 
-use crate::provider::{Message, approx_tokens};
-
-use super::{
+use crate::guardrail::{
     MAX_ACTION_STRING_TOKENS, MAX_MESSAGE_ENTRY_TOKENS, MAX_MESSAGE_TRANSCRIPT_TOKENS,
     MAX_TOOL_ENTRY_TOKENS, MAX_TOOL_TRANSCRIPT_TOKENS, RECENT_ENTRY_LIMIT, RiskLevel,
     TRUNCATION_TAG, UserAuthLevel,
 };
+use crate::provider::{Message, approx_tokens};
 
-const POLICY_PROMPT: &str = include_str!("policy.md");
+const POLICY_PROMPT: &str = include_str!("guardrail_policy.md");
 
 pub fn policy_prompt() -> &'static str {
     POLICY_PROMPT
@@ -322,7 +321,7 @@ fn extract_json_object(text: &str) -> Option<&str> {
 ///
 /// Accepts a surrounding prose wrapper (extracts the outermost `{...}`) as a
 /// thin recovery path, but non-JSON output is still a review failure.
-pub fn parse_assessment(text: &str) -> anyhow::Result<super::Assessment> {
+pub fn parse_assessment(text: &str) -> anyhow::Result<crate::guardrail::Assessment> {
     let payload = if let Ok(p) = serde_json::from_str::<AssessmentPayload>(text) {
         p
     } else if let Some(slice) = extract_json_object(text) {
@@ -339,7 +338,7 @@ pub fn parse_assessment(text: &str) -> anyhow::Result<super::Assessment> {
         .filter(|r| !r.trim().is_empty())
         .unwrap_or_else(|| "No reason provided.".to_string());
 
-    Ok(super::Assessment {
+    Ok(crate::guardrail::Assessment {
         risk_level,
         user_auth_level,
         reason,

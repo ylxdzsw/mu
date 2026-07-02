@@ -6,6 +6,7 @@ use crate::config::Config;
 use crate::models::RequestOptions;
 use crate::provider::{Message, Provider, ProviderError};
 use crate::store::Store;
+use crate::{bash, truncate};
 
 pub async fn maybe_compact(
     store: &Store,
@@ -47,7 +48,7 @@ pub async fn run_compaction(
     provider: &dyn Provider,
     system_prompt: &str,
 ) -> Result<()> {
-    crate::tools::bash::install_signal_forwarder();
+    bash::install_signal_forwarder();
     let messages = store.all_messages_for_session(session_id)?;
     let keep = config.compaction.keep_recent_turns;
 
@@ -159,7 +160,7 @@ pub async fn run_compaction(
 }
 
 pub fn prune_spills(state_dir: &Path) {
-    crate::tools::truncate::prune_truncation_spills(state_dir, 7);
+    truncate::prune_truncation_spills(state_dir, 7);
 }
 
 #[cfg(test)]

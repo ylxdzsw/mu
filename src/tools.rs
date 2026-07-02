@@ -1,15 +1,11 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::Value;
 
 use crate::config::{Config, LimitsConfig};
 use crate::renderer::Renderer;
-
-pub mod bash;
-pub mod truncate;
 
 #[derive(Debug, Clone)]
 pub struct ToolResult {
@@ -40,50 +36,27 @@ pub enum ExecutionMode {
     Concurrent,
 }
 
-#[async_trait]
-pub trait Tool: Send + Sync {
-    fn name(&self) -> &'static str;
-    fn description(&self) -> &'static str;
-    fn parameters_schema(&self) -> Value;
-    fn execution_mode(&self, _args: &Value) -> ExecutionMode {
-        ExecutionMode::Sequential
-    }
-    async fn execute(&self, args: Value, ctx: &mut ToolContext<'_>) -> Result<ToolResult>;
+pub fn bash_tool_definition() -> Value {
+    serde_json::json!({
+        "type": "function",
+        "function": {
+            "name": "bash",
+            "description": crate::bash::description(),
+            "parameters": crate::bash::parameters_schema()
+        }
+    })
 }
 
-pub struct ToolRegistry {
-    tools: Vec<Box<dyn Tool>>,
+pub fn tool_definitions() -> Vec<Value> {
+    vec![bash_tool_definition()]
 }
 
-impl ToolRegistry {
-    pub fn new(config: &Config) -> Self {
-        let _ = config;
-        let tools: Vec<Box<dyn Tool>> = vec![Box::new(bash::BashTool)];
-        Self { tools }
-    }
+pub fn execution_mode(name: &str, args: &Value) -> Option<ExecutionMode> {
+    (name == "bash").then(|| crate::bash::execution_mode(args))
+}
 
-    pub fn definitions(&self) -> Vec<Value> {
-        self.tools
-            .iter()
-            .map(|t| {
-                serde_json::json!({
-                    "type": "function",
-                    "function": {
-                        "name": t.name(),
-                        "description": t.description(),
-                        "parameters": t.parameters_schema()
-                    }
-                })
-            })
-            .collect()
-    }
-
-    pub fn get(&self, name: &str) -> Option<&dyn Tool> {
-        self.tools
-            .iter()
-            .find(|t| t.name() == name)
-            .map(|t| t.as_ref())
-    }
+pub async fn execute_bash_tool(args: Value, ctx: &mut ToolContext<'_>) -> Result<ToolResult> {
+    crate::bash::execute(args, ctx).await
 }
 
 pub fn resolve_path(path: &str) -> PathBuf {
@@ -102,7 +75,7 @@ pub fn apply_truncation(
     state_dir: &Path,
     use_tail: bool,
 ) -> Result<ToolResult> {
-    let truncated = truncate::truncate_output(&output, limits, prefix, state_dir, use_tail)?;
+    let truncated = crate::truncate::truncate_output(&output, limits, prefix, state_dir, use_tail)?;
     Ok(ToolResult {
         output: truncated.text,
         display: ToolDisplay::None,
@@ -144,7 +117,7 @@ mod tests {
 
     use serde_json::json;
 
-    use super::{Tool, ToolRegistry, bash::BashTool};
+    use super::{execution_mode, tool_definitions};
     use crate::config::{CompactionConfig, Config, LimitsConfig, ProviderConfig};
 
     fn test_config() -> Config {
@@ -168,15 +141,15 @@ mod tests {
     }
 
     #[test]
-    fn registry_exposes_only_bash() {
-        let registry = ToolRegistry::new(&test_config());
-        let definitions = registry.definitions();
+    fn tool_definitions_expose_only_bash() {
+        let _config = test_config();
+        let definitions = tool_definitions();
         assert_eq!(definitions.len(), 1);
         assert_eq!(definitions[0]["function"]["name"].as_str(), Some("bash"));
-        assert!(registry.get("bash").is_some());
+        assert!(execution_mode("bash", &json!({"risk": "readonly"})).is_some());
         for removed in ["read", "write", "edit", "fetch", "search"] {
             assert!(
-                registry.get(removed).is_none(),
+                execution_mode(removed, &json!({})).is_none(),
                 "{removed} should be hidden"
             );
         }
@@ -184,7 +157,7 @@ mod tests {
 
     #[test]
     fn bash_schema_requires_title_risk_and_script() {
-        let schema = BashTool.parameters_schema();
+        let schema = crate::bash::parameters_schema();
         assert_eq!(schema["required"], json!(["title", "risk", "script"]));
         assert_eq!(
             schema["properties"]["risk"]["enum"],

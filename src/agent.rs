@@ -16,8 +16,9 @@ use crate::provider::{
 };
 use crate::renderer::Renderer;
 use crate::store::{ReviewRecord, Store, ToolCallRecord};
-use crate::tools::bash::{self, RunningBash};
-use crate::tools::{ExecutionMode, ToolContext, ToolRegistry, ToolResult, missing_tool_message};
+use crate::tools::{ExecutionMode, ToolContext, ToolResult, missing_tool_message};
+use crate::{bash, tools};
+use bash::RunningBash;
 
 pub struct TurnResult {
     pub usage: Usage,
@@ -80,8 +81,7 @@ impl<'a> AgentLoop<'a> {
 
         let mut context = self.load_pending_context()?;
 
-        let registry = ToolRegistry::new(self.config);
-        let tools = registry.definitions();
+        let tool_definitions = tools::tool_definitions();
         let max_iter = self.config.limits.max_iterations;
 
         let mut total_usage = Usage::default();
@@ -108,7 +108,12 @@ impl<'a> AgentLoop<'a> {
                 };
                 let result = self
                     .provider
-                    .stream_chat(&self.request, &context, &tools, &mut on_stream_event)
+                    .stream_chat(
+                        &self.request,
+                        &context,
+                        &tool_definitions,
+                        &mut on_stream_event,
+                    )
                     .await;
                 self.renderer.assistant_end()?;
                 match &result {
@@ -198,7 +203,6 @@ impl<'a> AgentLoop<'a> {
                         }
                         let args = parse_tool_args(&tool_calls[cursor]);
                         let concurrent = self.concurrent_tool_call_eligible(
-                            &registry,
                             guardrail.as_ref(),
                             &tool_calls[cursor],
                             &args,
@@ -331,13 +335,13 @@ impl<'a> AgentLoop<'a> {
                             )?;
                             let started = Instant::now();
 
-                            let tool_result = if let Some(tool) = registry.get(&tc.function.name) {
+                            let tool_result = if tc.function.name == "bash" {
                                 let mut ctx = ToolContext {
                                     config: self.config,
                                     renderer: Some(self.renderer),
                                     state_dir: self.state_dir,
                                 };
-                                tool.execute(args, &mut ctx).await
+                                tools::execute_bash_tool(args, &mut ctx).await
                             } else {
                                 unknown_tool_result(&tc.function.name)
                             };
@@ -358,7 +362,6 @@ impl<'a> AgentLoop<'a> {
                         while end < tool_calls.len() {
                             let next_args = parse_tool_args(&tool_calls[end]);
                             let next_concurrent = self.concurrent_tool_call_eligible(
-                                &registry,
                                 guardrail.as_ref(),
                                 &tool_calls[end],
                                 &next_args,
@@ -473,7 +476,6 @@ impl<'a> AgentLoop<'a> {
 
     fn concurrent_tool_call_eligible(
         &self,
-        registry: &ToolRegistry,
         guardrail: Option<&Guardrail>,
         call: &ToolCall,
         args: &Value,
@@ -481,10 +483,10 @@ impl<'a> AgentLoop<'a> {
         if self.renderer.output_format() == OutputFormat::Plain {
             return false;
         }
-        let Some(tool) = registry.get(&call.function.name) else {
+        let Some(mode) = tools::execution_mode(&call.function.name, args) else {
             return false;
         };
-        if tool.execution_mode(args) != ExecutionMode::Concurrent {
+        if mode != ExecutionMode::Concurrent {
             return false;
         }
         !guardrail_review_required(guardrail, call, args)
@@ -499,7 +501,7 @@ impl<'a> AgentLoop<'a> {
         let mut executions = Vec::new();
         for call in batch {
             let args = parse_tool_args(call);
-            let bash_args = crate::tools::parse_args(&args)?;
+            let bash_args = tools::parse_args(&args)?;
             executions.push(ConcurrentBashExecution {
                 call,
                 args,

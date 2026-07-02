@@ -1,5 +1,3 @@
-pub mod prompt;
-
 use std::collections::VecDeque;
 use std::fmt;
 use std::sync::Arc;
@@ -9,17 +7,19 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use crate::config::{Config, GuardrailConfig};
+use crate::guardrail_prompt;
 use crate::models::RequestOptions;
 use crate::provider::{Message, Provider, ProviderError};
+use crate::{bash, provider};
 
 const MAX_ATTEMPTS: u32 = 3;
-const MAX_MESSAGE_TRANSCRIPT_TOKENS: usize = 10_000;
-const MAX_TOOL_TRANSCRIPT_TOKENS: usize = 10_000;
-const MAX_MESSAGE_ENTRY_TOKENS: usize = 2_000;
-const MAX_TOOL_ENTRY_TOKENS: usize = 1_000;
-const RECENT_ENTRY_LIMIT: usize = 40;
-const MAX_ACTION_STRING_TOKENS: usize = 16_000;
-const TRUNCATION_TAG: &str = "truncated";
+pub(crate) const MAX_MESSAGE_TRANSCRIPT_TOKENS: usize = 10_000;
+pub(crate) const MAX_TOOL_TRANSCRIPT_TOKENS: usize = 10_000;
+pub(crate) const MAX_MESSAGE_ENTRY_TOKENS: usize = 2_000;
+pub(crate) const MAX_TOOL_ENTRY_TOKENS: usize = 1_000;
+pub(crate) const RECENT_ENTRY_LIMIT: usize = 40;
+pub(crate) const MAX_ACTION_STRING_TOKENS: usize = 16_000;
+pub(crate) const TRUNCATION_TAG: &str = "truncated";
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -140,7 +140,7 @@ impl Guardrail {
     /// should abort the turn — re-authorizing would likely fail again since
     /// the reviewer itself is malfunctioning).
     pub async fn assess(&mut self, action: &Value, context: &[Message]) -> GuardrailOutcome {
-        crate::tools::bash::install_signal_forwarder();
+        bash::install_signal_forwarder();
         let model_ref = self
             .config
             .review_model
@@ -150,14 +150,13 @@ impl Guardrail {
             Ok(model) => model,
             Err(error) => return GuardrailOutcome::Failed(error),
         };
-        let provider =
-            match crate::provider::build_provider(&self.runtime, &request_model.provider_id) {
-                Ok(provider) => provider,
-                Err(error) => return GuardrailOutcome::Failed(error),
-            };
+        let provider = match provider::build_provider(&self.runtime, &request_model.provider_id) {
+            Ok(provider) => provider,
+            Err(error) => return GuardrailOutcome::Failed(error),
+        };
 
-        let system_prompt = prompt::policy_prompt().to_string();
-        let user_content = prompt::build_reviewer_user_content(context, action);
+        let system_prompt = guardrail_prompt::policy_prompt().to_string();
+        let user_content = guardrail_prompt::build_reviewer_user_content(context, action);
 
         let msgs = vec![
             Message::System {
@@ -213,7 +212,7 @@ impl Guardrail {
                         } => c.as_str(),
                         _ => "",
                     };
-                    match prompt::parse_assessment(content) {
+                    match guardrail_prompt::parse_assessment(content) {
                         Ok(assessment) => {
                             if assessment.is_allowed() {
                                 self.record_non_denial();

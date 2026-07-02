@@ -1,4 +1,3 @@
-pub mod openai;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -191,7 +190,7 @@ pub fn approx_tokens(s: &str) -> u64 {
 pub fn build_provider(config: &Config, provider_id: &str) -> anyhow::Result<Arc<dyn Provider>> {
     let provider = config.provider(provider_id)?;
     let api_key = config.api_key_for_provider(provider_id)?;
-    Ok(Arc::new(openai::OpenAiProvider::new(
+    Ok(Arc::new(crate::openai::OpenAiProvider::new(
         provider.base_url.clone(),
         api_key,
     )) as Arc<dyn Provider>)

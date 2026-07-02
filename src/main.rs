@@ -12,12 +12,15 @@ use serde::Serialize;
 compile_error!("mu is supported only on Unix-like systems");
 
 mod agent;
+mod bash;
 mod cli;
 mod compaction;
 mod config;
 mod env;
 mod guardrail;
+mod guardrail_prompt;
 mod models;
+mod openai;
 mod paths;
 mod provider;
 mod redaction;
@@ -27,6 +30,7 @@ mod skills;
 mod store;
 mod system_prompt;
 mod tools;
+mod truncate;
 
 use cli::{Args, Command, ProjectSub, SessionOriginArg, SessionSub};
 use config::Config;
