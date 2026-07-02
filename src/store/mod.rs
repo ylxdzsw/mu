@@ -8,7 +8,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
 use uuid::Uuid;
 
-use crate::provider::{Message, ToolCall, UserContent, approx_tokens};
+use crate::provider::{Message, ToolCall, Usage, UserContent, approx_tokens};
 
 #[derive(Debug, Clone)]
 pub struct Session {
@@ -71,11 +71,24 @@ pub struct SessionSummary {
     pub model: String,
     pub title: Option<String>,
     pub last_total_tokens: u64,
-    pub cost_total: f64,
     pub origin: SessionOrigin,
     pub archived: bool,
     pub message_count: u64,
     pub turn_count: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TurnUsage {
+    pub id: i64,
+    pub session_id: String,
+    pub model: String,
+    pub input_tokens: u64,
+    pub cache_read_input_tokens: u64,
+    pub cache_write_input_tokens: u64,
+    pub output_tokens: u64,
+    pub reasoning_output_tokens: u64,
+    pub total_tokens: u64,
+    pub created_at: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -213,10 +226,8 @@ impl Store {
                 updated_at TEXT NOT NULL,
                 cwd TEXT NOT NULL,
                 model TEXT NOT NULL,
-                effort TEXT,
                 title TEXT,
                 last_total_tokens INTEGER NOT NULL DEFAULT 0,
-                cost_total REAL NOT NULL DEFAULT 0,
                 origin TEXT NOT NULL DEFAULT 'cli',
                 archived INTEGER NOT NULL DEFAULT 0
             );
@@ -246,6 +257,20 @@ impl Store {
                 dir_mtime INTEGER NOT NULL,
                 skills_json TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS turn_usage (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT NOT NULL,
+                model TEXT NOT NULL,
+                input_tokens INTEGER NOT NULL DEFAULT 0,
+                cache_read_input_tokens INTEGER NOT NULL DEFAULT 0,
+                cache_write_input_tokens INTEGER NOT NULL DEFAULT 0,
+                output_tokens INTEGER NOT NULL DEFAULT 0,
+                reasoning_output_tokens INTEGER NOT NULL DEFAULT 0,
+                total_tokens INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY(session_id) REFERENCES session(id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_turn_usage_session_id ON turn_usage(session_id);
             CREATE TABLE IF NOT EXISTS review (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 session_id TEXT NOT NULL,
@@ -258,7 +283,6 @@ impl Store {
                 created_at TEXT NOT NULL
             );",
         )?;
-        self.ensure_session_column("effort", "TEXT")?;
         self.ensure_session_column("origin", "TEXT NOT NULL DEFAULT 'cli'")?;
         self.ensure_session_column("archived", "INTEGER NOT NULL DEFAULT 0")?;
         self.ensure_session_column("pending_state", "TEXT")?;
@@ -268,6 +292,7 @@ impl Store {
         self.ensure_session_column("pending_error_message", "TEXT")?;
         self.ensure_message_column("user_content_json", "TEXT")?;
         self.ensure_tool_call_column("risk", "TEXT")?;
+        self.rebuild_session_without_stale_columns()?;
         Ok(())
     }
 
@@ -298,6 +323,59 @@ impl Store {
         Ok(())
     }
 
+    fn session_has_column(&self, name: &str) -> Result<bool> {
+        let mut stmt = self.conn.prepare("PRAGMA table_info(session)")?;
+        let columns = stmt.query_map([], |row| row.get::<_, String>(1))?;
+        for column in columns {
+            if column? == name {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    fn rebuild_session_without_stale_columns(&self) -> Result<()> {
+        if !self.session_has_column("effort")? && !self.session_has_column("cost_total")? {
+            return Ok(());
+        }
+
+        self.conn.execute_batch(
+            "PRAGMA foreign_keys=off;
+             BEGIN;
+             CREATE TABLE session_new (
+                id TEXT PRIMARY KEY,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                cwd TEXT NOT NULL,
+                model TEXT NOT NULL,
+                title TEXT,
+                last_total_tokens INTEGER NOT NULL DEFAULT 0,
+                origin TEXT NOT NULL DEFAULT 'cli',
+                archived INTEGER NOT NULL DEFAULT 0,
+                pending_state TEXT,
+                pending_prompt_message_id INTEGER,
+                pending_checkpoint_message_id INTEGER,
+                pending_retry_count INTEGER NOT NULL DEFAULT 0,
+                pending_error_message TEXT
+             );
+             INSERT INTO session_new (
+                id, created_at, updated_at, cwd, model, title, last_total_tokens,
+                origin, archived, pending_state, pending_prompt_message_id,
+                pending_checkpoint_message_id, pending_retry_count, pending_error_message
+             )
+             SELECT
+                id, created_at, updated_at, cwd, model, title, last_total_tokens,
+                origin, archived, pending_state, pending_prompt_message_id,
+                pending_checkpoint_message_id, pending_retry_count, pending_error_message
+             FROM session;
+             DROP TABLE session;
+             ALTER TABLE session_new RENAME TO session;
+             COMMIT;
+             PRAGMA foreign_keys=on;",
+        )?;
+        Ok(())
+    }
+
     #[cfg(test)]
     pub fn create_session(&self, cwd: &str, model: &str) -> Result<Session> {
         self.create_session_with_origin(cwd, model, SessionOrigin::Cli)
@@ -312,16 +390,9 @@ impl Store {
         let id = Uuid::new_v4().to_string();
         let now = chrono::Utc::now().to_rfc3339();
         self.conn.execute(
-            "INSERT INTO session (id, created_at, updated_at, cwd, model, effort, title, last_total_tokens, cost_total, origin, archived)
-             VALUES (?1, ?2, ?2, ?3, ?4, ?5, NULL, 0, 0, ?6, 0)",
-            params![
-                id,
-                now,
-                cwd,
-                model,
-                Option::<String>::None,
-                origin.as_str()
-            ],
+            "INSERT INTO session (id, created_at, updated_at, cwd, model, title, last_total_tokens, origin, archived)
+             VALUES (?1, ?2, ?2, ?3, ?4, NULL, 0, ?5, 0)",
+            params![id, now, cwd, model, origin.as_str()],
         )?;
         Ok(Session {
             id,
@@ -415,7 +486,7 @@ impl Store {
         let sql = format!(
             "SELECT
                 s.id, s.created_at, s.updated_at, s.cwd, s.model, s.title,
-                s.last_total_tokens, s.cost_total, s.origin, s.archived,
+                s.last_total_tokens, s.origin, s.archived,
                 COUNT(m.id) AS message_count,
                 COALESCE(SUM(CASE WHEN m.role = 'user' THEN 1 ELSE 0 END), 0) AS user_count
              FROM session s
@@ -431,9 +502,9 @@ impl Store {
         };
         let mut summaries = Vec::new();
         while let Some(row) = rows.next()? {
-            let origin: String = row.get(8)?;
-            let message_count = row.get::<_, i64>(10)? as u64;
-            let user_count = row.get::<_, i64>(11)? as u64;
+            let origin: String = row.get(7)?;
+            let message_count = row.get::<_, i64>(9)? as u64;
+            let user_count = row.get::<_, i64>(10)? as u64;
             summaries.push(SessionSummary {
                 id: row.get(0)?,
                 created_at: row.get(1)?,
@@ -442,9 +513,8 @@ impl Store {
                 model: row.get(4)?,
                 title: row.get(5)?,
                 last_total_tokens: row.get::<_, i64>(6)? as u64,
-                cost_total: row.get(7)?,
                 origin: parse_origin(origin)?,
-                archived: row.get::<_, i64>(9)? != 0,
+                archived: row.get::<_, i64>(8)? != 0,
                 message_count,
                 turn_count: user_count.saturating_sub(1),
             });
@@ -456,7 +526,7 @@ impl Store {
         let mut stmt = self.conn.prepare(
             "SELECT
                 s.id, s.created_at, s.updated_at, s.cwd, s.model, s.title,
-                s.last_total_tokens, s.cost_total, s.origin, s.archived,
+                s.last_total_tokens, s.origin, s.archived,
                 COUNT(m.id) AS message_count,
                 COALESCE(SUM(CASE WHEN m.role = 'user' THEN 1 ELSE 0 END), 0) AS user_count
              FROM session s
@@ -466,9 +536,9 @@ impl Store {
         )?;
         let row = stmt
             .query_row(params![id], |row| {
-                let origin: String = row.get(8)?;
-                let message_count = row.get::<_, i64>(10)? as u64;
-                let user_count = row.get::<_, i64>(11)? as u64;
+                let origin: String = row.get(7)?;
+                let message_count = row.get::<_, i64>(9)? as u64;
+                let user_count = row.get::<_, i64>(10)? as u64;
                 Ok(SessionSummary {
                     id: row.get(0)?,
                     created_at: row.get(1)?,
@@ -477,9 +547,8 @@ impl Store {
                     model: row.get(4)?,
                     title: row.get(5)?,
                     last_total_tokens: row.get::<_, i64>(6)? as u64,
-                    cost_total: row.get(7)?,
                     origin: parse_origin(origin)?,
-                    archived: row.get::<_, i64>(9)? != 0,
+                    archived: row.get::<_, i64>(8)? != 0,
                     message_count,
                     turn_count: user_count.saturating_sub(1),
                 })
@@ -521,27 +590,72 @@ impl Store {
     pub fn update_session(
         &self,
         id: &str,
-        last_total_tokens: u64,
-        cost_delta: f64,
+        usage: &Usage,
         title: Option<&str>,
         model: &str,
     ) -> Result<()> {
         let now = chrono::Utc::now().to_rfc3339();
+        let tx = self.conn.unchecked_transaction()?;
         if let Some(t) = title {
-            self.conn.execute(
+            tx.execute(
                 "UPDATE session SET updated_at = ?1, last_total_tokens = ?2,
-                 cost_total = cost_total + ?3, title = COALESCE(title, ?4),
-                 model = ?5 WHERE id = ?6",
-                params![now, last_total_tokens as i64, cost_delta, t, model, id],
+                 title = COALESCE(title, ?3), model = ?4 WHERE id = ?5",
+                params![now, usage.total_tokens as i64, t, model, id],
             )?;
         } else {
-            self.conn.execute(
+            tx.execute(
                 "UPDATE session SET updated_at = ?1, last_total_tokens = ?2,
-                 cost_total = cost_total + ?3, model = ?4 WHERE id = ?5",
-                params![now, last_total_tokens as i64, cost_delta, model, id],
+                 model = ?3 WHERE id = ?4",
+                params![now, usage.total_tokens as i64, model, id],
             )?;
         }
+        tx.execute(
+            "INSERT INTO turn_usage (
+                session_id, model, input_tokens, cache_read_input_tokens,
+                cache_write_input_tokens, output_tokens, reasoning_output_tokens,
+                total_tokens, created_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                id,
+                model,
+                usage.input_tokens as i64,
+                usage.cache_read_input_tokens as i64,
+                usage.cache_write_input_tokens as i64,
+                usage.output_tokens as i64,
+                usage.reasoning_output_tokens as i64,
+                usage.total_tokens as i64,
+                now,
+            ],
+        )?;
+        tx.commit()?;
         Ok(())
+    }
+
+    pub fn turn_usage(&self, session_id: &str) -> Result<Vec<TurnUsage>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, session_id, model, input_tokens, cache_read_input_tokens,
+                    cache_write_input_tokens, output_tokens, reasoning_output_tokens,
+                    total_tokens, created_at
+             FROM turn_usage
+             WHERE session_id = ?1
+             ORDER BY id ASC",
+        )?;
+        let rows = stmt.query_map(params![session_id], |row| {
+            Ok(TurnUsage {
+                id: row.get(0)?,
+                session_id: row.get(1)?,
+                model: row.get(2)?,
+                input_tokens: row.get::<_, i64>(3)? as u64,
+                cache_read_input_tokens: row.get::<_, i64>(4)? as u64,
+                cache_write_input_tokens: row.get::<_, i64>(5)? as u64,
+                output_tokens: row.get::<_, i64>(6)? as u64,
+                reasoning_output_tokens: row.get::<_, i64>(7)? as u64,
+                total_tokens: row.get::<_, i64>(8)? as u64,
+                created_at: row.get(9)?,
+            })
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .context("loading turn usage")
     }
 
     pub fn update_session_cwd(&self, id: &str, cwd: &str) -> Result<()> {

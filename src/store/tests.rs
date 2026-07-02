@@ -1,5 +1,5 @@
 use super::*;
-use crate::provider::{ContentPart, FunctionCall, ImageUrl, ToolCall};
+use crate::provider::{ContentPart, FunctionCall, ImageUrl, ToolCall, Usage};
 
 fn temp_store() -> (Store, std::path::PathBuf) {
     let tmp = std::env::temp_dir().join(format!("mu-store-{}", uuid::Uuid::new_v4()));
@@ -74,6 +74,81 @@ fn reloads_legacy_text_user_content() {
     };
 
     assert_eq!(text, "legacy text");
+    let _ = std::fs::remove_dir_all(tmp);
+}
+
+#[test]
+fn migrates_legacy_session_columns_and_tracks_turn_usage() {
+    let tmp = std::env::temp_dir().join(format!("mu-store-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&tmp).unwrap();
+    let db_path = tmp.join("mu.db");
+    {
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE session (
+                id TEXT PRIMARY KEY,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                cwd TEXT NOT NULL,
+                model TEXT NOT NULL,
+                effort TEXT,
+                title TEXT,
+                last_total_tokens INTEGER NOT NULL DEFAULT 0,
+                cost_total REAL NOT NULL DEFAULT 0
+            );
+            INSERT INTO session (
+                id, created_at, updated_at, cwd, model, effort, title,
+                last_total_tokens, cost_total
+            ) VALUES (
+                'session-1', 'now', 'now', '/tmp', 'old-model', 'high',
+                'legacy', 7, 1.23
+            );",
+        )
+        .unwrap();
+    }
+
+    let store = Store::open(&db_path).unwrap();
+    let columns = store
+        .conn
+        .prepare("PRAGMA table_info(session)")
+        .unwrap()
+        .query_map([], |row| row.get::<_, String>(1))
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap();
+
+    assert!(!columns.contains(&"effort".to_string()));
+    assert!(!columns.contains(&"cost_total".to_string()));
+
+    let loaded = store.get_session("session-1").unwrap().unwrap();
+    assert_eq!(loaded.model, "old-model");
+    assert_eq!(loaded.title.as_deref(), Some("legacy"));
+    assert_eq!(loaded.last_total_tokens, 7);
+    assert_eq!(loaded.origin, SessionOrigin::Cli);
+    assert!(!loaded.archived);
+
+    let usage = Usage {
+        input_tokens: 12,
+        cache_read_input_tokens: 3,
+        cache_write_input_tokens: 2,
+        output_tokens: 5,
+        reasoning_output_tokens: 4,
+        total_tokens: 17,
+    };
+    store
+        .update_session("session-1", &usage, None, "new-model")
+        .unwrap();
+    let usage_rows = store.turn_usage("session-1").unwrap();
+
+    assert_eq!(usage_rows.len(), 1);
+    assert_eq!(usage_rows[0].model, "new-model");
+    assert_eq!(usage_rows[0].input_tokens, 12);
+    assert_eq!(usage_rows[0].cache_read_input_tokens, 3);
+    assert_eq!(usage_rows[0].cache_write_input_tokens, 2);
+    assert_eq!(usage_rows[0].output_tokens, 5);
+    assert_eq!(usage_rows[0].reasoning_output_tokens, 4);
+    assert_eq!(usage_rows[0].total_tokens, 17);
+
     let _ = std::fs::remove_dir_all(tmp);
 }
 

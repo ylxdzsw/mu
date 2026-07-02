@@ -70,7 +70,6 @@ pub struct StatusSession {
     pub message_count: u64,
     pub turn_count: u64,
     pub last_total_tokens: u64,
-    pub cost_total: f64,
 }
 
 #[derive(Debug, Clone, Serialize, Default)]
@@ -256,7 +255,6 @@ fn status_session(summary: crate::store::SessionSummary) -> StatusSession {
         message_count: summary.message_count,
         turn_count: summary.turn_count,
         last_total_tokens: summary.last_total_tokens,
-        cost_total: summary.cost_total,
     }
 }
 

@@ -26,9 +26,10 @@ impl Provider for FakeProvider {
             },
             finish_reason: FinishReason::Stop,
             usage: Some(Usage {
-                prompt_tokens: 1,
-                completion_tokens: 1,
+                input_tokens: 1,
+                output_tokens: 1,
                 total_tokens: 2,
+                ..Usage::default()
             }),
         })
     }

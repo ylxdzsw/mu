@@ -33,7 +33,7 @@ fn streams_deltas_and_accumulates_tool_calls() {
     for chunk in [
         "data: {\"choices\":[{\"delta\":{\"content\":\"hel\"},\"finish_reason\":null}]}\n\n",
         "data: {\"choices\":[{\"delta\":{\"content\":\"lo\",\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"read\",\"arguments\":\"{\\\"path\\\":\"}}]},\"finish_reason\":null}]}\n\n",
-        "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"\\\"/tmp/x\\\"}\"}}]},\"finish_reason\":\"tool_calls\"}],\"usage\":{\"prompt_tokens\":12,\"completion_tokens\":5,\"total_tokens\":17}}\n\n",
+        "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"\\\"/tmp/x\\\"}\"}}]},\"finish_reason\":\"tool_calls\"}],\"usage\":{\"prompt_tokens\":12,\"completion_tokens\":5,\"total_tokens\":17,\"prompt_tokens_details\":{\"cached_tokens\":3,\"cache_creation_tokens\":2},\"completion_tokens_details\":{\"reasoning_tokens\":4}}}\n\n",
         "data: [DONE]\n\n",
     ] {
         buffer.push_str(chunk);
@@ -44,7 +44,13 @@ fn streams_deltas_and_accumulates_tool_calls() {
     assert_eq!(tool_call_starts, 1);
     assert_eq!(state.content, "hello");
     assert_eq!(state.finish_reason, FinishReason::ToolCalls);
-    assert_eq!(state.usage.unwrap().total_tokens, 17);
+    let usage = state.usage.unwrap();
+    assert_eq!(usage.input_tokens, 12);
+    assert_eq!(usage.cache_read_input_tokens, 3);
+    assert_eq!(usage.cache_write_input_tokens, 2);
+    assert_eq!(usage.output_tokens, 5);
+    assert_eq!(usage.reasoning_output_tokens, 4);
+    assert_eq!(usage.total_tokens, 17);
     let calls: Vec<_> = state
         .tool_accum
         .into_values()

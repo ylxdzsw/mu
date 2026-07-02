@@ -57,9 +57,10 @@ impl Provider for ToolThenStopProvider {
                 },
                 finish_reason: FinishReason::ToolCalls,
                 usage: Some(Usage {
-                    prompt_tokens: 1,
-                    completion_tokens: 1,
+                    input_tokens: 1,
+                    output_tokens: 1,
                     total_tokens: 2,
+                    ..Usage::default()
                 }),
             }),
             1 => {
@@ -78,9 +79,10 @@ impl Provider for ToolThenStopProvider {
                     },
                     finish_reason: FinishReason::Stop,
                     usage: Some(Usage {
-                        prompt_tokens: 1,
-                        completion_tokens: 1,
+                        input_tokens: 1,
+                        output_tokens: 1,
                         total_tokens: 2,
+                        ..Usage::default()
                     }),
                 })
             }
@@ -112,9 +114,10 @@ impl Provider for RetryThenStopProvider {
                 },
                 finish_reason: FinishReason::Stop,
                 usage: Some(Usage {
-                    prompt_tokens: 1,
-                    completion_tokens: 1,
+                    input_tokens: 1,
+                    output_tokens: 1,
                     total_tokens: 2,
+                    ..Usage::default()
                 }),
             }),
             other => panic!("unexpected retry provider step {other}"),

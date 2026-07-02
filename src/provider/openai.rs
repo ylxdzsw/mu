@@ -69,6 +69,24 @@ struct UsageJson {
     prompt_tokens: u64,
     completion_tokens: u64,
     total_tokens: u64,
+    #[serde(default)]
+    prompt_tokens_details: PromptTokensDetailsJson,
+    #[serde(default)]
+    completion_tokens_details: CompletionTokensDetailsJson,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct PromptTokensDetailsJson {
+    #[serde(default)]
+    cached_tokens: u64,
+    #[serde(default)]
+    cache_creation_tokens: u64,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct CompletionTokensDetailsJson {
+    #[serde(default)]
+    reasoning_tokens: u64,
 }
 
 type ToolCallAccumulator = BTreeMap<usize, (Option<String>, Option<String>, String, String)>;
@@ -263,8 +281,11 @@ fn consume_sse_buffer(
 
             if let Some(u) = parsed.usage {
                 state.usage = Some(Usage {
-                    prompt_tokens: u.prompt_tokens,
-                    completion_tokens: u.completion_tokens,
+                    input_tokens: u.prompt_tokens,
+                    cache_read_input_tokens: u.prompt_tokens_details.cached_tokens,
+                    cache_write_input_tokens: u.prompt_tokens_details.cache_creation_tokens,
+                    output_tokens: u.completion_tokens,
+                    reasoning_output_tokens: u.completion_tokens_details.reasoning_tokens,
                     total_tokens: u.total_tokens,
                 });
             }

@@ -502,19 +502,17 @@ impl Renderer {
 
     pub fn turn_summary(
         &mut self,
-        prompt_tokens: u64,
-        completion_tokens: u64,
+        input_tokens: u64,
+        output_tokens: u64,
         context_pct: Option<f64>,
-        cost: Option<f64>,
     ) -> io::Result<()> {
         if self.format == OutputFormat::Json {
             return self.write_json(
                 "turn_summary",
                 serde_json::json!({
-                    "prompt_tokens": prompt_tokens,
-                    "completion_tokens": completion_tokens,
+                    "input_tokens": input_tokens,
+                    "output_tokens": output_tokens,
                     "context_pct": context_pct,
-                    "cost": cost
                 }),
             );
         }
@@ -524,7 +522,7 @@ impl Renderer {
         write!(
             self.stderr,
             "{}\n\n",
-            format_turn_summary(prompt_tokens, completion_tokens, context_pct, cost)
+            format_turn_summary(input_tokens, output_tokens, context_pct)
         )?;
         self.stderr.flush()
     }
@@ -1728,21 +1726,11 @@ fn strip_ansi(input: &str) -> String {
     out
 }
 
-fn format_turn_summary(
-    prompt_tokens: u64,
-    completion_tokens: u64,
-    context_pct: Option<f64>,
-    cost: Option<f64>,
-) -> String {
+fn format_turn_summary(input_tokens: u64, output_tokens: u64, context_pct: Option<f64>) -> String {
     let ctx = context_pct
         .map(|p| format!("{p:.0}%"))
         .unwrap_or_else(|| "?".into());
-    let mut summary =
-        format!("[mu] tokens: {prompt_tokens} in / {completion_tokens} out  context: {ctx}");
-    if let Some(cost) = cost {
-        summary.push_str(&format!("  cost: ${cost:.4}"));
-    }
-    summary
+    format!("[mu] tokens: {input_tokens} in / {output_tokens} out  context: {ctx}")
 }
 
 #[cfg(test)]

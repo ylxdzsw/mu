@@ -691,21 +691,14 @@ async fn run_turn(args: RunTurnArgs<'_>) -> Result<()> {
     match &result {
         Ok(r) => {
             let ctx_pct =
-                model_context_window.map(|cw| (r.final_total_tokens as f64 / cw as f64) * 100.0);
-            store.update_session(
-                session_id,
-                r.final_total_tokens,
-                r.cost,
-                Some(&title),
-                &request.model.canonical,
-            )?;
+                model_context_window.map(|cw| (r.usage.total_tokens as f64 / cw as f64) * 100.0);
+            store.update_session(session_id, &r.usage, Some(&title), &request.model.canonical)?;
             store.clear_pending_turn(session_id)?;
             renderer.finish_turn()?;
             renderer.turn_summary(
-                r.prompt_tokens,
-                r.completion_tokens,
+                r.usage.visible_input_tokens(),
+                r.usage.visible_output_tokens(),
                 ctx_pct,
-                if r.cost > 0.0 { Some(r.cost) } else { None },
             )?;
             renderer.turn_done_bell(turn_started.elapsed())?;
         }
@@ -828,9 +821,6 @@ fn print_status_report(report: &StatusReport) {
             "turns: {}  messages: {}  updated: {}",
             session.turn_count, session.message_count, session.updated_at
         );
-        if session.cost_total > 0.0 {
-            println!("cost total: ${:.4}", session.cost_total);
-        }
     }
     if report.active.busy {
         println!("active: busy");

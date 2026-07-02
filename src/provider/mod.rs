@@ -92,9 +92,24 @@ pub struct FunctionCall {
 
 #[derive(Debug, Clone, Default)]
 pub struct Usage {
-    pub prompt_tokens: u64,
-    pub completion_tokens: u64,
+    pub input_tokens: u64,
+    pub cache_read_input_tokens: u64,
+    pub cache_write_input_tokens: u64,
+    pub output_tokens: u64,
+    pub reasoning_output_tokens: u64,
     pub total_tokens: u64,
+}
+
+impl Usage {
+    pub fn visible_input_tokens(&self) -> u64 {
+        self.input_tokens
+            .saturating_sub(self.cache_read_input_tokens)
+            .saturating_sub(self.cache_write_input_tokens)
+    }
+
+    pub fn visible_output_tokens(&self) -> u64 {
+        self.output_tokens
+    }
 }
 
 #[derive(Debug, Clone)]

@@ -218,17 +218,14 @@ fn pty_transcript_shows_live_placeholder_and_omission_updates() {
 
 #[test]
 fn omits_cost_when_not_available() {
-    let summary = format_turn_summary(12, 5, Some(25.0), None);
+    let summary = format_turn_summary(12, 5, Some(25.0));
     assert_eq!(summary, "[mu] tokens: 12 in / 5 out  context: 25%");
 }
 
 #[test]
-fn includes_cost_when_available() {
-    let summary = format_turn_summary(12, 5, None, Some(0.0034));
-    assert_eq!(
-        summary,
-        "[mu] tokens: 12 in / 5 out  context: ?  cost: $0.0034"
-    );
+fn formats_unknown_context_without_cost() {
+    let summary = format_turn_summary(12, 5, None);
+    assert_eq!(summary, "[mu] tokens: 12 in / 5 out  context: ?");
 }
 
 #[test]
@@ -385,7 +382,7 @@ fn capture_renderer_pty_transcript(
                 )
                 .unwrap();
             renderer.finish_turn().unwrap();
-            renderer.turn_summary(12, 5, Some(25.0), None).unwrap();
+            renderer.turn_summary(12, 5, Some(25.0)).unwrap();
             renderer.turn_done_bell(turn_elapsed).unwrap();
             if let Some(prompt) = trailing_prompt {
                 let bytes = prompt.as_bytes();
@@ -609,7 +606,7 @@ fn capture_plain_renderer_transcript(
                 )
                 .unwrap();
             renderer.finish_turn().unwrap();
-            renderer.turn_summary(12, 5, Some(25.0), None).unwrap();
+            renderer.turn_summary(12, 5, Some(25.0)).unwrap();
             renderer.turn_done_bell(turn_elapsed).unwrap();
             if let Some(prompt) = trailing_prompt {
                 let bytes = prompt.as_bytes();

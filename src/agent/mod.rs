@@ -11,17 +11,16 @@ use crate::compaction;
 use crate::config::Config;
 use crate::guardrail::{Guardrail, GuardrailOutcome, bash_risk};
 use crate::models::RequestOptions;
-use crate::provider::{FinishReason, Message, Provider, ProviderError, StreamEvent, ToolCall};
+use crate::provider::{
+    FinishReason, Message, Provider, ProviderError, StreamEvent, ToolCall, Usage,
+};
 use crate::renderer::Renderer;
 use crate::store::{ReviewRecord, Store, ToolCallRecord};
 use crate::tools::bash::{self, RunningBash};
 use crate::tools::{ExecutionMode, ToolContext, ToolRegistry, ToolResult, missing_tool_message};
 
 pub struct TurnResult {
-    pub prompt_tokens: u64,
-    pub completion_tokens: u64,
-    pub final_total_tokens: u64,
-    pub cost: f64,
+    pub usage: Usage,
 }
 
 struct ConcurrentBashExecution<'a> {
@@ -71,9 +70,7 @@ impl<'a> AgentLoop<'a> {
         let tools = registry.definitions();
         let max_iter = self.config.limits.max_iterations;
 
-        let mut total_prompt: u64 = 0;
-        let mut total_completion: u64 = 0;
-        let mut final_total: u64 = 0;
+        let mut total_usage = Usage::default();
         let mut overflow_retries: u32 = 0;
         let mut live_provider_retries: u32 = 0;
         const MAX_OVERFLOW_RETRIES: u32 = 3;
@@ -102,7 +99,7 @@ impl<'a> AgentLoop<'a> {
                         let usage = stream_result
                             .usage
                             .as_ref()
-                            .map(|u| (u.prompt_tokens, u.completion_tokens));
+                            .map(|u| (u.visible_input_tokens(), u.visible_output_tokens()));
                         self.renderer.reasoning_end(usage)?;
                     }
                     Err(_) => self.renderer.cancel_live_state()?,
@@ -154,9 +151,12 @@ impl<'a> AgentLoop<'a> {
             };
 
             if let Some(u) = &stream_result.usage {
-                total_prompt += u.prompt_tokens;
-                total_completion += u.completion_tokens;
-                final_total = u.total_tokens;
+                total_usage.input_tokens += u.input_tokens;
+                total_usage.cache_read_input_tokens += u.cache_read_input_tokens;
+                total_usage.cache_write_input_tokens += u.cache_write_input_tokens;
+                total_usage.output_tokens += u.output_tokens;
+                total_usage.reasoning_output_tokens += u.reasoning_output_tokens;
+                total_usage.total_tokens = u.total_tokens;
             }
 
             let msg_id = self
@@ -369,19 +369,7 @@ impl<'a> AgentLoop<'a> {
             }
         }
 
-        let cost = compute_cost(
-            self.config,
-            &self.request.model,
-            total_prompt,
-            total_completion,
-        );
-
-        Ok(TurnResult {
-            prompt_tokens: total_prompt,
-            completion_tokens: total_completion,
-            final_total_tokens: final_total,
-            cost,
-        })
+        Ok(TurnResult { usage: total_usage })
     }
 
     fn load_pending_context(&self) -> Result<Vec<Message>> {
@@ -658,21 +646,6 @@ fn guardrail_review_required(guardrail: Option<&Guardrail>, call: &ToolCall, arg
 
 fn unknown_tool_result(name: &str) -> Result<ToolResult> {
     Err(anyhow::anyhow!(missing_tool_message(name)))
-}
-
-fn compute_cost(
-    config: &Config,
-    model: &crate::models::ResolvedModelRef,
-    prompt: u64,
-    completion: u64,
-) -> f64 {
-    let Some(model_cfg) = config.model_config(&model.provider_id, &model.model_id) else {
-        return 0.0;
-    };
-    let Some(prices) = &model_cfg.price_per_mtok else {
-        return 0.0;
-    };
-    (prompt as f64 / 1_000_000.0) * prices.input + (completion as f64 / 1_000_000.0) * prices.output
 }
 
 #[cfg(test)]
