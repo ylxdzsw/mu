@@ -60,7 +60,6 @@ pub struct StoredMessage {
     pub role: String,
     pub content: String,
     pub seq: i64,
-    pub created_at: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -122,6 +121,10 @@ pub struct TranscriptMessage {
     pub content: String,
     pub seq: i64,
     pub created_at: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<ToolCall>>,
 }
 
 #[derive(Debug, Clone)]
@@ -943,7 +946,7 @@ impl Store {
 
     fn message_at_seq(&self, session_id: &str, seq: i64) -> Result<Option<StoredMessage>> {
         let mut stmt = self.conn.prepare(
-            "SELECT role, content, seq, created_at FROM message
+            "SELECT role, content, seq FROM message
              WHERE session_id = ?1 AND seq = ?2",
         )?;
         let row = stmt
@@ -952,7 +955,6 @@ impl Store {
                     role: row.get(0)?,
                     content: row.get(1)?,
                     seq: row.get(2)?,
-                    created_at: row.get(3)?,
                 })
             })
             .optional()?;
@@ -1079,7 +1081,7 @@ impl Store {
 
     pub fn all_messages_for_session(&self, session_id: &str) -> Result<Vec<StoredMessage>> {
         let mut stmt = self.conn.prepare(
-            "SELECT role, content, seq, created_at FROM message
+            "SELECT role, content, seq FROM message
              WHERE session_id = ?1 ORDER BY seq ASC",
         )?;
         let rows = stmt.query_map(params![session_id], |row| {
@@ -1087,7 +1089,6 @@ impl Store {
                 role: row.get(0)?,
                 content: row.get(1)?,
                 seq: row.get(2)?,
-                created_at: row.get(3)?,
             })
         })?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
@@ -1095,16 +1096,34 @@ impl Store {
     }
 
     pub fn transcript(&self, session_id: &str) -> Result<Vec<TranscriptMessage>> {
-        let messages = self.all_messages_for_session(session_id)?;
-        Ok(messages
-            .into_iter()
-            .map(|message| TranscriptMessage {
-                role: message.role,
-                content: message.content,
-                seq: message.seq,
-                created_at: message.created_at,
+        let mut stmt = self.conn.prepare(
+            "SELECT role, content, tool_call_id, tool_calls_json, seq, created_at FROM message
+             WHERE session_id = ?1 ORDER BY seq ASC",
+        )?;
+        let rows = stmt.query_map(params![session_id], |row| {
+            let tool_calls_json: Option<String> = row.get(3)?;
+            let tool_calls = tool_calls_json
+                .as_deref()
+                .map(serde_json::from_str)
+                .transpose()
+                .map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        3,
+                        rusqlite::types::Type::Text,
+                        Box::new(error),
+                    )
+                })?;
+            Ok(TranscriptMessage {
+                role: row.get(0)?,
+                content: row.get(1)?,
+                tool_call_id: row.get(2)?,
+                tool_calls,
+                seq: row.get(4)?,
+                created_at: row.get(5)?,
             })
-            .collect())
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .context("loading transcript messages")
     }
 
     pub fn latest_summary_sequence(&self, session_id: &str) -> Result<Option<i64>> {

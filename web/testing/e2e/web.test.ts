@@ -49,7 +49,7 @@ async function verifyPromptSubmission() {
     await page.getByRole("button", { name: "Send prompt" }).click();
 
     await page
-      .locator(".conversation-card-body[data-mono='false']")
+      .locator(".markdown-rendered")
       .filter({ hasText: `Fake response to: ${prompt}` })
       .waitFor({ state: "visible" });
 
