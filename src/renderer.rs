@@ -93,6 +93,10 @@ impl Renderer {
             return self.write_json("assistant_delta", serde_json::json!({ "text": text }));
         }
         if !self.styled {
+            if !self.assistant_block_open {
+                self.ensure_block_separator_if_needed()?;
+                self.assistant_block_open = true;
+            }
             return self.write_stdout_committed(text);
         }
 
@@ -113,6 +117,10 @@ impl Renderer {
     }
 
     pub fn assistant_end(&mut self) -> io::Result<()> {
+        if !self.styled {
+            self.assistant_block_open = false;
+            return Ok(());
+        }
         let Some(block) = self.markdown.finish() else {
             self.assistant_block_open = false;
             return Ok(());
@@ -127,7 +135,7 @@ impl Renderer {
     }
 
     pub fn reasoning_start(&mut self) -> io::Result<()> {
-        if !self.styled {
+        if self.format == OutputFormat::Json {
             return Ok(());
         }
         self.assistant_block_open = false;
@@ -140,7 +148,7 @@ impl Renderer {
     }
 
     pub fn reasoning_delta(&mut self, text: &str) -> io::Result<()> {
-        if text.is_empty() || !self.styled {
+        if text.is_empty() || self.format == OutputFormat::Json {
             return Ok(());
         }
         let Some(reasoning) = self.reasoning.as_mut() else {
@@ -150,6 +158,9 @@ impl Renderer {
             .reasoning_chars
             .saturating_add(text.chars().count());
         if reasoning.committed {
+            return Ok(());
+        }
+        if !self.styled {
             return Ok(());
         }
         self.live_line = Some(LiveLine::Thinking);
@@ -174,6 +185,7 @@ impl Renderer {
             reasoning.started.elapsed(),
             reasoning.reasoning_chars,
             usage,
+            self.styled,
         );
         reasoning.committed = true;
         self.live_line = None;
@@ -182,10 +194,13 @@ impl Renderer {
     }
 
     pub fn tool_call_composition_start(&mut self) -> io::Result<()> {
-        if !self.styled {
+        if self.format == OutputFormat::Json {
             return Ok(());
         }
         self.assistant_block_open = false;
+        if !self.styled {
+            return Ok(());
+        }
         self.live_line = Some(LiveLine::ToolComposition);
         self.render_live_line()
     }
@@ -221,14 +236,9 @@ impl Renderer {
             return Ok(());
         }
         self.assistant_block_open = false;
-        if self.styled {
-            self.reasoning_end(None)?;
-        }
-        if self.styled {
-            self.ensure_block_separator_if_needed()?;
-        } else {
-            self.ensure_line_start()?;
-        }
+        self.reasoning_end(None)?;
+        self.live_line = None;
+        self.ensure_block_separator_if_needed()?;
         let title = args
             .get("title")
             .and_then(|value| value.as_str())
@@ -240,9 +250,7 @@ impl Renderer {
         let risk = args.get("risk").and_then(|value| value.as_str());
         let line = format_bash_header(title, script, risk, self.styled);
         self.active_bash_tool_call_id = tool_call_id.map(ToOwned::to_owned);
-        if self.styled {
-            self.bash_preview = Some(BashPreviewState::default());
-        }
+        self.bash_preview = Some(BashPreviewState::default());
         self.write_committed(&line)
     }
 
@@ -267,20 +275,29 @@ impl Renderer {
             );
         }
         let sanitized = strip_ansi(text);
-        if !self.styled {
-            return self.write_stdout_committed(&sanitized);
-        }
         let Some(preview) = self.bash_preview.as_mut() else {
-            return self.write_committed(&format!("{GRAY}{sanitized}{RESET}"));
+            return if self.styled {
+                self.write_committed(&format!("{GRAY}{sanitized}{RESET}"))
+            } else {
+                self.write_committed(&sanitized)
+            };
         };
         preview.raw.push_str(&sanitized);
         let snapshot = compute_bash_preview_snapshot(&preview.raw, false);
         if snapshot.head_rendered.len() > preview.committed_head_len {
             let next = snapshot.head_rendered[preview.committed_head_len..].to_string();
             preview.committed_head_len = snapshot.head_rendered.len();
-            self.write_committed(&format!("{GRAY}{next}{RESET}"))?;
+            if self.styled {
+                self.write_committed(&format!("{GRAY}{next}{RESET}"))?;
+            } else {
+                self.write_committed(&next)?;
+            }
         }
-        self.set_omitted_live_line(snapshot.omitted_lines, snapshot.omitted_bytes)
+        if self.styled {
+            self.set_omitted_live_line(snapshot.omitted_lines, snapshot.omitted_bytes)
+        } else {
+            Ok(())
+        }
     }
 
     pub fn tool_finished(
@@ -342,7 +359,7 @@ impl Renderer {
                 "{RED}✗ {BOLD}{name} failed{RESET}{RED}: {error}{RESET}{DIM} · {elapsed}{RESET}\n"
             )
         } else {
-            format!("[error] {name} failed: {error} ({elapsed})\n")
+            format!("✗ {name} failed: {error} · {elapsed}\n")
         };
         self.write_stdout_committed(&terminal_trim_committed_text(&line))
     }
@@ -368,11 +385,7 @@ impl Renderer {
             );
         }
         self.assistant_block_open = false;
-        if self.styled {
-            self.ensure_block_separator_if_needed()?;
-        } else {
-            self.ensure_line_start()?;
-        }
+        self.ensure_block_separator_if_needed()?;
         let verdict = if allowed { "allow" } else { "deny" };
         let script_preview = script.lines().next().unwrap_or(script);
         let script_preview = if script_preview.len() > 120 {
@@ -410,11 +423,7 @@ impl Renderer {
             return self.write_json("notice", serde_json::json!({ "message": msg }));
         }
         self.assistant_block_open = false;
-        if self.styled {
-            self.ensure_block_separator_if_needed()?;
-        } else {
-            self.ensure_line_start()?;
-        }
+        self.ensure_block_separator_if_needed()?;
         self.write_stdout_committed(&terminal_trim_committed_text(&format!("{msg}\n")))
     }
 
@@ -449,19 +458,11 @@ impl Renderer {
         if !self.stderr.is_terminal() {
             return Ok(());
         }
-        if self.styled {
-            write!(
-                self.stderr,
-                "{}\n\n",
-                format_turn_summary(prompt_tokens, completion_tokens, context_pct, cost)
-            )?;
-        } else {
-            writeln!(
-                self.stderr,
-                "{}",
-                format_turn_summary(prompt_tokens, completion_tokens, context_pct, cost)
-            )?;
-        }
+        write!(
+            self.stderr,
+            "{}\n\n",
+            format_turn_summary(prompt_tokens, completion_tokens, context_pct, cost)
+        )?;
         self.stderr.flush()
     }
 
@@ -551,7 +552,11 @@ impl Renderer {
             Some(LiveLine::BashOmitted {
                 omitted_lines,
                 omitted_bytes,
-            }) => Some(format_omitted_line(omitted_lines, omitted_bytes)),
+            }) => Some(format_omitted_line(
+                omitted_lines,
+                omitted_bytes,
+                self.styled,
+            )),
             None => None,
         }
     }
@@ -584,22 +589,32 @@ impl Renderer {
         self.live_line = None;
         if snapshot.head_rendered.len() > preview.committed_head_len {
             let next = snapshot.head_rendered[preview.committed_head_len..].to_string();
-            self.write_stdout_committed(&format!(
-                "{GRAY}{}{RESET}",
-                terminal_trim_committed_text(&next)
-            ))?;
+            if self.styled {
+                self.write_stdout_committed(&format!(
+                    "{GRAY}{}{RESET}",
+                    terminal_trim_committed_text(&next)
+                ))?;
+            } else {
+                self.write_stdout_committed(&terminal_trim_committed_text(&next))?;
+            }
         }
         if snapshot.omitted_lines > 0 || snapshot.omitted_bytes > 0 {
             self.write_stdout_committed(&terminal_trim_committed_text(&format!(
                 "{}\n",
-                format_omitted_line(snapshot.omitted_lines, snapshot.omitted_bytes)
+                format_omitted_line(snapshot.omitted_lines, snapshot.omitted_bytes, self.styled)
             )))?;
         }
         if !snapshot.tail_rendered.is_empty() {
-            self.write_stdout_committed(&format!(
-                "{GRAY}{}{RESET}",
-                terminal_trim_committed_text(&snapshot.tail_rendered)
-            ))?;
+            if self.styled {
+                self.write_stdout_committed(&format!(
+                    "{GRAY}{}{RESET}",
+                    terminal_trim_committed_text(&snapshot.tail_rendered)
+                ))?;
+            } else {
+                self.write_stdout_committed(&terminal_trim_committed_text(
+                    &snapshot.tail_rendered,
+                ))?;
+            }
         }
         Ok(())
     }
@@ -622,9 +637,19 @@ impl Renderer {
     }
 
     fn write_stdout(&mut self, text: &str) -> io::Result<()> {
+        let previous_trailing_newlines = self.trailing_newlines;
+        let visible = strip_ansi(text);
+        let visible_char_count = visible.chars().count();
+        let trailing_in_text = visible.chars().rev().take_while(|ch| *ch == '\n').count();
         self.stdout.write_all(text.as_bytes())?;
-        self.stdout_at_line_start = text.ends_with('\n');
-        self.trailing_newlines = text.chars().rev().take_while(|ch| *ch == '\n').count();
+        self.stdout_at_line_start = visible.ends_with('\n');
+        self.trailing_newlines = if text.is_empty() {
+            previous_trailing_newlines
+        } else if trailing_in_text == visible_char_count {
+            previous_trailing_newlines + trailing_in_text
+        } else {
+            trailing_in_text
+        };
         self.stdout.flush()
     }
 
@@ -1223,7 +1248,8 @@ fn format_tool(display: &ToolDisplay, elapsed: Duration, styled: bool) -> String
                 };
                 format!("{color}{icon} exit {exit_code}{RESET}{DIM} · {elapsed}{RESET}\n")
             } else {
-                format!("[bash] exit {exit_code} ({elapsed})\n")
+                let icon = if *exit_code == 0 { "✓" } else { "✗" };
+                format!("{icon} exit {exit_code} · {elapsed}\n")
             }
         }
     }
@@ -1241,10 +1267,21 @@ fn tool_display_json(display: &ToolDisplay) -> serde_json::Value {
 fn format_bash_header(title: &str, script: &str, risk: Option<&str>, styled: bool) -> String {
     let command = preview_first_line(script, BASH_COMMAND_PREVIEW_BYTES);
     if !styled {
-        return match risk {
-            Some(risk) => format!("$ {} {command}\n", format_risk_label(risk, false)),
-            None => format!("$ {command}\n"),
-        };
+        let mut out = String::new();
+        if !title.is_empty() {
+            out.push_str("# ");
+            out.push_str(title);
+            out.push('\n');
+        }
+        out.push('$');
+        out.push(' ');
+        if let Some(risk) = risk {
+            out.push_str(&format_risk_label(risk, false));
+            out.push(' ');
+        }
+        out.push_str(&command);
+        out.push('\n');
+        return out;
     }
 
     let mut out = String::new();
@@ -1309,16 +1346,25 @@ fn format_thought_line(
     elapsed: Duration,
     reasoning_chars: usize,
     usage: Option<(u64, u64)>,
+    styled: bool,
 ) -> String {
     let elapsed = format_duration(elapsed);
     let tokens = usage
         .map(|(_, completion_tokens)| completion_tokens.to_string())
         .unwrap_or_else(|| format!("~{}", approx_tokens_from_chars(reasoning_chars)));
-    format!("{GRAY}[thought {elapsed}, {tokens} tokens]{RESET}\n")
+    if styled {
+        format!("{GRAY}[thought {elapsed}, {tokens} tokens]{RESET}\n")
+    } else {
+        format!("[thought {elapsed}, {tokens} tokens]\n")
+    }
 }
 
-fn format_omitted_line(omitted_lines: usize, omitted_bytes: usize) -> String {
-    format!("{GRAY}[… omitted {omitted_lines} lines, {omitted_bytes} bytes]{RESET}")
+fn format_omitted_line(omitted_lines: usize, omitted_bytes: usize, styled: bool) -> String {
+    if styled {
+        format!("{GRAY}[… omitted {omitted_lines} lines, {omitted_bytes} bytes]{RESET}")
+    } else {
+        format!("[… omitted {omitted_lines} lines, {omitted_bytes} bytes]")
+    }
 }
 
 fn approx_tokens_from_chars(chars: usize) -> u64 {

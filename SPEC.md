@@ -768,8 +768,8 @@ human-facing sections. The renderer owns the spacing contract for those blocks.
   the final turn output (including the stderr summary line) and the next shell
   prompt.
 
-This contract is terminal-only. Plain and JSON output remain sequential,
-portable renderings without terminal spacing rules or control sequences.
+This contract applies to human-facing `terminal` and `plain` output. JSON
+remains a machine-oriented event stream without terminal spacing rules.
 
 **Stream routing (explicit).** The conversation transcript goes to **stdout**:
 tool presentation, tool failures, Bash output, and assistant text. Fatal process
@@ -778,16 +778,20 @@ captures the complete portable transcript while fatal diagnostics/summary
 remain visible. Stdout TTY detection selects rich versus portable rendering;
 stderr TTY detection suppresses the summary when redirected.
 
-- **Tool presentation.** Bash prints `$ [risk] <title>`, streams ANSI-sanitized
-  output, and prints its final exit status. Full tool results still follow the
-  shared model-context truncation policy (§4). In `plain`, streaming is always
-  sequential. In `terminal`, concurrent readonly batches still present exactly
-  one active live bash stream at a time in original tool order; later calls may
-  already be running, but their presentation is buffered until they become the
-  active slot.
-- **Assistant text.** Raw deltas stream unchanged when redirected. TTY display
-  commits parsed Markdown blocks as soon as they are stable; only the current
-  incomplete block is delayed.
+- **Tool presentation.** Bash prints an optional `# <title>` line, then its
+  command preview. `plain` shows explicit risk labels such as `[readonly]`
+  where `terminal` uses color. Both human-facing outputs stream the same head
+  preview, then print the omission marker only once at tool completion if a
+  middle section was actually omitted, followed by any reserved tail and a
+  matching exit line. Full tool results still follow the shared model-context
+  truncation policy (§4). In `plain`, streaming is always sequential. In
+  `terminal`, concurrent readonly batches still present exactly one active live
+  bash stream at a time in original tool order; later calls may already be
+  running, but their presentation is buffered until they become the active
+  slot.
+- **Assistant text.** `plain` and redirected output stream raw Markdown deltas
+  unchanged. TTY `terminal` display commits parsed Markdown blocks as soon as
+  they are stable; only the current incomplete block is delayed.
 - **Errors.** Always printed and clearly prefixed, with TTY styling and a plain
   ASCII fallback. Fatal turn failure produces a non-zero process exit code so
   the shell's `$?` is meaningful.
@@ -806,14 +810,14 @@ optional per-model rates in `config.jsonc` (omitted if no rates configured).
 This is the *only* stderr output in the normal case. It appears after all
 stdout, and goes to stderr so it stays out of a captured stdout transcript. It
 is suppressed if stderr is not a TTY (piped/redirected), since it would pollute
-log files. In terminal mode it is followed by one blank line so the next shell
-prompt is visually separated from the completed turn.
+log files. In both human-facing modes it is followed by one blank line so the
+next shell prompt is visually separated from the completed turn.
 
-Plain and JSON modes avoid terminal-only summaries and control sequences so they
-remain suitable for scripts. Human terminal mode may show progress for
-in-flight work, but committed transcript content is never erased from scrollback.
-When `terminal_bell.enabled` is true, terminal mode also emits a BEL (`\a`)
-after a successful turn's summary once total turn duration meets
+Plain and JSON modes avoid terminal-only control sequences so they remain
+suitable for scripts. Human terminal mode may show progress for in-flight work,
+but committed transcript content is never erased from scrollback. When
+`terminal_bell.enabled` is true, terminal mode also emits a BEL (`\a`) after a
+successful turn's summary once total turn duration meets
 `terminal_bell.min_duration_ms` (default 10s).
 
 ---

@@ -76,7 +76,7 @@ fn non_tty_tool_format_is_plain_and_compact() {
         Duration::from_millis(250),
         false,
     );
-    assert_eq!(line, "[bash] exit 7 (250ms)\n");
+    assert_eq!(line, "✗ exit 7 · 250ms\n");
     assert!(!line.contains('\x1b'));
 }
 
@@ -108,8 +108,20 @@ fn bash_header_renders_title_and_risk_colored_script_without_risk_label() {
 
 #[test]
 fn short_reasoning_trace_still_formats_a_thought_line() {
-    let line = format_thought_line(Duration::from_millis(300), 3, None);
+    let line = format_thought_line(Duration::from_millis(300), 3, None, true);
     assert_eq!(line, "\x1b[90m[thought 300ms, ~1 tokens]\x1b[0m\n");
+}
+
+#[test]
+fn plain_bash_header_keeps_title_and_explicit_risk_prefix() {
+    let header = format_bash_header("List files", "printf 'a'\npwd", Some("readonly"), false);
+    assert_eq!(header, "# List files\n$ [readonly] printf 'a'…\n");
+}
+
+#[test]
+fn plain_reasoning_trace_formats_without_ansi() {
+    let line = format_thought_line(Duration::from_millis(300), 3, None, false);
+    assert_eq!(line, "[thought 300ms, ~1 tokens]\n");
 }
 
 #[test]
@@ -174,11 +186,7 @@ fn terminal_trimming_only_removes_committed_line_suffixes() {
 #[test]
 fn pty_transcript_shows_live_placeholder_and_omission_updates() {
     let raw = capture_renderer_pty_transcript(false, Duration::from_secs(12), None);
-    let normalized = strip_ansi(&raw.replace('\r', ""))
-        .lines()
-        .map(|line| line.trim_end())
-        .collect::<Vec<_>>()
-        .join("\n");
+    let normalized = visible_terminal_text(&raw);
 
     assert!(raw.contains(&format!("{DIM}${RESET}")));
     assert!(raw.matches("[… omitted").count() > 1);
@@ -189,11 +197,20 @@ fn pty_transcript_shows_live_placeholder_and_omission_updates() {
     assert!(normalized.contains("$ i=1…"));
     assert!(!normalized.contains("  while [ $i -le 40 ]; do"));
     assert!(normalized.contains("[… omitted 35 lines, 245 bytes]"));
+    assert!(
+        normalized.contains("line03\n[… omitted 35 lines, 245 bytes]"),
+        "{normalized:?}"
+    );
+    assert!(
+        !normalized.contains("line03\n\n[… omitted 35 lines, 245 bytes]"),
+        "{normalized:?}"
+    );
     assert!(normalized.contains("line03"));
     assert!(!normalized.contains("line04"));
     assert!(normalized.contains("line39"));
     assert!(normalized.contains("line40"));
-    assert!(normalized.contains("\n\n$"));
+    assert!(normalized.contains("\n\n# Stream demo"));
+    assert!(!normalized.contains("\n\n\n# Stream demo"));
     assert!(!normalized.ends_with("\n\n"));
     assert!(normalized.starts_with("[thought"));
     assert!(normalized.contains("5 tokens]"));
@@ -247,6 +264,57 @@ fn terminal_summary_leaves_a_blank_line_before_the_next_prompt() {
 
     assert!(normalized.contains("[mu] tokens: 12 in / 5 out  context: 25%\n\nmu> "));
     assert!(!normalized.contains("[mu] tokens: 12 in / 5 out  context: 25%\n\n\nmu> "));
+}
+
+#[test]
+fn pty_transcript_keeps_one_blank_line_before_followup_thinking() {
+    let raw = capture_tool_then_followup_thinking_transcript();
+    let normalized = visible_terminal_text(&raw);
+
+    assert!(normalized.contains("exit 0"), "{normalized:?}");
+    assert!(
+        normalized.contains("✓ exit 0 · 250ms\n\n[thought"),
+        "{normalized:?}"
+    );
+    assert!(
+        !normalized.contains("exit 0\n\n\n[thought"),
+        "{normalized:?}"
+    );
+}
+
+#[test]
+fn plain_transcript_aligns_tool_blocks_without_live_updates_or_bell() {
+    let raw = capture_plain_renderer_transcript(true, Duration::from_secs(12), Some("mu> "));
+    let normalized = raw.replace('\r', "");
+
+    assert!(!raw.contains('\x1b'));
+    assert_eq!(raw.matches("[thought").count(), 1);
+    assert_eq!(raw.matches("[… omitted").count(), 1);
+    assert!(
+        normalized.contains("# Stream demo\n$ [readonly] i=1…\nline01\nline02\nline03\n"),
+        "{normalized:?}"
+    );
+    assert!(
+        normalized.contains("[… omitted 35 lines, 245 bytes]\nline39\nline40\n✓ exit 0 · 250ms\n"),
+        "{normalized:?}"
+    );
+    assert!(!normalized.contains("line04"));
+    assert!(normalized.contains("[mu] tokens: 12 in / 5 out  context: 25%\n\nmu> "));
+    assert!(!raw.ends_with('\x07'));
+}
+
+#[test]
+fn plain_transcript_keeps_raw_markdown_and_spacing_after_thought() {
+    let raw = capture_plain_markdown_after_thought_transcript();
+    let normalized = raw.replace('\r', "");
+
+    assert!(!raw.contains('\x1b'));
+    assert!(normalized.contains("[thought"));
+    assert!(normalized.contains("5 tokens]"));
+    assert!(
+        normalized.contains("[thought 40ms, 5 tokens]\n\n# Heading\n\n- item\n"),
+        "{normalized:?}"
+    );
 }
 
 fn capture_renderer_pty_transcript(
@@ -398,6 +466,312 @@ fn capture_assistant_after_thought_transcript() -> String {
         assert_eq!(libc::WEXITSTATUS(status), 0);
         String::from_utf8_lossy(&out).into_owned()
     }
+}
+
+fn capture_tool_then_followup_thinking_transcript() -> String {
+    let _guard = pty_test_lock().lock().unwrap();
+    let mut master: RawFd = -1;
+    let mut slave: RawFd = -1;
+    unsafe {
+        assert_eq!(
+            libc::openpty(
+                &mut master,
+                &mut slave,
+                std::ptr::null_mut(),
+                std::ptr::null(),
+                std::ptr::null(),
+            ),
+            0
+        );
+        let pid = libc::fork();
+        assert!(pid >= 0);
+        if pid == 0 {
+            libc::close(master);
+            assert_eq!(libc::dup2(slave, libc::STDOUT_FILENO), libc::STDOUT_FILENO);
+            assert_eq!(libc::dup2(slave, libc::STDERR_FILENO), libc::STDERR_FILENO);
+            if slave > libc::STDERR_FILENO {
+                libc::close(slave);
+            }
+
+            let mut renderer = Renderer::with_format(OutputFormat::Terminal);
+            renderer.tool_call_composition_start().unwrap();
+            renderer
+                .tool_start(
+                    None,
+                    "bash",
+                    &json!({
+                        "title": "Stream demo",
+                        "risk": "readonly",
+                        "script": "i=1\nwhile [ $i -le 40 ]; do\n  printf 'line%02d\\n' \"$i\"\n  i=$((i+1))\n  sleep 0.02\ndone",
+                    }),
+                )
+                .unwrap();
+            for idx in 1..=40 {
+                renderer
+                    .bash_output(None, "bash", &format!("line{idx:02}\n"))
+                    .unwrap();
+            }
+            renderer
+                .tool_finished(
+                    None,
+                    "bash",
+                    &ToolDisplay::Bash { exit_code: 0 },
+                    Duration::from_millis(250),
+                )
+                .unwrap();
+            renderer.reasoning_start().unwrap();
+            renderer.reasoning_delta("followup").unwrap();
+            libc::_exit(0);
+        }
+
+        libc::close(slave);
+        let mut out = Vec::new();
+        let mut buf = [0u8; 4096];
+        loop {
+            let n = libc::read(master, buf.as_mut_ptr().cast(), buf.len());
+            if n <= 0 {
+                break;
+            }
+            out.extend_from_slice(&buf[..n as usize]);
+        }
+        libc::close(master);
+        let mut status = 0;
+        assert_eq!(libc::waitpid(pid, &mut status, 0), pid);
+        assert!(libc::WIFEXITED(status));
+        assert_eq!(libc::WEXITSTATUS(status), 0);
+        String::from_utf8_lossy(&out).into_owned()
+    }
+}
+
+fn capture_plain_renderer_transcript(
+    bell_enabled: bool,
+    turn_elapsed: Duration,
+    trailing_prompt: Option<&str>,
+) -> String {
+    let _guard = pty_test_lock().lock().unwrap();
+    let mut master: RawFd = -1;
+    let mut slave: RawFd = -1;
+    unsafe {
+        assert_eq!(
+            libc::openpty(
+                &mut master,
+                &mut slave,
+                std::ptr::null_mut(),
+                std::ptr::null(),
+                std::ptr::null(),
+            ),
+            0
+        );
+        let pid = libc::fork();
+        assert!(pid >= 0);
+        if pid == 0 {
+            libc::close(master);
+            assert_eq!(libc::dup2(slave, libc::STDOUT_FILENO), libc::STDOUT_FILENO);
+            assert_eq!(libc::dup2(slave, libc::STDERR_FILENO), libc::STDERR_FILENO);
+            if slave > libc::STDERR_FILENO {
+                libc::close(slave);
+            }
+
+            let mut renderer = Renderer::with_terminal_bell(
+                OutputFormat::Plain,
+                bell_enabled.then_some(Duration::from_secs(10)),
+            );
+            renderer.reasoning_start().unwrap();
+            renderer.reasoning_delta("plan").unwrap();
+            std::thread::sleep(Duration::from_millis(40));
+            renderer.reasoning_end(Some((12, 5))).unwrap();
+
+            renderer.tool_call_composition_start().unwrap();
+            renderer
+                .tool_start(
+                    None,
+                    "bash",
+                    &json!({
+                        "title": "Stream demo",
+                        "risk": "readonly",
+                        "script": "i=1\nwhile [ $i -le 40 ]; do\n  printf 'line%02d\\n' \"$i\"\n  i=$((i+1))\n  sleep 0.02\ndone",
+                    }),
+                )
+                .unwrap();
+            for idx in 1..=40 {
+                renderer
+                    .bash_output(None, "bash", &format!("line{idx:02}\n"))
+                    .unwrap();
+            }
+            renderer
+                .tool_finished(
+                    None,
+                    "bash",
+                    &ToolDisplay::Bash { exit_code: 0 },
+                    Duration::from_millis(250),
+                )
+                .unwrap();
+            renderer.finish_turn().unwrap();
+            renderer.turn_summary(12, 5, Some(25.0), None).unwrap();
+            renderer.turn_done_bell(turn_elapsed).unwrap();
+            if let Some(prompt) = trailing_prompt {
+                let bytes = prompt.as_bytes();
+                assert_eq!(
+                    libc::write(libc::STDOUT_FILENO, bytes.as_ptr().cast(), bytes.len()),
+                    bytes.len() as isize
+                );
+            }
+            libc::_exit(0);
+        }
+
+        libc::close(slave);
+        let mut out = Vec::new();
+        let mut buf = [0u8; 4096];
+        loop {
+            let n = libc::read(master, buf.as_mut_ptr().cast(), buf.len());
+            if n <= 0 {
+                break;
+            }
+            out.extend_from_slice(&buf[..n as usize]);
+        }
+        libc::close(master);
+        let mut status = 0;
+        assert_eq!(libc::waitpid(pid, &mut status, 0), pid);
+        assert!(libc::WIFEXITED(status));
+        assert_eq!(libc::WEXITSTATUS(status), 0);
+        String::from_utf8_lossy(&out).into_owned()
+    }
+}
+
+fn capture_plain_markdown_after_thought_transcript() -> String {
+    let _guard = pty_test_lock().lock().unwrap();
+    let mut master: RawFd = -1;
+    let mut slave: RawFd = -1;
+    unsafe {
+        assert_eq!(
+            libc::openpty(
+                &mut master,
+                &mut slave,
+                std::ptr::null_mut(),
+                std::ptr::null(),
+                std::ptr::null(),
+            ),
+            0
+        );
+        let pid = libc::fork();
+        assert!(pid >= 0);
+        if pid == 0 {
+            libc::close(master);
+            assert_eq!(libc::dup2(slave, libc::STDOUT_FILENO), libc::STDOUT_FILENO);
+            assert_eq!(libc::dup2(slave, libc::STDERR_FILENO), libc::STDERR_FILENO);
+            if slave > libc::STDERR_FILENO {
+                libc::close(slave);
+            }
+
+            let mut renderer = Renderer::with_format(OutputFormat::Plain);
+            renderer.reasoning_start().unwrap();
+            renderer.reasoning_delta("plan").unwrap();
+            std::thread::sleep(Duration::from_millis(40));
+            renderer.reasoning_end(Some((12, 5))).unwrap();
+            renderer.assistant_text("# Heading\n\n- item\n").unwrap();
+            renderer.finish_turn().unwrap();
+            libc::_exit(0);
+        }
+
+        libc::close(slave);
+        let mut out = Vec::new();
+        let mut buf = [0u8; 4096];
+        loop {
+            let n = libc::read(master, buf.as_mut_ptr().cast(), buf.len());
+            if n <= 0 {
+                break;
+            }
+            out.extend_from_slice(&buf[..n as usize]);
+        }
+        libc::close(master);
+        let mut status = 0;
+        assert_eq!(libc::waitpid(pid, &mut status, 0), pid);
+        assert!(libc::WIFEXITED(status));
+        assert_eq!(libc::WEXITSTATUS(status), 0);
+        String::from_utf8_lossy(&out).into_owned()
+    }
+}
+
+fn visible_terminal_text(raw: &str) -> String {
+    let mut lines: Vec<Vec<char>> = vec![Vec::new()];
+    let mut row = 0usize;
+    let mut col = 0usize;
+    let chars: Vec<char> = raw.chars().collect();
+    let mut idx = 0usize;
+
+    while idx < chars.len() {
+        match chars[idx] {
+            '\x1b' => {
+                idx += 1;
+                match chars.get(idx) {
+                    Some('[') => {
+                        idx += 1;
+                        let mut seq = String::new();
+                        while idx < chars.len() {
+                            let ch = chars[idx];
+                            seq.push(ch);
+                            idx += 1;
+                            if ('@'..='~').contains(&ch) {
+                                break;
+                            }
+                        }
+                        if seq == "2K" {
+                            lines[row].clear();
+                            col = 0;
+                        }
+                    }
+                    Some(']') => {
+                        idx += 1;
+                        let mut escape = false;
+                        while idx < chars.len() {
+                            let ch = chars[idx];
+                            idx += 1;
+                            if ch == '\x07' || (escape && ch == '\\') {
+                                break;
+                            }
+                            escape = ch == '\x1b';
+                        }
+                    }
+                    Some(_) => {
+                        idx += 1;
+                    }
+                    None => break,
+                }
+            }
+            '\r' => {
+                col = 0;
+                idx += 1;
+            }
+            '\n' => {
+                lines.push(Vec::new());
+                row += 1;
+                col = 0;
+                idx += 1;
+            }
+            ch => {
+                if col < lines[row].len() {
+                    lines[row][col] = ch;
+                } else {
+                    while lines[row].len() < col {
+                        lines[row].push(' ');
+                    }
+                    lines[row].push(ch);
+                }
+                col += 1;
+                idx += 1;
+            }
+        }
+    }
+
+    while lines.last().is_some_and(|line| line.is_empty()) {
+        lines.pop();
+    }
+
+    lines
+        .into_iter()
+        .map(|line| line.into_iter().collect::<String>())
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn pty_test_lock() -> &'static Mutex<()> {
