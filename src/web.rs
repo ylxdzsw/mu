@@ -496,6 +496,7 @@ async fn open_project(
                 "init",
                 "--path",
                 path.to_str().unwrap_or_default(),
+                "--force",
                 "--json",
             ],
         )

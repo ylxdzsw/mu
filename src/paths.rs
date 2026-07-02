@@ -1,5 +1,7 @@
 use std::path::{Path, PathBuf};
 
+use anyhow::{Result, bail};
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Project {
     pub root: PathBuf,
@@ -23,6 +25,13 @@ pub struct GitWorktreeInfo {
 pub enum Scope {
     Project(Project),
     Global,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectInitResult {
+    pub root: PathBuf,
+    pub created_files: Vec<&'static str>,
+    pub already_initialized: bool,
 }
 
 impl Scope {
@@ -92,34 +101,75 @@ fn dirs_home() -> PathBuf {
         .unwrap_or_else(|_| PathBuf::from("/tmp"))
 }
 
-pub fn ensure_dir(path: &std::path::Path) -> anyhow::Result<()> {
+pub fn ensure_dir(path: &std::path::Path) -> Result<()> {
     std::fs::create_dir_all(path)?;
     Ok(())
 }
 
-pub fn ensure_project_layout(scope: &Scope) -> anyhow::Result<()> {
-    ensure_state_layout(&scope.state_dir(), matches!(scope, Scope::Project(_)))
+pub fn ensure_project_layout(scope: &Scope) -> Result<()> {
+    ensure_state_layout(&scope.state_dir(), matches!(scope, Scope::Project(_)))?;
+    Ok(())
 }
 
-pub fn ensure_project_layout_at(root: &Path) -> anyhow::Result<()> {
-    ensure_state_layout(&root.join(".mu"), true)
+pub fn init_project_layout_at(root: &Path, force: bool) -> Result<ProjectInitResult> {
+    validate_project_init_root(root, force)?;
+    let created_files = ensure_state_layout(&root.join(".mu"), true)?;
+    Ok(ProjectInitResult {
+        root: root.to_path_buf(),
+        already_initialized: created_files.is_empty(),
+        created_files,
+    })
 }
 
-fn ensure_state_layout(dir: &Path, project: bool) -> anyhow::Result<()> {
-    ensure_dir(dir)?;
-    ensure_dir(&dir.join("skills"))?;
+fn ensure_state_layout(dir: &Path, project: bool) -> Result<Vec<&'static str>> {
+    let mut created_files = Vec::new();
+    if !dir.exists() {
+        ensure_dir(dir)?;
+        created_files.push(".mu/");
+    } else {
+        ensure_dir(dir)?;
+    }
     if project {
         let config = dir.join("config.jsonc");
         if !config.exists() {
-            std::fs::write(&config, "{\n}\n")?;
+            std::fs::write(&config, PROJECT_CONFIG_TEMPLATE)?;
+            created_files.push(".mu/config.jsonc");
         }
     }
     let gitignore = dir.join(".gitignore");
     if !gitignore.exists() {
-        std::fs::write(
-            &gitignore,
-            ".env\nsessions.db\nsessions.db-*\n*.db\n*.db-*\n",
-        )?;
+        std::fs::write(&gitignore, STATE_GITIGNORE)?;
+        created_files.push(".mu/.gitignore");
+    }
+    Ok(created_files)
+}
+
+pub fn validate_project_init_root(root: &Path, force: bool) -> Result<()> {
+    if is_home(root) {
+        bail!(
+            "cannot initialize a mu project at {}; home is reserved for global scope",
+            root.display()
+        );
+    }
+    if root.parent().is_none() {
+        bail!(
+            "cannot initialize a mu project at {}; filesystem root is not a project scope",
+            root.display()
+        );
+    }
+    if root.join(".mu").is_dir() {
+        return Ok(());
+    }
+    if let Some(project) = discover_project(root)
+        && project.root != root
+        && !force
+    {
+        bail!(
+            "target {} is inside existing {} project {}; rerun with --force to create a nested mu project",
+            root.display(),
+            project_marker_name(project.marker),
+            project.root.display()
+        );
     }
     Ok(())
 }
@@ -127,6 +177,18 @@ fn ensure_state_layout(dir: &Path, project: bool) -> anyhow::Result<()> {
 fn is_home(path: &Path) -> bool {
     path == dirs_home()
 }
+
+fn project_marker_name(marker: ProjectMarker) -> &'static str {
+    match marker {
+        ProjectMarker::Mu => "mu",
+        ProjectMarker::Git => "git",
+    }
+}
+
+const PROJECT_CONFIG_TEMPLATE: &str =
+    "{\n  // Optional project-local overrides merged over ~/.mu/config.jsonc.\n}\n";
+
+const STATE_GITIGNORE: &str = ".env\nsessions.db\nsessions.db-*\n*.db\n*.db-*\n";
 
 fn git_worktree_info(root: &Path) -> Option<GitWorktreeInfo> {
     let dot_git = root.join(".git");
@@ -223,23 +285,61 @@ mod tests {
     }
 
     #[test]
-    fn ensure_project_layout_at_creates_expected_scaffold() {
+    fn init_project_layout_at_creates_minimal_scaffold() {
         let root = std::env::temp_dir().join(format!("mu-layout-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&root).unwrap();
 
-        ensure_project_layout_at(&root).unwrap();
+        let result = init_project_layout_at(&root, true).unwrap();
 
         let state_dir = root.join(".mu");
+        assert_eq!(result.root, root);
+        assert_eq!(
+            result.created_files,
+            vec![".mu/", ".mu/config.jsonc", ".mu/.gitignore"]
+        );
+        assert!(!result.already_initialized);
         assert!(state_dir.is_dir());
-        assert!(state_dir.join("skills").is_dir());
         assert_eq!(
             std::fs::read_to_string(state_dir.join("config.jsonc")).unwrap(),
-            "{\n}\n"
+            PROJECT_CONFIG_TEMPLATE
         );
         assert_eq!(
             std::fs::read_to_string(state_dir.join(".gitignore")).unwrap(),
-            ".env\nsessions.db\nsessions.db-*\n*.db\n*.db-*\n"
+            STATE_GITIGNORE
         );
+        assert!(!state_dir.join("skills").exists());
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn init_project_layout_at_rejects_nested_target_without_force() {
+        let root = std::env::temp_dir().join(format!("mu-nested-{}", uuid::Uuid::new_v4()));
+        let nested = root.join("subdir");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::create_dir(root.join(".git")).unwrap();
+
+        let err = init_project_layout_at(&nested, false).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("rerun with --force to create a nested mu project")
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn init_project_layout_at_allows_nested_target_with_force() {
+        let root = std::env::temp_dir().join(format!("mu-force-{}", uuid::Uuid::new_v4()));
+        let nested = root.join("subdir");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::create_dir(root.join(".git")).unwrap();
+
+        let result = init_project_layout_at(&nested, true).unwrap();
+
+        assert_eq!(result.root, nested);
+        assert!(result.created_files.contains(&".mu/"));
+        assert!(nested.join(".mu").is_dir());
 
         let _ = std::fs::remove_dir_all(root);
     }

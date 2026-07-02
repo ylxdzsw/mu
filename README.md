@@ -89,6 +89,7 @@ MU_ZSH_EXIT_HOOKS+=(mu_restore_conflicts)
 | `mu --output plain` | Render sequential plain assistant/tool text |
 | `mu --output terminal` | Render sequential interactive terminal output |
 | `mu --output json` | Render newline-delimited JSON events for integrations/web UI |
+| `mu project init [--path <dir>] [--force]` | Create minimal local `.mu` metadata in the current directory or target directory |
 | `mu status --json [--include-models]` | Report the resolved model, session, context state, and optional configured model list |
 | `mu session new` | Create session, print id |
 | `mu session list` | List recent non-archived CLI sessions |
@@ -149,6 +150,12 @@ overrides it when a project is active. Optional `.env` files in those same
 directories are also loaded with project values overriding global values; the
 resulting environment is used for provider API key lookup and `bash` tool
 processes.
+
+`mu project init` creates a minimal local `.mu` scaffold in the current
+directory by default, or at `--path <dir>` when provided. It writes `.mu/`,
+`.mu/config.jsonc`, and `.mu/.gitignore`, but does not create an empty
+`skills/` directory. By default it refuses to create a nested mu project inside
+another discovered project; pass `--force` only when you explicitly want that.
 
 Providers and models are configured directly in `config.jsonc`. Model
 references use the same format everywhere: `provider/model[:effort]`, where the

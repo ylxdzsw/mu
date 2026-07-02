@@ -99,6 +99,14 @@ struct ProjectInfo {
     needs_confirmation: bool,
 }
 
+#[derive(Debug, Serialize)]
+struct ProjectInitInfo {
+    path: String,
+    project_root: String,
+    created_files: Vec<&'static str>,
+    already_initialized: bool,
+}
+
 fn session_origin(origin: SessionOriginArg) -> store::SessionOrigin {
     match origin {
         SessionOriginArg::Cli => store::SessionOrigin::Cli,
@@ -118,6 +126,10 @@ fn resolve_existing_dir(base: &Path, path: &Path) -> Result<PathBuf> {
         bail!("not a directory: {}", path.display());
     }
     Ok(path)
+}
+
+fn resolve_target_dir(base: &Path, path: Option<&Path>) -> Result<PathBuf> {
+    resolve_existing_dir(base, path.unwrap_or(base))
 }
 
 fn inspect_project_path(base: &Path, path: &Path) -> Result<ProjectInfo> {
@@ -172,6 +184,17 @@ fn print_project_info(info: &ProjectInfo) {
     );
 }
 
+fn print_project_init_info(info: &ProjectInitInfo) {
+    println!("path: {}", info.path);
+    println!("project_root: {}", info.project_root);
+    println!("already_initialized: {}", info.already_initialized);
+    if info.created_files.is_empty() {
+        println!("created_files: (none)");
+    } else {
+        println!("created_files: {}", info.created_files.join(", "));
+    }
+}
+
 async fn run() -> Result<()> {
     let args = Args::parse();
     let cwd = std::env::current_dir()?;
@@ -194,14 +217,19 @@ async fn run() -> Result<()> {
                         print_project_info(&info);
                     }
                 }
-                ProjectSub::Init { path, json } => {
-                    let root = resolve_existing_dir(&cwd, &path)?;
-                    paths::ensure_project_layout_at(&root)?;
-                    let info = inspect_project_path(&cwd, &root)?;
+                ProjectSub::Init { path, force, json } => {
+                    let root = resolve_target_dir(&cwd, path.as_deref())?;
+                    let result = paths::init_project_layout_at(&root, force)?;
+                    let info = ProjectInitInfo {
+                        path: result.root.display().to_string(),
+                        project_root: result.root.display().to_string(),
+                        created_files: result.created_files,
+                        already_initialized: result.already_initialized,
+                    };
                     if json {
                         println!("{}", serde_json::to_string(&info)?);
                     } else {
-                        print_project_info(&info);
+                        print_project_init_info(&info);
                     }
                 }
             }

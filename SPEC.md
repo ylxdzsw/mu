@@ -225,8 +225,9 @@ small:
   attachment to an existing session.
 - `mu project inspect --path <dir>` — report whether a directory resolves to a
   project scope, and which marker (`.mu` or `.git`) was found.
-- `mu project init --path <dir>` — create `.mu/` project metadata in an
-  explicitly chosen directory.
+- `mu project init [--path <dir>] [--force]` — create minimal `.mu/` project
+  metadata in the current directory by default, or in an explicitly chosen
+  directory.
 - `mu session new` — create a session and print its id.
 - `mu session list` — list recent non-archived CLI-origin sessions by default;
   wrappers may widen this to all origins.
@@ -377,8 +378,8 @@ Creating a `.mu` project should use the same layout rules as the CLI:
 
 - create `.mu/`;
 - create `.mu/config.jsonc` only when needed by existing project-layout rules;
-- create `.mu/skills/`;
 - create `.mu/.gitignore` that ignores session databases and secret/env files.
+- do not create an empty `skills/` directory up front.
 
 The web UI should not invent a separate project registry as the source of
 truth. It may keep a convenience list of recently opened paths, but project

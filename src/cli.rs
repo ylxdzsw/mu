@@ -137,7 +137,10 @@ pub enum ProjectSub {
     /// Explicitly create mu project metadata in a directory
     Init {
         #[arg(long)]
-        path: PathBuf,
+        path: Option<PathBuf>,
+
+        #[arg(long)]
+        force: bool,
 
         #[arg(long)]
         json: bool,
@@ -256,6 +259,21 @@ mod tests {
                 assert!(!json);
             }
             other => panic!("expected project inspect command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn project_init_defaults_to_current_directory() {
+        let args = Args::try_parse_from(["mu", "project", "init"]).unwrap();
+        match args.command {
+            Some(Command::Project {
+                sub: ProjectSub::Init { path, force, json },
+            }) => {
+                assert!(path.is_none());
+                assert!(!force);
+                assert!(!json);
+            }
+            other => panic!("expected project init command, got {other:?}"),
         }
     }
 }
