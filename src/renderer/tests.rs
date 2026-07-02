@@ -309,10 +309,12 @@ fn plain_transcript_keeps_raw_markdown_and_spacing_after_thought() {
     let normalized = raw.replace('\r', "");
 
     assert!(!raw.contains('\x1b'));
-    assert!(normalized.contains("[thought"));
-    assert!(normalized.contains("5 tokens]"));
     assert!(
-        normalized.contains("[thought 40ms, 5 tokens]\n\n# Heading\n\n- item\n"),
+        normalized.starts_with("[thought ") && normalized.contains(", 5 tokens]\n\n"),
+        "{normalized:?}"
+    );
+    assert!(
+        normalized.ends_with("# Heading\n\n- item\n"),
         "{normalized:?}"
     );
 }
