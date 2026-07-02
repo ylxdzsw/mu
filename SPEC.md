@@ -776,16 +776,19 @@ remain visible. Stdout TTY detection selects rich versus portable rendering;
 stderr TTY detection suppresses the summary when redirected.
 
 - **Tool presentation.** Bash prints an optional `# <title>` line, then its
-  command preview. `plain` shows explicit risk labels such as `[readonly]`
+  command preview. The header may be committed while the model is still
+  streaming the tool-call arguments; once execution begins, the header is not
+  printed a second time. `plain` shows explicit risk labels such as `[readonly]`
   where `terminal` uses color. Both human-facing outputs stream the same head
   preview, then print the omission marker only once at tool completion if a
   middle section was actually omitted, followed by any reserved tail and a
   matching exit line. Full tool results still follow the shared model-context
-  truncation policy (§4). In `plain`, streaming is always sequential. In
-  `terminal`, concurrent readonly batches still present exactly one active live
-  bash stream at a time in original tool order; later calls may already be
-  running, but their presentation is buffered until they become the active
-  slot.
+  truncation policy (§4). Multiple tool calls in one assistant message are
+  previewed and then executed in provider order. In `plain`, execution
+  streaming is always sequential. In `terminal`, concurrent readonly batches
+  still present exactly one active live bash stream at a time in original tool
+  order; later calls may already be running, but their execution output is
+  buffered until they become the active slot.
 - **Assistant text.** `plain` and redirected output stream raw Markdown deltas
   unchanged. TTY `terminal` display commits parsed Markdown blocks as soon as
   they are stable; only the current incomplete block is delayed.

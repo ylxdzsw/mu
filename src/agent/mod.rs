@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Result, bail};
-use serde_json::Value;
+use serde_json::{Map, Value};
 use tokio::time::sleep;
 
 use crate::cli::OutputFormat;
@@ -12,7 +12,7 @@ use crate::config::Config;
 use crate::guardrail::{Guardrail, GuardrailOutcome, bash_risk};
 use crate::models::RequestOptions;
 use crate::provider::{
-    FinishReason, Message, Provider, ProviderError, StreamEvent, ToolCall, Usage,
+    FinishReason, Message, Provider, ProviderError, StreamEvent, ToolCall, ToolCallDelta, Usage,
 };
 use crate::renderer::Renderer;
 use crate::store::{ReviewRecord, Store, ToolCallRecord};
@@ -29,6 +29,20 @@ struct ConcurrentBashExecution<'a> {
     running: Option<RunningBash>,
     streamed_len: usize,
     completed: Option<(Result<ToolResult>, Duration)>,
+}
+
+#[derive(Default)]
+struct StreamingToolPreview {
+    id: Option<String>,
+    name: Option<String>,
+    arguments: String,
+    rendered: bool,
+}
+
+#[derive(Default)]
+struct StreamingToolPreviews {
+    entries: Vec<StreamingToolPreview>,
+    next_to_render: usize,
 }
 
 pub struct AgentLoop<'a> {
@@ -77,6 +91,7 @@ impl<'a> AgentLoop<'a> {
         const MAX_LIVE_PROVIDER_RETRIES: u32 = 3;
 
         for iteration in 0..max_iter {
+            let mut tool_previews = StreamingToolPreviews::default();
             let stream_result = loop {
                 let mut on_stream_event = |event: StreamEvent| -> Result<(), ProviderError> {
                     let result = match event {
@@ -84,7 +99,9 @@ impl<'a> AgentLoop<'a> {
                         StreamEvent::ReasoningStart => self.renderer.reasoning_start(),
                         StreamEvent::ReasoningDelta(text) => self.renderer.reasoning_delta(&text),
                         StreamEvent::ReasoningEnd => self.renderer.reasoning_end(None),
-                        StreamEvent::ToolCallStart => self.renderer.tool_call_composition_start(),
+                        StreamEvent::ToolCallDelta(delta) => {
+                            handle_tool_call_delta(self.renderer, &mut tool_previews, delta)
+                        }
                         StreamEvent::Tick => self.renderer.thinking_tick(),
                     };
                     result.map_err(|e| ProviderError::Other(e.to_string()))
@@ -302,8 +319,16 @@ impl<'a> AgentLoop<'a> {
                                 }
                             }
 
-                            self.renderer
-                                .tool_start(Some(&tc.id), &tc.function.name, &args)?;
+                            self.renderer.tool_start(
+                                Some(&tc.id),
+                                &tc.function.name,
+                                &args,
+                                tool_previews
+                                    .entries
+                                    .get(cursor)
+                                    .map(|preview| preview.rendered)
+                                    .unwrap_or(false),
+                            )?;
                             let started = Instant::now();
 
                             let tool_result = if let Some(tool) = registry.get(&tc.function.name) {
@@ -500,6 +525,7 @@ impl<'a> AgentLoop<'a> {
                         Some(&exec.call.id),
                         &exec.call.function.name,
                         &exec.args,
+                        false,
                     )?;
                     self.stream_running_bash(exec).await?;
                     let (result, elapsed, final_output) = exec
@@ -525,6 +551,7 @@ impl<'a> AgentLoop<'a> {
                         Some(&exec.call.id),
                         &exec.call.function.name,
                         &exec.args,
+                        false,
                     )?;
                 }
 
@@ -620,6 +647,128 @@ impl<'a> AgentLoop<'a> {
 
 fn parse_tool_args(call: &ToolCall) -> Value {
     serde_json::from_str(&call.function.arguments).unwrap_or(Value::Object(Default::default()))
+}
+
+fn handle_tool_call_delta(
+    renderer: &mut Renderer,
+    previews: &mut StreamingToolPreviews,
+    delta: ToolCallDelta,
+) -> std::io::Result<()> {
+    if delta.index >= previews.entries.len() {
+        previews
+            .entries
+            .resize_with(delta.index + 1, StreamingToolPreview::default);
+    }
+    let preview = &mut previews.entries[delta.index];
+    if let Some(id) = delta.id {
+        preview.id = Some(id);
+    }
+    if let Some(name) = delta.name {
+        preview.name = Some(name);
+    }
+    preview.arguments.push_str(&delta.arguments_delta);
+
+    let mut rendered_any = false;
+    while previews.next_to_render < previews.entries.len() {
+        let preview = &mut previews.entries[previews.next_to_render];
+        if preview.rendered {
+            previews.next_to_render += 1;
+            continue;
+        }
+        let Some(name) = preview.name.as_deref() else {
+            break;
+        };
+        let Some(args) = parse_preview_args(&preview.arguments) else {
+            break;
+        };
+        preview.rendered = renderer.tool_call_preview(preview.id.as_deref(), name, &args)?;
+        if !preview.rendered {
+            break;
+        }
+        rendered_any = true;
+        previews.next_to_render += 1;
+    }
+
+    if rendered_any {
+        Ok(())
+    } else {
+        renderer.tool_call_composition_start()
+    }
+}
+
+fn parse_preview_args(arguments: &str) -> Option<Value> {
+    if let Ok(value) = serde_json::from_str(arguments) {
+        return Some(value);
+    }
+
+    let title = extract_json_string_field(arguments, "title");
+    let risk = extract_json_string_field(arguments, "risk");
+    let script = extract_json_string_field(arguments, "script")?;
+
+    let mut map = Map::new();
+    if let Some(title) = title {
+        map.insert("title".into(), Value::String(title));
+    }
+    if let Some(risk) = risk {
+        map.insert("risk".into(), Value::String(risk));
+    }
+    map.insert("script".into(), Value::String(script));
+    Some(Value::Object(map))
+}
+
+fn extract_json_string_field(input: &str, field: &str) -> Option<String> {
+    let quoted_field = format!("\"{field}\"");
+    let mut search_from = 0;
+    while let Some(relative) = input[search_from..].find(&quoted_field) {
+        let after_field = search_from + relative + quoted_field.len();
+        let rest = &input[after_field..];
+        let colon = rest.find(':')?;
+        let mut value_start = after_field + colon + 1;
+        while matches!(
+            input.as_bytes().get(value_start),
+            Some(b' ' | b'\n' | b'\r' | b'\t')
+        ) {
+            value_start += 1;
+        }
+        if input.as_bytes().get(value_start) != Some(&b'"') {
+            search_from = value_start;
+            continue;
+        }
+        return parse_json_string_prefix(&input[value_start + 1..]);
+    }
+    None
+}
+
+fn parse_json_string_prefix(input: &str) -> Option<String> {
+    let mut out = String::new();
+    let mut chars = input.chars();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '"' => return Some(out),
+            '\\' => match chars.next() {
+                Some('"') => out.push('"'),
+                Some('\\') => out.push('\\'),
+                Some('/') => out.push('/'),
+                Some('b') => out.push('\u{0008}'),
+                Some('f') => out.push('\u{000c}'),
+                Some('n') => out.push('\n'),
+                Some('r') => out.push('\r'),
+                Some('t') => out.push('\t'),
+                Some('u') => {
+                    let mut code = String::new();
+                    for _ in 0..4 {
+                        code.push(chars.next()?);
+                    }
+                    let value = u16::from_str_radix(&code, 16).ok()?;
+                    out.push(char::from_u32(value as u32)?);
+                }
+                Some(other) => out.push(other),
+                None => return Some(out),
+            },
+            other => out.push(other),
+        }
+    }
+    Some(out)
 }
 
 fn tool_call_risk(args: &str) -> Option<String> {
@@ -726,6 +875,76 @@ mod tests {
             redaction: RedactionConfig::default(),
             env: HashMap::new(),
         }
+    }
+
+    #[test]
+    fn preview_args_parse_partial_bash_fields() {
+        let value = parse_preview_args(
+            "{\"title\":\"List files\",\"risk\":\"readonly\",\"script\":\"printf \\\"a\\\\n\\\"",
+        )
+        .unwrap();
+
+        assert_eq!(value["title"], "List files");
+        assert_eq!(value["risk"], "readonly");
+        assert_eq!(value["script"], "printf \"a\\n\"");
+    }
+
+    #[test]
+    fn preview_args_parse_multiple_tool_calls_independently() {
+        let first = parse_preview_args(
+            "{\"title\":\"First\",\"risk\":\"readonly\",\"script\":\"echo first\"",
+        )
+        .unwrap();
+        let second = parse_preview_args(
+            "{\"title\":\"Second\",\"risk\":\"reversible\",\"script\":\"echo second\"",
+        )
+        .unwrap();
+
+        assert_eq!(first["title"], "First");
+        assert_eq!(first["risk"], "readonly");
+        assert_eq!(first["script"], "echo first");
+        assert_eq!(second["title"], "Second");
+        assert_eq!(second["risk"], "reversible");
+        assert_eq!(second["script"], "echo second");
+    }
+
+    #[test]
+    fn streamed_tool_previews_render_in_index_order() {
+        let mut renderer = Renderer::with_format(OutputFormat::Plain);
+        let mut previews = StreamingToolPreviews::default();
+
+        handle_tool_call_delta(
+            &mut renderer,
+            &mut previews,
+            ToolCallDelta {
+                index: 1,
+                id: Some("call_2".into()),
+                name: Some("bash".into()),
+                arguments_delta:
+                    "{\"title\":\"Second\",\"risk\":\"readonly\",\"script\":\"echo second\"".into(),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(previews.next_to_render, 0);
+        assert!(!previews.entries[1].rendered);
+
+        handle_tool_call_delta(
+            &mut renderer,
+            &mut previews,
+            ToolCallDelta {
+                index: 0,
+                id: Some("call_1".into()),
+                name: Some("bash".into()),
+                arguments_delta:
+                    "{\"title\":\"First\",\"risk\":\"readonly\",\"script\":\"echo first\"".into(),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(previews.next_to_render, 2);
+        assert!(previews.entries[0].rendered);
+        assert!(previews.entries[1].rendered);
     }
 
     #[tokio::test]

@@ -11,7 +11,7 @@ use crate::models::RequestOptions;
 
 use super::{
     FinishReason, FunctionCall, Message, Provider, ProviderError, StreamEvent, StreamResult,
-    ToolCall, Usage,
+    ToolCall, ToolCallDelta as ProviderToolCallDelta, Usage,
 };
 
 pub struct OpenAiProvider {
@@ -316,10 +316,6 @@ fn consume_sse_buffer(
                     state.content.push_str(&text);
                 }
                 if let Some(ref tcs) = choice.delta.tool_calls {
-                    if !state.tool_call_started && !tcs.is_empty() {
-                        on_event(StreamEvent::ToolCallStart)?;
-                        state.tool_call_started = true;
-                    }
                     for tc in tcs {
                         let entry = state
                             .tool_accum
@@ -339,6 +335,19 @@ fn consume_sse_buffer(
                                 entry.2.push_str(args);
                             }
                         }
+                        let name = tc.function.as_ref().and_then(|f| f.name.clone());
+                        let arguments_delta = tc
+                            .function
+                            .as_ref()
+                            .and_then(|f| f.arguments.clone())
+                            .unwrap_or_default();
+                        on_event(StreamEvent::ToolCallDelta(ProviderToolCallDelta {
+                            index: tc.index,
+                            id: tc.id.clone(),
+                            name,
+                            arguments_delta,
+                        }))?;
+                        state.tool_call_started = true;
                     }
                 }
                 if let Some(ref reason) = choice.finish_reason {
@@ -437,11 +446,11 @@ mod tests {
     #[test]
     fn streams_deltas_and_accumulates_tool_calls() {
         let mut seen = String::new();
-        let mut tool_call_starts = 0usize;
+        let mut tool_call_deltas = Vec::new();
         let mut on_event = |event: StreamEvent| -> Result<(), ProviderError> {
             match event {
                 StreamEvent::TextDelta(delta) => seen.push_str(&delta),
-                StreamEvent::ToolCallStart => tool_call_starts += 1,
+                StreamEvent::ToolCallDelta(delta) => tool_call_deltas.push(delta),
                 _ => {}
             }
             Ok(())
@@ -461,7 +470,12 @@ mod tests {
         }
 
         assert_eq!(seen, "hello");
-        assert_eq!(tool_call_starts, 1);
+        assert_eq!(tool_call_deltas.len(), 2);
+        assert_eq!(tool_call_deltas[0].index, 0);
+        assert_eq!(tool_call_deltas[0].id.as_deref(), Some("call_1"));
+        assert_eq!(tool_call_deltas[0].name.as_deref(), Some("read"));
+        assert_eq!(tool_call_deltas[0].arguments_delta, "{\"path\":");
+        assert_eq!(tool_call_deltas[1].arguments_delta, "\"/tmp/x\"}");
         assert_eq!(state.content, "hello");
         assert_eq!(state.finish_reason, FinishReason::ToolCalls);
         assert_eq!(state.usage.unwrap().total_tokens, 17);
@@ -478,7 +492,7 @@ mod tests {
                 }
                 StreamEvent::ReasoningEnd => seen_events.push("reasoning_end".to_string()),
                 StreamEvent::TextDelta(text) => seen_events.push(format!("text:{text}")),
-                StreamEvent::ToolCallStart | StreamEvent::Tick => {}
+                StreamEvent::ToolCallDelta(_) | StreamEvent::Tick => {}
             }
             Ok(())
         };

@@ -205,6 +205,37 @@ impl Renderer {
         self.render_live_line()
     }
 
+    pub fn tool_call_preview(
+        &mut self,
+        tool_call_id: Option<&str>,
+        name: &str,
+        args: &serde_json::Value,
+    ) -> io::Result<bool> {
+        if self.format == OutputFormat::Json || name != "bash" {
+            return Ok(false);
+        }
+        let Some(script) = args.get("script").and_then(|value| value.as_str()) else {
+            return Ok(false);
+        };
+        if script.is_empty() {
+            return Ok(false);
+        }
+
+        self.assistant_block_open = false;
+        self.reasoning_end(None)?;
+        self.live_line = None;
+        self.ensure_block_separator_if_needed()?;
+        let title = args
+            .get("title")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default();
+        let risk = args.get("risk").and_then(|value| value.as_str());
+        let line = format_bash_header(title, script, risk, self.styled);
+        self.active_bash_tool_call_id = tool_call_id.map(ToOwned::to_owned);
+        self.write_committed(&line)?;
+        Ok(true)
+    }
+
     pub fn cancel_live_state(&mut self) -> io::Result<()> {
         self.clear_live_line()?;
         self.live_line = None;
@@ -221,6 +252,7 @@ impl Renderer {
         tool_call_id: Option<&str>,
         name: &str,
         args: &serde_json::Value,
+        header_already_rendered: bool,
     ) -> io::Result<()> {
         if self.format == OutputFormat::Json {
             return self.write_json(
@@ -238,6 +270,11 @@ impl Renderer {
         self.assistant_block_open = false;
         self.reasoning_end(None)?;
         self.live_line = None;
+        self.active_bash_tool_call_id = tool_call_id.map(ToOwned::to_owned);
+        self.bash_preview = Some(BashPreviewState::default());
+        if header_already_rendered {
+            return Ok(());
+        }
         self.ensure_block_separator_if_needed()?;
         let title = args
             .get("title")
@@ -249,8 +286,6 @@ impl Renderer {
             .unwrap_or_default();
         let risk = args.get("risk").and_then(|value| value.as_str());
         let line = format_bash_header(title, script, risk, self.styled);
-        self.active_bash_tool_call_id = tool_call_id.map(ToOwned::to_owned);
-        self.bash_preview = Some(BashPreviewState::default());
         self.write_committed(&line)
     }
 
@@ -609,7 +644,7 @@ impl Renderer {
                     approx_tokens_from_chars(reasoning.reasoning_chars),
                 ))
             }
-            Some(LiveLine::ToolComposition) => Some(format!("{CYAN}${RESET}")),
+            Some(LiveLine::ToolComposition) => Some(format!("{GRAY}#{RESET}")),
             Some(LiveLine::BashOmitted {
                 omitted_lines,
                 omitted_bytes,
@@ -1772,6 +1807,43 @@ mod tests {
     }
 
     #[test]
+    fn tool_composition_placeholder_matches_title_marker() {
+        let mut renderer = Renderer::with_format(OutputFormat::Terminal);
+        renderer.styled = true;
+        renderer.live_line = Some(LiveLine::ToolComposition);
+
+        assert_eq!(renderer.format_live_line(), Some(format!("{GRAY}#{RESET}")));
+    }
+
+    #[test]
+    fn bash_start_can_reuse_streamed_header_without_duplication() {
+        let mut renderer = Renderer::with_format(OutputFormat::Plain);
+        let args = json!({
+            "title": "List files",
+            "risk": "readonly",
+            "script": "printf 'a'\npwd",
+        });
+
+        assert!(
+            renderer
+                .tool_call_preview(Some("call_1"), "bash", &args)
+                .unwrap()
+        );
+        renderer
+            .tool_start(Some("call_1"), "bash", &args, true)
+            .unwrap();
+        renderer.bash_output(Some("call_1"), "bash", "a\n").unwrap();
+        renderer
+            .tool_finished(
+                Some("call_1"),
+                "bash",
+                &ToolDisplay::Bash { exit_code: 0 },
+                Duration::from_millis(1),
+            )
+            .unwrap();
+    }
+
+    #[test]
     fn terminal_trimming_only_removes_committed_line_suffixes() {
         assert_eq!(
             terminal_trim_committed_text("a  \n b\t\t\nc  "),
@@ -1832,6 +1904,7 @@ mod tests {
                             "risk": "readonly",
                             "script": "printf 'line01\\nline02\\nline03\\n'",
                         }),
+                        false,
                     )
                     .unwrap();
                 renderer
