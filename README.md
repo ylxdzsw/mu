@@ -129,12 +129,17 @@ npm --prefix web start -- /run/mu-web/mu-web.sock
 ```
 
 The socket path is required. The service chmods the socket to `0660`, resolves
-its launch cwd from its own `pwd`, and shells out to `mu` from `PATH`. For
-systemd deployment, set `WorkingDirectory=/root` and ensure the service `PATH`
-includes the desired `mu` binary. Streaming turn responses set
-`X-Accel-Buffering: no`, so nginx locations proxying this socket should also
-disable buffering and caching. The browser-side e2e suite also lives in `web/`
-and can be run with `npm --prefix web run test:e2e`.
+its launch cwd from its own `pwd`, and shells out to `mu` from `PATH`. The
+service entrypoint accepts only that socket-path argument; older flag-style
+startup wrappers such as `--socket` or `--mu-exe` are not supported. For
+systemd deployment, use a checked-in unit like
+[`deploy/mu-web.service`](deploy/mu-web.service), keep
+`WorkingDirectory=/root/mu` if you want the browser to default to this repo as
+its launch project, and ensure the service `PATH` includes the desired `mu`
+binary. Streaming turn responses set `X-Accel-Buffering: no`, so nginx
+locations proxying this socket should also disable buffering and caching. The
+browser-side e2e suite also lives in `web/` and can be run with
+`npm --prefix web run test:e2e`.
 
 ## Config
 

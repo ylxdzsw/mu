@@ -1,0 +1,16 @@
+[Unit]
+Description=mu Web UI
+After=network.target nginx.service
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/mu
+Environment=PATH=/root/mu/target/release:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin
+ExecStartPre=/usr/bin/install -d -o root -g http -m 2770 /run/mu-web
+ExecStart=/usr/bin/node /root/mu/web/server.ts /run/mu-web/mu-web.sock
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

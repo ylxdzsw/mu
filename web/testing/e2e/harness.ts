@@ -5,26 +5,35 @@ import { request as httpRequest } from "node:http";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import type { ChildProcessWithoutNullStreams } from "node:child_process";
+import type { Server } from "node:http";
+
+export interface Harness {
+  baseUrl: string;
+  projectDir: string;
+  providerRequests: unknown[];
+  close(): Promise<void>;
+}
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(__dirname, "..", "..", "..");
 const fixtureProject = path.join(repoRoot, "testing", "fixtures", "project");
 const fixtureGlobalMu = path.join(repoRoot, "testing", ".mu");
 const muBinary = path.join(repoRoot, "target", "debug", "mu");
-const webServer = path.join(repoRoot, "web", "server.mjs");
+const webServer = path.join(repoRoot, "web", "server.ts");
 const debug = process.env.MU_WEB_E2E_DEBUG === "1";
 
-function delay(ms) {
+function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-function log(...args) {
+function log(...args: unknown[]): void {
   if (debug) {
     console.log("[mu-web-e2e]", ...args);
   }
 }
 
-function onceServerListening(server) {
+function onceServerListening(server: Server): Promise<void> {
   return new Promise((resolve, reject) => {
     const onError = (error) => {
       server.off("listening", onListening);
@@ -40,7 +49,7 @@ function onceServerListening(server) {
   });
 }
 
-async function waitForSocket(socketPath, timeoutMs = 10_000) {
+async function waitForSocket(socketPath: string, timeoutMs = 10_000): Promise<void> {
   const started = Date.now();
   while (Date.now() - started < timeoutMs) {
     try {
@@ -56,7 +65,7 @@ async function waitForSocket(socketPath, timeoutMs = 10_000) {
   throw new Error(`timed out waiting for socket ${socketPath}`);
 }
 
-async function waitForHttp(url, timeoutMs = 10_000) {
+async function waitForHttp(url: string, timeoutMs = 10_000): Promise<void> {
   const started = Date.now();
   while (Date.now() - started < timeoutMs) {
     try {
@@ -75,7 +84,7 @@ async function waitForHttp(url, timeoutMs = 10_000) {
   throw new Error(`timed out waiting for ${url}`);
 }
 
-function buildStreamingResponse(prompt) {
+function buildStreamingResponse(prompt: string): string[] {
   const text = `Fake response to: ${prompt}`;
   const first = JSON.stringify({
     choices: [{ delta: { content: text }, finish_reason: null }],
@@ -91,8 +100,12 @@ function buildStreamingResponse(prompt) {
   return [first, second, "[DONE]"];
 }
 
-async function startFakeProvider() {
-  const requests = [];
+async function startFakeProvider(): Promise<{
+  requests: unknown[];
+  port: number;
+  close(): Promise<void>;
+}> {
+  const requests: unknown[] = [];
   const server = http.createServer((req, res) => {
     if (req.method === "GET" && req.url === "/v1/models") {
       res.writeHead(200, { "content-type": "application/json" });
@@ -136,6 +149,9 @@ async function startFakeProvider() {
 
   await onceServerListening(server);
   const address = server.address();
+  if (!address || typeof address === "string") {
+    throw new Error("fake provider did not expose a TCP port");
+  }
   return {
     requests,
     port: address.port,
@@ -145,7 +161,7 @@ async function startFakeProvider() {
   };
 }
 
-async function startSocketProxy(socketPath) {
+async function startSocketProxy(socketPath: string): Promise<{ url: string; close(): Promise<void> }> {
   const server = http.createServer((req, res) => {
     const upstream = httpRequest(
       {
@@ -170,6 +186,9 @@ async function startSocketProxy(socketPath) {
 
   await onceServerListening(server);
   const address = server.address();
+  if (!address || typeof address === "string") {
+    throw new Error("socket proxy did not expose a TCP port");
+  }
   return {
     url: `http://127.0.0.1:${address.port}`,
     async close() {
@@ -178,7 +197,7 @@ async function startSocketProxy(socketPath) {
   };
 }
 
-function testingEnv({ runRoot, globalDir }) {
+function testingEnv({ runRoot, globalDir }: { runRoot: string; globalDir: string }): NodeJS.ProcessEnv {
   return {
     ...process.env,
     HOME: path.join(runRoot, "home"),
@@ -189,7 +208,7 @@ function testingEnv({ runRoot, globalDir }) {
   };
 }
 
-export async function startHarness() {
+export async function startHarness(): Promise<Harness> {
   log("creating temp workspace");
   const runRoot = await mkdtemp(path.join(tmpdir(), "mu-web-e2e-"));
   const projectDir = path.join(runRoot, "project");
@@ -224,7 +243,7 @@ export async function startHarness() {
 
   const socketPath = path.join(runRoot, "mu-web.sock");
   log("starting web server", socketPath);
-  const mu = spawn(process.execPath, [webServer, socketPath], {
+  const mu: ChildProcessWithoutNullStreams = spawn(process.execPath, [webServer, socketPath], {
     cwd: projectDir,
     env,
     stdio: ["ignore", "pipe", "pipe"],

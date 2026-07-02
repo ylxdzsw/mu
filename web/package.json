@@ -3,8 +3,8 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "start": "node server.mjs",
-    "test:e2e": "cargo build --manifest-path ../Cargo.toml --bin mu && node testing/e2e/web.test.mjs"
+    "start": "node server.ts",
+    "test:e2e": "cargo build --manifest-path ../Cargo.toml --bin mu && node testing/e2e/web.test.ts"
   },
   "devDependencies": {
     "@playwright/test": "^1.55.0"

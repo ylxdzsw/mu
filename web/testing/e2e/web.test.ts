@@ -1,8 +1,9 @@
 import assert from "node:assert/strict";
 
 import { chromium } from "@playwright/test";
+import type { Page } from "@playwright/test";
 
-import { startHarness } from "./harness.mjs";
+import { startHarness, type Harness } from "./harness.ts";
 
 function launchBrowser() {
   return chromium.launch({
@@ -12,7 +13,7 @@ function launchBrowser() {
   });
 }
 
-async function withBrowserSession(run) {
+async function withBrowserSession(run: (context: { harness: Harness; page: Page }) => Promise<void>) {
   const harness = await startHarness();
   const browser = await launchBrowser();
   const page = await browser.newPage();

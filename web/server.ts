@@ -6,6 +6,86 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import readline from "node:readline";
 import { fileURLToPath } from "node:url";
+import type { ChildProcessWithoutNullStreams } from "node:child_process";
+import type { IncomingMessage, ServerResponse } from "node:http";
+
+type Scope = { kind: "global" } | { kind: "project"; path: string };
+
+type EventPayload = Record<string, unknown>;
+
+interface ProjectSummary {
+  path: string;
+  marker: string;
+}
+
+interface ProjectInspectOutput {
+  project_root?: string;
+  discovered_marker?: string;
+}
+
+interface SessionSummary {
+  id: string;
+}
+
+interface UploadImage {
+  name: string;
+  data_url: string;
+}
+
+interface TurnInput {
+  prompt?: string;
+  project: string;
+  session_id?: string;
+  model?: string;
+  images?: UploadImage[];
+}
+
+interface OpenProjectInput {
+  path: string;
+  create?: boolean;
+}
+
+interface TurnRecord {
+  id: string;
+  project: string;
+  session_id: string;
+  started_at: string;
+  pgid: number;
+}
+
+interface TurnEventEnvelope {
+  seq: number;
+  event: string;
+  payload: EventPayload;
+}
+
+interface TurnSnapshot {
+  prompt: string;
+  assistant_text: string;
+  raw_events: TurnEventEnvelope[];
+  stderr: string;
+  exit_code: number | null;
+}
+
+interface TurnView {
+  turn: TurnRecord;
+  last_seq: number;
+  completed: boolean;
+  snapshot: TurnSnapshot;
+}
+
+type TurnReplay =
+  | { type: "reset"; nextSeq: number }
+  | { type: "ready"; events: TurnEventEnvelope[]; completed: boolean };
+
+interface AppState {
+  launchCwd: string;
+  launchProject: ProjectSummary | null;
+  globalHome: string;
+  recentProjects: ProjectSummary[];
+  turns: Map<string, TurnRuntime>;
+  uploadRoot: string;
+}
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const publicRoot = path.join(__dirname, "public");
@@ -22,7 +102,14 @@ const BASE_HEADERS = {
 };
 
 class TurnRuntime {
-  constructor(turn, prompt) {
+  turn: TurnRecord;
+  events: TurnEventEnvelope[];
+  nextSeq: number;
+  completed: boolean;
+  waiters: Set<() => void>;
+  snapshot: TurnSnapshot;
+
+  constructor(turn: TurnRecord, prompt: string) {
     this.turn = turn;
     this.events = [];
     this.nextSeq = 0;
@@ -38,7 +125,7 @@ class TurnRuntime {
     this.pushEvent("turn_start", { turn });
   }
 
-  pushEvent(event, payload) {
+  pushEvent(event: string, payload: EventPayload): void {
     this.nextSeq += 1;
     const envelope = { seq: this.nextSeq, event, payload };
     applySnapshotEvent(this.snapshot, envelope);
@@ -49,12 +136,12 @@ class TurnRuntime {
     this.notify();
   }
 
-  markCompleted() {
+  markCompleted(): void {
     this.completed = true;
     this.notify();
   }
 
-  currentView() {
+  currentView(): TurnView {
     return {
       turn: this.turn,
       last_seq: this.nextSeq,
@@ -63,7 +150,7 @@ class TurnRuntime {
     };
   }
 
-  replayAfter(after) {
+  replayAfter(after: number): TurnReplay {
     const first = this.events[0];
     if (first && first.seq > after + 1) {
       return { type: "reset", nextSeq: first.seq };
@@ -75,7 +162,7 @@ class TurnRuntime {
     };
   }
 
-  waitForChange(after) {
+  waitForChange(after: number): Promise<void> {
     if (this.nextSeq > after || this.completed) {
       return Promise.resolve();
     }
@@ -84,7 +171,7 @@ class TurnRuntime {
     });
   }
 
-  notify() {
+  notify(): void {
     for (const resolve of this.waiters) {
       resolve();
     }
@@ -92,7 +179,7 @@ class TurnRuntime {
   }
 }
 
-async function main() {
+async function main(): Promise<void> {
   const socketPath = socketPathFromArgv(process.argv);
   await prepareSocketPath(socketPath);
 
@@ -122,14 +209,14 @@ async function main() {
   process.on("SIGTERM", shutdown);
 }
 
-function socketPathFromArgv(argv) {
+function socketPathFromArgv(argv: string[]): string {
   if (argv.length !== 3 || !argv[2]) {
     throw new Error("expected exactly one argument: <socket-path>");
   }
   return argv[2];
 }
 
-async function prepareSocketPath(socketPath) {
+async function prepareSocketPath(socketPath: string): Promise<void> {
   await mkdir(path.dirname(socketPath), { recursive: true });
   try {
     const metadata = await lstat(socketPath);
@@ -137,7 +224,7 @@ async function prepareSocketPath(socketPath) {
       throw new Error(`refusing to replace non-socket path: ${socketPath}`);
     }
     await rm(socketPath, { force: true });
-  } catch (error) {
+  } catch (error: any) {
     if (error && error.code === "ENOENT") {
       return;
     }
@@ -145,7 +232,7 @@ async function prepareSocketPath(socketPath) {
   }
 }
 
-async function createState() {
+async function createState(): Promise<AppState> {
   const launchCwd = await realpath(process.cwd());
   const launchProject = await discoverProject(launchCwd);
   const uploadRoot = path.join(runtimeDir(), "web-uploads");
@@ -160,15 +247,15 @@ async function createState() {
   };
 }
 
-function runtimeDir() {
+function runtimeDir(): string {
   if (process.env.XDG_RUNTIME_DIR) {
     return path.join(process.env.XDG_RUNTIME_DIR, "mu");
   }
   return path.join(tmpdir(), "mu");
 }
 
-async function discoverProject(cwd) {
-  const info = await runJsonCommand(
+async function discoverProject(cwd: string): Promise<ProjectSummary | null> {
+  const info = await runJsonCommand<ProjectInspectOutput>(
     { globalHome: process.env.HOME || "/tmp" },
     null,
     ["project", "inspect", "--path", cwd, "--json"],
@@ -183,7 +270,11 @@ async function discoverProject(cwd) {
   };
 }
 
-async function handleRequest(request, response, state) {
+async function handleRequest(
+  request: IncomingMessage,
+  response: ServerResponse,
+  state: AppState,
+): Promise<void> {
   const url = new URL(request.url, "http://localhost");
 
   if (request.method === "GET" && !url.pathname.startsWith("/api/")) {
@@ -214,7 +305,7 @@ async function handleRequest(request, response, state) {
   }
 
   if (request.method === "POST" && url.pathname === "/api/projects/open") {
-    const input = await parseJsonBody(request);
+    const input = await parseJsonBody<OpenProjectInput>(request);
     const root = await resolveExistingDir(input.path);
     const marker = await markerAt(root);
     if (!marker && !input.create) {
@@ -249,7 +340,7 @@ async function handleRequest(request, response, state) {
   }
 
   if (request.method === "POST" && url.pathname === "/api/sessions") {
-    const input = await parseJsonBody(request);
+    const input = await parseJsonBody<{ project: string }>(request);
     const scope = await parseScopeTarget(state, input.project);
     writeJson(response, 200, await createWebSession(state, scope));
     return;
@@ -281,7 +372,7 @@ async function handleRequest(request, response, state) {
   }
 
   if (request.method === "POST" && url.pathname === "/api/turns") {
-    const input = await parseJsonBody(request);
+    const input = await parseJsonBody<TurnInput>(request);
     if (!input.prompt || !input.prompt.trim()) {
       writeJson(response, 400, { error: "empty prompt" });
       return;
@@ -343,7 +434,7 @@ async function handleRequest(request, response, state) {
   writeJson(response, 404, { error: "not found" });
 }
 
-async function serveStatic(response, pathname) {
+async function serveStatic(response: ServerResponse, pathname: string): Promise<boolean> {
   const target = pathname === "/" ? "/index.html" : pathname;
   const filePath = path.resolve(publicRoot, `.${target}`);
   if (filePath !== publicRoot && !filePath.startsWith(`${publicRoot}${path.sep}`)) {
@@ -363,7 +454,7 @@ async function serveStatic(response, pathname) {
     });
     response.end(body);
     return true;
-  } catch (error) {
+  } catch (error: any) {
     if (error.code === "ENOENT") {
       return false;
     }
@@ -371,7 +462,7 @@ async function serveStatic(response, pathname) {
   }
 }
 
-function contentType(filePath) {
+function contentType(filePath: string): string {
   if (filePath.endsWith(".html")) {
     return "text/html; charset=utf-8";
   }
@@ -387,13 +478,13 @@ function contentType(filePath) {
   return "application/octet-stream";
 }
 
-async function parseJsonBody(request) {
+async function parseJsonBody<T>(request: IncomingMessage): Promise<T> {
   const body = await readBody(request);
-  return JSON.parse(body || "{}");
+  return JSON.parse(body || "{}") as T;
 }
 
-async function readBody(request) {
-  const chunks = [];
+async function readBody(request: IncomingMessage): Promise<string> {
+  const chunks: Buffer[] = [];
   let total = 0;
   for await (const chunk of request) {
     total += chunk.length;
@@ -405,7 +496,7 @@ async function readBody(request) {
   return Buffer.concat(chunks).toString("utf8");
 }
 
-function queryFlag(url, key) {
+function queryFlag(url: URL, key: string): boolean {
   const value = url.searchParams.get(key);
   if (!value) {
     return false;
@@ -413,7 +504,7 @@ function queryFlag(url, key) {
   return ["1", "true", "yes", "on"].includes(value.trim().toLowerCase());
 }
 
-async function scopeQuery(state, url) {
+async function scopeQuery(state: AppState, url: URL): Promise<Scope> {
   const project = url.searchParams.get("project");
   if (!project) {
     throw new Error("missing project");
@@ -421,22 +512,22 @@ async function scopeQuery(state, url) {
   return parseScopeTarget(state, project);
 }
 
-async function parseScopeTarget(state, value) {
+async function parseScopeTarget(state: AppState, value: string): Promise<Scope> {
   if (value === GLOBAL_PROJECT_ID) {
     return { kind: "global" };
   }
   return { kind: "project", path: await requireProject(value) };
 }
 
-function scopeKey(scope) {
+function scopeKey(scope: Scope): string {
   return scope.kind === "global" ? GLOBAL_PROJECT_ID : scope.path;
 }
 
-function currentDirForScope(state, scope) {
+function currentDirForScope(state: AppState, scope: Scope): string {
   return scope.kind === "global" ? state.globalHome : scope.path;
 }
 
-async function resolveExistingDir(target) {
+async function resolveExistingDir(target: string): Promise<string> {
   const resolved = await realpath(target);
   const metadata = await stat(resolved);
   if (!metadata.isDirectory()) {
@@ -445,7 +536,7 @@ async function resolveExistingDir(target) {
   return resolved;
 }
 
-async function markerAt(target) {
+async function markerAt(target: string): Promise<string | null> {
   try {
     const muStat = await stat(path.join(target, ".mu"));
     if (muStat.isDirectory()) {
@@ -460,7 +551,7 @@ async function markerAt(target) {
   }
 }
 
-async function requireProject(target) {
+async function requireProject(target: string): Promise<string> {
   const resolved = await resolveExistingDir(target);
   if (!(await markerAt(resolved))) {
     throw new Error(`not a project: ${resolved}`);
@@ -468,7 +559,7 @@ async function requireProject(target) {
   return resolved;
 }
 
-async function requireMarker(target) {
+async function requireMarker(target: string): Promise<string> {
   const marker = await markerAt(target);
   if (!marker) {
     throw new Error(`not a project: ${target}`);
@@ -476,7 +567,12 @@ async function requireMarker(target) {
   return marker;
 }
 
-async function inspectProject(target) {
+async function inspectProject(target: string): Promise<{
+  path: string;
+  is_project: boolean;
+  marker: string | null;
+  needs_confirmation: boolean;
+}> {
   const resolved = await resolveExistingDir(target);
   const marker = await markerAt(resolved);
   return {
@@ -487,22 +583,31 @@ async function inspectProject(target) {
   };
 }
 
-function rememberProject(state, summary) {
+function rememberProject(state: AppState, summary: ProjectSummary): void {
   state.recentProjects = [summary, ...state.recentProjects.filter((project) => project.path !== summary.path)];
   state.recentProjects = state.recentProjects.slice(0, 20);
 }
 
-async function runJsonCommand(state, scope, args, overrideCwd = null) {
+async function runJsonCommand<T>(
+  state: { globalHome: string } | AppState,
+  scope: Scope | null,
+  args: string[],
+  overrideCwd: string | null = null,
+): Promise<T> {
   const cwd = overrideCwd || (scope ? currentDirForScope(state, scope) : undefined);
   const { stdout } = await execFileResult(MU_EXE, args, { cwd });
   try {
-    return JSON.parse(stdout);
-  } catch (error) {
+    return JSON.parse(stdout) as T;
+  } catch (error: any) {
     throw new Error(`parsing mu JSON output: ${error.message}`);
   }
 }
 
-function execFileResult(file, args, options) {
+function execFileResult(
+  file: string,
+  args: string[],
+  options: { cwd?: string },
+): Promise<{ stdout: string; stderr: string }> {
   return new Promise((resolve, reject) => {
     execFile(file, args, { ...options, maxBuffer: MAX_REQUEST_BYTES }, (error, stdout, stderr) => {
       if (error) {
@@ -515,15 +620,19 @@ function execFileResult(file, args, options) {
   });
 }
 
-async function createWebSession(state, scope) {
-  return runJsonCommand(state, scope, ["session", "new", "--origin", "web", "--json"]);
+async function createWebSession(state: AppState, scope: Scope): Promise<SessionSummary> {
+  return runJsonCommand<SessionSummary>(state, scope, ["session", "new", "--origin", "web", "--json"]);
 }
 
-async function activeSession(state, scope, sessionId) {
+async function activeSession(state: AppState, scope: Scope, sessionId: string): Promise<boolean> {
   return Boolean(await findActiveTurn(state, scope, sessionId));
 }
 
-async function findActiveTurn(state, scope, sessionId) {
+async function findActiveTurn(
+  state: AppState,
+  scope: Scope,
+  sessionId: string,
+): Promise<TurnRuntime | null> {
   const project = scopeKey(scope);
   for (const runtime of state.turns.values()) {
     if (runtime.turn.project !== project) {
@@ -539,7 +648,7 @@ async function findActiveTurn(state, scope, sessionId) {
   return null;
 }
 
-async function launchTurn(state, scope, input) {
+async function launchTurn(state: AppState, scope: Scope, input: TurnInput): Promise<TurnRecord> {
   const turnId = randomUUID();
   const uploadDir = path.join(state.uploadRoot, turnId);
   const imagePaths = await saveUploads(uploadDir, input.images || []);
@@ -551,7 +660,7 @@ async function launchTurn(state, scope, input) {
     args.push("--image", imagePath);
   }
 
-  const child = spawn(MU_EXE, args, {
+  const child: ChildProcessWithoutNullStreams = spawn(MU_EXE, args, {
     cwd: currentDirForScope(state, scope),
     detached: true,
     stdio: ["pipe", "pipe", "pipe"],
@@ -572,16 +681,20 @@ async function launchTurn(state, scope, input) {
   return turn;
 }
 
-function onceSpawn(child) {
+function onceSpawn(child: ChildProcessWithoutNullStreams): Promise<void> {
   return new Promise((resolve, reject) => {
     child.once("spawn", resolve);
     child.once("error", reject);
   });
 }
 
-async function runTurnTask(runtime, child, uploadDir) {
-  let streamError = null;
-  const stderrChunks = [];
+async function runTurnTask(
+  runtime: TurnRuntime,
+  child: ChildProcessWithoutNullStreams,
+  uploadDir: string,
+): Promise<void> {
+  let streamError: Error | null = null;
+  const stderrChunks: string[] = [];
   child.stderr.setEncoding("utf8");
   child.stderr.on("data", (chunk) => {
     stderrChunks.push(chunk);
@@ -595,14 +708,14 @@ async function runTurnTask(runtime, child, uploadDir) {
 
   try {
     for await (const line of lines) {
-      const event = JSON.parse(line);
+      const event = JSON.parse(line) as { event?: string; payload?: EventPayload };
       const eventName = event.event;
       if (typeof eventName !== "string") {
         throw new Error("child JSON event missing event name");
       }
       runtime.pushEvent(eventName, event.payload ?? {});
     }
-  } catch (error) {
+  } catch (error: any) {
     streamError = error;
   }
 
@@ -620,7 +733,7 @@ async function runTurnTask(runtime, child, uploadDir) {
   await rm(uploadDir, { recursive: true, force: true }).catch(() => {});
 }
 
-function onceExit(child) {
+function onceExit(child: ChildProcessWithoutNullStreams): Promise<number> {
   return new Promise((resolve, reject) => {
     child.once("error", reject);
     child.once("exit", (code) => {
@@ -629,12 +742,12 @@ function onceExit(child) {
   });
 }
 
-async function saveUploads(root, images) {
+async function saveUploads(root: string, images: UploadImage[]): Promise<string[]> {
   if (!images.length) {
     return [];
   }
   await mkdir(root, { recursive: true });
-  const paths = [];
+  const paths: string[] = [];
   for (let index = 0; index < images.length; index += 1) {
     const image = images[index];
     const [mimePart, encoded] = image.data_url.split(";base64,");
@@ -649,7 +762,7 @@ async function saveUploads(root, images) {
   return paths;
 }
 
-function extensionForMime(mime) {
+function extensionForMime(mime: string): string {
   switch (mime) {
     case "image/png":
       return "png";
@@ -664,7 +777,12 @@ function extensionForMime(mime) {
   }
 }
 
-async function streamTurnEvents(response, state, id, after) {
+async function streamTurnEvents(
+  response: ServerResponse,
+  state: AppState,
+  id: string,
+  after: number,
+): Promise<void> {
   const runtime = state.turns.get(id);
   if (!runtime) {
     writeJson(response, 404, { error: "turn not found" });
@@ -702,13 +820,18 @@ async function streamTurnEvents(response, state, id, after) {
   }
 }
 
-function onceResponseClosed(response) {
+function onceResponseClosed(response: ServerResponse): Promise<void> {
   return new Promise((resolve) => {
     response.once("close", resolve);
   });
 }
 
-async function writeSseEvent(response, id, event, payload) {
+async function writeSseEvent(
+  response: ServerResponse,
+  id: number | null,
+  event: string,
+  payload: EventPayload,
+): Promise<void> {
   let frame = "";
   if (id !== null) {
     frame += `id: ${id}\n`;
@@ -720,7 +843,7 @@ async function writeSseEvent(response, id, event, payload) {
   }
 }
 
-async function abortTurn(response, state, id) {
+async function abortTurn(response: ServerResponse, state: AppState, id: string): Promise<void> {
   const runtime = state.turns.get(id);
   if (!runtime || runtime.completed) {
     writeJson(response, 404, { error: "turn not found" });
@@ -728,7 +851,7 @@ async function abortTurn(response, state, id) {
   }
   try {
     process.kill(-runtime.turn.pgid, "SIGTERM");
-  } catch (error) {
+  } catch (error: any) {
     writeJson(response, 500, { error: error.message });
     return;
   }
@@ -742,7 +865,7 @@ async function abortTurn(response, state, id) {
   writeJson(response, 200, { ok: true });
 }
 
-function applySnapshotEvent(snapshot, envelope) {
+function applySnapshotEvent(snapshot: TurnSnapshot, envelope: TurnEventEnvelope): void {
   snapshot.raw_events.push({
     seq: envelope.seq,
     event: envelope.event,
@@ -759,7 +882,7 @@ function applySnapshotEvent(snapshot, envelope) {
   }
 }
 
-function writeJson(response, status, value) {
+function writeJson(response: ServerResponse, status: number, value: unknown): void {
   const body = Buffer.from(JSON.stringify(value));
   response.writeHead(status, {
     ...BASE_HEADERS,
@@ -770,7 +893,7 @@ function writeJson(response, status, value) {
   response.end(body);
 }
 
-main().catch((error) => {
+main().catch((error: any) => {
   console.error(error.message || String(error));
   process.exit(1);
 });
