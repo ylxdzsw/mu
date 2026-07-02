@@ -4,7 +4,7 @@
 completed agent turn out. The core `mu` binary reads a prompt on stdin, accepts
 attached inputs such as images, runs an agent loop, streams turn events in the
 selected output format, persists completed messages, and exits. Interactive
-shells, `mu web`, editor integrations, and other surfaces build around that
+shells, the standalone `web/` service, editor integrations, and other surfaces build around that
 simple turn unit instead of changing it.
 
 This document describes the design, the key decisions behind it, and the
@@ -26,7 +26,7 @@ is unambiguous.
   immediately when a turn completes.
 - **Composable.** The main abstraction is a turn, not a chat app, daemon,
   terminal UI, or project manager. Thin surfaces such as the zsh plugin,
-  shell scripts, and `mu web` coordinate and present turns; they do not host a
+  shell scripts, and the standalone web service coordinate and present turns; they do not host a
   separate agent loop.
 - **Non-magical.** No TUI. The shell owns the terminal and line editing; `mu`
   just reads a prompt and appends output. Output streams as it is produced (a
@@ -52,9 +52,9 @@ is unambiguous.
 - **No re-rendering.** Lines are written once and never rewritten. Native
   terminal scrollback is the history mechanism.
 - **No daemon in the core turn path.** Each turn is a fresh, stateless-on-exit
-  process that loads/saves session state from SQLite. `mu web` may host a local
-  coordinator around this turn boundary, but it remains part of the same
-  executable rather than a separate agent runtime or second binary.
+  process that loads/saves session state from SQLite. The standalone web
+  service may host a local coordinator around this turn boundary, but it
+  remains a thin wrapper rather than a separate agent runtime.
 - **No plugin SDK, no MCP, no sub-agents (initially).** Extensibility is via
   skills (markdown) and `bash` (call any CLI tool).
 - **No core shell emulation.** The core `mu` binary does not ship shell behavior,
@@ -93,18 +93,17 @@ surface is small (chat completions + streaming + tool calls).
 
 `mu` is one executable with a default **turn runner** mode: prompt and attached
 inputs in, streamed turn events out, completed state persisted, exit. It also
-owns management subcommands, and future entry modes should remain subcommands of
-that same binary. The turn path itself has no concept of prompts, key bindings,
-web sessions, or long-lived UI state.
+owns management subcommands for core state inspection and mutation. The turn
+path itself has no concept of prompts, key bindings, web sessions, or
+long-lived UI state.
 
 Interactive surfaces are thin wrappers around that unit:
 
 - The zsh plugin is the preferred interactive surface. It owns zsh line editing,
   prompt mode, and keybindings, then submits each entered prompt by spawning
   `mu` for one foreground turn.
-- The web surface lives behind `mu web`, similar in spirit to `opencode serve`.
-  It is packaged as a subcommand in the same executable, but conceptually
-  behaves like a separate web wrapper: it coordinates HTTP, browser state, and
+- The web surface lives in `web/` as a standalone Node service, similar in
+  spirit to `opencode serve`. It coordinates HTTP, browser state, and
   presentation while calling the normal `mu` command path for agent/session
   work. It does not host a separate agent loop, and it should not create
   sessions by inserting directly into the store.
@@ -154,7 +153,7 @@ in the active global/project scope. See §9, §10, and §11.
 ## 3. Architecture overview
 
 `mu` has one executable, multiple entry modes, and multiple thin external
-surfaces. The CLI turn runner remains the core unit; `mu web` is a local browser
+surfaces. The CLI turn runner remains the core unit; the web service is a local browser
 wrapper in the same binary, not a separate agent runtime with different turn
 semantics.
 
@@ -162,7 +161,7 @@ semantics.
    ┌──────────────────────────── external surfaces ─────────────────────────────┐
    │  shell scripts / editor tasks: `mu [opts] <<< PROMPT`                     │
    │  zsh plugin: prompt mode; every entered line spawns one `mu` turn         │
-   │  browsers / editors: coordinate through `mu web`                          │
+   │  browsers / editors: coordinate through the web service                   │
    └───────────────────────────────────┬───────────────────────────────────────┘
                                         │ invokes the same executable / command path
                                         ▼
@@ -220,7 +219,7 @@ small:
 - `mu [-s <id>] [-c] [--model <id>] [-i <image>] [--output plain|terminal|json] <prompt-file>`
   — run one turn from a prompt file; if the first line starts with `#!`, drop
   it before sending the prompt. `-i/--image` is repeatable.
-- `mu.zsh` — zsh prompt mode; each accepted prompt runs one foreground `mu`
+- `shell/zsh` — zsh prompt mode; each accepted prompt runs one foreground `mu`
   turn and keeps using the same session. `MU_ZSH_SESSION_ID=<id>` seeds
   attachment to an existing session.
 - `mu project inspect --path <dir>` — report whether a directory resolves to a
@@ -237,24 +236,25 @@ small:
 - `mu session unarchive --session <id>` — restore an archived session to
   default lists.
 - `mu compact --session <id>` — force compaction.
-- `mu web [--socket <path>] [--socket-mode <octal>]` — serve the local browser
-  UI on a Unix socket.
+- `npm --prefix web start -- [--socket <path>] [--socket-mode <octal>] [--mu-exe <path>]`
+  — serve the local browser UI on a Unix socket.
 
 The turn runner remains one completed turn per invocation. Bare `mu` reads the
 prompt from stdin; `mu <prompt-file>` reads it from a file and trims a leading
 shebang line when present. Exact subcommand names win at the top level, so a
 prompt file that collides with a subcommand name must be passed with a
-disambiguating path such as `./status`. `mu web` is the long-lived wrapper
-surface: it accepts browser requests, starts project-scoped sessions, shells
-out to the same turn runner with `--output json`, accepts prompts asynchronously,
-and exposes replayable browser event streams over SSE rather than WebSockets. `mu session new/list`, `mu session transcript`, and project
-inspection/init do **not** require a configured provider. Turn invocation and
+disambiguating path such as `./status`. The standalone web service is the
+long-lived wrapper surface: it accepts browser requests, starts
+project-scoped sessions, shells out to the same turn runner with `--output json`,
+accepts prompts asynchronously, and exposes replayable browser event streams
+over SSE rather than WebSockets. `mu session new/list`, `mu session transcript`,
+and project inspection/init do **not** require a configured provider. Turn invocation and
 `mu compact` require a configured provider because they can contact the
 provider (§7).
 
 ### Web surface
 
-`mu web` is the browser surface for `mu`: a local, self-hosted web UI for
+The standalone web service is the browser surface for `mu`: a local, self-hosted web UI for
 starting, resuming, monitoring, and reviewing `mu` sessions across multiple
 projects. It should feel visually and interaction-wise like opencode's web UI,
 while preserving `mu`'s simpler model: command-driven turns, project-scoped
@@ -270,10 +270,10 @@ state, and the normal `mu` CLI as the authority for agent work.
   product model is `mu`: projects, sessions, turns, status, and the single
   `bash` tool. The UI must not inherit opencode concepts that do not exist in
   `mu`.
-- **Multi-project first.** A running `mu web` instance can browse and work
+- **Multi-project first.** A running web service instance can browse and work
   across many projects. The launch directory is only the initial/default
   project.
-- **Secure by deployment boundary.** `mu web` does not implement
+- **Secure by deployment boundary.** The web service does not implement
   browser-facing authentication. It listens only on a Unix domain socket, and
   nginx or another trusted reverse proxy owns TLS and authentication.
 - **Status is canonical.** Session/project metadata shown in the UI should come
@@ -287,7 +287,7 @@ state, and the normal `mu` CLI as the authority for agent work.
 #### Non-goals
 
 - No application-level login, cookie auth, OAuth, RBAC, or per-user permission
-  model inside `mu web`.
+  model inside the web service.
 - No public TCP listener. Production and normal local service mode use a Unix
   socket only.
 - No hidden project creation. Merely browsing or selecting a directory must not
@@ -297,8 +297,8 @@ state, and the normal `mu` CLI as the authority for agent work.
 - No duplicate database interpretation in the web server for status/sidebar
   metadata or listing filters.
 - No global-scope sessions in the web surface. CLI and shell use may still
-  support global sessions, but `mu web` requires an explicit project.
-- No attempt to make `mu web` a shell replacement. The shell remains the best
+  support global sessions, but the web service requires an explicit project.
+- No attempt to make the web service a shell replacement. The shell remains the best
   place for terminal-native interaction.
 - No file review or IDE replacement requirement for V1. Those can be added only
   when they are backed by truthful `mu` data.
@@ -347,7 +347,7 @@ The UI should translate vocabulary to `mu` terms where visible labels matter:
 
 #### Multi-project model
 
-`mu web` must support multiple projects in one browser session.
+The web service must support multiple projects in one browser session.
 
 A directory is already a project when `mu` discovery would treat it as a
 project:
@@ -359,7 +359,7 @@ The app should keep a recent/project list. The launch cwd is the initial
 selected project when it is a project. If launch cwd is not a project, the app
 may open with no selected project and offer a project picker.
 
-`mu web` does not show or create global-scope sessions in V1. If it launches
+The web service does not show or create global-scope sessions in V1. If it launches
 outside a project, it should show a friendly empty state with actions to open an
 existing project or create a `.mu` project at an explicitly confirmed
 directory. This keeps every web session anchored to a project path, which makes
@@ -448,13 +448,12 @@ not grow its own ad-hoc SQLite queries for sidebar data.
 
 #### Backend and data ownership
 
-`mu web` is packaged as a subcommand of the `mu` binary, but conceptually it is
-a separate web wrapper that happens to ship in the same executable. Its job is
-to coordinate HTTP, static assets, project selection, browser subscriptions, and
+The web service is a separate wrapper that ships from `web/`. Its job is to
+coordinate HTTP, static assets, project selection, browser subscriptions, and
 presentation. It should not share the agent loop as an in-process library path
 or become another way to mutate session state.
 
-For agent/session operations, `mu web` should invoke the ordinary `mu` command
+For agent/session operations, the web service should invoke the ordinary `mu` command
 surface whenever practical:
 
 - session creation uses the same session command or turn invocation path as CLI
@@ -466,9 +465,8 @@ surface whenever practical:
 - model lists come from `mu models list --json`;
 - archive/list behavior comes from session commands rather than web-only SQL.
 
-This keeps `mu web` conceptually close to a separate binary such as `mu-web`
-that shells out to `mu`, while still allowing us to distribute it as
-`mu web`.
+This keeps the web service conceptually close to a separate binary such as
+`mu-web` that shells out to `mu`.
 
 The web API is allowed to expose browser-shaped endpoints, but they must map to
 existing `mu` concepts:
@@ -483,7 +481,7 @@ existing `mu` concepts:
 
 The API should carry project path explicitly for project-scoped operations. The
 current process cwd must not be the hidden global selector for all web requests,
-because a single `mu web` process serves multiple projects.
+because a single web service process serves multiple projects.
 
 The web server may keep ephemeral in-memory state for child processes, active
 streams, browser subscriptions, and recently opened projects. Persistent session
@@ -491,7 +489,7 @@ state remains owned by the invoked `mu` commands and their existing stores.
 
 #### Security and deployment
 
-`mu web` trusts the local reverse-proxy boundary.
+The web service trusts the local reverse-proxy boundary.
 
 Requirements:
 
@@ -513,7 +511,7 @@ This server already uses two relevant deployment patterns:
   `SocketGroup=http`, `SocketMode=0660`, and nginx proxies to
   `http://unix:/run/webterm/$slot.sock`.
 
-`mu web` should follow that family of deployment:
+The web service should follow that family of deployment:
 
 - socket under `/run/mu-web/`;
 - runtime directory owned by root and connectable by nginx's `http` group when
@@ -523,13 +521,13 @@ This server already uses two relevant deployment patterns:
 - streaming endpoints disable proxy buffering and caching.
 
 The application should be safe to expose only to whoever nginx authenticates.
-Once a request reaches the Unix socket, `mu web` treats it as authorized.
+Once a request reaches the Unix socket, the web service treats it as authorized.
 
 #### Status contract
 
 The web UI depends on `mu status` as the canonical metadata contract. To support
 multi-project web operation, status must be invocable for a specific project
-context and optional session id, not just whichever directory launched `mu web`.
+context and optional session id, not just whichever directory launched the web service.
 The current implementation achieves that by spawning `mu status` with the
 target project as `cwd` rather than by passing an explicit `--path` flag.
 
@@ -550,7 +548,7 @@ should be able to report it.
 
 #### Open questions
 
-- Should the first `mu web` URL open directly into the launch project, or always
+- Should the first web-service URL open directly into the launch project, or always
   show the multi-project home with the launch project selected?
 - Should recent projects be stored globally in `~/.mu`, or should they remain
   browser-local until there is a stronger need for cross-browser persistence?
@@ -856,7 +854,7 @@ Consequences:
 
 ### 6.2 Entry and exit
 
-- Source `mu.zsh` from `.zshrc`.
+- Source `shell/zsh` from `.zshrc`.
 - Press Tab with the cursor at the beginning of the line to enter `mu>` mode;
   press Tab at the beginning of a `mu>` line to leave it again. In both
   directions, keep the current buffer and cursor position intact.

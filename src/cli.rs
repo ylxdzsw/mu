@@ -70,8 +70,6 @@ pub enum Command {
         #[arg(long)]
         session: String,
     },
-    /// Serve the local browser UI
-    Web(WebArgs),
 }
 
 #[derive(ClapArgs, Debug, Clone)]
@@ -151,17 +149,6 @@ pub enum ProjectSub {
 pub enum SessionOriginArg {
     Cli,
     Web,
-}
-
-#[derive(ClapArgs, Debug, Clone)]
-pub struct WebArgs {
-    /// Unix socket path to listen on
-    #[arg(long, default_value = "/run/mu-web/mu-web.sock")]
-    pub socket: PathBuf,
-
-    /// Unix socket permissions, written as an octal mode such as 0600 or 0660
-    #[arg(long, default_value = "0600")]
-    pub socket_mode: String,
 }
 
 #[cfg(test)]

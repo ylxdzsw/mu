@@ -27,7 +27,6 @@ mod skills;
 mod store;
 mod system_prompt;
 mod tools;
-mod web;
 
 use cli::{Args, Command, ProjectSub, SessionOriginArg, SessionSub};
 use config::Config;
@@ -365,10 +364,6 @@ async fn run() -> Result<()> {
                     store.set_session_archived(&session, false)?;
                 }
             }
-            return Ok(());
-        }
-        Some(Command::Web(web_args)) => {
-            web::serve(web_args, cwd).await?;
             return Ok(());
         }
         Some(Command::Status(status_args)) => {

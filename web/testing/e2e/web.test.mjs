@@ -63,7 +63,7 @@ async function main() {
   await verifyModelPicker();
   console.log("ok - loads split frontend assets and status-driven model picker");
   await verifyPromptSubmission();
-  console.log("ok - submits a prompt through real mu web against the fake provider");
+  console.log("ok - submits a prompt through the standalone web server against the fake provider");
 }
 
 await main();

@@ -23,17 +23,19 @@ starter provider if the file does not exist. Edit that file to use another
 OpenAI-compatible endpoint, API-key env var, or default model.
 
 Run a single turn by piping a prompt to `mu`, pass a prompt file directly to
-`mu` for file-backed prompts and executable prompt scripts, or source the zsh plugin for an integrated shell
-prompt mode that keeps using the same session across turns. Arch Linux
+`mu` for file-backed prompts and executable prompt scripts, or source the zsh
+plugin for an integrated shell prompt mode that keeps using the same session
+across turns. The browser UI lives as a standalone Node service in `web/`.
+Arch Linux
 packaging for the current checkout lives in [`PKGBUILD`](PKGBUILD) at the repo
 root.
 
 ## zsh plugin
 
 ```zsh
-source /path/to/mu/mu.zsh
+source /path/to/mu/shell/zsh
 # Arch package install path:
-# source /usr/share/mu/mu.zsh
+# source /usr/share/mu/shell/zsh
 ```
 
 Press Tab with the cursor at the beginning of the line to toggle into or out of
@@ -96,7 +98,6 @@ MU_ZSH_EXIT_HOOKS+=(mu_restore_conflicts)
 | `mu session archive --session <id>` | Hide a session from default lists |
 | `mu session unarchive --session <id>` | Restore an archived session to default lists |
 | `mu compact --session <id>` | Force compaction |
-| `mu web [--socket /run/mu-web/mu-web.sock]` | Serve the local browser UI on a Unix socket |
 
 Prompt-file mode accepts the same turn options as stdin mode. Put the prompt
 file last, for example `mu --output plain --model openai/gpt-5:high prompt.md`.
@@ -118,19 +119,21 @@ same working directory as the invoking shell.
 
 ## Web UI
 
-`mu web` serves the local browser UI from the same `mu` binary. It listens on a
-Unix domain socket only; it does not implement browser-facing auth, cookies,
-OAuth, RBAC, CORS, or a TCP listener. Put nginx or another trusted reverse proxy
-in front of it for TLS and authentication.
+The browser UI is a standalone Node service in `web/`. It listens on a Unix
+domain socket only; it does not implement browser-facing auth, cookies, OAuth,
+RBAC, CORS, or a documented TCP listener. Put nginx or another trusted reverse
+proxy in front of it for TLS and authentication.
 
 ```bash
-mu web --socket /run/mu-web/mu-web.sock --socket-mode 0660
+npm --prefix web start -- --socket /run/mu-web/mu-web.sock --socket-mode 0660 --mu-exe /path/to/mu
 ```
 
 The default socket is `/run/mu-web/mu-web.sock` with private `0600`
-permissions. Use `--socket-mode 0660` when the reverse proxy connects through a
-shared group. Streaming turn responses set `X-Accel-Buffering: no`, so nginx
-locations proxying this socket should also disable buffering and caching.
+permissions. Set `MU_WEB_MU_EXE` or pass `--mu-exe` when the `mu` binary is not
+already on `PATH`. Streaming turn responses set `X-Accel-Buffering: no`, so
+nginx locations proxying this socket should also disable buffering and caching.
+The browser-side e2e suite also lives in `web/` and can be run with
+`npm --prefix web run test:e2e`.
 
 ## Config
 

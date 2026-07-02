@@ -7,10 +7,11 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const repoRoot = path.resolve(__dirname, "..", "..");
+const repoRoot = path.resolve(__dirname, "..", "..", "..");
 const fixtureProject = path.join(repoRoot, "testing", "fixtures", "project");
 const fixtureGlobalMu = path.join(repoRoot, "testing", ".mu");
 const muBinary = path.join(repoRoot, "target", "debug", "mu");
+const webServer = path.join(repoRoot, "web", "server.mjs");
 const debug = process.env.MU_WEB_E2E_DEBUG === "1";
 
 function delay(ms) {
@@ -221,8 +222,8 @@ export async function startHarness() {
   await writeFile(path.join(globalDir, "config.jsonc"), configBody);
 
   const socketPath = path.join(runRoot, "mu-web.sock");
-  log("starting mu web", socketPath);
-  const mu = spawn(muBinary, ["web", "--socket", socketPath], {
+  log("starting web server", socketPath);
+  const mu = spawn(process.execPath, [webServer, "--socket", socketPath, "--mu-exe", muBinary], {
     cwd: projectDir,
     env,
     stdio: ["ignore", "pipe", "pipe"],
