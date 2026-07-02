@@ -154,9 +154,6 @@ pub fn build_status_report(
     include_models: bool,
 ) -> Result<StatusReport> {
     let resolved = resolve_invocation(store, config, overrides)?;
-    if let Some(session) = resolved.attached_session.as_ref() {
-        store.reconcile_pending_turn(&session.id)?;
-    }
     let model_info = resolve_model_info(config, &resolved.request.model);
     let session_summary = resolved
         .attached_session
@@ -167,18 +164,27 @@ pub fn build_status_report(
     let active = resolved
         .attached_session
         .as_ref()
-        .is_some_and(|session| crate::store::is_session_busy(&session.id));
+        .is_some_and(|session| store.is_session_busy(&session.id));
     let incomplete_turn = resolved
         .attached_session
         .as_ref()
         .map(|session| {
             store.pending_turn(&session.id).map(|pending| {
-                pending
-                    .filter(|pending| pending.state == crate::store::PendingState::Incomplete)
-                    .map(|pending| IncompleteTurnStatus {
+                pending.and_then(|pending| match pending.state {
+                    crate::store::PendingState::Incomplete => Some(IncompleteTurnStatus {
                         retry_count: pending.retry_count,
                         error_message: pending.error_message,
-                    })
+                    }),
+                    crate::store::PendingState::Running if !active => Some(IncompleteTurnStatus {
+                        retry_count: pending.retry_count,
+                        error_message: Some(
+                            pending
+                                .error_message
+                                .unwrap_or_else(|| "previous turn was interrupted".to_string()),
+                        ),
+                    }),
+                    crate::store::PendingState::Running => None,
+                })
             })
         })
         .transpose()?
@@ -452,5 +458,52 @@ mod tests {
             incomplete.error_message.as_deref(),
             Some("previous turn was interrupted")
         );
+    }
+
+    #[test]
+    fn status_report_surfaces_stale_running_turn_without_mutating_history() {
+        let store = Store::open_memory().unwrap();
+        let session = store
+            .create_session_with_origin(
+                "/tmp",
+                "alpha/default-model:high",
+                crate::store::SessionOrigin::Cli,
+            )
+            .unwrap();
+        store
+            .begin_pending_turn(
+                &session.id,
+                &crate::provider::UserContent::Text("retry".into()),
+            )
+            .unwrap();
+        let before = store.session_summary(&session.id).unwrap().unwrap();
+
+        let report = build_status_report(
+            &store,
+            &test_config(),
+            &InvocationOverrides {
+                session: Some(session.id.clone()),
+                continue_latest: false,
+                model: None,
+            },
+            None,
+            false,
+        )
+        .unwrap();
+
+        assert!(!report.active.busy);
+        let incomplete = report.incomplete_turn.expect("incomplete turn");
+        assert_eq!(incomplete.retry_count, 0);
+        assert_eq!(
+            incomplete.error_message.as_deref(),
+            Some("previous turn was interrupted")
+        );
+
+        let pending = store.pending_turn(&session.id).unwrap().unwrap();
+        assert_eq!(pending.state, crate::store::PendingState::Running);
+
+        let after = store.session_summary(&session.id).unwrap().unwrap();
+        assert_eq!(after.message_count, before.message_count);
+        assert_eq!(after.turn_count, before.turn_count);
     }
 }

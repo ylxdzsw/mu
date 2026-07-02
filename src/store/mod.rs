@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
 use fs2::FileExt;
@@ -169,19 +169,24 @@ pub struct ReviewRecord<'a> {
 
 pub struct Store {
     conn: Connection,
+    lock_dir: PathBuf,
 }
 
 impl Store {
     pub fn open(path: &Path) -> Result<Self> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
+        let state_dir = path
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("session database path must have a parent directory"))?;
+        std::fs::create_dir_all(state_dir)?;
         let conn = Connection::open(path).context("opening SQLite database")?;
         conn.execute_batch(
             "PRAGMA journal_mode=WAL;
              PRAGMA busy_timeout=5000;",
         )?;
-        let store = Self { conn };
+        let store = Self {
+            conn,
+            lock_dir: state_dir.join("locks"),
+        };
         store.migrate()?;
         Ok(store)
     }
@@ -192,7 +197,10 @@ impl Store {
             "PRAGMA journal_mode=WAL;
              PRAGMA busy_timeout=5000;",
         )?;
-        let store = Self { conn };
+        let store = Self {
+            conn,
+            lock_dir: std::env::temp_dir().join(format!("mu-memory-locks-{}", Uuid::new_v4())),
+        };
         store.migrate()?;
         Ok(store)
     }
@@ -570,11 +578,15 @@ impl Store {
         Ok(row.flatten())
     }
 
-    pub fn reconcile_pending_turn(&self, session_id: &str) -> Result<Option<PendingTurn>> {
+    pub fn reconcile_pending_turn_locked(
+        &self,
+        _lock: &SessionLock,
+        session_id: &str,
+    ) -> Result<Option<PendingTurn>> {
         let Some(pending) = self.pending_turn(session_id)? else {
             return Ok(None);
         };
-        if pending.state != PendingState::Running || is_session_busy(session_id) {
+        if pending.state != PendingState::Running {
             return Ok(Some(pending));
         }
 
@@ -961,18 +973,11 @@ impl Store {
         Ok(row)
     }
 
-    pub fn next_seq(&self, session_id: &str) -> Result<i64> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT COALESCE(MAX(seq), -1) + 1 FROM message WHERE session_id = ?1")?;
-        let seq: i64 = stmt.query_row(params![session_id], |row| row.get(0))?;
-        Ok(seq)
-    }
-
     pub fn append_message(&self, session_id: &str, message: &Message) -> Result<i64> {
         let now = chrono::Utc::now().to_rfc3339();
-        insert_message(&self.conn, session_id, message, &now)?;
-        let id = self.conn.last_insert_rowid();
+        let tx = self.conn.unchecked_transaction()?;
+        let id = insert_message_in(&tx, session_id, message, &now)?;
+        tx.commit()?;
         Ok(id)
     }
 
@@ -997,12 +1002,14 @@ impl Store {
     }
 
     pub fn append_summary(&self, session_id: &str, content: &str) -> Result<()> {
-        let seq = self.next_seq(session_id)?;
         let now = chrono::Utc::now().to_rfc3339();
-        self.conn.execute(
+        let tx = self.conn.unchecked_transaction()?;
+        let seq = next_seq_in(&tx, session_id)?;
+        tx.execute(
             "INSERT INTO message (session_id, role, content, seq, created_at) VALUES (?1, 'summary', ?2, ?3, ?4)",
             params![session_id, content, seq, now],
         )?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -1174,40 +1181,39 @@ impl Store {
         )?;
         Ok(())
     }
+    pub fn acquire_session_lock(&self, session_id: &str) -> Result<SessionLock> {
+        crate::paths::ensure_dir(&self.lock_dir)?;
+        let lock_path = self.session_lock_path(session_id);
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(&lock_path)
+            .context("opening session lock file")?;
+        file.try_lock_exclusive()
+            .map_err(|_| anyhow::anyhow!("session busy"))?;
+        Ok(SessionLock { _file: file })
+    }
+
+    pub fn is_session_busy(&self, session_id: &str) -> bool {
+        let lock_path = self.session_lock_path(session_id);
+        if !lock_path.exists() {
+            return false;
+        }
+        let Ok(file) = std::fs::OpenOptions::new().write(true).open(&lock_path) else {
+            return true;
+        };
+        file.try_lock_exclusive().is_err()
+    }
+
+    fn session_lock_path(&self, session_id: &str) -> PathBuf {
+        self.lock_dir.join(format!("{session_id}.lock"))
+    }
 }
 
+#[derive(Debug)]
 pub struct SessionLock {
     _file: std::fs::File,
-}
-
-pub fn acquire_session_lock(session_id: &str) -> Result<SessionLock> {
-    let lock_path = session_lock_path(session_id)?;
-    let file = std::fs::OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(false)
-        .open(&lock_path)
-        .context("opening session lock file")?;
-    file.try_lock_exclusive()
-        .map_err(|_| anyhow::anyhow!("session busy"))?;
-    Ok(SessionLock { _file: file })
-}
-
-pub fn is_session_busy(session_id: &str) -> bool {
-    let lock_path = crate::paths::runtime_dir().join(format!("{session_id}.lock"));
-    if !lock_path.exists() {
-        return false;
-    }
-    let Ok(file) = std::fs::OpenOptions::new().write(true).open(&lock_path) else {
-        return true;
-    };
-    file.try_lock_exclusive().is_err()
-}
-
-pub fn session_lock_path(session_id: &str) -> Result<std::path::PathBuf> {
-    let lock_dir = crate::paths::runtime_dir();
-    crate::paths::ensure_dir(&lock_dir)?;
-    Ok(lock_dir.join(format!("{session_id}.lock")))
 }
 
 pub fn write_session_id(path: &Path, id: &str) -> Result<()> {
@@ -1247,55 +1253,6 @@ fn next_seq_in(tx: &rusqlite::Transaction<'_>, session_id: &str) -> Result<i64> 
         tx.prepare("SELECT COALESCE(MAX(seq), -1) + 1 FROM message WHERE session_id = ?1")?;
     let seq: i64 = stmt.query_row(params![session_id], |row| row.get::<_, i64>(0))?;
     Ok(seq)
-}
-
-fn insert_message(conn: &Connection, session_id: &str, message: &Message, now: &str) -> Result<()> {
-    let seq = {
-        let mut stmt =
-            conn.prepare("SELECT COALESCE(MAX(seq), -1) + 1 FROM message WHERE session_id = ?1")?;
-        stmt.query_row(params![session_id], |row| row.get::<_, i64>(0))?
-    };
-    match message {
-        Message::User { content } => {
-            let user_content_json = serde_json::to_string(content)?;
-            conn.execute(
-                "INSERT INTO message (session_id, role, content, user_content_json, seq, created_at)
-                 VALUES (?1, 'user', ?2, ?3, ?4, ?5)",
-                params![session_id, content.text(), user_content_json, seq, now],
-            )?;
-        }
-        Message::Assistant {
-            content,
-            tool_calls,
-        } => {
-            let tc_json = tool_calls.as_ref().map(serde_json::to_string).transpose()?;
-            conn.execute(
-                "INSERT INTO message (session_id, role, content, tool_calls_json, seq, created_at)
-                 VALUES (?1, 'assistant', ?2, ?3, ?4, ?5)",
-                params![
-                    session_id,
-                    content.as_deref().unwrap_or(""),
-                    tc_json,
-                    seq,
-                    now
-                ],
-            )?;
-        }
-        Message::Tool {
-            content,
-            tool_call_id,
-        } => {
-            conn.execute(
-                "INSERT INTO message (session_id, role, content, tool_call_id, seq, created_at)
-                 VALUES (?1, 'tool', ?2, ?3, ?4, ?5)",
-                params![session_id, content, tool_call_id, seq, now],
-            )?;
-        }
-        Message::System { .. } => {
-            bail!("system messages are not persisted directly");
-        }
-    }
-    Ok(())
 }
 
 fn insert_message_in(
@@ -1606,7 +1563,11 @@ mod tests {
             )
             .unwrap();
 
-        let pending = store.reconcile_pending_turn(&session.id).unwrap().unwrap();
+        let lock = store.acquire_session_lock(&session.id).unwrap();
+        let pending = store
+            .reconcile_pending_turn_locked(&lock, &session.id)
+            .unwrap()
+            .unwrap();
         assert_eq!(pending.state, PendingState::Incomplete);
         assert_eq!(pending.prompt_message_id, prompt_id);
         assert_eq!(
@@ -1635,6 +1596,21 @@ mod tests {
                 "error: interrupted before tool result was completed".into(),
             )
         );
+        let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    #[test]
+    fn session_lock_contends_across_store_handles_for_same_db() {
+        let (store, tmp) = temp_store();
+        let session = store.create_session("/tmp", "fake-model").unwrap();
+        let second = Store::open(&tmp.join("mu.db")).unwrap();
+
+        let _lock = store.acquire_session_lock(&session.id).unwrap();
+
+        assert!(second.is_session_busy(&session.id));
+        let err = second.acquire_session_lock(&session.id).unwrap_err();
+        assert!(err.to_string().contains("session busy"));
+
         let _ = std::fs::remove_dir_all(tmp);
     }
 }

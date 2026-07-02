@@ -88,13 +88,6 @@ pub fn global_dir() -> PathBuf {
     dirs_home().join(".mu")
 }
 
-pub fn runtime_dir() -> PathBuf {
-    if let Ok(dir) = std::env::var("XDG_RUNTIME_DIR") {
-        return PathBuf::from(dir).join("mu");
-    }
-    std::env::temp_dir().join("mu")
-}
-
 fn dirs_home() -> PathBuf {
     std::env::var("HOME")
         .map(PathBuf::from)
@@ -188,7 +181,7 @@ fn project_marker_name(marker: ProjectMarker) -> &'static str {
 const PROJECT_CONFIG_TEMPLATE: &str =
     "{\n  // Optional project-local overrides merged over ~/.mu/config.jsonc.\n}\n";
 
-const STATE_GITIGNORE: &str = ".env\nsessions.db\nsessions.db-*\n*.db\n*.db-*\n";
+const STATE_GITIGNORE: &str = ".env\nsessions.db\nsessions.db-*\nlocks/\n*.db\n*.db-*\n";
 
 fn git_worktree_info(root: &Path) -> Option<GitWorktreeInfo> {
     let dot_git = root.join(".git");

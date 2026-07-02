@@ -405,7 +405,15 @@ async fn run() -> Result<()> {
             let store = store::Store::open(&db_path)?;
             let session = resolve_retry_session(&store, &retry_args)?
                 .ok_or_else(|| anyhow::anyhow!("no sessions found in active scope"))?;
-            store.reconcile_pending_turn(&session.id)?;
+            let _lock = match store.acquire_session_lock(&session.id) {
+                Ok(lock) => lock,
+                Err(_) => {
+                    eprintln!("session busy");
+                    process::exit(2);
+                }
+            };
+
+            store.reconcile_pending_turn_locked(&_lock, &session.id)?;
             let pending = store
                 .pending_turn(&session.id)?
                 .ok_or_else(|| anyhow::anyhow!("latest session has no incomplete turn to retry"))?;
@@ -422,14 +430,6 @@ async fn run() -> Result<()> {
             };
             let model_info = models::resolve_model_info(&config, &request.model);
             let provider = build_provider(&config, &request.model.provider_id)?;
-
-            let _lock = match store::acquire_session_lock(&session.id) {
-                Ok(lock) => lock,
-                Err(_) => {
-                    eprintln!("session busy");
-                    process::exit(2);
-                }
-            };
 
             store.resume_pending_turn(&session.id)?;
             let retry_count = store.increment_pending_retry_count(&session.id)?;
@@ -469,7 +469,7 @@ async fn run() -> Result<()> {
                 model: models::resolve_model_ref(&config, &session_state.model)?,
             };
             let provider = build_provider(&config, &request.model.provider_id)?;
-            let _lock = match store::acquire_session_lock(&session) {
+            let _lock = match store.acquire_session_lock(&session) {
                 Ok(lock) => lock,
                 Err(_) => {
                     eprintln!("session busy");
@@ -546,15 +546,15 @@ async fn run_turn_from_source(
     };
     let session_id = session.id.clone();
 
-    store.reconcile_pending_turn(&session_id)?;
-
-    let _lock = match store::acquire_session_lock(&session_id) {
+    let _lock = match store.acquire_session_lock(&session_id) {
         Ok(lock) => lock,
         Err(_) => {
             eprintln!("session busy");
             process::exit(2);
         }
     };
+
+    store.reconcile_pending_turn_locked(&_lock, &session_id)?;
 
     if let Some(pending) = store.pending_turn(&session_id)? {
         let reason = pending

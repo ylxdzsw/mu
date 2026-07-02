@@ -1268,9 +1268,10 @@ lock for its duration; a second `mu` targeting the same session finds it held
 and **fails fast** with a "session busy" message rather than interleaving
 writes.
 
-The lock is an advisory `flock` on a per-session lock file under
-`$XDG_RUNTIME_DIR/mu/` (one file per session id), acquired in lifecycle step 5
-before any DB writes. This is deliberately *not* a SQLite-level lock:
+The lock is an advisory `flock` on a per-session lock file under the active
+state directory's `locks/` folder (for example `<project>/.mu/locks/` or
+`~/.mu/locks/`), acquired in lifecycle step 5 before any DB writes. This is
+deliberately *not* a SQLite-level lock:
 `BEGIN IMMEDIATE` takes a reserved lock on the **whole database file**, which
 would serialize unrelated sessions against each other. A per-session `flock`
 lets different sessions proceed independently.
