@@ -418,5 +418,105 @@ fn next_event_boundary(buffer: &str) -> Option<(usize, usize)> {
 }
 
 #[cfg(test)]
-#[path = "openai_tests.rs"]
-mod tests;
+mod tests {
+    use super::*;
+    use crate::models::{EffortLevel, ResolvedModelRef};
+
+    fn test_model(effort: Option<EffortLevel>) -> ResolvedModelRef {
+        ResolvedModelRef {
+            canonical: match effort {
+                Some(level) => format!("test/gpt-test:{level}"),
+                None => "test/gpt-test".into(),
+            },
+            provider_id: "test".into(),
+            model_id: "gpt-test".into(),
+            effort,
+        }
+    }
+
+    #[test]
+    fn streams_deltas_and_accumulates_tool_calls() {
+        let mut seen = String::new();
+        let mut tool_call_starts = 0usize;
+        let mut on_event = |event: StreamEvent| -> Result<(), ProviderError> {
+            match event {
+                StreamEvent::TextDelta(delta) => seen.push_str(&delta),
+                StreamEvent::ToolCallStart => tool_call_starts += 1,
+                _ => {}
+            }
+            Ok(())
+        };
+
+        let mut buffer = String::new();
+        let mut state = StreamParseState::default();
+
+        for chunk in [
+            "data: {\"choices\":[{\"delta\":{\"content\":\"hel\"},\"finish_reason\":null}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"lo\",\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"read\",\"arguments\":\"{\\\"path\\\":\"}}]},\"finish_reason\":null}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"\\\"/tmp/x\\\"}\"}}]},\"finish_reason\":\"tool_calls\"}],\"usage\":{\"prompt_tokens\":12,\"completion_tokens\":5,\"total_tokens\":17,\"prompt_tokens_details\":{\"cached_tokens\":3,\"cache_creation_tokens\":2},\"completion_tokens_details\":{\"reasoning_tokens\":4}}}\n\n",
+            "data: [DONE]\n\n",
+        ] {
+            buffer.push_str(chunk);
+            consume_sse_buffer(&mut buffer, &mut state, &mut on_event).unwrap();
+        }
+
+        assert_eq!(seen, "hello");
+        assert_eq!(tool_call_starts, 1);
+        assert_eq!(state.content, "hello");
+        assert_eq!(state.finish_reason, FinishReason::ToolCalls);
+        assert_eq!(state.usage.unwrap().total_tokens, 17);
+    }
+
+    #[test]
+    fn reasoning_content_emits_start_delta_and_end() {
+        let mut seen_events = Vec::new();
+        let mut on_event = |event: StreamEvent| -> Result<(), ProviderError> {
+            match event {
+                StreamEvent::ReasoningStart => seen_events.push("reasoning_start".to_string()),
+                StreamEvent::ReasoningDelta(text) => {
+                    seen_events.push(format!("reasoning_delta:{text}"))
+                }
+                StreamEvent::ReasoningEnd => seen_events.push("reasoning_end".to_string()),
+                StreamEvent::TextDelta(text) => seen_events.push(format!("text:{text}")),
+                StreamEvent::ToolCallStart | StreamEvent::Tick => {}
+            }
+            Ok(())
+        };
+
+        let mut buffer = String::new();
+        let mut state = StreamParseState::default();
+
+        for chunk in [
+            "data: {\"choices\":[{\"delta\":{\"reasoning_content\":[{\"type\":\"reasoning_text\",\"text\":\"step 1\"}]},\"finish_reason\":null}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"done\"},\"finish_reason\":\"stop\"}]}\n\n",
+            "data: [DONE]\n\n",
+        ] {
+            buffer.push_str(chunk);
+            consume_sse_buffer(&mut buffer, &mut state, &mut on_event).unwrap();
+        }
+
+        assert_eq!(
+            seen_events,
+            vec![
+                "reasoning_start".to_string(),
+                "reasoning_delta:step 1".to_string(),
+                "reasoning_end".to_string(),
+                "text:done".to_string(),
+            ]
+        );
+        assert!(!state.reasoning_active);
+    }
+
+    #[test]
+    fn request_includes_reasoning_effort_when_set() {
+        let body = build_chat_request_body(
+            &RequestOptions {
+                model: test_model(Some(EffortLevel::High)),
+            },
+            &[],
+            &[],
+        );
+
+        assert_eq!(body["reasoning"]["effort"], "high");
+    }
+}

@@ -77,20 +77,6 @@ pub struct SessionSummary {
     pub turn_count: u64,
 }
 
-#[derive(Debug, Clone, Serialize)]
-pub struct TurnUsage {
-    pub id: i64,
-    pub session_id: String,
-    pub model: String,
-    pub input_tokens: u64,
-    pub cache_read_input_tokens: u64,
-    pub cache_write_input_tokens: u64,
-    pub output_tokens: u64,
-    pub reasoning_output_tokens: u64,
-    pub total_tokens: u64,
-    pub created_at: String,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PendingState {
@@ -629,33 +615,6 @@ impl Store {
         )?;
         tx.commit()?;
         Ok(())
-    }
-
-    pub fn turn_usage(&self, session_id: &str) -> Result<Vec<TurnUsage>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id, session_id, model, input_tokens, cache_read_input_tokens,
-                    cache_write_input_tokens, output_tokens, reasoning_output_tokens,
-                    total_tokens, created_at
-             FROM turn_usage
-             WHERE session_id = ?1
-             ORDER BY id ASC",
-        )?;
-        let rows = stmt.query_map(params![session_id], |row| {
-            Ok(TurnUsage {
-                id: row.get(0)?,
-                session_id: row.get(1)?,
-                model: row.get(2)?,
-                input_tokens: row.get::<_, i64>(3)? as u64,
-                cache_read_input_tokens: row.get::<_, i64>(4)? as u64,
-                cache_write_input_tokens: row.get::<_, i64>(5)? as u64,
-                output_tokens: row.get::<_, i64>(6)? as u64,
-                reasoning_output_tokens: row.get::<_, i64>(7)? as u64,
-                total_tokens: row.get::<_, i64>(8)? as u64,
-                created_at: row.get(9)?,
-            })
-        })?;
-        rows.collect::<rusqlite::Result<Vec<_>>>()
-            .context("loading turn usage")
     }
 
     pub fn update_session_cwd(&self, id: &str, cwd: &str) -> Result<()> {
@@ -1458,4 +1417,180 @@ fn parse_origin(value: String) -> rusqlite::Result<SessionOrigin> {
 }
 
 #[cfg(test)]
-mod tests;
+mod tests {
+    use super::*;
+    use crate::provider::{ContentPart, FunctionCall, ImageUrl, ToolCall};
+
+    fn temp_store() -> (Store, std::path::PathBuf) {
+        let tmp = std::env::temp_dir().join(format!("mu-store-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        (Store::open(&tmp.join("mu.db")).unwrap(), tmp)
+    }
+
+    #[test]
+    fn reloads_full_user_content_with_images() {
+        let (store, tmp) = temp_store();
+        let session = store.create_session("/tmp", "fake-model").unwrap();
+        let expected_image_url = "data:image/png;base64,abcd".to_string();
+
+        store
+            .append_message(
+                &session.id,
+                &Message::User {
+                    content: UserContent::Parts(vec![
+                        ContentPart::Text {
+                            text: "describe this".to_string(),
+                        },
+                        ContentPart::ImageUrl {
+                            image_url: ImageUrl {
+                                url: expected_image_url.clone(),
+                            },
+                        },
+                    ]),
+                },
+            )
+            .unwrap();
+
+        let messages = store.load_context_messages(&session.id).unwrap();
+        let Message::User {
+            content: UserContent::Parts(parts),
+        } = &messages[0]
+        else {
+            panic!("expected user parts");
+        };
+
+        assert!(matches!(
+            &parts[0],
+            ContentPart::Text { text } if text == "describe this"
+        ));
+        assert!(matches!(
+            &parts[1],
+            ContentPart::ImageUrl { image_url } if image_url.url == expected_image_url
+        ));
+
+        let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    #[test]
+    fn list_sessions_defaults_to_cli_origin_and_skips_archived() {
+        let (store, tmp) = temp_store();
+        let cli = store.create_session("/tmp", "cli-model").unwrap();
+        let web = store
+            .create_session_with_origin("/tmp", "web-model", SessionOrigin::Web)
+            .unwrap();
+        let archived = store.create_session("/tmp", "archived-model").unwrap();
+        store.set_session_archived(&archived.id, true).unwrap();
+
+        let sessions = store.list_sessions(20).unwrap();
+
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].0.id, cli.id);
+        assert_eq!(sessions[0].0.origin, SessionOrigin::Cli);
+        assert!(!sessions[0].0.archived);
+
+        let web_sessions = store
+            .list_sessions_by_origin(SessionOrigin::Web, 20)
+            .unwrap();
+        assert_eq!(web_sessions.len(), 1);
+        assert_eq!(web_sessions[0].0.id, web.id);
+        let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    #[test]
+    fn reconcile_pending_turn_synthesizes_missing_tool_results() {
+        let (store, tmp) = temp_store();
+        let session = store.create_session("/tmp", "fake-model").unwrap();
+
+        store
+            .append_message(
+                &session.id,
+                &Message::User {
+                    content: UserContent::Text("seed".into()),
+                },
+            )
+            .unwrap();
+        let prompt_id = store
+            .begin_pending_turn(&session.id, &UserContent::Text("run".into()))
+            .unwrap();
+        let assistant_id = store
+            .advance_pending_checkpoint_with_message(
+                &session.id,
+                &Message::Assistant {
+                    content: None,
+                    tool_calls: Some(vec![
+                        ToolCall {
+                            id: "call-a".into(),
+                            call_type: "function".into(),
+                            function: FunctionCall {
+                                name: "bash".into(),
+                                arguments:
+                                    "{\"title\":\"a\",\"risk\":\"readonly\",\"script\":\"echo a\"}"
+                                        .into(),
+                            },
+                        },
+                        ToolCall {
+                            id: "call-b".into(),
+                            call_type: "function".into(),
+                            function: FunctionCall {
+                                name: "bash".into(),
+                                arguments:
+                                    "{\"title\":\"b\",\"risk\":\"readonly\",\"script\":\"echo b\"}"
+                                        .into(),
+                            },
+                        },
+                    ]),
+                },
+            )
+            .unwrap();
+        store
+            .persist_tool_result(
+                &session.id,
+                ToolCallRecord {
+                    message_id: assistant_id,
+                    id: "call-a",
+                    tool: "bash",
+                    args: "{\"title\":\"a\",\"risk\":\"readonly\",\"script\":\"echo a\"}",
+                    risk: Some("readonly"),
+                    output: "a",
+                    status: "ok",
+                },
+                "a",
+            )
+            .unwrap();
+
+        let lock = store.acquire_session_lock(&session.id).unwrap();
+        let pending = store
+            .reconcile_pending_turn_locked(&lock, &session.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(pending.state, PendingState::Incomplete);
+        assert_eq!(pending.prompt_message_id, prompt_id);
+        assert_eq!(
+            pending.error_message.as_deref(),
+            Some("previous turn was interrupted")
+        );
+
+        let tool_messages = store
+            .load_context_messages(&session.id)
+            .unwrap()
+            .into_iter()
+            .filter_map(|message| match message {
+                Message::Tool {
+                    tool_call_id,
+                    content,
+                } => Some((tool_call_id, content)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(tool_messages.len(), 2);
+        assert_eq!(tool_messages[0], ("call-a".into(), "a".into()));
+        assert_eq!(
+            tool_messages[1],
+            (
+                "call-b".into(),
+                "error: interrupted before tool result was completed".into(),
+            )
+        );
+        let _ = std::fs::remove_dir_all(tmp);
+    }
+}

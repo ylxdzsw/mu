@@ -347,5 +347,41 @@ pub fn parse_assessment(text: &str) -> anyhow::Result<super::Assessment> {
 }
 
 #[cfg(test)]
-#[path = "prompt_tests.rs"]
-mod tests;
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_assessment_with_prose_wrapper() {
+        let text = "Here is my assessment:\n{\"risk_level\":\"low\",\"user_auth_level\":\"unknown\",\"reason\":\"safe\"}\nDone.";
+        let a = parse_assessment(text).unwrap();
+        assert_eq!(a.risk_level, RiskLevel::Low);
+        assert_eq!(a.user_auth_level, UserAuthLevel::Unknown);
+        assert!(a.is_allowed());
+    }
+
+    #[test]
+    fn build_user_content_includes_transcript_and_action() {
+        let context = vec![
+            Message::User {
+                content: "delete the database".into(),
+            },
+            Message::Assistant {
+                content: Some("I'll run rm".into()),
+                tool_calls: None,
+            },
+        ];
+        let action = serde_json::json!({
+            "tool": "bash",
+            "script": "rm -rf /data",
+            "risk": "destructive"
+        });
+
+        let content = build_reviewer_user_content(&context, &action);
+        assert!(content.contains(">>> TRANSCRIPT START"));
+        assert!(content.contains("delete the database"));
+        assert!(content.contains(">>> TRANSCRIPT END"));
+        assert!(content.contains(">>> APPROVAL REQUEST START"));
+        assert!(content.contains("rm -rf /data"));
+        assert!(content.contains(">>> APPROVAL REQUEST END"));
+    }
+}

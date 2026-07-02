@@ -213,5 +213,46 @@ fn absolutize(base: &Path, path: &Path) -> PathBuf {
 }
 
 #[cfg(test)]
-#[path = "paths_tests.rs"]
-mod tests;
+mod tests {
+    use super::*;
+
+    #[test]
+    fn discovers_nearest_mu_project_without_creating_files() {
+        let root = std::env::temp_dir().join(format!("mu-paths-{}", uuid::Uuid::new_v4()));
+        let nested = root.join("a/b");
+        std::fs::create_dir_all(root.join(".mu")).unwrap();
+        std::fs::create_dir_all(&nested).unwrap();
+
+        let project = discover_project(&nested).unwrap();
+        assert_eq!(project.root, root);
+        assert_eq!(project.marker, ProjectMarker::Mu);
+    }
+
+    #[test]
+    fn init_project_layout_at_creates_minimal_scaffold() {
+        let root = std::env::temp_dir().join(format!("mu-layout-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+
+        let result = init_project_layout_at(&root, true).unwrap();
+
+        let state_dir = root.join(".mu");
+        assert_eq!(result.root, root);
+        assert_eq!(
+            result.created_files,
+            vec![".mu/", ".mu/config.jsonc", ".mu/.gitignore"]
+        );
+        assert!(!result.already_initialized);
+        assert!(state_dir.is_dir());
+        assert_eq!(
+            std::fs::read_to_string(state_dir.join("config.jsonc")).unwrap(),
+            PROJECT_CONFIG_TEMPLATE
+        );
+        assert_eq!(
+            std::fs::read_to_string(state_dir.join(".gitignore")).unwrap(),
+            STATE_GITIGNORE
+        );
+        assert!(!state_dir.join("skills").exists());
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+}

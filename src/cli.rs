@@ -166,5 +166,40 @@ pub enum SessionOriginArg {
 }
 
 #[cfg(test)]
-#[path = "cli_tests.rs"]
-mod tests;
+mod tests {
+    use std::path::PathBuf;
+
+    use clap::Parser;
+
+    use super::*;
+
+    #[test]
+    fn parses_prompt_file_with_turn_options() {
+        let args = Args::try_parse_from([
+            "mu",
+            "--output",
+            "plain",
+            "--model",
+            "gpt-test",
+            "-i",
+            "image.png",
+            "prompt.md",
+        ])
+        .unwrap();
+        assert_eq!(args.prompt_file, Some(PathBuf::from("prompt.md")));
+        assert!(args.command.is_none());
+        assert_eq!(args.turn.output, OutputFormat::Plain);
+        assert_eq!(args.turn.selection.model.as_deref(), Some("gpt-test"));
+        assert_eq!(args.turn.images, vec![PathBuf::from("image.png")]);
+    }
+
+    #[test]
+    fn exact_subcommand_names_take_priority_over_prompt_files() {
+        let args = Args::try_parse_from(["mu", "status", "--json"]).unwrap();
+        assert!(args.prompt_file.is_none());
+        match args.command {
+            Some(Command::Status(status)) => assert!(status.json),
+            other => panic!("expected status command, got {other:?}"),
+        }
+    }
+}

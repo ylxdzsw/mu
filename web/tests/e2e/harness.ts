@@ -17,10 +17,11 @@ export interface Harness {
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(__dirname, "..", "..", "..");
-const fixtureProject = path.join(repoRoot, "testing", "fixtures", "project");
-const fixtureGlobalMu = path.join(repoRoot, "testing", ".mu");
+const webRoot = path.join(repoRoot, "web");
+const fixtureProject = path.join(webRoot, "tests", "fixtures", "project");
+const fixtureGlobalMu = path.join(webRoot, "tests", "fixtures", "global", ".mu");
 const muBinary = path.join(repoRoot, "target", "debug", "mu");
-const webServer = path.join(repoRoot, "web", "server.ts");
+const webServer = path.join(webRoot, "server.ts");
 const debug = process.env.MU_WEB_E2E_DEBUG === "1";
 
 function delay(ms: number): Promise<void> {

@@ -896,5 +896,35 @@ fn base64_encode(bytes: &[u8]) -> String {
 }
 
 #[cfg(test)]
-#[path = "main_tests.rs"]
-mod tests;
+mod tests {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use super::*;
+
+    fn temp_file_path(name: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("mu-{name}-{nanos}.tmp"))
+    }
+
+    #[test]
+    fn load_prompt_file_trims_shebang_line() {
+        let path = temp_file_path("shebang");
+        std::fs::write(&path, "#!/usr/bin/env -S mu --output plain\nhello\n").unwrap();
+        let prompt = load_prompt(PromptSource::File(path.clone())).unwrap();
+        std::fs::remove_file(path).unwrap();
+        assert_eq!(prompt, "hello");
+    }
+
+    #[test]
+    fn load_prompt_file_reports_utf8_errors_with_path() {
+        let path = temp_file_path("invalid-utf8");
+        std::fs::write(&path, [0xff, 0xfe, 0xfd]).unwrap();
+        let err = load_prompt(PromptSource::File(path.clone())).unwrap_err();
+        std::fs::remove_file(&path).unwrap();
+        assert!(err.to_string().contains("reading prompt file"));
+        assert!(err.to_string().contains(path.to_string_lossy().as_ref()));
+    }
+}

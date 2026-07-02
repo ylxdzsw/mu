@@ -128,5 +128,14 @@ pub fn prune_truncation_spills(state_dir: &std::path::Path, retention_days: u64)
 }
 
 #[cfg(test)]
-#[path = "truncate_tests.rs"]
-mod tests;
+mod tests {
+    use super::truncate_line;
+
+    #[test]
+    fn truncate_line_respects_char_boundaries() {
+        let line = "héllo wörld ".repeat(20);
+        let out = truncate_line(&line, 25);
+        assert!(out.ends_with('…'));
+        assert!(out.len() <= 25 + '…'.len_utf8());
+    }
+}

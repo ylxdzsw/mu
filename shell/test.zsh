@@ -108,11 +108,11 @@ _mu_zsh_exit_mode
 [[ "$BUFFER" == "draft prompt" ]] || fail "mode exit path preserves shell buffer"
 
 saved_pwd=$PWD
-builtin cd "$root/tests"
+builtin cd "$root/shell"
 nested_prompt=$(_mu_zsh_build_mode_prompt)
 builtin cd "$saved_pwd"
 escaped_root=${root//\%/%%}
-nested_pwd=$root/tests
+nested_pwd=$root/shell
 escaped_nested_pwd=${nested_pwd//\%/%%}
 [[ "$nested_prompt" == *"%F{45}${escaped_nested_pwd}%f %F{141}(${escaped_root})%f"* ]] || fail "shows project root when cwd differs"
 

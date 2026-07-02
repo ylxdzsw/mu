@@ -1733,10 +1733,152 @@ fn format_turn_summary(input_tokens: u64, output_tokens: u64, context_pct: Optio
     format!("[mu] tokens: {input_tokens} in / {output_tokens} out  context: {ctx}")
 }
 
-#[cfg(test)]
-mod tests;
-
 struct LinePreview {
     rendered: String,
     raw_kept_bytes: usize,
+}
+
+#[cfg(test)]
+mod tests {
+    use std::os::fd::RawFd;
+    use std::sync::{Mutex, OnceLock};
+    use std::time::Duration;
+
+    use serde_json::json;
+
+    use super::*;
+
+    #[test]
+    fn markdown_renderer_handles_lists_and_tables() {
+        let rendered =
+            render_markdown("- one\n  - two\n\n| Name | Value |\n| --- | --- |\n| a | b |\n");
+        assert!(rendered.contains("• one"));
+        assert!(rendered.contains("• two"));
+        assert!(rendered.contains("| Name | Value |"));
+        assert!(rendered.contains("---"));
+        assert!(rendered.lines().any(|line| line.starts_with('|')
+            && line.ends_with('|')
+            && line.contains('a')
+            && line.contains('b')));
+    }
+
+    #[test]
+    fn bash_header_renders_title_and_risk_colored_script_without_risk_label() {
+        let header = format_bash_header("List files", "printf 'a'\npwd", Some("readonly"), true);
+        assert!(header.starts_with(&format!("{GRAY}# {RESET}{BOLD}List files{RESET}\n")));
+        assert!(header.contains(&format!("{DIM}${RESET} {CYAN}{BOLD}printf 'a'…{RESET}\n")));
+        assert!(!header.contains("  pwd\n"));
+        assert!(!header.contains("[readonly]"));
+    }
+
+    #[test]
+    fn terminal_trimming_only_removes_committed_line_suffixes() {
+        assert_eq!(
+            terminal_trim_committed_text("a  \n b\t\t\nc  "),
+            "a\n b\nc  "
+        );
+        assert_eq!(trim_final_tail_fragment("tail \t\n\n"), "tail");
+    }
+
+    #[test]
+    fn terminal_summary_leaves_a_blank_line_before_the_next_prompt() {
+        let raw = capture_renderer_pty_transcript(Duration::from_secs(12), Some("mu> "));
+        let normalized = strip_ansi(&raw.replace('\r', ""));
+
+        assert!(normalized.contains("[mu] tokens: 12 in / 5 out  context: 25%\n\nmu> "));
+        assert!(!normalized.contains("[mu] tokens: 12 in / 5 out  context: 25%\n\n\nmu> "));
+    }
+
+    fn capture_renderer_pty_transcript(
+        turn_elapsed: Duration,
+        trailing_prompt: Option<&str>,
+    ) -> String {
+        let _guard = pty_test_lock().lock().unwrap();
+        let mut master: RawFd = -1;
+        let mut slave: RawFd = -1;
+        unsafe {
+            assert_eq!(
+                libc::openpty(
+                    &mut master,
+                    &mut slave,
+                    std::ptr::null_mut(),
+                    std::ptr::null(),
+                    std::ptr::null(),
+                ),
+                0
+            );
+            let pid = libc::fork();
+            assert!(pid >= 0);
+            if pid == 0 {
+                libc::close(master);
+                assert_eq!(libc::dup2(slave, libc::STDOUT_FILENO), libc::STDOUT_FILENO);
+                assert_eq!(libc::dup2(slave, libc::STDERR_FILENO), libc::STDERR_FILENO);
+                if slave > libc::STDERR_FILENO {
+                    libc::close(slave);
+                }
+
+                let mut renderer = Renderer::with_format(OutputFormat::Terminal);
+                renderer.reasoning_start().unwrap();
+                renderer.reasoning_delta("plan").unwrap();
+                std::thread::sleep(Duration::from_millis(40));
+                renderer.reasoning_end(Some((12, 5))).unwrap();
+                renderer.tool_call_composition_start().unwrap();
+                renderer
+                    .tool_start(
+                        None,
+                        "bash",
+                        &json!({
+                            "title": "Stream demo",
+                            "risk": "readonly",
+                            "script": "printf 'line01\\nline02\\nline03\\n'",
+                        }),
+                    )
+                    .unwrap();
+                renderer
+                    .bash_output(None, "bash", "line01\nline02\nline03\n")
+                    .unwrap();
+                renderer
+                    .tool_finished(
+                        None,
+                        "bash",
+                        &ToolDisplay::Bash { exit_code: 0 },
+                        Duration::from_millis(250),
+                    )
+                    .unwrap();
+                renderer.finish_turn().unwrap();
+                renderer.turn_summary(12, 5, Some(25.0)).unwrap();
+                renderer.turn_done_bell(turn_elapsed).unwrap();
+                if let Some(prompt) = trailing_prompt {
+                    let bytes = prompt.as_bytes();
+                    assert_eq!(
+                        libc::write(libc::STDOUT_FILENO, bytes.as_ptr().cast(), bytes.len()),
+                        bytes.len() as isize
+                    );
+                }
+                libc::_exit(0);
+            }
+
+            libc::close(slave);
+            let mut out = Vec::new();
+            let mut buf = [0u8; 4096];
+            loop {
+                let n = libc::read(master, buf.as_mut_ptr().cast(), buf.len());
+                if n <= 0 {
+                    break;
+                }
+                out.extend_from_slice(&buf[..n as usize]);
+            }
+            libc::close(master);
+            let mut status = 0;
+            assert_eq!(libc::waitpid(pid, &mut status, 0), pid);
+            assert!(libc::WIFEXITED(status));
+            assert_eq!(libc::WEXITSTATUS(status), 0);
+            String::from_utf8_lossy(&out).into_owned()
+        }
+    }
+
+    fn pty_test_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
 }

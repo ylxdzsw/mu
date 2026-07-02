@@ -285,4 +285,73 @@ pub fn bash_risk(args: &Value) -> Option<String> {
 }
 
 #[cfg(test)]
-mod tests;
+mod tests {
+    use std::collections::VecDeque;
+
+    use serde_json::json;
+
+    use super::*;
+    use crate::config::CircuitBreakerConfig;
+
+    fn test_guardrail(consecutive: u32, window_denials: u32) -> Guardrail {
+        Guardrail {
+            config: GuardrailConfig {
+                enabled: true,
+                review_model: None,
+                timeout_ms: 1000,
+                circuit_breaker: CircuitBreakerConfig {
+                    consecutive,
+                    window: 50,
+                    window_denials,
+                },
+            },
+            runtime: Config {
+                providers: Default::default(),
+                default_model: String::new(),
+                compaction: crate::config::CompactionConfig::default(),
+                limits: crate::config::LimitsConfig::default(),
+                guardrail: GuardrailConfig::default(),
+                terminal_bell: crate::config::TerminalBellConfig::default(),
+                redaction: crate::config::RedactionConfig::default(),
+                env: Default::default(),
+            },
+            consecutive_denials: 0,
+            recent_denials: VecDeque::new(),
+            interrupt_triggered: false,
+        }
+    }
+
+    #[test]
+    fn circuit_breaker_trips_on_consecutive_denials() {
+        let mut g = test_guardrail(3, 10);
+        g.record_denial();
+        g.record_denial();
+        g.record_denial();
+        let trip = g.circuit_breaker_tripped().unwrap();
+        assert_eq!(trip.0, 3);
+    }
+
+    #[test]
+    fn should_review_only_destructive_when_enabled() {
+        let g = test_guardrail(3, 10);
+        assert!(g.should_review("destructive"));
+        assert!(!g.should_review("reversible"));
+        assert!(!g.should_review("readonly"));
+    }
+
+    #[test]
+    fn bash_risk_valid_values() {
+        assert_eq!(
+            bash_risk(&json!({"risk": "readonly"})),
+            Some("readonly".into())
+        );
+        assert_eq!(
+            bash_risk(&json!({"risk": "reversible"})),
+            Some("reversible".into())
+        );
+        assert_eq!(
+            bash_risk(&json!({"risk": "destructive"})),
+            Some("destructive".into())
+        );
+    }
+}
