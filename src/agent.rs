@@ -666,6 +666,7 @@ fn handle_tool_call_delta(
             .resize_with(delta.index + 1, StreamingToolPreview::default);
     }
     let preview = &mut previews.entries[delta.index];
+    let was_rendered = preview.rendered;
     if let Some(id) = delta.id {
         preview.id = Some(id);
     }
@@ -673,6 +674,9 @@ fn handle_tool_call_delta(
         preview.name = Some(name);
     }
     preview.arguments.push_str(&delta.arguments_delta);
+    if was_rendered {
+        return Ok(());
+    }
 
     let mut rendered_any = false;
     while previews.next_to_render < previews.entries.len() {
@@ -949,6 +953,44 @@ mod tests {
         assert_eq!(previews.next_to_render, 2);
         assert!(previews.entries[0].rendered);
         assert!(previews.entries[1].rendered);
+    }
+
+    #[test]
+    fn rendered_tool_preview_does_not_restart_composition_line() {
+        let mut renderer = Renderer::with_format(OutputFormat::Terminal);
+        renderer.force_styled_for_test();
+        let mut previews = StreamingToolPreviews::default();
+
+        handle_tool_call_delta(
+            &mut renderer,
+            &mut previews,
+            ToolCallDelta {
+                index: 0,
+                id: Some("call_1".into()),
+                name: Some("bash".into()),
+                arguments_delta:
+                    "{\"title\":\"List\",\"risk\":\"readonly\",\"script\":\"printf 'a'".into(),
+            },
+        )
+        .unwrap();
+        assert!(previews.entries[0].rendered);
+        assert!(!renderer.has_tool_composition_live_line_for_test());
+
+        handle_tool_call_delta(
+            &mut renderer,
+            &mut previews,
+            ToolCallDelta {
+                index: 0,
+                id: None,
+                name: None,
+                arguments_delta: "\\n'\"}".into(),
+            },
+        )
+        .unwrap();
+
+        assert!(previews.entries[0].rendered);
+        assert!(previews.entries[0].arguments.ends_with("\\n'\"}"));
+        assert!(!renderer.has_tool_composition_live_line_for_test());
     }
 
     #[tokio::test]

@@ -85,6 +85,16 @@ impl Renderer {
         self.format
     }
 
+    #[cfg(test)]
+    pub(crate) fn force_styled_for_test(&mut self) {
+        self.styled = true;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_tool_composition_live_line_for_test(&self) -> bool {
+        matches!(self.live_line, Some(LiveLine::ToolComposition))
+    }
+
     pub fn assistant_text(&mut self, text: &str) -> io::Result<()> {
         if text.is_empty() {
             return Ok(());
