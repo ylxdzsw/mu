@@ -28,7 +28,30 @@ export MU_ZSH_TEST_PROJECT_ROOT=$root
 cat > "$prompt_fake_bin/mu" <<'EOF'
 #!/usr/bin/env zsh
 if [[ "$1" == "status" ]]; then
-  print -r -- "{\"model_id\":\"prompt-test-model\",\"context_percent\":25.0,\"project_root\":\"$MU_ZSH_TEST_PROJECT_ROOT\"}"
+  model=prompt-test-model
+  include_models=0
+  while (( $# )); do
+    case "$1" in
+      --model)
+        shift
+        model=$1
+        ;;
+      --include-models)
+        include_models=1
+        ;;
+    esac
+    shift
+  done
+  [[ "$model" == invalid/* ]] && exit 1
+  if (( include_models )); then
+    print -r -- "{\"model_id\":\"$model\",\"context_percent\":25.0,\"project_root\":\"$MU_ZSH_TEST_PROJECT_ROOT\",\"available_models\":{\"providers\":[{\"id\":\"local\",\"models\":[{\"id\":\"local/solo\",\"model_id\":\"solo\",\"supported_efforts\":[\"max\"]},{\"id\":\"local/shared\",\"model_id\":\"shared\",\"supported_efforts\":[]}]},{\"id\":\"openai\",\"models\":[{\"id\":\"openai/gpt\",\"model_id\":\"gpt\",\"supported_efforts\":[\"low\",\"high\"]},{\"id\":\"openai/shared\",\"model_id\":\"shared\",\"supported_efforts\":[\"medium\"]}]}]}}"
+  else
+    print -r -- "{\"model_id\":\"$model\",\"context_percent\":25.0,\"project_root\":\"$MU_ZSH_TEST_PROJECT_ROOT\"}"
+  fi
+  exit 0
+fi
+if [[ "$1" == "retry" || "$1" == "compact" ]]; then
+  print -r -- "$*" >> "$MU_ZSH_FAKE_LOG"
   exit 0
 fi
 print -r -- "$*" >> "$MU_ZSH_FAKE_LOG"
@@ -157,13 +180,28 @@ _mu_zsh_clear_history_return
 MU_ZSH_BIN=mu
 MU_ZSH_OUTPUT=terminal
 MU_ZSH_SESSION_ID=abc123
+MU_ZSH_SESSION_SCOPE=$(_mu_zsh_current_scope_key)
 cmd=$(_mu_zsh_build_command)
 [[ "$cmd" == "mu --output terminal -s abc123" ]] || fail "builds attached command: $cmd"
 
 MU_ZSH_SESSION_ID=
+MU_ZSH_SESSION_SCOPE=
 cmd=$(_mu_zsh_build_command)
 [[ "$cmd" == "mu --output terminal" ]] || fail "builds new-session command: $cmd"
 MU_ZSH_BIN=$prompt_fake_bin/mu
+
+MU_ZSH_MODEL=openai/gpt
+MU_ZSH_MODEL_SCOPE=$(_mu_zsh_current_scope_key)
+cmd=$(_mu_zsh_build_command)
+[[ "$cmd" == "$prompt_fake_bin/mu --output terminal --model openai/gpt" ]] || fail "builds pending-model command: $cmd"
+status_json=$(_mu_zsh_status_json)
+[[ "$status_json" == *"\"model_id\":\"openai/gpt\""* ]] || fail "status uses pending model"
+MU_ZSH_SESSION_ID=abc123
+MU_ZSH_SESSION_SCOPE=$(_mu_zsh_current_scope_key)
+cmd=$(_mu_zsh_build_command)
+[[ "$cmd" == "$prompt_fake_bin/mu --output terminal -s abc123 --model openai/gpt" ]] || fail "builds attached pending-model command: $cmd"
+_mu_zsh_clear_model_state
+_mu_zsh_clear_session_state
 
 quoted=$(_mu_zsh_quote_prompt $'quote " dollar $ backslash \\ newline\nnext')
 eval "roundtrip=$quoted"
@@ -192,6 +230,67 @@ grep -q -- "prompt=first prompt" "$MU_ZSH_FAKE_LOG" || fail "sends first prompt 
 grep -q -- "prompt=second prompt" "$MU_ZSH_FAKE_LOG" || fail "sends second prompt on stdin"
 
 rm -f "$MU_ZSH_FAKE_LOG" "$MU_ZSH_SESSION_FILE"
+
+MU_ZSH_BIN=$prompt_fake_bin/mu
+MU_ZSH_OUTPUT=plain
+MU_ZSH_SESSION_ID=
+MU_ZSH_SESSION_SCOPE=
+command_matches=("${(@f)$(_mu_zsh_slash_command_matches /)}")
+[[ "${(j:,:)command_matches}" == "/model" ]] || fail "hides session commands without a valid session"
+MU_ZSH_SESSION_ID=tracked-session
+MU_ZSH_SESSION_SCOPE=$(_mu_zsh_current_scope_key)
+command_matches=("${(@f)$(_mu_zsh_slash_command_matches /)}")
+[[ "${(j:,:)command_matches}" == "/model,/new,/retry,/compact" ]] || fail "shows session commands with a valid session: ${(j:,:)command_matches}"
+BUFFER="/ret"
+CURSOR=${#BUFFER}
+_mu_zsh_complete_slash
+[[ "$BUFFER" == "/retry " && "$CURSOR" -eq 7 ]] || fail "directly completes a single slash command: $BUFFER ($CURSOR)"
+
+model_matches=("${(@f)$(_mu_zsh_model_completion_matches "")}")
+[[ " ${(j: :)model_matches} " == *" openai/gpt "* ]] || fail "offers provider-qualified model"
+[[ " ${(j: :)model_matches} " == *" gpt "* ]] || fail "offers unique unqualified model"
+[[ " ${(j: :)model_matches} " == *" local/solo "* ]] || fail "offers second provider-qualified model"
+[[ " ${(j: :)model_matches} " == *" solo "* ]] || fail "offers second unique unqualified model"
+[[ " ${(j: :)model_matches} " == *" openai/shared "* ]] || fail "offers ambiguous model qualified"
+[[ " ${(j: :)model_matches} " == *" local/shared "* ]] || fail "offers other ambiguous model qualified"
+[[ " ${(j: :)model_matches} " != *" shared "* ]] || fail "does not offer ambiguous unqualified model"
+model_matches=("${(@f)$(_mu_zsh_model_completion_matches "gpt")}")
+[[ "${(j:,:)model_matches}" == "gpt" ]] || fail "does not show variants before colon: ${(j:,:)model_matches}"
+model_matches=("${(@f)$(_mu_zsh_model_completion_matches "gpt:")}")
+[[ "${(j:,:)model_matches}" == "gpt:low,gpt:high" ]] || fail "shows variants after colon: ${(j:,:)model_matches}"
+model_matches=("${(@f)$(_mu_zsh_model_completion_matches "openai/gpt:h")}")
+[[ "${(j:,:)model_matches}" == "openai/gpt:high" ]] || fail "filters provider-qualified variants: ${(j:,:)model_matches}"
+BUFFER="/model openai/gpt:h"
+CURSOR=${#BUFFER}
+_mu_zsh_complete_slash
+[[ "$BUFFER" == "/model openai/gpt:high" ]] || fail "directly completes a single model variant: $BUFFER"
+
+rm -f "$MU_ZSH_FAKE_LOG"
+_mu_zsh_run_slash_command "/retry"
+grep -q -- "retry -s tracked-session --output plain" "$MU_ZSH_FAKE_LOG" || fail "retry slash command targets tracked session"
+rm -f "$MU_ZSH_FAKE_LOG"
+_mu_zsh_run_slash_command "/compact"
+grep -q -- "compact --session tracked-session" "$MU_ZSH_FAKE_LOG" || fail "compact slash command targets tracked session"
+_mu_zsh_run_slash_command "/new"
+[[ -z "$MU_ZSH_SESSION_ID" && -z "$MU_ZSH_SESSION_SCOPE" ]] || fail "new slash command lazily clears tracked session"
+if _mu_zsh_run_slash_command "/retry"; then
+  fail "retry without a valid tracked session should fail"
+fi
+if _mu_zsh_run_slash_command "/new extra"; then
+  fail "new should reject arguments"
+fi
+if _mu_zsh_run_slash_command "/unknown"; then
+  fail "unknown slash command should fail"
+fi
+_mu_zsh_run_slash_command "/model gpt"
+[[ "$MU_ZSH_MODEL" == gpt ]] || fail "model slash command records pending model"
+[[ "$MU_ZSH_MODEL_SCOPE" == "$(_mu_zsh_current_scope_key)" ]] || fail "model slash command records scope"
+if _mu_zsh_run_slash_command "/model invalid/model"; then
+  fail "model slash command should validate model refs"
+fi
+_mu_zsh_clear_model_state
+_mu_zsh_clear_session_state
+rm -f "$MU_ZSH_FAKE_LOG"
 
 scope_root=$tmpdir/scope-projects
 project_a=$scope_root/project-a
@@ -233,6 +332,9 @@ builtin cd "$project_a/subdir"
 _mu_zsh_submit_prompt "project a prompt"
 [[ "$MU_ZSH_SESSION_ID" == "session-project-a" ]] || fail "creates a scoped session for the first project"
 
+MU_ZSH_MODEL=model-for-a
+MU_ZSH_MODEL_SCOPE=$(_mu_zsh_current_scope_key)
+
 builtin cd "$project_b/subdir"
 cmd=$(_mu_zsh_build_command)
 [[ "$cmd" == "$scope_fake_bin/mu --output plain" ]] || fail "does not reuse another project's session before submitting there: $cmd"
@@ -243,12 +345,13 @@ status_json=$(_mu_zsh_status_json)
 
 builtin cd "$project_a/subdir"
 cmd=$(_mu_zsh_build_command)
-[[ "$cmd" == "$scope_fake_bin/mu --output plain -s session-project-a" ]] || fail "returns to the original scoped session after cd-ing back: $cmd"
+[[ "$cmd" == "$scope_fake_bin/mu --output plain -s session-project-a --model model-for-a" ]] || fail "returns to the original scoped session and model after cd-ing back: $cmd"
 
 builtin cd "$project_b/subdir"
 _mu_zsh_submit_prompt "project b prompt"
 [[ "$MU_ZSH_SESSION_ID" == "session-project-b" ]] || fail "creates a new scoped session after submitting in the second project"
 [[ "$MU_ZSH_SESSION_SCOPE" == "project:$project_b" ]] || fail "moves the tracked session scope after starting in the second project"
+[[ -z "$MU_ZSH_MODEL" && -z "$MU_ZSH_MODEL_SCOPE" ]] || fail "forgets pending model after submitting in another project"
 
 builtin cd "$project_a/subdir"
 cmd=$(_mu_zsh_build_command)
