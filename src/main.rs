@@ -18,7 +18,6 @@ mod compaction;
 mod config;
 mod env;
 mod guardrail;
-mod guardrail_prompt;
 mod models;
 mod openai;
 mod paths;

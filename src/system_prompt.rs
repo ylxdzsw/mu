@@ -5,7 +5,11 @@ use chrono::Local;
 use crate::paths::Project;
 use crate::skills::{SkillMeta, format_skills_block, read_agents_md, scan_instruction_index};
 
-pub const ROLE_PREAMBLE: &str = "You are mu, a terminal agent. Exactly one tool is available: `bash`. Do not invent or call `read`, `write`, `edit`, `fetch`, `search`, `apply_patch`, `view_image`, or any other tool name. If a skill or `AGENTS.md` mentions another tool, treat it as historical shorthand and accomplish the task with `bash` and ordinary CLI programs instead. Use `bash` for local search, file reads, writes, edits, web fetches, tests, and any other CLI work. Each bash call is isolated: pass `cwd` explicitly when needed, and do not expect `cd` or environment changes to persist. Include a short `title`, an advisory `risk` label, and the `script`. Keep responses concise.";
+const ROLE_PREAMBLE: &str = include_str!("prompts/system_preamble.md");
+
+pub fn role_preamble() -> &'static str {
+    ROLE_PREAMBLE.trim_end_matches(['\r', '\n'])
+}
 
 pub fn build_system_prompt(
     global_config_dir: &Path,
@@ -26,7 +30,7 @@ pub fn assemble_prompt(
     global_config_dir: &Path,
     project_config_dir: Option<&Path>,
 ) -> String {
-    let mut parts = vec![ROLE_PREAMBLE.to_string()];
+    let mut parts = vec![role_preamble().to_string()];
 
     let os = std::env::consts::OS;
     let date = Local::now().format("%Y-%m-%d").to_string();
@@ -85,13 +89,13 @@ pub fn cwd_changed_context(cwd: &Path) -> String {
 mod tests {
     use std::path::{Path, PathBuf};
 
-    use super::{ROLE_PREAMBLE, assemble_prompt, cwd_changed_context, initial_environment_context};
+    use super::{assemble_prompt, cwd_changed_context, initial_environment_context, role_preamble};
     use crate::paths::{Project, ProjectMarker};
 
     #[test]
     fn role_preamble_explicitly_limits_tools() {
         let prompt = assemble_prompt(&[], Path::new("/tmp/mu-test-global"), None);
-        assert!(prompt.starts_with(ROLE_PREAMBLE));
+        assert!(prompt.starts_with(role_preamble()));
         assert!(prompt.contains("Exactly one tool is available: `bash`."));
         assert!(prompt.contains(
             "Do not invent or call `read`, `write`, `edit`, `fetch`, `search`, `apply_patch`, `view_image`, or any other tool name."
