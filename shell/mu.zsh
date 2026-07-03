@@ -29,6 +29,8 @@ typeset -g MU_ZSH_ORIGINAL_RPROMPT=${MU_ZSH_ORIGINAL_RPROMPT:-}
 typeset -g MU_ZSH_SAVED_KEYMAP=${MU_ZSH_SAVED_KEYMAP:-main}
 typeset -g MU_ZSH_ORIGINAL_TAB_WIDGET=${MU_ZSH_ORIGINAL_TAB_WIDGET:-}
 typeset -g MU_ZSH_ORIGINAL_STTY=${MU_ZSH_ORIGINAL_STTY:-}
+typeset -g MU_ZSH_SCOPE_CACHE_PWD=${MU_ZSH_SCOPE_CACHE_PWD:-}
+typeset -g MU_ZSH_SCOPE_CACHE_KEY=${MU_ZSH_SCOPE_CACHE_KEY:-}
 typeset -g MU_ZSH_HISTORY_BUFFER=${MU_ZSH_HISTORY_BUFFER:-}
 typeset -gi MU_ZSH_HISTORY_CURSOR=${MU_ZSH_HISTORY_CURSOR:-0}
 typeset -gi MU_ZSH_HISTORY_HISTNO=${MU_ZSH_HISTORY_HISTNO:-0}
@@ -94,7 +96,7 @@ _mu_zsh_quote_prompt() {
   print -r -- "${(qqq)1}"
 }
 
-_mu_zsh_scope_key_for_dir() {
+_mu_zsh_set_scope_key_for_dir() {
   local dir=$1
   local home=${HOME:-}
   local parent
@@ -107,7 +109,7 @@ _mu_zsh_scope_key_for_dir() {
       break
     fi
     if [[ -d "$dir/.mu" || -e "$dir/.git" ]]; then
-      print -r -- "project:$dir"
+      REPLY="project:$dir"
       return 0
     fi
     parent=${dir:h}
@@ -115,16 +117,41 @@ _mu_zsh_scope_key_for_dir() {
     dir=$parent
   done
 
-  print -r -- "global"
+  REPLY=global
+}
+
+_mu_zsh_scope_key_for_dir() {
+  _mu_zsh_set_scope_key_for_dir "$1"
+  print -r -- "$REPLY"
+}
+
+_mu_zsh_set_current_scope_key() {
+  if [[ -n "$MU_ZSH_SCOPE_CACHE_KEY" && "$MU_ZSH_SCOPE_CACHE_PWD" == "$PWD" ]]; then
+    REPLY=$MU_ZSH_SCOPE_CACHE_KEY
+    return 0
+  fi
+
+  _mu_zsh_set_scope_key_for_dir "$PWD"
+  MU_ZSH_SCOPE_CACHE_PWD=$PWD
+  MU_ZSH_SCOPE_CACHE_KEY=$REPLY
+}
+
+_mu_zsh_clear_scope_cache() {
+  MU_ZSH_SCOPE_CACHE_PWD=
+  MU_ZSH_SCOPE_CACHE_KEY=
 }
 
 _mu_zsh_current_scope_key() {
-  _mu_zsh_scope_key_for_dir "$PWD"
+  _mu_zsh_set_current_scope_key
+  print -r -- "$REPLY"
 }
 
 _mu_zsh_sync_session_state() {
-  local scope
-  scope=$(_mu_zsh_current_scope_key)
+  local scope=${1:-}
+  [[ -n "$scope" ]] || {
+    _mu_zsh_set_current_scope_key
+    scope=$REPLY
+  }
 
   if [[ -z "$MU_ZSH_SESSION_ID" ]]; then
     MU_ZSH_SESSION_SCOPE=
@@ -144,8 +171,11 @@ _mu_zsh_sync_session_state() {
 }
 
 _mu_zsh_sync_model_state() {
-  local scope
-  scope=$(_mu_zsh_current_scope_key)
+  local scope=${1:-}
+  [[ -n "$scope" ]] || {
+    _mu_zsh_set_current_scope_key
+    scope=$REPLY
+  }
 
   if [[ -z "$MU_ZSH_MODEL" ]]; then
     MU_ZSH_MODEL_SCOPE=
@@ -165,8 +195,13 @@ _mu_zsh_sync_model_state() {
 }
 
 _mu_zsh_sync_state() {
-  _mu_zsh_sync_session_state
-  _mu_zsh_sync_model_state
+  local scope=${1:-}
+  [[ -n "$scope" ]] || {
+    _mu_zsh_set_current_scope_key
+    scope=$REPLY
+  }
+  _mu_zsh_sync_session_state "$scope"
+  _mu_zsh_sync_model_state "$scope"
 }
 
 _mu_zsh_clear_session_state() {
@@ -194,7 +229,12 @@ _mu_zsh_forget_state_outside_scope() {
 
 _mu_zsh_remember_session_for_scope() {
   local id=$1
-  local scope=${2:-$(_mu_zsh_current_scope_key)}
+  local scope=${2:-}
+
+  [[ -n "$scope" ]] || {
+    _mu_zsh_set_current_scope_key
+    scope=$REPLY
+  }
 
   [[ -n "$id" ]] || return 0
   MU_ZSH_SESSION_ID=$id
@@ -204,11 +244,12 @@ _mu_zsh_remember_session_for_scope() {
 
 _mu_zsh_record_history() {
   local prompt=$1
+  local scope=${2:-}
   local quoted
   local session_id
   local model
   quoted=$(_mu_zsh_quote_prompt "$prompt")
-  _mu_zsh_sync_state
+  _mu_zsh_sync_state "$scope"
   session_id=$MU_ZSH_EFFECTIVE_SESSION_ID
   model=$MU_ZSH_EFFECTIVE_MODEL
 
@@ -301,7 +342,7 @@ _mu_zsh_status_json_with_commands() {
   "${command[@]}" 2>/dev/null
 }
 
-_mu_zsh_status_field() {
+_mu_zsh_status_field_reply() {
   local json=$1
   local key=$2
   local remainder
@@ -311,13 +352,19 @@ _mu_zsh_status_field() {
 
   if [[ "$remainder" == \"* ]]; then
     remainder=${remainder#\"}
-    print -r -- "${remainder%%\"*}"
+    REPLY=${remainder%%\"*}
     return 0
   fi
 
   remainder=${remainder%%,*}
-  remainder=${remainder%%\}*}
-  print -r -- "$remainder"
+  REPLY=${remainder%%\}*}
+}
+
+_mu_zsh_status_field() {
+  local json=$1
+  local key=$2
+  _mu_zsh_status_field_reply "$json" "$key" || return 1
+  print -r -- "$REPLY"
 }
 
 _mu_zsh_format_context_percent() {
@@ -339,32 +386,62 @@ _mu_zsh_format_context_percent() {
 _mu_zsh_build_mode_prompt() {
   local status_json model context_raw context cwd project_root project_segment
   local clean unclean_segment
+  local escaped_model escaped_context escaped_project_root escaped_unclean_text
 
   status_json=$(_mu_zsh_status_json) || status_json=
-  model=$(_mu_zsh_status_field "$status_json" model_id 2>/dev/null) || model=mu
-  context_raw=$(_mu_zsh_status_field "$status_json" context_percent 2>/dev/null) || context_raw=
-  project_root=$(_mu_zsh_status_field "$status_json" project_root 2>/dev/null) || project_root=
+  if _mu_zsh_status_field_reply "$status_json" model_id 2>/dev/null; then
+    model=$REPLY
+  else
+    model=mu
+  fi
+  if _mu_zsh_status_field_reply "$status_json" context_percent 2>/dev/null; then
+    context_raw=$REPLY
+  else
+    context_raw=
+  fi
+  if _mu_zsh_status_field_reply "$status_json" project_root 2>/dev/null; then
+    project_root=$REPLY
+  else
+    project_root=
+  fi
   [[ "$project_root" == null ]] && project_root=
-  context=$(_mu_zsh_format_context_percent "$context_raw")
-  cwd=$(_mu_zsh_escape_prompt_text "$PWD")
+  if [[ -z "$context_raw" || "$context_raw" == null ]]; then
+    context=0%
+  elif ! printf -v context '%.0f%%' "$context_raw" 2>/dev/null; then
+    context=0%
+  fi
+  cwd=$PWD
+  cwd=${cwd//\%/%%}
+  escaped_model=$model
+  escaped_model=${escaped_model//\%/%%}
+  escaped_context=$context
+  escaped_context=${escaped_context//\%/%%}
   if [[ -z "$project_root" ]]; then
     project_segment=" %F{$MU_ZSH_PROMPT_PROJECT_COLOR}(global)%f"
   elif [[ "$project_root" != "$PWD" ]]; then
-    project_segment=" %F{$MU_ZSH_PROMPT_PROJECT_COLOR}($(_mu_zsh_escape_prompt_text "$project_root"))%f"
+    escaped_project_root=$project_root
+    escaped_project_root=${escaped_project_root//\%/%%}
+    project_segment=" %F{$MU_ZSH_PROMPT_PROJECT_COLOR}(${escaped_project_root})%f"
   else
     project_segment=
   fi
 
   # When the tracked session's last turn was interrupted (unclean), surface it
   # so the user knows they can /retry to resume or just type to redirect.
-  clean=$(_mu_zsh_status_field "$status_json" clean 2>/dev/null) || clean=
+  if _mu_zsh_status_field_reply "$status_json" clean 2>/dev/null; then
+    clean=$REPLY
+  else
+    clean=
+  fi
   if [[ "$clean" == false ]]; then
-    unclean_segment=" %F{$MU_ZSH_PROMPT_UNCLEAN_COLOR}[$(_mu_zsh_escape_prompt_text "$MU_ZSH_PROMPT_UNCLEAN_TEXT")]%f"
+    escaped_unclean_text=$MU_ZSH_PROMPT_UNCLEAN_TEXT
+    escaped_unclean_text=${escaped_unclean_text//\%/%%}
+    unclean_segment=" %F{$MU_ZSH_PROMPT_UNCLEAN_COLOR}[${escaped_unclean_text}]%f"
   else
     unclean_segment=
   fi
 
-  print -r -- "%F{$MU_ZSH_PROMPT_MODEL_COLOR}$(_mu_zsh_escape_prompt_text "$model")%f %F{$MU_ZSH_PROMPT_CONTEXT_COLOR}$(_mu_zsh_escape_prompt_text "$context")%f %F{$MU_ZSH_PROMPT_PWD_COLOR}${cwd}%f${project_segment}${unclean_segment}
+  print -r -- "%F{$MU_ZSH_PROMPT_MODEL_COLOR}${escaped_model}%f %F{$MU_ZSH_PROMPT_CONTEXT_COLOR}${escaped_context}%f %F{$MU_ZSH_PROMPT_PWD_COLOR}${cwd}%f${project_segment}${unclean_segment}
 ${MU_ZSH_PROMPT_INPUT}"
 }
 
@@ -443,7 +520,8 @@ _mu_zsh_clear_history_return() {
 }
 
 _mu_zsh_reset_mode_prompt() {
-  [[ "$MU_ZSH_MODE" == mu ]] && _mu_zsh_refresh_prompt
+  local skip_refresh=${1:-0}
+  [[ "$MU_ZSH_MODE" == mu && "$skip_refresh" != 1 ]] && _mu_zsh_refresh_prompt
   zle reset-prompt
   _mu_zsh_apply_prompt_tty
   zle -K mumode 2>/dev/null || true
@@ -661,7 +739,7 @@ _mu_zsh_run_custom_slash_command() {
 
   scope=$(_mu_zsh_current_scope_key)
   _mu_zsh_forget_state_outside_scope "$scope"
-  _mu_zsh_sync_state
+  _mu_zsh_sync_state "$scope"
   session_id=$MU_ZSH_EFFECTIVE_SESSION_ID
   model=$MU_ZSH_EFFECTIVE_MODEL
 
@@ -762,7 +840,7 @@ _mu_zsh_run_slash_command() {
   esac
 
   scope=$(_mu_zsh_current_scope_key)
-  _mu_zsh_sync_state
+  _mu_zsh_sync_state "$scope"
   _mu_zsh_forget_state_outside_scope "$scope"
   return $exit_status
 }
@@ -808,8 +886,8 @@ _mu_zsh_submit_prompt() {
   scope=$(_mu_zsh_current_scope_key)
   _mu_zsh_forget_state_outside_scope "$scope"
 
-  _mu_zsh_record_history "$prompt"
-  _mu_zsh_sync_state
+  _mu_zsh_record_history "$prompt" "$scope"
+  _mu_zsh_sync_state "$scope"
   session_id=$MU_ZSH_EFFECTIVE_SESSION_ID
   model=$MU_ZSH_EFFECTIVE_MODEL
 
@@ -870,7 +948,7 @@ _mu_zsh_tab() {
 
   if (( CURSOR == 0 )); then
     _mu_zsh_enter_mode
-    _mu_zsh_reset_mode_prompt
+    _mu_zsh_reset_mode_prompt 1
     return
   fi
 
@@ -975,7 +1053,7 @@ _mu_zsh_shell_down() {
     cursor=$MU_ZSH_HISTORY_CURSOR
     _mu_zsh_enter_mode
     CURSOR=$cursor
-    _mu_zsh_reset_mode_prompt
+    _mu_zsh_reset_mode_prompt 1
   fi
 }
 
@@ -994,7 +1072,7 @@ _mu_zsh_cleanup() {
 
 mu-zsh-mode() {
   _mu_zsh_enter_mode
-  _mu_zsh_reset_mode_prompt
+  _mu_zsh_reset_mode_prompt 1
 }
 
 mu-zsh-exit-mode() {
@@ -1038,6 +1116,8 @@ if [[ -o zle ]]; then
   zle -N mu-zsh-mode
   zle -N mu-zsh-exit-mode
   add-zsh-hook zshexit _mu_zsh_cleanup
+  add-zsh-hook precmd _mu_zsh_clear_scope_cache
+  add-zsh-hook chpwd _mu_zsh_clear_scope_cache
   add-zle-hook-widget line-init _mu_zsh_line_init 2>/dev/null || true
   _mu_zsh_capture_tty_state
   _mu_zsh_apply_prompt_tty

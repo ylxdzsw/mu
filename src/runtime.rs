@@ -241,9 +241,10 @@ fn status_session(summary: crate::store::SessionSummary) -> StatusSession {
 }
 
 fn git_status(project: &crate::paths::Project) -> GitStatus {
+    let (branch, dirty) = git_branch_and_dirty(&project.root).unwrap_or((None, None));
     GitStatus {
-        branch: git_branch(&project.root),
-        dirty: git_dirty(&project.root),
+        branch,
+        dirty,
         git_dir: project
             .worktree
             .as_ref()
@@ -256,31 +257,37 @@ fn git_status(project: &crate::paths::Project) -> GitStatus {
     }
 }
 
-fn git_branch(project_root: &std::path::Path) -> Option<String> {
-    let output = Command::new("git")
-        .arg("branch")
-        .arg("--show-current")
-        .current_dir(project_root)
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let branch = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    (!branch.is_empty()).then_some(branch)
-}
-
-fn git_dirty(project_root: &std::path::Path) -> Option<bool> {
+fn git_branch_and_dirty(project_root: &std::path::Path) -> Option<(Option<String>, Option<bool>)> {
     let output = Command::new("git")
         .arg("status")
-        .arg("--porcelain")
+        .arg("--porcelain=v2")
+        .arg("-b")
         .current_dir(project_root)
         .output()
         .ok()?;
     if !output.status.success() {
         return None;
     }
-    Some(!output.stdout.is_empty())
+    Some(parse_git_status_output(&output.stdout))
+}
+
+fn parse_git_status_output(output: &[u8]) -> (Option<String>, Option<bool>) {
+    let mut branch = None;
+    let mut dirty = false;
+
+    for line in String::from_utf8_lossy(output).lines() {
+        if let Some(head) = line.strip_prefix("# branch.head ") {
+            if !head.is_empty() && head != "(detached)" && head != "(unknown)" {
+                branch = Some(head.to_string());
+            }
+            continue;
+        }
+        if !line.is_empty() && !line.starts_with('#') {
+            dirty = true;
+        }
+    }
+
+    (branch, Some(dirty))
 }
 
 #[cfg(test)]
@@ -427,5 +434,24 @@ mod tests {
         )
         .unwrap();
         assert!(report.clean);
+    }
+
+    #[test]
+    fn parses_git_status_output_for_clean_branch() {
+        let (branch, dirty) =
+            parse_git_status_output(b"# branch.oid abc123\n# branch.head master\n");
+
+        assert_eq!(branch.as_deref(), Some("master"));
+        assert_eq!(dirty, Some(false));
+    }
+
+    #[test]
+    fn parses_git_status_output_for_detached_dirty_repo() {
+        let (branch, dirty) = parse_git_status_output(
+            b"# branch.oid abc123\n# branch.head (detached)\n1 M. N... 100644 100644 100644 abc def file.txt\n",
+        );
+
+        assert_eq!(branch, None);
+        assert_eq!(dirty, Some(true));
     }
 }

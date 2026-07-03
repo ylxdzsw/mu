@@ -190,6 +190,21 @@ _mu_zsh_clear_history_return
 [[ "$MU_ZSH_HISTORY_CURSOR" -eq 0 ]] || fail "clears saved history return cursor"
 [[ "$MU_ZSH_HISTORY_HISTNO" -eq 0 ]] || fail "clears saved history return histno"
 
+scope_cache_dir=$tmpdir/scope-cache
+mkdir -p -- "$scope_cache_dir"
+saved_pwd=$PWD
+saved_home=${HOME:-}
+HOME=$tmpdir
+_mu_zsh_clear_scope_cache
+builtin cd "$scope_cache_dir"
+[[ "$(_mu_zsh_current_scope_key)" == "global" ]] || fail "starts uncached global"
+mkdir -p -- .mu
+_mu_zsh_clear_scope_cache
+[[ "$(_mu_zsh_current_scope_key)" == "project:$scope_cache_dir" ]] || fail "scope cache invalidation refreshes project detection"
+builtin cd "$saved_pwd"
+HOME=$saved_home
+_mu_zsh_clear_scope_cache
+
 MU_ZSH_BIN=mu
 MU_ZSH_OUTPUT=terminal
 MU_ZSH_SESSION_ID=abc123
