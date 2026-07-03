@@ -846,6 +846,9 @@ Submitting a non-empty prompt runs `mu` as an ordinary foreground child process.
 The plugin passes `--session` after the first turn, forwards configured output
 mode, writes the prompt to the child process's stdin, waits for the turn to
 finish, and then redraws `mu>` with the same session id.
+After ZLE commits the submitted prompt line to scrollback, the plugin prints one
+empty line before child-process output starts, independent of whether the child
+uses `terminal` or `plain` human-facing output.
 
 Consequences:
 

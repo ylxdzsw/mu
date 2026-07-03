@@ -30,6 +30,7 @@ typeset -g MU_ZSH_ORIGINAL_STTY=${MU_ZSH_ORIGINAL_STTY:-}
 typeset -g MU_ZSH_HISTORY_BUFFER=${MU_ZSH_HISTORY_BUFFER:-}
 typeset -gi MU_ZSH_HISTORY_CURSOR=${MU_ZSH_HISTORY_CURSOR:-0}
 typeset -gi MU_ZSH_HISTORY_HISTNO=${MU_ZSH_HISTORY_HISTNO:-0}
+typeset -gi MU_ZSH_OUTPUT_SEPARATOR_PENDING=${MU_ZSH_OUTPUT_SEPARATOR_PENDING:-0}
 typeset -gi MU_ZSH_HAD_HIGHLIGHTERS=${MU_ZSH_HAD_HIGHLIGHTERS:-0}
 typeset -gi MU_ZSH_DISABLED_AUTOSUGGESTIONS=${MU_ZSH_DISABLED_AUTOSUGGESTIONS:-0}
 typeset -ga MU_ZSH_SAVED_HIGHLIGHTERS
@@ -219,6 +220,14 @@ _mu_zsh_record_history() {
     print -sr -- "$MU_ZSH_BIN --model ${(q)model} --output ${(q)MU_ZSH_OUTPUT} <<< $quoted"
   else
     print -sr -- "$MU_ZSH_BIN --output ${(q)MU_ZSH_OUTPUT} <<< $quoted"
+  fi
+}
+
+_mu_zsh_print_output_separator_if_pending() {
+  if (( MU_ZSH_OUTPUT_SEPARATOR_PENDING )); then
+    MU_ZSH_OUTPUT_SEPARATOR_PENDING=0
+    print
+    print
   fi
 }
 
@@ -681,6 +690,7 @@ _mu_zsh_run_slash_command() {
   fi
 
   print -sr -- "$line"
+  _mu_zsh_print_output_separator_if_pending
 
   case "$command" in
     /model)
@@ -795,6 +805,7 @@ _mu_zsh_submit_prompt() {
     local -a command
     command=("$MU_ZSH_BIN" -s "$session_id" --output "$MU_ZSH_OUTPUT")
     [[ -n "$model" ]] && command+=(--model "$model")
+    _mu_zsh_print_output_separator_if_pending
     "${command[@]}" <<< "$prompt"
     exit_status=$?
   else
@@ -802,6 +813,7 @@ _mu_zsh_submit_prompt() {
     command=("$MU_ZSH_BIN" --output "$MU_ZSH_OUTPUT")
     [[ -n "$model" ]] && command+=(--model "$model")
     rm -f -- "$MU_ZSH_SESSION_FILE" 2>/dev/null || true
+    _mu_zsh_print_output_separator_if_pending
     MU_SESSION_FILE=$MU_ZSH_SESSION_FILE "${command[@]}" <<< "$prompt"
     exit_status=$?
     _mu_zsh_read_session_file "$scope"
@@ -900,6 +912,7 @@ _mu_zsh_accept() {
   zle -I
   _mu_zsh_clear_prompt
   _mu_zsh_restore_tty_state
+  MU_ZSH_OUTPUT_SEPARATOR_PENDING=1
   if [[ "$prompt" == /* ]]; then
     _mu_zsh_run_slash_command "$prompt"
   else

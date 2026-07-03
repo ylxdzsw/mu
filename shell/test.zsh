@@ -438,6 +438,8 @@ for line in "${(@f)normalized}"; do
 done
 (( hello_count == 1 )) || fail "submitted prompt should appear once, saw $hello_count copies"
 [[ "$normalized" == *"Hello! I'm your terminal agent."* ]] || fail "interactive response should be rendered"
+after_submitted_prompt=${normalized#*$'mu> hello\n'}
+[[ "$after_submitted_prompt" == *$'\n\nHello! I'* ]] || fail "submitted prompt should be separated from terminal output"
 [[ "$normalized" == *'mu> cancel-me'* ]] || fail "Ctrl-C should leave the cancelled mu line in scrollback"
 [[ $(<"$interactive_capture_calls") == x ]] || fail "interactive fake mu should run exactly once"
 after_response=${normalized#*"Hello! I'm your terminal agent."}
@@ -458,6 +460,26 @@ cmp -- "$interactive_expected_stdin" "$interactive_capture_stdin" || fail "inter
 interactive_args=("${(@f)$(<"$interactive_capture_args")}")
 expected_interactive_args=(--output terminal)
 [[ "${(j:\0:)interactive_args}" == "${(j:\0:)expected_interactive_args}" ]] || fail "unexpected interactive args: ${interactive_args[*]}"
+
+plain_transcript=$tmpdir/plain-transcript
+plain_setup="$interactive_setup; MU_ZSH_OUTPUT=plain"
+rm -f -- "$interactive_capture_args" "$interactive_capture_stdin" "$interactive_capture_calls"
+interactive_status=0
+{
+  print -r -- "$plain_setup"
+  sleep 0.2
+  print -rn -- $'\t'"plain prompt"$'\r'
+  sleep 0.4
+  print -rn -- $'\x04'
+} | timeout 5 script -qfec 'TERM=xterm-256color zsh -df' "$plain_transcript" >/dev/null || interactive_status=$?
+(( interactive_status == 0 )) || fail "plain transcript exited with status $interactive_status"
+
+normalized=$(perl -pe 's/\e\[[0-?]*[ -\/]*[@-~]//g' "$plain_transcript" | col -b)
+after_submitted_prompt=${normalized#*$'mu> plain prompt\n'}
+[[ "$after_submitted_prompt" == *$'\n\nHello! I'* ]] || fail "submitted prompt should be separated from plain output"
+interactive_args=("${(@f)$(<"$interactive_capture_args")}")
+expected_plain_args=(--output plain)
+[[ "${(j:\0:)interactive_args}" == "${(j:\0:)expected_plain_args}" ]] || fail "unexpected plain interactive args: ${interactive_args[*]}"
 
 toggle_transcript=$tmpdir/toggle-transcript
 toggle_setup="$interactive_setup; _mu_test_tab_roundtrip() { BUFFER='echo toggled'; CURSOR=0; _mu_zsh_tab; _mu_zsh_tab; }; zle -N _mu_test_tab_roundtrip; bindkey '^T' _mu_test_tab_roundtrip"
