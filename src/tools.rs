@@ -118,19 +118,18 @@ mod tests {
     use serde_json::json;
 
     use super::{execution_mode, tool_definitions};
-    use crate::config::{CompactionConfig, Config, LimitsConfig, ProviderConfig};
+    use crate::config::{CompactionConfig, Config, LimitsConfig, OrderedMap, ProviderConfig};
 
     fn test_config() -> Config {
         Config {
-            providers: HashMap::from([(
+            providers: OrderedMap::from_iter([(
                 "test".into(),
                 ProviderConfig {
                     base_url: "http://localhost".into(),
                     api_key_env: "MU_TEST_KEY".into(),
-                    models: HashMap::new(),
+                    models: OrderedMap::default(),
                 },
             )]),
-            default_model: "test/test-model".into(),
             compaction: CompactionConfig::default(),
             limits: LimitsConfig::default(),
             guardrail: crate::config::GuardrailConfig::default(),

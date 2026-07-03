@@ -446,7 +446,6 @@ The sidebar may also include metadata that is useful while working:
 - current session turn count;
 - last updated time;
 - total token or context estimate;
-- cost total if available;
 - compaction state or last summary marker;
 - active turn duration/status.
 
@@ -619,7 +618,7 @@ it in this order:
    f. If `finish_reason` is `stop`: the loop ends.
 10. **Update the session row:** `last_total_tokens` = the `total_tokens` from the
     *final* provider response of the turn (this already reflects the full context
-    incl. prior turns); add this turn's cost to `cost_total`; bump `updated_at`.
+    incl. prior turns); bump `updated_at`.
 11. **Print the turn summary line** to stderr (§5), release the `flock`, exit 0.
 
 **Usage accounting.** Each provider response in the loop carries its own `usage`.
@@ -627,9 +626,8 @@ For the **context fullness** figure (`last_total_tokens`, the summary's
 `context: N%`) use only the **final** response's `total_tokens` — because
 `prompt_tokens` already includes the entire prior context, the last response's
 `total_tokens` is the true current context size (summing across iterations would
-double-count). For **cost** and the `in`/`out` token display, sum
-`prompt_tokens`/`completion_tokens` across all iterations of the turn (you pay
-for each round-trip).
+double-count). For the `in`/`out` token display, sum `prompt_tokens` and
+`completion_tokens` across all iterations of the turn.
 
 **Interruption.** Steps 9d/9e persist only *after* a message is fully formed. If
 SIGINT / a dropped connection / a provider error occurs mid-stream, the partial
@@ -808,14 +806,12 @@ stderr TTY detection suppresses the summary when redirected.
 single structured summary line to stderr:
 
 ```
-[mu] tokens: 1234 in / 456 out  context: 12%  cost: $0.003
+[mu] tokens: 1234 in / 456 out  context: 12%
 ```
 
 All figures come from the provider's reported `usage` for the turn: `in`/`out`
 are `prompt_tokens`/`completion_tokens`; `context` is the new
-`total_tokens` ÷ model context window; `cost` is `total_tokens` priced via the
-optional per-model rates in `config.jsonc` (omitted if no rates configured).
-This is the *only* stderr output in the normal case. It appears after all
+`total_tokens` ÷ model context window. This is the *only* stderr output in the normal case. It appears after all
 stdout, and goes to stderr so it stays out of a captured stdout transcript. It
 is suppressed if stderr is not a TTY (piped/redirected), since it would pollute
 log files. In both human-facing modes it is followed by one blank line so the
@@ -958,15 +954,15 @@ chunk carries `usage`.
 
 **Model context window.** The 75% threshold needs the model's max context size.
 Source it from `config.jsonc`: each configured model entry carries a
-`context_window` integer (and optional price rates). mu does not fetch model
-cards. If a model has no configured `context_window`, compaction's Tier 1 is
+`context_window` integer. mu does not fetch model cards. If a model has no configured `context_window`, compaction's Tier 1 is
 skipped for it and Tier 2 (API-error fallback) is the only guard.
 
 Model and provider selection come from `config.jsonc`: a `base_url`, the env var
-holding the API key, and a default model id. If the global config file is
-missing, `mu` creates a starter `~/.mu/config.jsonc` automatically before
-loading configuration. API keys are read from environment variables; `mu` does
-not store secrets in its database.
+holding the API key, and ordered provider/model definitions. If the global config
+file is missing, `mu` creates a starter `~/.mu/config.jsonc` automatically before
+loading configuration. In a scope with no sessions, the first configured model is
+used. API keys are read from environment variables; `mu` does not store secrets
+in its database.
 
 **No provider, hard fail.** If no provider is configured (no base URL, or the
 key env var is unset), a *turn* invocation exits immediately with a non-zero
@@ -1084,21 +1080,21 @@ one scope are not visible in another.
 
   ```jsonc
   {
-    "provider": {
-      "base_url": "https://api.openai.com/v1",  // required
-      "api_key_env": "OPENAI_API_KEY"            // required: env var NAME, not the key
+    "providers": {
+      "openai": {
+        "base_url": "https://api.openai.com/v1", // required
+        "api_key_env": "OPENAI_API_KEY",         // required: env var NAME, not the key
+        "models": {
+          "gpt-4o": {
+            "context_window": 128000,            // needed for Tier-1 compaction & context%
+            "supported_efforts": ["low", "medium", "high"]
+          }
+        }
+      }
     },
-    "default_model": "gpt-4o",                   // required
-    "default_effort": null,                      // optional: null|low|medium|high|xhigh|max
     "terminal_bell": {                           // optional terminal notification policy
       "enabled": true,
       "min_duration_ms": 10000
-    },
-    "models": {                                  // optional per-model tuning
-      "gpt-4o": {
-        "context_window": 128000,                // needed for Tier-1 compaction & context%
-        "price_per_mtok": { "input": 2.5, "output": 10.0 }  // optional, for cost line
-      }
     },
     "compaction": { "fraction": 0.75, "keep_recent_turns": 2 },  // optional
     "limits": { "max_iterations": 50, "max_lines": 2000, "max_bytes": 51200, "max_line_bytes": 10240 },
@@ -1108,10 +1104,12 @@ one scope are not visible in another.
   }
   ```
 
-  Only `provider.*` and `default_model` are required; everything else has the
-  defaults shown. If global `config.jsonc` is missing, `mu` creates a starter
-  file automatically. `mu` hard-fails on a turn if the required fields are
-  missing or the API-key env var is unset (§7).
+  At least one provider and one model are required; everything else has the
+  defaults shown. Provider and model order is meaningful: project config entries
+  are listed before inherited global entries, and model suggestions follow that
+  order. If global `config.jsonc` is missing, `mu` creates a starter file
+  automatically. `mu` hard-fails on a turn if the required fields are missing or
+  the API-key env var is unset (§7).
 - **.env** — optional dotenv data. Values are visible to `bash`; this is
   convenience, not sandboxing. Values from provider `api_key_env` and
   `redaction.env` are exact-value redacted from bash output before the output is
@@ -1173,7 +1171,7 @@ Conceptual schema (flat and small):
   `archived`, `title`,
   `last_total_tokens` (the most recent `usage.total_tokens` reported by the
   provider; used for the pre-turn overflow check, §"Context window and
-  compaction"), `cost_total` (accumulated USD, for the turn summary). `origin`
+  compaction"). `origin`
   is `cli` or `web` depending on which surface created the session. `archived`
   is a boolean listing filter; archived sessions remain resumable by explicit
   id. `model` is set at session creation from the effective model (lifecycle
@@ -1424,7 +1422,8 @@ actions:
 **Reviewer call.** A separate non-streaming chat-completions call inside the
 turn process (mu is per-turn, so there is no persistent reviewer session). The
 reviewer uses the same provider and API key as the primary agent; the model
-defaults to `default_model` but can be overridden via `guardrail.review_model`.
+defaults to the active turn model but can be overridden via
+`guardrail.review_model`.
 The reviewer has no tools — it judges from a compact transcript and the action
 JSON alone.
 
@@ -1478,7 +1477,7 @@ length errors are not retried.
 ```jsonc
 "guardrail": {
   "enabled": false,                          // default off (preserves yolo default)
-  "review_model": null,                      // null → same as default_model
+  "review_model": null,                      // null -> same as active turn model
   "timeout_ms": 90000,
   "circuit_breaker": { "consecutive": 3, "window": 50, "window_denials": 10 }
 }

@@ -5,7 +5,7 @@ use anyhow::{Context, Result, bail};
 use clap::ValueEnum;
 use serde::{Deserialize, Serialize};
 
-use crate::config::{Config, PriceConfig};
+use crate::config::Config;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, ValueEnum)]
 #[serde(rename_all = "lowercase")]
@@ -87,18 +87,24 @@ pub struct AvailableModel {
     pub supported_efforts: Vec<EffortLevel>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub context_window: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub price_per_mtok: Option<PriceConfig>,
 }
 
 pub fn validate_config(config: &Config) -> Result<()> {
-    resolve_model_ref(config, &config.default_model)
-        .with_context(|| "invalid `default_model` in config.jsonc")?;
+    first_model_ref(config)?;
     if let Some(review_model) = config.guardrail.review_model.as_deref() {
         resolve_model_ref(config, review_model)
             .with_context(|| "invalid `guardrail.review_model` in config.jsonc")?;
     }
     Ok(())
+}
+
+pub fn first_model_ref(config: &Config) -> Result<ResolvedModelRef> {
+    for (provider_id, provider) in config.providers.iter() {
+        if let Some((model_id, _)) = provider.models.iter().next() {
+            return resolve_exact_model(config, provider_id, model_id, None);
+        }
+    }
+    bail!("no models configured in config.jsonc")
 }
 
 pub fn resolve_model_ref(config: &Config, raw: &str) -> Result<ResolvedModelRef> {
@@ -160,11 +166,11 @@ pub fn validate_model_effort(config: &Config, model: &ResolvedModelRef) -> Resul
 }
 
 pub fn available_models(config: &Config) -> AvailableModelsPayload {
-    let mut providers = config
+    let providers = config
         .providers
         .iter()
         .map(|(provider_id, provider)| {
-            let mut models = provider
+            let models = provider
                 .models
                 .iter()
                 .map(|(model_id, model)| AvailableModel {
@@ -172,17 +178,14 @@ pub fn available_models(config: &Config) -> AvailableModelsPayload {
                     model_id: model_id.clone(),
                     supported_efforts: model.supported_efforts.clone().unwrap_or_default(),
                     context_window: model.context_window,
-                    price_per_mtok: model.price_per_mtok.clone(),
                 })
                 .collect::<Vec<_>>();
-            models.sort_by(|left, right| left.model_id.cmp(&right.model_id));
             AvailableProvider {
                 id: provider_id.clone(),
                 models,
             }
         })
         .collect::<Vec<_>>();
-    providers.sort_by(|left, right| left.id.cmp(&right.id));
     AvailableModelsPayload { providers }
 }
 
@@ -272,23 +275,22 @@ mod tests {
     use super::*;
     use crate::config::{
         CircuitBreakerConfig, CompactionConfig, GuardrailConfig, LimitsConfig, ModelConfig,
-        ProviderConfig, RedactionConfig, TerminalBellConfig,
+        OrderedMap, ProviderConfig, RedactionConfig, TerminalBellConfig,
     };
 
     fn test_config() -> Config {
         Config {
-            providers: HashMap::from([
+            providers: OrderedMap::from_iter([
                 (
                     "alpha".into(),
                     ProviderConfig {
                         base_url: "https://alpha.test/v1".into(),
                         api_key_env: "ALPHA_KEY".into(),
-                        models: HashMap::from([
+                        models: OrderedMap::from_iter([
                             (
                                 "common-model".into(),
                                 ModelConfig {
                                     context_window: Some(100),
-                                    price_per_mtok: None,
                                     supported_efforts: Some(vec![
                                         EffortLevel::Low,
                                         EffortLevel::Medium,
@@ -300,7 +302,6 @@ mod tests {
                                 "nested/model".into(),
                                 ModelConfig {
                                     context_window: Some(200),
-                                    price_per_mtok: None,
                                     supported_efforts: None,
                                 },
                             ),
@@ -312,18 +313,16 @@ mod tests {
                     ProviderConfig {
                         base_url: "https://beta.test/v1".into(),
                         api_key_env: "BETA_KEY".into(),
-                        models: HashMap::from([(
+                        models: OrderedMap::from_iter([(
                             "common-model".into(),
                             ModelConfig {
                                 context_window: Some(300),
-                                price_per_mtok: None,
                                 supported_efforts: Some(vec![EffortLevel::Max]),
                             },
                         )]),
                     },
                 ),
             ]),
-            default_model: "alpha/common-model:medium".into(),
             compaction: CompactionConfig::default(),
             limits: LimitsConfig::default(),
             guardrail: GuardrailConfig {
@@ -354,11 +353,58 @@ mod tests {
     }
 
     #[test]
-    fn validate_config_checks_default_and_review_models() {
+    fn validate_config_checks_first_and_review_models() {
         validate_config(&test_config()).unwrap();
 
         let mut invalid = test_config();
-        invalid.default_model = "alpha/missing".into();
+        invalid.guardrail.review_model = Some("alpha/missing".into());
         assert!(validate_config(&invalid).is_err());
+    }
+
+    #[test]
+    fn first_model_uses_configured_order() {
+        let resolved = first_model_ref(&test_config()).unwrap();
+        assert_eq!(resolved.canonical, "alpha/common-model");
+    }
+
+    #[test]
+    fn first_model_skips_empty_providers() {
+        let mut config = test_config();
+        config.providers = OrderedMap::from_iter([
+            (
+                "empty".into(),
+                ProviderConfig {
+                    base_url: "https://empty.test/v1".into(),
+                    api_key_env: "EMPTY_KEY".into(),
+                    models: OrderedMap::default(),
+                },
+            ),
+            (
+                "alpha".into(),
+                ProviderConfig {
+                    base_url: "https://alpha.test/v1".into(),
+                    api_key_env: "ALPHA_KEY".into(),
+                    models: OrderedMap::from_iter([(
+                        "first-real".into(),
+                        ModelConfig {
+                            context_window: None,
+                            supported_efforts: None,
+                        },
+                    )]),
+                },
+            ),
+        ]);
+
+        let resolved = first_model_ref(&config).unwrap();
+        assert_eq!(resolved.canonical, "alpha/first-real");
+    }
+
+    #[test]
+    fn available_models_uses_configured_order() {
+        let payload = available_models(&test_config());
+        assert_eq!(payload.providers[0].id, "alpha");
+        assert_eq!(payload.providers[1].id, "beta");
+        assert_eq!(payload.providers[0].models[0].id, "alpha/common-model");
+        assert_eq!(payload.providers[0].models[1].id, "alpha/nested/model");
     }
 }

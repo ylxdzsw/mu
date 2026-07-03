@@ -7,7 +7,7 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use crate::config::{Config, GuardrailConfig};
-use crate::models::RequestOptions;
+use crate::models::{RequestOptions, ResolvedModelRef};
 use crate::provider::{Message, Provider, ProviderError, approx_tokens};
 use crate::{bash, provider};
 
@@ -115,16 +115,22 @@ pub enum GuardrailOutcome {
 pub struct Guardrail {
     config: GuardrailConfig,
     runtime: Config,
+    active_model: ResolvedModelRef,
     consecutive_denials: u32,
     recent_denials: VecDeque<bool>,
     interrupt_triggered: bool,
 }
 
 impl Guardrail {
-    pub fn new(config: &Config, _provider: Arc<dyn Provider>) -> Self {
+    pub fn new(
+        config: &Config,
+        active_model: &ResolvedModelRef,
+        _provider: Arc<dyn Provider>,
+    ) -> Self {
         Self {
             config: config.guardrail.clone(),
             runtime: config.clone(),
+            active_model: active_model.clone(),
             consecutive_denials: 0,
             recent_denials: VecDeque::new(),
             interrupt_triggered: false,
@@ -141,14 +147,12 @@ impl Guardrail {
     /// the reviewer itself is malfunctioning).
     pub async fn assess(&mut self, action: &Value, context: &[Message]) -> GuardrailOutcome {
         bash::install_signal_forwarder();
-        let model_ref = self
-            .config
-            .review_model
-            .as_deref()
-            .unwrap_or(&self.runtime.default_model);
-        let request_model = match crate::models::resolve_model_ref(&self.runtime, model_ref) {
-            Ok(model) => model,
-            Err(error) => return GuardrailOutcome::Failed(error),
+        let request_model = match self.config.review_model.as_deref() {
+            Some(model_ref) => match crate::models::resolve_model_ref(&self.runtime, model_ref) {
+                Ok(model) => model,
+                Err(error) => return GuardrailOutcome::Failed(error),
+            },
+            None => self.active_model.clone(),
         };
         let provider = match provider::build_provider(&self.runtime, &request_model.provider_id) {
             Ok(provider) => provider,
@@ -637,13 +641,18 @@ mod tests {
             },
             runtime: Config {
                 providers: Default::default(),
-                default_model: String::new(),
                 compaction: crate::config::CompactionConfig::default(),
                 limits: crate::config::LimitsConfig::default(),
                 guardrail: GuardrailConfig::default(),
                 terminal_bell: crate::config::TerminalBellConfig::default(),
                 redaction: crate::config::RedactionConfig::default(),
                 env: Default::default(),
+            },
+            active_model: crate::models::ResolvedModelRef {
+                canonical: "test/model".into(),
+                provider_id: "test".into(),
+                model_id: "model".into(),
+                effort: None,
             },
             consecutive_denials: 0,
             recent_denials: VecDeque::new(),

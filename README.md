@@ -20,7 +20,7 @@ export OPENAI_API_KEY=...  # or your provider key
 
 `mu` creates `~/.mu/config.jsonc` automatically with an OpenAI-compatible
 starter provider if the file does not exist. Edit that file to use another
-OpenAI-compatible endpoint, API-key env var, or default model.
+OpenAI-compatible endpoint, API-key env var, or configured model order.
 
 Run a single turn by piping a prompt to `mu`, pass a prompt file directly to
 `mu` for file-backed prompts and executable prompt scripts, or source the zsh
@@ -181,7 +181,9 @@ another discovered project; pass `--force` only when you explicitly want that.
 Providers and models are configured directly in `config.jsonc`. Model
 references use the same format everywhere: `provider/model[:effort]`, where the
 effort suffix is optional. A bare `model[:effort]` is also accepted when that
-model id is provided by exactly one configured provider.
+model id is provided by exactly one configured provider. In a scope with no
+sessions yet, `mu` uses the first configured model; project config order takes
+precedence over global config order.
 
 `terminal_bell.enabled` defaults to `true`. When enabled, `mu --output terminal`
 rings the terminal bell after a successful turn that ran for at least

@@ -74,7 +74,11 @@ impl<'a> AgentLoop<'a> {
         .await?;
 
         let mut guardrail = if self.config.guardrail.enabled {
-            Some(Guardrail::new(self.config, self.provider.clone()))
+            Some(Guardrail::new(
+                self.config,
+                &self.request.model,
+                self.provider.clone(),
+            ))
         } else {
             None
         };
@@ -854,22 +858,20 @@ mod tests {
 
     fn test_config() -> Config {
         Config {
-            providers: HashMap::from([(
+            providers: crate::config::OrderedMap::from_iter([(
                 "test".into(),
                 ProviderConfig {
                     base_url: "http://localhost".into(),
                     api_key_env: "MU_TEST_KEY".into(),
-                    models: HashMap::from([(
+                    models: crate::config::OrderedMap::from_iter([(
                         "fake-model".into(),
                         crate::config::ModelConfig {
                             context_window: None,
-                            price_per_mtok: None,
                             supported_efforts: None,
                         },
                     )]),
                 },
             )]),
-            default_model: "test/fake-model".into(),
             compaction: CompactionConfig::default(),
             limits: LimitsConfig::default(),
             guardrail: GuardrailConfig::default(),

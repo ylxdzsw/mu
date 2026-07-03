@@ -165,7 +165,6 @@ pub fn prune_spills(state_dir: &Path) {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
     use std::path::Path;
 
     use async_trait::async_trait;
@@ -204,22 +203,20 @@ mod tests {
 
     fn test_config() -> Config {
         Config {
-            providers: HashMap::from([(
+            providers: crate::config::OrderedMap::from_iter([(
                 "test".into(),
                 crate::config::ProviderConfig {
                     base_url: "http://localhost".into(),
                     api_key_env: "TEST_KEY".into(),
-                    models: HashMap::from([(
+                    models: crate::config::OrderedMap::from_iter([(
                         "fake-model".into(),
                         crate::config::ModelConfig {
                             context_window: None,
-                            price_per_mtok: None,
                             supported_efforts: None,
                         },
                     )]),
                 },
             )]),
-            default_model: "test/fake-model".into(),
             compaction: crate::config::CompactionConfig {
                 fraction: 0.75,
                 keep_recent_turns: 2,

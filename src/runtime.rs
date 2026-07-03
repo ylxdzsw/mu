@@ -5,7 +5,7 @@ use std::process::Command;
 use crate::config::Config;
 use crate::models::{
     AvailableModelsPayload, RequestOptions, ResolvedModelInfo, ResolvedModelRef, available_models,
-    resolve_model_info, resolve_model_ref,
+    first_model_ref, resolve_model_info, resolve_model_ref,
 };
 use crate::skills::CommandMeta;
 use crate::store::{Session, Store};
@@ -125,26 +125,25 @@ pub fn resolve_invocation(
         });
     }
 
-    let latest_scope_session = store.latest_session()?;
-    let seed_ref = overrides
-        .model
-        .as_deref()
-        .or_else(|| {
-            latest_scope_session
-                .as_ref()
-                .map(|session| session.model.as_str())
-        })
-        .unwrap_or(config.default_model.as_str());
-    let request_ref = overrides.model.as_deref().unwrap_or(seed_ref);
+    let seed_model = if let Some(model_ref) = overrides.model.as_deref() {
+        resolve_model_ref(config, model_ref)?
+    } else if let Some(session) = store.latest_session()? {
+        resolve_model_ref(config, &session.model)?
+    } else {
+        first_model_ref(config)?
+    };
+    let request_model = if let Some(model_ref) = overrides.model.as_deref() {
+        resolve_model_ref(config, model_ref)?
+    } else {
+        seed_model.clone()
+    };
 
     Ok(ResolvedInvocation {
         attached_session: None,
         request: RequestOptions {
-            model: resolve_model_ref(config, request_ref)?,
+            model: request_model,
         },
-        session_seed: RequestOptions {
-            model: resolve_model_ref(config, seed_ref)?,
-        },
+        session_seed: RequestOptions { model: seed_model },
     })
 }
 
@@ -312,29 +311,27 @@ mod tests {
 
     use super::*;
     use crate::config::{
-        CompactionConfig, Config, GuardrailConfig, LimitsConfig, ModelConfig, ProviderConfig,
-        RedactionConfig, TerminalBellConfig,
+        CompactionConfig, Config, GuardrailConfig, LimitsConfig, ModelConfig, OrderedMap,
+        ProviderConfig, RedactionConfig, TerminalBellConfig,
     };
     use crate::models::EffortLevel;
 
     fn test_config() -> Config {
         Config {
-            providers: HashMap::from([(
+            providers: OrderedMap::from_iter([(
                 "alpha".into(),
                 ProviderConfig {
                     base_url: "http://localhost".into(),
                     api_key_env: "MU_TEST_KEY".into(),
-                    models: HashMap::from([(
+                    models: OrderedMap::from_iter([(
                         "default-model".into(),
                         ModelConfig {
                             context_window: Some(100),
-                            price_per_mtok: None,
                             supported_efforts: Some(vec![EffortLevel::Low, EffortLevel::High]),
                         },
                     )]),
                 },
             )]),
-            default_model: "alpha/default-model:low".into(),
             compaction: CompactionConfig::default(),
             limits: LimitsConfig::default(),
             guardrail: GuardrailConfig::default(),
@@ -342,6 +339,17 @@ mod tests {
             redaction: RedactionConfig::default(),
             env: HashMap::new(),
         }
+    }
+
+    #[test]
+    fn new_scope_uses_first_configured_model() {
+        let store = Store::open_memory().unwrap();
+
+        let resolved =
+            resolve_invocation(&store, &test_config(), &InvocationOverrides::default()).unwrap();
+
+        assert_eq!(resolved.request.model.canonical, "alpha/default-model");
+        assert_eq!(resolved.session_seed.model.canonical, "alpha/default-model");
     }
 
     #[test]

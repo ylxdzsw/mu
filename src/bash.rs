@@ -568,8 +568,6 @@ fn wait_for_exit(child: &mut std::process::Child, grace: Duration) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
-
     use super::run_bash;
     use crate::config::{
         CompactionConfig, Config, GuardrailConfig, LimitsConfig, ProviderConfig, RedactionConfig,
@@ -596,15 +594,14 @@ mod tests {
 
     fn test_config(env: &[(&str, &str)], redaction_env: &[&str]) -> Config {
         Config {
-            providers: HashMap::from([(
+            providers: crate::config::OrderedMap::from_iter([(
                 "test".into(),
                 ProviderConfig {
                     base_url: "https://example.test".into(),
                     api_key_env: "OPENAI_API_KEY".into(),
-                    models: HashMap::new(),
+                    models: crate::config::OrderedMap::default(),
                 },
             )]),
-            default_model: "test/model".into(),
             compaction: CompactionConfig::default(),
             limits: LimitsConfig::default(),
             guardrail: GuardrailConfig::default(),

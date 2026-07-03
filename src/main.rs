@@ -249,17 +249,16 @@ async fn run() -> Result<()> {
                     paths::ensure_project_layout(&scope)?;
                     let store = store::Store::open(&db_path)?;
                     let latest = store.latest_session()?;
-                    let inherited_model = latest.as_ref().map(|session| session.model.clone());
-                    let default_model = if inherited_model.is_some() {
-                        None
-                    } else {
-                        Some(Config::load_for_scope(project_config_dir.as_deref())?.default_model)
+                    let model = match latest.as_ref().map(|session| session.model.clone()) {
+                        Some(model) => model,
+                        None => {
+                            let config = Config::load_for_scope(project_config_dir.as_deref())?;
+                            models::first_model_ref(&config)?.canonical
+                        }
                     };
                     let session = store.create_session_with_origin(
                         &cwd.display().to_string(),
-                        inherited_model
-                            .as_deref()
-                            .unwrap_or(default_model.as_deref().unwrap()),
+                        &model,
                         origin,
                     )?;
                     store.append_message(

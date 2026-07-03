@@ -235,8 +235,7 @@ export async function startHarness(): Promise<Harness> {
         }
       }
     }
-  },
-  "default_model": "fake/fake-model"
+  }
 }
 `;
   await writeFile(path.join(projectDir, ".mu", "config.jsonc"), configBody);

@@ -120,24 +120,22 @@ fn byte_index_after_chars(text: &str, chars: usize) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
-
     use super::*;
     use crate::config::{
-        CompactionConfig, Config, GuardrailConfig, LimitsConfig, ProviderConfig, RedactionConfig,
+        CompactionConfig, Config, GuardrailConfig, LimitsConfig, OrderedMap, ProviderConfig,
+        RedactionConfig,
     };
 
     fn config(env: &[(&str, &str)], redaction_env: &[&str]) -> Config {
         Config {
-            providers: HashMap::from([(
+            providers: OrderedMap::from_iter([(
                 "test".into(),
                 ProviderConfig {
                     base_url: "https://example.test".into(),
                     api_key_env: "OPENAI_API_KEY".into(),
-                    models: HashMap::new(),
+                    models: OrderedMap::default(),
                 },
             )]),
-            default_model: "test/model".into(),
             compaction: CompactionConfig::default(),
             limits: LimitsConfig::default(),
             guardrail: GuardrailConfig::default(),

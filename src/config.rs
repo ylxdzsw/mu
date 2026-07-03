@@ -1,8 +1,10 @@
 use std::collections::HashMap;
+use std::fmt;
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
-use serde::{Deserialize, Serialize};
+use serde::de::{MapAccess, Visitor};
+use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::env::EnvMap;
 use crate::models::EffortLevel;
@@ -11,9 +13,7 @@ use crate::paths;
 #[derive(Debug, Clone, Deserialize)]
 pub struct Config {
     #[serde(default)]
-    pub providers: HashMap<String, ProviderConfig>,
-    #[serde(default)]
-    pub default_model: String,
+    pub providers: OrderedMap<ProviderConfig>,
     #[serde(default)]
     pub compaction: CompactionConfig,
     #[serde(default)]
@@ -35,22 +35,14 @@ pub struct ProviderConfig {
     #[serde(default)]
     pub api_key_env: String,
     #[serde(default)]
-    pub models: HashMap<String, ModelConfig>,
+    pub models: OrderedMap<ModelConfig>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ModelConfig {
     pub context_window: Option<u64>,
     #[serde(default)]
-    pub price_per_mtok: Option<PriceConfig>,
-    #[serde(default)]
     pub supported_efforts: Option<Vec<EffortLevel>>,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct PriceConfig {
-    pub input: f64,
-    pub output: f64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -107,6 +99,138 @@ pub struct TerminalBellConfig {
 pub struct RedactionConfig {
     #[serde(default)]
     pub env: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct OrderedMap<T> {
+    entries: Vec<(String, T)>,
+}
+
+impl<T> Default for OrderedMap<T> {
+    fn default() -> Self {
+        Self {
+            entries: Vec::new(),
+        }
+    }
+}
+
+impl<T> OrderedMap<T> {
+    pub fn get(&self, key: &str) -> Option<&T> {
+        self.entries
+            .iter()
+            .find(|(candidate, _)| candidate == key)
+            .map(|(_, value)| value)
+    }
+
+    pub fn contains_key(&self, key: &str) -> bool {
+        self.get(key).is_some()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = (&String, &T)> {
+        self.entries.iter().map(|(key, value)| (key, value))
+    }
+
+    pub fn iter_mut(&mut self) -> impl Iterator<Item = (&String, &mut T)> {
+        self.entries.iter_mut().map(|(key, value)| (&*key, value))
+    }
+
+    pub fn values(&self) -> impl Iterator<Item = &T> {
+        self.entries.iter().map(|(_, value)| value)
+    }
+
+    pub fn keys(&self) -> impl Iterator<Item = &String> {
+        self.entries.iter().map(|(key, _)| key)
+    }
+
+    pub fn reorder_by_keys(&mut self, order: &[String]) {
+        let mut remaining = std::mem::take(&mut self.entries);
+        let mut ordered = Vec::with_capacity(remaining.len());
+        for key in order {
+            if let Some(index) = remaining.iter().position(|(candidate, _)| candidate == key) {
+                ordered.push(remaining.remove(index));
+            }
+        }
+        ordered.extend(remaining);
+        self.entries = ordered;
+    }
+}
+
+impl<'a, T> IntoIterator for &'a OrderedMap<T> {
+    type Item = (&'a String, &'a T);
+    type IntoIter =
+        std::iter::Map<std::slice::Iter<'a, (String, T)>, fn(&(String, T)) -> (&String, &T)>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        fn as_refs<T>((key, value): &(String, T)) -> (&String, &T) {
+            (key, value)
+        }
+        self.entries.iter().map(as_refs::<T>)
+    }
+}
+
+impl<T> FromIterator<(String, T)> for OrderedMap<T> {
+    fn from_iter<I: IntoIterator<Item = (String, T)>>(iter: I) -> Self {
+        let mut entries = Vec::new();
+        for (key, value) in iter {
+            if let Some((_, existing)) = entries.iter_mut().find(|(candidate, _)| candidate == &key)
+            {
+                *existing = value;
+            } else {
+                entries.push((key, value));
+            }
+        }
+        Self { entries }
+    }
+}
+
+impl<'de, T> Deserialize<'de> for OrderedMap<T>
+where
+    T: Deserialize<'de>,
+{
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct OrderedMapVisitor<T> {
+            marker: std::marker::PhantomData<T>,
+        }
+
+        impl<'de, T> Visitor<'de> for OrderedMapVisitor<T>
+        where
+            T: Deserialize<'de>,
+        {
+            type Value = OrderedMap<T>;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("an object")
+            }
+
+            fn visit_map<A>(self, mut access: A) -> std::result::Result<Self::Value, A::Error>
+            where
+                A: MapAccess<'de>,
+            {
+                let mut entries = Vec::with_capacity(access.size_hint().unwrap_or(0));
+                while let Some((key, value)) = access.next_entry::<String, T>()? {
+                    if let Some((_, existing)) =
+                        entries.iter_mut().find(|(candidate, _)| candidate == &key)
+                    {
+                        *existing = value;
+                    } else {
+                        entries.push((key, value));
+                    }
+                }
+                Ok(OrderedMap { entries })
+            }
+        }
+
+        deserializer.deserialize_map(OrderedMapVisitor {
+            marker: std::marker::PhantomData,
+        })
+    }
 }
 
 fn default_fraction() -> f64 {
@@ -203,17 +327,20 @@ impl Config {
     pub fn load_for_scope(project_config_dir: Option<&Path>) -> Result<Self> {
         let global_path = paths::global_dir().join("config.jsonc");
         ensure_starter_config(&global_path)?;
-        let mut value = read_config_value(&global_path)?;
+        let (mut value, global_order) = read_config_file(&global_path)?;
+        let mut order = combined_config_order(&global_order, None);
 
         if let Some(dir) = project_config_dir {
             let project_path = dir.join("config.jsonc");
             if project_path.exists() {
-                let project = read_config_value(&project_path)?;
+                let (project, project_order) = read_config_file(&project_path)?;
                 merge_json(&mut value, project);
+                order = combined_config_order(&global_order, Some(&project_order));
             }
         }
 
         let mut config = config_from_value(value)?;
+        apply_config_order(&mut config, &order);
         config.env = crate::env::load_effective(project_config_dir)?;
         config.validate_runtime()?;
         Ok(config)
@@ -256,9 +383,6 @@ impl Config {
         if self.providers.is_empty() {
             bail!("no providers configured in config.jsonc: set `providers`");
         }
-        if self.default_model.trim().is_empty() {
-            bail!("no default model configured in config.jsonc: set `default_model`");
-        }
         for (provider_id, provider) in &self.providers {
             if provider.base_url.trim().is_empty() {
                 bail!("provider `{provider_id}` is missing `base_url` in config.jsonc");
@@ -290,15 +414,96 @@ fn config_from_value(value: serde_json::Value) -> Result<Config> {
     Ok(config)
 }
 
-fn read_config_value(path: &Path) -> Result<serde_json::Value> {
+fn read_config_file(path: &Path) -> Result<(serde_json::Value, ConfigOrder)> {
     if !path.exists() {
         bail!("config not found at {}", path.display());
     }
     let raw =
         std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
-    jsonc_parser::parse_to_serde_value::<Option<serde_json::Value>>(&raw, &Default::default())
-        .map_err(|e| anyhow::anyhow!("parsing {}: {e}", path.display()))?
-        .ok_or_else(|| anyhow::anyhow!("{} is empty", path.display()))
+    let value =
+        jsonc_parser::parse_to_serde_value::<Option<serde_json::Value>>(&raw, &Default::default())
+            .map_err(|e| anyhow::anyhow!("parsing {}: {e}", path.display()))?
+            .ok_or_else(|| anyhow::anyhow!("{} is empty", path.display()))?;
+    let order =
+        jsonc_parser::parse_to_serde_value::<Option<ConfigOrderRaw>>(&raw, &Default::default())
+            .map_err(|e| anyhow::anyhow!("parsing {}: {e}", path.display()))?
+            .unwrap_or_default()
+            .into_order();
+    Ok((value, order))
+}
+
+#[derive(Debug, Clone, Default)]
+struct ConfigOrder {
+    providers: Vec<String>,
+    models: HashMap<String, Vec<String>>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct ConfigOrderRaw {
+    #[serde(default)]
+    providers: OrderedMap<ProviderOrderRaw>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct ProviderOrderRaw {
+    #[serde(default)]
+    models: OrderedMap<serde::de::IgnoredAny>,
+}
+
+impl ConfigOrderRaw {
+    fn into_order(self) -> ConfigOrder {
+        let providers = self.providers.keys().cloned().collect::<Vec<_>>();
+        let models = self
+            .providers
+            .iter()
+            .map(|(provider_id, provider)| {
+                (
+                    provider_id.clone(),
+                    provider.models.keys().cloned().collect::<Vec<_>>(),
+                )
+            })
+            .collect::<HashMap<_, _>>();
+        ConfigOrder { providers, models }
+    }
+}
+
+fn combined_config_order(global: &ConfigOrder, project: Option<&ConfigOrder>) -> ConfigOrder {
+    let Some(project) = project else {
+        return global.clone();
+    };
+
+    let mut providers = project.providers.clone();
+    providers.extend(
+        global
+            .providers
+            .iter()
+            .filter(|provider_id| !project.providers.contains(provider_id))
+            .cloned(),
+    );
+
+    let mut models = HashMap::new();
+    for provider_id in &providers {
+        let project_models = project.models.get(provider_id).cloned().unwrap_or_default();
+        let global_models = global.models.get(provider_id).cloned().unwrap_or_default();
+        let mut merged_models = project_models.clone();
+        merged_models.extend(
+            global_models
+                .into_iter()
+                .filter(|model_id| !project_models.contains(model_id)),
+        );
+        models.insert(provider_id.clone(), merged_models);
+    }
+
+    ConfigOrder { providers, models }
+}
+
+fn apply_config_order(config: &mut Config, order: &ConfigOrder) {
+    config.providers.reorder_by_keys(&order.providers);
+    for (provider_id, provider) in config.providers.iter_mut() {
+        if let Some(model_order) = order.models.get(provider_id) {
+            provider.models.reorder_by_keys(model_order);
+        }
+    }
 }
 
 fn merge_json(base: &mut serde_json::Value, overlay: serde_json::Value) {
@@ -325,13 +530,11 @@ const STARTER_CONFIG: &str = r#"{
       "models": {
         "gpt-4o": {
           "context_window": 128000,
-          "price_per_mtok": { "input": 2.5, "output": 10.0 },
           "supported_efforts": ["low", "medium", "high"]
         }
       }
     }
   },
-  "default_model": "openai/gpt-4o",
   "terminal_bell": {
     "enabled": true,
     "min_duration_ms": 10000
@@ -370,7 +573,6 @@ mod tests {
                     "models": {"one": {"context_window": 1}}
                 }
             },
-            "default_model": "alpha/one",
             "limits": {"max_iterations": 5, "max_lines": 10}
         });
         let overlay = serde_json::json!({
@@ -384,12 +586,10 @@ mod tests {
                     "models": {"three": {"context_window": 3}}
                 }
             },
-            "default_model": "beta/three",
             "limits": {"max_lines": 20}
         });
         merge_json(&mut base, overlay);
 
-        assert_eq!(base["default_model"], "beta/three");
         assert_eq!(
             base["providers"]["alpha"]["models"]["one"]["context_window"],
             1
@@ -409,15 +609,14 @@ mod tests {
     #[test]
     fn api_key_reads_effective_env_for_provider() {
         let config = Config {
-            providers: HashMap::from([(
+            providers: OrderedMap::from_iter([(
                 "alpha".into(),
                 ProviderConfig {
                     base_url: "http://localhost".into(),
                     api_key_env: "TEST_KEY".into(),
-                    models: HashMap::new(),
+                    models: OrderedMap::default(),
                 },
             )]),
-            default_model: "alpha/test-model".into(),
             compaction: CompactionConfig::default(),
             limits: LimitsConfig::default(),
             guardrail: GuardrailConfig::default(),
@@ -433,7 +632,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_rejects_missing_default_model() {
+    fn parse_accepts_without_explicit_default() {
         let value = serde_json::json!({
             "providers": {
                 "openai": {
@@ -443,7 +642,41 @@ mod tests {
             }
         });
 
-        let err = config_from_value(value).unwrap_err();
-        assert!(err.to_string().contains("no default model configured"));
+        config_from_value(value).unwrap();
+    }
+
+    #[test]
+    fn project_order_takes_precedence_over_global_order() {
+        let global = ConfigOrder {
+            providers: vec!["global-first".into(), "shared".into()],
+            models: HashMap::from([
+                ("global-first".into(), vec!["g1".into()]),
+                (
+                    "shared".into(),
+                    vec!["global-model".into(), "shared-model".into()],
+                ),
+            ]),
+        };
+        let project = ConfigOrder {
+            providers: vec!["shared".into(), "project-only".into()],
+            models: HashMap::from([
+                (
+                    "shared".into(),
+                    vec!["project-model".into(), "shared-model".into()],
+                ),
+                ("project-only".into(), vec!["p1".into()]),
+            ]),
+        };
+
+        let order = combined_config_order(&global, Some(&project));
+
+        assert_eq!(
+            order.providers,
+            vec!["shared", "project-only", "global-first"]
+        );
+        assert_eq!(
+            order.models["shared"],
+            vec!["project-model", "shared-model", "global-model"]
+        );
     }
 }
