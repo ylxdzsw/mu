@@ -44,8 +44,10 @@ pub struct StatusReport {
     pub git: Option<GitStatus>,
     pub session: Option<StatusSession>,
     pub active: StatusActiveTurn,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub incomplete_turn: Option<IncompleteTurnStatus>,
+    /// Whether the selected session's last turn finished cleanly. `false` means
+    /// it was interrupted; the next prompt continues on top of it or `mu retry`
+    /// resumes it. `true` when there is no selected session.
+    pub clean: bool,
     pub compaction: Option<CompactionStatus>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub available_models: Option<AvailableModelsPayload>,
@@ -81,12 +83,6 @@ pub struct StatusActiveTurn {
 }
 
 #[derive(Debug, Clone, Serialize)]
-pub struct IncompleteTurnStatus {
-    pub retry_count: u64,
-    pub error_message: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize)]
 pub struct CompactionStatus {
     pub latest_summary_seq: Option<i64>,
 }
@@ -104,7 +100,7 @@ pub fn resolve_invocation(
         Some(
             store
                 .get_session(id)?
-                .ok_or_else(|| anyhow::anyhow!("session not found in active scope: {id}"))?,
+                .ok_or_else(|| crate::exit::ExitError::session_not_found(id))?,
         )
     } else if overrides.continue_latest {
         store.latest_session()?
@@ -167,30 +163,12 @@ pub fn build_status_report(
         .attached_session
         .as_ref()
         .is_some_and(|session| store.is_session_busy(&session.id));
-    let incomplete_turn = resolved
+    let clean = resolved
         .attached_session
         .as_ref()
-        .map(|session| {
-            store.pending_turn(&session.id).map(|pending| {
-                pending.and_then(|pending| match pending.state {
-                    crate::store::PendingState::Incomplete => Some(IncompleteTurnStatus {
-                        retry_count: pending.retry_count,
-                        error_message: pending.error_message,
-                    }),
-                    crate::store::PendingState::Running if !active => Some(IncompleteTurnStatus {
-                        retry_count: pending.retry_count,
-                        error_message: Some(
-                            pending
-                                .error_message
-                                .unwrap_or_else(|| "previous turn was interrupted".to_string()),
-                        ),
-                    }),
-                    crate::store::PendingState::Running => None,
-                })
-            })
-        })
+        .map(|session| store.is_session_clean(&session.id))
         .transpose()?
-        .flatten();
+        .unwrap_or(true);
     let compaction = resolved
         .attached_session
         .as_ref()
@@ -216,7 +194,7 @@ pub fn build_status_report(
         git: project.map(git_status),
         session: session_summary.map(status_session),
         active: StatusActiveTurn { busy: active },
-        incomplete_turn,
+        clean,
         compaction,
         available_models: include_models.then(|| available_models(config)),
         commands,
@@ -382,7 +360,7 @@ mod tests {
     }
 
     #[test]
-    fn status_report_surfaces_incomplete_turn() {
+    fn status_report_reports_cleanliness() {
         let store = Store::open_memory().unwrap();
         let session = store
             .create_session_with_origin(
@@ -391,14 +369,22 @@ mod tests {
                 crate::store::SessionOrigin::Cli,
             )
             .unwrap();
+        // A user prompt with no assistant reply => interrupted => unclean.
         store
-            .begin_pending_turn(
+            .append_message(
                 &session.id,
-                &crate::provider::UserContent::Text("retry".into()),
+                &crate::provider::Message::User {
+                    content: crate::provider::UserContent::Text("hi".into()),
+                },
             )
             .unwrap();
         store
-            .mark_pending_incomplete(&session.id, "previous turn was interrupted")
+            .append_message(
+                &session.id,
+                &crate::provider::Message::User {
+                    content: crate::provider::UserContent::Text("retry".into()),
+                },
+            )
             .unwrap();
 
         let report = build_status_report(
@@ -415,11 +401,31 @@ mod tests {
         )
         .unwrap();
 
-        let incomplete = report.incomplete_turn.expect("incomplete turn");
-        assert_eq!(incomplete.retry_count, 0);
-        assert_eq!(
-            incomplete.error_message.as_deref(),
-            Some("previous turn was interrupted")
-        );
+        assert!(!report.clean);
+
+        // A completed assistant reply => clean.
+        store
+            .append_message(
+                &session.id,
+                &crate::provider::Message::Assistant {
+                    content: Some("hello".into()),
+                    tool_calls: None,
+                },
+            )
+            .unwrap();
+        let report = build_status_report(
+            &store,
+            &test_config(),
+            &InvocationOverrides {
+                session: Some(session.id.clone()),
+                continue_latest: false,
+                model: None,
+            },
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+        assert!(report.clean);
     }
 }

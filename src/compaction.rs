@@ -8,6 +8,30 @@ use crate::provider::{Message, Provider, ProviderError};
 use crate::store::Store;
 use crate::{bash, truncate};
 
+/// Per-message caps applied only to the *summarization input*, so a very large
+/// history (e.g. many big tool outputs) cannot make the compaction request
+/// itself overflow. The stored transcript is untouched — this bounds only the
+/// text handed to the summarizer.
+const MAX_SUMMARY_ENTRY_CHARS: usize = 4000;
+const MAX_SUMMARY_TOOL_CHARS: usize = 2000;
+
+/// Clamp a single transcript entry to `max_chars`, keeping a head and tail
+/// (errors and results often live at the end) with an elision marker. Operates
+/// on `char`s so multi-byte codepoints are never split.
+fn clamp_for_summary(content: &str, max_chars: usize) -> String {
+    let total = content.chars().count();
+    if total <= max_chars {
+        return content.to_string();
+    }
+    let head = max_chars.saturating_sub(max_chars / 4);
+    let tail = max_chars.saturating_sub(head);
+    let chars: Vec<char> = content.chars().collect();
+    let omitted = total.saturating_sub(head + tail);
+    let head_str: String = chars[..head].iter().collect();
+    let tail_str: String = chars[total - tail..].iter().collect();
+    format!("{head_str}\n…[{omitted} chars elided for summary]…\n{tail_str}")
+}
+
 pub async fn maybe_compact(
     store: &Store,
     config: &Config,
@@ -74,16 +98,16 @@ pub async fn run_compaction(
         .iter()
         .filter(|m| m.seq < cut_seq && m.role != "summary")
         .map(|m| {
-            let role = match m.role.as_str() {
-                "user" => "user",
-                "assistant" => "assistant",
-                "tool" => "tool-result",
-                _ => "system",
+            let (role, cap) = match m.role.as_str() {
+                "user" => ("user", MAX_SUMMARY_ENTRY_CHARS),
+                "assistant" => ("assistant", MAX_SUMMARY_ENTRY_CHARS),
+                "tool" => ("tool-result", MAX_SUMMARY_TOOL_CHARS),
+                _ => ("system", MAX_SUMMARY_ENTRY_CHARS),
             };
             if m.content.is_empty() {
                 format!("[{role}]: (no text content)")
             } else {
-                format!("[{role}]: {}", m.content)
+                format!("[{role}]: {}", clamp_for_summary(&m.content, cap))
             }
         })
         .collect();

@@ -242,6 +242,9 @@ small:
 - `mu session unarchive --session <id>` — restore an archived session to
   default lists.
 - `mu compact --session <id>` — force compaction.
+- `mu retry [-s <id>] [-c]` — resume an interrupted (unclean) turn: normalize
+  the tail and continue the agent loop with no new prompt. No-op on a clean
+  session.
 - `npm --prefix web start -- <socket-path>` — serve the local browser UI on a
   Unix socket.
 
@@ -589,15 +592,21 @@ it in this order:
      `$MU_SESSION_FILE` when that env var is set (§11).
 5. **Acquire the session `flock`** (§11). If held, print "session busy", exit
    non-zero.
-6. **Build the context message list** from the DB: the latest compaction summary
-   message (if any) followed by all messages after it, in order.
+6. **Normalize any interrupted tail, then build the context list.** If the
+   previous turn was interrupted it may have left a dangling assistant
+   tool-call message (some `tool_calls` without a result). Synthesize an
+   interrupted result for each result-less call so the history is API-valid
+   (§11; idempotent — a no-op on a clean session). Then build the context
+   message list: the latest compaction summary message (if any) followed by all
+   messages after it, in order.
 7. **Pre-turn compaction check** (§11, Tier 1): if the session's stored
    `last_total_tokens` (or bytes÷4 on the first turn) exceeds the configured
    fraction of the model context window, run compaction now, then rebuild the
    context list.
 8. **Append the new user message** to the DB and to the context list. If images
    were attached, persist and reload the full multi-part user content
-   (text + image URLs), not only the textual projection.
+   (text + image URLs), not only the textual projection. (`mu retry` skips this
+   step: it resumes the existing, now-normalized history with no new prompt.)
 9. **Agent loop** — repeat until the model returns `finish_reason: "stop"` or the
    max-iterations cap is hit:
    a. Send the context list + tool definitions to the provider (streaming).
@@ -632,11 +641,14 @@ double-count). For the `in`/`out` token display, sum `prompt_tokens` and
 **Interruption.** Steps 9d/9e persist only *after* a message is fully formed. If
 SIGINT / a dropped connection / a provider error occurs mid-stream, the partial
 assistant message is never written; the DB holds only completed messages (§11).
-No tool call begins without first persisting its parent assistant message. Once
-tool execution has started, interrupts fan out to every active tool process
-group, stop launching new tools, drain partial output, and still persist tool
-results in request order, so Ctrl-C stops work without making already-produced
-tool output disappear.
+No tool call begins without first persisting its parent assistant message, and a
+result is persisted for every call that begins execution. Once tool execution
+has started, interrupts fan out to every active tool process group, stop
+launching new tools, drain partial output, and still persist tool results in
+request order, so Ctrl-C stops work without making already-produced tool output
+disappear. Nothing else is written on interruption: the process just exits. Any
+dangling tool-call left by the interruption is repaired by step 6 of the *next*
+invocation (see §11, "Interrupted turns and retry").
 
 ---
 
@@ -939,7 +951,10 @@ and a **`tools` array** carrying the `bash` tool definition
 `{type:"function", function:{name, description, parameters: <JSON schema>}}`).
 Tool definitions go in this dedicated `tools` parameter — **not** embedded in the
 system prompt. Request `stream_options:{include_usage:true}` so the final SSE
-chunk carries `usage`.
+chunk carries `usage`. When the resolved model reference includes a
+reasoning-effort suffix, it is sent as the top-level Chat Completions field
+`reasoning_effort: "<level>"` (not the Responses-API `reasoning:{effort}`
+object, which real OpenAI `/chat/completions` rejects).
 
 **Streaming accumulation (implement exactly).** The response is an SSE stream of
 `data: {json}` lines ending with `data: [DONE]`. For each chunk, look at
@@ -957,8 +972,10 @@ chunk carries `usage`.
 
 **Model context window.** The 75% threshold needs the model's max context size.
 Source it from `config.jsonc`: each configured model entry carries a
-`context_window` integer. mu does not fetch model cards. If a model has no configured `context_window`, compaction's Tier 1 is
-skipped for it and Tier 2 (API-error fallback) is the only guard.
+`context_window` integer. mu does not fetch model cards. If a model has no
+configured `context_window`, the threshold-based tiers (Tier 1 pre-turn and Tier
+2 in-loop) are skipped for it and the Tier 3 API-error fallback is the only
+guard.
 
 Model and provider selection come from `config.jsonc`: a `base_url`, the env var
 holding the API key, and ordered provider/model definitions. If the global config
@@ -1135,18 +1152,20 @@ The system prompt is intentionally minimal and assembled in this fixed order:
    > and any other CLI work. Each bash call is isolated; pass `cwd` explicitly
    > when needed. Keep responses concise.
    The exact wording lives in `src/prompts/system_preamble.md`; keep it short.
-2. An environment block, plain `key: value` lines:
+2. A `<runtime>` block of host-stable facts only, as plain `key: value` lines:
    ```
-   <env>
-   cwd: /home/user/project/subdir
-   project_root: /home/user/project
-   session_id: ...
+   <runtime>
    os: linux
    date: 2026-06-18
-   </env>
+   </runtime>
    ```
-   If the active scope is global, `project_root` is omitted. Worktree
-   information is included when available.
+   Per-session environment — current working directory, project root, session
+   id, and git worktree details — is **not** part of the system prompt. It is
+   introduced once as the first user message when the session is created, and a
+   later working-directory change is announced with a `<system-reminder>` on the
+   affected turn (§11, "Agent environment context"). Keeping this out of the
+   system prompt lets the system prefix stay identical across turns (and across
+   sessions in the same scope), which is friendlier to provider prompt caching.
 3. The `<available_skills>` block (§8), or omitted if there are no skills. Skill
    metadata is merged from global and active-project instruction indexes.
 4. The global `AGENTS.md` contents, if the file exists.
@@ -1191,9 +1210,12 @@ Conceptual schema (flat and small):
   compaction summary (§"Context window and compaction"); the context builder
   starts from the latest `summary` row and includes everything after it.
 - **tool_call** — `id`, `message_id`, `tool`, `args` (JSON), `risk`, `output`,
-  `status`, timings. Records the agent's tool invocations for inspection and the
-  renderer's truncation pointers. (Tool *results* fed back to the model are stored as
-  `tool` messages; this table is the structured audit copy.)
+  `status` (`ok` / `error` / `interrupted`), timings. Records the agent's tool
+  invocations for inspection and the renderer's truncation pointers. (Tool
+  *results* fed back to the model are stored as `tool` messages; this table is
+  the structured audit copy.) There is intentionally **no** turn-status or
+  checkpoint column on `session`: whether the last turn finished is derived from
+  the message tail (§"Interrupted turns and retry").
 
 ### Session mapping
 
@@ -1207,10 +1229,10 @@ V1 maps each interactive shell instance to at most one active session:
 - **Attach / continue.** `MU_ZSH_SESSION_ID=<id>` seeds the zsh plugin with an
   existing session, while `mu -s <id>` and `mu -c` handle one-shot re-entry from
   the command line. `mu session list` lists non-archived CLI-origin candidates.
-- **Per-turn lifecycle.** Each turn: open DB → acquire session lock → load
-  session messages → run turn (persisting each completed message as it lands) →
-  release lock → exit. The connection opens lazily so a turn that errors early
-  stays cheap.
+- **Per-turn lifecycle.** Each turn: open DB → acquire session lock → normalize
+  any interrupted tail → load session messages → run turn (persisting each
+  completed message as it lands) → release lock → exit. The connection opens
+  lazily so a turn that errors early stays cheap.
 
 Sessions are append-only logs; resuming replays messages into the context
 window. Multiple shells holding *different* sessions run concurrently (safe under
@@ -1251,23 +1273,64 @@ stored session `cwd`. It does not restate project information.
 Persistence is at **message granularity**, and only **completed** messages are
 written:
 
-- As the turn proceeds, each fully-formed message (a complete assistant message,
-  a complete tool result) is committed to SQLite as it lands.
-- A partial/in-flight message is **never** persisted. If the turn is interrupted
-  — Ctrl-C (SIGINT kills the process), a dropped connection, a provider error —
-  the incomplete message is simply discarded. Because `mu` is a per-turn process,
-  the partial state dies with the process; there is nothing to clean up.
-- On the next turn, context is reconstructed purely from completed messages, so
-  the history is always API-valid (no dangling tool-call without a result, the
-  problem opencode and codex have to actively repair because they persist
-  in-flight turns). The user simply re-prompts, or retries, from the last
-  committed message.
+- The user prompt is written when the turn starts. As the turn proceeds, each
+  fully-formed assistant message (including its `tool_calls`) is committed as its
+  stream completes, and each tool result is committed when that tool finishes.
+  A result is persisted for **every tool call that begins execution** — even one
+  killed mid-run gets a result recorded — so a side-effecting command is never
+  lost from history.
+- A partial/in-flight assistant message (streamed text, reasoning) is **never**
+  persisted. On interruption — Ctrl-C, a dropped connection, a provider error —
+  the process simply exits and the partial stream dies with it. Nothing is
+  written on the interruption path.
 
-This is simpler than opencode (which persists the partial turn and rewrites
-dangling tool calls into synthetic "interrupted" errors) and codex (which reads
-back a partial JSONL rollout) — both complications that only exist because those
-harnesses are long-lived. mu's per-process model makes "discard the incomplete
-message" correct and trivial.
+### Interrupted turns and retry
+
+There is **no** stored turn-status flag or checkpoint. Whether the last turn
+finished is *derived* from the message log:
+
+- A session is **clean** when its last message is a completed assistant reply
+  (an `assistant` message with no `tool_calls`), a compaction `summary`, or when
+  its only message is the synthetic environment seed (no real turn yet).
+- Otherwise it is **unclean**: the tail is a user prompt with no reply, a tool
+  result with no following assistant turn, or an assistant message still
+  carrying `tool_calls`.
+
+**Rationale — derive, don't store.** A separate boolean can drift out of sync
+with the messages (precisely in the crash cases that matter) and would risk
+"retrying" a turn that actually completed. The log is the single source of
+truth, so cleanliness is read from it and cannot desync.
+
+**Normalizing an interrupted tail.** Before any turn or retry runs, mu makes the
+tail API-valid: for the most recent assistant tool-call message, every
+`tool_call` that has no result gets a synthesized interrupted result
+(`INTERRUPTED_TOOL_RESULT`: "may have started and not completed; verify state").
+Calls that finished keep their real result untouched. This is idempotent (a
+no-op on a clean session).
+
+**Rationale — treat result-less calls uniformly.** We do **not** try to tell a
+call that "never started" from one "started but killed": the window between
+persisting a tool-call request and spawning the process is sub-millisecond, and
+a write may have realized side effects. Assuming "maybe executed" and asking the
+agent to verify is the safe, simple choice — it removes the need for any
+per-call "running" marker in the database.
+
+**Recovery is not a special mode.** On the next invocation:
+
+- A **new prompt** normalizes the tail, then appends on top and runs. This makes
+  the common "Ctrl-C to redirect" flow work: after interrupting, the user can
+  just type the next instruction; the agent sees the interrupted results and the
+  new prompt and continues or redirects. No forced retry, no stuck session.
+- **`mu retry`** normalizes the tail and re-runs the loop with *no* new prompt,
+  so the model continues the interrupted turn. It refuses on a clean session
+  ("nothing to retry").
+
+**Contrast with opencode/codex.** They persist the partial turn and must repair
+dangling tool calls / read back a partial rollout on resume, because they are
+long-lived. mu writes only completed messages, derives cleanliness structurally,
+and repairs the tail lazily at the next turn — the same validity guarantee with
+no persisted turn-state machine. (Richer history editing — discard, revert — is
+deferred to explicit future commands.)
 
 ### Session concurrency lock
 
@@ -1312,7 +1375,8 @@ exists yet:
 - estimating the size of **not-yet-sent** content (e.g. which messages to keep
   when building a compaction), where the provider has not yet returned a count.
 
-Context management then uses a **two-tier strategy**:
+Context management then uses a **three-tier strategy**, from most to least
+graceful:
 
 **Tier 1 — graceful pre-turn compaction (75% threshold).** At the start of each
 turn, mu compares the stored `total_tokens` from the previous turn (or the
@@ -1321,16 +1385,34 @@ exceeds a configurable fraction (default 75%), mu compacts *before* sending the
 new turn. Because this runs between turns, it is fully graceful — no turn is
 wasted, no replay.
 
-**Tier 2 — hard-stop on API overflow error.** The pre-turn figure can lag (a
-single turn may add a very large tool result). If the provider returns a
-context-length error during a turn, mu catches it, compacts immediately, and
-retries the turn once. If the retry also overflows, the turn is aborted with a
-clear message.
+**Tier 2 — proactive in-loop compaction.** A single turn can add many large tool
+results, so the pre-turn figure goes stale *within* a turn. Before each model
+call after the first in the agent loop, mu re-estimates the working context
+(bytes÷4 over the in-memory message list, the same heuristic opencode uses for
+planning) and compacts against the same fraction threshold if it has grown too
+large. This catches runaway tool output before it becomes a hard API error. If a
+single compaction cannot bring the context back under the threshold (e.g. the
+retained recent turns are themselves oversized), mu stops re-compacting for the
+rest of that turn and lets Tier 3 handle the true overflow, so it never loops on
+summarize calls.
 
-**Compaction algorithm** (same in both tiers): summarize everything up to a
+**Tier 3 — hard-stop on API overflow error.** If the provider still returns a
+context-length error during a turn, mu catches it, compacts immediately, and
+retries (up to 3 times). If it still overflows, the turn is aborted with a clear
+message. Overflow is recognized from an HTTP `413`, a structured error
+`code`/`type` of `context_length_exceeded`, or a known overflow phrase in a 4xx
+body (e.g. "prompt is too long", "maximum context length", "context window") —
+message matching is gated to client errors so an unrelated 5xx body is not
+misclassified.
+
+**Compaction algorithm** (same in all tiers): summarize everything up to a
 cut point into a single **`summary` message row** (replacing any prior summary
 row), keeping the most recent N turns (default 2, configurable) as verbatim rows
-after it. The next turn's context builder (lifecycle step 6) loads the latest
+after it. The cut is always at a user-message boundary, so a retained assistant
+`tool_calls` message is never separated from its `tool` results. The
+summarization *input* clamps each entry (tool results hardest) so a huge history
+cannot make the summarize request itself overflow; the stored transcript is
+untouched. The next turn's context builder (lifecycle step 6) loads the latest
 `summary` row plus all rows after it — so compacted history is naturally
 excluded without deleting anything. The original rows remain in SQLite (the
 on-disk transcript is lossless); only the in-context working set shrinks. When a
@@ -1341,9 +1423,9 @@ anchored summary, preserve still-true details, remove stale facts").
 
 Contrast with opencode: opencode detects overflow *after* a turn completes (from
 the reported token count), compacts, then replays the user's last message — so an
-overflow turn costs double. mu's pre-turn check (using the same reported count,
-just consulted before the next turn instead of after the last one) avoids that
-waste, and Tier 2 covers the same edge case codex's mid-turn compaction does.
+overflow turn costs double. mu's pre-turn check (Tier 1) and in-loop check (Tier
+2) avoid that replay in the common cases, and Tier 3 covers the residual hard
+overflow the way codex's mid-turn compaction does.
 
 ### Agent-loop bounds
 
@@ -1355,18 +1437,25 @@ and re-prompt. In "yolo" mode with no approval gate, this cap is the main guard
 against a loop silently burning tokens.
 
 **Exit codes.** `0` success; `1` general/config/provider error; `2` session busy
-(lock held) or `--session` not found; `130` interrupted by SIGINT (the shell's
-default for Ctrl-C). The summary line is printed only on exit `0`.
+(lock held) or `--session` not found; `128 + signal` when a forwarded
+terminating signal ends the turn — most commonly `130` for SIGINT (the shell's
+default for Ctrl-C), and `143` for SIGTERM. A signalled exit takes precedence
+over the generic error code even when the interruption first surfaces as a turn
+error. The summary line is printed only on exit `0`.
 
 ### Abort, pause, and resume
 
 Abort means the current language-model request or tool execution is cancelled
 when possible, the turn stops, and `mu` exits. Abort is an explicit interruption
 of work in progress; completed messages remain persisted and partial messages
-are discarded as described above.
+are discarded as described above. The interrupted turn leaves the session
+"unclean"; it is resumed by `mu retry` (continue with no new prompt) or
+superseded by simply sending the next prompt (§11, "Interrupted turns and
+retry").
 
-Pause and resume are V2 features. The initial design does not promise pausing at
-tool-call boundaries or resuming a partially completed turn.
+Pausing at arbitrary points and resuming a partially completed model stream are
+not supported: resume always restarts from the last completed message, with any
+in-flight tool call recorded as interrupted.
 
 ---
 

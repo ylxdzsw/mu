@@ -17,6 +17,7 @@ mod cli;
 mod compaction;
 mod config;
 mod env;
+mod exit;
 mod guardrail;
 mod models;
 mod openai;
@@ -52,17 +53,14 @@ struct RunTurnArgs<'a> {
     session_id: &'a str,
     request: &'a RequestOptions,
     model_context_window: Option<u64>,
-    prompt: &'a str,
+    /// Display title source (first ~60 chars). `None` on retry, which continues
+    /// an existing turn and must not overwrite the stored title.
+    title: Option<&'a str>,
     output: cli::OutputFormat,
     state_dir: &'a std::path::Path,
     project_config_dir: Option<&'a std::path::Path>,
-    retry_notice: Option<RetryNotice<'a>>,
-}
-
-struct RetryNotice<'a> {
-    retry_count: u64,
-    checkpoint_message_id: i64,
-    reason: &'a str,
+    /// A short notice rendered before the turn (e.g. "resuming interrupted turn").
+    preamble_notice: Option<&'a str>,
 }
 
 #[tokio::main]
@@ -70,8 +68,23 @@ async fn main() {
     if let Err(e) = run().await {
         let mut r = Renderer::with_format(error_output_format());
         let _ = r.error(&e.to_string());
-        process::exit(1);
+        process::exit(exit_code_for(&e));
     }
+}
+
+/// Map a fatal error to a process exit code (SPEC §11).
+///
+/// A forwarded terminating signal wins first (`128 + signal`, so `130` for
+/// SIGINT), then any error carrying an explicit `ExitError` code, otherwise the
+/// general error code `1`.
+fn exit_code_for(error: &anyhow::Error) -> i32 {
+    if let Some(signal) = bash::cancellation_signal() {
+        return 128 + signal;
+    }
+    if let Some(exit) = error.downcast_ref::<exit::ExitError>() {
+        return exit.code;
+    }
+    1
 }
 
 fn error_output_format() -> cli::OutputFormat {
@@ -335,11 +348,11 @@ async fn run() -> Result<()> {
                 }
                 SessionSub::Transcript { session, json } => {
                     if !db_path.exists() {
-                        bail!("session not found in active scope: {session}");
+                        return Err(exit::ExitError::session_not_found(&session));
                     }
                     let store = store::Store::open(&db_path)?;
                     if store.get_session(&session)?.is_none() {
-                        bail!("session not found in active scope: {session}");
+                        return Err(exit::ExitError::session_not_found(&session));
                     }
                     let transcript = store.transcript(&session)?;
                     if json {
@@ -352,21 +365,21 @@ async fn run() -> Result<()> {
                 }
                 SessionSub::Archive { session } => {
                     if !db_path.exists() {
-                        bail!("session not found in active scope: {session}");
+                        return Err(exit::ExitError::session_not_found(&session));
                     }
                     let store = store::Store::open(&db_path)?;
                     if store.get_session(&session)?.is_none() {
-                        bail!("session not found in active scope: {session}");
+                        return Err(exit::ExitError::session_not_found(&session));
                     }
                     store.set_session_archived(&session, true)?;
                 }
                 SessionSub::Unarchive { session } => {
                     if !db_path.exists() {
-                        bail!("session not found in active scope: {session}");
+                        return Err(exit::ExitError::session_not_found(&session));
                     }
                     let store = store::Store::open(&db_path)?;
                     if store.get_session(&session)?.is_none() {
-                        bail!("session not found in active scope: {session}");
+                        return Err(exit::ExitError::session_not_found(&session));
                     }
                     store.set_session_archived(&session, false)?;
                 }
@@ -426,26 +439,21 @@ async fn run() -> Result<()> {
                 }
             };
 
-            store.reconcile_pending_turn_locked(&_lock, &session.id)?;
-            let pending = store
-                .pending_turn(&session.id)?
-                .ok_or_else(|| anyhow::anyhow!("latest session has no incomplete turn to retry"))?;
-            if pending.state != store::PendingState::Incomplete {
-                bail!("session does not have an incomplete turn to retry");
+            // Nothing to resume on a session whose last turn already finished.
+            if store.is_session_clean(&session.id)? {
+                println!("session is already complete; nothing to retry");
+                return Ok(());
             }
-            let prompt_content = store
-                .prompt_user_content(&session.id, pending.prompt_message_id)?
-                .ok_or_else(|| anyhow::anyhow!("pending prompt is missing from session history"))?;
-            let prompt = prompt_content.text();
+
+            // Make the interrupted tail valid (synthesize results for any
+            // dangling tool calls), then continue the loop with no new prompt.
+            store.normalize_interrupted_tail(&session.id)?;
 
             let request = RequestOptions {
                 model: models::resolve_model_ref(&config, &session.model)?,
             };
             let model_info = models::resolve_model_info(&config, &request.model);
             let provider = build_provider(&config, &request.model.provider_id)?;
-
-            store.resume_pending_turn(&session.id)?;
-            let retry_count = store.increment_pending_retry_count(&session.id)?;
 
             run_turn(RunTurnArgs {
                 config: &config,
@@ -454,15 +462,11 @@ async fn run() -> Result<()> {
                 session_id: &session.id,
                 request: &request,
                 model_context_window: model_info.context_window,
-                prompt: &prompt,
+                title: None,
                 output: retry_args.output,
                 state_dir: &state_dir,
                 project_config_dir: project_config_dir.as_deref(),
-                retry_notice: Some(RetryNotice {
-                    retry_count,
-                    checkpoint_message_id: pending.checkpoint_message_id,
-                    reason: pending.error_message.as_deref().unwrap_or("manual retry"),
-                }),
+                preamble_notice: Some("[mu] resuming interrupted turn"),
             })
             .await?;
 
@@ -472,12 +476,12 @@ async fn run() -> Result<()> {
             let config = Config::load_for_scope(project_config_dir.as_deref())?;
             let db_path = scope.session_db_path();
             if !db_path.exists() {
-                bail!("session not found in active scope: {session}");
+                return Err(exit::ExitError::session_not_found(&session));
             }
             let store = store::Store::open(&db_path)?;
             let session_state = store
                 .get_session(&session)?
-                .ok_or_else(|| anyhow::anyhow!("session not found in active scope: {session}"))?;
+                .ok_or_else(|| exit::ExitError::session_not_found(&session))?;
             let request = RequestOptions {
                 model: models::resolve_model_ref(&config, &session_state.model)?,
             };
@@ -492,7 +496,6 @@ async fn run() -> Result<()> {
             let system_prompt = system_prompt::build_system_prompt(
                 &paths::global_dir(),
                 project_config_dir.as_deref(),
-                Some(&store),
             )?;
             compaction::run_compaction(
                 &store,
@@ -567,14 +570,11 @@ async fn run_turn_from_source(
         }
     };
 
-    store.reconcile_pending_turn_locked(&_lock, &session_id)?;
-
-    if let Some(pending) = store.pending_turn(&session_id)? {
-        let reason = pending
-            .error_message
-            .unwrap_or_else(|| "latest turn is still incomplete".to_string());
-        bail!("session has an incomplete turn: {reason}. Run `mu retry` to continue.");
-    }
+    // If the previous turn was interrupted, normalize its tail (synthesize
+    // interrupted results for any dangling tool calls) so history is valid.
+    // The new prompt then lands on top of that valid history — the user can
+    // redirect after a Ctrl-C without being forced to `mu retry` first.
+    store.normalize_interrupted_tail(&session_id)?;
 
     if created {
         if let Ok(session_file) = std::env::var("MU_SESSION_FILE") {
@@ -591,8 +591,14 @@ async fn run_turn_from_source(
     }
 
     let prompt_content = build_prompt_content(&prompt, attachments);
-    store.begin_pending_turn(&session_id, &prompt_content)?;
+    store.append_message(
+        &session_id,
+        &provider::Message::User {
+            content: prompt_content,
+        },
+    )?;
 
+    let title: String = prompt.chars().take(60).collect();
     run_turn(RunTurnArgs {
         config: &config,
         provider,
@@ -600,11 +606,11 @@ async fn run_turn_from_source(
         session_id: &session_id,
         request: &resolved.request,
         model_context_window: model_info.context_window,
-        prompt: &prompt,
+        title: Some(&title),
         output: turn.output,
         state_dir: &state_dir,
         project_config_dir,
-        retry_notice: None,
+        preamble_notice: None,
     })
     .await?;
 
@@ -692,15 +698,14 @@ async fn run_turn(args: RunTurnArgs<'_>) -> Result<()> {
         session_id,
         request,
         model_context_window,
-        prompt,
+        title,
         output,
         state_dir,
         project_config_dir,
-        retry_notice,
+        preamble_notice,
     } = args;
     let system_prompt =
-        system_prompt::build_system_prompt(&paths::global_dir(), project_config_dir, Some(store))?;
-    let title: String = prompt.chars().take(60).collect();
+        system_prompt::build_system_prompt(&paths::global_dir(), project_config_dir)?;
 
     let turn_done_bell_min_duration = config
         .terminal_bell
@@ -708,14 +713,8 @@ async fn run_turn(args: RunTurnArgs<'_>) -> Result<()> {
         .then_some(Duration::from_millis(config.terminal_bell.min_duration_ms));
     let mut renderer = Renderer::with_terminal_bell(output, turn_done_bell_min_duration);
     let turn_started = Instant::now();
-    if let Some(retry_notice) = retry_notice {
-        renderer.turn_retry(
-            "manual",
-            retry_notice.retry_count,
-            None,
-            retry_notice.checkpoint_message_id,
-            retry_notice.reason,
-        )?;
+    if let Some(notice) = preamble_notice {
+        renderer.notice(notice)?;
     }
     let mut agent = agent::AgentLoop {
         config,
@@ -735,8 +734,7 @@ async fn run_turn(args: RunTurnArgs<'_>) -> Result<()> {
         Ok(r) => {
             let ctx_pct =
                 model_context_window.map(|cw| (r.usage.total_tokens as f64 / cw as f64) * 100.0);
-            store.update_session(session_id, &r.usage, Some(&title), &request.model.canonical)?;
-            store.clear_pending_turn(session_id)?;
+            store.update_session(session_id, &r.usage, title, &request.model.canonical)?;
             renderer.finish_turn()?;
             renderer.turn_summary(
                 r.usage.visible_input_tokens(),
@@ -746,17 +744,10 @@ async fn run_turn(args: RunTurnArgs<'_>) -> Result<()> {
             renderer.turn_done_bell(turn_started.elapsed())?;
         }
         Err(error) => {
-            store.mark_pending_incomplete(session_id, &error.to_string())?;
-            if let Some(pending) = store.pending_turn(session_id)? {
-                renderer.turn_incomplete(
-                    pending.retry_count,
-                    pending.checkpoint_message_id,
-                    pending
-                        .error_message
-                        .as_deref()
-                        .unwrap_or("turn interrupted"),
-                )?;
-            }
+            // Nothing to clean up: only completed messages are persisted, so the
+            // log ends at the last landed message. The session is now "unclean";
+            // the next turn or `mu retry` will normalize any dangling tool call.
+            renderer.turn_interrupted(&error.to_string())?;
         }
     }
 
@@ -803,9 +794,11 @@ fn resolve_retry_session(
         bail!("use either -s/--session or -c/--continue-latest, not both");
     }
     if let Some(id) = retry.session.as_deref() {
-        return Ok(Some(store.get_session(id)?.ok_or_else(|| {
-            anyhow::anyhow!("session not found in active scope: {id}")
-        })?));
+        return Ok(Some(
+            store
+                .get_session(id)?
+                .ok_or_else(|| exit::ExitError::session_not_found(id))?,
+        ));
     }
     store.latest_session()
 }
@@ -868,16 +861,8 @@ fn print_status_report(report: &StatusReport) {
     if report.active.busy {
         println!("active: busy");
     }
-    if let Some(incomplete) = &report.incomplete_turn {
-        println!(
-            "incomplete turn: retry_count={}{}",
-            incomplete.retry_count,
-            incomplete
-                .error_message
-                .as_deref()
-                .map(|message| format!("  reason: {message}"))
-                .unwrap_or_default()
-        );
+    if report.session_id.is_some() && !report.clean {
+        println!("clean: no (last turn interrupted)");
         println!("retry: mu retry");
     }
     println!("supported effort levels: {effort_levels}");
@@ -969,5 +954,23 @@ mod tests {
         std::fs::remove_file(&path).unwrap();
         assert!(err.to_string().contains("reading prompt file"));
         assert!(err.to_string().contains(path.to_string_lossy().as_ref()));
+    }
+
+    #[test]
+    fn exit_code_maps_session_not_found_to_two() {
+        bash::reset_cancellation_state();
+        let err = exit::ExitError::session_not_found("abc123");
+        assert_eq!(exit_code_for(&err), 2);
+        assert!(
+            err.to_string()
+                .contains("session not found in active scope: abc123")
+        );
+    }
+
+    #[test]
+    fn exit_code_defaults_to_one_for_generic_errors() {
+        bash::reset_cancellation_state();
+        let err = anyhow::anyhow!("something went wrong");
+        assert_eq!(exit_code_for(&err), 1);
     }
 }

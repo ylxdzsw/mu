@@ -22,6 +22,8 @@ typeset -g MU_ZSH_PROMPT_MODEL_COLOR=${MU_ZSH_PROMPT_MODEL_COLOR:-39}
 typeset -g MU_ZSH_PROMPT_CONTEXT_COLOR=${MU_ZSH_PROMPT_CONTEXT_COLOR:-214}
 typeset -g MU_ZSH_PROMPT_PWD_COLOR=${MU_ZSH_PROMPT_PWD_COLOR:-45}
 typeset -g MU_ZSH_PROMPT_PROJECT_COLOR=${MU_ZSH_PROMPT_PROJECT_COLOR:-141}
+typeset -g MU_ZSH_PROMPT_UNCLEAN_COLOR=${MU_ZSH_PROMPT_UNCLEAN_COLOR:-203}
+typeset -g MU_ZSH_PROMPT_UNCLEAN_TEXT=${MU_ZSH_PROMPT_UNCLEAN_TEXT:-'interrupted · /retry'}
 typeset -g MU_ZSH_ORIGINAL_PROMPT=${MU_ZSH_ORIGINAL_PROMPT:-}
 typeset -g MU_ZSH_ORIGINAL_RPROMPT=${MU_ZSH_ORIGINAL_RPROMPT:-}
 typeset -g MU_ZSH_SAVED_KEYMAP=${MU_ZSH_SAVED_KEYMAP:-main}
@@ -336,6 +338,7 @@ _mu_zsh_format_context_percent() {
 
 _mu_zsh_build_mode_prompt() {
   local status_json model context_raw context cwd project_root project_segment
+  local clean unclean_segment
 
   status_json=$(_mu_zsh_status_json) || status_json=
   model=$(_mu_zsh_status_field "$status_json" model_id 2>/dev/null) || model=mu
@@ -352,7 +355,16 @@ _mu_zsh_build_mode_prompt() {
     project_segment=
   fi
 
-  print -r -- "%F{$MU_ZSH_PROMPT_MODEL_COLOR}$(_mu_zsh_escape_prompt_text "$model")%f %F{$MU_ZSH_PROMPT_CONTEXT_COLOR}$(_mu_zsh_escape_prompt_text "$context")%f %F{$MU_ZSH_PROMPT_PWD_COLOR}${cwd}%f${project_segment}
+  # When the tracked session's last turn was interrupted (unclean), surface it
+  # so the user knows they can /retry to resume or just type to redirect.
+  clean=$(_mu_zsh_status_field "$status_json" clean 2>/dev/null) || clean=
+  if [[ "$clean" == false ]]; then
+    unclean_segment=" %F{$MU_ZSH_PROMPT_UNCLEAN_COLOR}[$(_mu_zsh_escape_prompt_text "$MU_ZSH_PROMPT_UNCLEAN_TEXT")]%f"
+  else
+    unclean_segment=
+  fi
+
+  print -r -- "%F{$MU_ZSH_PROMPT_MODEL_COLOR}$(_mu_zsh_escape_prompt_text "$model")%f %F{$MU_ZSH_PROMPT_CONTEXT_COLOR}$(_mu_zsh_escape_prompt_text "$context")%f %F{$MU_ZSH_PROMPT_PWD_COLOR}${cwd}%f${project_segment}${unclean_segment}
 ${MU_ZSH_PROMPT_INPUT}"
 }
 

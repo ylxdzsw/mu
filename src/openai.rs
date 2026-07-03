@@ -136,10 +136,7 @@ impl Provider for OpenAiProvider {
         if !response.status().is_success() {
             let status = response.status();
             let text = response.text().await.unwrap_or_default();
-            if text.contains("context_length")
-                || text.contains("maximum context length")
-                || text.contains("context length")
-            {
+            if is_context_length_error(status.as_u16(), &text) {
                 return Err(ProviderError::ContextLength);
             }
             if status.as_u16() == 429 {
@@ -252,7 +249,10 @@ fn build_chat_request_body(
         "stream_options": { "include_usage": true }
     });
     if let Some(effort) = request.model.effort {
-        body["reasoning"] = serde_json::json!({ "effort": effort });
+        // Chat Completions uses a top-level `reasoning_effort` string. (The
+        // nested `reasoning: { effort }` object is the Responses API shape and
+        // is rejected by real OpenAI `/chat/completions`.)
+        body["reasoning_effort"] = Value::String(effort.as_str().to_string());
     }
     body
 }
@@ -361,6 +361,55 @@ fn consume_sse_buffer(
     }
 
     Ok(())
+}
+
+/// Classify an error response as a context-length overflow.
+///
+/// Overflow is always a client error. We accept three independent signals so
+/// differently-worded providers are still recognized:
+///   1. HTTP 413 (Payload Too Large) — some gateways use this for prompt size.
+///   2. A structured `error.code`/`error.type` of `context_length_exceeded`
+///      (OpenAI et al.) or `string_above_max_length`.
+///   3. A known context-overflow phrase in the body, but only for 4xx so a 5xx
+///      stack trace that happens to mention "context length" is not misread.
+fn is_context_length_error(status: u16, body: &str) -> bool {
+    if status == 413 {
+        return true;
+    }
+    let is_client_error = (400..500).contains(&status);
+
+    if let Ok(value) = serde_json::from_str::<Value>(body) {
+        let code = value["error"]["code"]
+            .as_str()
+            .or_else(|| value["error"]["type"].as_str())
+            .unwrap_or("");
+        if code.eq_ignore_ascii_case("context_length_exceeded")
+            || code.eq_ignore_ascii_case("string_above_max_length")
+        {
+            return true;
+        }
+    }
+
+    if !is_client_error {
+        return false;
+    }
+
+    const PATTERNS: &[&str] = &[
+        "context_length_exceeded",
+        "context length",
+        "maximum context length",
+        "context window",
+        "exceeds the context",
+        "exceed the context",
+        "prompt is too long",
+        "input is too long",
+        "too many tokens",
+        "maximum number of tokens",
+        "reduce the length",
+        "reduce the amount",
+    ];
+    let lower = body.to_ascii_lowercase();
+    PATTERNS.iter().any(|pattern| lower.contains(pattern))
 }
 
 fn reasoning_text_from_value(value: &Value) -> Option<String> {
@@ -530,6 +579,44 @@ mod tests {
             &[],
         );
 
-        assert_eq!(body["reasoning"]["effort"], "high");
+        assert_eq!(body["reasoning_effort"], "high");
+    }
+
+    #[test]
+    fn detects_context_length_errors_across_shapes() {
+        // Structured OpenAI-style code.
+        assert!(is_context_length_error(
+            400,
+            r#"{"error":{"message":"too long","code":"context_length_exceeded"}}"#
+        ));
+        // HTTP 413 regardless of body.
+        assert!(is_context_length_error(413, "Payload Too Large"));
+        // Anthropic-style prose on a 400.
+        assert!(is_context_length_error(
+            400,
+            r#"{"error":{"type":"invalid_request_error","message":"prompt is too long: 250000 tokens > 200000 maximum"}}"#
+        ));
+        // Generic phrasing.
+        assert!(is_context_length_error(
+            400,
+            "This model's maximum context length is 128000 tokens"
+        ));
+    }
+
+    #[test]
+    fn does_not_misclassify_unrelated_errors() {
+        // Unrelated 400 (bad request) must not be treated as overflow.
+        assert!(!is_context_length_error(
+            400,
+            r#"{"error":{"message":"invalid 'model' parameter","code":"model_not_found"}}"#
+        ));
+        // A 5xx whose body coincidentally mentions context length must not
+        // trigger reactive compaction.
+        assert!(!is_context_length_error(
+            500,
+            "internal error in context length calculator"
+        ));
+        // 401 auth failure.
+        assert!(!is_context_length_error(401, "invalid api key"));
     }
 }

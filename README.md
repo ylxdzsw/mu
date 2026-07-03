@@ -99,9 +99,17 @@ MU_ZSH_EXIT_HOOKS+=(mu_restore_conflicts)
 | `mu session archive --session <id>` | Hide a session from default lists |
 | `mu session unarchive --session <id>` | Restore an archived session to default lists |
 | `mu compact --session <id>` | Force compaction |
+| `mu retry [-s <id>] [-c]` | Resume an interrupted turn (see below) |
 
 Prompt-file mode accepts the same turn options as stdin mode. Put the prompt
 file last, for example `mu --output plain --model openai/gpt-5:high prompt.md`.
+
+If a turn is interrupted (Ctrl-C, a dropped connection, a crash), only the
+completed messages are kept — any tool command that started running is recorded,
+including one that was killed mid-run, so already-applied changes are never
+silently dropped. The session is then "unclean": you can `mu retry` to continue
+that turn where it left off, or just send your next prompt to redirect (it lands
+on top of the interrupted history). `mu status` reports cleanliness.
 
 Top-level subcommands win on exact name matches. If you want to use a prompt
 file named like a subcommand such as `status`, prepend `./` to disambiguate:

@@ -77,7 +77,7 @@ pub enum Command {
     },
     /// Inspect the resolved model and context state
     Status(StatusArgs),
-    /// Retry the latest incomplete turn in a session
+    /// Resume an interrupted (unclean) turn in a session
     Retry(RetryArgs),
     /// Force compaction for a session
     Compact {

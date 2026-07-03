@@ -470,6 +470,17 @@ pub fn cancellation_requested() -> bool {
     CANCELLING.load(Ordering::SeqCst)
 }
 
+/// If a terminating signal was forwarded during this turn, return its number so
+/// the process can exit with the shell-conventional `128 + signal` status
+/// (e.g. `130` for SIGINT). Returns `None` when no cancellation occurred.
+pub fn cancellation_signal() -> Option<i32> {
+    if !cancellation_requested() {
+        return None;
+    }
+    let signal = LAST_SIGNAL.load(Ordering::SeqCst);
+    Some(if signal > 0 { signal } else { libc::SIGINT })
+}
+
 fn last_signal() -> i32 {
     LAST_SIGNAL.load(Ordering::SeqCst)
 }

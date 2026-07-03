@@ -14,9 +14,7 @@ pub fn role_preamble() -> &'static str {
 pub fn build_system_prompt(
     global_config_dir: &Path,
     project_config_dir: Option<&Path>,
-    store: Option<&crate::store::Store>,
 ) -> anyhow::Result<String> {
-    let _ = store;
     let index = scan_instruction_index(global_config_dir, project_config_dir)?;
     Ok(assemble_prompt(
         &index.skills,

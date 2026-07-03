@@ -13,6 +13,7 @@ use crate::guardrail::{Guardrail, GuardrailOutcome, bash_risk};
 use crate::models::RequestOptions;
 use crate::provider::{
     FinishReason, Message, Provider, ProviderError, StreamEvent, ToolCall, ToolCallDelta, Usage,
+    approx_tokens,
 };
 use crate::renderer::Renderer;
 use crate::store::{ReviewRecord, Store, ToolCallRecord};
@@ -83,7 +84,7 @@ impl<'a> AgentLoop<'a> {
             None
         };
 
-        let mut context = self.load_pending_context()?;
+        let mut context = self.load_context()?;
 
         let tool_definitions = tools::tool_definitions();
         let max_iter = self.config.limits.max_iterations;
@@ -91,10 +92,44 @@ impl<'a> AgentLoop<'a> {
         let mut total_usage = Usage::default();
         let mut overflow_retries: u32 = 0;
         let mut live_provider_retries: u32 = 0;
+        let mut proactive_compaction_exhausted = false;
         const MAX_OVERFLOW_RETRIES: u32 = 3;
         const MAX_LIVE_PROVIDER_RETRIES: u32 = 3;
 
         for iteration in 0..max_iter {
+            // Proactive compaction (SPEC §11 Tier 2): `maybe_compact` only runs
+            // once before the turn, but a single turn can add many large tool
+            // results. Re-check the growing context before each subsequent model
+            // call so we compact gracefully instead of waiting for the hard API
+            // overflow guard (Tier 3, below). Uses the same context * fraction
+            // threshold as the pre-turn check.
+            if iteration > 0
+                && !proactive_compaction_exhausted
+                && let Some(context_window) = self.model_context_window
+            {
+                let threshold = (context_window as f64 * self.config.compaction.fraction) as u64;
+                if approx_context_tokens(&context) > threshold {
+                    compaction::run_compaction(
+                        self.store,
+                        self.config,
+                        self.session_id,
+                        &self.request,
+                        self.provider.as_ref(),
+                        &self.system_prompt,
+                    )
+                    .await?;
+                    context = self.load_context()?;
+                    // If compaction could not get us back under the threshold
+                    // (e.g. the retained recent turns alone are huge), stop
+                    // retrying proactively this turn to avoid repeated
+                    // summarize calls; the reactive guard still covers a true
+                    // hard overflow.
+                    if approx_context_tokens(&context) > threshold {
+                        proactive_compaction_exhausted = true;
+                    }
+                }
+            }
+
             let mut tool_previews = StreamingToolPreviews::default();
             let stream_result = loop {
                 let mut on_stream_event = |event: StreamEvent| -> Result<(), ProviderError> {
@@ -145,7 +180,7 @@ impl<'a> AgentLoop<'a> {
                             &self.system_prompt,
                         )
                         .await?;
-                        context = self.load_pending_context()?;
+                        context = self.load_context()?;
                     }
                     Err(ProviderError::ContextLength) => {
                         bail!("context length exceeded even after compaction");
@@ -155,22 +190,12 @@ impl<'a> AgentLoop<'a> {
                             && live_provider_retries < MAX_LIVE_PROVIDER_RETRIES =>
                     {
                         live_provider_retries += 1;
-                        let retry_count =
-                            self.store.increment_pending_retry_count(self.session_id)?;
-                        let pending =
-                            self.store.pending_turn(self.session_id)?.ok_or_else(|| {
-                                anyhow::anyhow!(
-                                    "session missing pending turn during provider retry recovery"
-                                )
-                            })?;
                         self.renderer.turn_retry(
-                            "auto",
-                            retry_count,
-                            Some(MAX_LIVE_PROVIDER_RETRIES as u64),
-                            pending.checkpoint_message_id,
+                            live_provider_retries as u64,
+                            MAX_LIVE_PROVIDER_RETRIES as u64,
                             &error.to_string(),
                         )?;
-                        context = self.load_pending_context()?;
+                        context = self.load_context()?;
                     }
                     Err(e) => bail!("provider error: {e}"),
                 }
@@ -187,7 +212,7 @@ impl<'a> AgentLoop<'a> {
 
             let msg_id = self
                 .store
-                .advance_pending_checkpoint_with_message(self.session_id, &stream_result.message)?;
+                .append_message(self.session_id, &stream_result.message)?;
             context.push(stream_result.message.clone());
 
             match stream_result.finish_reason {
@@ -404,14 +429,11 @@ impl<'a> AgentLoop<'a> {
         Ok(TurnResult { usage: total_usage })
     }
 
-    fn load_pending_context(&self) -> Result<Vec<Message>> {
-        let checkpoint_message_id = self
-            .store
-            .pending_turn(self.session_id)?
-            .map(|pending| pending.checkpoint_message_id);
-        let mut context = self
-            .store
-            .load_context_messages_until(self.session_id, checkpoint_message_id)?;
+    /// Load the full completed-message history plus the leading system prompt.
+    /// History is always valid here because the caller normalizes any
+    /// interrupted tail (synthesizing missing tool results) before the turn.
+    fn load_context(&self) -> Result<Vec<Message>> {
+        let mut context = self.store.load_context_messages(self.session_id)?;
         context.insert(
             0,
             Message::System {
@@ -653,6 +675,32 @@ impl<'a> AgentLoop<'a> {
 
 fn parse_tool_args(call: &ToolCall) -> Value {
     serde_json::from_str(&call.function.arguments).unwrap_or(Value::Object(Default::default()))
+}
+
+/// Cheap char/4 estimate of the in-memory context size, mirroring the fallback
+/// estimator used elsewhere. Used for the in-loop proactive compaction check so
+/// growing tool output is caught before it forces a hard API overflow.
+fn approx_context_tokens(context: &[Message]) -> u64 {
+    context
+        .iter()
+        .map(|message| match message {
+            Message::System { content } => approx_tokens(content),
+            Message::User { content } => approx_tokens(&content.text()),
+            Message::Assistant {
+                content,
+                tool_calls,
+            } => {
+                approx_tokens(content.as_deref().unwrap_or(""))
+                    + tool_calls
+                        .as_ref()
+                        .map(|calls| {
+                            approx_tokens(&serde_json::to_string(calls).unwrap_or_default())
+                        })
+                        .unwrap_or(0)
+            }
+            Message::Tool { content, .. } => approx_tokens(content),
+        })
+        .sum()
 }
 
 fn handle_tool_call_delta(
@@ -994,7 +1042,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn live_provider_retry_reuses_pending_checkpoint() {
+    async fn live_provider_retry_completes_turn() {
         let tmp = std::env::temp_dir().join(format!("mu-agent-retry-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&tmp).unwrap();
         let store = Store::open(&tmp.join("mu.db")).unwrap();
@@ -1002,7 +1050,12 @@ mod tests {
         let config = test_config();
         let request_model = crate::models::resolve_model_ref(&config, "test/fake-model").unwrap();
         store
-            .begin_pending_turn(&session.id, &UserContent::Text("retry me".into()))
+            .append_message(
+                &session.id,
+                &Message::User {
+                    content: UserContent::Text("retry me".into()),
+                },
+            )
             .unwrap();
         let provider = Arc::new(RetryThenStopProvider {
             step: Mutex::new(0),
@@ -1024,8 +1077,9 @@ mod tests {
 
         agent.run_turn().await.unwrap();
 
-        let pending = store.pending_turn(&session.id).unwrap().unwrap();
-        assert_eq!(pending.retry_count, 1);
+        // The transient provider error was retried in-process without adding a
+        // second user message, and the session is clean after completion.
+        assert!(store.is_session_clean(&session.id).unwrap());
         let messages = store.load_context_messages(&session.id).unwrap();
         assert_eq!(
             messages
@@ -1041,6 +1095,181 @@ mod tests {
                 tool_calls: None,
             }) if content == "done"
         ));
+        let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    /// A provider that grows the context with one large tool result, then
+    /// stops. Any summarization request (the compaction call) is answered with
+    /// a short summary so the in-loop proactive compaction path can complete.
+    struct GrowThenStopProvider {
+        turn_step: Mutex<usize>,
+    }
+
+    #[async_trait(?Send)]
+    impl Provider for GrowThenStopProvider {
+        async fn stream_chat(
+            &self,
+            _request: &RequestOptions,
+            messages: &[Message],
+            _tools: &[Value],
+            _on_event: &mut dyn FnMut(crate::provider::StreamEvent) -> Result<(), ProviderError>,
+        ) -> Result<StreamResult, ProviderError> {
+            let is_summarize = messages.iter().any(|message| match message {
+                Message::User { content } => {
+                    let text = content.text();
+                    text.contains("Summarize this conversation")
+                        || text.contains("Update this conversation summary")
+                }
+                _ => false,
+            });
+            if is_summarize {
+                return Ok(StreamResult {
+                    message: Message::Assistant {
+                        content: Some("summary".into()),
+                        tool_calls: None,
+                    },
+                    finish_reason: FinishReason::Stop,
+                    usage: Some(Usage {
+                        input_tokens: 1,
+                        output_tokens: 1,
+                        total_tokens: 2,
+                        ..Usage::default()
+                    }),
+                });
+            }
+
+            let mut step = self.turn_step.lock().unwrap();
+            let current = *step;
+            *step += 1;
+            match current {
+                0 => Ok(StreamResult {
+                    message: Message::Assistant {
+                        content: None,
+                        tool_calls: Some(vec![ToolCall {
+                            id: "call_grow".into(),
+                            call_type: "function".into(),
+                            function: crate::provider::FunctionCall {
+                                name: "bash".into(),
+                                arguments: serde_json::json!({
+                                    "title": "grow context",
+                                    "risk": "readonly",
+                                    "script": "printf 'x%.0s' {1..3000}",
+                                })
+                                .to_string(),
+                            },
+                        }]),
+                    },
+                    finish_reason: FinishReason::ToolCalls,
+                    usage: Some(Usage {
+                        input_tokens: 10,
+                        output_tokens: 5,
+                        total_tokens: 15,
+                        ..Usage::default()
+                    }),
+                }),
+                _ => Ok(StreamResult {
+                    message: Message::Assistant {
+                        content: Some("done".into()),
+                        tool_calls: None,
+                    },
+                    finish_reason: FinishReason::Stop,
+                    usage: Some(Usage {
+                        input_tokens: 10,
+                        output_tokens: 5,
+                        total_tokens: 15,
+                        ..Usage::default()
+                    }),
+                }),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn large_tool_result_triggers_in_loop_compaction() {
+        let tmp = std::env::temp_dir().join(format!("mu-agent-proactive-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let store = Store::open(&tmp.join("mu.db")).unwrap();
+        let session = store.create_session("/tmp", "test/fake-model").unwrap();
+        let config = test_config();
+        let request_model = crate::models::resolve_model_ref(&config, "test/fake-model").unwrap();
+
+        // Small prior history so the pre-turn check does NOT compact; the huge
+        // tool result produced mid-turn is what should push us over.
+        for turn in ["one", "two"] {
+            store
+                .append_message(
+                    &session.id,
+                    &Message::User {
+                        content: UserContent::Text(format!("turn {turn}")),
+                    },
+                )
+                .unwrap();
+            store
+                .append_message(
+                    &session.id,
+                    &Message::Assistant {
+                        content: Some(format!("reply {turn}")),
+                        tool_calls: None,
+                    },
+                )
+                .unwrap();
+        }
+        store
+            .append_message(
+                &session.id,
+                &Message::User {
+                    content: UserContent::Text("turn three".into()),
+                },
+            )
+            .unwrap();
+
+        // No summary exists yet.
+        assert!(
+            store
+                .latest_summary_sequence(&session.id)
+                .unwrap()
+                .is_none()
+        );
+
+        let provider = Arc::new(GrowThenStopProvider {
+            turn_step: Mutex::new(0),
+        });
+        let mut renderer = Renderer::with_format(OutputFormat::Plain);
+        let mut agent = AgentLoop {
+            config: &config,
+            provider,
+            store: &store,
+            session_id: &session.id,
+            request: RequestOptions {
+                model: request_model,
+            },
+            // Tiny window: threshold = 200 * 0.75 = 150 tokens (~600 bytes).
+            // The ~3KB tool result blows past it, forcing an in-loop compaction.
+            model_context_window: Some(200),
+            renderer: &mut renderer,
+            state_dir: &tmp,
+            system_prompt: "system".into(),
+        };
+
+        agent.run_turn().await.unwrap();
+
+        // Proactive compaction ran mid-turn and produced a summary row.
+        assert!(
+            store
+                .latest_summary_sequence(&session.id)
+                .unwrap()
+                .is_some()
+        );
+        // The turn still completed cleanly after compaction.
+        let messages = store.load_context_messages(&session.id).unwrap();
+        assert!(matches!(
+            messages.last(),
+            Some(Message::Assistant {
+                content: Some(content),
+                tool_calls: None,
+            }) if content == "done"
+        ));
+
         let _ = std::fs::remove_dir_all(tmp);
     }
 }
