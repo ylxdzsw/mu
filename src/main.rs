@@ -43,6 +43,7 @@ use runtime::{InvocationOverrides, StatusReport, build_status_report, resolve_in
 enum PromptSource {
     Stdin,
     File(PathBuf),
+    Command(PathBuf),
 }
 
 struct RunTurnArgs<'a> {
@@ -210,9 +211,7 @@ async fn run() -> Result<()> {
     let scope = paths::discover_scope(&cwd);
     let project_config_dir = scope.project().map(|p| p.root.join(".mu"));
     let origin = session_origin(args.origin);
-    let prompt_source = args
-        .prompt_file
-        .map_or(PromptSource::Stdin, PromptSource::File);
+    let prompt_source = resolve_prompt_source(args.prompt_file, &scope)?;
     let default_turn = args.turn;
 
     match args.command {
@@ -379,6 +378,17 @@ async fn run() -> Result<()> {
         Some(Command::Status(status_args)) => {
             let config = Config::load_for_scope(project_config_dir.as_deref())?;
             let store = open_status_store(scope.session_db_path().as_path())?;
+            let commands = if status_args.include_commands {
+                Some(
+                    skills::scan_instruction_index(
+                        &paths::global_dir(),
+                        project_config_dir.as_deref(),
+                    )?
+                    .commands,
+                )
+            } else {
+                None
+            };
             let report = build_status_report(
                 &store,
                 &config,
@@ -389,6 +399,7 @@ async fn run() -> Result<()> {
                 },
                 scope.project(),
                 status_args.include_models,
+                commands,
             )?;
             if status_args.json {
                 println!("{}", serde_json::to_string(&report)?);
@@ -614,8 +625,38 @@ fn load_prompt(source: PromptSource) -> Result<String> {
                 .with_context(|| format!("reading prompt file {}", path.display()))?;
             normalize_prompt(&raw, true)?
         }
+        PromptSource::Command(path) => skills::command_prompt(&path)?,
     };
     Ok(raw)
+}
+
+fn resolve_prompt_source(
+    prompt_file: Option<PathBuf>,
+    scope: &paths::Scope,
+) -> Result<PromptSource> {
+    let Some(path) = prompt_file else {
+        return Ok(PromptSource::Stdin);
+    };
+    if is_explicit_prompt_path(&path) {
+        return Ok(PromptSource::File(path));
+    }
+    let name = path.display().to_string();
+    let project_config_dir = scope.project().map(|project| project.root.join(".mu"));
+    let index =
+        skills::scan_instruction_index(&paths::global_dir(), project_config_dir.as_deref())?;
+    if let Some(command) = skills::find_command(&index, &name) {
+        return Ok(PromptSource::Command(PathBuf::from(&command.path)));
+    }
+    Ok(PromptSource::File(path))
+}
+
+fn is_explicit_prompt_path(path: &Path) -> bool {
+    path.is_absolute()
+        || path
+            .components()
+            .next()
+            .is_some_and(|component| matches!(component, std::path::Component::ParentDir))
+        || path.to_string_lossy().starts_with("./")
 }
 
 fn normalize_prompt(raw: &str, trim_shebang: bool) -> Result<String> {

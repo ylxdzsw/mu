@@ -30,6 +30,7 @@ cat > "$prompt_fake_bin/mu" <<'EOF'
 if [[ "$1" == "status" ]]; then
   model=prompt-test-model
   include_models=0
+  include_commands=0
   while (( $# )); do
     case "$1" in
       --model)
@@ -39,14 +40,26 @@ if [[ "$1" == "status" ]]; then
       --include-models)
         include_models=1
         ;;
+      --include-commands)
+        include_commands=1
+        ;;
     esac
     shift
   done
   [[ "$model" == invalid/* ]] && exit 1
   if (( include_models )); then
     print -r -- "{\"model_id\":\"$model\",\"context_percent\":25.0,\"project_root\":\"$MU_ZSH_TEST_PROJECT_ROOT\",\"available_models\":{\"providers\":[{\"id\":\"local\",\"models\":[{\"id\":\"local/solo\",\"model_id\":\"solo\",\"supported_efforts\":[\"max\"]},{\"id\":\"local/shared\",\"model_id\":\"shared\",\"supported_efforts\":[]}]},{\"id\":\"openai\",\"models\":[{\"id\":\"openai/gpt\",\"model_id\":\"gpt\",\"supported_efforts\":[\"low\",\"high\"]},{\"id\":\"openai/shared\",\"model_id\":\"shared\",\"supported_efforts\":[\"medium\"]}]}]}}"
+  elif (( include_commands )); then
+    print -r -- "{\"model_id\":\"$model\",\"context_percent\":25.0,\"project_root\":\"$MU_ZSH_TEST_PROJECT_ROOT\",\"commands\":[{\"name\":\"review.md\",\"path\":\"$MU_ZSH_TEST_PROJECT_ROOT/.mu/review.md\",\"scope\":\"project\"}]}"
   else
     print -r -- "{\"model_id\":\"$model\",\"context_percent\":25.0,\"project_root\":\"$MU_ZSH_TEST_PROJECT_ROOT\"}"
+  fi
+  exit 0
+fi
+if [[ "$1" == "--output" && "$3" == "review.md" ]]; then
+  print -r -- "$*" >> "$MU_ZSH_FAKE_LOG"
+  if [[ -n "$MU_SESSION_FILE" ]]; then
+    print -r -- "created-session" > "$MU_SESSION_FILE"
   fi
   exit 0
 fi
@@ -236,15 +249,19 @@ MU_ZSH_OUTPUT=plain
 MU_ZSH_SESSION_ID=
 MU_ZSH_SESSION_SCOPE=
 command_matches=("${(@f)$(_mu_zsh_slash_command_matches /)}")
-[[ "${(j:,:)command_matches}" == "/model" ]] || fail "hides session commands without a valid session"
+[[ "${(j:,:)command_matches}" == "/model,/review.md" ]] || fail "hides session commands without a valid session"
 MU_ZSH_SESSION_ID=tracked-session
 MU_ZSH_SESSION_SCOPE=$(_mu_zsh_current_scope_key)
 command_matches=("${(@f)$(_mu_zsh_slash_command_matches /)}")
-[[ "${(j:,:)command_matches}" == "/model,/new,/retry,/compact" ]] || fail "shows session commands with a valid session: ${(j:,:)command_matches}"
+[[ "${(j:,:)command_matches}" == "/model,/new,/retry,/compact,/review.md" ]] || fail "shows session commands with a valid session: ${(j:,:)command_matches}"
 BUFFER="/ret"
 CURSOR=${#BUFFER}
 _mu_zsh_complete_slash
 [[ "$BUFFER" == "/retry " && "$CURSOR" -eq 7 ]] || fail "directly completes a single slash command: $BUFFER ($CURSOR)"
+BUFFER="/rev"
+CURSOR=${#BUFFER}
+_mu_zsh_complete_slash
+[[ "$BUFFER" == "/review.md " ]] || fail "directly completes a custom slash command: $BUFFER"
 
 model_matches=("${(@f)$(_mu_zsh_model_completion_matches "")}")
 [[ " ${(j: :)model_matches} " == *" openai/gpt "* ]] || fail "offers provider-qualified model"
@@ -271,8 +288,15 @@ grep -q -- "retry -s tracked-session --output plain" "$MU_ZSH_FAKE_LOG" || fail 
 rm -f "$MU_ZSH_FAKE_LOG"
 _mu_zsh_run_slash_command "/compact"
 grep -q -- "compact --session tracked-session" "$MU_ZSH_FAKE_LOG" || fail "compact slash command targets tracked session"
+rm -f "$MU_ZSH_FAKE_LOG"
+_mu_zsh_run_slash_command "/review.md"
+grep -q -- "--output plain -s tracked-session review.md" "$MU_ZSH_FAKE_LOG" || fail "custom slash command targets tracked session"
 _mu_zsh_run_slash_command "/new"
 [[ -z "$MU_ZSH_SESSION_ID" && -z "$MU_ZSH_SESSION_SCOPE" ]] || fail "new slash command lazily clears tracked session"
+rm -f "$MU_ZSH_FAKE_LOG" "$MU_ZSH_SESSION_FILE"
+_mu_zsh_run_slash_command "/review.md"
+[[ "$MU_ZSH_SESSION_ID" == "created-session" ]] || fail "custom slash command captures new session id"
+_mu_zsh_clear_session_state
 if _mu_zsh_run_slash_command "/retry"; then
   fail "retry without a valid tracked session should fail"
 fi

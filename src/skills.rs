@@ -1,6 +1,16 @@
-use std::path::Path;
+use std::collections::BTreeMap;
+use std::path::{Component, Path};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
+
+const CACHE_VERSION: u32 = 1;
+const CACHE_RELATIVE_PATH: &str = "cache/instruction-index-v1.json";
+const MAX_DEPTH: usize = 4;
+const MAX_FILES_PER_ROOT: usize = 512;
+const MAX_SKILLS: usize = 64;
+const MAX_COMMANDS: usize = 256;
+const MAX_NAME_LEN: usize = 64;
+const MAX_DESCRIPTION_LEN: usize = 256;
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SkillMeta {
@@ -9,127 +19,109 @@ pub struct SkillMeta {
     pub path: String,
 }
 
-pub fn scan_skills(
-    config_dir: &Path,
-    store: Option<&crate::store::Store>,
-) -> Result<Vec<SkillMeta>> {
-    let skills_dir = config_dir.join("skills");
-    if !skills_dir.exists() {
-        return Ok(vec![]);
-    }
-
-    let mtime = dir_mtime(&skills_dir)?;
-
-    if let Some(store) = store
-        && let Ok(Some(cached)) = store.get_skill_cache(mtime)
-        && let Ok(skills) = serde_json::from_str(&cached)
-    {
-        return Ok(skills);
-    }
-
-    let mut skills = Vec::new();
-    for entry in std::fs::read_dir(&skills_dir)? {
-        let entry = entry?;
-        if !entry.path().is_dir() {
-            continue;
-        }
-        let skill_md = entry.path().join("SKILL.md");
-        if !skill_md.exists() {
-            eprintln!(
-                "warning: skill dir {} has no SKILL.md",
-                entry.path().display()
-            );
-            continue;
-        }
-        match parse_skill_frontmatter(&skill_md) {
-            Ok((name, description)) => {
-                if name.len() > 64 {
-                    eprintln!("warning: skill name too long in {}", skill_md.display());
-                    continue;
-                }
-                if description.len() > 256 {
-                    eprintln!(
-                        "warning: skill description too long in {}",
-                        skill_md.display()
-                    );
-                    continue;
-                }
-                skills.push(SkillMeta {
-                    name,
-                    description,
-                    path: skill_md.canonicalize()?.display().to_string(),
-                });
-            }
-            Err(e) => {
-                eprintln!("warning: malformed skill {}: {e}", skill_md.display());
-            }
-        }
-    }
-
-    if let Some(store) = store
-        && let Ok(json) = serde_json::to_string(&skills)
-    {
-        let _ = store.set_skill_cache(mtime, &json);
-    }
-
-    Ok(skills)
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct CommandMeta {
+    pub name: String,
+    pub path: String,
+    pub scope: InstructionScope,
 }
 
-fn dir_mtime(path: &Path) -> Result<i64> {
-    let mut max_mtime = file_mtime(path)?;
-
-    for entry in std::fs::read_dir(path)? {
-        let entry = entry?;
-        if !entry.path().is_dir() {
-            continue;
-        }
-        let skill_md = entry.path().join("SKILL.md");
-        if skill_md.exists() {
-            let m = file_mtime(&skill_md)?;
-            if m > max_mtime {
-                max_mtime = m;
-            }
-        }
-    }
-    Ok(max_mtime)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum InstructionScope {
+    Global,
+    Project,
 }
 
-fn file_mtime(path: &Path) -> Result<i64> {
-    let meta = std::fs::metadata(path)?;
-    let modified = meta.modified()?;
-    Ok(modified
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs() as i64)
+#[derive(Debug, Clone, Default)]
+pub struct InstructionIndex {
+    pub skills: Vec<SkillMeta>,
+    pub commands: Vec<CommandMeta>,
 }
 
-fn parse_skill_frontmatter(path: &Path) -> Result<(String, String)> {
-    let content = std::fs::read_to_string(path)?;
-    if !content.starts_with("---") {
-        anyhow::bail!("missing YAML frontmatter");
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct RootCache {
+    version: u32,
+    root: String,
+    limits: ScanLimits,
+    snapshot: Vec<SnapshotEntry>,
+    skills: Vec<SkillMeta>,
+    commands: Vec<CommandMeta>,
+    warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct ScanLimits {
+    max_depth: usize,
+    max_files: usize,
+    max_skills: usize,
+    max_commands: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct SnapshotEntry {
+    path: String,
+    kind: SnapshotKind,
+    modified: Option<u64>,
+    size: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum SnapshotKind {
+    Dir,
+    File,
+}
+
+#[derive(Debug)]
+struct RootIndex {
+    skills: Vec<SkillMeta>,
+    commands: Vec<CommandMeta>,
+}
+
+#[derive(Debug)]
+struct ScanSnapshot {
+    entries: Vec<SnapshotEntry>,
+    truncated: bool,
+}
+
+#[derive(Debug)]
+struct ParsedInstruction {
+    is_command: bool,
+    skill: Option<(String, String)>,
+}
+
+pub fn scan_instruction_index(
+    global_config_dir: &Path,
+    project_config_dir: Option<&Path>,
+) -> Result<InstructionIndex> {
+    let mut roots = Vec::new();
+    roots.push(scan_root(global_config_dir, InstructionScope::Global)?);
+    if let Some(project_config_dir) = project_config_dir {
+        roots.push(scan_root(project_config_dir, InstructionScope::Project)?);
     }
-    let rest = &content[3..];
-    let end = rest
-        .find("\n---")
-        .ok_or_else(|| anyhow::anyhow!("unclosed frontmatter"))?;
-    let yaml = &rest[..end];
-    let mut name = None;
-    let mut description = None;
-    for line in yaml.lines() {
-        if let Some((k, v)) = line.split_once(':') {
-            let key = k.trim();
-            let val = v.trim().trim_matches('"');
-            match key {
-                "name" => name = Some(val.to_string()),
-                "description" => description = Some(val.to_string()),
-                _ => {}
-            }
+
+    let mut skills_by_name = BTreeMap::new();
+    let mut commands_by_name = BTreeMap::new();
+    for root in roots {
+        for skill in root.skills {
+            skills_by_name.insert(skill.name.clone(), skill);
+        }
+        for command in root.commands {
+            commands_by_name.insert(command.name.clone(), command);
         }
     }
-    Ok((
-        name.ok_or_else(|| anyhow::anyhow!("missing name"))?,
-        description.ok_or_else(|| anyhow::anyhow!("missing description"))?,
-    ))
+
+    let mut skills = skills_by_name.into_values().collect::<Vec<_>>();
+    let mut commands = commands_by_name.into_values().collect::<Vec<_>>();
+    if skills.len() > MAX_SKILLS {
+        skills.truncate(MAX_SKILLS);
+    }
+    if commands.len() > MAX_COMMANDS {
+        commands.truncate(MAX_COMMANDS);
+    }
+
+    Ok(InstructionIndex { skills, commands })
 }
 
 pub fn format_skills_block(skills: &[SkillMeta]) -> String {
@@ -143,11 +135,513 @@ pub fn format_skills_block(skills: &[SkillMeta]) -> String {
             s.name, s.description, s.path
         ));
     }
-    lines.push("Relative paths inside SKILL.md resolve against the skill's directory.".into());
+    lines.push(
+        "Relative paths inside a skill file resolve against that file's containing directory."
+            .into(),
+    );
     lines.push("</available_skills>".into());
     lines.join("\n")
 }
 
 pub fn read_agents_md(path: &Path) -> Option<String> {
     std::fs::read_to_string(path).ok()
+}
+
+pub fn command_prompt(path: &Path) -> Result<String> {
+    let raw = std::fs::read_to_string(path)
+        .with_context(|| format!("reading custom command {}", path.display()))?;
+    let body = strip_instruction_headers(&raw);
+    let prompt = body.trim_end_matches(['\r', '\n']).to_string();
+    if prompt.is_empty() {
+        anyhow::bail!("empty custom command {}", path.display());
+    }
+    Ok(prompt)
+}
+
+pub fn find_command<'a>(index: &'a InstructionIndex, name: &str) -> Option<&'a CommandMeta> {
+    index.commands.iter().find(|command| command.name == name)
+}
+
+fn scan_root(root: &Path, scope: InstructionScope) -> Result<RootIndex> {
+    if !root.is_dir() {
+        return Ok(RootIndex {
+            skills: Vec::new(),
+            commands: Vec::new(),
+        });
+    }
+
+    let limits = ScanLimits {
+        max_depth: MAX_DEPTH,
+        max_files: MAX_FILES_PER_ROOT,
+        max_skills: MAX_SKILLS,
+        max_commands: MAX_COMMANDS,
+    };
+    let snapshot = collect_snapshot(root, limits)?;
+    let cache_path = root.join(CACHE_RELATIVE_PATH);
+
+    if let Ok(text) = std::fs::read_to_string(&cache_path)
+        && let Ok(cache) = serde_json::from_str::<RootCache>(&text)
+        && cache.version == CACHE_VERSION
+        && cache.root == root.display().to_string()
+        && cache.limits == limits
+        && cache.snapshot == snapshot.entries
+    {
+        return Ok(RootIndex {
+            skills: cache.skills,
+            commands: cache.commands,
+        });
+    }
+
+    let (index, warnings) = build_root_index(root, scope, &snapshot)?;
+    write_cache(
+        &cache_path,
+        &RootCache {
+            version: CACHE_VERSION,
+            root: root.display().to_string(),
+            limits,
+            snapshot: snapshot.entries,
+            skills: index.skills.clone(),
+            commands: index.commands.clone(),
+            warnings,
+        },
+    );
+    Ok(index)
+}
+
+fn collect_snapshot(root: &Path, limits: ScanLimits) -> Result<ScanSnapshot> {
+    let mut entries = Vec::new();
+    let mut file_count = 0;
+    let mut truncated = false;
+    collect_snapshot_dir(
+        root,
+        Path::new(""),
+        0,
+        limits,
+        &mut entries,
+        &mut file_count,
+        &mut truncated,
+    )?;
+    entries.sort_by(|a, b| {
+        a.path
+            .cmp(&b.path)
+            .then_with(|| kind_name(&a.kind).cmp(kind_name(&b.kind)))
+    });
+    Ok(ScanSnapshot { entries, truncated })
+}
+
+fn collect_snapshot_dir(
+    root: &Path,
+    relative_dir: &Path,
+    depth: usize,
+    limits: ScanLimits,
+    entries: &mut Vec<SnapshotEntry>,
+    file_count: &mut usize,
+    truncated: &mut bool,
+) -> Result<()> {
+    if depth >= limits.max_depth {
+        return Ok(());
+    }
+
+    let dir = root.join(relative_dir);
+    let mut children = Vec::new();
+    for entry in std::fs::read_dir(&dir).with_context(|| format!("reading {}", dir.display()))? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if is_reserved_entry(relative_dir, &name) {
+            continue;
+        }
+        children.push((name.to_string(), entry.path()));
+    }
+    children.sort_by(|a, b| a.0.cmp(&b.0));
+
+    for (name, path) in children {
+        let relative = relative_dir.join(&name);
+        let metadata = match std::fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(_) => continue,
+        };
+        if metadata.is_dir() {
+            if is_valid_instruction_relative_path(&relative) {
+                entries.push(SnapshotEntry {
+                    path: slash_path(&relative),
+                    kind: SnapshotKind::Dir,
+                    modified: None,
+                    size: None,
+                });
+                collect_snapshot_dir(
+                    root,
+                    &relative,
+                    depth + 1,
+                    limits,
+                    entries,
+                    file_count,
+                    truncated,
+                )?;
+            }
+        } else if metadata.is_file() {
+            if *file_count >= limits.max_files {
+                *truncated = true;
+                continue;
+            }
+            *file_count += 1;
+            if !is_valid_instruction_relative_path(&relative) {
+                continue;
+            }
+            entries.push(SnapshotEntry {
+                path: slash_path(&relative),
+                kind: SnapshotKind::File,
+                modified: metadata
+                    .modified()
+                    .ok()
+                    .and_then(|mtime| mtime.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|duration| duration.as_secs()),
+                size: Some(metadata.len()),
+            });
+        }
+    }
+
+    Ok(())
+}
+
+fn build_root_index(
+    root: &Path,
+    scope: InstructionScope,
+    snapshot: &ScanSnapshot,
+) -> Result<(RootIndex, Vec<String>)> {
+    let mut skills = Vec::new();
+    let mut commands = Vec::new();
+    let mut warnings = Vec::new();
+
+    if snapshot.truncated {
+        warnings.push(format!(
+            "{} scan reached the {} file limit",
+            root.display(),
+            MAX_FILES_PER_ROOT
+        ));
+    }
+
+    for entry in snapshot
+        .entries
+        .iter()
+        .filter(|entry| matches!(entry.kind, SnapshotKind::File))
+    {
+        let relative = Path::new(&entry.path);
+        let path = root.join(relative);
+        let content = match std::fs::read_to_string(&path) {
+            Ok(content) => content,
+            Err(error) => {
+                warnings.push(format!("failed to read {}: {error}", path.display()));
+                continue;
+            }
+        };
+        let parsed = parse_instruction(&content);
+        if parsed.is_command && commands.len() < MAX_COMMANDS {
+            commands.push(CommandMeta {
+                name: entry.path.clone(),
+                path: path
+                    .canonicalize()
+                    .unwrap_or(path.clone())
+                    .display()
+                    .to_string(),
+                scope,
+            });
+        }
+        if let Some((name, description)) = parsed.skill {
+            match expected_skill_name(relative) {
+                Some(expected) if expected == name => {
+                    if skills.len() < MAX_SKILLS {
+                        skills.push(SkillMeta {
+                            name,
+                            description,
+                            path: path
+                                .canonicalize()
+                                .unwrap_or(path.clone())
+                                .display()
+                                .to_string(),
+                        });
+                    }
+                }
+                Some(expected) => warnings.push(format!(
+                    "skill {} has name {}, expected {}",
+                    path.display(),
+                    name,
+                    expected
+                )),
+                None => warnings.push(format!(
+                    "skill {} has no valid inferred name",
+                    path.display()
+                )),
+            }
+        }
+    }
+
+    for warning in &warnings {
+        eprintln!("warning: {warning}");
+    }
+
+    Ok((RootIndex { skills, commands }, warnings))
+}
+
+fn parse_instruction(content: &str) -> ParsedInstruction {
+    let (after_shebang, is_command) = strip_optional_mu_shebang(content);
+    let skill = parse_skill_frontmatter(after_shebang).ok();
+    ParsedInstruction { is_command, skill }
+}
+
+fn strip_instruction_headers(content: &str) -> &str {
+    let (after_shebang, _) = strip_optional_mu_shebang(content);
+    strip_closed_frontmatter(after_shebang).unwrap_or(after_shebang)
+}
+
+fn strip_optional_mu_shebang(content: &str) -> (&str, bool) {
+    let first_line = content.lines().next().unwrap_or_default();
+    if !is_mu_shebang(first_line) {
+        return (content, false);
+    }
+    match content.find('\n') {
+        Some(idx) => (&content[idx + 1..], true),
+        None => ("", true),
+    }
+}
+
+fn is_mu_shebang(line: &str) -> bool {
+    let Some(rest) = line.strip_prefix("#!") else {
+        return false;
+    };
+    rest.split_whitespace().any(|token| {
+        token == "mu"
+            || Path::new(token)
+                .file_name()
+                .is_some_and(|file_name| file_name == "mu")
+    })
+}
+
+fn parse_skill_frontmatter(content: &str) -> Result<(String, String)> {
+    let content = content
+        .strip_prefix("---")
+        .context("missing YAML frontmatter")?;
+    let end = content.find("\n---").context("unclosed frontmatter")?;
+    let yaml = &content[..end];
+    let mut name = None;
+    let mut description = None;
+    for line in yaml.lines() {
+        if let Some((key, value)) = line.split_once(':') {
+            let value = value.trim().trim_matches('"');
+            match key.trim() {
+                "name" => name = Some(value.to_string()),
+                "description" => description = Some(collapse_description(value)),
+                _ => {}
+            }
+        }
+    }
+    let name = name.context("missing name")?;
+    let description = description.context("missing description")?;
+    if !valid_skill_name(&name) {
+        anyhow::bail!("invalid skill name");
+    }
+    if description.is_empty() {
+        anyhow::bail!("empty description");
+    }
+    if description.len() > MAX_DESCRIPTION_LEN {
+        anyhow::bail!("description too long");
+    }
+    Ok((name, description))
+}
+
+fn strip_closed_frontmatter(content: &str) -> Option<&str> {
+    let rest = content.strip_prefix("---")?;
+    let end = rest.find("\n---")?;
+    let after_marker = &rest[end + "\n---".len()..];
+    Some(after_marker.strip_prefix('\n').unwrap_or(after_marker))
+}
+
+fn collapse_description(value: &str) -> String {
+    value.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn expected_skill_name(relative: &Path) -> Option<String> {
+    let file_name = relative.file_name()?.to_string_lossy();
+    if file_name == "SKILL.md" {
+        return relative
+            .parent()?
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned());
+    }
+    relative
+        .file_stem()
+        .map(|stem| stem.to_string_lossy().into_owned())
+}
+
+fn valid_skill_name(name: &str) -> bool {
+    if name.is_empty() || name.len() > MAX_NAME_LEN {
+        return false;
+    }
+    let mut chars = name.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if !first.is_ascii_lowercase() && !first.is_ascii_digit() {
+        return false;
+    }
+    chars.all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '_' || ch == '-')
+}
+
+fn is_reserved_entry(relative_dir: &Path, name: &str) -> bool {
+    if name == "." || name == ".." {
+        return true;
+    }
+    if relative_dir.as_os_str().is_empty() {
+        return matches!(
+            name,
+            "cache" | "locks" | "config.jsonc" | ".env" | ".gitignore" | "AGENTS.md"
+        ) || name == "sessions.db"
+            || name.starts_with("sessions.db-");
+    }
+    false
+}
+
+fn is_valid_instruction_relative_path(path: &Path) -> bool {
+    path.components().all(|component| match component {
+        Component::Normal(name) => {
+            let name = name.to_string_lossy();
+            !name.is_empty()
+                && !name.starts_with('.')
+                && !name.starts_with('-')
+                && name
+                    .chars()
+                    .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.'))
+        }
+        _ => false,
+    })
+}
+
+fn slash_path(path: &Path) -> String {
+    path.components()
+        .filter_map(|component| match component {
+            Component::Normal(name) => Some(name.to_string_lossy().into_owned()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+fn write_cache(path: &Path, cache: &RootCache) {
+    let Some(parent) = path.parent() else {
+        return;
+    };
+    if std::fs::create_dir_all(parent).is_err() {
+        return;
+    }
+    let Ok(json) = serde_json::to_string(cache) else {
+        return;
+    };
+    let _ = std::fs::write(path, json);
+}
+
+fn kind_name(kind: &SnapshotKind) -> &'static str {
+    match kind {
+        SnapshotKind::Dir => "dir",
+        SnapshotKind::File => "file",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn detects_permissive_mu_shebangs() {
+        assert!(is_mu_shebang("#!/usr/bin/env mu"));
+        assert!(is_mu_shebang("#!/usr/bin/env -S mu --output plain"));
+        assert!(is_mu_shebang("#!/usr/bin/mu"));
+        assert!(!is_mu_shebang("#!/usr/bin/env bash"));
+        assert!(!is_mu_shebang("not a shebang"));
+    }
+
+    #[test]
+    fn command_prompt_strips_shebang_and_frontmatter() {
+        let body = strip_instruction_headers(
+            "#!/usr/bin/env mu\n---\nname: review\n---\nReview the tree.\n",
+        );
+        assert_eq!(body, "Review the tree.\n");
+    }
+
+    #[test]
+    fn skill_name_must_match_file_or_parent_folder() {
+        assert_eq!(
+            expected_skill_name(Path::new("review.md")).as_deref(),
+            Some("review")
+        );
+        assert_eq!(
+            expected_skill_name(Path::new("review/SKILL.md")).as_deref(),
+            Some("review")
+        );
+    }
+
+    #[test]
+    fn scans_flat_command_skill_files() {
+        let root = temp_root("flat-command-skill");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(
+            root.join("review.md"),
+            "#!/usr/bin/env mu\n---\nname: review\ndescription: Review changes.\n---\nReview it.\n",
+        )
+        .unwrap();
+
+        let index = scan_instruction_index(&root, None).unwrap();
+
+        assert_eq!(index.commands.len(), 1);
+        assert_eq!(index.commands[0].name, "review.md");
+        assert_eq!(index.skills.len(), 1);
+        assert_eq!(index.skills[0].name, "review");
+        assert_eq!(index.skills[0].description, "Review changes.");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn scans_legacy_skill_md_when_name_matches_parent() {
+        let root = temp_root("legacy-skill");
+        let dir = root.join("review");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("SKILL.md"),
+            "---\nname: review\ndescription: Review changes.\n---\nReview it.\n",
+        )
+        .unwrap();
+
+        let index = scan_instruction_index(&root, None).unwrap();
+
+        assert!(index.commands.is_empty());
+        assert_eq!(index.skills.len(), 1);
+        assert_eq!(index.skills[0].name, "review");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn rejects_skill_name_that_does_not_match_file() {
+        let root = temp_root("skill-name-mismatch");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(
+            root.join("review.md"),
+            "---\nname: other\ndescription: Review changes.\n---\nReview it.\n",
+        )
+        .unwrap();
+
+        let index = scan_instruction_index(&root, None).unwrap();
+
+        assert!(index.skills.is_empty());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    fn temp_root(name: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("mu-{name}-{}-{nanos}", std::process::id()))
+    }
 }

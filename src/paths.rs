@@ -181,7 +181,7 @@ fn project_marker_name(marker: ProjectMarker) -> &'static str {
 const PROJECT_CONFIG_TEMPLATE: &str =
     "{\n  // Optional project-local overrides merged over ~/.mu/config.jsonc.\n}\n";
 
-const STATE_GITIGNORE: &str = ".env\nsessions.db\nsessions.db-*\nlocks/\n*.db\n*.db-*\n";
+const STATE_GITIGNORE: &str = ".env\nsessions.db\nsessions.db-*\nlocks/\ncache/\n*.db\n*.db-*\n";
 
 fn git_worktree_info(root: &Path) -> Option<GitWorktreeInfo> {
     let dot_git = root.join(".git");

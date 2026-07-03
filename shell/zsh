@@ -277,6 +277,19 @@ _mu_zsh_status_json_with_models() {
   "${command[@]}" 2>/dev/null
 }
 
+_mu_zsh_status_json_with_commands() {
+  local -a command
+  local session_id
+  local model
+  _mu_zsh_sync_state
+  session_id=$MU_ZSH_EFFECTIVE_SESSION_ID
+  model=$MU_ZSH_EFFECTIVE_MODEL
+  command=("$MU_ZSH_BIN" status --json --include-commands)
+  [[ -n "$session_id" ]] && command+=(-s "$session_id")
+  [[ -n "$model" ]] && command+=(--model "$model")
+  "${command[@]}" 2>/dev/null
+}
+
 _mu_zsh_status_field() {
   local json=$1
   local key=$2
@@ -435,12 +448,42 @@ _mu_zsh_slash_command_matches() {
   if _mu_zsh_has_effective_session; then
     commands+=(/new /retry /compact)
   fi
+  commands+=("${(@f)$(_mu_zsh_custom_slash_commands 2>/dev/null || true)}")
 
   local command
   for command in "${commands[@]}"; do
     [[ "$command" == "$prefix"* ]] && print -r -- "$command"
   done
   return 0
+}
+
+_mu_zsh_custom_slash_commands() {
+  local json
+  json=$(_mu_zsh_status_json_with_commands) || return 1
+  command -v python3 >/dev/null 2>&1 || return 1
+  python3 -c '
+import json
+import sys
+
+try:
+    payload = json.load(sys.stdin)
+except Exception:
+    sys.exit(1)
+
+for command in payload.get("commands") or []:
+    name = command.get("name")
+    if name:
+        print("/" + name)
+' <<< "$json"
+}
+
+_mu_zsh_has_custom_slash_command() {
+  local slash_command=$1
+  local command
+  for command in "${(@f)$(_mu_zsh_custom_slash_commands 2>/dev/null || true)}"; do
+    [[ "$command" == "$slash_command" ]] && return 0
+  done
+  return 1
 }
 
 _mu_zsh_model_records() {
@@ -589,6 +632,36 @@ _mu_zsh_validate_model_ref() {
   "${command[@]}" >/dev/null 2>&1
 }
 
+_mu_zsh_run_custom_slash_command() {
+  local slash_command=$1
+  local name=${slash_command#/}
+  local exit_status scope session_id model
+  local -a command
+
+  scope=$(_mu_zsh_current_scope_key)
+  _mu_zsh_forget_state_outside_scope "$scope"
+  _mu_zsh_sync_state
+  session_id=$MU_ZSH_EFFECTIVE_SESSION_ID
+  model=$MU_ZSH_EFFECTIVE_MODEL
+
+  command=("$MU_ZSH_BIN" --output "$MU_ZSH_OUTPUT")
+  [[ -n "$session_id" ]] && command+=(-s "$session_id")
+  [[ -n "$model" ]] && command+=(--model "$model")
+  command+=("$name")
+
+  if [[ -n "$session_id" ]]; then
+    "${command[@]}"
+    exit_status=$?
+  else
+    rm -f -- "$MU_ZSH_SESSION_FILE" 2>/dev/null || true
+    MU_SESSION_FILE=$MU_ZSH_SESSION_FILE "${command[@]}"
+    exit_status=$?
+    _mu_zsh_read_session_file "$scope"
+  fi
+
+  return $exit_status
+}
+
 _mu_zsh_run_slash_command() {
   local line=$1
   local command rest session_id scope
@@ -655,8 +728,14 @@ _mu_zsh_run_slash_command() {
       fi
       ;;
     *)
-      print -r -- "[mu] unknown slash command: $command"
-      return 1
+      if _mu_zsh_has_custom_slash_command "$command"; then
+        _mu_zsh_validate_no_args "$command" "$rest" || return 1
+        _mu_zsh_run_custom_slash_command "$command"
+        exit_status=$?
+      else
+        print -r -- "[mu] unknown slash command: $command"
+        return 1
+      fi
       ;;
   esac
 

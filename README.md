@@ -93,6 +93,7 @@ MU_ZSH_EXIT_HOOKS+=(mu_restore_conflicts)
 | `mu --output json` | Render newline-delimited JSON events for integrations/web UI |
 | `mu project init [--path <dir>] [--force]` | Create minimal local `.mu` metadata in the current directory or target directory |
 | `mu status --json [--include-models]` | Report the resolved model, session, context state, and optional configured model list |
+| `mu status --json --include-commands` | Include discovered custom command entries |
 | `mu session new` | Create session, print id |
 | `mu session list` | List recent non-archived CLI sessions |
 | `mu session archive --session <id>` | Hide a session from default lists |
@@ -116,6 +117,14 @@ Write a concise release note for the current checkout.
 Prompt-file mode removes the shebang line before sending the prompt to the
 model. Stdin mode does not trim shebang-like input. Prompt-file mode keeps the
 same working directory as the invoking shell.
+
+Files under global or project `.mu` can also act as a small instruction library.
+A file whose first line is a permissive `mu` shebang is a custom command and can
+be run by its relative `.mu` path, for example `mu review.md`. A file with YAML
+frontmatter containing `name` and `description` is listed as a skill only when
+the name matches the filename stem; legacy `name/SKILL.md` files also qualify
+when the name matches the parent directory. Commands and skills are cached under
+`.mu/cache/` for fast startup.
 
 ## Web UI
 
@@ -178,7 +187,8 @@ model id is provided by exactly one configured provider.
 rings the terminal bell after a successful turn that ran for at least
 `terminal_bell.min_duration_ms` (default `10000`).
 
-Optional: `.env`, `AGENTS.md` (global and project-local), `skills/*/SKILL.md`.
+Optional: `.env`, `AGENTS.md` (global and project-local), instruction files
+under `.mu`.
 Provider API key values and names listed in `redaction.env` are exact-value
 redacted from `bash` tool output before it is stored or shown to the model.
 

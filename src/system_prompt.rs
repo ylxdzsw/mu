@@ -3,7 +3,7 @@ use std::path::Path;
 use chrono::Local;
 
 use crate::paths::Project;
-use crate::skills::{SkillMeta, format_skills_block, read_agents_md, scan_skills};
+use crate::skills::{SkillMeta, format_skills_block, read_agents_md, scan_instruction_index};
 
 pub const ROLE_PREAMBLE: &str = "You are mu, a terminal agent. Exactly one tool is available: `bash`. Do not invent or call `read`, `write`, `edit`, `fetch`, `search`, `apply_patch`, `view_image`, or any other tool name. If a skill or `AGENTS.md` mentions another tool, treat it as historical shorthand and accomplish the task with `bash` and ordinary CLI programs instead. Use `bash` for local search, file reads, writes, edits, web fetches, tests, and any other CLI work. Each bash call is isolated: pass `cwd` explicitly when needed, and do not expect `cd` or environment changes to persist. Include a short `title`, an advisory `risk` label, and the `script`. Keep responses concise.";
 
@@ -12,12 +12,10 @@ pub fn build_system_prompt(
     project_config_dir: Option<&Path>,
     store: Option<&crate::store::Store>,
 ) -> anyhow::Result<String> {
-    let mut skills = scan_skills(global_config_dir, store)?;
-    if let Some(project_config_dir) = project_config_dir {
-        skills.extend(scan_skills(project_config_dir, store)?);
-    }
+    let _ = store;
+    let index = scan_instruction_index(global_config_dir, project_config_dir)?;
     Ok(assemble_prompt(
-        &skills,
+        &index.skills,
         global_config_dir,
         project_config_dir,
     ))

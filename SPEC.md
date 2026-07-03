@@ -138,14 +138,14 @@ advisory UI/audit metadata only; it is not a sandbox or approval proof.
 ### 2.5 Skills via progressive disclosure, no skill tool
 
 Skill metadata (name + description + path) is injected into the system prompt.
-The agent loads a skill's full `SKILL.md` on demand using `bash` (`sed`, `cat`,
-`rg`, etc.). No dedicated "skill" tool — this keeps the model-visible surface at
-one tool and makes skills "just files".
+The agent loads a skill file on demand using `bash` (`sed`, `cat`, `rg`, etc.).
+No dedicated "skill" tool — this keeps the model-visible surface at one tool
+and makes skills "just files".
 
 ### 2.6 Flat config, single SQLite state file
 
-All user-facing configuration is a flat directory of plain files
-(`config.jsonc`, `AGENTS.md`, `skills/`). Runtime state is one SQLite database
+All user-facing configuration and instruction files live under a flat `.mu`
+directory (`config.jsonc`, `AGENTS.md`, prompt/skill/command files). Runtime state is one SQLite database
 in the active global/project scope. See §9, §10, and §11.
 
 ---
@@ -219,6 +219,10 @@ small:
 - `mu [-s <id>] [-c] [--model <id>] [-i <image>] [--output plain|terminal|json] <prompt-file>`
   — run one turn from a prompt file; if the first line starts with `#!`, drop
   it before sending the prompt. `-i/--image` is repeatable.
+- `mu [-s <id>] [-c] [--model <id>] [--output plain|terminal|json] <custom-command>`
+  — run a discovered shebang command from the active project/global `.mu`
+  instruction index. Command names are relative `.mu` paths including
+  extensions; built-in subcommands and explicit prompt paths win.
 - `shell/zsh` — zsh prompt mode; each accepted prompt runs one foreground `mu`
   turn and keeps using the same session. `MU_ZSH_SESSION_ID=<id>` seeds
   attachment to an existing session.
@@ -227,6 +231,8 @@ small:
 - `mu project init [--path <dir>] [--force]` — create minimal `.mu/` project
   metadata in the current directory by default, or in an explicitly chosen
   directory.
+- `mu status --json --include-commands` — include discovered custom command
+  names, paths, and scope for shell completion/debugging.
 - `mu session new` — create a session and print its id.
 - `mu session list` — list recent non-archived CLI-origin sessions by default;
   wrappers may widen this to all origins.
@@ -240,10 +246,12 @@ small:
   Unix socket.
 
 The turn runner remains one completed turn per invocation. Bare `mu` reads the
-prompt from stdin; `mu <prompt-file>` reads it from a file and trims a leading
-shebang line when present. Exact subcommand names win at the top level, so a
-prompt file that collides with a subcommand name must be passed with a
-disambiguating path such as `./status`. The standalone web service is the
+prompt from stdin; a positional name first resolves to a discovered custom
+command unless it is an explicit path such as `./prompt.md`, then falls back to
+prompt-file mode. Prompt-file mode trims a leading shebang line when present.
+Exact subcommand names win at the top level, so a prompt file that collides with
+a subcommand name must be passed with a disambiguating path such as `./status`.
+The standalone web service is the
 long-lived wrapper surface: it accepts browser requests, starts
 project-scoped sessions, shells out to the same turn runner with `--output json`,
 accepts prompts asynchronously, and exposes replayable browser event streams
@@ -975,25 +983,22 @@ trait.
 
 ## 8. Skills
 
-Skills are reusable, on-demand instruction bundles, following the opencode/pi
-shape and the broader Agent Skills convention.
+Skills are reusable, on-demand instruction files discovered inside the active
+global and project `.mu` directories.
 
-- A skill is a directory under the config `skills/` folder containing a
-  `SKILL.md` whose YAML front-matter defines `name` and `description`. The body
-  is markdown instructions; the directory may hold supporting scripts/files.
-- On startup `mu` scans `skills/`, parses front-matter (bounded name/description
-  lengths, graceful warnings on malformed files), and injects a compact
-  `<available_skills>` block — name, description, absolute `SKILL.md` path — into
-  the system prompt.
-- When a task matches a skill, the model reads the full `SKILL.md` via `bash`,
-  using the **absolute path** from the injected `<available_skills>` block. Any
-  relative paths *written inside* a `SKILL.md` (e.g. `scripts/foo.sh`) are
-  documented to resolve against the skill's own directory; the system prompt
-  states this so the model expands them to absolute paths before calling tools.
+- A skill is a regular file with YAML front-matter defining `name` and
+  `description`. The `name` must match the filename stem. For compatibility,
+  `folder/SKILL.md` also qualifies when `name` matches `folder`.
+- On startup `mu` scans `.mu` with bounded depth/file limits, parses only
+  qualifying front-matter, and injects a compact `<available_skills>` block —
+  name, description, absolute file path — into the system prompt.
+- When a task matches a skill, the model reads the full file via `bash`, using
+  the **absolute path** from the injected block. Relative paths written inside a
+  skill file resolve against that file's containing directory.
 
-Progressive disclosure: only short metadata is always in context; full
-instructions are pulled in on demand. No dedicated tool, no registration — skills
-are files discovered on startup (and cached, §13).
+The same file may also be a custom command when its first line is a permissive
+`mu` shebang. Progressive disclosure remains: only short metadata is always in
+context; full instructions are pulled in on demand.
 
 ---
 
@@ -1028,9 +1033,11 @@ The project-local directory is `.mu`. It contains:
 - `config.jsonc`, the project configuration.
 - `.env`, optional local environment values.
 - `AGENTS.md`, the project-local agent instructions.
-- `skills/`, the project-local skills directory.
+- optional instruction files that may be plain references, custom commands,
+  skills, or both.
 - `sessions.db`, the project-local session history and state database.
-- `.gitignore`, which ignores session database files and related SQLite files.
+- `cache/`, the local instruction index cache.
+- `.gitignore`, which ignores session database, cache, and related SQLite files.
 
 Project state is private to the project. A project should be movable and
 understandable by inspecting its `.mu` directory, while still avoiding committing
@@ -1051,10 +1058,8 @@ The global and project directories have the same conceptual shape:
   config.jsonc      # provider base_url + key env var + model; optional tuning
   .env              # optional environment values for provider lookup + bash
   AGENTS.md         # agent instructions, appended to system prompt
-  skills/
-    <skill-name>/
-      SKILL.md      # front-matter: name, description; body: instructions
-      ...           # optional supporting files
+  review.md         # optional command/skill/reference instruction file
+  cache/            # local instruction-index cache
 ```
 
 When a project is active, global configuration is loaded first and project
@@ -1142,7 +1147,7 @@ The system prompt is intentionally minimal and assembled in this fixed order:
    If the active scope is global, `project_root` is omitted. Worktree
    information is included when available.
 3. The `<available_skills>` block (§8), or omitted if there are no skills. Skill
-   metadata is merged from global and active-project skill directories.
+   metadata is merged from global and active-project instruction indexes.
 4. The global `AGENTS.md` contents, if the file exists.
 5. The project-local `AGENTS.md` contents, if a project is active and the file
    exists.

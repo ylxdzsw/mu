@@ -96,6 +96,9 @@ pub struct StatusArgs {
 
     #[arg(long)]
     pub include_models: bool,
+
+    #[arg(long)]
+    pub include_commands: bool,
 }
 
 #[derive(Subcommand, Debug)]

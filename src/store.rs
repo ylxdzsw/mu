@@ -1236,24 +1236,6 @@ impl Store {
             .unwrap_or(0)
     }
 
-    pub fn get_skill_cache(&self, mtime: i64) -> Result<Option<String>> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT skills_json FROM skill_cache WHERE dir_mtime = ?1")?;
-        let row = stmt
-            .query_row(params![mtime], |row| row.get(0))
-            .optional()?;
-        Ok(row)
-    }
-
-    pub fn set_skill_cache(&self, mtime: i64, skills_json: &str) -> Result<()> {
-        self.conn.execute("DELETE FROM skill_cache", [])?;
-        self.conn.execute(
-            "INSERT INTO skill_cache (dir_mtime, skills_json) VALUES (?1, ?2)",
-            params![mtime, skills_json],
-        )?;
-        Ok(())
-    }
     pub fn acquire_session_lock(&self, session_id: &str) -> Result<SessionLock> {
         crate::paths::ensure_dir(&self.lock_dir)?;
         let lock_path = self.session_lock_path(session_id);
@@ -1289,6 +1271,14 @@ pub struct SessionLock {
     _file: std::fs::File,
 }
 
+type ContextRow = (
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+);
+
 pub fn write_session_id(path: &Path, id: &str) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -1303,15 +1293,7 @@ fn load_user_content(content: String, user_content_json: Option<String>) -> User
         .unwrap_or(UserContent::Text(content))
 }
 
-fn load_context_row(
-    row: &rusqlite::Row<'_>,
-) -> rusqlite::Result<(
-    String,
-    String,
-    Option<String>,
-    Option<String>,
-    Option<String>,
-)> {
+fn load_context_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ContextRow> {
     Ok((
         row.get(0)?,
         row.get(1)?,
