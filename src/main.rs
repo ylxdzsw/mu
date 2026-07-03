@@ -280,7 +280,6 @@ async fn run() -> Result<()> {
                             content: system_prompt::initial_environment_context(
                                 &cwd,
                                 scope.project(),
-                                &session.id,
                             )
                             .into(),
                         },
@@ -769,7 +768,7 @@ fn create_seeded_session(
     store.append_message(
         &session.id,
         &provider::Message::User {
-            content: system_prompt::initial_environment_context(cwd, project, &session.id).into(),
+            content: system_prompt::initial_environment_context(cwd, project).into(),
         },
     )?;
     Ok((session, true))

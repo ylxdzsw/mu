@@ -54,13 +54,8 @@ pub fn assemble_prompt(
 pub fn initial_environment_context(
     cwd: &Path,
     project: Option<&Project>,
-    session_id: &str,
 ) -> String {
-    let mut lines = vec![
-        "[environment]".to_string(),
-        format!("current working directory: {}", cwd.display()),
-        format!("active session id: {session_id}"),
-    ];
+    let mut lines = vec!["[environment]".to_string()];
 
     if let Some(project) = project {
         lines.push(format!("project root: {}", project.root.display()));
@@ -72,6 +67,8 @@ pub fn initial_environment_context(
             }
         }
     }
+
+    lines.push(format!("current working directory: {}", cwd.display()));
 
     lines.join("\n")
 }
@@ -112,10 +109,11 @@ mod tests {
                     common_dir: Some(PathBuf::from("/tmp/repo/.git")),
                 }),
             }),
-            "session-1",
         );
         assert!(context.contains("project root: /tmp/work"));
         assert!(context.contains("git worktree: yes"));
+        assert!(context.contains("current working directory: /tmp/work/subdir"));
+        assert!(!context.contains("active session id"));
     }
 
     #[test]
