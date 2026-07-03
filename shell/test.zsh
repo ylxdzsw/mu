@@ -2,7 +2,7 @@
 set -eu
 
 root=${0:A:h:h}
-source "$root/shell/zsh"
+source "$root/shell/mu.zsh"
 
 fail() {
   print -u2 -- "FAIL: $*"
@@ -411,7 +411,7 @@ printf '%s\n\n' "Hello! I'm your terminal agent. How can I assist you today? Fee
 EOF
 chmod +x "$interactive_fake_bin/mu"
 
-interactive_setup="PS1='> '; PATH=${(q)interactive_fake_bin}:\$PATH; export TEST_CAPTURE_ARGS=${(q)interactive_capture_args} TEST_CAPTURE_STDIN=${(q)interactive_capture_stdin} TEST_CAPTURE_CALLS=${(q)interactive_capture_calls}; source ${(q)root}/shell/zsh; bindkey -M mumode '^G' _mu_zsh_interrupt"
+interactive_setup="PS1='> '; PATH=${(q)interactive_fake_bin}:\$PATH; export TEST_CAPTURE_ARGS=${(q)interactive_capture_args} TEST_CAPTURE_STDIN=${(q)interactive_capture_stdin} TEST_CAPTURE_CALLS=${(q)interactive_capture_calls}; source ${(q)root}/shell/mu.zsh; bindkey -M mumode '^G' _mu_zsh_interrupt"
 
 interactive_transcript=$tmpdir/transcript
 rm -f -- "$interactive_capture_args" "$interactive_capture_stdin" "$interactive_capture_calls"
@@ -485,7 +485,7 @@ history_return_prompt='agent after history'
 print -r -- "print -rn -- shell-history > ${(q)history_return_replay}" > "$history_return_file"
 rm -f -- "$history_return_replay" "$interactive_capture_args" "$interactive_capture_stdin" "$interactive_capture_calls"
 
-history_return_setup=" setopt HIST_IGNORE_SPACE; PS1='> '; PATH=${(q)interactive_fake_bin}:\$PATH; export TEST_CAPTURE_ARGS=${(q)interactive_capture_args} TEST_CAPTURE_STDIN=${(q)interactive_capture_stdin} TEST_CAPTURE_CALLS=${(q)interactive_capture_calls}; HISTFILE=${(q)history_return_file}; HISTSIZE=100; SAVEHIST=100; fc -R ${(q)history_return_file}; source ${(q)root}/shell/zsh"
+history_return_setup=" setopt HIST_IGNORE_SPACE; PS1='> '; PATH=${(q)interactive_fake_bin}:\$PATH; export TEST_CAPTURE_ARGS=${(q)interactive_capture_args} TEST_CAPTURE_STDIN=${(q)interactive_capture_stdin} TEST_CAPTURE_CALLS=${(q)interactive_capture_calls}; HISTFILE=${(q)history_return_file}; HISTSIZE=100; SAVEHIST=100; fc -R ${(q)history_return_file}; source ${(q)root}/shell/mu.zsh"
 interactive_status=0
 {
   print -r -- "$history_return_setup"

@@ -393,7 +393,7 @@ _mu_zsh_run_hooks() {
     if (( $+functions[$hook] )); then
       "$hook"
     else
-      print -u2 -- "mu shell/zsh: hook function not found: $hook"
+      print -u2 -- "mu shell/mu.zsh: hook function not found: $hook"
     fi
   done
 }
