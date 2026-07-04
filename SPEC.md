@@ -617,8 +617,8 @@ it in this order:
    d. **Persist the completed assistant message** (including any `tool_calls`)
       to the DB and append it to the context list.
    e. If `finish_reason` is `tool_calls`: split the calls into maximal
-      contiguous batches of eligible readonly work. `plain` output remains
-      sequential. `terminal` and `json` may execute contiguous
+      contiguous batches of eligible readonly work. `plain`, `terminal`, and
+      `json` may execute contiguous
       `risk:"readonly"` `bash` calls concurrently, but **persist tool result
       messages** (`role: "tool"`, with their `tool_call_id`) in the model's
       original call order before looping back to (a). Any non-readonly call,
@@ -675,12 +675,12 @@ do not persist to later bash calls. `stdin`, when present, is piped literally to
 the child process so the agent can write bytes containing `$`, backticks,
 quotes, or heredoc delimiters without shell expansion.
 
-**Execution ordering.** `plain` output executes every `bash` call sequentially
-in request order. `terminal` and `json` may execute maximal contiguous batches
-of `risk:"readonly"` `bash` calls concurrently because each call runs in its
-own process group with isolated `cwd`, environment, timeout, and stdin. This is
-an execution optimization only: stored tool-call records, stored tool messages,
-and the next model request still see the original assistant tool-call order.
+**Execution ordering.** Human-facing and JSON output may execute maximal
+contiguous batches of `risk:"readonly"` `bash` calls concurrently because each
+call runs in its own process group with isolated `cwd`, environment, timeout,
+and stdin. This is an execution optimization only: stored tool-call records,
+stored tool messages, and the next model request still see the original
+assistant tool-call order.
 
 **Terminal visibility.** `bash` prints `$ [risk] <title>`, streams combined
 output, and finishes with exit status/duration. Every tool error is visible.
@@ -740,13 +740,14 @@ behavior.
   formats, suitable for incremental consumers (newline-delimited JSON is the V1
   shape).
 
-**Concurrency contract.** `plain` is intentionally sequential-only. `terminal`
-and `json` may run contiguous readonly `bash` calls concurrently. `json`
+**Concurrency contract.** `plain`, `terminal`, and `json` may run contiguous
+readonly `bash` calls concurrently. `json`
 streams per-tool `tool_start`/`tool_output`/`tool_finish`/`tool_error` events
 with `tool_call_id` so consumers can associate interleaved machine events with
 the right call. `terminal` keeps append-only scrollback and the one-live-line
 rule: at most one bash call owns live terminal streaming at a time, even while
-later readonly calls are already running in the background.
+later readonly calls are already running in the background. `plain` follows the
+same ordered human-facing display without live-line redraws.
 
 The renderer is the sole writer to stdout/stderr and enforces the selected
 format. It may style output only when stdout is a TTY and `--output terminal` is
@@ -805,12 +806,11 @@ stderr TTY detection suppresses the summary when redirected.
   only once at tool completion if a middle section was actually omitted,
   followed by any reserved tail and a matching exit line. Full tool results
   still follow the shared model-context truncation policy (§4). Multiple tool
-  calls in one assistant message are displayed and then executed in provider
-  order. In `plain`, execution
-  streaming is always sequential. In `terminal`, concurrent readonly batches
-  still present exactly one active live bash stream at a time in original tool
-  order; later calls may already be running, but their execution output is
-  buffered until they become the active slot.
+  calls in one assistant message are displayed in provider order. In `plain`
+  and `terminal`, concurrent readonly batches still present exactly one active
+  bash stream at a time in original tool order; later calls may already be
+  running, but their execution output is buffered until they become the active
+  slot.
 - **Assistant text.** `plain` and redirected output stream raw Markdown deltas
   unchanged. TTY `terminal` display commits parsed Markdown blocks as soon as
   they are stable; only the current incomplete block is delayed.

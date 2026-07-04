@@ -1587,11 +1587,12 @@ fn compute_bash_preview_snapshot(text: &str, finalizing: bool) -> BashPreviewSna
         head_fragment_kept = preview.raw_kept_bytes;
         head_rendered.push_str(&preview.rendered);
     }
-    let fallback_reserved = if !trimmed_trailing.is_empty() {
-        trim_to_last_bytes(&trimmed_trailing, BASH_TAIL_FALLBACK_BYTES)
-    } else {
-        String::new()
-    };
+    let fallback_reserved =
+        if !trimmed_trailing.is_empty() && head_fragment_kept < trimmed_trailing.len() {
+            trim_to_last_bytes(&trimmed_trailing, BASH_TAIL_FALLBACK_BYTES)
+        } else {
+            String::new()
+        };
 
     if !finalizing {
         return BashPreviewSnapshot {
@@ -1859,6 +1860,25 @@ mod tests {
     }
 
     #[test]
+    fn bash_preview_does_not_duplicate_short_unterminated_output_on_finish() {
+        let snapshot = compute_bash_preview_snapshot("first", true);
+
+        assert_eq!(snapshot.head_rendered, "first");
+        assert_eq!(snapshot.tail_rendered, "");
+        assert_eq!(snapshot.omitted_lines, 0);
+        assert_eq!(snapshot.omitted_bytes, 0);
+    }
+
+    #[test]
+    fn plain_reasoning_commits_summary_after_reasoning_finishes() {
+        let raw = capture_plain_reasoning_transcript();
+        let normalized = strip_ansi(&raw.replace('\r', ""));
+
+        assert!(normalized.starts_with("[thought "));
+        assert!(normalized.contains(", ~2 tokens]\n"));
+    }
+
+    #[test]
     fn terminal_summary_leaves_a_blank_line_before_the_next_prompt() {
         let raw = capture_renderer_pty_transcript(Duration::from_secs(12), Some("mu> "));
         let normalized = strip_ansi(&raw.replace('\r', ""));
@@ -1947,6 +1967,56 @@ mod tests {
                         bytes.len() as isize
                     );
                 }
+                libc::_exit(0);
+            }
+
+            libc::close(slave);
+            let mut out = Vec::new();
+            let mut buf = [0u8; 4096];
+            loop {
+                let n = libc::read(master, buf.as_mut_ptr().cast(), buf.len());
+                if n <= 0 {
+                    break;
+                }
+                out.extend_from_slice(&buf[..n as usize]);
+            }
+            libc::close(master);
+            let mut status = 0;
+            assert_eq!(libc::waitpid(pid, &mut status, 0), pid);
+            assert!(libc::WIFEXITED(status));
+            assert_eq!(libc::WEXITSTATUS(status), 0);
+            String::from_utf8_lossy(&out).into_owned()
+        }
+    }
+
+    fn capture_plain_reasoning_transcript() -> String {
+        let _guard = pty_test_lock().lock().unwrap();
+        let mut master: RawFd = -1;
+        let mut slave: RawFd = -1;
+        unsafe {
+            assert_eq!(
+                libc::openpty(
+                    &mut master,
+                    &mut slave,
+                    std::ptr::null_mut(),
+                    std::ptr::null(),
+                    std::ptr::null(),
+                ),
+                0
+            );
+            let pid = libc::fork();
+            assert!(pid >= 0);
+            if pid == 0 {
+                libc::close(master);
+                assert_eq!(libc::dup2(slave, libc::STDOUT_FILENO), libc::STDOUT_FILENO);
+                if slave > libc::STDERR_FILENO {
+                    libc::close(slave);
+                }
+
+                let mut renderer = Renderer::with_format(OutputFormat::Plain);
+                renderer.reasoning_start().unwrap();
+                renderer.reasoning_delta("reason").unwrap();
+                renderer.reasoning_end(None).unwrap();
                 libc::_exit(0);
             }
 

@@ -530,9 +530,6 @@ impl<'a> AgentLoop<'a> {
         call: &ToolCall,
         args: &Value,
     ) -> bool {
-        if self.renderer.output_format() == OutputFormat::Plain {
-            return false;
-        }
         let Some(mode) = tools::execution_mode(&call.function.name, args) else {
             return false;
         };
@@ -576,7 +573,7 @@ impl<'a> AgentLoop<'a> {
         }
 
         match self.renderer.output_format() {
-            OutputFormat::Terminal => {
+            OutputFormat::Plain | OutputFormat::Terminal => {
                 for exec in &mut executions {
                     if let Some(running) = exec.running.as_ref() {
                         for warning in running.warnings() {
@@ -669,7 +666,6 @@ impl<'a> AgentLoop<'a> {
                     )?;
                 }
             }
-            OutputFormat::Plain => unreachable!("plain mode stays sequential"),
         }
 
         Ok(())
@@ -1192,6 +1188,83 @@ mod tests {
         }
     }
 
+    struct TwoReadonlyThenStopProvider {
+        step: Mutex<usize>,
+    }
+
+    #[async_trait(?Send)]
+    impl Provider for TwoReadonlyThenStopProvider {
+        async fn stream_chat(
+            &self,
+            _request: &RequestOptions,
+            _messages: &[Message],
+            _tools: &[Value],
+            _on_event: &mut dyn FnMut(crate::provider::StreamEvent) -> Result<(), ProviderError>,
+        ) -> Result<StreamResult, ProviderError> {
+            let mut step = self.step.lock().unwrap();
+            let current = *step;
+            *step += 1;
+            match current {
+                0 => Ok(StreamResult {
+                    message: Message::Assistant {
+                        content: None,
+                        tool_calls: Some(vec![
+                            ToolCall {
+                                id: "call_first".into(),
+                                call_type: "function".into(),
+                                function: crate::provider::FunctionCall {
+                                    name: "bash".into(),
+                                    arguments: serde_json::json!({
+                                        "title": "first",
+                                        "risk": "readonly",
+                                        "script": "sleep 1; printf first",
+                                        "timeout": 5,
+                                    })
+                                    .to_string(),
+                                },
+                            },
+                            ToolCall {
+                                id: "call_second".into(),
+                                call_type: "function".into(),
+                                function: crate::provider::FunctionCall {
+                                    name: "bash".into(),
+                                    arguments: serde_json::json!({
+                                        "title": "second",
+                                        "risk": "readonly",
+                                        "script": "sleep 1; printf second",
+                                        "timeout": 5,
+                                    })
+                                    .to_string(),
+                                },
+                            },
+                        ]),
+                    },
+                    finish_reason: FinishReason::ToolCalls,
+                    usage: Some(Usage {
+                        input_tokens: 1,
+                        output_tokens: 1,
+                        total_tokens: 2,
+                        ..Usage::default()
+                    }),
+                }),
+                1 => Ok(StreamResult {
+                    message: Message::Assistant {
+                        content: Some("done".into()),
+                        tool_calls: None,
+                    },
+                    finish_reason: FinishReason::Stop,
+                    usage: Some(Usage {
+                        input_tokens: 1,
+                        output_tokens: 1,
+                        total_tokens: 2,
+                        ..Usage::default()
+                    }),
+                }),
+                other => panic!("unexpected two-tool provider step {other}"),
+            }
+        }
+    }
+
     fn test_config() -> Config {
         Config {
             providers: crate::config::OrderedMap::from_iter([(
@@ -1420,6 +1493,71 @@ mod tests {
                 tool_calls: None,
             }) if content == "done"
         ));
+        let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    #[tokio::test]
+    async fn plain_readonly_bash_batch_executes_concurrently_but_persists_in_order() {
+        let tmp = std::env::temp_dir().join(format!(
+            "mu-agent-plain-concurrent-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let store = Store::open(&tmp.join("mu.db")).unwrap();
+        let session = store.create_session("/tmp", "test/fake-model").unwrap();
+        let config = test_config();
+        let request_model = crate::models::resolve_model_ref(&config, "test/fake-model").unwrap();
+        store
+            .append_message(
+                &session.id,
+                &Message::User {
+                    content: UserContent::Text("run both".into()),
+                },
+            )
+            .unwrap();
+        let provider = Arc::new(TwoReadonlyThenStopProvider {
+            step: Mutex::new(0),
+        });
+        let mut renderer = Renderer::with_format(OutputFormat::Plain);
+        let mut agent = AgentLoop {
+            config: &config,
+            provider,
+            store: &store,
+            session_id: &session.id,
+            request: RequestOptions {
+                model: request_model,
+            },
+            model_context_window: None,
+            renderer: &mut renderer,
+            state_dir: &tmp,
+            system_prompt: "system".into(),
+        };
+
+        let started = Instant::now();
+        agent.run_turn().await.unwrap();
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed < Duration::from_millis(1800),
+            "plain readonly batch appears sequential: {elapsed:?}"
+        );
+        let tool_messages: Vec<_> = store
+            .load_context_messages(&session.id)
+            .unwrap()
+            .into_iter()
+            .filter_map(|message| match message {
+                Message::Tool {
+                    content,
+                    tool_call_id,
+                } => Some((tool_call_id, content)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(tool_messages.len(), 2);
+        assert_eq!(tool_messages[0].0, "call_first");
+        assert!(tool_messages[0].1.contains("first"));
+        assert_eq!(tool_messages[1].0, "call_second");
+        assert!(tool_messages[1].1.contains("second"));
         let _ = std::fs::remove_dir_all(tmp);
     }
 
