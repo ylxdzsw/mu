@@ -724,11 +724,14 @@ _mu_zsh_validate_model_ref() {
   local model=$1
   local -a command
   local session_id
+  local status_json
   _mu_zsh_sync_session_state
   session_id=$MU_ZSH_EFFECTIVE_SESSION_ID
   command=("$MU_ZSH_BIN" status --json --model "$model")
   [[ -n "$session_id" ]] && command+=(-s "$session_id")
-  "${command[@]}" >/dev/null 2>&1
+  status_json=$("${command[@]}" 2>/dev/null) || return 1
+  _mu_zsh_status_field_reply "$status_json" model_id 2>/dev/null || REPLY=$model
+  return 0
 }
 
 _mu_zsh_run_custom_slash_command() {
@@ -763,7 +766,7 @@ _mu_zsh_run_custom_slash_command() {
 
 _mu_zsh_run_slash_command() {
   local line=$1
-  local command rest session_id scope
+  local command rest session_id scope resolved_model
   local exit_status=0
 
   command=${line%%[[:space:]]*}
@@ -796,10 +799,11 @@ _mu_zsh_run_slash_command() {
         print -r -- "[mu] unknown or unsupported model: $rest"
         return 1
       fi
-      MU_ZSH_MODEL=$rest
+      resolved_model=$REPLY
+      MU_ZSH_MODEL=$resolved_model
       MU_ZSH_MODEL_SCOPE=$(_mu_zsh_current_scope_key)
-      MU_ZSH_EFFECTIVE_MODEL=$rest
-      print -r -- "[mu] next turns in this scope will use $rest"
+      MU_ZSH_EFFECTIVE_MODEL=$resolved_model
+      print -r -- "[mu] next turns in this scope will use $resolved_model"
       ;;
     /new)
       _mu_zsh_validate_no_args "$command" "$rest" || return 1

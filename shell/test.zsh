@@ -46,6 +46,7 @@ if [[ "$1" == "status" ]]; then
     esac
     shift
   done
+  [[ "$model" == gpt ]] && model=openai/gpt
   [[ "$model" == invalid/* ]] && exit 1
   if (( include_models )); then
     print -r -- "{\"model_id\":\"$model\",\"context_percent\":25.0,\"project_root\":\"$MU_ZSH_TEST_PROJECT_ROOT\",\"available_models\":{\"providers\":[{\"id\":\"local\",\"models\":[{\"id\":\"local/solo\",\"model_id\":\"solo\",\"supported_efforts\":[\"max\"]},{\"id\":\"local/shared\",\"model_id\":\"shared\",\"supported_efforts\":[]}]},{\"id\":\"openai\",\"models\":[{\"id\":\"openai/gpt\",\"model_id\":\"gpt\",\"supported_efforts\":[\"low\",\"high\"]},{\"id\":\"openai/shared\",\"model_id\":\"shared\",\"supported_efforts\":[\"medium\"]}]}]}}"
@@ -322,7 +323,7 @@ if _mu_zsh_run_slash_command "/unknown"; then
   fail "unknown slash command should fail"
 fi
 _mu_zsh_run_slash_command "/model gpt"
-[[ "$MU_ZSH_MODEL" == gpt ]] || fail "model slash command records pending model"
+[[ "$MU_ZSH_MODEL" == openai/gpt ]] || fail "model slash command records canonical model"
 [[ "$MU_ZSH_MODEL_SCOPE" == "$(_mu_zsh_current_scope_key)" ]] || fail "model slash command records scope"
 if _mu_zsh_run_slash_command "/model invalid/model"; then
   fail "model slash command should validate model refs"
@@ -413,7 +414,18 @@ mkdir -p -- "$interactive_fake_bin"
 cat > "$interactive_fake_bin/mu" <<'EOF'
 #!/bin/sh
 if [ "$1" = "status" ]; then
-  printf '%s\n' "{\"model_id\":\"prompt-test-model\",\"context_percent\":25.0,\"project_root\":\"$MU_ZSH_TEST_PROJECT_ROOT\"}"
+  model=prompt-test-model
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --model)
+        shift
+        model=$1
+        ;;
+    esac
+    shift
+  done
+  [ "$model" = gpt ] && model=openai/gpt
+  printf '%s\n' "{\"model_id\":\"$model\",\"context_percent\":25.0,\"project_root\":\"$MU_ZSH_TEST_PROJECT_ROOT\"}"
   exit 0
 fi
 printf x >> "$TEST_CAPTURE_CALLS"
@@ -495,6 +507,24 @@ after_submitted_prompt=${normalized#*$'mu> plain prompt\n'}
 interactive_args=("${(@f)$(<"$interactive_capture_args")}")
 expected_plain_args=(--output plain)
 [[ "${(j:\0:)interactive_args}" == "${(j:\0:)expected_plain_args}" ]] || fail "unexpected plain interactive args: ${interactive_args[*]}"
+
+model_switch_transcript=$tmpdir/model-switch-transcript
+rm -f -- "$interactive_capture_args" "$interactive_capture_stdin" "$interactive_capture_calls"
+interactive_status=0
+{
+  print -r -- "$interactive_setup"
+  sleep 0.2
+  print -rn -- $'\t'"/model gpt"$'\r'
+  sleep 0.4
+  print -rn -- $'\x04'
+} | timeout 5 script -qfec 'TERM=xterm-256color zsh -df' "$model_switch_transcript" >/dev/null || interactive_status=$?
+(( interactive_status == 0 )) || fail "model switch transcript exited with status $interactive_status"
+
+normalized=$(perl -pe 's/\e\[[0-?]*[ -\/]*[@-~]//g' "$model_switch_transcript" | col -b)
+[[ "$normalized" == *$'[mu] next turns in this scope will use openai/gpt\n'* ]] || fail "model slash command should confirm the canonical model"
+after_model_switch=${normalized#*$'[mu] next turns in this scope will use openai/gpt\n'}
+[[ "$after_model_switch" == *$'openai/gpt 25%'* ]] || fail "model slash command should redraw prompt with selected model"
+[[ ! -e "$interactive_capture_calls" || ! -s "$interactive_capture_calls" ]] || fail "model slash command should not submit a prompt"
 
 toggle_transcript=$tmpdir/toggle-transcript
 toggle_setup="$interactive_setup; _mu_test_tab_roundtrip() { BUFFER='echo toggled'; CURSOR=0; _mu_zsh_tab; _mu_zsh_tab; }; zle -N _mu_test_tab_roundtrip; bindkey '^T' _mu_test_tab_roundtrip"
