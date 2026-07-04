@@ -793,16 +793,20 @@ captures the complete portable transcript while fatal diagnostics/summary
 remain visible. Stdout TTY detection selects rich versus portable rendering;
 stderr TTY detection suppresses the summary when redirected.
 
-- **Tool presentation.** Bash prints an optional `# <title>` line, then its
-  command preview. The header may be committed while the model is still
-  streaming the tool-call arguments; once execution begins, the header is not
-  printed a second time. `plain` shows explicit risk labels such as `[readonly]`
-  where `terminal` uses color. Both human-facing outputs stream the same head
-  preview, then print the omission marker only once at tool completion if a
-  middle section was actually omitted, followed by any reserved tail and a
-  matching exit line. Full tool results still follow the shared model-context
-  truncation policy (§4). Multiple tool calls in one assistant message are
-  previewed and then executed in provider order. In `plain`, execution
+- **Tool presentation.** Bash streams a command header as the model composes the
+  tool-call arguments: `# <title>` first, then `$ <script>` once the `risk`
+  value is available so terminal output can color the command consistently.
+  The title and script are append-only and capped in place; the script display
+  is the first decoded line with a byte cap. If fields arrive out of order,
+  display buffers until the ordered header can be committed. Once execution
+  begins, the header is not printed a second time. `plain` shows explicit risk
+  labels such as `[readonly]` where `terminal` uses color. Both human-facing
+  outputs stream the same output head preview, then print the omission marker
+  only once at tool completion if a middle section was actually omitted,
+  followed by any reserved tail and a matching exit line. Full tool results
+  still follow the shared model-context truncation policy (§4). Multiple tool
+  calls in one assistant message are displayed and then executed in provider
+  order. In `plain`, execution
   streaming is always sequential. In `terminal`, concurrent readonly batches
   still present exactly one active live bash stream at a time in original tool
   order; later calls may already be running, but their execution output is
@@ -1537,9 +1541,11 @@ taxonomy, risk category rules, and a strict JSON output contract.
 **Outcomes.**
 
 - **Allow** (`auth >= risk`): the bash call executes. A `[guardrail: allow]`
-  line is rendered before execution.
+  line with the reviewer reason is rendered after the streamed command header
+  and before execution output.
 - **Deny** (`auth < risk`): the bash call does not execute. A `[guardrail: deny]`
-  line is rendered, and a tool error is returned to the agent:
+  line with the reviewer reason is rendered after the streamed command header,
+  and a tool error is returned to the agent:
   > guardrail: action rejected — risk_level X exceeds user_auth_level Y (reason).
   > Do not work around this; stop and ask the user to authorize, or choose a
   > less destructive approach.

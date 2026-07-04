@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Result, bail};
-use serde_json::{Map, Value};
+use serde_json::Value;
 use tokio::time::sleep;
 
 use crate::cli::OutputFormat;
@@ -28,23 +28,34 @@ pub struct TurnResult {
 struct ConcurrentBashExecution<'a> {
     call: &'a ToolCall,
     args: Value,
+    header_already_rendered: bool,
     running: Option<RunningBash>,
     streamed_len: usize,
     completed: Option<(Result<ToolResult>, Duration)>,
 }
 
 #[derive(Default)]
-struct StreamingToolPreview {
+struct StreamingCommandHeader {
     id: Option<String>,
     name: Option<String>,
     arguments: String,
-    rendered: bool,
+    display: CommandHeaderDisplay,
 }
 
 #[derive(Default)]
-struct StreamingToolPreviews {
-    entries: Vec<StreamingToolPreview>,
+struct StreamingCommandHeaders {
+    entries: Vec<StreamingCommandHeader>,
     next_to_render: usize,
+}
+
+#[derive(Default)]
+struct CommandHeaderDisplay {
+    started: bool,
+    title_displayed_bytes: usize,
+    title_line_done: bool,
+    script_started: bool,
+    script_displayed_bytes: usize,
+    script_line_done: bool,
 }
 
 pub struct AgentLoop<'a> {
@@ -130,7 +141,7 @@ impl<'a> AgentLoop<'a> {
                 }
             }
 
-            let mut tool_previews = StreamingToolPreviews::default();
+            let mut command_headers = StreamingCommandHeaders::default();
             let stream_result = loop {
                 let mut on_stream_event = |event: StreamEvent| -> Result<(), ProviderError> {
                     let result = match event {
@@ -139,7 +150,7 @@ impl<'a> AgentLoop<'a> {
                         StreamEvent::ReasoningDelta(text) => self.renderer.reasoning_delta(&text),
                         StreamEvent::ReasoningEnd => self.renderer.reasoning_end(None),
                         StreamEvent::ToolCallDelta(delta) => {
-                            handle_tool_call_delta(self.renderer, &mut tool_previews, delta)
+                            handle_tool_call_delta(self.renderer, &mut command_headers, delta)
                         }
                         StreamEvent::Tick => self.renderer.thinking_tick(),
                     };
@@ -240,8 +251,17 @@ impl<'a> AgentLoop<'a> {
                         if !concurrent {
                             let tc = &tool_calls[cursor];
 
+                            let header_already_rendered = finish_command_header(
+                                self.renderer,
+                                &mut command_headers,
+                                cursor,
+                                tc,
+                                &args,
+                            )?;
+
                             // Guardrail: review destructive bash calls before execution.
-                            // Runs before tool_start so denied commands never print a `$` line.
+                            // The streamed command header above is the proposed action;
+                            // denied commands still never stream execution output.
                             if let Some(g) = guardrail.as_mut()
                                 && tc.function.name == "bash"
                             {
@@ -356,11 +376,7 @@ impl<'a> AgentLoop<'a> {
                                 Some(&tc.id),
                                 &tc.function.name,
                                 &args,
-                                tool_previews
-                                    .entries
-                                    .get(cursor)
-                                    .map(|preview| preview.rendered)
-                                    .unwrap_or(false),
+                                header_already_rendered,
                             )?;
                             let started = Instant::now();
 
@@ -402,9 +418,17 @@ impl<'a> AgentLoop<'a> {
                         }
 
                         let batch = &tool_calls[cursor..end];
-                        for chunk in batch.chunks(bash::MAX_ACTIVE_PROCESS_GROUPS) {
-                            self.execute_concurrent_bash_batch(msg_id, chunk, &mut context)
-                                .await?;
+                        for (chunk_offset, chunk) in
+                            batch.chunks(bash::MAX_ACTIVE_PROCESS_GROUPS).enumerate()
+                        {
+                            self.execute_concurrent_bash_batch(
+                                msg_id,
+                                chunk,
+                                &mut context,
+                                &mut command_headers,
+                                cursor + chunk_offset * bash::MAX_ACTIVE_PROCESS_GROUPS,
+                            )
+                            .await?;
                             if bash::cancellation_requested() {
                                 bail!("turn interrupted");
                             }
@@ -523,14 +547,24 @@ impl<'a> AgentLoop<'a> {
         message_id: i64,
         batch: &[ToolCall],
         context: &mut Vec<Message>,
+        command_headers: &mut StreamingCommandHeaders,
+        header_start_index: usize,
     ) -> Result<()> {
         let mut executions = Vec::new();
         for call in batch {
             let args = parse_tool_args(call);
+            let header_already_rendered = finish_command_header(
+                self.renderer,
+                command_headers,
+                header_start_index + executions.len(),
+                call,
+                &args,
+            )?;
             let bash_args = tools::parse_args(&args)?;
             executions.push(ConcurrentBashExecution {
                 call,
                 args,
+                header_already_rendered,
                 running: Some(bash::start_bash_task(
                     bash_args,
                     self.config,
@@ -553,7 +587,7 @@ impl<'a> AgentLoop<'a> {
                         Some(&exec.call.id),
                         &exec.call.function.name,
                         &exec.args,
-                        false,
+                        exec.header_already_rendered,
                     )?;
                     self.stream_running_bash(exec).await?;
                     let (result, elapsed, final_output) = exec
@@ -579,7 +613,7 @@ impl<'a> AgentLoop<'a> {
                         Some(&exec.call.id),
                         &exec.call.function.name,
                         &exec.args,
-                        false,
+                        exec.header_already_rendered,
                     )?;
                 }
 
@@ -705,128 +739,378 @@ fn approx_context_tokens(context: &[Message]) -> u64 {
 
 fn handle_tool_call_delta(
     renderer: &mut Renderer,
-    previews: &mut StreamingToolPreviews,
+    headers: &mut StreamingCommandHeaders,
     delta: ToolCallDelta,
 ) -> std::io::Result<()> {
-    if delta.index >= previews.entries.len() {
-        previews
+    if delta.index >= headers.entries.len() {
+        headers
             .entries
-            .resize_with(delta.index + 1, StreamingToolPreview::default);
+            .resize_with(delta.index + 1, StreamingCommandHeader::default);
     }
-    let preview = &mut previews.entries[delta.index];
-    let was_rendered = preview.rendered;
+    let header = &mut headers.entries[delta.index];
     if let Some(id) = delta.id {
-        preview.id = Some(id);
+        header.id = Some(id);
     }
     if let Some(name) = delta.name {
-        preview.name = Some(name);
+        header.name = Some(name);
     }
-    preview.arguments.push_str(&delta.arguments_delta);
-    if was_rendered {
-        return Ok(());
-    }
+    header.arguments.push_str(&delta.arguments_delta);
 
-    let mut rendered_any = false;
-    while previews.next_to_render < previews.entries.len() {
-        let preview = &mut previews.entries[previews.next_to_render];
-        if preview.rendered {
-            previews.next_to_render += 1;
+    while headers.next_to_render < headers.entries.len() {
+        let header = &mut headers.entries[headers.next_to_render];
+        if header.display.is_done() {
+            headers.next_to_render += 1;
             continue;
         }
-        let Some(name) = preview.name.as_deref() else {
-            break;
-        };
-        let Some(args) = parse_preview_args(&preview.arguments) else {
-            break;
-        };
-        preview.rendered = renderer.tool_call_preview(preview.id.as_deref(), name, &args)?;
-        if !preview.rendered {
+
+        header.display.update(
+            renderer,
+            header.id.as_deref(),
+            string_field_state(&header.arguments, "title"),
+            string_field_state(&header.arguments, "risk"),
+            string_field_state(&header.arguments, "script"),
+        )?;
+        if !header.display.is_done() {
             break;
         }
-        rendered_any = true;
-        previews.next_to_render += 1;
+        headers.next_to_render += 1;
     }
 
-    if rendered_any {
+    Ok(())
+}
+
+fn finish_command_header(
+    renderer: &mut Renderer,
+    headers: &mut StreamingCommandHeaders,
+    index: usize,
+    call: &ToolCall,
+    args: &Value,
+) -> std::io::Result<bool> {
+    if index >= headers.entries.len() {
+        headers
+            .entries
+            .resize_with(index + 1, StreamingCommandHeader::default);
+    }
+    let header = &mut headers.entries[index];
+    if header.id.is_none() {
+        header.id = Some(call.id.clone());
+    }
+    header.finish(renderer, args)
+}
+
+impl StreamingCommandHeader {
+    fn finish(&mut self, renderer: &mut Renderer, args: &Value) -> std::io::Result<bool> {
+        let title = args.get("title").and_then(|value| value.as_str());
+        let risk = args.get("risk").and_then(|value| value.as_str());
+        let script = args.get("script").and_then(|value| value.as_str());
+        self.display.update(
+            renderer,
+            self.id.as_deref(),
+            StringFieldState::from_final(title),
+            StringFieldState::from_final(risk),
+            StringFieldState::from_final(script),
+        )?;
+        Ok(self.display.started)
+    }
+}
+
+impl CommandHeaderDisplay {
+    fn is_done(&self) -> bool {
+        self.title_line_done && self.script_line_done
+    }
+
+    fn update(
+        &mut self,
+        renderer: &mut Renderer,
+        tool_call_id: Option<&str>,
+        title: StringFieldState,
+        risk: StringFieldState,
+        script: StringFieldState,
+    ) -> std::io::Result<()> {
+        if !self.started {
+            self.started = renderer.bash_header_start(tool_call_id)?;
+        }
+
+        if !self.title_line_done
+            && let Some(value) = title.value()
+        {
+            let done = stream_first_line(
+                value,
+                title.is_complete(),
+                crate::renderer::BASH_TITLE_PREVIEW_BYTES,
+                &mut self.title_displayed_bytes,
+                |text| renderer.bash_header_title_delta(text),
+            )?;
+            if done {
+                renderer.bash_header_title_end()?;
+                self.title_line_done = true;
+            }
+        }
+
+        let Some(risk) = risk.complete_value() else {
+            return Ok(());
+        };
+
+        if self.title_line_done && !self.script_started {
+            renderer.bash_header_script_start(Some(risk))?;
+            self.script_started = true;
+        }
+
+        if self.script_started
+            && !self.script_line_done
+            && let Some(value) = script.value()
+        {
+            let done = stream_first_line(
+                value,
+                script.is_complete(),
+                crate::renderer::BASH_COMMAND_PREVIEW_BYTES,
+                &mut self.script_displayed_bytes,
+                |text| renderer.bash_header_script_delta(text),
+            )?;
+            if done {
+                renderer.bash_header_script_end()?;
+                self.script_line_done = true;
+            }
+        }
         Ok(())
-    } else {
-        renderer.tool_call_composition_start()
     }
 }
 
-fn parse_preview_args(arguments: &str) -> Option<Value> {
-    if let Ok(value) = serde_json::from_str(arguments) {
-        return Some(value);
-    }
-
-    let title = extract_json_string_field(arguments, "title");
-    let risk = extract_json_string_field(arguments, "risk");
-    let script = extract_json_string_field(arguments, "script")?;
-
-    let mut map = Map::new();
-    if let Some(title) = title {
-        map.insert("title".into(), Value::String(title));
-    }
-    if let Some(risk) = risk {
-        map.insert("risk".into(), Value::String(risk));
-    }
-    map.insert("script".into(), Value::String(script));
-    Some(Value::Object(map))
+#[derive(Debug, PartialEq, Eq)]
+enum StringFieldState {
+    Missing,
+    Partial(String),
+    Complete(String),
 }
 
-fn extract_json_string_field(input: &str, field: &str) -> Option<String> {
-    let quoted_field = format!("\"{field}\"");
-    let mut search_from = 0;
-    while let Some(relative) = input[search_from..].find(&quoted_field) {
-        let after_field = search_from + relative + quoted_field.len();
-        let rest = &input[after_field..];
-        let colon = rest.find(':')?;
-        let mut value_start = after_field + colon + 1;
-        while matches!(
-            input.as_bytes().get(value_start),
-            Some(b' ' | b'\n' | b'\r' | b'\t')
-        ) {
-            value_start += 1;
+impl StringFieldState {
+    fn from_final(value: Option<&str>) -> Self {
+        value
+            .map(|value| Self::Complete(value.to_string()))
+            .unwrap_or(Self::Missing)
+    }
+
+    fn value(&self) -> Option<&str> {
+        match self {
+            Self::Missing => None,
+            Self::Partial(value) | Self::Complete(value) => Some(value),
         }
-        if input.as_bytes().get(value_start) != Some(&b'"') {
-            search_from = value_start;
-            continue;
+    }
+
+    fn complete_value(&self) -> Option<&str> {
+        match self {
+            Self::Complete(value) => Some(value),
+            Self::Missing | Self::Partial(_) => None,
         }
-        return parse_json_string_prefix(&input[value_start + 1..]);
+    }
+
+    fn is_complete(&self) -> bool {
+        matches!(self, Self::Complete(_))
+    }
+}
+
+enum JsonStringParse {
+    Complete { value: String, consumed: usize },
+    Partial(String),
+    Invalid,
+}
+
+fn string_field_state(input: &str, field: &str) -> StringFieldState {
+    let bytes = input.as_bytes();
+    let mut pos = skip_ws(input, 0);
+    if bytes.get(pos) != Some(&b'{') {
+        return StringFieldState::Missing;
+    }
+    pos += 1;
+
+    loop {
+        pos = skip_ws(input, pos);
+        match bytes.get(pos) {
+            Some(b',') => {
+                pos += 1;
+                continue;
+            }
+            Some(b'}') | None => return StringFieldState::Missing,
+            Some(b'"') => {}
+            Some(_) => return StringFieldState::Missing,
+        }
+
+        let JsonStringParse::Complete {
+            value: key,
+            consumed,
+        } = parse_json_string(&input[pos + 1..])
+        else {
+            return StringFieldState::Missing;
+        };
+        pos += 1 + consumed;
+        pos = skip_ws(input, pos);
+        if bytes.get(pos) != Some(&b':') {
+            return StringFieldState::Missing;
+        }
+        pos += 1;
+        pos = skip_ws(input, pos);
+
+        if key == field {
+            if bytes.get(pos) != Some(&b'"') {
+                return StringFieldState::Missing;
+            }
+            return match parse_json_string(&input[pos + 1..]) {
+                JsonStringParse::Complete { value, .. } => StringFieldState::Complete(value),
+                JsonStringParse::Partial(value) => StringFieldState::Partial(value),
+                JsonStringParse::Invalid => StringFieldState::Missing,
+            };
+        }
+
+        let Some(next) = skip_json_value(input, pos) else {
+            return StringFieldState::Missing;
+        };
+        pos = next;
+    }
+}
+
+fn skip_ws(input: &str, mut pos: usize) -> usize {
+    while matches!(
+        input.as_bytes().get(pos),
+        Some(b' ' | b'\n' | b'\r' | b'\t')
+    ) {
+        pos += 1;
+    }
+    pos
+}
+
+fn skip_json_value(input: &str, pos: usize) -> Option<usize> {
+    let bytes = input.as_bytes();
+    match bytes.get(pos)? {
+        b'"' => match parse_json_string(&input[pos + 1..]) {
+            JsonStringParse::Complete { consumed, .. } => Some(pos + 1 + consumed),
+            JsonStringParse::Partial(_) | JsonStringParse::Invalid => None,
+        },
+        b'{' | b'[' => skip_balanced_json(input, pos),
+        _ => {
+            let mut end = pos;
+            while let Some(byte) = bytes.get(end) {
+                if matches!(byte, b',' | b'}') {
+                    break;
+                }
+                end += 1;
+            }
+            (end > pos).then_some(end)
+        }
+    }
+}
+
+fn skip_balanced_json(input: &str, pos: usize) -> Option<usize> {
+    let bytes = input.as_bytes();
+    let mut depth = 0usize;
+    let mut cursor = pos;
+    while let Some(byte) = bytes.get(cursor) {
+        match byte {
+            b'"' => match parse_json_string(&input[cursor + 1..]) {
+                JsonStringParse::Complete { consumed, .. } => cursor += 1 + consumed,
+                JsonStringParse::Partial(_) | JsonStringParse::Invalid => return None,
+            },
+            b'{' | b'[' => {
+                depth += 1;
+                cursor += 1;
+            }
+            b'}' | b']' => {
+                depth = depth.checked_sub(1)?;
+                cursor += 1;
+                if depth == 0 {
+                    return Some(cursor);
+                }
+            }
+            _ => cursor += 1,
+        }
     }
     None
 }
 
-fn parse_json_string_prefix(input: &str) -> Option<String> {
+fn parse_json_string(input: &str) -> JsonStringParse {
     let mut out = String::new();
-    let mut chars = input.chars();
-    while let Some(ch) = chars.next() {
+    let mut chars = input.char_indices();
+    while let Some((idx, ch)) = chars.next() {
         match ch {
-            '"' => return Some(out),
+            '"' => {
+                return JsonStringParse::Complete {
+                    value: out,
+                    consumed: idx + ch.len_utf8(),
+                };
+            }
             '\\' => match chars.next() {
-                Some('"') => out.push('"'),
-                Some('\\') => out.push('\\'),
-                Some('/') => out.push('/'),
-                Some('b') => out.push('\u{0008}'),
-                Some('f') => out.push('\u{000c}'),
-                Some('n') => out.push('\n'),
-                Some('r') => out.push('\r'),
-                Some('t') => out.push('\t'),
-                Some('u') => {
+                Some((_, '"')) => out.push('"'),
+                Some((_, '\\')) => out.push('\\'),
+                Some((_, '/')) => out.push('/'),
+                Some((_, 'b')) => out.push('\u{0008}'),
+                Some((_, 'f')) => out.push('\u{000c}'),
+                Some((_, 'n')) => out.push('\n'),
+                Some((_, 'r')) => out.push('\r'),
+                Some((_, 't')) => out.push('\t'),
+                Some((_, 'u')) => {
                     let mut code = String::new();
                     for _ in 0..4 {
-                        code.push(chars.next()?);
+                        let Some((hex_idx, hex)) = chars.next() else {
+                            return JsonStringParse::Partial(out);
+                        };
+                        code.push(hex);
+                        let _ = hex_idx;
                     }
-                    let value = u16::from_str_radix(&code, 16).ok()?;
-                    out.push(char::from_u32(value as u32)?);
+                    let Ok(value) = u16::from_str_radix(&code, 16) else {
+                        return JsonStringParse::Invalid;
+                    };
+                    let Some(ch) = char::from_u32(value as u32) else {
+                        return JsonStringParse::Invalid;
+                    };
+                    out.push(ch);
                 }
-                Some(other) => out.push(other),
-                None => return Some(out),
+                Some((_, other)) => out.push(other),
+                None => return JsonStringParse::Partial(out),
             },
             other => out.push(other),
         }
     }
-    Some(out)
+    JsonStringParse::Partial(out)
+}
+
+fn stream_first_line(
+    value: &str,
+    complete: bool,
+    max_bytes: usize,
+    displayed_bytes: &mut usize,
+    mut write: impl FnMut(&str) -> std::io::Result<()>,
+) -> std::io::Result<bool> {
+    let body_limit = max_bytes.saturating_sub(crate::renderer::ELLIPSIS.len());
+    let start = (*displayed_bytes).min(value.len());
+    let mut out = String::new();
+    let mut consumed = start;
+
+    for (relative, ch) in value[start..].char_indices() {
+        let absolute = start + relative;
+        if ch == '\n' {
+            out.push_str(crate::renderer::ELLIPSIS);
+            write(&out)?;
+            return Ok(true);
+        }
+        let next = absolute + ch.len_utf8();
+        if next > body_limit {
+            out.push_str(crate::renderer::ELLIPSIS);
+            write(&out)?;
+            return Ok(true);
+        }
+        out.push(ch);
+        consumed = next;
+    }
+
+    *displayed_bytes = consumed;
+    write(&out)?;
+    if complete {
+        return Ok(true);
+    }
+    if value.len() > body_limit {
+        write(crate::renderer::ELLIPSIS)?;
+        return Ok(true);
+    }
+    Ok(false)
 }
 
 fn tool_call_risk(args: &str) -> Option<String> {
@@ -934,99 +1218,141 @@ mod tests {
     }
 
     #[test]
-    fn preview_args_parse_partial_bash_fields() {
-        let value = parse_preview_args(
-            "{\"title\":\"List files\",\"risk\":\"readonly\",\"script\":\"printf \\\"a\\\\n\\\"",
-        )
-        .unwrap();
+    fn string_field_state_distinguishes_partial_and_complete_fields() {
+        let partial = r#"{"title":"List files","risk":"readonly","script":"cargo test rende"#;
+        assert_eq!(
+            string_field_state(partial, "title"),
+            StringFieldState::Complete("List files".into())
+        );
+        assert_eq!(
+            string_field_state(partial, "risk"),
+            StringFieldState::Complete("readonly".into())
+        );
+        assert_eq!(
+            string_field_state(partial, "script"),
+            StringFieldState::Partial("cargo test rende".into())
+        );
 
-        assert_eq!(value["title"], "List files");
-        assert_eq!(value["risk"], "readonly");
-        assert_eq!(value["script"], "printf \"a\\n\"");
+        let complete = r#"{"script":"cargo test renderer::tests""#;
+        assert_eq!(
+            string_field_state(complete, "script"),
+            StringFieldState::Complete("cargo test renderer::tests".into())
+        );
     }
 
     #[test]
-    fn preview_args_parse_multiple_tool_calls_independently() {
-        let first = parse_preview_args(
-            "{\"title\":\"First\",\"risk\":\"readonly\",\"script\":\"echo first\"",
-        )
-        .unwrap();
-        let second = parse_preview_args(
-            "{\"title\":\"Second\",\"risk\":\"reversible\",\"script\":\"echo second\"",
-        )
-        .unwrap();
+    fn string_field_state_ignores_field_names_inside_values() {
+        let args = r#"{"title":"mentions \"script\"","risk":"readonly","script":"echo first""#;
 
-        assert_eq!(first["title"], "First");
-        assert_eq!(first["risk"], "readonly");
-        assert_eq!(first["script"], "echo first");
-        assert_eq!(second["title"], "Second");
-        assert_eq!(second["risk"], "reversible");
-        assert_eq!(second["script"], "echo second");
+        assert_eq!(
+            string_field_state(args, "title"),
+            StringFieldState::Complete("mentions \"script\"".into())
+        );
+        assert_eq!(
+            string_field_state(args, "script"),
+            StringFieldState::Complete("echo first".into())
+        );
     }
 
     #[test]
-    fn streamed_tool_previews_render_in_index_order() {
+    fn streamed_command_headers_render_in_index_order() {
         let mut renderer = Renderer::with_format(OutputFormat::Plain);
-        let mut previews = StreamingToolPreviews::default();
+        let mut headers = StreamingCommandHeaders::default();
 
         handle_tool_call_delta(
             &mut renderer,
-            &mut previews,
+            &mut headers,
             ToolCallDelta {
                 index: 1,
                 id: Some("call_2".into()),
                 name: Some("bash".into()),
-                arguments_delta:
-                    "{\"title\":\"Second\",\"risk\":\"readonly\",\"script\":\"echo second\"".into(),
+                arguments_delta: r#"{"title":"Second","risk":"readonly","script":"echo second""#
+                    .into(),
             },
         )
         .unwrap();
 
-        assert_eq!(previews.next_to_render, 0);
-        assert!(!previews.entries[1].rendered);
+        assert_eq!(headers.next_to_render, 0);
+        assert!(!headers.entries[1].display.started);
 
         handle_tool_call_delta(
             &mut renderer,
-            &mut previews,
+            &mut headers,
             ToolCallDelta {
                 index: 0,
                 id: Some("call_1".into()),
                 name: Some("bash".into()),
-                arguments_delta:
-                    "{\"title\":\"First\",\"risk\":\"readonly\",\"script\":\"echo first\"".into(),
+                arguments_delta: r#"{"title":"First","risk":"readonly","script":"echo first""#
+                    .into(),
             },
         )
         .unwrap();
 
-        assert_eq!(previews.next_to_render, 2);
-        assert!(previews.entries[0].rendered);
-        assert!(previews.entries[1].rendered);
+        assert_eq!(headers.next_to_render, 2);
+        assert!(headers.entries[0].display.is_done());
+        assert!(headers.entries[1].display.is_done());
     }
 
     #[test]
-    fn rendered_tool_preview_does_not_restart_composition_line() {
-        let mut renderer = Renderer::with_format(OutputFormat::Terminal);
-        renderer.force_styled_for_test();
-        let mut previews = StreamingToolPreviews::default();
+    fn plain_command_header_starts_before_title_arrives() {
+        let mut renderer = Renderer::with_format(OutputFormat::Plain);
+        let mut headers = StreamingCommandHeaders::default();
 
         handle_tool_call_delta(
             &mut renderer,
-            &mut previews,
+            &mut headers,
             ToolCallDelta {
                 index: 0,
                 id: Some("call_1".into()),
                 name: Some("bash".into()),
-                arguments_delta:
-                    "{\"title\":\"List\",\"risk\":\"readonly\",\"script\":\"printf 'a'".into(),
+                arguments_delta: String::new(),
             },
         )
         .unwrap();
-        assert!(previews.entries[0].rendered);
-        assert!(!renderer.has_tool_composition_live_line_for_test());
+
+        assert!(headers.entries[0].display.started);
+        assert!(!headers.entries[0].display.title_line_done);
+        assert!(!headers.entries[0].display.script_started);
 
         handle_tool_call_delta(
             &mut renderer,
-            &mut previews,
+            &mut headers,
+            ToolCallDelta {
+                index: 0,
+                id: None,
+                name: None,
+                arguments_delta:
+                    r#"{"title":"Plain title","risk":"readonly","script":"echo plain""#.into(),
+            },
+        )
+        .unwrap();
+
+        assert!(headers.entries[0].display.is_done());
+    }
+
+    #[test]
+    fn streamed_command_header_waits_for_script_completion() {
+        let mut renderer = Renderer::with_format(OutputFormat::Terminal);
+        renderer.force_styled_for_test();
+        let mut headers = StreamingCommandHeaders::default();
+
+        handle_tool_call_delta(
+            &mut renderer,
+            &mut headers,
+            ToolCallDelta {
+                index: 0,
+                id: Some("call_1".into()),
+                name: Some("bash".into()),
+                arguments_delta: r#"{"title":"List","risk":"readonly","script":"printf 'a'"#.into(),
+            },
+        )
+        .unwrap();
+        assert!(headers.entries[0].display.started);
+        assert!(!headers.entries[0].display.is_done());
+
+        handle_tool_call_delta(
+            &mut renderer,
+            &mut headers,
             ToolCallDelta {
                 index: 0,
                 id: None,
@@ -1036,9 +1362,8 @@ mod tests {
         )
         .unwrap();
 
-        assert!(previews.entries[0].rendered);
-        assert!(previews.entries[0].arguments.ends_with("\\n'\"}"));
-        assert!(!renderer.has_tool_composition_live_line_for_test());
+        assert!(headers.entries[0].display.is_done());
+        assert!(headers.entries[0].arguments.ends_with("\\n'\"}"));
     }
 
     #[tokio::test]

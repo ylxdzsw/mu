@@ -21,14 +21,16 @@ const YELLOW: &str = "\x1b[93m";
 const BLUE: &str = "\x1b[94m";
 const CYAN: &str = "\x1b[96m";
 const GRAY: &str = "\x1b[90m";
-const BASH_COMMAND_PREVIEW_BYTES: usize = 160;
+pub(crate) const BASH_COMMAND_PREVIEW_BYTES: usize = 160;
+pub(crate) const BASH_TITLE_PREVIEW_BYTES: usize = 120;
+const GUARDRAIL_REASON_PREVIEW_BYTES: usize = 180;
 const BASH_HEAD_LINE_BUDGET: usize = 3;
 const BASH_HEAD_BYTE_BUDGET: usize = 1024;
 const BASH_HEAD_LINE_CAP_BYTES: usize = 256;
 const BASH_TAIL_LINE_RESERVE: usize = 2;
 const BASH_TAIL_FALLBACK_BYTES: usize = 512;
 const BASH_TAIL_LINE_CAP_BYTES: usize = 256;
-const ELLIPSIS: &str = "…";
+pub(crate) const ELLIPSIS: &str = "…";
 
 pub struct Renderer {
     stdout: io::Stdout,
@@ -88,11 +90,6 @@ impl Renderer {
     #[cfg(test)]
     pub(crate) fn force_styled_for_test(&mut self) {
         self.styled = true;
-    }
-
-    #[cfg(test)]
-    pub(crate) fn has_tool_composition_live_line_for_test(&self) -> bool {
-        matches!(self.live_line, Some(LiveLine::ToolComposition))
     }
 
     pub fn assistant_text(&mut self, text: &str) -> io::Result<()> {
@@ -203,46 +200,98 @@ impl Renderer {
         self.write_committed(&line)
     }
 
-    pub fn tool_call_composition_start(&mut self) -> io::Result<()> {
+    pub fn bash_header_start(&mut self, tool_call_id: Option<&str>) -> io::Result<bool> {
         if self.format == OutputFormat::Json {
-            return Ok(());
-        }
-        self.assistant_block_open = false;
-        if !self.styled {
-            return Ok(());
-        }
-        self.live_line = Some(LiveLine::ToolComposition);
-        self.render_live_line()
-    }
-
-    pub fn tool_call_preview(
-        &mut self,
-        tool_call_id: Option<&str>,
-        name: &str,
-        args: &serde_json::Value,
-    ) -> io::Result<bool> {
-        if self.format == OutputFormat::Json || name != "bash" {
             return Ok(false);
         }
-        let Some(script) = args.get("script").and_then(|value| value.as_str()) else {
-            return Ok(false);
-        };
-        if script.is_empty() {
-            return Ok(false);
-        }
-
         self.assistant_block_open = false;
         self.reasoning_end(None)?;
         self.live_line = None;
         self.ensure_block_separator_if_needed()?;
+        self.active_bash_tool_call_id = tool_call_id.map(ToOwned::to_owned);
+        if self.styled {
+            self.write_committed(&format!("{GRAY}# {RESET}{BOLD}"))?;
+        } else {
+            self.write_committed("# ")?;
+        }
+        Ok(true)
+    }
+
+    pub fn bash_header_title_delta(&mut self, text: &str) -> io::Result<()> {
+        if self.format == OutputFormat::Json || text.is_empty() {
+            return Ok(());
+        }
+        self.write_committed(text)
+    }
+
+    pub fn bash_header_title_end(&mut self) -> io::Result<()> {
+        if self.format == OutputFormat::Json {
+            return Ok(());
+        }
+        if self.styled {
+            self.write_committed(&format!("{RESET}\n"))
+        } else {
+            self.write_committed("\n")
+        }
+    }
+
+    pub fn bash_header_script_start(&mut self, risk: Option<&str>) -> io::Result<()> {
+        if self.format == OutputFormat::Json {
+            return Ok(());
+        }
+        if self.styled {
+            self.write_committed(&format!("{DIM}${RESET} {}{BOLD}", bash_risk_color(risk)))
+        } else {
+            let mut out = String::from("$ ");
+            if let Some(risk) = risk {
+                out.push_str(&format_risk_label(risk, false));
+                out.push(' ');
+            }
+            self.write_committed(&out)
+        }
+    }
+
+    pub fn bash_header_script_delta(&mut self, text: &str) -> io::Result<()> {
+        if self.format == OutputFormat::Json || text.is_empty() {
+            return Ok(());
+        }
+        self.write_committed(text)
+    }
+
+    pub fn bash_header_script_end(&mut self) -> io::Result<()> {
+        if self.format == OutputFormat::Json {
+            return Ok(());
+        }
+        if self.styled {
+            self.write_committed(&format!("{RESET}\n"))
+        } else {
+            self.write_committed("\n")
+        }
+    }
+
+    pub fn bash_header_full(
+        &mut self,
+        tool_call_id: Option<&str>,
+        args: &serde_json::Value,
+    ) -> io::Result<bool> {
+        if self.format == OutputFormat::Json {
+            return Ok(false);
+        }
         let title = args
             .get("title")
             .and_then(|value| value.as_str())
             .unwrap_or_default();
+        let script = args
+            .get("script")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default();
         let risk = args.get("risk").and_then(|value| value.as_str());
-        let line = format_bash_header(title, script, risk, self.styled);
-        self.active_bash_tool_call_id = tool_call_id.map(ToOwned::to_owned);
-        self.write_committed(&line)?;
+        self.bash_header_start(tool_call_id)?;
+        self.bash_header_title_delta(&preview_first_line(title, BASH_TITLE_PREVIEW_BYTES))?;
+        self.bash_header_title_end()?;
+        self.bash_header_script_start(risk)?;
+        self.bash_header_script_delta(&preview_first_line(script, BASH_COMMAND_PREVIEW_BYTES))?;
+        self.bash_header_script_end()?;
         Ok(true)
     }
 
@@ -285,18 +334,7 @@ impl Renderer {
         if header_already_rendered {
             return Ok(());
         }
-        self.ensure_block_separator_if_needed()?;
-        let title = args
-            .get("title")
-            .and_then(|value| value.as_str())
-            .unwrap_or_default();
-        let script = args
-            .get("script")
-            .and_then(|value| value.as_str())
-            .unwrap_or_default();
-        let risk = args.get("risk").and_then(|value| value.as_str());
-        let line = format_bash_header(title, script, risk, self.styled);
-        self.write_committed(&line)
+        self.bash_header_full(tool_call_id, args).map(|_| ())
     }
 
     pub fn bash_output(
@@ -430,14 +468,9 @@ impl Renderer {
             );
         }
         self.assistant_block_open = false;
-        self.ensure_block_separator_if_needed()?;
+        self.ensure_line_start()?;
         let verdict = if allowed { "allow" } else { "deny" };
-        let script_preview = script.lines().next().unwrap_or(script);
-        let script_preview = if script_preview.len() > 120 {
-            format!("{}…", &script_preview[..117])
-        } else {
-            script_preview.to_string()
-        };
+        let reason_preview = preview_first_line(reason, GUARDRAIL_REASON_PREVIEW_BYTES);
         let line = if self.styled {
             let (color, verdict) = if allowed {
                 (GREEN, "allow")
@@ -445,11 +478,11 @@ impl Renderer {
                 (RED, "deny")
             };
             format!(
-                "{color}[guardrail: {verdict}]{RESET} {DIM}risk={risk_level} auth={user_auth_level} — {reason}{RESET}\n{DIM}  {script_preview}{RESET}\n"
+                "{color}[guardrail: {verdict}]{RESET} {DIM}risk={risk_level} auth={user_auth_level} — {reason_preview}{RESET}\n"
             )
         } else {
             format!(
-                "[guardrail: {verdict}] risk={risk_level} auth={user_auth_level} — {reason}\n  {script_preview}\n"
+                "[guardrail: {verdict}] risk={risk_level} auth={user_auth_level} — {reason_preview}\n"
             )
         };
         self.write_stdout_committed(&terminal_trim_committed_text(&line))
@@ -601,10 +634,7 @@ impl Renderer {
         }
         if self.live_line_rendered {
             self.stdout.write_all(b"\r\x1b[2K")?;
-        } else if matches!(
-            self.live_line,
-            Some(LiveLine::Thinking | LiveLine::ToolComposition)
-        ) {
+        } else if matches!(self.live_line, Some(LiveLine::Thinking)) {
             self.ensure_block_separator_if_needed()?;
         } else if !self.stdout_at_line_start {
             self.write_stdout("\n")?;
@@ -634,7 +664,6 @@ impl Renderer {
                     approx_tokens_from_chars(reasoning.reasoning_chars),
                 ))
             }
-            Some(LiveLine::ToolComposition) => Some(format!("{GRAY}#{RESET}")),
             Some(LiveLine::BashOmitted {
                 omitted_lines,
                 omitted_bytes,
@@ -764,7 +793,6 @@ struct MarkdownStream {
 #[derive(Clone, Copy)]
 enum LiveLine {
     Thinking,
-    ToolComposition,
     BashOmitted {
         omitted_lines: usize,
         omitted_bytes: usize,
@@ -1350,6 +1378,7 @@ fn tool_display_json(display: &ToolDisplay) -> serde_json::Value {
     }
 }
 
+#[cfg(test)]
 fn format_bash_header(title: &str, script: &str, risk: Option<&str>, styled: bool) -> String {
     let command = preview_first_line(script, BASH_COMMAND_PREVIEW_BYTES);
     if !styled {
@@ -1797,15 +1826,6 @@ mod tests {
     }
 
     #[test]
-    fn tool_composition_placeholder_matches_title_marker() {
-        let mut renderer = Renderer::with_format(OutputFormat::Terminal);
-        renderer.styled = true;
-        renderer.live_line = Some(LiveLine::ToolComposition);
-
-        assert_eq!(renderer.format_live_line(), Some(format!("{GRAY}#{RESET}")));
-    }
-
-    #[test]
     fn bash_start_can_reuse_streamed_header_without_duplication() {
         let mut renderer = Renderer::with_format(OutputFormat::Plain);
         let args = json!({
@@ -1814,11 +1834,7 @@ mod tests {
             "script": "printf 'a'\npwd",
         });
 
-        assert!(
-            renderer
-                .tool_call_preview(Some("call_1"), "bash", &args)
-                .unwrap()
-        );
+        assert!(renderer.bash_header_full(Some("call_1"), &args).unwrap());
         renderer
             .tool_start(Some("call_1"), "bash", &args, true)
             .unwrap();
@@ -1847,6 +1863,11 @@ mod tests {
         let raw = capture_renderer_pty_transcript(Duration::from_secs(12), Some("mu> "));
         let normalized = strip_ansi(&raw.replace('\r', ""));
 
+        assert!(normalized.contains(
+            "$ printf 'line01\\nline02\\nline03\\n'\n[guardrail: allow] risk=low auth=explicit"
+        ));
+        assert!(normalized.contains("reason is acceptable\nline01\n"));
+        assert!(!normalized.contains("reason is acceptable\n\nline01\n"));
         assert!(normalized.contains("[mu] tokens: 12 in / 5 out  context: 25%\n\nmu> "));
         assert!(!normalized.contains("[mu] tokens: 12 in / 5 out  context: 25%\n\n\nmu> "));
     }
@@ -1884,7 +1905,6 @@ mod tests {
                 renderer.reasoning_delta("plan").unwrap();
                 std::thread::sleep(Duration::from_millis(40));
                 renderer.reasoning_end(Some((12, 5))).unwrap();
-                renderer.tool_call_composition_start().unwrap();
                 renderer
                     .tool_start(
                         None,
@@ -1895,6 +1915,15 @@ mod tests {
                             "script": "printf 'line01\\nline02\\nline03\\n'",
                         }),
                         false,
+                    )
+                    .unwrap();
+                renderer
+                    .guardrail_verdict(
+                        true,
+                        "low",
+                        "explicit",
+                        "reason is acceptable",
+                        "printf 'line01\\nline02\\nline03\\n'",
                     )
                     .unwrap();
                 renderer
