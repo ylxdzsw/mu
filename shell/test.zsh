@@ -176,8 +176,10 @@ escaped_global_pwd=${global_pwd//\%/%%}
 [[ "$global_prompt" == *"%F{45}${escaped_global_pwd}%f %F{141}(global)%f"* ]] || fail "shows global marker outside project scope"
 
 MU_ZSH_ORIGINAL_TAB_WIDGET=
+MU_ZSH_ORIGINAL_SLASH_WIDGET=
 _mu_zsh_save_widget_bindings
 [[ -n "$MU_ZSH_ORIGINAL_TAB_WIDGET" ]] || fail "saves tab widget fallback"
+[[ -n "$MU_ZSH_ORIGINAL_SLASH_WIDGET" ]] || fail "saves slash widget fallback"
 up_key=$'\e[A'
 down_key=$'\e[B'
 [[ -n "${MU_ZSH_SHELL_UP_WIDGETS[$up_key]:-}" ]] || fail "saves up-arrow widget fallback"
@@ -272,12 +274,26 @@ command_matches=("${(@f)$(_mu_zsh_slash_command_matches /)}")
 [[ "${(j:,:)command_matches}" == "/model,/new,/retry,/compact,/review.md" ]] || fail "shows session commands with a valid session: ${(j:,:)command_matches}"
 BUFFER="/ret"
 CURSOR=${#BUFFER}
-_mu_zsh_complete_slash
-[[ "$BUFFER" == "/retry " && "$CURSOR" -eq 7 ]] || fail "directly completes a single slash command: $BUFFER ($CURSOR)"
+completion_matches=("${(@f)$(_mu_zsh_completion_matches)}")
+[[ "${(j:,:)completion_matches}" == "/retry" ]] || fail "filters a single slash command candidate: ${(j:,:)completion_matches}"
+BUFFER="/r"
+CURSOR=${#BUFFER}
+completion_matches=("${(@f)$(_mu_zsh_completion_matches)}")
+[[ "${(j:,:)completion_matches}" == "/retry,/review.md" ]] || fail "keeps multiple common-prefix slash candidates: ${(j:,:)completion_matches}"
 BUFFER="/rev"
 CURSOR=${#BUFFER}
-_mu_zsh_complete_slash
-[[ "$BUFFER" == "/review.md " ]] || fail "directly completes a custom slash command: $BUFFER"
+completion_matches=("${(@f)$(_mu_zsh_completion_matches)}")
+[[ "${(j:,:)completion_matches}" == "/review.md" ]] || fail "filters a custom slash command candidate: ${(j:,:)completion_matches}"
+BUFFER="/unknown"
+CURSOR=${#BUFFER}
+if _mu_zsh_completion_matches >/dev/null; then
+  fail "unknown slash text should have no completion candidates"
+fi
+_mu_zsh_is_known_slash_command /model || fail "recognizes built-in slash command"
+_mu_zsh_is_known_slash_command /review.md || fail "recognizes custom slash command"
+if _mu_zsh_is_known_slash_command /unknown; then
+  fail "unknown slash text should not dispatch as a command"
+fi
 
 model_matches=("${(@f)$(_mu_zsh_model_completion_matches "")}")
 [[ " ${(j: :)model_matches} " == *" openai/gpt "* ]] || fail "offers provider-qualified model"
@@ -295,8 +311,8 @@ model_matches=("${(@f)$(_mu_zsh_model_completion_matches "openai/gpt:h")}")
 [[ "${(j:,:)model_matches}" == "openai/gpt:high" ]] || fail "filters provider-qualified variants: ${(j:,:)model_matches}"
 BUFFER="/model openai/gpt:h"
 CURSOR=${#BUFFER}
-_mu_zsh_complete_slash
-[[ "$BUFFER" == "/model openai/gpt:high" ]] || fail "directly completes a single model variant: $BUFFER"
+completion_matches=("${(@f)$(_mu_zsh_completion_matches)}")
+[[ "${(j:,:)completion_matches}" == "openai/gpt:high" ]] || fail "filters model completion candidates from the zle buffer: ${(j:,:)completion_matches}"
 
 rm -f "$MU_ZSH_FAKE_LOG"
 _mu_zsh_run_slash_command "/retry"
@@ -415,17 +431,25 @@ cat > "$interactive_fake_bin/mu" <<'EOF'
 #!/bin/sh
 if [ "$1" = "status" ]; then
   model=prompt-test-model
+  include_commands=0
   while [ "$#" -gt 0 ]; do
     case "$1" in
       --model)
         shift
         model=$1
         ;;
+      --include-commands)
+        include_commands=1
+        ;;
     esac
     shift
   done
   [ "$model" = gpt ] && model=openai/gpt
-  printf '%s\n' "{\"model_id\":\"$model\",\"context_percent\":25.0,\"project_root\":\"$MU_ZSH_TEST_PROJECT_ROOT\"}"
+  if [ "$include_commands" -eq 1 ] && [ -n "$TEST_EXTRA_COMMAND" ]; then
+    printf '%s\n' "{\"model_id\":\"$model\",\"context_percent\":25.0,\"project_root\":\"$MU_ZSH_TEST_PROJECT_ROOT\",\"commands\":[{\"name\":\"$TEST_EXTRA_COMMAND\",\"path\":\"$MU_ZSH_TEST_PROJECT_ROOT/.mu/$TEST_EXTRA_COMMAND\",\"scope\":\"project\"}]}"
+  else
+    printf '%s\n' "{\"model_id\":\"$model\",\"context_percent\":25.0,\"project_root\":\"$MU_ZSH_TEST_PROJECT_ROOT\"}"
+  fi
   exit 0
 fi
 printf x >> "$TEST_CAPTURE_CALLS"
@@ -525,6 +549,72 @@ normalized=$(perl -pe 's/\e\[[0-?]*[ -\/]*[@-~]//g' "$model_switch_transcript" |
 after_model_switch=${normalized#*$'[mu] next turns in this scope will use openai/gpt\n'}
 [[ "$after_model_switch" == *$'openai/gpt 25%'* ]] || fail "model slash command should redraw prompt with selected model"
 [[ ! -e "$interactive_capture_calls" || ! -s "$interactive_capture_calls" ]] || fail "model slash command should not submit a prompt"
+
+slash_completion_transcript=$tmpdir/slash-completion-transcript
+rm -f -- "$interactive_capture_args" "$interactive_capture_stdin" "$interactive_capture_calls"
+interactive_status=0
+{
+  print -r -- "$interactive_setup"
+  sleep 0.2
+  print -rn -- $'\t'"/mo"$'\t'"gpt"$'\r'
+  sleep 0.4
+  print -rn -- $'\x04'
+} | timeout 5 script -qfec 'TERM=xterm-256color zsh -df' "$slash_completion_transcript" >/dev/null || interactive_status=$?
+(( interactive_status == 0 )) || fail "slash completion transcript exited with status $interactive_status"
+
+normalized=$(perl -pe 's/\e\[[0-?]*[ -\/]*[@-~]//g' "$slash_completion_transcript" | col -b)
+[[ "$normalized" == *$'[mu] next turns in this scope will use openai/gpt\n'* ]] || fail "Tab should complete /mo to the /model slash command"
+[[ ! -e "$interactive_capture_calls" || ! -s "$interactive_capture_calls" ]] || fail "completed model slash command should not submit a prompt"
+
+common_prefix_transcript=$tmpdir/common-prefix-transcript
+common_prefix_setup="$interactive_setup; export TEST_EXTRA_COMMAND=model-helper.md; _mu_test_common_prefix_completion() { BUFFER='/mod'; CURSOR=\${#BUFFER}; _mu_zsh_complete_slash; zle -I; print -r -- \"[completion-buffer=\$BUFFER cursor=\$CURSOR]\"; _mu_zsh_clear_prompt; _mu_zsh_reset_mode_prompt; }; zle -N _mu_test_common_prefix_completion; bindkey -M mumode '^T' _mu_test_common_prefix_completion"
+rm -f -- "$interactive_capture_args" "$interactive_capture_stdin" "$interactive_capture_calls"
+interactive_status=0
+{
+  print -r -- "$common_prefix_setup"
+  sleep 0.2
+  print -rn -- $'\t\x14'
+  sleep 0.4
+  print -rn -- $'\x04'
+} | timeout 5 script -qfec 'TERM=xterm-256color zsh -df' "$common_prefix_transcript" >/dev/null || interactive_status=$?
+(( interactive_status == 0 )) || fail "common-prefix completion transcript exited with status $interactive_status"
+
+normalized=$(perl -pe 's/\e\[[0-?]*[ -\/]*[@-~]//g' "$common_prefix_transcript" | col -b)
+[[ "$normalized" == *'[completion-buffer=/model cursor=6]'* ]] || fail "common-prefix completion should not add a suffix space"
+[[ ! -e "$interactive_capture_calls" || ! -s "$interactive_capture_calls" ]] || fail "common-prefix completion should not submit a prompt"
+
+delete_slash_transcript=$tmpdir/delete-slash-transcript
+delete_slash_setup="$interactive_setup; _mu_test_delete_slash_completion() { BUFFER='/'; CURSOR=1; _mu_zsh_list_slash_choices; _mu_zsh_backspace; if _mu_zsh_slash_completion_context; then back_state=active; else back_state=inactive; fi; back_buffer=\$BUFFER; back_cursor=\$CURSOR; BUFFER='/'; CURSOR=0; _mu_zsh_list_slash_choices; _mu_zsh_delete_char; if _mu_zsh_slash_completion_context; then forward_state=active; else forward_state=inactive; fi; zle -I; print -r -- \"[back-buffer=\$back_buffer back-cursor=\$back_cursor back-context=\$back_state forward-buffer=\$BUFFER forward-cursor=\$CURSOR forward-context=\$forward_state]\"; _mu_zsh_clear_prompt; _mu_zsh_reset_mode_prompt; }; zle -N _mu_test_delete_slash_completion; bindkey -M mumode '^Y' _mu_test_delete_slash_completion"
+rm -f -- "$interactive_capture_args" "$interactive_capture_stdin" "$interactive_capture_calls"
+interactive_status=0
+{
+  print -r -- "$delete_slash_setup"
+  sleep 0.2
+  print -rn -- $'\t\x19'
+  sleep 0.4
+  print -rn -- $'\x04'
+} | timeout 5 script -qfec 'TERM=xterm-256color zsh -df' "$delete_slash_transcript" >/dev/null || interactive_status=$?
+(( interactive_status == 0 )) || fail "delete slash completion transcript exited with status $interactive_status"
+
+normalized=$(perl -pe 's/\e\[[0-?]*[ -\/]*[@-~]//g' "$delete_slash_transcript" | col -b)
+[[ "$normalized" == *'[back-buffer= back-cursor=0 back-context=inactive forward-buffer= forward-cursor=0 forward-context=inactive]'* ]] || fail "deleting slash should leave slash-completion context"
+[[ ! -e "$interactive_capture_calls" || ! -s "$interactive_capture_calls" ]] || fail "delete slash completion should not submit a prompt"
+
+unknown_slash_transcript=$tmpdir/unknown-slash-transcript
+rm -f -- "$interactive_capture_args" "$interactive_capture_stdin" "$interactive_capture_calls"
+interactive_status=0
+{
+  print -r -- "$interactive_setup"
+  sleep 0.2
+  print -rn -- $'\t'"/not-a-command custom"$'\r'
+  sleep 0.4
+  print -rn -- $'\x04'
+} | timeout 5 script -qfec 'TERM=xterm-256color zsh -df' "$unknown_slash_transcript" >/dev/null || interactive_status=$?
+(( interactive_status == 0 )) || fail "unknown slash transcript exited with status $interactive_status"
+
+[[ $(<"$interactive_capture_calls") == x ]] || fail "unknown slash input should submit as a normal prompt"
+print -rn -- '/not-a-command custom'$'\n' > "$interactive_expected_stdin"
+cmp -- "$interactive_expected_stdin" "$interactive_capture_stdin" || fail "unknown slash input should be passed on stdin"
 
 toggle_transcript=$tmpdir/toggle-transcript
 toggle_setup="$interactive_setup; _mu_test_tab_roundtrip() { BUFFER='echo toggled'; CURSOR=0; _mu_zsh_tab; _mu_zsh_tab; }; zle -N _mu_test_tab_roundtrip; bindkey '^T' _mu_test_tab_roundtrip"

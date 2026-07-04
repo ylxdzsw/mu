@@ -28,6 +28,7 @@ typeset -g MU_ZSH_ORIGINAL_PROMPT=${MU_ZSH_ORIGINAL_PROMPT:-}
 typeset -g MU_ZSH_ORIGINAL_RPROMPT=${MU_ZSH_ORIGINAL_RPROMPT:-}
 typeset -g MU_ZSH_SAVED_KEYMAP=${MU_ZSH_SAVED_KEYMAP:-main}
 typeset -g MU_ZSH_ORIGINAL_TAB_WIDGET=${MU_ZSH_ORIGINAL_TAB_WIDGET:-}
+typeset -g MU_ZSH_ORIGINAL_SLASH_WIDGET=${MU_ZSH_ORIGINAL_SLASH_WIDGET:-}
 typeset -g MU_ZSH_ORIGINAL_STTY=${MU_ZSH_ORIGINAL_STTY:-}
 typeset -g MU_ZSH_SCOPE_CACHE_PWD=${MU_ZSH_SCOPE_CACHE_PWD:-}
 typeset -g MU_ZSH_SCOPE_CACHE_KEY=${MU_ZSH_SCOPE_CACHE_KEY:-}
@@ -55,6 +56,10 @@ _mu_zsh_save_widget_bindings() {
   [[ "$MU_ZSH_ORIGINAL_TAB_WIDGET" == _mu_zsh_tab ]] && MU_ZSH_ORIGINAL_TAB_WIDGET=
 
   [[ -z "$MU_ZSH_ORIGINAL_TAB_WIDGET" ]] && MU_ZSH_ORIGINAL_TAB_WIDGET=expand-or-complete
+
+  [[ -z "$MU_ZSH_ORIGINAL_SLASH_WIDGET" ]] && MU_ZSH_ORIGINAL_SLASH_WIDGET=$(_mu_zsh_widget_for_key '/')
+  [[ "$MU_ZSH_ORIGINAL_SLASH_WIDGET" == _mu_zsh_slash ]] && MU_ZSH_ORIGINAL_SLASH_WIDGET=
+  [[ -z "$MU_ZSH_ORIGINAL_SLASH_WIDGET" ]] && MU_ZSH_ORIGINAL_SLASH_WIDGET=.self-insert
 
   local key widget
   for key in $'\e[A' $'\eOA'; do
@@ -661,43 +666,80 @@ _mu_zsh_model_completion_matches() {
   return 0
 }
 
-_mu_zsh_complete_slash() {
-  local left post arg
-  local -a matches
+_mu_zsh_slash_completion_context() {
+  local left
 
   [[ "$BUFFER" == /* ]] || return 1
   left=${BUFFER[1,$CURSOR]}
-  post=${BUFFER[$((CURSOR + 1)),-1]}
+
+  if [[ "$left" == "/model "* ]]; then
+    left=${left#"/model "}
+    [[ "$left" != *[[:space:]]* ]]
+    return
+  fi
+
+  [[ "$left" != *[[:space:]]* ]]
+}
+
+_mu_zsh_completion_matches() {
+  local left arg
+  local -a matches
+
+  left=${BUFFER[1,$CURSOR]}
 
   if [[ "$left" == "/model "* ]]; then
     arg=${left#"/model "}
+    [[ "$arg" != *[[:space:]]* ]] || return 1
     matches=("${(@f)$(_mu_zsh_model_completion_matches "$arg")}")
-    if (( ${#matches[@]} == 1 )); then
-      BUFFER="/model ${matches[1]}$post"
-      CURSOR=$(( 7 + ${#matches[1]} ))
-    elif (( ${#matches[@]} > 1 )); then
-      zle -M "${(j:  :)matches}"
-    else
-      zle -M "no model matches"
-    fi
+    matches=("${(@)matches:#}")
+    (( ${#matches[@]} )) || return 1
+    print -rl -- "${matches[@]}"
     return 0
   fi
 
-  if [[ "$left" == *[[:space:]]* ]]; then
-    zle -M "no completion for slash command arguments"
-    return 0
-  fi
+  [[ "$left" == /* ]] || return 1
+  [[ "$left" != *[[:space:]]* ]] || return 1
 
   matches=("${(@f)$(_mu_zsh_slash_command_matches "$left")}")
-  if (( ${#matches[@]} == 1 )); then
-    BUFFER="${matches[1]} $post"
-    CURSOR=$(( ${#matches[1]} + 1 ))
-  elif (( ${#matches[@]} > 1 )); then
-    zle -M "${(j:  :)matches}"
-  else
-    zle -M "no slash command matches"
-  fi
+  matches=("${(@)matches:#}")
+  (( ${#matches[@]} )) || return 1
+  print -rl -- "${matches[@]}"
   return 0
+}
+
+_mu_zsh_completion() {
+  local -a matches
+
+  matches=("${(@f)$(_mu_zsh_completion_matches)}")
+  (( ${#matches[@]} )) || return 1
+
+  if (( ${#matches[@]} == 1 )); then
+    compadd -Q -S ' ' -- "${matches[@]}"
+  else
+    compadd -Q -- "${matches[@]}"
+  fi
+}
+
+_mu_zsh_complete_slash() {
+  _mu_zsh_slash_completion_context || return 1
+  zle _mu_zsh_complete_widget
+}
+
+_mu_zsh_list_slash_choices() {
+  _mu_zsh_slash_completion_context || return 1
+  zle _mu_zsh_list_widget 2>/dev/null || true
+}
+
+_mu_zsh_is_known_slash_command() {
+  local command=$1
+
+  case "$command" in
+    /model|/new|/retry|/compact)
+      return 0
+      ;;
+  esac
+
+  _mu_zsh_has_custom_slash_command "$command"
 }
 
 _mu_zsh_require_effective_session() {
@@ -933,7 +975,7 @@ _mu_zsh_shell_eof() {
 
 _mu_zsh_tab() {
   if [[ "$MU_ZSH_MODE" == mu ]]; then
-    if [[ "$BUFFER" == /* ]]; then
+    if _mu_zsh_slash_completion_context; then
       _mu_zsh_complete_slash
       return
     fi
@@ -959,8 +1001,38 @@ _mu_zsh_tab() {
   _mu_zsh_call_original_widget "$MU_ZSH_ORIGINAL_TAB_WIDGET"
 }
 
+_mu_zsh_slash() {
+  local should_complete=0
+
+  if [[ "$MU_ZSH_MODE" == mu && "$BUFFER" != /* && "$CURSOR" -eq 0 ]]; then
+    should_complete=1
+  fi
+
+  if [[ -n "$MU_ZSH_ORIGINAL_SLASH_WIDGET" && "$MU_ZSH_ORIGINAL_SLASH_WIDGET" != _mu_zsh_slash ]]; then
+    zle "$MU_ZSH_ORIGINAL_SLASH_WIDGET"
+  else
+    zle .self-insert
+  fi
+
+  (( should_complete )) && _mu_zsh_list_slash_choices
+}
+
+_mu_zsh_clear_completion_if_outside_context() {
+  if [[ "$MU_ZSH_MODE" == mu ]] && ! _mu_zsh_slash_completion_context; then
+    zle -M ''
+    zle -I
+    zle -R
+  fi
+}
+
 _mu_zsh_backspace() {
   zle backward-delete-char
+  _mu_zsh_clear_completion_if_outside_context
+}
+
+_mu_zsh_delete_char() {
+  zle delete-char
+  _mu_zsh_clear_completion_if_outside_context
 }
 
 _mu_zsh_interrupt() {
@@ -985,7 +1057,7 @@ _mu_zsh_eof() {
   fi
 
   if (( CURSOR < ${#BUFFER} )); then
-    zle delete-char
+    _mu_zsh_delete_char
   fi
 }
 
@@ -998,6 +1070,7 @@ _mu_zsh_accept() {
   fi
 
   local prompt=$BUFFER
+  local command
   if [[ -z "${prompt//[[:space:]]/}" ]]; then
     _mu_zsh_redraw_mode_prompt
     return
@@ -1008,7 +1081,12 @@ _mu_zsh_accept() {
   _mu_zsh_restore_tty_state
   MU_ZSH_OUTPUT_SEPARATOR_PENDING=1
   if [[ "$prompt" == /* ]]; then
-    _mu_zsh_run_slash_command "$prompt"
+    command=${prompt%%[[:space:]]*}
+    if _mu_zsh_is_known_slash_command "$command"; then
+      _mu_zsh_run_slash_command "$prompt"
+    else
+      _mu_zsh_submit_prompt "$prompt"
+    fi
   else
     _mu_zsh_submit_prompt "$prompt"
   fi
@@ -1090,12 +1168,14 @@ _mu_zsh_configure_keymap() {
   bindkey -M mumode '^M' _mu_zsh_accept
   bindkey -M mumode '^J' _mu_zsh_accept
   bindkey -M mumode '^I' _mu_zsh_tab
+  bindkey -M mumode '/' _mu_zsh_slash
   bindkey -M mumode $'\e[A' _mu_zsh_history_up
   bindkey -M mumode $'\eOA' _mu_zsh_history_up
   bindkey -M mumode $'\e[B' _mu_zsh_history_down
   bindkey -M mumode $'\eOB' _mu_zsh_history_down
   bindkey -M mumode '^?' _mu_zsh_backspace
   bindkey -M mumode '^H' _mu_zsh_backspace
+  bindkey -M mumode $'\e[3~' _mu_zsh_delete_char
   bindkey -M mumode '^C' _mu_zsh_interrupt
   bindkey -M mumode '^D' _mu_zsh_eof
 }
@@ -1108,9 +1188,13 @@ if [[ -o zle ]]; then
   bindkey -N mumode main 2>/dev/null || true
   _mu_zsh_configure_keymap
   _mu_zsh_save_widget_bindings
+  zle -C _mu_zsh_complete_widget complete-word _mu_zsh_completion
+  zle -C _mu_zsh_list_widget list-choices _mu_zsh_completion
   zle -N _mu_zsh_tab
+  zle -N _mu_zsh_slash
   zle -N _mu_zsh_accept
   zle -N _mu_zsh_backspace
+  zle -N _mu_zsh_delete_char
   zle -N _mu_zsh_interrupt
   zle -N _mu_zsh_eof
   zle -N _mu_zsh_history_up
