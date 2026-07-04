@@ -51,10 +51,7 @@ pub fn assemble_prompt(
     parts.join("\n\n")
 }
 
-pub fn initial_environment_context(
-    cwd: &Path,
-    project: Option<&Project>,
-) -> String {
+pub fn initial_environment_context(cwd: &Path, project: Option<&Project>) -> String {
     let mut lines = vec!["[environment]".to_string()];
 
     if let Some(project) = project {
