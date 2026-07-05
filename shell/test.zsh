@@ -180,19 +180,6 @@ MU_ZSH_ORIGINAL_SLASH_WIDGET=
 _mu_zsh_save_widget_bindings
 [[ -n "$MU_ZSH_ORIGINAL_TAB_WIDGET" ]] || fail "saves tab widget fallback"
 [[ -n "$MU_ZSH_ORIGINAL_SLASH_WIDGET" ]] || fail "saves slash widget fallback"
-up_key=$'\e[A'
-down_key=$'\e[B'
-[[ -n "${MU_ZSH_SHELL_UP_WIDGETS[$up_key]:-}" ]] || fail "saves up-arrow widget fallback"
-[[ -n "${MU_ZSH_SHELL_DOWN_WIDGETS[$down_key]:-}" ]] || fail "saves down-arrow widget fallback"
-
-MU_ZSH_HISTORY_BUFFER="draft"
-MU_ZSH_HISTORY_CURSOR=2
-MU_ZSH_HISTORY_HISTNO=7
-_mu_zsh_clear_history_return
-[[ -z "$MU_ZSH_HISTORY_BUFFER" ]] || fail "clears saved history return buffer"
-[[ "$MU_ZSH_HISTORY_CURSOR" -eq 0 ]] || fail "clears saved history return cursor"
-[[ "$MU_ZSH_HISTORY_HISTNO" -eq 0 ]] || fail "clears saved history return histno"
-
 scope_cache_dir=$tmpdir/scope-cache
 mkdir -p -- "$scope_cache_dir"
 saved_pwd=$PWD
@@ -635,29 +622,29 @@ normalized=$(perl -pe 's/\e\[[0-?]*[ -\/]*[@-~]//g' "$toggle_transcript" | col -
 [[ "$normalized" == *$'\ntoggled\n'* ]] || fail "Tab at cursor start should preserve the buffer when returning to shell mode"
 [[ ! -e "$interactive_capture_calls" || ! -s "$interactive_capture_calls" ]] || fail "Tab toggle transcript should not call fake mu"
 
-history_return_replay=$tmpdir/history-return-replay
-history_return_file=$tmpdir/history-return
-history_return_transcript=$tmpdir/history-return-transcript
-history_return_prompt='agent after history'
-print -r -- "print -rn -- shell-history > ${(q)history_return_replay}" > "$history_return_file"
-rm -f -- "$history_return_replay" "$interactive_capture_args" "$interactive_capture_stdin" "$interactive_capture_calls"
+history_disabled_replay=$tmpdir/history-disabled-replay
+history_disabled_file=$tmpdir/history-disabled
+history_disabled_transcript=$tmpdir/history-disabled-transcript
+history_disabled_prompt='agent ignores arrows'
+print -r -- "print -rn -- shell-history > ${(q)history_disabled_replay}" > "$history_disabled_file"
+rm -f -- "$history_disabled_replay" "$interactive_capture_args" "$interactive_capture_stdin" "$interactive_capture_calls"
 
-history_return_setup=" setopt HIST_IGNORE_SPACE; PS1='> '; PATH=${(q)interactive_fake_bin}:\$PATH; export TEST_CAPTURE_ARGS=${(q)interactive_capture_args} TEST_CAPTURE_STDIN=${(q)interactive_capture_stdin} TEST_CAPTURE_CALLS=${(q)interactive_capture_calls}; HISTFILE=${(q)history_return_file}; HISTSIZE=100; SAVEHIST=100; fc -R ${(q)history_return_file}; source ${(q)root}/shell/mu.zsh"
+history_disabled_setup=" setopt HIST_IGNORE_SPACE; PS1='> '; PATH=${(q)interactive_fake_bin}:\$PATH; export TEST_CAPTURE_ARGS=${(q)interactive_capture_args} TEST_CAPTURE_STDIN=${(q)interactive_capture_stdin} TEST_CAPTURE_CALLS=${(q)interactive_capture_calls}; HISTFILE=${(q)history_disabled_file}; HISTSIZE=100; SAVEHIST=100; fc -R ${(q)history_disabled_file}; source ${(q)root}/shell/mu.zsh"
 interactive_status=0
 {
-  print -r -- "$history_return_setup"
+  print -r -- "$history_disabled_setup"
   sleep 0.2
-  print -rn -- $'\t'"$history_return_prompt"$'\e[A\e[B\r'
+  print -rn -- $'\t'"$history_disabled_prompt"$'\e[A\e[B\r'
   sleep 0.4
   print -rn -- $'\x04'
-} | timeout 5 script -qfec 'TERM=xterm-256color zsh -df' "$history_return_transcript" >/dev/null || interactive_status=$?
-(( interactive_status == 0 )) || fail "history return transcript exited with status $interactive_status"
-[[ ! -e "$history_return_replay" ]] || fail "history detour should not execute the recalled shell history entry"
-[[ $(<"$interactive_capture_calls") == x ]] || fail "history detour should still submit exactly one mu prompt"
+} | timeout 5 script -qfec 'TERM=xterm-256color zsh -df' "$history_disabled_transcript" >/dev/null || interactive_status=$?
+(( interactive_status == 0 )) || fail "history-disabled transcript exited with status $interactive_status"
+[[ ! -e "$history_disabled_replay" ]] || fail "mu-mode arrows should not execute the recalled shell history entry"
+[[ $(<"$interactive_capture_calls") == x ]] || fail "mu-mode arrows should still submit exactly one mu prompt"
 
 interactive_args=("${(@f)$(<"$interactive_capture_args")}")
-[[ "${(j:\0:)interactive_args}" == "${(j:\0:)expected_interactive_args}" ]] || fail "unexpected history-detour args: ${interactive_args[*]}"
-print -rn -- "$history_return_prompt"$'\n' > "$interactive_expected_stdin"
-cmp -- "$interactive_expected_stdin" "$interactive_capture_stdin" || fail "history detour should restore the mu draft before submit"
+[[ "${(j:\0:)interactive_args}" == "${(j:\0:)expected_interactive_args}" ]] || fail "unexpected history-disabled args: ${interactive_args[*]}"
+print -rn -- "$history_disabled_prompt"$'\n' > "$interactive_expected_stdin"
+cmp -- "$interactive_expected_stdin" "$interactive_capture_stdin" || fail "mu-mode arrows should leave the draft unchanged before submit"
 
 print -- "ok"

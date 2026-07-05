@@ -44,9 +44,9 @@ buffer as one `mu` turn when it contains non-whitespace text; empty or
 whitespace-only Enter just draws a fresh `mu>` prompt. Ctrl-C cancels the
 current `mu>` draft, leaves the cancelled line in scrollback, and draws a fresh
 prompt. Backspace always deletes. Ctrl-D keeps normal shell EOF behavior even in
-`mu>` mode, so an empty `mu>` prompt exits the shell. Press Up in `mu>` mode to
-detour through normal shell history recall; when you return to the saved draft,
-Down re-enters `mu>` mode with that draft restored.
+`mu>` mode, so an empty `mu>` prompt exits the shell. Up and Down stay within
+the current `mu>` buffer and never browse shell history; leave `mu>` mode first
+if you want normal shell history navigation.
 
 The plugin owns only zsh line editing and prompt mode. Each submission still
 spawns the `mu` binary for one foreground turn, so streaming output, Ctrl-C, and

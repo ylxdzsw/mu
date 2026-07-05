@@ -3,8 +3,9 @@
 # Source this file from .zshrc to add a shell-native mu prompt mode:
 # press Tab at cursor position 0 to toggle "mu>" mode while preserving the
 # current buffer, Enter to submit one non-blank mu turn, Ctrl+C to cancel the
-# current mu prompt while leaving the typed line in scrollback, and Ctrl+D to
-# keep normal shell EOF behavior even from "mu>" mode.
+# current mu prompt while leaving the typed line in scrollback, Ctrl+D to keep
+# normal shell EOF behavior even from "mu>" mode, and Up/Down to stay within
+# the current buffer instead of browsing shell history.
 
 typeset -g MU_ZSH_MODE=${MU_ZSH_MODE:-shell}
 typeset -g MU_ZSH_SESSION_ID=${MU_ZSH_SESSION_ID:-}
@@ -32,17 +33,12 @@ typeset -g MU_ZSH_ORIGINAL_SLASH_WIDGET=${MU_ZSH_ORIGINAL_SLASH_WIDGET:-}
 typeset -g MU_ZSH_ORIGINAL_STTY=${MU_ZSH_ORIGINAL_STTY:-}
 typeset -g MU_ZSH_SCOPE_CACHE_PWD=${MU_ZSH_SCOPE_CACHE_PWD:-}
 typeset -g MU_ZSH_SCOPE_CACHE_KEY=${MU_ZSH_SCOPE_CACHE_KEY:-}
-typeset -g MU_ZSH_HISTORY_BUFFER=${MU_ZSH_HISTORY_BUFFER:-}
-typeset -gi MU_ZSH_HISTORY_CURSOR=${MU_ZSH_HISTORY_CURSOR:-0}
-typeset -gi MU_ZSH_HISTORY_HISTNO=${MU_ZSH_HISTORY_HISTNO:-0}
 typeset -gi MU_ZSH_OUTPUT_SEPARATOR_PENDING=${MU_ZSH_OUTPUT_SEPARATOR_PENDING:-0}
 typeset -gi MU_ZSH_HAD_HIGHLIGHTERS=${MU_ZSH_HAD_HIGHLIGHTERS:-0}
 typeset -gi MU_ZSH_DISABLED_AUTOSUGGESTIONS=${MU_ZSH_DISABLED_AUTOSUGGESTIONS:-0}
 typeset -ga MU_ZSH_SAVED_HIGHLIGHTERS
 typeset -ga MU_ZSH_ENTER_HOOKS
 typeset -ga MU_ZSH_EXIT_HOOKS
-typeset -gA MU_ZSH_SHELL_UP_WIDGETS
-typeset -gA MU_ZSH_SHELL_DOWN_WIDGETS
 
 _mu_zsh_widget_for_key() {
   local key=$1
@@ -60,19 +56,6 @@ _mu_zsh_save_widget_bindings() {
   [[ -z "$MU_ZSH_ORIGINAL_SLASH_WIDGET" ]] && MU_ZSH_ORIGINAL_SLASH_WIDGET=$(_mu_zsh_widget_for_key '/')
   [[ "$MU_ZSH_ORIGINAL_SLASH_WIDGET" == _mu_zsh_slash ]] && MU_ZSH_ORIGINAL_SLASH_WIDGET=
   [[ -z "$MU_ZSH_ORIGINAL_SLASH_WIDGET" ]] && MU_ZSH_ORIGINAL_SLASH_WIDGET=.self-insert
-
-  local key widget
-  for key in $'\e[A' $'\eOA'; do
-    widget=$(_mu_zsh_widget_for_key "$key")
-    [[ -z "$widget" || "$widget" == _mu_zsh_history_up ]] && widget=up-line-or-history
-    MU_ZSH_SHELL_UP_WIDGETS[$key]=$widget
-  done
-
-  for key in $'\e[B' $'\eOB'; do
-    widget=$(_mu_zsh_widget_for_key "$key")
-    [[ -z "$widget" || "$widget" == _mu_zsh_shell_down ]] && widget=down-line-or-history
-    MU_ZSH_SHELL_DOWN_WIDGETS[$key]=$widget
-  done
   return 0
 }
 
@@ -81,20 +64,6 @@ _mu_zsh_call_original_widget() {
   if [[ -n "$widget" && "$widget" != _mu_zsh_tab ]]; then
     zle "$widget"
   fi
-}
-
-_mu_zsh_saved_up_widget() {
-  local key=$1
-  local widget=${MU_ZSH_SHELL_UP_WIDGETS[$key]:-up-line-or-history}
-  [[ -z "$widget" || "$widget" == _mu_zsh_history_up ]] && widget=up-line-or-history
-  print -r -- "$widget"
-}
-
-_mu_zsh_saved_down_widget() {
-  local key=$1
-  local widget=${MU_ZSH_SHELL_DOWN_WIDGETS[$key]:-down-line-or-history}
-  [[ -z "$widget" || "$widget" == _mu_zsh_shell_down ]] && widget=down-line-or-history
-  print -r -- "$widget"
 }
 
 _mu_zsh_quote_prompt() {
@@ -518,12 +487,6 @@ _mu_zsh_apply_prompt_tty() {
   stty eof '^]' 2>/dev/null || true
 }
 
-_mu_zsh_clear_history_return() {
-  MU_ZSH_HISTORY_BUFFER=
-  MU_ZSH_HISTORY_CURSOR=0
-  MU_ZSH_HISTORY_HISTNO=0
-}
-
 _mu_zsh_reset_mode_prompt() {
   local skip_refresh=${1:-0}
   [[ "$MU_ZSH_MODE" == mu && "$skip_refresh" != 1 ]] && _mu_zsh_refresh_prompt
@@ -895,7 +858,6 @@ _mu_zsh_enter_mode() {
   [[ "$MU_ZSH_MODE" == mu ]] && return 0
 
   _mu_zsh_capture_tty_state
-  _mu_zsh_clear_history_return
   MU_ZSH_MODE=mu
   MU_ZSH_SAVED_KEYMAP=${KEYMAP:-main}
   MU_ZSH_ORIGINAL_PROMPT=$PROMPT
@@ -960,7 +922,6 @@ _mu_zsh_submit_prompt() {
 
 _mu_zsh_shell_eof() {
   if [[ -z "$BUFFER" ]]; then
-    _mu_zsh_clear_history_return
     _mu_zsh_restore_tty_state
     BUFFER=exit
     CURSOR=${#BUFFER}
@@ -981,7 +942,6 @@ _mu_zsh_tab() {
     fi
 
     if (( CURSOR == 0 )); then
-      _mu_zsh_clear_history_return
       _mu_zsh_exit_mode
       zle reset-prompt
       zle -K "${MU_ZSH_SAVED_KEYMAP:-main}" 2>/dev/null || zle -K main 2>/dev/null || true
@@ -1063,7 +1023,6 @@ _mu_zsh_eof() {
 
 _mu_zsh_accept() {
   if [[ "$MU_ZSH_MODE" != mu ]]; then
-    _mu_zsh_clear_history_return
     _mu_zsh_restore_tty_state
     zle .accept-line
     return
@@ -1095,50 +1054,6 @@ _mu_zsh_accept() {
   _mu_zsh_reset_mode_prompt
 }
 
-_mu_zsh_history_up() {
-  local before_histno=$HISTNO
-  local before_buffer=$BUFFER
-  local before_cursor=$CURSOR
-  local key=${KEYS:-$'\e[A'}
-  local widget
-
-  widget=$(_mu_zsh_saved_up_widget "$key")
-  zle "$widget"
-
-  if [[ "$MU_ZSH_MODE" == mu && "$HISTNO" -ne "$before_histno" ]]; then
-    MU_ZSH_HISTORY_BUFFER=$before_buffer
-    MU_ZSH_HISTORY_CURSOR=$before_cursor
-    MU_ZSH_HISTORY_HISTNO=$before_histno
-    _mu_zsh_exit_mode
-    zle reset-prompt
-  fi
-}
-
-_mu_zsh_history_down() {
-  local key=${KEYS:-$'\e[B'}
-  local widget
-
-  widget=$(_mu_zsh_saved_down_widget "$key")
-  zle "$widget"
-}
-
-_mu_zsh_shell_down() {
-  local key=${KEYS:-$'\e[B'}
-  local widget cursor
-
-  widget=$(_mu_zsh_saved_down_widget "$key")
-  zle "$widget"
-
-  if [[ -n "$MU_ZSH_HISTORY_BUFFER" ]] &&
-     (( HISTNO == MU_ZSH_HISTORY_HISTNO )) &&
-     [[ "$BUFFER" == "$MU_ZSH_HISTORY_BUFFER" ]]; then
-    cursor=$MU_ZSH_HISTORY_CURSOR
-    _mu_zsh_enter_mode
-    CURSOR=$cursor
-    _mu_zsh_reset_mode_prompt 1
-  fi
-}
-
 _mu_zsh_line_init() {
   _mu_zsh_capture_tty_state
   [[ "$MU_ZSH_MODE" == mu ]] && _mu_zsh_refresh_prompt
@@ -1158,7 +1073,6 @@ mu-zsh-mode() {
 }
 
 mu-zsh-exit-mode() {
-  _mu_zsh_clear_history_return
   _mu_zsh_exit_mode
   zle reset-prompt
   zle -K "${MU_ZSH_SAVED_KEYMAP:-main}" 2>/dev/null || zle -K main 2>/dev/null || true
@@ -1169,10 +1083,10 @@ _mu_zsh_configure_keymap() {
   bindkey -M mumode '^J' _mu_zsh_accept
   bindkey -M mumode '^I' _mu_zsh_tab
   bindkey -M mumode '/' _mu_zsh_slash
-  bindkey -M mumode $'\e[A' _mu_zsh_history_up
-  bindkey -M mumode $'\eOA' _mu_zsh_history_up
-  bindkey -M mumode $'\e[B' _mu_zsh_history_down
-  bindkey -M mumode $'\eOB' _mu_zsh_history_down
+  bindkey -M mumode $'\e[A' up-line
+  bindkey -M mumode $'\eOA' up-line
+  bindkey -M mumode $'\e[B' down-line
+  bindkey -M mumode $'\eOB' down-line
   bindkey -M mumode '^?' _mu_zsh_backspace
   bindkey -M mumode '^H' _mu_zsh_backspace
   bindkey -M mumode $'\e[3~' _mu_zsh_delete_char
@@ -1197,9 +1111,6 @@ if [[ -o zle ]]; then
   zle -N _mu_zsh_delete_char
   zle -N _mu_zsh_interrupt
   zle -N _mu_zsh_eof
-  zle -N _mu_zsh_history_up
-  zle -N _mu_zsh_history_down
-  zle -N _mu_zsh_shell_down
   zle -N _mu_zsh_line_init
   zle -N mu-zsh-mode
   zle -N mu-zsh-exit-mode
@@ -1211,6 +1122,4 @@ if [[ -o zle ]]; then
   _mu_zsh_apply_prompt_tty
   bindkey '^I' _mu_zsh_tab
   bindkey '^D' _mu_zsh_eof
-  bindkey $'\e[B' _mu_zsh_shell_down
-  bindkey $'\eOB' _mu_zsh_shell_down
 fi

@@ -851,10 +851,10 @@ Enter submits the current buffer as one `mu` turn when it contains non-whitespac
 text and otherwise just draws a fresh `mu>` prompt; Ctrl-C cancels the current
 `mu>` draft but leaves the cancelled line in scrollback; Backspace remains an
 ordinary delete key; and Ctrl-D keeps normal shell EOF behavior even while
-`mu>` mode is active. Up-arrow history recall should temporarily detour out of
-`mu>` mode, and Down should restore the saved draft and re-enter `mu>` mode
-when the user returns to that point in history. The plugin must not duplicate
-agent-loop, provider, store, or tool semantics.
+`mu>` mode is active. Up and Down stay within the current `mu>` buffer and do
+not browse shell history; the user leaves `mu>` mode first if they want normal
+shell history navigation. The plugin must not duplicate agent-loop, provider,
+store, or tool semantics.
 
 ### 6.1 Invocation pattern
 
@@ -889,9 +889,9 @@ Consequences:
 - Backspace should always delete backward; it is not a mode-exit key.
 - Ctrl-D should keep normal shell EOF semantics even inside `mu>` mode, so an
   empty `mu>` prompt exits the shell rather than merely leaving prompt mode.
-- Press Up while editing in `mu>` mode to recall shell history and temporarily
-  leave prompt mode; if the user returns to the saved draft with Down, re-enter
-  `mu>` mode with that draft restored.
+- Press Up or Down while editing in `mu>` mode to move within the current
+  buffer only. They must not recall shell history; leave `mu>` mode first if
+  shell history navigation is desired.
 - While `mu>` mode is active, conflicting line-editor plugins should be
   suspended. Common ZLE helpers such as syntax highlighting and autosuggestions
   may be disabled automatically; additional plugin toggles may be attached with
