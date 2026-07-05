@@ -48,12 +48,16 @@ if [[ "$1" == "status" ]]; then
   done
   [[ "$model" == gpt ]] && model=openai/gpt
   [[ "$model" == invalid/* ]] && exit 1
+  provider=${model%%/*}
+  model_id=${model#*/}
+  [[ "$provider" == "$model" ]] && provider=test
+  model_json="\"model\":{\"provider_id\":\"$provider\",\"model_id\":\"$model_id\",\"effort\":null,\"canonical\":\"$model\"}"
   if (( include_models )); then
-    print -r -- "{\"model_id\":\"$model\",\"context_percent\":25.0,\"project_root\":\"$MU_ZSH_TEST_PROJECT_ROOT\",\"available_models\":{\"providers\":[{\"id\":\"local\",\"models\":[{\"id\":\"local/solo\",\"model_id\":\"solo\",\"supported_efforts\":[\"max\"]},{\"id\":\"local/shared\",\"model_id\":\"shared\",\"supported_efforts\":[]}]},{\"id\":\"openai\",\"models\":[{\"id\":\"openai/gpt\",\"model_id\":\"gpt\",\"supported_efforts\":[\"low\",\"high\"]},{\"id\":\"openai/shared\",\"model_id\":\"shared\",\"supported_efforts\":[\"medium\"]}]}]}}"
+    print -r -- "{$model_json,\"context_percent\":25.0,\"project_root\":\"$MU_ZSH_TEST_PROJECT_ROOT\",\"available_models\":{\"providers\":[{\"id\":\"local\",\"models\":[{\"id\":\"local/solo\",\"model_id\":\"solo\",\"supported_efforts\":[\"max\"]},{\"id\":\"local/shared\",\"model_id\":\"shared\",\"supported_efforts\":[]}]},{\"id\":\"openai\",\"models\":[{\"id\":\"openai/gpt\",\"model_id\":\"gpt\",\"supported_efforts\":[\"low\",\"high\"]},{\"id\":\"openai/shared\",\"model_id\":\"shared\",\"supported_efforts\":[\"medium\"]}]}]}}"
   elif (( include_commands )); then
-    print -r -- "{\"model_id\":\"$model\",\"context_percent\":25.0,\"project_root\":\"$MU_ZSH_TEST_PROJECT_ROOT\",\"commands\":[{\"name\":\"review.md\",\"path\":\"$MU_ZSH_TEST_PROJECT_ROOT/.mu/review.md\",\"scope\":\"project\"}]}"
+    print -r -- "{$model_json,\"context_percent\":25.0,\"project_root\":\"$MU_ZSH_TEST_PROJECT_ROOT\",\"commands\":[{\"name\":\"review.md\",\"path\":\"$MU_ZSH_TEST_PROJECT_ROOT/.mu/review.md\",\"scope\":\"project\"}]}"
   else
-    print -r -- "{\"model_id\":\"$model\",\"context_percent\":25.0,\"project_root\":\"$MU_ZSH_TEST_PROJECT_ROOT\"}"
+    print -r -- "{$model_json,\"context_percent\":25.0,\"project_root\":\"$MU_ZSH_TEST_PROJECT_ROOT\"}"
   fi
   exit 0
 fi
@@ -158,7 +162,7 @@ mkdir -p -- "$global_fake_bin"
 cat > "$global_fake_bin/mu" <<'EOF'
 #!/usr/bin/env zsh
 if [[ "$1" == "status" ]]; then
-  print -r -- '{"model_id":"global-model","context_percent":5.0,"project_root":null}'
+  print -r -- '{"model":{"provider_id":"test","model_id":"global-model","effort":null,"canonical":"global-model"},"context_percent":5.0,"project_root":null}'
   exit 0
 fi
 exit 1
@@ -213,7 +217,7 @@ MU_ZSH_MODEL_SCOPE=$(_mu_zsh_current_scope_key)
 cmd=$(_mu_zsh_build_command)
 [[ "$cmd" == "$prompt_fake_bin/mu --output terminal --model openai/gpt" ]] || fail "builds pending-model command: $cmd"
 status_json=$(_mu_zsh_status_json)
-[[ "$status_json" == *"\"model_id\":\"openai/gpt\""* ]] || fail "status uses pending model"
+[[ "$status_json" == *"\"canonical\":\"openai/gpt\""* ]] || fail "status uses pending model"
 MU_ZSH_SESSION_ID=abc123
 MU_ZSH_SESSION_SCOPE=$(_mu_zsh_current_scope_key)
 cmd=$(_mu_zsh_build_command)
@@ -350,7 +354,7 @@ done
 scope_name=${scope_root:t}
 if [[ "$1" == "status" ]]; then
   print -r -- "$*" >> "$MU_ZSH_SCOPE_LOG"
-  print -r -- "{\"model_id\":\"scope-model\",\"context_percent\":10.0,\"project_root\":\"$scope_root\"}"
+  print -r -- "{\"model\":{\"provider_id\":\"test\",\"model_id\":\"scope-model\",\"effort\":null,\"canonical\":\"scope-model\"},\"context_percent\":10.0,\"project_root\":\"$scope_root\"}"
   exit 0
 fi
 print -r -- "$PWD :: $*" >> "$MU_ZSH_SCOPE_LOG"
@@ -404,7 +408,7 @@ builtin cd "$saved_pwd"
 MU_ZSH_BIN=$prompt_fake_bin/mu
 rm -f "$MU_ZSH_SCOPE_LOG" "$MU_ZSH_SESSION_FILE"
 
-for dependency in script timeout perl col cmp; do
+for dependency in script timeout perl col cmp jq; do
   command -v "$dependency" >/dev/null || fail "missing test dependency: $dependency"
 done
 
@@ -432,10 +436,14 @@ if [ "$1" = "status" ]; then
     shift
   done
   [ "$model" = gpt ] && model=openai/gpt
+  provider=${model%%/*}
+  model_id=${model#*/}
+  [ "$provider" = "$model" ] && provider=test
+  model_json="\"model\":{\"provider_id\":\"$provider\",\"model_id\":\"$model_id\",\"effort\":null,\"canonical\":\"$model\"}"
   if [ "$include_commands" -eq 1 ] && [ -n "$TEST_EXTRA_COMMAND" ]; then
-    printf '%s\n' "{\"model_id\":\"$model\",\"context_percent\":25.0,\"project_root\":\"$MU_ZSH_TEST_PROJECT_ROOT\",\"commands\":[{\"name\":\"$TEST_EXTRA_COMMAND\",\"path\":\"$MU_ZSH_TEST_PROJECT_ROOT/.mu/$TEST_EXTRA_COMMAND\",\"scope\":\"project\"}]}"
+    printf '%s\n' "{$model_json,\"context_percent\":25.0,\"project_root\":\"$MU_ZSH_TEST_PROJECT_ROOT\",\"commands\":[{\"name\":\"$TEST_EXTRA_COMMAND\",\"path\":\"$MU_ZSH_TEST_PROJECT_ROOT/.mu/$TEST_EXTRA_COMMAND\",\"scope\":\"project\"}]}"
   else
-    printf '%s\n' "{\"model_id\":\"$model\",\"context_percent\":25.0,\"project_root\":\"$MU_ZSH_TEST_PROJECT_ROOT\"}"
+    printf '%s\n' "{$model_json,\"context_percent\":25.0,\"project_root\":\"$MU_ZSH_TEST_PROJECT_ROOT\"}"
   fi
   exit 0
 fi

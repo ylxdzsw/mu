@@ -34,7 +34,6 @@ pub struct StatusModel {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct StatusReport {
-    pub model_id: String,
     pub model: StatusModel,
     pub session_id: Option<String>,
     pub context_percent: Option<f64>,
@@ -181,7 +180,6 @@ pub fn build_status_report(
     let model = status_model(&resolved.request.model);
 
     Ok(StatusReport {
-        model_id: model.canonical.clone(),
         model,
         session_id: resolved
             .attached_session

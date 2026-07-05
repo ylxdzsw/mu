@@ -223,7 +223,7 @@ small:
   — run a discovered shebang command from the active project/global `.mu`
   instruction index. Command names are relative `.mu` paths including
   extensions; built-in subcommands and explicit prompt paths win.
-- `shell/zsh` — zsh prompt mode; each accepted prompt runs one foreground `mu`
+- `shell/mu.zsh` — zsh prompt mode; each accepted prompt runs one foreground `mu`
   turn and keeps using the same session. `MU_ZSH_SESSION_ID=<id>` seeds
   attachment to an existing session.
 - `mu project inspect --path <dir>` — report whether a directory resolves to a
@@ -878,7 +878,7 @@ Consequences:
 
 ### 6.2 Entry and exit
 
-- Source `shell/zsh` from `.zshrc`.
+- Source `shell/mu.zsh` from `.zshrc`.
 - Press Tab with the cursor at the beginning of the line to enter `mu>` mode;
   press Tab at the beginning of a `mu>` line to leave it again. In both
   directions, keep the current buffer and cursor position intact.

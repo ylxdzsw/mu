@@ -8,7 +8,7 @@ pkgdesc='Small composable agent runtime for the terminal'
 arch=('x86_64')
 url='https://github.com/ylxdzsw/mu'
 license=('custom')
-depends=('bash' 'sqlite')
+depends=('bash' 'jq' 'sqlite')
 makedepends=('cargo' 'git')
 source=("$pkgname::git+$url.git")
 sha256sums=('SKIP')
@@ -34,7 +34,7 @@ check() {
 
 package() {
   install -Dm755 "$srcdir/target/release/mu" "$pkgdir/usr/bin/mu"
-  install -Dm644 "$srcdir/$pkgname/shell/zsh" "$pkgdir/usr/share/mu/shell/zsh"
+  install -Dm644 "$srcdir/$pkgname/shell/mu.zsh" "$pkgdir/usr/share/mu/shell/mu.zsh"
   cp -r "$srcdir/$pkgname/web" "$pkgdir/usr/share/mu/"
   install -Dm644 "$srcdir/$pkgname/README.md" "$pkgdir/usr/share/doc/$pkgname/README.md"
   install -Dm644 "$srcdir/$pkgname/SPEC.md" "$pkgdir/usr/share/doc/$pkgname/SPEC.md"

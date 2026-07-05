@@ -834,7 +834,7 @@ fn print_status_report(report: &StatusReport) {
             .join(", ")
     };
 
-    println!("model: {}", report.model_id);
+    println!("model: {}", report.model.canonical);
     println!("session: {session}");
     println!("context: {context}");
     println!("project: {project}");

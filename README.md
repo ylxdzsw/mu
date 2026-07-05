@@ -33,10 +33,13 @@ root.
 ## zsh plugin
 
 ```zsh
-source /path/to/mu/shell/zsh
+source /path/to/mu/shell/mu.zsh
 # Arch package install path:
-# source /usr/share/mu/shell/zsh
+# source /usr/share/mu/shell/mu.zsh
 ```
+
+The plugin requires `zsh`, `jq`, and the `mu` binary on `PATH` unless
+`MU_ZSH_BIN` points at a specific executable.
 
 Press Tab with the cursor at the beginning of the line to toggle into or out of
 `mu>` mode without losing the current buffer. Press Enter to submit the current

@@ -317,45 +317,15 @@ _mu_zsh_status_json_with_commands() {
   "${command[@]}" 2>/dev/null
 }
 
-_mu_zsh_status_field_reply() {
+_mu_zsh_json_value_reply() {
   local json=$1
-  local key=$2
-  local remainder
+  local filter=$2
+  local value
 
-  remainder=${json#*\"$key\":}
-  [[ "$remainder" == "$json" ]] && return 1
-
-  if [[ "$remainder" == \"* ]]; then
-    remainder=${remainder#\"}
-    REPLY=${remainder%%\"*}
-    return 0
-  fi
-
-  remainder=${remainder%%,*}
-  REPLY=${remainder%%\}*}
-}
-
-_mu_zsh_status_field() {
-  local json=$1
-  local key=$2
-  _mu_zsh_status_field_reply "$json" "$key" || return 1
-  print -r -- "$REPLY"
-}
-
-_mu_zsh_format_context_percent() {
-  local raw=$1
-  local formatted
-
-  if [[ -z "$raw" || "$raw" == null ]]; then
-    print -r -- "0%"
-    return 0
-  fi
-
-  formatted=$(printf '%.0f%%' "$raw" 2>/dev/null) || {
-    print -r -- "0%"
-    return 0
-  }
-  print -r -- "$formatted"
+  command -v jq >/dev/null 2>&1 || return 1
+  value=$(jq -r "$filter" <<< "$json" 2>/dev/null) || return 1
+  [[ -n "$value" && "$value" != null ]] || return 1
+  REPLY=$value
 }
 
 _mu_zsh_build_mode_prompt() {
@@ -364,22 +334,21 @@ _mu_zsh_build_mode_prompt() {
   local escaped_model escaped_context escaped_project_root escaped_unclean_text
 
   status_json=$(_mu_zsh_status_json) || status_json=
-  if _mu_zsh_status_field_reply "$status_json" model_id 2>/dev/null; then
+  if _mu_zsh_json_value_reply "$status_json" '.model.canonical // empty' 2>/dev/null; then
     model=$REPLY
   else
     model=mu
   fi
-  if _mu_zsh_status_field_reply "$status_json" context_percent 2>/dev/null; then
+  if _mu_zsh_json_value_reply "$status_json" '.context_percent // empty' 2>/dev/null; then
     context_raw=$REPLY
   else
     context_raw=
   fi
-  if _mu_zsh_status_field_reply "$status_json" project_root 2>/dev/null; then
+  if _mu_zsh_json_value_reply "$status_json" '.project_root // empty' 2>/dev/null; then
     project_root=$REPLY
   else
     project_root=
   fi
-  [[ "$project_root" == null ]] && project_root=
   if [[ -z "$context_raw" || "$context_raw" == null ]]; then
     context=0%
   elif ! printf -v context '%.0f%%' "$context_raw" 2>/dev/null; then
@@ -403,7 +372,7 @@ _mu_zsh_build_mode_prompt() {
 
   # When the tracked session's last turn was interrupted (unclean), surface it
   # so the user knows they can /retry to resume or just type to redirect.
-  if _mu_zsh_status_field_reply "$status_json" clean 2>/dev/null; then
+  if _mu_zsh_json_value_reply "$status_json" 'if has("clean") then .clean else empty end' 2>/dev/null; then
     clean=$REPLY
   else
     clean=
@@ -511,21 +480,8 @@ _mu_zsh_slash_command_matches() {
 _mu_zsh_custom_slash_commands() {
   local json
   json=$(_mu_zsh_status_json_with_commands) || return 1
-  command -v python3 >/dev/null 2>&1 || return 1
-  python3 -c '
-import json
-import sys
-
-try:
-    payload = json.load(sys.stdin)
-except Exception:
-    sys.exit(1)
-
-for command in payload.get("commands") or []:
-    name = command.get("name")
-    if name:
-        print("/" + name)
-' <<< "$json"
+  command -v jq >/dev/null 2>&1 || return 1
+  jq -r '.commands[]?.name | "/" + .' <<< "$json"
 }
 
 _mu_zsh_has_custom_slash_command() {
@@ -540,21 +496,13 @@ _mu_zsh_has_custom_slash_command() {
 _mu_zsh_model_records() {
   local json
   json=$(_mu_zsh_status_json_with_models) || return 1
-  command -v python3 >/dev/null 2>&1 || return 1
-  python3 -c '
-import json
-import sys
-
-try:
-    payload = json.load(sys.stdin)
-except Exception:
-    sys.exit(1)
-
-for provider in payload.get("available_models", {}).get("providers", []):
-    for model in provider.get("models", []):
-        efforts = ",".join(model.get("supported_efforts") or [])
-        print("{}\t{}\t{}".format(model.get("id", ""), model.get("model_id", ""), efforts))
-' <<< "$json"
+  command -v jq >/dev/null 2>&1 || return 1
+  jq -r '
+    .available_models.providers[]? as $provider
+    | $provider.models[]?
+    | [(.id // ""), (.model_id // ""), ((.supported_efforts // []) | join(","))]
+    | @tsv
+  ' <<< "$json"
 }
 
 _mu_zsh_model_completion_matches() {
@@ -717,7 +665,7 @@ _mu_zsh_validate_model_ref() {
   command=("$MU_ZSH_BIN" status --json --model "$model")
   [[ -n "$MU_ZSH_EFFECTIVE_SESSION_ID" ]] && command+=(-s "$MU_ZSH_EFFECTIVE_SESSION_ID")
   status_json=$("${command[@]}" 2>/dev/null) || return 1
-  _mu_zsh_status_field_reply "$status_json" model_id 2>/dev/null || REPLY=$model
+  _mu_zsh_json_value_reply "$status_json" '.model.canonical // empty' 2>/dev/null || REPLY=$model
   return 0
 }
 
