@@ -9,6 +9,16 @@ fail() {
   exit 1
 }
 
+assert_command_reply() {
+  local label=$1
+  shift
+  local -a expected
+  expected=("$@")
+  if [[ "${(j:\0:)MU_ZSH_COMMAND_REPLY}" != "${(j:\0:)expected}" ]]; then
+    fail "$label: ${(q)MU_ZSH_COMMAND_REPLY[@]}"
+  fi
+}
+
 tmpdir=$(mktemp -d)
 TRAPEXIT() {
   local exit_code=$?
@@ -184,44 +194,41 @@ MU_ZSH_ORIGINAL_SLASH_WIDGET=
 _mu_zsh_save_widget_bindings
 [[ -n "$MU_ZSH_ORIGINAL_TAB_WIDGET" ]] || fail "saves tab widget fallback"
 [[ -n "$MU_ZSH_ORIGINAL_SLASH_WIDGET" ]] || fail "saves slash widget fallback"
-scope_cache_dir=$tmpdir/scope-cache
-mkdir -p -- "$scope_cache_dir"
+scope_discovery_dir=$tmpdir/scope-discovery
+mkdir -p -- "$scope_discovery_dir"
 saved_pwd=$PWD
 saved_home=${HOME:-}
 HOME=$tmpdir
-_mu_zsh_clear_scope_cache
-builtin cd "$scope_cache_dir"
+builtin cd "$scope_discovery_dir"
 [[ "$(_mu_zsh_current_scope_key)" == "global" ]] || fail "starts uncached global"
 mkdir -p -- .mu
-_mu_zsh_clear_scope_cache
-[[ "$(_mu_zsh_current_scope_key)" == "project:$scope_cache_dir" ]] || fail "scope cache invalidation refreshes project detection"
+[[ "$(_mu_zsh_current_scope_key)" == "project:$scope_discovery_dir" ]] || fail "scope detection refreshes project markers"
 builtin cd "$saved_pwd"
 HOME=$saved_home
-_mu_zsh_clear_scope_cache
 
 MU_ZSH_BIN=mu
 MU_ZSH_OUTPUT=terminal
 MU_ZSH_SESSION_ID=abc123
 MU_ZSH_SESSION_SCOPE=$(_mu_zsh_current_scope_key)
-cmd=$(_mu_zsh_build_command)
-[[ "$cmd" == "mu --output terminal -s abc123" ]] || fail "builds attached command: $cmd"
+_mu_zsh_base_command_reply
+assert_command_reply "builds attached command" mu --output terminal -s abc123
 
 MU_ZSH_SESSION_ID=
 MU_ZSH_SESSION_SCOPE=
-cmd=$(_mu_zsh_build_command)
-[[ "$cmd" == "mu --output terminal" ]] || fail "builds new-session command: $cmd"
+_mu_zsh_base_command_reply
+assert_command_reply "builds new-session command" mu --output terminal
 MU_ZSH_BIN=$prompt_fake_bin/mu
 
 MU_ZSH_MODEL=openai/gpt
 MU_ZSH_MODEL_SCOPE=$(_mu_zsh_current_scope_key)
-cmd=$(_mu_zsh_build_command)
-[[ "$cmd" == "$prompt_fake_bin/mu --output terminal --model openai/gpt" ]] || fail "builds pending-model command: $cmd"
+_mu_zsh_base_command_reply
+assert_command_reply "builds pending-model command" "$prompt_fake_bin/mu" --output terminal --model openai/gpt
 status_json=$(_mu_zsh_status_json)
 [[ "$status_json" == *"\"canonical\":\"openai/gpt\""* ]] || fail "status uses pending model"
 MU_ZSH_SESSION_ID=abc123
 MU_ZSH_SESSION_SCOPE=$(_mu_zsh_current_scope_key)
-cmd=$(_mu_zsh_build_command)
-[[ "$cmd" == "$prompt_fake_bin/mu --output terminal -s abc123 --model openai/gpt" ]] || fail "builds attached pending-model command: $cmd"
+_mu_zsh_base_command_reply
+assert_command_reply "builds attached pending-model command" "$prompt_fake_bin/mu" --output terminal -s abc123 --model openai/gpt
 _mu_zsh_clear_model_state
 _mu_zsh_clear_session_state
 
@@ -383,16 +390,16 @@ MU_ZSH_MODEL=model-for-a
 MU_ZSH_MODEL_SCOPE=$(_mu_zsh_current_scope_key)
 
 builtin cd "$project_b/subdir"
-cmd=$(_mu_zsh_build_command)
-[[ "$cmd" == "$scope_fake_bin/mu --output plain" ]] || fail "does not reuse another project's session before submitting there: $cmd"
+_mu_zsh_base_command_reply
+assert_command_reply "does not reuse another project's session before submitting there" "$scope_fake_bin/mu" --output plain
 : > "$MU_ZSH_SCOPE_LOG"
 status_json=$(_mu_zsh_status_json)
 [[ "$status_json" == *"\"project_root\":\"$project_b\""* ]] || fail "status follows the current project"
 ! grep -q -- "-s session-project-a" "$MU_ZSH_SCOPE_LOG" || fail "status should not attach the first project's session in a different project"
 
 builtin cd "$project_a/subdir"
-cmd=$(_mu_zsh_build_command)
-[[ "$cmd" == "$scope_fake_bin/mu --output plain -s session-project-a --model model-for-a" ]] || fail "returns to the original scoped session and model after cd-ing back: $cmd"
+_mu_zsh_base_command_reply
+assert_command_reply "returns to the original scoped session and model after cd-ing back" "$scope_fake_bin/mu" --output plain -s session-project-a --model model-for-a
 
 builtin cd "$project_b/subdir"
 _mu_zsh_submit_prompt "project b prompt"
@@ -401,8 +408,8 @@ _mu_zsh_submit_prompt "project b prompt"
 [[ -z "$MU_ZSH_MODEL" && -z "$MU_ZSH_MODEL_SCOPE" ]] || fail "forgets pending model after submitting in another project"
 
 builtin cd "$project_a/subdir"
-cmd=$(_mu_zsh_build_command)
-[[ "$cmd" == "$scope_fake_bin/mu --output plain" ]] || fail "forgets the first project's session once a new one starts elsewhere: $cmd"
+_mu_zsh_base_command_reply
+assert_command_reply "forgets the first project's session once a new one starts elsewhere" "$scope_fake_bin/mu" --output plain
 
 builtin cd "$saved_pwd"
 MU_ZSH_BIN=$prompt_fake_bin/mu

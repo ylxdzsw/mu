@@ -30,8 +30,6 @@ typeset -g MU_ZSH_ORIGINAL_RPROMPT=${MU_ZSH_ORIGINAL_RPROMPT:-}
 typeset -g MU_ZSH_SAVED_KEYMAP=${MU_ZSH_SAVED_KEYMAP:-main}
 typeset -g MU_ZSH_ORIGINAL_TAB_WIDGET=${MU_ZSH_ORIGINAL_TAB_WIDGET:-}
 typeset -g MU_ZSH_ORIGINAL_SLASH_WIDGET=${MU_ZSH_ORIGINAL_SLASH_WIDGET:-}
-typeset -g MU_ZSH_SCOPE_CACHE_PWD=${MU_ZSH_SCOPE_CACHE_PWD:-}
-typeset -g MU_ZSH_SCOPE_CACHE_KEY=${MU_ZSH_SCOPE_CACHE_KEY:-}
 typeset -gi MU_ZSH_OUTPUT_SEPARATOR_PENDING=${MU_ZSH_OUTPUT_SEPARATOR_PENDING:-0}
 typeset -gi MU_ZSH_HAD_HIGHLIGHTERS=${MU_ZSH_HAD_HIGHLIGHTERS:-0}
 typeset -gi MU_ZSH_DISABLED_AUTOSUGGESTIONS=${MU_ZSH_DISABLED_AUTOSUGGESTIONS:-0}
@@ -100,19 +98,7 @@ _mu_zsh_scope_key_for_dir() {
 }
 
 _mu_zsh_set_current_scope_key() {
-  if [[ -n "$MU_ZSH_SCOPE_CACHE_KEY" && "$MU_ZSH_SCOPE_CACHE_PWD" == "$PWD" ]]; then
-    REPLY=$MU_ZSH_SCOPE_CACHE_KEY
-    return 0
-  fi
-
   _mu_zsh_set_scope_key_for_dir "$PWD"
-  MU_ZSH_SCOPE_CACHE_PWD=$PWD
-  MU_ZSH_SCOPE_CACHE_KEY=$REPLY
-}
-
-_mu_zsh_clear_scope_cache() {
-  MU_ZSH_SCOPE_CACHE_PWD=
-  MU_ZSH_SCOPE_CACHE_KEY=
 }
 
 _mu_zsh_current_scope_key() {
@@ -283,13 +269,6 @@ _mu_zsh_status_command_reply() {
   return 0
 }
 
-_mu_zsh_build_command() {
-  local -a command
-  _mu_zsh_base_command_reply
-  command=("${MU_ZSH_COMMAND_REPLY[@]}")
-  print -r -- "${(j: :)${(q)command[@]}}"
-}
-
 _mu_zsh_escape_prompt_text() {
   local text=$1
   text=${text//\%/%%}
@@ -298,21 +277,7 @@ _mu_zsh_escape_prompt_text() {
 
 _mu_zsh_status_json() {
   local -a command
-  _mu_zsh_status_command_reply
-  command=("${MU_ZSH_COMMAND_REPLY[@]}")
-  "${command[@]}" 2>/dev/null
-}
-
-_mu_zsh_status_json_with_models() {
-  local -a command
-  _mu_zsh_status_command_reply --include-models
-  command=("${MU_ZSH_COMMAND_REPLY[@]}")
-  "${command[@]}" 2>/dev/null
-}
-
-_mu_zsh_status_json_with_commands() {
-  local -a command
-  _mu_zsh_status_command_reply --include-commands
+  _mu_zsh_status_command_reply "$@"
   command=("${MU_ZSH_COMMAND_REPLY[@]}")
   "${command[@]}" 2>/dev/null
 }
@@ -479,7 +444,7 @@ _mu_zsh_slash_command_matches() {
 
 _mu_zsh_custom_slash_commands() {
   local json
-  json=$(_mu_zsh_status_json_with_commands) || return 1
+  json=$(_mu_zsh_status_json --include-commands) || return 1
   command -v jq >/dev/null 2>&1 || return 1
   jq -r '.commands[]?.name | "/" + .' <<< "$json"
 }
@@ -495,7 +460,7 @@ _mu_zsh_has_custom_slash_command() {
 
 _mu_zsh_model_records() {
   local json
-  json=$(_mu_zsh_status_json_with_models) || return 1
+  json=$(_mu_zsh_status_json --include-models) || return 1
   command -v jq >/dev/null 2>&1 || return 1
   jq -r '
     .available_models.providers[]? as $provider
@@ -991,8 +956,6 @@ if [[ -o zle ]]; then
   zle -N _mu_zsh_line_init
   zle -N mu-zsh-mode
   zle -N mu-zsh-exit-mode
-  add-zsh-hook precmd _mu_zsh_clear_scope_cache
-  add-zsh-hook chpwd _mu_zsh_clear_scope_cache
   add-zle-hook-widget line-init _mu_zsh_line_init 2>/dev/null || true
   bindkey '^I' _mu_zsh_tab
 fi
