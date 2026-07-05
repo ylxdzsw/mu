@@ -2,22 +2,14 @@ import { clear, element } from "../lib/dom.js";
 
 const COLLAPSED_OUTPUT_LINES = 3;
 
-function makeConversationCard(label, content, options = {}) {
-  const card = element("section", "conversation-card");
-  if (options.kind) {
-    card.dataset.kind = options.kind;
-  }
-  if (options.error) {
-    card.classList.add("conversation-error");
-  }
-
-  const header = element("div", "conversation-card-header", label);
-  const body = element("pre", "conversation-card-body", content);
-  body.dataset.mono = options.mono ? "true" : "false";
-
-  card.appendChild(header);
-  card.appendChild(body);
-  return card;
+function makeConversationNote(label, content, options = {}) {
+  const section = element("section", "timeline-part note-part");
+  if (options.error) section.classList.add("conversation-error");
+  const heading = element("div", "timeline-label", label);
+  const body = element("pre", "plain-transcript-text", content);
+  section.appendChild(heading);
+  section.appendChild(body);
+  return section;
 }
 
 function appendText(parent, text) {
@@ -264,6 +256,7 @@ function toolPreview(text, lineCount = COLLAPSED_OUTPUT_LINES) {
 function renderDisclosure(label, text, options = {}) {
   const details = element("details", "tool-disclosure");
   if (options.open) details.open = true;
+  if (options.key) details.dataset.disclosureKey = options.key;
   const summary = element("summary", "tool-disclosure-summary");
   summary.appendChild(element("span", "", label));
   summary.appendChild(element("span", "tool-disclosure-preview", options.preview || toolPreview(text, 1)));
@@ -279,6 +272,7 @@ function renderToolPart(part) {
 
   const details = element("details", "tool-part-details");
   details.dataset.toolCallId = part.id || "";
+  details.dataset.disclosureKey = `${part.id || part.tool || "tool"}:tool`;
   const summary = element("summary", "tool-part-summary");
   summary.appendChild(element("span", "tool-chevron", ""));
   summary.appendChild(element("span", "tool-name", toolTitle(part)));
@@ -291,13 +285,16 @@ function renderToolPart(part) {
   details.appendChild(summary);
 
   const body = element("div", "tool-part-body");
+  const command = toolCommand(part);
   body.appendChild(
-    renderDisclosure("Command", toolCommand(part), {
-      preview: toolPreview(toolCommand(part), 1),
+    renderDisclosure(part.tool === "bash" ? "Script" : "Arguments", command, {
+      key: `${part.id || part.tool || "tool"}:command`,
+      preview: toolPreview(command, 1),
     }),
   );
   body.appendChild(
     renderDisclosure("Output", part.output || part.error || "", {
+      key: `${part.id || part.tool || "tool"}:output`,
       preview: part.error ? part.error : toolPreview(part.output || "", COLLAPSED_OUTPUT_LINES),
       emptyText: "(no output yet)",
     }),
@@ -390,7 +387,7 @@ function normalizeTranscriptMessages(messages) {
   return parts;
 }
 
-function normalizeLiveParts(vm) {
+function normalizeLiveTurn(vm) {
   const active = vm.activeTurn;
   if (!active) return [];
   const parts = [];
@@ -483,6 +480,25 @@ function normalizeLiveParts(vm) {
   return parts;
 }
 
+function normalizeDocumentParts(vm) {
+  const transcript = vm.transcript || [];
+  const activePrompt = vm.activeTurn?.snapshot?.prompt;
+  const activePromptIndex =
+    vm.activeTurn && activePrompt
+      ? transcript.findLastIndex((message) => message.role === "user" && message.content === activePrompt)
+      : -1;
+  const storedMessages =
+    vm.activeTurn && !vm.activeTurn.completed && activePromptIndex >= 0
+      ? transcript.slice(0, activePromptIndex)
+      : transcript;
+  const parts = normalizeTranscriptMessages(storedMessages);
+  if (vm.activeTurn?.completed && activePromptIndex >= 0) {
+    return parts;
+  }
+  for (const part of normalizeLiveTurn(vm)) parts.push(part);
+  return parts;
+}
+
 function renderPart(part) {
   if (part.type === "tool") return renderToolPart(part);
   if (part.type === "plain") return renderPlainPart(part);
@@ -490,6 +506,12 @@ function renderPart(part) {
 }
 
 export class MuConversationView extends HTMLElement {
+  constructor() {
+    super();
+    this.openDisclosures = new Set();
+    this.addEventListener("toggle", (event) => this.trackDisclosureState(event), true);
+  }
+
   set viewModel(value) {
     this._viewModel = value;
     this.render();
@@ -499,10 +521,39 @@ export class MuConversationView extends HTMLElement {
     this.render();
   }
 
+  rememberOpenDisclosures() {
+    for (const details of this.querySelectorAll("details[data-disclosure-key][open]")) {
+      this.openDisclosures.add(details.dataset.disclosureKey);
+    }
+    return new Set(this.openDisclosures);
+  }
+
+  restoreOpenDisclosures(open) {
+    if (!open.size) return;
+    for (const details of this.querySelectorAll("details[data-disclosure-key]")) {
+      if (open.has(details.dataset.disclosureKey)) {
+        details.open = true;
+      }
+    }
+  }
+
+  trackDisclosureState(event) {
+    const details = event.target;
+    if (!(details instanceof HTMLDetailsElement)) return;
+    const key = details.dataset.disclosureKey;
+    if (!key) return;
+    if (details.open) {
+      this.openDisclosures.add(key);
+    } else {
+      this.openDisclosures.delete(key);
+    }
+  }
+
   render() {
     const vm = this._viewModel;
     if (!vm) return;
 
+    const openDisclosures = this.rememberOpenDisclosures();
     clear(this);
     this.className = "conversation-body";
 
@@ -545,40 +596,35 @@ export class MuConversationView extends HTMLElement {
 
     if (vm.transcriptLoading) {
       thread.appendChild(
-        makeConversationCard("loading", "Loading persisted transcript...", { mono: true }),
+        makeConversationNote("loading", "Loading persisted transcript..."),
       );
     } else if (vm.transcriptError) {
       thread.appendChild(
-        makeConversationCard("transcript error", vm.transcriptError, {
-          mono: true,
+        makeConversationNote("transcript error", vm.transcriptError, {
           error: true,
         }),
       );
     } else if (vm.transcript.length === 0 && !showingDraft && !vm.activeTurn) {
       thread.appendChild(
-        makeConversationCard("history", "No completed transcript yet.", { mono: true }),
+        makeConversationNote("history", "No completed transcript yet."),
       );
     } else {
-      for (const part of normalizeTranscriptMessages(vm.transcript)) {
+      for (const part of normalizeDocumentParts(vm)) {
         thread.appendChild(renderPart(part));
       }
     }
 
     if (showingDraft && !vm.activeTurn) {
       thread.appendChild(
-        makeConversationCard(
+        makeConversationNote(
           "draft session",
           "The first submitted prompt will create a web session and start streaming into this view.",
-          { mono: true, kind: "live" },
         ),
       );
     }
 
-    for (const part of normalizeLiveParts(vm)) {
-      thread.appendChild(renderPart(part));
-    }
-
     this.appendChild(thread);
+    this.restoreOpenDisclosures(openDisclosures);
     this.scrollTop = this.scrollHeight;
   }
 }

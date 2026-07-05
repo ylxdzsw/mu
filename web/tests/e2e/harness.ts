@@ -85,7 +85,140 @@ async function waitForHttp(url: string, timeoutMs = 10_000): Promise<void> {
   throw new Error(`timed out waiting for ${url}`);
 }
 
-function buildStreamingResponse(prompt: string): string[] {
+function lastMessageRole(body: any): string {
+  const messages = Array.isArray(body.messages) ? body.messages : [];
+  const last = messages.at(-1);
+  return typeof last?.role === "string" ? last.role : "";
+}
+
+function buildToolCallResponse(): string[] {
+  const args = JSON.stringify({
+    title: "Stream fixture output",
+    risk: "readonly",
+    script: 'for item in 1 2 3 4; do printf "tool-line-$item\\n"; sleep 0.05; done',
+  });
+  const first = JSON.stringify({
+    choices: [
+      {
+        delta: {
+          content: "I'll run a quick readonly check.",
+          tool_calls: [
+            {
+              index: 0,
+              id: "call_stream_fixture",
+              type: "function",
+              function: {
+                name: "bash",
+                arguments: args.slice(0, 40),
+              },
+            },
+          ],
+        },
+        finish_reason: null,
+      },
+    ],
+  });
+  const second = JSON.stringify({
+    choices: [
+      {
+        delta: {
+          tool_calls: [
+            {
+              index: 0,
+              function: {
+                arguments: args.slice(40),
+              },
+            },
+          ],
+        },
+        finish_reason: "tool_calls",
+      },
+    ],
+    usage: {
+      prompt_tokens: 18,
+      completion_tokens: 12,
+      total_tokens: 30,
+    },
+  });
+  return [first, second, "[DONE]"];
+}
+
+function buildConcurrentToolCallResponse(): string[] {
+  const slowArgs = JSON.stringify({
+    title: "Slow concurrent fixture",
+    risk: "readonly",
+    script: 'for item in slow-1 slow-2; do printf "$item\\n"; sleep 0.08; done',
+  });
+  const fastArgs = JSON.stringify({
+    title: "Fast concurrent fixture",
+    risk: "readonly",
+    script: 'for item in fast-1 fast-2; do printf "$item\\n"; sleep 0.02; done',
+  });
+  const chunk = JSON.stringify({
+    choices: [
+      {
+        delta: {
+          content: "I'll run two readonly checks at once.",
+          tool_calls: [
+            {
+              index: 0,
+              id: "call_slow_fixture",
+              type: "function",
+              function: {
+                name: "bash",
+                arguments: slowArgs,
+              },
+            },
+            {
+              index: 1,
+              id: "call_fast_fixture",
+              type: "function",
+              function: {
+                name: "bash",
+                arguments: fastArgs,
+              },
+            },
+          ],
+        },
+        finish_reason: "tool_calls",
+      },
+    ],
+    usage: {
+      prompt_tokens: 22,
+      completion_tokens: 18,
+      total_tokens: 40,
+    },
+  });
+  return [chunk, "[DONE]"];
+}
+
+function buildStreamingResponse(body: any): string[] {
+  if (lastMessageRole(body) === "tool") {
+    const final = JSON.stringify({
+      choices: [
+        {
+          delta: { content: "Tool output received. The streamed lines are available above." },
+          finish_reason: "stop",
+        },
+      ],
+      usage: {
+        prompt_tokens: 28,
+        completion_tokens: 10,
+        total_tokens: 38,
+      },
+    });
+    return [final, "[DONE]"];
+  }
+
+  const prompt =
+    body.messages?.filter((message) => message.role === "user").at(-1)?.content || "unknown";
+  if (String(prompt).includes("concurrent tools")) {
+    return buildConcurrentToolCallResponse();
+  }
+  if (String(prompt).includes("stream a tool")) {
+    return buildToolCallResponse();
+  }
+
   const text = `Fake response to: ${prompt}`;
   const first = JSON.stringify({
     choices: [{ delta: { content: text }, finish_reason: null }],
@@ -128,14 +261,12 @@ async function startFakeProvider(): Promise<{
       req.on("end", async () => {
         const body = JSON.parse(raw || "{}");
         requests.push(body);
-        const prompt =
-          body.messages?.filter((message) => message.role === "user").at(-1)?.content || "unknown";
         res.writeHead(200, {
           "content-type": "text/event-stream; charset=utf-8",
           "cache-control": "no-cache",
           connection: "close",
         });
-        for (const chunk of buildStreamingResponse(prompt)) {
+        for (const chunk of buildStreamingResponse(body)) {
           res.write(`data: ${chunk}\n\n`);
           await delay(25);
         }
