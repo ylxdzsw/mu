@@ -481,15 +481,17 @@ after_submitted_prompt=${normalized#*$'mu> hello\n'}
 [[ "$normalized" == *'mu> cancel-me'* ]] || fail "Ctrl-C should leave the cancelled mu line in scrollback"
 [[ $(<"$interactive_capture_calls") == x ]] || fail "interactive fake mu should run exactly once"
 after_response=${normalized#*"Hello! I'm your terminal agent."}
-after_response=${after_response%%exit*}
 redrawn_prompt_count=0
 post_turn_prompt_count=0
+native_exit_count=0
 for line in "${(@f)after_response}"; do
   [[ "$line" == 'hello' ]] && (( redrawn_prompt_count += 1 ))
-  [[ "$line" == 'mu> ' ]] && (( post_turn_prompt_count += 1 ))
+  [[ "$line" == 'mu>' || "$line" == 'mu> ' ]] && (( post_turn_prompt_count += 1 ))
+  [[ "$line" == 'exit' ]] && (( native_exit_count += 1 ))
 done
 (( redrawn_prompt_count == 0 )) || fail "submitted prompt should not be redrawn after response, saw $redrawn_prompt_count copies"
 (( post_turn_prompt_count == 1 )) || fail "post-turn mu prompt should appear once, saw $post_turn_prompt_count copies"
+(( native_exit_count == 0 )) || fail "Ctrl-D should not synthesize a visible exit command"
 
 interactive_expected_stdin=$tmpdir/expected-stdin
 print -rn -- 'hello'$'\n' > "$interactive_expected_stdin"

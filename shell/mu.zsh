@@ -30,12 +30,12 @@ typeset -g MU_ZSH_ORIGINAL_RPROMPT=${MU_ZSH_ORIGINAL_RPROMPT:-}
 typeset -g MU_ZSH_SAVED_KEYMAP=${MU_ZSH_SAVED_KEYMAP:-main}
 typeset -g MU_ZSH_ORIGINAL_TAB_WIDGET=${MU_ZSH_ORIGINAL_TAB_WIDGET:-}
 typeset -g MU_ZSH_ORIGINAL_SLASH_WIDGET=${MU_ZSH_ORIGINAL_SLASH_WIDGET:-}
-typeset -g MU_ZSH_ORIGINAL_STTY=${MU_ZSH_ORIGINAL_STTY:-}
 typeset -g MU_ZSH_SCOPE_CACHE_PWD=${MU_ZSH_SCOPE_CACHE_PWD:-}
 typeset -g MU_ZSH_SCOPE_CACHE_KEY=${MU_ZSH_SCOPE_CACHE_KEY:-}
 typeset -gi MU_ZSH_OUTPUT_SEPARATOR_PENDING=${MU_ZSH_OUTPUT_SEPARATOR_PENDING:-0}
 typeset -gi MU_ZSH_HAD_HIGHLIGHTERS=${MU_ZSH_HAD_HIGHLIGHTERS:-0}
 typeset -gi MU_ZSH_DISABLED_AUTOSUGGESTIONS=${MU_ZSH_DISABLED_AUTOSUGGESTIONS:-0}
+typeset -ga MU_ZSH_COMMAND_REPLY
 typeset -ga MU_ZSH_SAVED_HIGHLIGHTERS
 typeset -ga MU_ZSH_ENTER_HOOKS
 typeset -ga MU_ZSH_EXIT_HOOKS
@@ -258,16 +258,35 @@ _mu_zsh_read_session_file() {
   [[ -n "$id" ]] && _mu_zsh_remember_session_for_scope "$id" "$scope"
 }
 
+_mu_zsh_base_command_reply() {
+  local scope=${1:-}
+  [[ -n "$scope" ]] || {
+    _mu_zsh_set_current_scope_key
+    scope=$REPLY
+  }
+
+  _mu_zsh_sync_state "$scope"
+  MU_ZSH_COMMAND_REPLY=("$MU_ZSH_BIN" --output "$MU_ZSH_OUTPUT")
+  [[ -n "$MU_ZSH_EFFECTIVE_SESSION_ID" ]] && MU_ZSH_COMMAND_REPLY+=(-s "$MU_ZSH_EFFECTIVE_SESSION_ID")
+  [[ -n "$MU_ZSH_EFFECTIVE_MODEL" ]] && MU_ZSH_COMMAND_REPLY+=(--model "$MU_ZSH_EFFECTIVE_MODEL")
+  return 0
+}
+
+_mu_zsh_status_command_reply() {
+  local -a flags
+  flags=("$@")
+
+  _mu_zsh_sync_state
+  MU_ZSH_COMMAND_REPLY=("$MU_ZSH_BIN" status --json "${flags[@]}")
+  [[ -n "$MU_ZSH_EFFECTIVE_SESSION_ID" ]] && MU_ZSH_COMMAND_REPLY+=(-s "$MU_ZSH_EFFECTIVE_SESSION_ID")
+  [[ -n "$MU_ZSH_EFFECTIVE_MODEL" ]] && MU_ZSH_COMMAND_REPLY+=(--model "$MU_ZSH_EFFECTIVE_MODEL")
+  return 0
+}
+
 _mu_zsh_build_command() {
   local -a command
-  local session_id
-  local model
-  _mu_zsh_sync_state
-  session_id=$MU_ZSH_EFFECTIVE_SESSION_ID
-  model=$MU_ZSH_EFFECTIVE_MODEL
-  command=("$MU_ZSH_BIN" --output "$MU_ZSH_OUTPUT")
-  [[ -n "$session_id" ]] && command+=(-s "$session_id")
-  [[ -n "$model" ]] && command+=(--model "$model")
+  _mu_zsh_base_command_reply
+  command=("${MU_ZSH_COMMAND_REPLY[@]}")
   print -r -- "${(j: :)${(q)command[@]}}"
 }
 
@@ -279,40 +298,22 @@ _mu_zsh_escape_prompt_text() {
 
 _mu_zsh_status_json() {
   local -a command
-  local session_id
-  local model
-  _mu_zsh_sync_state
-  session_id=$MU_ZSH_EFFECTIVE_SESSION_ID
-  model=$MU_ZSH_EFFECTIVE_MODEL
-  command=("$MU_ZSH_BIN" status --json)
-  [[ -n "$session_id" ]] && command+=(-s "$session_id")
-  [[ -n "$model" ]] && command+=(--model "$model")
+  _mu_zsh_status_command_reply
+  command=("${MU_ZSH_COMMAND_REPLY[@]}")
   "${command[@]}" 2>/dev/null
 }
 
 _mu_zsh_status_json_with_models() {
   local -a command
-  local session_id
-  local model
-  _mu_zsh_sync_state
-  session_id=$MU_ZSH_EFFECTIVE_SESSION_ID
-  model=$MU_ZSH_EFFECTIVE_MODEL
-  command=("$MU_ZSH_BIN" status --json --include-models)
-  [[ -n "$session_id" ]] && command+=(-s "$session_id")
-  [[ -n "$model" ]] && command+=(--model "$model")
+  _mu_zsh_status_command_reply --include-models
+  command=("${MU_ZSH_COMMAND_REPLY[@]}")
   "${command[@]}" 2>/dev/null
 }
 
 _mu_zsh_status_json_with_commands() {
   local -a command
-  local session_id
-  local model
-  _mu_zsh_sync_state
-  session_id=$MU_ZSH_EFFECTIVE_SESSION_ID
-  model=$MU_ZSH_EFFECTIVE_MODEL
-  command=("$MU_ZSH_BIN" status --json --include-commands)
-  [[ -n "$session_id" ]] && command+=(-s "$session_id")
-  [[ -n "$model" ]] && command+=(--model "$model")
+  _mu_zsh_status_command_reply --include-commands
+  command=("${MU_ZSH_COMMAND_REPLY[@]}")
   "${command[@]}" 2>/dev/null
 }
 
@@ -470,28 +471,11 @@ _mu_zsh_run_hooks() {
   done
 }
 
-_mu_zsh_capture_tty_state() {
-  [[ -n "$MU_ZSH_ORIGINAL_STTY" ]] && return 0
-  [[ -t 0 ]] || return 0
-  MU_ZSH_ORIGINAL_STTY=$(stty -g 2>/dev/null || true)
-}
-
-_mu_zsh_restore_tty_state() {
-  [[ -n "$MU_ZSH_ORIGINAL_STTY" ]] || return 0
-  stty "$MU_ZSH_ORIGINAL_STTY" 2>/dev/null || true
-  MU_ZSH_ORIGINAL_STTY=
-}
-
-_mu_zsh_apply_prompt_tty() {
-  [[ -n "$MU_ZSH_ORIGINAL_STTY" ]] || return 0
-  stty eof '^]' 2>/dev/null || true
-}
-
 _mu_zsh_reset_mode_prompt() {
   local skip_refresh=${1:-0}
   [[ "$MU_ZSH_MODE" == mu && "$skip_refresh" != 1 ]] && _mu_zsh_refresh_prompt
   zle reset-prompt
-  _mu_zsh_apply_prompt_tty
+  zle -R
   zle -K mumode 2>/dev/null || true
 }
 
@@ -728,12 +712,10 @@ _mu_zsh_validate_no_args() {
 _mu_zsh_validate_model_ref() {
   local model=$1
   local -a command
-  local session_id
   local status_json
   _mu_zsh_sync_session_state
-  session_id=$MU_ZSH_EFFECTIVE_SESSION_ID
   command=("$MU_ZSH_BIN" status --json --model "$model")
-  [[ -n "$session_id" ]] && command+=(-s "$session_id")
+  [[ -n "$MU_ZSH_EFFECTIVE_SESSION_ID" ]] && command+=(-s "$MU_ZSH_EFFECTIVE_SESSION_ID")
   status_json=$("${command[@]}" 2>/dev/null) || return 1
   _mu_zsh_status_field_reply "$status_json" model_id 2>/dev/null || REPLY=$model
   return 0
@@ -742,18 +724,15 @@ _mu_zsh_validate_model_ref() {
 _mu_zsh_run_custom_slash_command() {
   local slash_command=$1
   local name=${slash_command#/}
-  local exit_status scope session_id model
+  local exit_status scope session_id
   local -a command
 
   scope=$(_mu_zsh_current_scope_key)
   _mu_zsh_forget_state_outside_scope "$scope"
-  _mu_zsh_sync_state "$scope"
+  _mu_zsh_base_command_reply "$scope"
   session_id=$MU_ZSH_EFFECTIVE_SESSION_ID
-  model=$MU_ZSH_EFFECTIVE_MODEL
 
-  command=("$MU_ZSH_BIN" --output "$MU_ZSH_OUTPUT")
-  [[ -n "$session_id" ]] && command+=(-s "$session_id")
-  [[ -n "$model" ]] && command+=(--model "$model")
+  command=("${MU_ZSH_COMMAND_REPLY[@]}")
   command+=("$name")
 
   if [[ -n "$session_id" ]]; then
@@ -857,7 +836,6 @@ _mu_zsh_run_slash_command() {
 _mu_zsh_enter_mode() {
   [[ "$MU_ZSH_MODE" == mu ]] && return 0
 
-  _mu_zsh_capture_tty_state
   MU_ZSH_MODE=mu
   MU_ZSH_SAVED_KEYMAP=${KEYMAP:-main}
   MU_ZSH_ORIGINAL_PROMPT=$PROMPT
@@ -889,27 +867,21 @@ _mu_zsh_submit_prompt() {
   local prompt=$1
   local exit_status
   local scope session_id
-  local model
+  local -a command
 
   scope=$(_mu_zsh_current_scope_key)
   _mu_zsh_forget_state_outside_scope "$scope"
 
   _mu_zsh_record_history "$prompt" "$scope"
-  _mu_zsh_sync_state "$scope"
+  _mu_zsh_base_command_reply "$scope"
   session_id=$MU_ZSH_EFFECTIVE_SESSION_ID
-  model=$MU_ZSH_EFFECTIVE_MODEL
+  command=("${MU_ZSH_COMMAND_REPLY[@]}")
 
   if [[ -n "$session_id" ]]; then
-    local -a command
-    command=("$MU_ZSH_BIN" -s "$session_id" --output "$MU_ZSH_OUTPUT")
-    [[ -n "$model" ]] && command+=(--model "$model")
     _mu_zsh_print_output_separator_if_pending
     "${command[@]}" <<< "$prompt"
     exit_status=$?
   else
-    local -a command
-    command=("$MU_ZSH_BIN" --output "$MU_ZSH_OUTPUT")
-    [[ -n "$model" ]] && command+=(--model "$model")
     rm -f -- "$MU_ZSH_SESSION_FILE" 2>/dev/null || true
     _mu_zsh_print_output_separator_if_pending
     MU_SESSION_FILE=$MU_ZSH_SESSION_FILE "${command[@]}" <<< "$prompt"
@@ -918,20 +890,6 @@ _mu_zsh_submit_prompt() {
   fi
 
   return $exit_status
-}
-
-_mu_zsh_shell_eof() {
-  if [[ -z "$BUFFER" ]]; then
-    _mu_zsh_restore_tty_state
-    BUFFER=exit
-    CURSOR=${#BUFFER}
-    zle .accept-line
-    return
-  fi
-
-  if (( CURSOR < ${#BUFFER} )); then
-    zle delete-char
-  fi
 }
 
 _mu_zsh_tab() {
@@ -1004,26 +962,8 @@ _mu_zsh_interrupt() {
   _mu_zsh_redraw_mode_prompt
 }
 
-_mu_zsh_eof() {
-  if [[ "$MU_ZSH_MODE" != mu ]]; then
-    _mu_zsh_shell_eof
-    return
-  fi
-
-  if [[ -z "$BUFFER" ]]; then
-    _mu_zsh_exit_mode
-    _mu_zsh_shell_eof
-    return
-  fi
-
-  if (( CURSOR < ${#BUFFER} )); then
-    _mu_zsh_delete_char
-  fi
-}
-
 _mu_zsh_accept() {
   if [[ "$MU_ZSH_MODE" != mu ]]; then
-    _mu_zsh_restore_tty_state
     zle .accept-line
     return
   fi
@@ -1037,7 +977,6 @@ _mu_zsh_accept() {
 
   zle -I
   _mu_zsh_clear_prompt
-  _mu_zsh_restore_tty_state
   MU_ZSH_OUTPUT_SEPARATOR_PENDING=1
   if [[ "$prompt" == /* ]]; then
     command=${prompt%%[[:space:]]*}
@@ -1049,22 +988,14 @@ _mu_zsh_accept() {
   else
     _mu_zsh_submit_prompt "$prompt"
   fi
-  _mu_zsh_capture_tty_state
-  _mu_zsh_apply_prompt_tty
   _mu_zsh_reset_mode_prompt
 }
 
 _mu_zsh_line_init() {
-  _mu_zsh_capture_tty_state
   [[ "$MU_ZSH_MODE" == mu ]] && _mu_zsh_refresh_prompt
-  _mu_zsh_apply_prompt_tty
   if [[ "$MU_ZSH_MODE" == mu ]]; then
     zle -K mumode 2>/dev/null || true
   fi
-}
-
-_mu_zsh_cleanup() {
-  _mu_zsh_restore_tty_state
 }
 
 mu-zsh-mode() {
@@ -1091,7 +1022,6 @@ _mu_zsh_configure_keymap() {
   bindkey -M mumode '^H' _mu_zsh_backspace
   bindkey -M mumode $'\e[3~' _mu_zsh_delete_char
   bindkey -M mumode '^C' _mu_zsh_interrupt
-  bindkey -M mumode '^D' _mu_zsh_eof
 }
 
 _mu_zsh_sync_state
@@ -1110,16 +1040,11 @@ if [[ -o zle ]]; then
   zle -N _mu_zsh_backspace
   zle -N _mu_zsh_delete_char
   zle -N _mu_zsh_interrupt
-  zle -N _mu_zsh_eof
   zle -N _mu_zsh_line_init
   zle -N mu-zsh-mode
   zle -N mu-zsh-exit-mode
-  add-zsh-hook zshexit _mu_zsh_cleanup
   add-zsh-hook precmd _mu_zsh_clear_scope_cache
   add-zsh-hook chpwd _mu_zsh_clear_scope_cache
   add-zle-hook-widget line-init _mu_zsh_line_init 2>/dev/null || true
-  _mu_zsh_capture_tty_state
-  _mu_zsh_apply_prompt_tty
   bindkey '^I' _mu_zsh_tab
-  bindkey '^D' _mu_zsh_eof
 fi
