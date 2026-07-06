@@ -40,6 +40,32 @@ async function verifyModelPicker() {
   });
 }
 
+async function verifyMobileComposerControlsStayInOneRow() {
+  await withBrowserSession(async ({ harness, page }) => {
+    await page.setViewportSize({ width: 320, height: 700 });
+    await page.goto(harness.baseUrl, { waitUntil: "load" });
+    await page.waitForFunction(
+      () => document.querySelector('[aria-label="Model"]')?.textContent?.includes("fake/fake-model"),
+    );
+
+    const boxes = await page.evaluate(() => {
+      const model = document.querySelector(".composer-picker-button")?.getBoundingClientRect();
+      const variant = document.querySelector(".composer-select")?.getBoundingClientRect();
+      const submit = document.querySelector(".composer-submit")?.getBoundingClientRect();
+      if (!model || !variant || !submit) return null;
+      return {
+        modelTop: model.top,
+        variantTop: variant.top,
+        submitTop: submit.top,
+      };
+    });
+
+    assert.notEqual(boxes, null);
+    assert.equal(Math.abs(boxes!.submitTop - boxes!.modelTop) <= 1, true);
+    assert.equal(Math.abs(boxes!.submitTop - boxes!.variantTop) <= 1, true);
+  });
+}
+
 async function verifyPromptSubmission() {
   await withBrowserSession(async ({ harness, page }) => {
     await page.goto(harness.baseUrl, { waitUntil: "load" });
@@ -155,6 +181,8 @@ async function verifyConcurrentToolOutputAttribution() {
 async function main() {
   await verifyModelPicker();
   console.log("ok - loads split frontend assets and status-driven model picker");
+  await verifyMobileComposerControlsStayInOneRow();
+  console.log("ok - keeps mobile composer controls on one row");
   await verifyPromptSubmission();
   console.log("ok - submits a prompt through the standalone web server against the fake provider");
   await verifyFlatStreamingToolTranscript();

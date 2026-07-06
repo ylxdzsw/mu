@@ -45,7 +45,7 @@
   gap: 12px;
   min-height: 44px;
   padding: 0 8px 8px;
-  flex-wrap: wrap;
+  flex-wrap: nowrap;
 }
 
 .composer-toolbar-main {
@@ -54,7 +54,7 @@
   gap: 2px;
   min-width: 0;
   flex: 1;
-  flex-wrap: wrap;
+  flex-wrap: nowrap;
 }
 
 .composer-icon-button,
@@ -71,6 +71,7 @@
 }
 
 .composer-icon-button {
+  flex: 0 0 auto;
   padding: 6px;
   color: var(--v2-icon-icon-muted);
   background: transparent;
@@ -96,6 +97,7 @@
   align-items: center;
   min-width: 0;
   max-width: 100%;
+  flex: 0 1 auto;
 }
 
 .composer-model-shell {
@@ -104,10 +106,12 @@
   align-items: center;
   min-width: 0;
   max-width: 100%;
+  flex: 1 1 auto;
 }
 
 .composer-picker-button {
   position: relative;
+  width: 100%;
   height: 28px;
   min-width: 0;
   max-width: 220px;
@@ -305,15 +309,15 @@
   }
 
   .composer-toolbar-main {
-    flex: 1 1 100%;
+    flex: 1 1 auto;
   }
 
   .composer-select {
-    max-width: 128px;
+    max-width: 92px;
   }
 
   .composer-picker-button {
-    max-width: min(164px, calc(100vw - 116px));
+    max-width: min(164px, calc(100vw - 176px));
   }
 
   .composer-model-popover-card {
