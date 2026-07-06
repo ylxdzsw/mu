@@ -230,22 +230,28 @@ function renderMarkdown(markdownText) {
   return markdown;
 }
 
-function formatJson(value) {
-  if (value == null) return "";
-  if (typeof value === "string") return value;
-  return JSON.stringify(value, null, 2);
+function bashArgs(part) {
+  return part.args && typeof part.args === "object" ? part.args : {};
 }
 
 function toolTitle(part) {
-  const args = part.args && typeof part.args === "object" ? part.args : {};
+  const args = bashArgs(part);
   if (typeof args.title === "string" && args.title.trim()) return args.title.trim();
-  return part.tool || "tool";
+  return "bash";
 }
 
-function toolCommand(part) {
-  const args = part.args && typeof part.args === "object" ? part.args : {};
-  if (part.tool === "bash" && typeof args.script === "string") return args.script;
-  return formatJson(args);
+function bashScript(part) {
+  const args = bashArgs(part);
+  return typeof args.script === "string" ? args.script : "";
+}
+
+function commandPreview(script) {
+  const lines = script
+    .replace(/\r\n?/gu, "\n")
+    .split("\n")
+    .filter((line) => line.trim());
+  if (!lines.length) return "(no command yet)";
+  return `$ ${lines[0].trim()}${lines.length > 1 ? " ..." : ""}`;
 }
 
 function toolPreview(text, lineCount = COLLAPSED_OUTPUT_LINES) {
@@ -269,17 +275,38 @@ function renderDisclosure(label, text, options = {}) {
   return details;
 }
 
+function renderBashMeta(part) {
+  const args = bashArgs(part);
+  const meta = element("div", "tool-meta");
+  const addItem = (label, value) => {
+    if (value == null || value === "") return;
+    const item = element("span", "tool-meta-item");
+    item.appendChild(element("span", "tool-meta-label", label));
+    item.appendChild(element("span", "tool-meta-value", value));
+    meta.appendChild(item);
+  };
+
+  addItem("cwd", args.cwd);
+  addItem("timeout", args.timeout != null ? `${args.timeout}s` : "");
+  addItem("stdin", typeof args.stdin === "string" && args.stdin ? `${args.stdin.length} bytes` : "");
+  return meta.childElementCount ? meta : null;
+}
+
 function renderToolPart(part) {
   const section = element("section", "timeline-part tool-part");
   section.dataset.status = part.status || "running";
 
   const details = element("details", "tool-part-details");
   details.dataset.toolCallId = part.id || "";
-  details.dataset.disclosureKey = `${part.id || part.tool || "tool"}:tool`;
+  details.dataset.disclosureKey = `${part.id || "bash"}:tool`;
   const summary = element("summary", "tool-part-summary");
+  const args = bashArgs(part);
   summary.appendChild(element("span", "tool-chevron", ""));
+  const risk = typeof args.risk === "string" && args.risk.trim() ? args.risk.trim() : "bash";
+  const riskBadge = element("span", "tool-risk", risk);
+  riskBadge.dataset.risk = risk;
+  summary.appendChild(riskBadge);
   summary.appendChild(element("span", "tool-name", toolTitle(part)));
-  summary.appendChild(element("span", "tool-kind", part.tool || "tool"));
   const status = element("span", "tool-status", part.status || "running");
   summary.appendChild(status);
   if (part.elapsedMs != null) {
@@ -288,16 +315,19 @@ function renderToolPart(part) {
   details.appendChild(summary);
 
   const body = element("div", "tool-part-body");
-  const command = toolCommand(part);
+  const meta = renderBashMeta(part);
+  if (meta) body.appendChild(meta);
+  const command = bashScript(part);
   body.appendChild(
-    renderDisclosure(part.tool === "bash" ? "Script" : "Arguments", command, {
-      key: `${part.id || part.tool || "tool"}:command`,
-      preview: toolPreview(command, 1),
+    renderDisclosure("Command", command, {
+      key: `${part.id || "bash"}:command`,
+      preview: commandPreview(command),
+      emptyText: "(no command yet)",
     }),
   );
   body.appendChild(
     renderDisclosure("Output", part.output || part.error || "", {
-      key: `${part.id || part.tool || "tool"}:output`,
+      key: `${part.id || "bash"}:output`,
       preview: part.error ? part.error : toolPreview(part.output || "", COLLAPSED_OUTPUT_LINES),
       emptyText: "(no output yet)",
     }),

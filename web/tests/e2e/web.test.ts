@@ -76,9 +76,10 @@ async function verifyFlatStreamingToolTranscript() {
     const tool = page.locator(".tool-part").filter({ hasText: "Stream fixture output" });
     await tool.waitFor({ state: "visible" });
     await tool.locator(".tool-part-details:not([open])").waitFor({ state: "attached" });
+    await tool.locator(".tool-risk", { hasText: "readonly" }).waitFor({ state: "visible" });
 
     await tool.locator(".tool-part-summary").click();
-    const scriptDisclosure = tool.locator(".tool-disclosure").filter({ hasText: "Script" });
+    const scriptDisclosure = tool.locator(".tool-disclosure").filter({ hasText: "Command" });
     const outputDisclosure = tool.locator(".tool-disclosure").filter({ hasText: "Output" });
     await scriptDisclosure.locator("summary").click();
     await scriptDisclosure
