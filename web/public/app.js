@@ -72,6 +72,7 @@ class MuWebApp {
     this.sessionsRequestSerial = 0;
     this.transcriptRequestSerial = 0;
     this.activeTurnRequestSerial = 0;
+    this.submitRequestSerial = 0;
     this.activeEventSource = null;
     this.activeReconnectTimer = null;
 
@@ -122,6 +123,12 @@ class MuWebApp {
 
   toggleSidebar() {
     this.setSidebarOpen(!this.state().sidebarOpen);
+  }
+
+  closeSidebarOnCompact() {
+    if (window.matchMedia("(max-width: 640px)").matches) {
+      this.setSidebarOpen(false);
+    }
   }
 
   openProjectDialog() {
@@ -290,10 +297,8 @@ class MuWebApp {
           });
         }
         state.selectedProjectId = route.project;
-      } else if (route.project === GLOBAL_PROJECT_ID) {
-        state.selectedProjectId = GLOBAL_PROJECT_ID;
       } else {
-        state.selectedProjectId = bootstrap?.launch_project?.path || GLOBAL_PROJECT_ID;
+        state.selectedProjectId = bootstrap?.launch_project?.path || state.projects[0]?.id || "";
       }
       resetProjectSelectionIfNeeded(state);
     });
@@ -302,6 +307,16 @@ class MuWebApp {
   async loadModelState() {
     const requestSerial = ++this.modelsRequestSerial;
     const project = selectedProjectQueryValue(this.state());
+    if (!project) {
+      this.update((state) => {
+        state.modelGroups = [];
+        state.modelLoadError = null;
+        state.modelScopeKey = null;
+        state.selectedModelId = "";
+        state.selectedVariant = "";
+      });
+      return;
+    }
     const sessionId = this.state().selectedSessionId;
     const params = new URLSearchParams({
       project,
@@ -374,6 +389,16 @@ class MuWebApp {
 
   async loadSessions() {
     const requestSerial = ++this.sessionsRequestSerial;
+    const project = selectedProjectQueryValue(this.state());
+    if (!project) {
+      this.update((state) => {
+        state.sessions = [];
+        state.sessionsLoading = false;
+        state.sessionsError = null;
+        state.selectedSessionId = null;
+      });
+      return;
+    }
     this.update((state) => {
       state.sessionsLoading = true;
       state.sessionsError = null;
@@ -381,7 +406,7 @@ class MuWebApp {
 
     try {
       const payload = await api(
-        `/api/sessions?project=${encodeURIComponent(selectedProjectQueryValue(this.state()))}`,
+        `/api/sessions?project=${encodeURIComponent(project)}`,
       );
       if (requestSerial !== this.sessionsRequestSerial) return;
       const sessions = Array.isArray(payload) ? payload : [];
@@ -450,7 +475,8 @@ class MuWebApp {
 
   async loadActiveTurn({ subscribe } = { subscribe: true }) {
     const sessionId = this.state().selectedSessionId;
-    if (!sessionId) {
+    const project = selectedProjectQueryValue(this.state());
+    if (!sessionId || !project) {
       this.update((state) => {
         state.activeTurn = null;
       });
@@ -462,7 +488,7 @@ class MuWebApp {
     const requestSerial = ++this.activeTurnRequestSerial;
     try {
       const payload = await api(
-        `/api/turns/active?project=${encodeURIComponent(selectedProjectQueryValue(this.state()))}&session=${encodeURIComponent(sessionId)}`,
+        `/api/turns/active?project=${encodeURIComponent(project)}&session=${encodeURIComponent(sessionId)}`,
       );
       if (requestSerial !== this.activeTurnRequestSerial || sessionId !== this.state().selectedSessionId) {
         return;
@@ -520,6 +546,7 @@ class MuWebApp {
 
   async selectProject(projectId) {
     if (this.state().selectedProjectId === projectId) return;
+    this.submitRequestSerial += 1;
     this.closeActiveStream();
     this.clearActiveReconnect();
     this.update((state) => {
@@ -529,6 +556,7 @@ class MuWebApp {
       state.transcript = [];
       state.transcriptError = null;
       state.activeTurn = null;
+      state.composerSubmitting = false;
     });
     this.syncRoute();
     await this.loadSessions();
@@ -540,15 +568,18 @@ class MuWebApp {
   async selectSession(sessionId) {
     const state = this.state();
     if (state.selectedSessionId === sessionId && state.draftProjectId == null) return;
+    this.submitRequestSerial += 1;
     this.update((draft) => {
       draft.selectedSessionId = sessionId;
       draft.draftProjectId = null;
+      draft.composerSubmitting = false;
     });
     this.syncRoute();
     await Promise.all([this.refreshConversationState(), this.loadModelState()]);
   }
 
   selectDraftSession(projectId) {
+    this.submitRequestSerial += 1;
     this.closeActiveStream();
     this.clearActiveReconnect();
     this.update((state) => {
@@ -558,6 +589,7 @@ class MuWebApp {
       state.transcriptError = null;
       state.activeTurn = null;
       state.composerDraft = "";
+      state.composerSubmitting = false;
       state.modelSelectionDirty = false;
     });
     this.syncRoute();
@@ -589,10 +621,12 @@ class MuWebApp {
         }),
       });
       this.rememberOpenedProject(project);
+      this.submitRequestSerial += 1;
       this.update((draft) => {
         draft.selectedProjectId = project.path;
         draft.selectedSessionId = null;
         draft.draftProjectId = null;
+        draft.composerSubmitting = false;
         draft.modelSelectionDirty = false;
         draft.projectDialog.open = false;
         draft.projectDialog.submitting = false;
@@ -624,27 +658,56 @@ class MuWebApp {
   }
 
   async submitComposer() {
-    const prompt = this.state().composerDraft.trim();
+    const state = this.state();
+    if (state.composerSubmitting) return;
+    const prompt = state.composerDraft.trim();
     if (!prompt) return;
+    const project = selectedProjectQueryValue(state);
+    if (!project) {
+      this.update((draft) => {
+        draft.transcriptError = "Open a project before starting a web session.";
+      });
+      return;
+    }
+
+    const requestSerial = ++this.submitRequestSerial;
+    const requestSessionId = state.selectedSessionId;
+    const requestDraftProjectId = state.draftProjectId;
+    const sameTarget = () => {
+      const current = this.state();
+      return (
+        requestSerial === this.submitRequestSerial &&
+        selectedProjectQueryValue(current) === project &&
+        current.selectedSessionId === requestSessionId &&
+        current.draftProjectId === requestDraftProjectId
+      );
+    };
+
+    this.update((draft) => {
+      draft.composerSubmitting = true;
+      draft.transcriptError = null;
+    });
 
     try {
       const launched = await api("/api/turns", {
         method: "POST",
         body: JSON.stringify({
-          project: selectedProjectQueryValue(this.state()),
-          session_id: this.state().selectedSessionId,
+          project,
+          session_id: requestSessionId,
           prompt,
           model: buildCanonicalModelRef(
-            this.state().selectedModelId,
-            this.state().selectedVariant,
+            state.selectedModelId,
+            state.selectedVariant,
           ),
           images: [],
         }),
       });
+      if (!sameTarget()) return;
       this.update((state) => {
         state.selectedSessionId = launched.turn.session_id;
         state.draftProjectId = null;
         state.composerDraft = "";
+        state.composerSubmitting = false;
         state.modelSelectionDirty = false;
         state.modelScopeKey = selectionScopeKey(
           selectedProjectQueryValue(state),
@@ -659,8 +722,61 @@ class MuWebApp {
       ]);
       this.composer.focusInput();
     } catch (error) {
+      if (!sameTarget()) return;
       this.update((state) => {
         state.transcriptError = error instanceof Error ? error.message : String(error);
+        state.composerSubmitting = false;
+      });
+    } finally {
+      if (requestSerial === this.submitRequestSerial && this.state().composerSubmitting) {
+        this.update((state) => {
+          state.composerSubmitting = false;
+        });
+      }
+    }
+  }
+
+  async abortActiveTurn() {
+    const turnId = this.state().activeTurn?.turn?.id;
+    if (!turnId) return;
+    try {
+      await api(`/api/turns/${encodeURIComponent(turnId)}/abort`, {
+        method: "POST",
+        body: JSON.stringify({}),
+      });
+    } catch (error) {
+      this.update((state) => {
+        state.transcriptError = error instanceof Error ? error.message : String(error);
+      });
+    }
+  }
+
+  async archiveSession(sessionId) {
+    const project = selectedProjectQueryValue(this.state());
+    if (!project || !sessionId) return;
+    try {
+      await api(
+        `/api/sessions/${encodeURIComponent(sessionId)}/archive?project=${encodeURIComponent(project)}`,
+        {
+          method: "POST",
+          body: JSON.stringify({}),
+        },
+      );
+      this.update((state) => {
+        if (state.selectedSessionId === sessionId) {
+          state.selectedSessionId = null;
+          state.draftProjectId = null;
+          state.transcript = [];
+          state.activeTurn = null;
+        }
+      });
+      this.syncRoute();
+      await this.loadSessions();
+      this.syncRoute();
+      await this.refreshConversationState();
+    } catch (error) {
+      this.update((state) => {
+        state.sessionsError = error instanceof Error ? error.message : String(error);
       });
     }
   }
@@ -670,16 +786,19 @@ class MuWebApp {
     this.sidebarHitbox.addEventListener("click", () => this.setSidebarOpen(false));
 
     this.sidebar.addEventListener("mu:select-project", (event) => {
-      this.setSidebarOpen(false);
+      this.closeSidebarOnCompact();
       void this.selectProject(event.detail.projectId);
     });
     this.sidebar.addEventListener("mu:select-session", (event) => {
-      this.setSidebarOpen(false);
+      this.closeSidebarOnCompact();
       void this.selectSession(event.detail.sessionId);
     });
     this.sidebar.addEventListener("mu:new-session", (event) => {
-      this.setSidebarOpen(false);
+      this.closeSidebarOnCompact();
       this.selectDraftSession(event.detail.projectId);
+    });
+    this.sidebar.addEventListener("mu:archive-session", (event) => {
+      void this.archiveSession(event.detail.sessionId);
     });
     this.sidebar.addEventListener("mu:open-project", () => {
       this.setSidebarOpen(false);
@@ -693,6 +812,9 @@ class MuWebApp {
     });
     this.composer.addEventListener("mu:composer-submit", () => {
       void this.submitComposer();
+    });
+    this.composer.addEventListener("mu:composer-abort", () => {
+      void this.abortActiveTurn();
     });
     this.composer.addEventListener("mu:model-change", (event) => {
       this.update((state) => {
@@ -779,7 +901,14 @@ class MuWebApp {
       selectedModelLabel: model?.displayName || "",
       selectedProviderLabel: model?.providerId || "",
       variants: model?.variants || [],
-      submitDisabled: state.composerDraft.trim().length === 0,
+      activeTurnId: state.activeTurn?.turn?.id || "",
+      submitting: state.composerSubmitting,
+      projectMissing: !selectedProjectQueryValue(state),
+      submitDisabled:
+        !state.activeTurn &&
+        (state.composerSubmitting ||
+          !selectedProjectQueryValue(state) ||
+          state.composerDraft.trim().length === 0),
     };
 
     this.projectModal.viewModel = state.projectDialog;
@@ -787,7 +916,7 @@ class MuWebApp {
 
   async start() {
     this.bindEvents();
-    this.setSidebarOpen(false);
+    this.setSidebarOpen(window.matchMedia("(min-width: 900px)").matches);
     await this.bootstrap();
     await this.loadSessions();
     await this.loadModelState();

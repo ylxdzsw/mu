@@ -1,10 +1,8 @@
-import { GLOBAL_PROJECT_ID } from "./constants.js";
-
 export function makeInitialState() {
   return {
     bootstrap: null,
     projects: [],
-    selectedProjectId: GLOBAL_PROJECT_ID,
+    selectedProjectId: "",
     selectedSessionId: null,
     draftProjectId: null,
     sessions: [],
@@ -21,6 +19,7 @@ export function makeInitialState() {
     modelScopeKey: null,
     modelSelectionDirty: false,
     composerDraft: "",
+    composerSubmitting: false,
     sidebarOpen: false,
     projectDialog: {
       open: false,

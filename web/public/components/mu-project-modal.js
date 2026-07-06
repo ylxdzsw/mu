@@ -22,11 +22,21 @@ export class MuProjectModal extends HTMLElement {
     this.querySelector(".project-modal-input")?.select();
   }
 
+  escapeHtml(value) {
+    return String(value || "")
+      .replace(/&/gu, "&amp;")
+      .replace(/</gu, "&lt;")
+      .replace(/>/gu, "&gt;")
+      .replace(/"/gu, "&quot;")
+      .replace(/'/gu, "&#39;");
+  }
+
   render() {
     const vm = this._viewModel;
     if (!vm) return;
 
     const needsConfirmation = !!vm.confirmationPath;
+    const errorHtml = this.escapeHtml(vm.error || "");
     this.className = "project-modal";
     this.hidden = !vm.open;
     this.innerHTML = `
@@ -61,7 +71,7 @@ export class MuProjectModal extends HTMLElement {
             >
           </label>
 
-          <p class="project-modal-error"${vm.error ? "" : " hidden"}>${vm.error || ""}</p>
+          <p class="project-modal-error"${vm.error ? "" : " hidden"}>${errorHtml}</p>
           <div class="project-modal-confirmation"${needsConfirmation ? "" : " hidden"}>
             This directory is not a project yet. Create \`.mu\` there and open it?
           </div>

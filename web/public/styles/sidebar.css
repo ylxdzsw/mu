@@ -70,7 +70,7 @@
 .sidebar-project-tile[data-selected="true"] {
   border-width: 2px;
   border-color: var(--v2-icon-icon-base);
-  background: transparent;
+  background: var(--v2-background-bg-layer-03);
 }
 
 .sidebar-project-avatar {
@@ -221,6 +221,16 @@
   border-color: var(--v2-border-border-muted);
 }
 
+.sidebar-new-session-button:disabled {
+  cursor: default;
+  opacity: 0.55;
+}
+
+.sidebar-new-session-button:disabled:hover {
+  background: var(--v2-background-bg-layer-01);
+  border-color: transparent;
+}
+
 .sidebar-new-session-button[data-active="true"] {
   background: var(--v2-background-bg-layer-03);
   border-color: var(--v2-border-border-muted);
@@ -254,8 +264,16 @@
   gap: 1px;
 }
 
+.sidebar-session-item {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  min-width: 0;
+}
+
 .sidebar-session-row {
-  width: 100%;
+  flex: 1;
+  min-width: 0;
   min-height: 32px;
   padding: 0 12px 0 8px;
   border-radius: 8px;
@@ -267,6 +285,33 @@
   text-align: left;
   cursor: pointer;
   transition: background-color 120ms ease-out;
+}
+
+.sidebar-session-action {
+  width: 28px;
+  height: 28px;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--v2-icon-icon-muted);
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  opacity: 0;
+}
+
+.sidebar-session-item:hover .sidebar-session-action,
+.sidebar-session-action:focus-visible {
+  opacity: 1;
+}
+
+.sidebar-session-action:hover {
+  background: var(--v2-overlay-simple-overlay-hover);
+}
+
+.sidebar-session-action svg {
+  width: 16px;
+  height: 16px;
 }
 
 .sidebar-session-row:hover {

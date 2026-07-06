@@ -188,7 +188,10 @@ function renderMarkdown(markdownText) {
     const bullet = line.match(/^\s{0,3}[-*+]\s+(.+)$/u);
     if (bullet) {
       flushParagraph(markdown, paragraph);
-      if (!list) list = document.createElement("ul");
+      if (!list || list.tagName !== "UL") {
+        closeList();
+        list = document.createElement("ul");
+      }
       const item = document.createElement("li");
       appendInlineMarkdown(item, bullet[1]);
       list.appendChild(item);
@@ -387,12 +390,12 @@ function normalizeTranscriptMessages(messages) {
   return parts;
 }
 
-function normalizeLiveTurn(vm) {
+function normalizeLiveTurn(vm, options = {}) {
   const active = vm.activeTurn;
   if (!active) return [];
   const parts = [];
   const snapshot = active.snapshot || {};
-  if (!vm.transcriptAlreadyContainsPrompt(snapshot.prompt)) {
+  if (!options.hidePrompt) {
     parts.push({
       id: `live-user-${active.turn.id}`,
       type: "text",
@@ -482,20 +485,23 @@ function normalizeLiveTurn(vm) {
 
 function normalizeDocumentParts(vm) {
   const transcript = vm.transcript || [];
+  if (vm.activeTurn?.completed && transcript.length > 0) {
+    return normalizeTranscriptMessages(transcript);
+  }
   const activePrompt = vm.activeTurn?.snapshot?.prompt;
-  const activePromptIndex =
-    vm.activeTurn && activePrompt
-      ? transcript.findLastIndex((message) => message.role === "user" && message.content === activePrompt)
-      : -1;
+  const trailingMessage = transcript.at(-1);
+  const hideLivePrompt =
+    vm.activeTurn &&
+    !vm.activeTurn.completed &&
+    activePrompt &&
+    trailingMessage?.role === "user" &&
+    trailingMessage?.content === activePrompt;
   const storedMessages =
-    vm.activeTurn && !vm.activeTurn.completed && activePromptIndex >= 0
-      ? transcript.slice(0, activePromptIndex)
+    hideLivePrompt
+      ? transcript.slice(0, -1)
       : transcript;
   const parts = normalizeTranscriptMessages(storedMessages);
-  if (vm.activeTurn?.completed && activePromptIndex >= 0) {
-    return parts;
-  }
-  for (const part of normalizeLiveTurn(vm)) parts.push(part);
+  for (const part of normalizeLiveTurn(vm, { hidePrompt: hideLivePrompt })) parts.push(part);
   return parts;
 }
 
@@ -554,6 +560,9 @@ export class MuConversationView extends HTMLElement {
     if (!vm) return;
 
     const openDisclosures = this.rememberOpenDisclosures();
+    const shouldStickToBottom =
+      this.scrollHeight <= this.clientHeight ||
+      this.scrollHeight - this.scrollTop - this.clientHeight < 48;
     clear(this);
     this.className = "conversation-body";
 
@@ -562,21 +571,27 @@ export class MuConversationView extends HTMLElement {
     if (!hasSelectedSession && !showingDraft) {
       const empty = element("div", "conversation-empty");
       empty.appendChild(element("p", "conversation-kicker", "mu web"));
-      empty.appendChild(element("h1", "conversation-title", "What should mu help with next?"));
+      empty.appendChild(
+        element(
+          "h1",
+          "conversation-title",
+          vm.selectedProject.missing ? "Open a project to start" : "What should mu help with next?",
+        ),
+      );
       empty.appendChild(
         element(
           "p",
           "conversation-copy",
-          "The browser surface follows the terminal transcript order, renders assistant Markdown, and keeps tool commands and output available behind collapsed disclosures.",
+          vm.selectedProject.missing
+            ? "Choose an existing project from the left panel or add a directory before starting a web session."
+            : "Pick a session or start a new one in the selected project.",
         ),
       );
       empty.appendChild(
         element(
           "p",
           "conversation-project",
-          vm.selectedProject.global
-            ? `Global scope: ${vm.selectedProject.path}`
-            : `Project: ${vm.selectedProject.path}`,
+          vm.selectedProject.missing ? "No project selected" : `Project: ${vm.selectedProject.path}`,
         ),
       );
       this.appendChild(empty);
@@ -625,7 +640,9 @@ export class MuConversationView extends HTMLElement {
 
     this.appendChild(thread);
     this.restoreOpenDisclosures(openDisclosures);
-    this.scrollTop = this.scrollHeight;
+    if (shouldStickToBottom) {
+      this.scrollTop = this.scrollHeight;
+    }
   }
 }
 

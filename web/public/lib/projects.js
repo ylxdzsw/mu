@@ -1,5 +1,3 @@
-import { GLOBAL_PROJECT_ID } from "./constants.js";
-
 function basename(path) {
   const parts = String(path || "")
     .split("/")
@@ -17,15 +15,16 @@ function projectInitials(name) {
   return letters.slice(0, 2).join("").toUpperCase();
 }
 
-export function globalProject(bootstrap) {
+export function emptyProject() {
   return {
-    id: GLOBAL_PROJECT_ID,
-    queryValue: GLOBAL_PROJECT_ID,
-    path: bootstrap?.global_home || "~",
-    marker: "global",
-    name: "Global",
-    global: true,
-    initials: "G",
+    id: "",
+    queryValue: "",
+    path: "",
+    marker: "",
+    name: "No project",
+    global: false,
+    missing: true,
+    initials: "?",
   };
 }
 
@@ -44,8 +43,8 @@ export function normalizeProject(summary) {
 }
 
 export function buildProjects(bootstrap) {
-  const deduped = [globalProject(bootstrap)];
-  const seen = new Set([GLOBAL_PROJECT_ID]);
+  const deduped = [];
+  const seen = new Set();
   const candidates = [
     bootstrap?.launch_project,
     ...(bootstrap?.recent_projects || []),
@@ -62,7 +61,7 @@ export function selectedProject(state) {
   return (
     state.projects.find((project) => project.id === state.selectedProjectId) ||
     state.projects[0] ||
-    globalProject(state.bootstrap)
+    emptyProject()
   );
 }
 
@@ -76,6 +75,6 @@ export function sessionTitle(session) {
 
 export function resetProjectSelectionIfNeeded(state) {
   if (!state.projects.some((project) => project.id === state.selectedProjectId)) {
-    state.selectedProjectId = state.projects[0]?.id || GLOBAL_PROJECT_ID;
+    state.selectedProjectId = state.projects[0]?.id || "";
   }
 }

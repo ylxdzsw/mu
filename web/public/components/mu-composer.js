@@ -169,10 +169,15 @@ export class MuComposer extends HTMLElement {
     this.variantShell = this.querySelector(".composer-select-shell");
     this.variantSelect = this.querySelector(".composer-select");
     this.submitButton = this.querySelector(".composer-submit");
+    this.submitIconPath = this.querySelector(".composer-submit path");
 
     this.form.addEventListener("submit", (event) => {
       event.preventDefault();
-      this.dispatch("mu:composer-submit");
+      if (this._viewModel?.activeTurnId) {
+        this.dispatch("mu:composer-abort");
+      } else {
+        this.dispatch("mu:composer-submit");
+      }
     });
     this.attachButton.addEventListener("click", () => {
       this.dispatch("mu:composer-attach");
@@ -295,6 +300,8 @@ export class MuComposer extends HTMLElement {
     const hasModels = (vm.modelGroups?.length || 0) > 0;
     const showModelPicker = !!vm.modelLoadError || hasModels;
     const showVariantPicker = showModelPicker && vm.variants.length > 0;
+    this.attachButton.hidden = true;
+    this.attachButton.disabled = true;
     this.modelShell.hidden = !showModelPicker;
     this.variantShell.hidden = !showVariantPicker;
 
@@ -315,6 +322,14 @@ export class MuComposer extends HTMLElement {
     this.renderModelPicker();
 
     this.submitButton.disabled = vm.submitDisabled;
+    this.submitButton.setAttribute(
+      "aria-label",
+      vm.activeTurnId ? "Abort turn" : vm.submitting ? "Sending prompt" : "Send prompt",
+    );
+    this.submitIconPath?.setAttribute(
+      "d",
+      vm.activeTurnId ? "M5 5h6v6H5z" : "M3.5 8h7.75M8.25 4.25 12 8l-3.75 3.75",
+    );
     this.syncHeight();
   }
 }

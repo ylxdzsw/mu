@@ -72,6 +72,7 @@
   display: flex;
   flex-direction: column;
   min-height: 0;
+  transition: margin-left 200ms ease-out;
 }
 
 .conversation-shell {
@@ -101,15 +102,27 @@
 }
 
 .app[data-sidebar-open="true"] .sidebar-hitbox {
-  pointer-events: auto;
+  pointer-events: none;
 }
 
 .app[data-sidebar-open="true"] .sidebar {
   transform: translateX(0);
 }
 
+.app[data-sidebar-open="true"] .chat-view {
+  margin-left: min(100%, 400px);
+}
+
 @media (max-width: 640px) {
   .sidebar {
     width: min(100%, 360px);
+  }
+
+  .app[data-sidebar-open="true"] .sidebar-hitbox {
+    pointer-events: auto;
+  }
+
+  .app[data-sidebar-open="true"] .chat-view {
+    margin-left: 0;
   }
 }

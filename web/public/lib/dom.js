@@ -59,6 +59,13 @@ function iconMarkup(name) {
             fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="1.2"/>
         </svg>
       `;
+    case "archive":
+      return `
+        <svg viewBox="0 0 16 16" aria-hidden="true">
+          <path d="M3 4.5h10M4 6.5v5.25c0 .69.56 1.25 1.25 1.25h5.5c.69 0 1.25-.56 1.25-1.25V6.5M6.25 8.5h3.5"
+            fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="1.2"/>
+        </svg>
+      `;
     default:
       return "";
   }

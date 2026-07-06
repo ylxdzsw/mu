@@ -73,15 +73,13 @@ export class MuSidebar extends HTMLElement {
     const title = element(
       "h2",
       "sidebar-panel-title",
-      vm.selectedProject.global ? "Global project" : vm.selectedProject.name,
+      vm.selectedProject.missing ? "No project" : vm.selectedProject.name,
     );
-    const badge = element("span", "sidebar-panel-badge", vm.selectedProject.marker);
+    const badge = element("span", "sidebar-panel-badge", vm.selectedProject.marker || "none");
     const path = element(
       "p",
       "sidebar-panel-path",
-      vm.selectedProject.global
-        ? `${vm.selectedProject.path} (home directory)`
-        : vm.selectedProject.path,
+      vm.selectedProject.missing ? "Open a project to start a web session." : vm.selectedProject.path,
     );
     titleRow.appendChild(title);
     titleRow.appendChild(badge);
@@ -90,6 +88,7 @@ export class MuSidebar extends HTMLElement {
     scroll.appendChild(header);
 
     const newSessionButton = button("sidebar-new-session-button", "New session");
+    newSessionButton.disabled = !!vm.selectedProject.missing;
     newSessionButton.dataset.active =
       vm.draftProjectId === vm.selectedProject.id ? "true" : "false";
     const newSessionIcon = element("span", "sidebar-new-session-button-icon");
@@ -123,6 +122,7 @@ export class MuSidebar extends HTMLElement {
     } else {
       const list = element("div", "sidebar-session-list");
       for (const session of vm.sessions) {
+        const item = element("div", "sidebar-session-item");
         const row = button("sidebar-session-row", sessionTitle(session));
         row.dataset.selected = session.id === vm.selectedSessionId ? "true" : "false";
         const status = element("span", "sidebar-session-status");
@@ -132,7 +132,14 @@ export class MuSidebar extends HTMLElement {
         row.addEventListener("click", () => {
           this.dispatch("mu:select-session", { sessionId: session.id });
         });
-        list.appendChild(row);
+        const archive = button("sidebar-session-action", "Archive session");
+        setIcon(archive, "archive");
+        archive.addEventListener("click", () => {
+          this.dispatch("mu:archive-session", { sessionId: session.id });
+        });
+        item.appendChild(row);
+        item.appendChild(archive);
+        list.appendChild(item);
       }
       scroll.appendChild(list);
     }

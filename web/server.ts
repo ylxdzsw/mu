@@ -81,7 +81,6 @@ type TurnReplay =
 interface AppState {
   launchCwd: string;
   launchProject: ProjectSummary | null;
-  globalHome: string;
   recentProjects: ProjectSummary[];
   turns: Map<string, TurnRuntime>;
   uploadRoot: string;
@@ -91,6 +90,7 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const publicRoot = path.join(__dirname, "public");
 const MAX_REQUEST_BYTES = 32 * 1024 * 1024;
 const MAX_TURN_EVENT_BUFFER = 512;
+const COMPLETED_TURN_RETENTION_MS = 60_000;
 const GLOBAL_PROJECT_ID = "__mu_global__";
 const SOCKET_MODE = 0o660;
 const MU_EXE = "mu";
@@ -240,7 +240,6 @@ async function createState(): Promise<AppState> {
   return {
     launchCwd,
     launchProject,
-    globalHome: process.env.HOME || "/tmp",
     recentProjects: launchProject ? [launchProject] : [],
     turns: new Map(),
     uploadRoot,
@@ -255,12 +254,8 @@ function runtimeDir(): string {
 }
 
 async function discoverProject(cwd: string): Promise<ProjectSummary | null> {
-  const info = await runJsonCommand<ProjectInspectOutput>(
-    { globalHome: process.env.HOME || "/tmp" },
-    null,
-    ["project", "inspect", "--path", cwd, "--json"],
-    cwd,
-  );
+  const { stdout } = await execFileResult(MU_EXE, ["project", "inspect", "--path", cwd, "--json"], { cwd });
+  const info = JSON.parse(stdout) as ProjectInspectOutput;
   if (!info.project_root || !info.discovered_marker) {
     return null;
   }
@@ -287,7 +282,6 @@ async function handleRequest(
   if (request.method === "GET" && url.pathname === "/api/bootstrap") {
     writeJson(response, 200, {
       launch_cwd: state.launchCwd,
-      global_home: state.globalHome,
       launch_project: state.launchProject,
       recent_projects: state.recentProjects,
     });
@@ -412,6 +406,26 @@ async function handleRequest(
   }
 
   if (
+    request.method === "POST" &&
+    url.pathname.startsWith("/api/sessions/") &&
+    (url.pathname.endsWith("/archive") || url.pathname.endsWith("/unarchive"))
+  ) {
+    const scope = await scopeQuery(state, url);
+    const archive = url.pathname.endsWith("/archive");
+    const suffix = archive ? "/archive" : "/unarchive";
+    const session = url.pathname
+      .slice("/api/sessions/".length, -suffix.length)
+      .replace(/^\/+|\/+$/g, "");
+    await runCommand(
+      state,
+      scope,
+      ["session", archive ? "archive" : "unarchive", "--session", session],
+    );
+    writeJson(response, 200, { ok: true });
+    return;
+  }
+
+  if (
     request.method === "GET" &&
     url.pathname.startsWith("/api/turns/") &&
     url.pathname.endsWith("/events")
@@ -514,7 +528,7 @@ async function scopeQuery(state: AppState, url: URL): Promise<Scope> {
 
 async function parseScopeTarget(state: AppState, value: string): Promise<Scope> {
   if (value === GLOBAL_PROJECT_ID) {
-    return { kind: "global" };
+    throw new Error("web requests require an explicit project");
   }
   return { kind: "project", path: await requireProject(value) };
 }
@@ -524,7 +538,7 @@ function scopeKey(scope: Scope): string {
 }
 
 function currentDirForScope(state: AppState, scope: Scope): string {
-  return scope.kind === "global" ? state.globalHome : scope.path;
+  return scope.kind === "global" ? process.env.HOME || state.launchCwd : scope.path;
 }
 
 async function resolveExistingDir(target: string): Promise<string> {
@@ -589,7 +603,7 @@ function rememberProject(state: AppState, summary: ProjectSummary): void {
 }
 
 async function runJsonCommand<T>(
-  state: { globalHome: string } | AppState,
+  state: AppState,
   scope: Scope | null,
   args: string[],
   overrideCwd: string | null = null,
@@ -601,6 +615,16 @@ async function runJsonCommand<T>(
   } catch (error: any) {
     throw new Error(`parsing mu JSON output: ${error.message}`);
   }
+}
+
+async function runCommand(
+  state: AppState,
+  scope: Scope | null,
+  args: string[],
+  overrideCwd: string | null = null,
+): Promise<void> {
+  const cwd = overrideCwd || (scope ? currentDirForScope(state, scope) : undefined);
+  await execFileResult(MU_EXE, args, { cwd });
 }
 
 function execFileResult(
@@ -677,7 +701,7 @@ async function launchTurn(state: AppState, scope: Scope, input: TurnInput): Prom
   };
   const runtime = new TurnRuntime(turn, input.prompt);
   state.turns.set(turnId, runtime);
-  runTurnTask(runtime, child, uploadDir);
+  runTurnTask(state, runtime, child, uploadDir);
   return turn;
 }
 
@@ -689,6 +713,7 @@ function onceSpawn(child: ChildProcessWithoutNullStreams): Promise<void> {
 }
 
 async function runTurnTask(
+  state: AppState,
   runtime: TurnRuntime,
   child: ChildProcessWithoutNullStreams,
   uploadDir: string,
@@ -730,6 +755,9 @@ async function runTurnTask(
   }
   runtime.pushEvent("turn_finish", { exit_code: exitCode });
   runtime.markCompleted();
+  setTimeout(() => {
+    state.turns.delete(runtime.turn.id);
+  }, COMPLETED_TURN_RETENTION_MS).unref();
   await rm(uploadDir, { recursive: true, force: true }).catch(() => {});
 }
 
