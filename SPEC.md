@@ -470,23 +470,24 @@ captures the complete portable transcript while fatal diagnostics/summary
 remain visible. Stdout TTY detection selects rich versus portable rendering;
 stderr TTY detection suppresses the summary when redirected.
 
-- **Tool presentation.** Bash streams a command header as the model composes the
-  tool-call arguments: `# <title>` first, then `$ <script>` once the `risk`
-  value is available so terminal output can color the command consistently.
-  The title and script are append-only and capped in place; the script display
-  is the first decoded line with a byte cap. If fields arrive out of order,
-  display buffers until the ordered header can be committed. Once execution
-  begins, the header is not printed a second time. `plain` shows explicit risk
-  labels such as `[readonly]` where `terminal` uses color. Both human-facing
-  outputs stream the same output head preview, then print the omission marker
-  only once at tool completion if a middle section was actually omitted,
-  followed by any reserved tail and a matching exit line. Full tool results
-  still follow the shared model-context truncation policy (§4). Multiple tool
-  calls in one assistant message are displayed in provider order. In `plain`
-  and `terminal`, concurrent readonly batches still present exactly one active
-  bash stream at a time in original tool order; later calls may already be
-  running, but their execution output is buffered until they become the active
-  slot.
+- **Tool presentation.** Bash streams the active command header as the model
+  composes the tool-call arguments: `# <title>` first, then `$ <script>` once
+  the `risk` value is available so terminal output can color the command
+  consistently. The title and script are append-only and capped in place; the
+  script display is the first decoded line with a byte cap. If fields arrive
+  out of order, display buffers until the ordered header can be committed.
+  Later tool-call headers are buffered until their original-order display slot
+  becomes active. Once execution begins, a header that was already streamed is
+  not printed a second time. `plain` shows explicit risk labels such as
+  `[readonly]` where `terminal` uses color. Both human-facing outputs stream the
+  same output head preview, then print the omission marker only once at tool
+  completion if a middle section was actually omitted, followed by any reserved
+  tail and a matching exit line. Full tool results still follow the shared
+  model-context truncation policy (§4). Multiple tool calls in one assistant
+  message are displayed in provider order. In `plain` and `terminal`,
+  concurrent readonly batches still present exactly one active bash stream at a
+  time in original tool order; later calls may already be running, but their
+  headers and execution output are buffered until they become the active slot.
 - **Assistant text.** `plain` and redirected output stream raw Markdown deltas
   unchanged. TTY `terminal` display commits parsed Markdown blocks as soon as
   they are stable; only the current incomplete block is delayed.

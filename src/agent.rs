@@ -28,7 +28,6 @@ pub struct TurnResult {
 struct ConcurrentBashExecution<'a> {
     call: &'a ToolCall,
     args: Value,
-    header_already_rendered: bool,
     running: Option<RunningBash>,
     streamed_len: usize,
 }
@@ -560,18 +559,10 @@ impl<'a> AgentLoop<'a> {
         let mut executions = Vec::new();
         for call in batch {
             let args = parse_tool_args(call);
-            let header_already_rendered = finish_command_header(
-                self.renderer,
-                command_headers,
-                header_start_index + executions.len(),
-                call,
-                &args,
-            )?;
             let bash_args = tools::parse_args(&args)?;
             executions.push(ConcurrentBashExecution {
                 call,
                 args,
-                header_already_rendered,
                 running: Some(bash::start_bash_task(
                     bash_args,
                     self.config,
@@ -581,7 +572,14 @@ impl<'a> AgentLoop<'a> {
             });
         }
 
-        for exec in &mut executions {
+        for (index, exec) in executions.iter_mut().enumerate() {
+            let header_already_rendered = finish_command_header(
+                self.renderer,
+                command_headers,
+                header_start_index + index,
+                exec.call,
+                &exec.args,
+            )?;
             if let Some(running) = exec.running.as_ref() {
                 for warning in running.warnings() {
                     self.renderer.notice(&format!("[redaction] {warning}"))?;
@@ -591,7 +589,7 @@ impl<'a> AgentLoop<'a> {
                 Some(&exec.call.id),
                 &exec.call.function.name,
                 &exec.args,
-                exec.header_already_rendered,
+                header_already_rendered,
             )?;
             self.stream_running_bash(exec).await?;
             let (result, elapsed, final_output) = exec
@@ -688,24 +686,20 @@ fn handle_tool_call_delta(
     }
     header.arguments.push_str(&delta.arguments_delta);
 
-    while headers.next_to_render < headers.entries.len() {
-        let header = &mut headers.entries[headers.next_to_render];
-        if header.display.is_done() {
-            headers.next_to_render += 1;
-            continue;
-        }
-
-        header.display.update(
-            renderer,
-            header.id.as_deref(),
-            string_field_state(&header.arguments, "title"),
-            string_field_state(&header.arguments, "risk"),
-            string_field_state(&header.arguments, "script"),
-        )?;
+    if delta.index == 0 {
+        let header = &mut headers.entries[0];
         if !header.display.is_done() {
-            break;
+            header.display.update(
+                renderer,
+                header.id.as_deref(),
+                string_field_state(&header.arguments, "title"),
+                string_field_state(&header.arguments, "risk"),
+                string_field_state(&header.arguments, "script"),
+            )?;
         }
-        headers.next_to_render += 1;
+        if header.display.is_done() {
+            headers.next_to_render = headers.next_to_render.max(1);
+        }
     }
 
     Ok(())
@@ -1264,7 +1258,7 @@ mod tests {
     }
 
     #[test]
-    fn streamed_command_headers_render_in_index_order() {
+    fn streamed_command_headers_defer_later_commands_until_active() {
         let mut renderer = Renderer::with_format(OutputFormat::Plain);
         let mut headers = StreamingCommandHeaders::default();
 
@@ -1284,6 +1278,33 @@ mod tests {
         assert_eq!(headers.next_to_render, 0);
         assert!(!headers.entries[1].display.started);
 
+        let first_args = serde_json::json!({
+            "title": "First",
+            "risk": "readonly",
+            "script": "echo first",
+        });
+        let second_args = serde_json::json!({
+            "title": "Second",
+            "risk": "readonly",
+            "script": "echo second",
+        });
+        let first_call = ToolCall {
+            id: "call_1".into(),
+            call_type: "function".into(),
+            function: crate::provider::FunctionCall {
+                name: "bash".into(),
+                arguments: first_args.to_string(),
+            },
+        };
+        let second_call = ToolCall {
+            id: "call_2".into(),
+            call_type: "function".into(),
+            function: crate::provider::FunctionCall {
+                name: "bash".into(),
+                arguments: second_args.to_string(),
+            },
+        };
+
         handle_tool_call_delta(
             &mut renderer,
             &mut headers,
@@ -1297,8 +1318,19 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(headers.next_to_render, 2);
+        assert_eq!(headers.next_to_render, 1);
         assert!(headers.entries[0].display.is_done());
+        assert!(!headers.entries[1].display.started);
+
+        assert!(
+            finish_command_header(&mut renderer, &mut headers, 0, &first_call, &first_args)
+                .unwrap()
+        );
+        assert!(!headers.entries[1].display.started);
+        assert!(
+            finish_command_header(&mut renderer, &mut headers, 1, &second_call, &second_args)
+                .unwrap()
+        );
         assert!(headers.entries[1].display.is_done());
     }
 
