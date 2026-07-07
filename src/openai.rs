@@ -509,8 +509,8 @@ mod tests {
 
         for chunk in [
             "data: {\"choices\":[{\"delta\":{\"content\":\"hel\"},\"finish_reason\":null}]}\n\n",
-            "data: {\"choices\":[{\"delta\":{\"content\":\"lo\",\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"read\",\"arguments\":\"{\\\"path\\\":\"}}]},\"finish_reason\":null}]}\n\n",
-            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"\\\"/tmp/x\\\"}\"}}]},\"finish_reason\":\"tool_calls\"}],\"usage\":{\"prompt_tokens\":12,\"completion_tokens\":5,\"total_tokens\":17,\"prompt_tokens_details\":{\"cached_tokens\":3,\"cache_creation_tokens\":2},\"completion_tokens_details\":{\"reasoning_tokens\":4}}}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"lo\",\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"bash\",\"arguments\":\"{\\\"title\\\":\\\"Inspect\\\",\\\"risk\\\":\\\"readonly\\\",\\\"script\\\":\"}}]},\"finish_reason\":null}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"\\\"pwd\\\"}\"}}]},\"finish_reason\":\"tool_calls\"}],\"usage\":{\"prompt_tokens\":12,\"completion_tokens\":5,\"total_tokens\":17,\"prompt_tokens_details\":{\"cached_tokens\":3,\"cache_creation_tokens\":2},\"completion_tokens_details\":{\"reasoning_tokens\":4}}}\n\n",
             "data: [DONE]\n\n",
         ] {
             buffer.push_str(chunk);
@@ -521,9 +521,12 @@ mod tests {
         assert_eq!(tool_call_deltas.len(), 2);
         assert_eq!(tool_call_deltas[0].index, 0);
         assert_eq!(tool_call_deltas[0].id.as_deref(), Some("call_1"));
-        assert_eq!(tool_call_deltas[0].name.as_deref(), Some("read"));
-        assert_eq!(tool_call_deltas[0].arguments_delta, "{\"path\":");
-        assert_eq!(tool_call_deltas[1].arguments_delta, "\"/tmp/x\"}");
+        assert_eq!(tool_call_deltas[0].name.as_deref(), Some("bash"));
+        assert_eq!(
+            tool_call_deltas[0].arguments_delta,
+            "{\"title\":\"Inspect\",\"risk\":\"readonly\",\"script\":"
+        );
+        assert_eq!(tool_call_deltas[1].arguments_delta, "\"pwd\"}");
         assert_eq!(state.content, "hello");
         assert_eq!(state.finish_reason, FinishReason::ToolCalls);
         assert_eq!(state.usage.unwrap().total_tokens, 17);

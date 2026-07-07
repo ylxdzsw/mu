@@ -1,6 +1,3 @@
-# VCS package that builds from the latest git HEAD. To publish to the AUR,
-# this would still need a declared license and a distinct package name (e.g. mu-git).
-
 pkgname=mu
 pkgver=0.1.0
 pkgrel=1

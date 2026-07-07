@@ -45,7 +45,6 @@ pub struct Renderer {
     live_line_rendered: bool,
     reasoning: Option<ReasoningState>,
     bash_preview: Option<BashPreviewState>,
-    active_bash_tool_call_id: Option<String>,
     turn_done_bell_min_duration: Option<Duration>,
     final_only: bool,
 }
@@ -77,7 +76,6 @@ impl Renderer {
             live_line_rendered: false,
             reasoning: None,
             bash_preview: None,
-            active_bash_tool_call_id: None,
             turn_done_bell_min_duration,
             final_only: format == OutputFormat::Final,
         }
@@ -208,7 +206,7 @@ impl Renderer {
         self.write_committed(&line)
     }
 
-    pub fn bash_header_start(&mut self, tool_call_id: Option<&str>) -> io::Result<bool> {
+    pub fn bash_header_start(&mut self, _tool_call_id: Option<&str>) -> io::Result<bool> {
         if self.final_only {
             return Ok(true);
         }
@@ -216,7 +214,6 @@ impl Renderer {
         self.reasoning_end(None)?;
         self.live_line = None;
         self.ensure_block_separator_if_needed()?;
-        self.active_bash_tool_call_id = tool_call_id.map(ToOwned::to_owned);
         if self.styled {
             self.write_committed(&format!("{GRAY}# {RESET}{BOLD}"))?;
         } else {
@@ -317,7 +314,6 @@ impl Renderer {
         self.live_line = None;
         self.reasoning = None;
         self.bash_preview = None;
-        self.active_bash_tool_call_id = None;
         Ok(())
     }
 
@@ -325,7 +321,7 @@ impl Renderer {
     /// its live output needs a visible command header.
     pub fn tool_start(
         &mut self,
-        tool_call_id: Option<&str>,
+        _tool_call_id: Option<&str>,
         name: &str,
         args: &serde_json::Value,
         header_already_rendered: bool,
@@ -339,12 +335,11 @@ impl Renderer {
         self.assistant_block_open = false;
         self.reasoning_end(None)?;
         self.live_line = None;
-        self.active_bash_tool_call_id = tool_call_id.map(ToOwned::to_owned);
         self.bash_preview = Some(BashPreviewState::default());
         if header_already_rendered {
             return Ok(());
         }
-        self.bash_header_full(tool_call_id, args).map(|_| ())
+        self.bash_header_full(None, args).map(|_| ())
     }
 
     pub fn bash_output(
@@ -388,15 +383,12 @@ impl Renderer {
     pub fn tool_finished(
         &mut self,
         _tool_call_id: Option<&str>,
-        tool: &str,
+        _tool: &str,
         display: &ToolDisplay,
         elapsed: Duration,
     ) -> io::Result<()> {
         if self.final_only {
             return Ok(());
-        }
-        if tool == "bash" {
-            self.active_bash_tool_call_id = None;
         }
         self.finalize_bash_preview()?;
         let text = format_tool(display, elapsed, self.styled);
@@ -416,9 +408,6 @@ impl Renderer {
     ) -> io::Result<()> {
         if self.final_only {
             return Ok(());
-        }
-        if name == "bash" {
-            self.active_bash_tool_call_id = None;
         }
         self.finalize_bash_preview()?;
         self.ensure_line_start()?;

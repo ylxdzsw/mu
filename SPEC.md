@@ -233,9 +233,11 @@ command unless it is an explicit path such as `./prompt.md`, then falls back to
 prompt-file mode. Prompt-file mode trims a leading shebang line when present.
 Exact subcommand names win at the top level, so a prompt file that collides with
 a subcommand name must be passed with a disambiguating path such as `./status`.
-`mu session new/list`, `mu session transcript`, and project inspection/init do
-**not** require a configured provider. Turn invocation and `mu compact` require
-a configured provider because they can contact the provider (§7).
+`mu session list`, `mu session transcript`, and project inspection/init do
+**not** require a configured provider. `mu session new` can reuse the latest
+session model, but in a fresh scope it needs a resolvable configured model.
+Turn invocation and `mu compact` require a configured provider because they can
+contact the provider (§7).
 
 ### Turn lifecycle (authoritative end-to-end flow)
 
@@ -243,9 +245,8 @@ This is the exact sequence the binary follows for one turn invocation. Implement
 it in this order:
 
 1. **Parse args**, resolve the active scope from the invoking `pwd` (§9), read
-   the entire prompt from
-   stdin into a string, and load any attached inputs such as repeatable
-   `-i/--image` image files.
+   the resolved prompt source (stdin, prompt file, or custom command), and load
+   any attached inputs such as repeatable `-i/--image` image files.
 2. **Load config** (§9): global first, then project config over it when a
    project is active. If the provider's required fields are missing, print an
    error to stderr and exit non-zero (§7). Resolve the effective model:
@@ -356,10 +357,10 @@ and stdin. This is an execution optimization only: stored tool-call records,
 stored tool messages, and the next model request still see the original
 assistant tool-call order.
 
-**Terminal visibility.** `bash` prints `$ [risk] <title>`, streams combined
-output, and finishes with exit status/duration. Every tool error is visible.
-TTY output uses OpenCode-inspired color and glyphs, including colored risk
-labels; redirected output uses ANSI-free ASCII equivalents.
+**Terminal visibility.** `bash` prints a `# <title>` line, then a `$ <script>`
+line with risk indicated by color in styled terminal output or an explicit
+`[risk]` label in plain output. It streams combined output and finishes with an
+exit status/duration line. Every tool error is visible.
 
 **Output truncation policy.** Following opencode's model, every bash output is
 capped before it enters the context window so a single large result cannot blow
@@ -387,8 +388,7 @@ literal `stdin` for content that should not be interpreted by the shell.
 in its own process group before `exec`, and on Linux `PR_SET_PDEATHSIG` asks the
 kernel to send SIGTERM if `mu` dies. On timeout or interrupt, `mu` sends SIGTERM
 to the process group, waits a short grace period, then sends SIGKILL; if group
-signaling fails it falls back to killing the direct child. Non-Unix platforms use
-best-effort direct child termination in V1; stronger job/cgroup handling is V2.
+signaling fails it falls back to killing the direct child.
 
 `timeout` defaults to 120 seconds and must be greater than zero. `mu` does not
 pre-check script argv size; if `bash -lc <script>` fails with OS
@@ -490,9 +490,9 @@ stderr TTY detection suppresses the summary when redirected.
 - **Assistant text.** `plain` and redirected output stream raw Markdown deltas
   unchanged. TTY `terminal` display commits parsed Markdown blocks as soon as
   they are stable; only the current incomplete block is delayed.
-- **Errors.** Always printed and clearly prefixed, with TTY styling and a plain
-  ASCII fallback. Fatal turn failure produces a non-zero process exit code so
-  the shell's `$?` is meaningful.
+- **Errors.** Always printed and clearly prefixed, with TTY styling when
+  available. Fatal turn failure produces a non-zero process exit code so the
+  shell's `$?` is meaningful.
 
 **Turn summary line.** When `mu` exits normally (turn complete), it prints a
 single structured summary line to stderr:
@@ -615,15 +615,15 @@ hand-written against the provider HTTP endpoint; the needed surface is small:
 - Stream deltas for assistant text and for tool-call arguments.
 - Report token usage.
 
-**V1 target: OpenAI-protocol chat-completions over HTTP, API key only.** This is
-the single most widely implemented contract — it covers OpenAI itself, the many
-compatible cloud gateways, and (importantly) local model servers
-(llama.cpp/`llama-server`, vLLM, LM Studio, Ollama's OpenAI endpoint, etc.).
-A configurable **base URL** plus a bearer **API key** is therefore the whole
-auth/transport story for V1. Subscription/OAuth providers (Claude Pro, ChatGPT)
-and the Anthropic-native protocol are out of scope for V1.
+**V1 target: OpenAI-protocol chat-completions over HTTP.** This is the single
+most widely implemented contract — it covers OpenAI itself, the many compatible
+cloud gateways, and (importantly) local model servers (llama.cpp/`llama-server`,
+vLLM, LM Studio, Ollama's OpenAI endpoint, etc.). A configurable **base URL** is
+required; bearer auth is sent only when `api_key_env` is configured. Subscription
+/OAuth providers (Claude Pro, ChatGPT) and the Anthropic-native protocol are out
+of scope for V1.
 
-**Request shape.** `POST {base_url}/chat/completions` with
+**Request shape.** `POST {base_url}/chat/completions` with optional
 `Authorization: Bearer {key}`, `stream: true`, `model`, the `messages` array,
 and a **`tools` array** carrying the `bash` tool definition
 `{type:"function", function:{name, description, parameters: <JSON schema>}}`).
@@ -655,18 +655,18 @@ configured `context_window`, the threshold-based tiers (Tier 1 pre-turn and Tier
 2 in-loop) are skipped for it and the Tier 3 API-error fallback is the only
 guard.
 
-Model and provider selection come from `config.jsonc`: a `base_url`, the env var
-holding the API key, and ordered provider/model definitions. If the global config
-file is missing, `mu` creates a starter `~/.mu/config.jsonc` automatically before
-loading configuration. In a scope with no sessions, the first configured model is
-used. API keys are read from environment variables; `mu` does not store secrets
-in its database.
+Model and provider selection come from `config.jsonc`: a `base_url`, optional
+env var holding the API key, and ordered provider/model definitions. If the
+global config file is missing, `mu` creates a starter `~/.mu/config.jsonc`
+automatically before loading configuration. In a scope with no sessions, the
+first configured model is used. API keys are read from environment variables;
+`mu` does not store secrets in its database.
 
-**No provider, hard fail.** If no provider is configured (no base URL, or the
-key env var is unset), a *turn* invocation exits immediately with a non-zero
-status and a clear message pointing at `config.jsonc` and the expected env var.
-`mu compact` follows the same rule because it calls the provider. There is no
-silent fallback once configuration has been loaded.
+**No provider, hard fail.** If no provider is configured, a provider has no
+base URL, or a non-empty configured key env var is unset, a *turn* invocation
+exits immediately with a non-zero status and a clear message pointing at
+`config.jsonc`. `mu compact` follows the same rule because it calls the
+provider. There is no silent fallback once configuration has been loaded.
 
 Because the canonical message history is stored in a provider-neutral form
 (§11), swapping the base URL/model across turns is supported without migration;
@@ -781,7 +781,7 @@ one scope are not visible in another.
     "providers": {
       "openai": {
         "base_url": "https://api.openai.com/v1", // required
-        "api_key_env": "OPENAI_API_KEY",         // required: env var NAME, not the key
+        "api_key_env": "OPENAI_API_KEY",         // optional: env var NAME, not the key
         "models": {
           "gpt-4o": {
             "context_window": 128000,            // needed for Tier-1 compaction & context%
@@ -872,10 +872,9 @@ Conceptual schema (flat and small):
   `last_total_tokens` (the most recent `usage.total_tokens` reported by the
   provider; used for the pre-turn overflow check, §"Context window and
   compaction"). `archived` is a boolean listing filter; archived sessions remain
-  resumable by explicit id. Existing databases may still have a legacy `origin`
-  column, but current session listing does not filter by it. `model` is set at
-  session creation from the effective model (lifecycle step 2); a later
-  `--model` overrides for that turn only and does **not**
+  resumable by explicit id. `model` is set at session creation from the
+  effective model (lifecycle step 2); a later `--model` overrides for that turn
+  only and does **not**
   rewrite the stored value. `cwd` records the last working directory used for
   that session. `title` is set lazily from the first user prompt (first ~60
   chars) and is display-only for `mu session list`.
@@ -1154,8 +1153,8 @@ The protections that remain are cheap and non-intrusive:
   transcript are the audit trail. Nothing happens off-screen.
 - **Interruptibility.** Because `mu` runs as a foreground job, Ctrl-C is the
   practical "stop" button: it stops launching new work, interrupts every active
-  tool process group, and flushes the partial transcript before the turn exits
-  non-zero.
+  tool process group, drains visible output where possible, persists completed
+  messages/tool results, and exits non-zero.
 - **Secrets** are never persisted by `mu`; provider keys come from the
   environment or `config.jsonc`, never the database.
 - **External content** (file contents, command output, fetched pages, web search

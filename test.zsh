@@ -460,7 +460,7 @@ cat > "$TEST_CAPTURE_STDIN"
 if [ -n "$MU_SESSION_FILE" ]; then
   printf '%s\n' "created-session" > "$MU_SESSION_FILE"
 fi
-printf '%s\n\n' "Hello! I'm your terminal agent. How can I assist you today? Feel free to ask me to run commands, search files, read/write files, fetch web content, or perform other tasks."
+printf '%s\n\n' "Hello! I'm your terminal agent."
 printf '%s\n\n' "[mu] tokens: 12 in / 5 out  context: 25%" >&2
 EOF
 chmod +x "$interactive_fake_bin/mu"

@@ -121,7 +121,6 @@ impl Store {
                 model TEXT NOT NULL,
                 title TEXT,
                 last_total_tokens INTEGER NOT NULL DEFAULT 0,
-                origin TEXT NOT NULL DEFAULT 'cli',
                 archived INTEGER NOT NULL DEFAULT 0
             );
             CREATE TABLE IF NOT EXISTS message (
@@ -176,7 +175,6 @@ impl Store {
                 created_at TEXT NOT NULL
             );",
         )?;
-        self.ensure_session_column("origin", "TEXT NOT NULL DEFAULT 'cli'")?;
         self.ensure_session_column("archived", "INTEGER NOT NULL DEFAULT 0")?;
         self.ensure_message_column("user_content_json", "TEXT")?;
         self.ensure_tool_call_column("risk", "TEXT")?;
@@ -219,10 +217,8 @@ impl Store {
         Ok(columns)
     }
 
-    /// Drop any session column outside the canonical set. This migrates old
-    /// databases that carried retired columns (`effort`, `cost_total`, and the
-    /// former `pending_*` interrupted-turn state machine) to the current flat
-    /// schema. SQLite cannot drop columns in place, so rebuild the table.
+    /// Drop any session column outside the canonical set. SQLite cannot drop
+    /// columns in place, so rebuild the table when retired columns are present.
     fn rebuild_session_without_stale_columns(&self) -> Result<()> {
         const CANONICAL: &[&str] = &[
             "id",
@@ -232,7 +228,6 @@ impl Store {
             "model",
             "title",
             "last_total_tokens",
-            "origin",
             "archived",
         ];
         let has_stale = self
@@ -254,16 +249,13 @@ impl Store {
                 model TEXT NOT NULL,
                 title TEXT,
                 last_total_tokens INTEGER NOT NULL DEFAULT 0,
-                origin TEXT NOT NULL DEFAULT 'cli',
                 archived INTEGER NOT NULL DEFAULT 0
              );
              INSERT INTO session_new (
-                id, created_at, updated_at, cwd, model, title, last_total_tokens,
-                origin, archived
+                id, created_at, updated_at, cwd, model, title, last_total_tokens, archived
              )
              SELECT
-                id, created_at, updated_at, cwd, model, title, last_total_tokens,
-                origin, archived
+                id, created_at, updated_at, cwd, model, title, last_total_tokens, archived
              FROM session;
              DROP TABLE session;
              ALTER TABLE session_new RENAME TO session;
@@ -277,8 +269,8 @@ impl Store {
         let id = Uuid::new_v4().to_string();
         let now = chrono::Utc::now().to_rfc3339();
         self.conn.execute(
-            "INSERT INTO session (id, created_at, updated_at, cwd, model, title, last_total_tokens, origin, archived)
-             VALUES (?1, ?2, ?2, ?3, ?4, NULL, 0, 'cli', 0)",
+            "INSERT INTO session (id, created_at, updated_at, cwd, model, title, last_total_tokens, archived)
+             VALUES (?1, ?2, ?2, ?3, ?4, NULL, 0, 0)",
             params![id, now, cwd, model],
         )?;
         Ok(Session {
@@ -986,17 +978,9 @@ mod tests {
     }
 
     #[test]
-    fn list_sessions_includes_legacy_origins_and_skips_archived() {
+    fn list_sessions_skips_archived() {
         let (store, tmp) = temp_store();
         let cli = store.create_session("/tmp", "cli-model").unwrap();
-        store
-            .conn
-            .execute(
-                "INSERT INTO session (id, created_at, updated_at, cwd, model, title, last_total_tokens, origin, archived)
-                 VALUES ('legacy-web', '2026-01-01T00:00:00Z', '2026-01-01T00:00:01Z', '/tmp', 'web-model', NULL, 0, 'web', 0)",
-                [],
-            )
-            .unwrap();
         let archived = store.create_session("/tmp", "archived-model").unwrap();
         store.set_session_archived(&archived.id, true).unwrap();
 
@@ -1007,7 +991,6 @@ mod tests {
             .map(|(session, _)| session.id.as_str())
             .collect::<Vec<_>>();
         assert!(ids.contains(&cli.id.as_str()));
-        assert!(ids.contains(&"legacy-web"));
         assert!(!ids.contains(&archived.id.as_str()));
         assert!(sessions.iter().all(|(session, _)| !session.archived));
         let _ = std::fs::remove_dir_all(tmp);

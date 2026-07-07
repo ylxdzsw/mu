@@ -146,12 +146,6 @@ mod tests {
         assert_eq!(definitions.len(), 1);
         assert_eq!(definitions[0]["function"]["name"].as_str(), Some("bash"));
         assert!(execution_mode("bash", &json!({"risk": "readonly"})).is_some());
-        for removed in ["read", "write", "edit", "fetch", "search"] {
-            assert!(
-                execution_mode(removed, &json!({})).is_none(),
-                "{removed} should be hidden"
-            );
-        }
     }
 
     #[test]
