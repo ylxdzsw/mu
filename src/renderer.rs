@@ -2,6 +2,7 @@ use std::io::{self, IsTerminal, Write};
 use std::time::{Duration, Instant};
 
 use pulldown_cmark::{Alignment, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::cli::OutputFormat;
 use crate::tools::ToolDisplay;
@@ -1218,7 +1219,9 @@ fn render_table_separator(widths: &[usize], alignments: &[Alignment]) -> String 
             Alignment::Right => format!("{:-<width$}:", "", width = width.saturating_sub(1)),
             Alignment::None => format!("{:-<width$}", "", width = width),
         };
+        out.push(' ');
         out.push_str(&segment);
+        out.push(' ');
         out.push('|');
     }
     out.push('\n');
@@ -1237,7 +1240,7 @@ fn pad_table_cell(cell: &str, width: usize, alignment: Alignment) -> String {
 }
 
 fn visible_text_width(text: &str) -> usize {
-    strip_ansi(text).chars().count()
+    UnicodeWidthStr::width(strip_ansi(text).as_str())
 }
 
 fn heading_styles(level: HeadingLevel) -> &'static [MdStyle] {
@@ -1728,14 +1731,45 @@ mod tests {
     fn markdown_renderer_handles_lists_and_tables() {
         let rendered =
             render_markdown("- one\n  - two\n\n| Name | Value |\n| --- | --- |\n| a | b |\n");
+        let plain = strip_ansi(&rendered);
         assert!(rendered.contains("• one"));
         assert!(rendered.contains("• two"));
-        assert!(rendered.contains("| Name | Value |"));
-        assert!(rendered.contains("---"));
-        assert!(rendered.lines().any(|line| line.starts_with('|')
-            && line.ends_with('|')
-            && line.contains('a')
-            && line.contains('b')));
+        assert!(plain.contains("| Name | Value |"));
+        assert_table_grid_aligned(&plain);
+    }
+
+    #[test]
+    fn markdown_renderer_aligns_wide_table_cells() {
+        let rendered =
+            render_markdown("| Name | Value |\n| --- | ---: |\n| 字 | 10 |\n| ascii | 2 |\n");
+        assert_table_grid_aligned(&strip_ansi(&rendered));
+    }
+
+    fn assert_table_grid_aligned(rendered: &str) {
+        let table_lines = rendered
+            .lines()
+            .filter(|line| line.starts_with('|') && line.ends_with('|'))
+            .collect::<Vec<_>>();
+        assert!(table_lines.len() >= 3, "{rendered:?}");
+
+        let first_bar_columns = bar_columns(table_lines[0]);
+        let first_width = UnicodeWidthStr::width(table_lines[0]);
+        for line in table_lines {
+            assert_eq!(bar_columns(line), first_bar_columns, "{rendered:?}");
+            assert_eq!(UnicodeWidthStr::width(line), first_width, "{rendered:?}");
+        }
+    }
+
+    fn bar_columns(line: &str) -> Vec<usize> {
+        let mut columns = Vec::new();
+        let mut width = 0;
+        for ch in line.chars() {
+            if ch == '|' {
+                columns.push(width);
+            }
+            width += UnicodeWidthChar::width(ch).unwrap_or(0);
+        }
+        columns
     }
 
     #[test]
