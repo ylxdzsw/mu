@@ -1,8 +1,8 @@
 #!/usr/bin/env zsh
 set -eu
 
-root=${0:A:h:h}
-source "$root/shell/mu.zsh"
+root=${0:A:h}
+source "$root/mu.zsh"
 
 fail() {
   print -u2 -- "FAIL: $*"
@@ -159,11 +159,11 @@ _mu_zsh_exit_mode
 [[ "$BUFFER" == "draft prompt" ]] || fail "mode exit path preserves shell buffer"
 
 saved_pwd=$PWD
-builtin cd "$root/shell"
+builtin cd "$root/src"
 nested_prompt=$(_mu_zsh_build_mode_prompt)
 builtin cd "$saved_pwd"
 escaped_root=${root//\%/%%}
-nested_pwd=$root/shell
+nested_pwd=$root/src
 escaped_nested_pwd=${nested_pwd//\%/%%}
 [[ "$nested_prompt" == *"%F{45}${escaped_nested_pwd}%f %F{141}(${escaped_root})%f"* ]] || fail "shows project root when cwd differs"
 
@@ -464,7 +464,7 @@ printf '%s\n\n' "Hello! I'm your terminal agent. How can I assist you today? Fee
 EOF
 chmod +x "$interactive_fake_bin/mu"
 
-interactive_setup="PS1='> '; PATH=${(q)interactive_fake_bin}:\$PATH; export TEST_CAPTURE_ARGS=${(q)interactive_capture_args} TEST_CAPTURE_STDIN=${(q)interactive_capture_stdin} TEST_CAPTURE_CALLS=${(q)interactive_capture_calls}; source ${(q)root}/shell/mu.zsh; bindkey -M mumode '^G' _mu_zsh_interrupt"
+interactive_setup="PS1='> '; PATH=${(q)interactive_fake_bin}:\$PATH; export TEST_CAPTURE_ARGS=${(q)interactive_capture_args} TEST_CAPTURE_STDIN=${(q)interactive_capture_stdin} TEST_CAPTURE_CALLS=${(q)interactive_capture_calls}; source ${(q)root}/mu.zsh; bindkey -M mumode '^G' _mu_zsh_interrupt"
 
 interactive_transcript=$tmpdir/transcript
 rm -f -- "$interactive_capture_args" "$interactive_capture_stdin" "$interactive_capture_calls"
@@ -646,7 +646,7 @@ history_disabled_prompt='agent ignores arrows'
 print -r -- "print -rn -- shell-history > ${(q)history_disabled_replay}" > "$history_disabled_file"
 rm -f -- "$history_disabled_replay" "$interactive_capture_args" "$interactive_capture_stdin" "$interactive_capture_calls"
 
-history_disabled_setup=" setopt HIST_IGNORE_SPACE; PS1='> '; PATH=${(q)interactive_fake_bin}:\$PATH; export TEST_CAPTURE_ARGS=${(q)interactive_capture_args} TEST_CAPTURE_STDIN=${(q)interactive_capture_stdin} TEST_CAPTURE_CALLS=${(q)interactive_capture_calls}; HISTFILE=${(q)history_disabled_file}; HISTSIZE=100; SAVEHIST=100; fc -R ${(q)history_disabled_file}; source ${(q)root}/shell/mu.zsh"
+history_disabled_setup=" setopt HIST_IGNORE_SPACE; PS1='> '; PATH=${(q)interactive_fake_bin}:\$PATH; export TEST_CAPTURE_ARGS=${(q)interactive_capture_args} TEST_CAPTURE_STDIN=${(q)interactive_capture_stdin} TEST_CAPTURE_CALLS=${(q)interactive_capture_calls}; HISTFILE=${(q)history_disabled_file}; HISTSIZE=100; SAVEHIST=100; fc -R ${(q)history_disabled_file}; source ${(q)root}/mu.zsh"
 interactive_status=0
 {
   print -r -- "$history_disabled_setup"

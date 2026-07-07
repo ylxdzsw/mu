@@ -34,7 +34,7 @@ check() {
 
 package() {
   install -Dm755 "$srcdir/target/release/mu" "$pkgdir/usr/bin/mu"
-  install -Dm644 "$srcdir/$pkgname/shell/mu.zsh" "$pkgdir/usr/share/mu/shell/mu.zsh"
+  install -Dm644 "$srcdir/$pkgname/mu.zsh" "$pkgdir/usr/share/mu/mu.zsh"
   install -Dm644 "$srcdir/$pkgname/README.md" "$pkgdir/usr/share/doc/$pkgname/README.md"
   install -Dm644 "$srcdir/$pkgname/SPEC.md" "$pkgdir/usr/share/doc/$pkgname/SPEC.md"
 }

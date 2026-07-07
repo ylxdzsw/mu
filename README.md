@@ -31,9 +31,9 @@ across turns. Arch Linux packaging for the current checkout lives in
 ## zsh plugin
 
 ```zsh
-source /path/to/mu/shell/mu.zsh
+source /path/to/mu/mu.zsh
 # Arch package install path:
-# source /usr/share/mu/shell/mu.zsh
+# source /usr/share/mu/mu.zsh
 ```
 
 The plugin requires `zsh`, `jq`, and the `mu` binary on `PATH` unless
