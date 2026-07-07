@@ -233,6 +233,11 @@ _mu_zsh_print_output_separator_if_pending() {
   fi
 }
 
+_mu_zsh_print_block_message() {
+  print -r -- "$1"
+  print
+}
+
 _mu_zsh_read_session_file() {
   local scope=${1:-$(_mu_zsh_current_scope_key)}
   [[ -r "$MU_ZSH_SESSION_FILE" ]] || return 0
@@ -605,7 +610,7 @@ _mu_zsh_require_effective_session() {
   local command=$1
   _mu_zsh_sync_session_state
   if [[ -z "$MU_ZSH_EFFECTIVE_SESSION_ID" ]]; then
-    print -r -- "[mu] $command requires an active session in this scope"
+    _mu_zsh_print_block_message "[mu] $command requires an active session in this scope"
     return 1
   fi
   return 0
@@ -615,7 +620,7 @@ _mu_zsh_validate_no_args() {
   local command=$1
   local rest=$2
   if [[ -n "$rest" ]]; then
-    print -r -- "[mu] $command does not accept arguments"
+    _mu_zsh_print_block_message "[mu] $command does not accept arguments"
     return 1
   fi
   return 0
@@ -684,28 +689,28 @@ _mu_zsh_run_slash_command() {
   case "$command" in
     /model)
       if [[ -z "$rest" ]]; then
-        print -r -- "[mu] usage: /model <model>"
+        _mu_zsh_print_block_message "[mu] usage: /model <model>"
         return 1
       fi
       if [[ "$rest" == *[[:space:]]* ]]; then
-        print -r -- "[mu] /model accepts exactly one model reference"
+        _mu_zsh_print_block_message "[mu] /model accepts exactly one model reference"
         return 1
       fi
       if ! _mu_zsh_validate_model_ref "$rest"; then
-        print -r -- "[mu] unknown or unsupported model: $rest"
+        _mu_zsh_print_block_message "[mu] unknown or unsupported model: $rest"
         return 1
       fi
       resolved_model=$REPLY
       MU_ZSH_MODEL=$resolved_model
       MU_ZSH_MODEL_SCOPE=$(_mu_zsh_current_scope_key)
       MU_ZSH_EFFECTIVE_MODEL=$resolved_model
-      print -r -- "[mu] next turns in this scope will use $resolved_model"
+      _mu_zsh_print_block_message "[mu] next turns in this scope will use $resolved_model"
       ;;
     /new)
       _mu_zsh_validate_no_args "$command" "$rest" || return 1
       _mu_zsh_require_effective_session "$command" || return 1
       _mu_zsh_clear_session_state
-      print -r -- "[mu] next turn will start a new session"
+      _mu_zsh_print_block_message "[mu] next turn will start a new session"
       ;;
     /retry)
       _mu_zsh_validate_no_args "$command" "$rest" || return 1
@@ -726,6 +731,7 @@ _mu_zsh_run_slash_command() {
       else
         exit_status=$?
       fi
+      print
       ;;
     *)
       if _mu_zsh_has_custom_slash_command "$command"; then
@@ -733,7 +739,7 @@ _mu_zsh_run_slash_command() {
         _mu_zsh_run_custom_slash_command "$command"
         exit_status=$?
       else
-        print -r -- "[mu] unknown slash command: $command"
+        _mu_zsh_print_block_message "[mu] unknown slash command: $command"
         return 1
       fi
       ;;

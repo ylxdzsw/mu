@@ -557,8 +557,29 @@ interactive_status=0
 normalized=$(perl -pe 's/\e\[[0-?]*[ -\/]*[@-~]//g' "$model_switch_transcript" | col -b)
 [[ "$normalized" == *$'[mu] next turns in this scope will use openai/gpt\n'* ]] || fail "model slash command should confirm the canonical model"
 after_model_switch=${normalized#*$'[mu] next turns in this scope will use openai/gpt\n'}
+[[ "$after_model_switch" == $'\n'* ]] || fail "model slash command should leave an empty line before the next prompt"
 [[ "$after_model_switch" == *$'openai/gpt 25%'* ]] || fail "model slash command should redraw prompt with selected model"
 [[ ! -e "$interactive_capture_calls" || ! -s "$interactive_capture_calls" ]] || fail "model slash command should not submit a prompt"
+
+new_session_transcript=$tmpdir/new-session-transcript
+rm -f -- "$interactive_capture_args" "$interactive_capture_stdin" "$interactive_capture_calls"
+interactive_status=0
+new_session_setup="$interactive_setup; MU_ZSH_SESSION_ID=tracked-session; MU_ZSH_SESSION_SCOPE=\$(_mu_zsh_current_scope_key); _mu_zsh_sync_state"
+{
+  print -r -- "$new_session_setup"
+  sleep 0.2
+  print -rn -- $'\t'"/new"$'\r'
+  sleep 0.4
+  print -rn -- $'\x04'
+} | timeout 5 script -qfec 'TERM=xterm-256color zsh -df' "$new_session_transcript" >/dev/null || interactive_status=$?
+(( interactive_status == 0 )) || fail "new session transcript exited with status $interactive_status"
+
+normalized=$(perl -pe 's/\e\[[0-?]*[ -\/]*[@-~]//g' "$new_session_transcript" | col -b)
+[[ "$normalized" == *$'[mu] next turn will start a new session\n'* ]] || fail "new slash command should confirm the next turn starts fresh"
+after_new_session=${normalized#*$'[mu] next turn will start a new session\n'}
+[[ "$after_new_session" == $'\n'* ]] || fail "new slash command should leave an empty line before the next prompt"
+[[ "$after_new_session" == *$'prompt-test-model 25%'* ]] || fail "new slash command should redraw prompt"
+[[ ! -e "$interactive_capture_calls" || ! -s "$interactive_capture_calls" ]] || fail "new slash command should not submit a prompt"
 
 slash_completion_transcript=$tmpdir/slash-completion-transcript
 rm -f -- "$interactive_capture_args" "$interactive_capture_stdin" "$interactive_capture_calls"
