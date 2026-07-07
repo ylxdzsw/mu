@@ -12,7 +12,7 @@ use crate::provider::{Message, Provider, ProviderError, approx_tokens};
 use crate::{bash, provider};
 
 const MAX_ATTEMPTS: u32 = 3;
-const POLICY_PROMPT: &str = include_str!("prompts/guardrail.md");
+const POLICY_PROMPT: &str = include_str!("guardrail.md");
 const MAX_MESSAGE_TRANSCRIPT_TOKENS: usize = 10_000;
 const MAX_TOOL_TRANSCRIPT_TOKENS: usize = 10_000;
 const MAX_MESSAGE_ENTRY_TOKENS: usize = 2_000;

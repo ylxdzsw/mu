@@ -5,7 +5,7 @@ use chrono::Local;
 use crate::paths::Project;
 use crate::skills::{SkillMeta, format_skills_block, read_agents_md, scan_instruction_index};
 
-const ROLE_PREAMBLE: &str = include_str!("prompts/system_preamble.md");
+const ROLE_PREAMBLE: &str = include_str!("system_preamble.md");
 
 pub fn role_preamble() -> &'static str {
     ROLE_PREAMBLE.trim_end_matches(['\r', '\n'])

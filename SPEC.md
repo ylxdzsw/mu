@@ -818,7 +818,7 @@ The system prompt is intentionally minimal and assembled in this fixed order:
    > `bash` for local search, file reads, writes, edits, web fetches, tests,
    > and any other CLI work. Each bash call is isolated; pass `cwd` explicitly
    > when needed. Keep responses concise.
-   The exact wording lives in `src/prompts/system_preamble.md`; keep it short.
+   The exact wording lives in `src/system_preamble.md`; keep it short.
 2. A `<runtime>` block of host-stable facts only, as plain `key: value` lines:
    ```
    <runtime>
@@ -1194,7 +1194,7 @@ keeps prefix + suffix with a `<truncated omitted_approx_tokens="N"/>` marker.
 The planned action is provided as pretty-printed JSON (capped at 16 000 tokens).
 
 **Reviewer system prompt.** A trimmed port of Codex's Guardian policy prompt
-(`src/prompts/guardrail.md`), adapted for mu: "terminal-agent" framing, no
+(`src/guardrail.md`), adapted for mu: "terminal-agent" framing, no
 sandbox/escalation concepts, no tool-check instructions (the reviewer has no
 tools), and no model-emitted allow/deny decision (the decision is computed from
 the ordinal comparison). The prompt covers evidence handling (transcript =
