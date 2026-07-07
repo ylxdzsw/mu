@@ -196,12 +196,12 @@ The core binary is invoked one of two ways: as a **turn** (default, reads a
 prompt on stdin) or as a **subcommand** (management, no prompt). The surface is
 small:
 
-- `mu [-s <id>] [-c] [--model <id>] [-i <image>] [--output plain|terminal]`
+- `mu [-s <id>] [-c] [--model <id>] [-i <image>] [--output final|plain|terminal]`
   — run one turn; prompt read from stdin. `-i/--image` is repeatable.
-- `mu [-s <id>] [-c] [--model <id>] [-i <image>] [--output plain|terminal] <prompt-file>`
+- `mu [-s <id>] [-c] [--model <id>] [-i <image>] [--output final|plain|terminal] <prompt-file>`
   — run one turn from a prompt file; if the first line starts with `#!`, drop
   it before sending the prompt. `-i/--image` is repeatable.
-- `mu [-s <id>] [-c] [--model <id>] [--output plain|terminal] <custom-command>`
+- `mu [-s <id>] [-c] [--model <id>] [--output final|plain|terminal] <custom-command>`
   — run a discovered shebang command from the active project/global `.mu`
   instruction index. Command names are relative `.mu` paths including
   extensions; built-in subcommands and explicit prompt paths win.
@@ -399,21 +399,32 @@ fall back to temp scripts.
 
 ## 5. Output and rendering
 
-`mu` supports two output formats: `plain` and `terminal`. They are
+`mu` supports three output formats: `final`, `plain`, and `terminal`. They are
 different renderings of the same agent turn and must not imply different agent
 behavior.
 
+- **Final output** is for supervisor agents invoking `mu` as a subagent. It
+  does not stream. On success, stdout is exactly the final raw assistant message
+  content from the completed turn, written once after the turn finishes and
+  without an added newline. Tool output, intermediate assistant tool-call
+  messages, reasoning/progress, automatic retry notices, summaries, and bells
+  are suppressed. Automatic retries and per-completed-message persistence still
+  behave the same as in human-facing modes. On fatal failure after retry
+  exhaustion or any other unrecovered error, stdout is `error: <message>`
+  followed by one newline and the process exits non-zero.
 - **Plain text** is for simple scripting and low-friction terminal use. It
   prioritizes assistant/tool text and avoids terminal-specific control.
 - **Terminal output** is for humans in an interactive terminal. It may use color
   and may update recent status lines for in-progress activity, but it must keep
   normal scrollback. It must not use an alternate screen, clear the screen, or
   require mouse interaction.
-**Concurrency contract.** `plain` and `terminal` may run contiguous readonly
+**Concurrency contract.** All output modes may run contiguous readonly
 `bash` calls concurrently. `terminal` keeps append-only scrollback and the
 one-live-line rule: at most one bash call owns live terminal streaming at a
 time, even while later readonly calls are already running in the background.
 `plain` follows the same ordered human-facing display without live-line redraws.
+`final` suppresses the live transcript display while preserving the same
+execution, ordering, and persistence semantics.
 
 The renderer is the sole writer to stdout/stderr and enforces the selected
 format. It may style output only when stdout is a TTY and `--output terminal` is

@@ -22,6 +22,7 @@ use bash::RunningBash;
 
 pub struct TurnResult {
     pub usage: Usage,
+    pub final_assistant: Option<String>,
 }
 
 struct ConcurrentBashExecution<'a> {
@@ -102,6 +103,7 @@ impl<'a> AgentLoop<'a> {
         let mut overflow_retries: u32 = 0;
         let mut live_provider_retries: u32 = 0;
         let mut proactive_compaction_exhausted = false;
+        let mut final_assistant = None;
         const MAX_OVERFLOW_RETRIES: u32 = 3;
         const MAX_LIVE_PROVIDER_RETRIES: u32 = 3;
 
@@ -225,7 +227,12 @@ impl<'a> AgentLoop<'a> {
             context.push(stream_result.message.clone());
 
             match stream_result.finish_reason {
-                FinishReason::Stop => break,
+                FinishReason::Stop => {
+                    if let Message::Assistant { content, .. } = &stream_result.message {
+                        final_assistant = content.clone();
+                    }
+                    break;
+                }
                 FinishReason::ToolCalls => {
                     let tool_calls = match &stream_result.message {
                         Message::Assistant { tool_calls, .. } => tool_calls
@@ -448,7 +455,10 @@ impl<'a> AgentLoop<'a> {
             }
         }
 
-        Ok(TurnResult { usage: total_usage })
+        Ok(TurnResult {
+            usage: total_usage,
+            final_assistant,
+        })
     }
 
     /// Load the full completed-message history plus the leading system prompt.
@@ -1398,10 +1408,11 @@ mod tests {
             system_prompt: "system".into(),
         };
 
-        agent.run_turn().await.unwrap();
+        let result = agent.run_turn().await.unwrap();
 
         // The transient provider error was retried in-process without adding a
         // second user message, and the session is clean after completion.
+        assert_eq!(result.final_assistant.as_deref(), Some("done"));
         assert!(store.is_session_clean(&session.id).unwrap());
         let messages = store.load_context_messages(&session.id).unwrap();
         assert_eq!(
@@ -1459,9 +1470,10 @@ mod tests {
         };
 
         let started = Instant::now();
-        agent.run_turn().await.unwrap();
+        let result = agent.run_turn().await.unwrap();
         let elapsed = started.elapsed();
 
+        assert_eq!(result.final_assistant.as_deref(), Some("done"));
         assert!(
             elapsed < Duration::from_millis(1800),
             "plain readonly batch appears sequential: {elapsed:?}"

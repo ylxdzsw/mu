@@ -47,6 +47,7 @@ pub struct Renderer {
     bash_preview: Option<BashPreviewState>,
     active_bash_tool_call_id: Option<String>,
     turn_done_bell_min_duration: Option<Duration>,
+    final_only: bool,
 }
 
 impl Renderer {
@@ -78,6 +79,7 @@ impl Renderer {
             bash_preview: None,
             active_bash_tool_call_id: None,
             turn_done_bell_min_duration,
+            final_only: format == OutputFormat::Final,
         }
     }
 
@@ -87,6 +89,9 @@ impl Renderer {
     }
 
     pub fn assistant_text(&mut self, text: &str) -> io::Result<()> {
+        if self.final_only {
+            return Ok(());
+        }
         if text.is_empty() {
             return Ok(());
         }
@@ -115,6 +120,9 @@ impl Renderer {
     }
 
     pub fn assistant_end(&mut self) -> io::Result<()> {
+        if self.final_only {
+            return Ok(());
+        }
         if !self.styled {
             self.assistant_block_open = false;
             return Ok(());
@@ -133,6 +141,9 @@ impl Renderer {
     }
 
     pub fn reasoning_start(&mut self) -> io::Result<()> {
+        if self.final_only {
+            return Ok(());
+        }
         self.assistant_block_open = false;
         self.reasoning = Some(ReasoningState {
             started: Instant::now(),
@@ -143,6 +154,9 @@ impl Renderer {
     }
 
     pub fn reasoning_delta(&mut self, text: &str) -> io::Result<()> {
+        if self.final_only {
+            return Ok(());
+        }
         if text.is_empty() {
             return Ok(());
         }
@@ -163,6 +177,9 @@ impl Renderer {
     }
 
     pub fn thinking_tick(&mut self) -> io::Result<()> {
+        if self.final_only {
+            return Ok(());
+        }
         if !matches!(self.live_line, Some(LiveLine::Thinking)) {
             return Ok(());
         }
@@ -170,6 +187,9 @@ impl Renderer {
     }
 
     pub fn reasoning_end(&mut self, usage: Option<(u64, u64)>) -> io::Result<()> {
+        if self.final_only {
+            return Ok(());
+        }
         let Some(reasoning) = self.reasoning.as_mut() else {
             return Ok(());
         };
@@ -189,6 +209,9 @@ impl Renderer {
     }
 
     pub fn bash_header_start(&mut self, tool_call_id: Option<&str>) -> io::Result<bool> {
+        if self.final_only {
+            return Ok(true);
+        }
         self.assistant_block_open = false;
         self.reasoning_end(None)?;
         self.live_line = None;
@@ -203,6 +226,9 @@ impl Renderer {
     }
 
     pub fn bash_header_title_delta(&mut self, text: &str) -> io::Result<()> {
+        if self.final_only {
+            return Ok(());
+        }
         if text.is_empty() {
             return Ok(());
         }
@@ -210,6 +236,9 @@ impl Renderer {
     }
 
     pub fn bash_header_title_end(&mut self) -> io::Result<()> {
+        if self.final_only {
+            return Ok(());
+        }
         if self.styled {
             self.write_committed(&format!("{RESET}\n"))
         } else {
@@ -218,6 +247,9 @@ impl Renderer {
     }
 
     pub fn bash_header_script_start(&mut self, risk: Option<&str>) -> io::Result<()> {
+        if self.final_only {
+            return Ok(());
+        }
         if self.styled {
             self.write_committed(&format!("{DIM}${RESET} {}{BOLD}", bash_risk_color(risk)))
         } else {
@@ -231,6 +263,9 @@ impl Renderer {
     }
 
     pub fn bash_header_script_delta(&mut self, text: &str) -> io::Result<()> {
+        if self.final_only {
+            return Ok(());
+        }
         if text.is_empty() {
             return Ok(());
         }
@@ -238,6 +273,9 @@ impl Renderer {
     }
 
     pub fn bash_header_script_end(&mut self) -> io::Result<()> {
+        if self.final_only {
+            return Ok(());
+        }
         if self.styled {
             self.write_committed(&format!("{RESET}\n"))
         } else {
@@ -250,6 +288,9 @@ impl Renderer {
         tool_call_id: Option<&str>,
         args: &serde_json::Value,
     ) -> io::Result<bool> {
+        if self.final_only {
+            return Ok(true);
+        }
         let title = args
             .get("title")
             .and_then(|value| value.as_str())
@@ -269,6 +310,9 @@ impl Renderer {
     }
 
     pub fn cancel_live_state(&mut self) -> io::Result<()> {
+        if self.final_only {
+            return Ok(());
+        }
         self.clear_live_line()?;
         self.live_line = None;
         self.reasoning = None;
@@ -286,6 +330,9 @@ impl Renderer {
         args: &serde_json::Value,
         header_already_rendered: bool,
     ) -> io::Result<()> {
+        if self.final_only {
+            return Ok(());
+        }
         if name != "bash" {
             return Ok(());
         }
@@ -306,6 +353,9 @@ impl Renderer {
         _tool: &str,
         text: &str,
     ) -> io::Result<()> {
+        if self.final_only {
+            return Ok(());
+        }
         if text.is_empty() {
             return Ok(());
         }
@@ -342,6 +392,9 @@ impl Renderer {
         display: &ToolDisplay,
         elapsed: Duration,
     ) -> io::Result<()> {
+        if self.final_only {
+            return Ok(());
+        }
         if tool == "bash" {
             self.active_bash_tool_call_id = None;
         }
@@ -361,6 +414,9 @@ impl Renderer {
         error: &str,
         elapsed: Duration,
     ) -> io::Result<()> {
+        if self.final_only {
+            return Ok(());
+        }
         if name == "bash" {
             self.active_bash_tool_call_id = None;
         }
@@ -385,6 +441,9 @@ impl Renderer {
         reason: &str,
         _script: &str,
     ) -> io::Result<()> {
+        if self.final_only {
+            return Ok(());
+        }
         self.assistant_block_open = false;
         self.ensure_line_start()?;
         let verdict = if allowed { "allow" } else { "deny" };
@@ -412,6 +471,9 @@ impl Renderer {
     }
 
     pub fn notice(&mut self, msg: &str) -> io::Result<()> {
+        if self.final_only {
+            return Ok(());
+        }
         self.assistant_block_open = false;
         self.ensure_block_separator_if_needed()?;
         self.write_stdout_committed(&terminal_trim_committed_text(&format!("{msg}\n")))
@@ -444,6 +506,9 @@ impl Renderer {
     /// Ensure stdout ends on a fresh line so the next shell prompt does not
     /// glue onto the final line of assistant output.
     pub fn finish_turn(&mut self) -> io::Result<()> {
+        if self.final_only {
+            return Ok(());
+        }
         self.assistant_end()?;
         self.ensure_line_start()
     }
@@ -454,6 +519,9 @@ impl Renderer {
         output_tokens: u64,
         context_pct: Option<f64>,
     ) -> io::Result<()> {
+        if self.final_only {
+            return Ok(());
+        }
         if !self.stderr.is_terminal() {
             return Ok(());
         }
@@ -466,6 +534,9 @@ impl Renderer {
     }
 
     pub fn turn_done_bell(&mut self, elapsed: Duration) -> io::Result<()> {
+        if self.final_only {
+            return Ok(());
+        }
         let Some(min_duration) = self.turn_done_bell_min_duration else {
             return Ok(());
         };

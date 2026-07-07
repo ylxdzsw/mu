@@ -1,4 +1,4 @@
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process;
 use std::sync::Arc;
@@ -65,8 +65,12 @@ struct RunTurnArgs<'a> {
 #[tokio::main]
 async fn main() {
     if let Err(e) = run().await {
-        let mut r = Renderer::with_format(error_output_format());
-        let _ = r.error(&e.to_string());
+        if error_output_format() == cli::OutputFormat::Final {
+            let _ = write_final_error(&e.to_string());
+        } else {
+            let mut r = Renderer::with_format(error_output_format());
+            let _ = r.error(&e.to_string());
+        }
         process::exit(exit_code_for(&e));
     }
 }
@@ -92,17 +96,43 @@ fn error_output_format() -> cli::OutputFormat {
         if arg == "--output" {
             return match args.next().as_deref() {
                 Some("plain") => cli::OutputFormat::Plain,
+                Some("final") => cli::OutputFormat::Final,
                 _ => cli::OutputFormat::Terminal,
             };
         }
         if let Some(value) = arg.strip_prefix("--output=") {
             return match value {
                 "plain" => cli::OutputFormat::Plain,
+                "final" => cli::OutputFormat::Final,
                 _ => cli::OutputFormat::Terminal,
             };
         }
     }
     cli::OutputFormat::Terminal
+}
+
+fn write_final_stdout(text: Option<&str>) -> io::Result<()> {
+    let Some(text) = text else {
+        return Ok(());
+    };
+    let mut stdout = io::stdout().lock();
+    stdout.write_all(text.as_bytes())?;
+    stdout.flush()
+}
+
+fn write_final_error(message: &str) -> io::Result<()> {
+    let mut stdout = io::stdout().lock();
+    writeln!(stdout, "error: {message}")?;
+    stdout.flush()
+}
+
+fn exit_session_busy(output: cli::OutputFormat) -> ! {
+    if output == cli::OutputFormat::Final {
+        let _ = write_final_error("session busy");
+    } else {
+        eprintln!("session busy");
+    }
+    process::exit(2);
 }
 
 #[derive(Debug)]
@@ -343,15 +373,14 @@ async fn run() -> Result<()> {
                 .ok_or_else(|| anyhow::anyhow!("no sessions found in active scope"))?;
             let _lock = match store.acquire_session_lock(&session.id) {
                 Ok(lock) => lock,
-                Err(_) => {
-                    eprintln!("session busy");
-                    process::exit(2);
-                }
+                Err(_) => exit_session_busy(retry_args.output),
             };
 
             // Nothing to resume on a session whose last turn already finished.
             if store.is_session_clean(&session.id)? {
-                println!("session is already complete; nothing to retry");
+                if retry_args.output != cli::OutputFormat::Final {
+                    println!("session is already complete; nothing to retry");
+                }
                 return Ok(());
             }
 
@@ -472,10 +501,7 @@ async fn run_turn_from_source(
 
     let _lock = match store.acquire_session_lock(&session_id) {
         Ok(lock) => lock,
-        Err(_) => {
-            eprintln!("session busy");
-            process::exit(2);
-        }
+        Err(_) => exit_session_busy(turn.output),
     };
 
     // If the previous turn was interrupted, normalize its tail (synthesize
@@ -644,18 +670,24 @@ async fn run_turn(args: RunTurnArgs<'_>) -> Result<()> {
                 model_context_window.map(|cw| (r.usage.total_tokens as f64 / cw as f64) * 100.0);
             store.update_session(session_id, &r.usage, title, &request.model.canonical)?;
             renderer.finish_turn()?;
-            renderer.turn_summary(
-                r.usage.visible_input_tokens(),
-                r.usage.visible_output_tokens(),
-                ctx_pct,
-            )?;
-            renderer.turn_done_bell(turn_started.elapsed())?;
+            if output == cli::OutputFormat::Final {
+                write_final_stdout(r.final_assistant.as_deref())?;
+            } else {
+                renderer.turn_summary(
+                    r.usage.visible_input_tokens(),
+                    r.usage.visible_output_tokens(),
+                    ctx_pct,
+                )?;
+                renderer.turn_done_bell(turn_started.elapsed())?;
+            }
         }
         Err(error) => {
             // Nothing to clean up: only completed messages are persisted, so the
             // log ends at the last landed message. The session is now "unclean";
             // the next turn or `mu retry` will normalize any dangling tool call.
-            renderer.turn_interrupted(&error.to_string())?;
+            if output != cli::OutputFormat::Final {
+                renderer.turn_interrupted(&error.to_string())?;
+            }
         }
     }
 

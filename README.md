@@ -89,6 +89,7 @@ MU_ZSH_EXIT_HOOKS+=(mu_restore_conflicts)
 | `mu -c` | Continue the latest session in the active scope, or create one |
 | `mu --model <provider>/<model>[:effort]` | Override model for this turn |
 | `mu -i image.png` | Attach an image to the turn |
+| `mu --output final` | Print only the final raw assistant message after the turn finishes |
 | `mu --output plain` | Render sequential plain assistant/tool text |
 | `mu --output terminal` | Render sequential interactive terminal output |
 | `mu project init [--path <dir>] [--force]` | Create minimal local `.mu` metadata in the current directory or target directory |

@@ -54,6 +54,7 @@ pub struct RetryArgs {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum OutputFormat {
+    Final,
     Plain,
     Terminal,
 }
@@ -165,6 +166,12 @@ mod tests {
         assert_eq!(args.turn.output, OutputFormat::Plain);
         assert_eq!(args.turn.selection.model.as_deref(), Some("gpt-test"));
         assert_eq!(args.turn.images, vec![PathBuf::from("image.png")]);
+    }
+
+    #[test]
+    fn parses_final_output_mode() {
+        let args = Args::try_parse_from(["mu", "--output", "final"]).unwrap();
+        assert_eq!(args.turn.output, OutputFormat::Final);
     }
 
     #[test]
