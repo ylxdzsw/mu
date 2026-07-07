@@ -461,6 +461,7 @@ if [ -n "$MU_SESSION_FILE" ]; then
   printf '%s\n' "created-session" > "$MU_SESSION_FILE"
 fi
 printf '%s\n\n' "Hello! I'm your terminal agent. How can I assist you today? Feel free to ask me to run commands, search files, read/write files, fetch web content, or perform other tasks."
+printf '%s\n\n' "[mu] tokens: 12 in / 5 out  context: 25%" >&2
 EOF
 chmod +x "$interactive_fake_bin/mu"
 
@@ -492,10 +493,12 @@ done
 (( hello_count == 1 )) || fail "submitted prompt should appear once, saw $hello_count copies"
 [[ "$normalized" == *"Hello! I'm your terminal agent."* ]] || fail "interactive response should be rendered"
 after_submitted_prompt=${normalized#*$'mu> hello\n'}
-[[ "$after_submitted_prompt" == *$'\n\nHello! I'* ]] || fail "submitted prompt should be separated from terminal output"
+[[ "$after_submitted_prompt" == $'\nHello! I'* ]] || fail "submitted prompt should have one empty line before terminal output"
+[[ "$after_submitted_prompt" != $'\n\nHello! I'* ]] || fail "submitted prompt should not have two empty lines before terminal output"
 [[ "$normalized" == *'mu> cancel-me'* ]] || fail "Ctrl-C should leave the cancelled mu line in scrollback"
 [[ $(<"$interactive_capture_calls") == x ]] || fail "interactive fake mu should run exactly once"
 after_response=${normalized#*"Hello! I'm your terminal agent."}
+[[ "$after_response" == *$'[mu] tokens: 12 in / 5 out  context: 25%\n\nprompt-test-model 25%'* ]] || fail "token summary should remain separated from the next prompt"
 redrawn_prompt_count=0
 post_turn_prompt_count=0
 native_exit_count=0
@@ -531,7 +534,10 @@ interactive_status=0
 
 normalized=$(perl -pe 's/\e\[[0-?]*[ -\/]*[@-~]//g' "$plain_transcript" | col -b)
 after_submitted_prompt=${normalized#*$'mu> plain prompt\n'}
-[[ "$after_submitted_prompt" == *$'\n\nHello! I'* ]] || fail "submitted prompt should be separated from plain output"
+[[ "$after_submitted_prompt" == $'\nHello! I'* ]] || fail "submitted prompt should have one empty line before plain output"
+[[ "$after_submitted_prompt" != $'\n\nHello! I'* ]] || fail "submitted prompt should not have two empty lines before plain output"
+after_response=${normalized#*"Hello! I'm your terminal agent."}
+[[ "$after_response" == *$'[mu] tokens: 12 in / 5 out  context: 25%\n\nprompt-test-model 25%'* ]] || fail "plain token summary should remain separated from the next prompt"
 interactive_args=("${(@f)$(<"$interactive_capture_args")}")
 expected_plain_args=(--output plain)
 [[ "${(j:\0:)interactive_args}" == "${(j:\0:)expected_plain_args}" ]] || fail "unexpected plain interactive args: ${interactive_args[*]}"

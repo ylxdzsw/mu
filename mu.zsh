@@ -230,7 +230,6 @@ _mu_zsh_print_output_separator_if_pending() {
   if (( MU_ZSH_OUTPUT_SEPARATOR_PENDING )); then
     MU_ZSH_OUTPUT_SEPARATOR_PENDING=0
     print
-    print
   fi
 }
 
