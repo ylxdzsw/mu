@@ -6,7 +6,6 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use clap::Parser;
-use serde::Serialize;
 
 #[cfg(not(unix))]
 compile_error!("mu is supported only on Unix-like systems");
@@ -106,17 +105,16 @@ fn error_output_format() -> cli::OutputFormat {
     cli::OutputFormat::Terminal
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug)]
 struct ProjectInfo {
     path: String,
     is_project: bool,
     marker: Option<&'static str>,
     project_root: Option<String>,
-    discovered_marker: Option<&'static str>,
     needs_confirmation: bool,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug)]
 struct ProjectInitInfo {
     path: String,
     project_root: String,
@@ -153,9 +151,6 @@ fn inspect_project_path(base: &Path, path: &Path) -> Result<ProjectInfo> {
         project_root: discovered
             .as_ref()
             .map(|project| project.root.display().to_string()),
-        discovered_marker: discovered
-            .as_ref()
-            .map(|project| project_marker_name(project.marker)),
         needs_confirmation: marker.is_none(),
     })
 }
@@ -167,13 +162,6 @@ fn project_marker_at(path: &Path) -> Option<&'static str> {
         Some("git")
     } else {
         None
-    }
-}
-
-fn project_marker_name(marker: paths::ProjectMarker) -> &'static str {
-    match marker {
-        paths::ProjectMarker::Mu => "mu",
-        paths::ProjectMarker::Git => "git",
     }
 }
 
@@ -216,15 +204,11 @@ async fn run() -> Result<()> {
     match args.command {
         Some(Command::Project { sub }) => {
             match sub {
-                ProjectSub::Inspect { path, json } => {
+                ProjectSub::Inspect { path } => {
                     let info = inspect_project_path(&cwd, &path)?;
-                    if json {
-                        println!("{}", serde_json::to_string(&info)?);
-                    } else {
-                        print_project_info(&info);
-                    }
+                    print_project_info(&info);
                 }
-                ProjectSub::Init { path, force, json } => {
+                ProjectSub::Init { path, force } => {
                     let root = resolve_target_dir(&cwd, path.as_deref())?;
                     let result = paths::init_project_layout_at(&root, force)?;
                     let info = ProjectInitInfo {
@@ -233,11 +217,7 @@ async fn run() -> Result<()> {
                         created_files: result.created_files,
                         already_initialized: result.already_initialized,
                     };
-                    if json {
-                        println!("{}", serde_json::to_string(&info)?);
-                    } else {
-                        print_project_init_info(&info);
-                    }
+                    print_project_init_info(&info);
                 }
             }
             return Ok(());
@@ -245,7 +225,7 @@ async fn run() -> Result<()> {
         Some(Command::Session { sub }) => {
             let db_path = scope.session_db_path();
             match sub {
-                SessionSub::New { json } => {
+                SessionSub::New => {
                     paths::ensure_project_layout(&scope)?;
                     let store = store::Store::open(&db_path)?;
                     let latest = store.latest_session()?;
@@ -267,28 +247,13 @@ async fn run() -> Result<()> {
                             .into(),
                         },
                     )?;
-                    if json {
-                        let summary = store
-                            .session_summary(&session.id)?
-                            .ok_or_else(|| anyhow::anyhow!("session not found after create"))?;
-                        println!("{}", serde_json::to_string(&summary)?);
-                    } else {
-                        println!("{}", session.id);
-                    }
+                    println!("{}", session.id);
                 }
-                SessionSub::List { json, limit } => {
+                SessionSub::List { limit } => {
                     if !db_path.exists() {
-                        if json {
-                            println!("[]");
-                        }
                         return Ok(());
                     }
                     let store = store::Store::open(&db_path)?;
-                    if json {
-                        let sessions = store.list_all_session_summaries(limit)?;
-                        println!("{}", serde_json::to_string(&sessions)?);
-                        return Ok(());
-                    }
                     let sessions = store.list_sessions(limit)?;
                     for (s, updated) in sessions {
                         debug_assert!(!s.archived);
@@ -296,7 +261,7 @@ async fn run() -> Result<()> {
                         println!("{}  {}  {}  {}", s.id, title, s.model, updated);
                     }
                 }
-                SessionSub::Transcript { session, json } => {
+                SessionSub::Transcript { session } => {
                     if !db_path.exists() {
                         return Err(exit::ExitError::session_not_found(&session));
                     }
@@ -304,13 +269,8 @@ async fn run() -> Result<()> {
                     if store.get_session(&session)?.is_none() {
                         return Err(exit::ExitError::session_not_found(&session));
                     }
-                    let transcript = store.transcript(&session)?;
-                    if json {
-                        println!("{}", serde_json::to_string(&transcript)?);
-                    } else {
-                        for message in transcript {
-                            println!("[{}:{}] {}", message.seq, message.role, message.content);
-                        }
+                    for message in store.all_messages_for_session(&session)? {
+                        println!("[{}:{}] {}", message.seq, message.role, message.content);
                     }
                 }
                 SessionSub::Archive { session } => {

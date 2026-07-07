@@ -4,7 +4,6 @@ use fs2::FileExt;
 
 use anyhow::{Context, Result, bail};
 use rusqlite::{Connection, OptionalExtension, params};
-use serde::Serialize;
 use uuid::Uuid;
 
 use crate::provider::{Message, ToolCall, Usage, UserContent, approx_tokens};
@@ -26,13 +25,12 @@ pub struct StoredMessage {
     pub seq: i64,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone)]
 pub struct SessionSummary {
     pub id: String,
     pub created_at: String,
     pub updated_at: String,
     pub cwd: String,
-    pub model: String,
     pub title: Option<String>,
     pub last_total_tokens: u64,
     pub archived: bool,
@@ -46,18 +44,6 @@ pub struct SessionSummary {
 /// request and spawning is sub-millisecond), so every result-less call gets the
 /// same conservative note and the agent is asked to verify state on resume.
 pub const INTERRUPTED_TOOL_RESULT: &str = "error: interrupted — this command may have started and not completed; its effects are unknown. Verify the resulting state before relying on it.";
-
-#[derive(Debug, Clone, Serialize)]
-pub struct TranscriptMessage {
-    pub role: String,
-    pub content: String,
-    pub seq: i64,
-    pub created_at: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub tool_call_id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub tool_calls: Option<Vec<ToolCall>>,
-}
 
 #[derive(Debug, Clone)]
 pub struct MessageRecord {
@@ -349,44 +335,10 @@ impl Store {
             .context("listing sessions")
     }
 
-    pub fn list_all_session_summaries(&self, limit: usize) -> Result<Vec<SessionSummary>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT
-                s.id, s.created_at, s.updated_at, s.cwd, s.model, s.title,
-                s.last_total_tokens, s.archived,
-                COUNT(m.id) AS message_count,
-                COALESCE(SUM(CASE WHEN m.role = 'user' THEN 1 ELSE 0 END), 0) AS user_count
-             FROM session s
-             LEFT JOIN message m ON m.session_id = s.id
-             WHERE s.archived = 0
-             GROUP BY s.id
-             ORDER BY s.updated_at DESC LIMIT ?1",
-        )?;
-        let mut rows = stmt.query(params![limit as i64])?;
-        let mut summaries = Vec::new();
-        while let Some(row) = rows.next()? {
-            let message_count = row.get::<_, i64>(8)? as u64;
-            let user_count = row.get::<_, i64>(9)? as u64;
-            summaries.push(SessionSummary {
-                id: row.get(0)?,
-                created_at: row.get(1)?,
-                updated_at: row.get(2)?,
-                cwd: row.get(3)?,
-                model: row.get(4)?,
-                title: row.get(5)?,
-                last_total_tokens: row.get::<_, i64>(6)? as u64,
-                archived: row.get::<_, i64>(7)? != 0,
-                message_count,
-                turn_count: user_count.saturating_sub(1),
-            });
-        }
-        Ok(summaries)
-    }
-
     pub fn session_summary(&self, id: &str) -> Result<Option<SessionSummary>> {
         let mut stmt = self.conn.prepare(
             "SELECT
-                s.id, s.created_at, s.updated_at, s.cwd, s.model, s.title,
+                s.id, s.created_at, s.updated_at, s.cwd, s.title,
                 s.last_total_tokens, s.archived,
                 COUNT(m.id) AS message_count,
                 COALESCE(SUM(CASE WHEN m.role = 'user' THEN 1 ELSE 0 END), 0) AS user_count
@@ -397,19 +349,16 @@ impl Store {
         )?;
         let row = stmt
             .query_row(params![id], |row| {
-                let message_count = row.get::<_, i64>(8)? as u64;
-                let user_count = row.get::<_, i64>(9)? as u64;
                 Ok(SessionSummary {
                     id: row.get(0)?,
                     created_at: row.get(1)?,
                     updated_at: row.get(2)?,
                     cwd: row.get(3)?,
-                    model: row.get(4)?,
-                    title: row.get(5)?,
-                    last_total_tokens: row.get::<_, i64>(6)? as u64,
-                    archived: row.get::<_, i64>(7)? != 0,
-                    message_count,
-                    turn_count: user_count.saturating_sub(1),
+                    title: row.get(4)?,
+                    last_total_tokens: row.get::<_, i64>(5)? as u64,
+                    archived: row.get::<_, i64>(6)? != 0,
+                    message_count: row.get::<_, i64>(7)? as u64,
+                    turn_count: row.get::<_, i64>(8)?.saturating_sub(1) as u64,
                 })
             })
             .optional()?;
@@ -800,37 +749,6 @@ impl Store {
         })?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
             .context("loading messages")
-    }
-
-    pub fn transcript(&self, session_id: &str) -> Result<Vec<TranscriptMessage>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT role, content, tool_call_id, tool_calls_json, seq, created_at FROM message
-             WHERE session_id = ?1 ORDER BY seq ASC",
-        )?;
-        let rows = stmt.query_map(params![session_id], |row| {
-            let tool_calls_json: Option<String> = row.get(3)?;
-            let tool_calls = tool_calls_json
-                .as_deref()
-                .map(serde_json::from_str)
-                .transpose()
-                .map_err(|error| {
-                    rusqlite::Error::FromSqlConversionFailure(
-                        3,
-                        rusqlite::types::Type::Text,
-                        Box::new(error),
-                    )
-                })?;
-            Ok(TranscriptMessage {
-                role: row.get(0)?,
-                content: row.get(1)?,
-                tool_call_id: row.get(2)?,
-                tool_calls,
-                seq: row.get(4)?,
-                created_at: row.get(5)?,
-            })
-        })?;
-        rows.collect::<rusqlite::Result<Vec<_>>>()
-            .context("loading transcript messages")
     }
 
     pub fn latest_summary_sequence(&self, session_id: &str) -> Result<Option<i64>> {

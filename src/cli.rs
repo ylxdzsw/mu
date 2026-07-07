@@ -99,15 +99,9 @@ pub struct StatusArgs {
 #[derive(Subcommand, Debug)]
 pub enum SessionSub {
     /// Create a new session and print its id
-    New {
-        #[arg(long)]
-        json: bool,
-    },
+    New,
     /// List recent sessions
     List {
-        #[arg(long)]
-        json: bool,
-
         #[arg(long, default_value_t = 20)]
         limit: usize,
     },
@@ -115,9 +109,6 @@ pub enum SessionSub {
     Transcript {
         #[arg(long)]
         session: String,
-
-        #[arg(long)]
-        json: bool,
     },
     /// Hide a session from default lists
     Archive {
@@ -137,9 +128,6 @@ pub enum ProjectSub {
     Inspect {
         #[arg(long)]
         path: PathBuf,
-
-        #[arg(long)]
-        json: bool,
     },
     /// Explicitly create mu project metadata in a directory
     Init {
@@ -148,9 +136,6 @@ pub enum ProjectSub {
 
         #[arg(long)]
         force: bool,
-
-        #[arg(long)]
-        json: bool,
     },
 }
 

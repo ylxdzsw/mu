@@ -4,8 +4,7 @@
 completed agent turn out. The core `mu` binary reads a prompt on stdin, accepts
 attached inputs such as images, runs an agent loop, streams turn events in the
 selected output format, persists completed messages, and exits. Interactive
-shells, editor integrations, and other surfaces build around that simple turn
-unit instead of changing it.
+shell use builds around that simple turn unit instead of changing it.
 
 This document describes the design, the key decisions behind it, and the
 high-level shape of the implementation. It favors prose and decisions over code,
@@ -25,9 +24,8 @@ is unambiguous.
 - **Responsive.** Output streams as it is produced. Control returns to the shell
   immediately when a turn completes.
 - **Composable.** The main abstraction is a turn, not a chat app, daemon,
-  terminal UI, or project manager. Thin surfaces such as the zsh plugin and
-  shell scripts coordinate and present turns; they do not host a separate agent
-  loop.
+  terminal UI, or project manager. The zsh plugin and shell scripts coordinate
+  turns; they do not host a separate agent loop.
 - **Non-magical.** No TUI. The shell owns the terminal and line editing; `mu`
   just reads a prompt and appends output. Output streams as it is produced (a
   tool line may appear before its output), but once a line is printed it is never
@@ -87,25 +85,22 @@ Tradeoff accepted: slower iteration than TypeScript, and no off-the-shelf
 "AI SDK". Provider integration is hand-written against HTTP APIs (see §7); the
 surface is small (chat completions + streaming + tool calls).
 
-### 2.2 Single binary + thin surfaces
+### 2.2 Single binary + shell surface
 
 `mu` is one executable with a default **turn runner** mode: prompt and attached
 inputs in, streamed turn events out, completed state persisted, exit. It also
 owns management subcommands for core state inspection and mutation. The turn
 path itself has no concept of prompts, key bindings, or long-lived UI state.
 
-Interactive surfaces are thin wrappers around that unit:
+Interactive use is a thin shell layer around that unit:
 
 - The zsh plugin is the preferred interactive surface. It owns zsh line editing,
   prompt mode, and keybindings, then submits each entered prompt by spawning
   `mu` for one foreground turn.
-- Other wrappers are allowed, but they must stay thin: they coordinate prompts
-  and presentation while delegating each agent turn to the `mu` command-line
-  interface.
 
 This single-binary shape is the central decision (see §3 for the full rationale
-recap). It keeps the agent semantics small and scriptable while letting each
-surface choose the interaction style that fits it.
+recap). It keeps the agent semantics small and scriptable while leaving the
+shell responsible for interaction.
 
 ### 2.3 Interactive mode lives in the shell surface
 
@@ -144,20 +139,19 @@ in the active global/project scope. See §9, §10, and §11.
 
 ## 3. Architecture overview
 
-`mu` has one executable, multiple entry modes, and multiple thin external
-surfaces. The CLI turn runner remains the core unit.
+`mu` has one executable and a small zsh integration around it. The CLI turn
+runner remains the core unit.
 
 ```
-   ┌──────────────────────────── external surfaces ─────────────────────────────┐
-   │  shell scripts / editor tasks: `mu [opts] <<< PROMPT`                     │
+   ┌──────────────────────────── shell surfaces ────────────────────────────────┐
+   │  shell scripts: `mu [opts] <<< PROMPT`                                    │
    │  zsh plugin: prompt mode; every entered line spawns one `mu` turn         │
-   │  editor tasks: coordinate through the command-line interface              │
    └───────────────────────────────────┬───────────────────────────────────────┘
                                         │ invokes the same executable / command path
                                         ▼
    ┌────────────────────────────── mu (single binary) ─────────────────────────┐
    │  default turn mode: one prompt in, one completed turn out                 │
-   │  management subcommands: session / status / models / compact              │
+   │  management subcommands: project / session / status / compact / retry     │
    │  turn/management command modules: project/config/session resolution       │
    │                           provider client + agent loop                    │
    │                           tool registry: bash                             │
@@ -174,7 +168,7 @@ REPL would have to reimplement completion, job control, and PTY handling
 behavior indefinitely. The cost is (a) session state must persist across process
 invocations — handled by SQLite in the active session scope, §11 — and (b)
 interactive shell commands are not automatically visible to the agent, which V1
-accepts (§6.3). Shell integration is allowed because it is only a line-editing
+accepts (§6.3). Shell integration is preferred because it is only a line-editing
 surface around repeated turn invocations, not a replacement runtime.
 
 ### Binary module responsibilities
@@ -219,8 +213,8 @@ small:
 - `mu project init [--path <dir>] [--force]` — create minimal `.mu/` project
   metadata in the current directory by default, or in an explicitly chosen
   directory.
-- `mu status --json --include-commands` — include discovered custom command
-  names, paths, and scope for shell completion/debugging.
+- `mu status --json [--include-models] [--include-commands]` — machine-readable
+  shell state for prompt rendering and completion.
 - `mu session new` — create a session and print its id.
 - `mu session list` — list recent non-archived sessions.
 - `mu session transcript --session <id>` — print a persisted session
