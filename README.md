@@ -91,7 +91,6 @@ MU_ZSH_EXIT_HOOKS+=(mu_restore_conflicts)
 | `mu -i image.png` | Attach an image to the turn |
 | `mu --output plain` | Render sequential plain assistant/tool text |
 | `mu --output terminal` | Render sequential interactive terminal output |
-| `mu --output json` | Render newline-delimited JSON events for integrations |
 | `mu project init [--path <dir>] [--force]` | Create minimal local `.mu` metadata in the current directory or target directory |
 | `mu status --json [--include-models]` | Report the resolved model, session, context state, and optional configured model list |
 | `mu status --json --include-commands` | Include discovered custom command entries |

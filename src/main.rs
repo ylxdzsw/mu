@@ -90,19 +90,14 @@ fn exit_code_for(error: &anyhow::Error) -> i32 {
 fn error_output_format() -> cli::OutputFormat {
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
-        if arg == "--json" {
-            return cli::OutputFormat::Json;
-        }
         if arg == "--output" {
             return match args.next().as_deref() {
-                Some("json") => cli::OutputFormat::Json,
                 Some("plain") => cli::OutputFormat::Plain,
                 _ => cli::OutputFormat::Terminal,
             };
         }
         if let Some(value) = arg.strip_prefix("--output=") {
             return match value {
-                "json" => cli::OutputFormat::Json,
                 "plain" => cli::OutputFormat::Plain,
                 _ => cli::OutputFormat::Terminal,
             };

@@ -39,7 +39,6 @@ pub struct Renderer {
     trailing_newlines: usize,
     has_committed_stdout: bool,
     styled: bool,
-    format: OutputFormat,
     markdown: MarkdownStream,
     assistant_block_open: bool,
     live_line: Option<LiveLine>,
@@ -71,7 +70,6 @@ impl Renderer {
             stdout_at_line_start: true,
             trailing_newlines: 0,
             has_committed_stdout: false,
-            format,
             markdown: MarkdownStream::default(),
             assistant_block_open: false,
             live_line: None,
@@ -83,10 +81,6 @@ impl Renderer {
         }
     }
 
-    pub fn output_format(&self) -> OutputFormat {
-        self.format
-    }
-
     #[cfg(test)]
     pub(crate) fn force_styled_for_test(&mut self) {
         self.styled = true;
@@ -95,9 +89,6 @@ impl Renderer {
     pub fn assistant_text(&mut self, text: &str) -> io::Result<()> {
         if text.is_empty() {
             return Ok(());
-        }
-        if self.format == OutputFormat::Json {
-            return self.write_json("assistant_delta", serde_json::json!({ "text": text }));
         }
         if !self.styled {
             if !self.assistant_block_open {
@@ -142,9 +133,6 @@ impl Renderer {
     }
 
     pub fn reasoning_start(&mut self) -> io::Result<()> {
-        if self.format == OutputFormat::Json {
-            return Ok(());
-        }
         self.assistant_block_open = false;
         self.reasoning = Some(ReasoningState {
             started: Instant::now(),
@@ -155,7 +143,7 @@ impl Renderer {
     }
 
     pub fn reasoning_delta(&mut self, text: &str) -> io::Result<()> {
-        if text.is_empty() || self.format == OutputFormat::Json {
+        if text.is_empty() {
             return Ok(());
         }
         let Some(reasoning) = self.reasoning.as_mut() else {
@@ -201,9 +189,6 @@ impl Renderer {
     }
 
     pub fn bash_header_start(&mut self, tool_call_id: Option<&str>) -> io::Result<bool> {
-        if self.format == OutputFormat::Json {
-            return Ok(false);
-        }
         self.assistant_block_open = false;
         self.reasoning_end(None)?;
         self.live_line = None;
@@ -218,16 +203,13 @@ impl Renderer {
     }
 
     pub fn bash_header_title_delta(&mut self, text: &str) -> io::Result<()> {
-        if self.format == OutputFormat::Json || text.is_empty() {
+        if text.is_empty() {
             return Ok(());
         }
         self.write_committed(text)
     }
 
     pub fn bash_header_title_end(&mut self) -> io::Result<()> {
-        if self.format == OutputFormat::Json {
-            return Ok(());
-        }
         if self.styled {
             self.write_committed(&format!("{RESET}\n"))
         } else {
@@ -236,9 +218,6 @@ impl Renderer {
     }
 
     pub fn bash_header_script_start(&mut self, risk: Option<&str>) -> io::Result<()> {
-        if self.format == OutputFormat::Json {
-            return Ok(());
-        }
         if self.styled {
             self.write_committed(&format!("{DIM}${RESET} {}{BOLD}", bash_risk_color(risk)))
         } else {
@@ -252,16 +231,13 @@ impl Renderer {
     }
 
     pub fn bash_header_script_delta(&mut self, text: &str) -> io::Result<()> {
-        if self.format == OutputFormat::Json || text.is_empty() {
+        if text.is_empty() {
             return Ok(());
         }
         self.write_committed(text)
     }
 
     pub fn bash_header_script_end(&mut self) -> io::Result<()> {
-        if self.format == OutputFormat::Json {
-            return Ok(());
-        }
         if self.styled {
             self.write_committed(&format!("{RESET}\n"))
         } else {
@@ -274,9 +250,6 @@ impl Renderer {
         tool_call_id: Option<&str>,
         args: &serde_json::Value,
     ) -> io::Result<bool> {
-        if self.format == OutputFormat::Json {
-            return Ok(false);
-        }
         let title = args
             .get("title")
             .and_then(|value| value.as_str())
@@ -313,16 +286,6 @@ impl Renderer {
         args: &serde_json::Value,
         header_already_rendered: bool,
     ) -> io::Result<()> {
-        if self.format == OutputFormat::Json {
-            return self.write_json(
-                "tool_start",
-                serde_json::json!({
-                    "tool_call_id": tool_call_id,
-                    "tool": name,
-                    "args": args
-                }),
-            );
-        }
         if name != "bash" {
             return Ok(());
         }
@@ -339,23 +302,12 @@ impl Renderer {
 
     pub fn bash_output(
         &mut self,
-        tool_call_id: Option<&str>,
-        tool: &str,
+        _tool_call_id: Option<&str>,
+        _tool: &str,
         text: &str,
     ) -> io::Result<()> {
         if text.is_empty() {
             return Ok(());
-        }
-        let tool_call_id = tool_call_id.or(self.active_bash_tool_call_id.as_deref());
-        if self.format == OutputFormat::Json {
-            return self.write_json(
-                "tool_output",
-                serde_json::json!({
-                    "tool_call_id": tool_call_id,
-                    "tool": tool,
-                    "text": strip_ansi(text)
-                }),
-            );
         }
         let sanitized = strip_ansi(text);
         let Some(preview) = self.bash_preview.as_mut() else {
@@ -385,24 +337,13 @@ impl Renderer {
 
     pub fn tool_finished(
         &mut self,
-        tool_call_id: Option<&str>,
+        _tool_call_id: Option<&str>,
         tool: &str,
         display: &ToolDisplay,
         elapsed: Duration,
     ) -> io::Result<()> {
         if tool == "bash" {
             self.active_bash_tool_call_id = None;
-        }
-        if self.format == OutputFormat::Json {
-            return self.write_json(
-                "tool_finish",
-                serde_json::json!({
-                    "tool_call_id": tool_call_id,
-                    "tool": tool,
-                    "display": tool_display_json(display),
-                    "elapsed_ms": elapsed.as_millis()
-                }),
-            );
         }
         self.finalize_bash_preview()?;
         let text = format_tool(display, elapsed, self.styled);
@@ -415,24 +356,13 @@ impl Renderer {
 
     pub fn tool_failed(
         &mut self,
-        tool_call_id: Option<&str>,
+        _tool_call_id: Option<&str>,
         name: &str,
         error: &str,
         elapsed: Duration,
     ) -> io::Result<()> {
         if name == "bash" {
             self.active_bash_tool_call_id = None;
-        }
-        if self.format == OutputFormat::Json {
-            return self.write_json(
-                "tool_error",
-                serde_json::json!({
-                    "tool_call_id": tool_call_id,
-                    "tool": name,
-                    "error": error,
-                    "elapsed_ms": elapsed.as_millis()
-                }),
-            );
         }
         self.finalize_bash_preview()?;
         self.ensure_line_start()?;
@@ -453,20 +383,8 @@ impl Renderer {
         risk_level: &str,
         user_auth_level: &str,
         reason: &str,
-        script: &str,
+        _script: &str,
     ) -> io::Result<()> {
-        if self.format == OutputFormat::Json {
-            return self.write_json(
-                "guardrail",
-                serde_json::json!({
-                    "allowed": allowed,
-                    "risk_level": risk_level,
-                    "user_auth_level": user_auth_level,
-                    "reason": reason,
-                    "script": script
-                }),
-            );
-        }
         self.assistant_block_open = false;
         self.ensure_line_start()?;
         let verdict = if allowed { "allow" } else { "deny" };
@@ -489,17 +407,11 @@ impl Renderer {
     }
 
     pub fn error(&mut self, msg: &str) -> io::Result<()> {
-        if self.format == OutputFormat::Json {
-            return self.write_json("error", serde_json::json!({ "message": msg }));
-        }
         writeln!(self.stderr, "error: {msg}")?;
         self.stderr.flush()
     }
 
     pub fn notice(&mut self, msg: &str) -> io::Result<()> {
-        if self.format == OutputFormat::Json {
-            return self.write_json("notice", serde_json::json!({ "message": msg }));
-        }
         self.assistant_block_open = false;
         self.ensure_block_separator_if_needed()?;
         self.write_stdout_committed(&terminal_trim_committed_text(&format!("{msg}\n")))
@@ -511,16 +423,6 @@ impl Renderer {
         max_auto_retries: u64,
         reason: &str,
     ) -> io::Result<()> {
-        if self.format == OutputFormat::Json {
-            return self.write_json(
-                "turn_retry",
-                serde_json::json!({
-                    "retry_count": retry_count,
-                    "max_auto_retries": max_auto_retries,
-                    "reason": reason,
-                }),
-            );
-        }
         self.notice(&format!(
             "[mu] retrying [{retry_count}/{max_auto_retries}] after {reason}"
         ))
@@ -532,15 +434,6 @@ impl Renderer {
     /// is now "unclean"; the next prompt continues on top of it, or `mu retry`
     /// resumes it.
     pub fn turn_interrupted(&mut self, reason: &str) -> io::Result<()> {
-        if self.format == OutputFormat::Json {
-            return self.write_json(
-                "turn_interrupted",
-                serde_json::json!({
-                    "reason": reason,
-                    "retry_available": true,
-                }),
-            );
-        }
         self.notice(&format!("[mu] interrupted: {reason}"))?;
         self.notice(
             "[mu] partial output above is not saved to session history; \
@@ -552,9 +445,6 @@ impl Renderer {
     /// glue onto the final line of assistant output.
     pub fn finish_turn(&mut self) -> io::Result<()> {
         self.assistant_end()?;
-        if self.format == OutputFormat::Json {
-            return Ok(());
-        }
         self.ensure_line_start()
     }
 
@@ -564,16 +454,6 @@ impl Renderer {
         output_tokens: u64,
         context_pct: Option<f64>,
     ) -> io::Result<()> {
-        if self.format == OutputFormat::Json {
-            return self.write_json(
-                "turn_summary",
-                serde_json::json!({
-                    "input_tokens": input_tokens,
-                    "output_tokens": output_tokens,
-                    "context_pct": context_pct,
-                }),
-            );
-        }
         if !self.stderr.is_terminal() {
             return Ok(());
         }
@@ -765,16 +645,6 @@ impl Renderer {
         } else {
             trailing_in_text
         };
-        self.stdout.flush()
-    }
-
-    fn write_json(&mut self, event: &str, payload: serde_json::Value) -> io::Result<()> {
-        let line = serde_json::json!({
-            "event": event,
-            "payload": payload,
-        });
-        writeln!(self.stdout, "{line}")?;
-        self.stdout_at_line_start = true;
         self.stdout.flush()
     }
 }
@@ -1365,15 +1235,6 @@ fn format_tool(display: &ToolDisplay, elapsed: Duration, styled: bool) -> String
                 let icon = if *exit_code == 0 { "✓" } else { "✗" };
                 format!("{icon} exit {exit_code} · {elapsed}\n")
             }
-        }
-    }
-}
-
-fn tool_display_json(display: &ToolDisplay) -> serde_json::Value {
-    match display {
-        ToolDisplay::None => serde_json::json!({"kind": "none"}),
-        ToolDisplay::Bash { exit_code } => {
-            serde_json::json!({"kind": "bash", "exit_code": exit_code})
         }
     }
 }

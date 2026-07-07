@@ -189,8 +189,8 @@ surface around repeated turn invocations, not a replacement runtime.
   definition and an execute function.
 - **Provider client.** Streaming HTTP to the model API behind one internal
   interface.
-- **Renderer.** Sole writer to output; render the same turn as plain text,
-  terminal UI, or JSON events (§5).
+- **Renderer.** Sole writer to output; render the same turn as plain text or
+  terminal UI (§5).
 - **Store.** SQLite load/append in either project-local or global scope (§11).
 
 The binary runs on a single `tokio` runtime. There is no input thread or line
@@ -202,12 +202,12 @@ The core binary is invoked one of two ways: as a **turn** (default, reads a
 prompt on stdin) or as a **subcommand** (management, no prompt). The surface is
 small:
 
-- `mu [-s <id>] [-c] [--model <id>] [-i <image>] [--output plain|terminal|json]`
+- `mu [-s <id>] [-c] [--model <id>] [-i <image>] [--output plain|terminal]`
   — run one turn; prompt read from stdin. `-i/--image` is repeatable.
-- `mu [-s <id>] [-c] [--model <id>] [-i <image>] [--output plain|terminal|json] <prompt-file>`
+- `mu [-s <id>] [-c] [--model <id>] [-i <image>] [--output plain|terminal] <prompt-file>`
   — run one turn from a prompt file; if the first line starts with `#!`, drop
   it before sending the prompt. `-i/--image` is repeatable.
-- `mu [-s <id>] [-c] [--model <id>] [--output plain|terminal|json] <custom-command>`
+- `mu [-s <id>] [-c] [--model <id>] [--output plain|terminal] <custom-command>`
   — run a discovered shebang command from the active project/global `.mu`
   instruction index. Command names are relative `.mu` paths including
   extensions; built-in subcommands and explicit prompt paths win.
@@ -297,9 +297,9 @@ it in this order:
    d. **Persist the completed assistant message** (including any `tool_calls`)
       to the DB and append it to the context list.
    e. If `finish_reason` is `tool_calls`: split the calls into maximal
-      contiguous batches of eligible readonly work. `plain`, `terminal`, and
-      `json` may execute contiguous
-      `risk:"readonly"` `bash` calls concurrently, but **persist tool result
+      contiguous batches of eligible readonly work. `plain` and `terminal` may
+      execute contiguous `risk:"readonly"` `bash` calls concurrently, but
+      **persist tool result
       messages** (`role: "tool"`, with their `tool_call_id`) in the model's
       original call order before looping back to (a). Any non-readonly call,
       unknown tool, or call that requires guardrail review is a sequential
@@ -355,8 +355,8 @@ do not persist to later bash calls. `stdin`, when present, is piped literally to
 the child process so the agent can write bytes containing `$`, backticks,
 quotes, or heredoc delimiters without shell expansion.
 
-**Execution ordering.** Human-facing and JSON output may execute maximal
-contiguous batches of `risk:"readonly"` `bash` calls concurrently because each
+**Execution ordering.** Human-facing output may execute maximal contiguous
+batches of `risk:"readonly"` `bash` calls concurrently because each
 call runs in its own process group with isolated `cwd`, environment, timeout,
 and stdin. This is an execution optimization only: stored tool-call records,
 stored tool messages, and the next model request still see the original
@@ -405,7 +405,7 @@ fall back to temp scripts.
 
 ## 5. Output and rendering
 
-`mu` supports three output formats: `plain`, `terminal`, and `json`. They are
+`mu` supports two output formats: `plain` and `terminal`. They are
 different renderings of the same agent turn and must not imply different agent
 behavior.
 
@@ -415,24 +415,16 @@ behavior.
   and may update recent status lines for in-progress activity, but it must keep
   normal scrollback. It must not use an alternate screen, clear the screen, or
   require mouse interaction.
-- **JSON output** is for programs and integrations. It is a
-  delimited serialization of the same turn events used by the other output
-  formats, suitable for incremental consumers (newline-delimited JSON is the V1
-  shape).
-
-**Concurrency contract.** `plain`, `terminal`, and `json` may run contiguous
-readonly `bash` calls concurrently. `json`
-streams per-tool `tool_start`/`tool_output`/`tool_finish`/`tool_error` events
-with `tool_call_id` so consumers can associate interleaved machine events with
-the right call. `terminal` keeps append-only scrollback and the one-live-line
-rule: at most one bash call owns live terminal streaming at a time, even while
-later readonly calls are already running in the background. `plain` follows the
-same ordered human-facing display without live-line redraws.
+**Concurrency contract.** `plain` and `terminal` may run contiguous readonly
+`bash` calls concurrently. `terminal` keeps append-only scrollback and the
+one-live-line rule: at most one bash call owns live terminal streaming at a
+time, even while later readonly calls are already running in the background.
+`plain` follows the same ordered human-facing display without live-line redraws.
 
 The renderer is the sole writer to stdout/stderr and enforces the selected
 format. It may style output only when stdout is a TTY and `--output terminal` is
 selected. It never clears the screen, uses an alternate screen, or requires
-mouse interaction. Plain/JSON output is always ANSI-free.
+mouse interaction. Plain output is always ANSI-free.
 
 Assistant Markdown is parsed on TTYs. The renderer buffers only the current
 unstable Markdown block, commits completed blocks once, and flushes the tail at
@@ -464,8 +456,7 @@ human-facing sections. The renderer owns the spacing contract for those blocks.
   the final turn output (including the stderr summary line) and the next shell
   prompt.
 
-This contract applies to human-facing `terminal` and `plain` output. JSON
-remains a machine-oriented event stream without terminal spacing rules.
+This contract applies to human-facing `terminal` and `plain` output.
 
 **Stream routing (explicit).** The conversation transcript goes to **stdout**:
 tool presentation, tool failures, Bash output, and assistant text. Fatal process
@@ -513,9 +504,9 @@ is suppressed if stderr is not a TTY (piped/redirected), since it would pollute
 log files. In both human-facing modes it is followed by one blank line so the
 next shell prompt is visually separated from the completed turn.
 
-Plain and JSON modes avoid terminal-only control sequences so they remain
-suitable for scripts. Human terminal mode may show progress for in-flight work,
-but committed transcript content is never erased from scrollback. When
+Plain mode avoids terminal-only control sequences so it remains suitable for
+scripts. Human terminal mode may show progress for in-flight work, but committed
+transcript content is never erased from scrollback. When
 `terminal_bell.enabled` is true, terminal mode also emits a BEL (`\a`) after a
 successful turn's summary once total turn duration meets
 `terminal_bell.min_duration_ms` (default 10s).

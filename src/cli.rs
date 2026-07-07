@@ -56,7 +56,6 @@ pub struct RetryArgs {
 pub enum OutputFormat {
     Plain,
     Terminal,
-    Json,
 }
 
 #[derive(Subcommand, Debug)]

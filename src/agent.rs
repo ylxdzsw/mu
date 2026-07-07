@@ -6,7 +6,6 @@ use anyhow::{Result, bail};
 use serde_json::Value;
 use tokio::time::sleep;
 
-use crate::cli::OutputFormat;
 use crate::compaction;
 use crate::config::Config;
 use crate::guardrail::{Guardrail, GuardrailOutcome, bash_risk};
@@ -31,7 +30,6 @@ struct ConcurrentBashExecution<'a> {
     header_already_rendered: bool,
     running: Option<RunningBash>,
     streamed_len: usize,
-    completed: Option<(Result<ToolResult>, Duration)>,
 }
 
 #[derive(Default)]
@@ -568,104 +566,30 @@ impl<'a> AgentLoop<'a> {
                     self.state_dir,
                 )),
                 streamed_len: 0,
-                completed: None,
             });
         }
 
-        match self.renderer.output_format() {
-            OutputFormat::Plain | OutputFormat::Terminal => {
-                for exec in &mut executions {
-                    if let Some(running) = exec.running.as_ref() {
-                        for warning in running.warnings() {
-                            self.renderer.notice(&format!("[redaction] {warning}"))?;
-                        }
-                    }
-                    self.renderer.tool_start(
-                        Some(&exec.call.id),
-                        &exec.call.function.name,
-                        &exec.args,
-                        exec.header_already_rendered,
-                    )?;
-                    self.stream_running_bash(exec).await?;
-                    let (result, elapsed, final_output) = exec
-                        .running
-                        .take()
-                        .expect("running bash present")
-                        .finish()
-                        .await;
-                    self.flush_buffered_bash_output(exec, &final_output)?;
-                    self.persist_tool_result(
-                        message_id, exec.call, result, elapsed, context, true,
-                    )?;
+        for exec in &mut executions {
+            if let Some(running) = exec.running.as_ref() {
+                for warning in running.warnings() {
+                    self.renderer.notice(&format!("[redaction] {warning}"))?;
                 }
             }
-            OutputFormat::Json => {
-                for exec in &mut executions {
-                    if let Some(running) = exec.running.as_ref() {
-                        for warning in running.warnings() {
-                            self.renderer.notice(&format!("[redaction] {warning}"))?;
-                        }
-                    }
-                    self.renderer.tool_start(
-                        Some(&exec.call.id),
-                        &exec.call.function.name,
-                        &exec.args,
-                        exec.header_already_rendered,
-                    )?;
-                }
-
-                while executions.iter().any(|exec| exec.completed.is_none()) {
-                    let mut progressed = false;
-                    for exec in &mut executions {
-                        if exec.completed.is_some() {
-                            continue;
-                        }
-                        let (snapshot, finished) = if let Some(running) = exec.running.as_ref() {
-                            (running.snapshot_output(), running.is_finished())
-                        } else {
-                            (String::new(), false)
-                        };
-                        if self.flush_buffered_bash_output(exec, &snapshot)? {
-                            progressed = true;
-                        }
-                        if finished {
-                            let (result, elapsed, final_output) = exec
-                                .running
-                                .take()
-                                .expect("running bash present")
-                                .finish()
-                                .await;
-                            let _ = self.flush_buffered_bash_output(exec, &final_output)?;
-                            match result.as_ref() {
-                                Ok(result) => self.renderer.tool_finished(
-                                    Some(&exec.call.id),
-                                    &exec.call.function.name,
-                                    &result.display,
-                                    elapsed,
-                                )?,
-                                Err(error) => self.renderer.tool_failed(
-                                    Some(&exec.call.id),
-                                    &exec.call.function.name,
-                                    &error.to_string(),
-                                    elapsed,
-                                )?,
-                            }
-                            exec.completed = Some((result, elapsed));
-                            progressed = true;
-                        }
-                    }
-                    if executions.iter().any(|exec| exec.completed.is_none()) && !progressed {
-                        sleep(Duration::from_millis(25)).await;
-                    }
-                }
-
-                for exec in executions {
-                    let (result, elapsed) = exec.completed.expect("completed bash result");
-                    self.persist_tool_result(
-                        message_id, exec.call, result, elapsed, context, false,
-                    )?;
-                }
-            }
+            self.renderer.tool_start(
+                Some(&exec.call.id),
+                &exec.call.function.name,
+                &exec.args,
+                exec.header_already_rendered,
+            )?;
+            self.stream_running_bash(exec).await?;
+            let (result, elapsed, final_output) = exec
+                .running
+                .take()
+                .expect("running bash present")
+                .finish()
+                .await;
+            self.flush_buffered_bash_output(exec, &final_output)?;
+            self.persist_tool_result(message_id, exec.call, result, elapsed, context, true)?;
         }
 
         Ok(())
@@ -1144,6 +1068,7 @@ mod tests {
     use serde_json::Value;
 
     use super::*;
+    use crate::cli::OutputFormat;
     use crate::config::{
         CompactionConfig, GuardrailConfig, LimitsConfig, ProviderConfig, RedactionConfig,
         TerminalBellConfig,
@@ -1458,7 +1383,7 @@ mod tests {
         let provider = Arc::new(RetryThenStopProvider {
             step: Mutex::new(0),
         });
-        let mut renderer = Renderer::with_format(OutputFormat::Json);
+        let mut renderer = Renderer::with_format(OutputFormat::Plain);
         let mut agent = AgentLoop {
             config: &config,
             provider,
