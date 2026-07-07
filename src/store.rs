@@ -7,6 +7,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 use uuid::Uuid;
 
 use crate::provider::{Message, ToolCall, Usage, UserContent, approx_tokens};
+use crate::tools::BashRisk;
 
 #[derive(Debug, Clone)]
 pub struct Session {
@@ -76,6 +77,17 @@ pub struct ReviewRecord<'a> {
 pub struct Store {
     conn: Connection,
     lock_dir: PathBuf,
+}
+
+fn session_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Session> {
+    Ok(Session {
+        id: row.get(0)?,
+        cwd: row.get(1)?,
+        model: row.get(2)?,
+        title: row.get(3)?,
+        last_total_tokens: row.get::<_, i64>(4)? as u64,
+        archived: row.get::<_, i64>(5)? != 0,
+    })
 }
 
 impl Store {
@@ -288,18 +300,7 @@ impl Store {
             "SELECT id, cwd, model, title, last_total_tokens, archived
              FROM session WHERE id = ?1",
         )?;
-        let row = stmt
-            .query_row(params![id], |row| {
-                Ok(Session {
-                    id: row.get(0)?,
-                    cwd: row.get(1)?,
-                    model: row.get(2)?,
-                    title: row.get(3)?,
-                    last_total_tokens: row.get::<_, i64>(4)? as u64,
-                    archived: row.get::<_, i64>(5)? != 0,
-                })
-            })
-            .optional()?;
+        let row = stmt.query_row(params![id], session_from_row).optional()?;
         Ok(row)
     }
 
@@ -311,17 +312,7 @@ impl Store {
              ORDER BY updated_at DESC LIMIT ?1",
         )?;
         let rows = stmt.query_map(params![limit as i64], |row| {
-            Ok((
-                Session {
-                    id: row.get(0)?,
-                    cwd: row.get(1)?,
-                    model: row.get(2)?,
-                    title: row.get(3)?,
-                    last_total_tokens: row.get::<_, i64>(4)? as u64,
-                    archived: row.get::<_, i64>(5)? != 0,
-                },
-                row.get::<_, String>(6)?,
-            ))
+            Ok((session_from_row(row)?, row.get::<_, String>(6)?))
         })?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
             .context("listing sessions")
@@ -362,18 +353,7 @@ impl Store {
             "SELECT id, cwd, model, title, last_total_tokens, archived
              FROM session WHERE archived = 0 ORDER BY updated_at DESC LIMIT 1",
         )?;
-        let row = stmt
-            .query_row([], |row| {
-                Ok(Session {
-                    id: row.get(0)?,
-                    cwd: row.get(1)?,
-                    model: row.get(2)?,
-                    title: row.get(3)?,
-                    last_total_tokens: row.get::<_, i64>(4)? as u64,
-                    archived: row.get::<_, i64>(5)? != 0,
-                })
-            })
-            .optional()?;
+        let row = stmt.query_row([], session_from_row).optional()?;
         Ok(row)
     }
 
@@ -499,7 +479,7 @@ impl Store {
             if answered.contains(call.id.as_str()) {
                 continue;
             }
-            let risk = risk_from_args(&call.function.arguments);
+            let risk = BashRisk::from_args_json(&call.function.arguments);
             self.persist_tool_result(
                 session_id,
                 ToolCallRecord {
@@ -507,7 +487,7 @@ impl Store {
                     id: &call.id,
                     tool: &call.function.name,
                     args: &call.function.arguments,
-                    risk: risk.as_deref(),
+                    risk: risk.as_ref().map(|risk| risk.as_str()),
                     output: INTERRUPTED_TOOL_RESULT,
                     status: "interrupted",
                 },
@@ -914,12 +894,6 @@ fn parse_tool_calls(json: Option<&str>) -> Option<Vec<ToolCall>> {
 
 fn has_tool_calls(json: Option<&str>) -> bool {
     parse_tool_calls(json).is_some()
-}
-
-fn risk_from_args(args: &str) -> Option<String> {
-    let value: serde_json::Value = serde_json::from_str(args).ok()?;
-    let risk = value.get("risk")?.as_str()?;
-    matches!(risk, "readonly" | "reversible" | "destructive").then(|| risk.to_string())
 }
 
 #[cfg(test)]

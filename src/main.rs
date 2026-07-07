@@ -223,6 +223,17 @@ fn print_project_init_info(info: &ProjectInitInfo) {
     }
 }
 
+fn open_store_with_session(db_path: &Path, session: &str) -> Result<store::Store> {
+    if !db_path.exists() {
+        return Err(exit::ExitError::session_not_found(session));
+    }
+    let store = store::Store::open(db_path)?;
+    if store.get_session(session)?.is_none() {
+        return Err(exit::ExitError::session_not_found(session));
+    }
+    Ok(store)
+}
+
 async fn run() -> Result<()> {
     let args = Args::parse();
     let cwd = std::env::current_dir()?;
@@ -292,35 +303,17 @@ async fn run() -> Result<()> {
                     }
                 }
                 SessionSub::Transcript { session } => {
-                    if !db_path.exists() {
-                        return Err(exit::ExitError::session_not_found(&session));
-                    }
-                    let store = store::Store::open(&db_path)?;
-                    if store.get_session(&session)?.is_none() {
-                        return Err(exit::ExitError::session_not_found(&session));
-                    }
+                    let store = open_store_with_session(&db_path, &session)?;
                     for message in store.all_messages_for_session(&session)? {
                         println!("[{}:{}] {}", message.seq, message.role, message.content);
                     }
                 }
                 SessionSub::Archive { session } => {
-                    if !db_path.exists() {
-                        return Err(exit::ExitError::session_not_found(&session));
-                    }
-                    let store = store::Store::open(&db_path)?;
-                    if store.get_session(&session)?.is_none() {
-                        return Err(exit::ExitError::session_not_found(&session));
-                    }
+                    let store = open_store_with_session(&db_path, &session)?;
                     store.set_session_archived(&session, true)?;
                 }
                 SessionSub::Unarchive { session } => {
-                    if !db_path.exists() {
-                        return Err(exit::ExitError::session_not_found(&session));
-                    }
-                    let store = store::Store::open(&db_path)?;
-                    if store.get_session(&session)?.is_none() {
-                        return Err(exit::ExitError::session_not_found(&session));
-                    }
+                    let store = open_store_with_session(&db_path, &session)?;
                     store.set_session_archived(&session, false)?;
                 }
             }

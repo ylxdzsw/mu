@@ -8,7 +8,7 @@ use tokio::time::sleep;
 
 use crate::compaction;
 use crate::config::Config;
-use crate::guardrail::{Guardrail, GuardrailOutcome, bash_risk};
+use crate::guardrail::{Guardrail, GuardrailOutcome};
 use crate::models::RequestOptions;
 use crate::provider::{
     FinishReason, Message, Provider, ProviderError, StreamEvent, ToolCall, ToolCallDelta, Usage,
@@ -16,7 +16,7 @@ use crate::provider::{
 };
 use crate::renderer::Renderer;
 use crate::store::{ReviewRecord, Store, ToolCallRecord};
-use crate::tools::{ExecutionMode, ToolContext, ToolResult, missing_tool_message};
+use crate::tools::{BashRisk, ExecutionMode, ToolContext, ToolResult, missing_tool_message};
 use crate::{bash, tools};
 use bash::RunningBash;
 
@@ -270,7 +270,7 @@ impl<'a> AgentLoop<'a> {
                             if let Some(g) = guardrail.as_mut()
                                 && tc.function.name == "bash"
                             {
-                                let risk = bash_risk(&args);
+                                let risk = BashRisk::from_value(&args);
                                 if risk.is_none() {
                                     let err = anyhow::anyhow!(
                                         "bash tool call missing required `risk` field"
@@ -286,7 +286,9 @@ impl<'a> AgentLoop<'a> {
                                     cursor += 1;
                                     continue;
                                 }
-                                if g.should_review(risk.as_deref().unwrap_or("")) {
+                                if g.should_review(
+                                    risk.as_ref().map(|risk| risk.as_str()).unwrap_or(""),
+                                ) {
                                     let args_for_review = args.clone();
                                     let action_json =
                                         serde_json::to_string(&args_for_review).unwrap_or_default();
@@ -363,7 +365,7 @@ impl<'a> AgentLoop<'a> {
                                                 id: &tc.id,
                                                 tool: &tc.function.name,
                                                 args: &tc.function.arguments,
-                                                risk: risk.as_deref(),
+                                                risk: risk.as_ref().map(|risk| risk.as_str()),
                                                 output: &output,
                                                 status: "error",
                                             })?;
@@ -510,7 +512,7 @@ impl<'a> AgentLoop<'a> {
             }
         };
 
-        let risk = tool_call_risk(&call.function.arguments);
+        let risk = BashRisk::from_args_json(&call.function.arguments);
         let message = Message::Tool {
             content: output.clone(),
             tool_call_id: call.id.clone(),
@@ -522,7 +524,7 @@ impl<'a> AgentLoop<'a> {
                 id: &call.id,
                 tool: &call.function.name,
                 args: &call.function.arguments,
-                risk: risk.as_deref(),
+                risk: risk.as_ref().map(|risk| risk.as_str()),
                 output: &output,
                 status,
             },
@@ -1043,15 +1045,6 @@ fn stream_first_line(
     Ok(false)
 }
 
-fn tool_call_risk(args: &str) -> Option<String> {
-    let value: Value = serde_json::from_str(args).ok()?;
-    let risk = value.get("risk")?.as_str()?;
-    match risk {
-        "readonly" | "reversible" | "destructive" => Some(risk.to_string()),
-        _ => None,
-    }
-}
-
 fn guardrail_review_required(guardrail: Option<&Guardrail>, call: &ToolCall, args: &Value) -> bool {
     if call.function.name != "bash" {
         return false;
@@ -1059,7 +1052,7 @@ fn guardrail_review_required(guardrail: Option<&Guardrail>, call: &ToolCall, arg
     let Some(guardrail) = guardrail else {
         return false;
     };
-    let Some(risk) = bash_risk(args) else {
+    let Some(risk) = BashRisk::from_value(args) else {
         return false;
     };
     guardrail.should_review(risk.as_str())
@@ -1125,6 +1118,7 @@ mod tests {
 
     struct TwoReadonlyThenStopProvider {
         step: Mutex<usize>,
+        barrier_path: String,
     }
 
     #[async_trait(?Send)]
@@ -1140,48 +1134,55 @@ mod tests {
             let current = *step;
             *step += 1;
             match current {
-                0 => Ok(StreamResult {
-                    message: Message::Assistant {
-                        content: None,
-                        tool_calls: Some(vec![
-                            ToolCall {
-                                id: "call_first".into(),
-                                call_type: "function".into(),
-                                function: crate::provider::FunctionCall {
-                                    name: "bash".into(),
-                                    arguments: serde_json::json!({
-                                        "title": "first",
-                                        "risk": "readonly",
-                                        "script": "sleep 1; printf first",
-                                        "timeout": 5,
-                                    })
-                                    .to_string(),
+                0 => {
+                    let first_script = format!(
+                        "while [ ! -f '{}' ]; do sleep 0.05; done; printf first",
+                        self.barrier_path
+                    );
+                    let second_script = format!("touch '{}'; printf second", self.barrier_path);
+                    Ok(StreamResult {
+                        message: Message::Assistant {
+                            content: None,
+                            tool_calls: Some(vec![
+                                ToolCall {
+                                    id: "call_first".into(),
+                                    call_type: "function".into(),
+                                    function: crate::provider::FunctionCall {
+                                        name: "bash".into(),
+                                        arguments: serde_json::json!({
+                                            "title": "first",
+                                            "risk": "readonly",
+                                            "script": first_script,
+                                            "timeout": 3,
+                                        })
+                                        .to_string(),
+                                    },
                                 },
-                            },
-                            ToolCall {
-                                id: "call_second".into(),
-                                call_type: "function".into(),
-                                function: crate::provider::FunctionCall {
-                                    name: "bash".into(),
-                                    arguments: serde_json::json!({
-                                        "title": "second",
-                                        "risk": "readonly",
-                                        "script": "sleep 1; printf second",
-                                        "timeout": 5,
-                                    })
-                                    .to_string(),
+                                ToolCall {
+                                    id: "call_second".into(),
+                                    call_type: "function".into(),
+                                    function: crate::provider::FunctionCall {
+                                        name: "bash".into(),
+                                        arguments: serde_json::json!({
+                                            "title": "second",
+                                            "risk": "readonly",
+                                            "script": second_script,
+                                            "timeout": 3,
+                                        })
+                                        .to_string(),
+                                    },
                                 },
-                            },
-                        ]),
-                    },
-                    finish_reason: FinishReason::ToolCalls,
-                    usage: Some(Usage {
-                        input_tokens: 1,
-                        output_tokens: 1,
-                        total_tokens: 2,
-                        ..Usage::default()
-                    }),
-                }),
+                            ]),
+                        },
+                        finish_reason: FinishReason::ToolCalls,
+                        usage: Some(Usage {
+                            input_tokens: 1,
+                            output_tokens: 1,
+                            total_tokens: 2,
+                            ..Usage::default()
+                        }),
+                    })
+                }
                 1 => Ok(StreamResult {
                     message: Message::Assistant {
                         content: Some("done".into()),
@@ -1453,6 +1454,7 @@ mod tests {
             .unwrap();
         let provider = Arc::new(TwoReadonlyThenStopProvider {
             step: Mutex::new(0),
+            barrier_path: tmp.join("second-started").display().to_string(),
         });
         let mut renderer = Renderer::with_format(OutputFormat::Plain);
         let mut agent = AgentLoop {
@@ -1469,15 +1471,9 @@ mod tests {
             system_prompt: "system".into(),
         };
 
-        let started = Instant::now();
         let result = agent.run_turn().await.unwrap();
-        let elapsed = started.elapsed();
 
         assert_eq!(result.final_assistant.as_deref(), Some("done"));
-        assert!(
-            elapsed < Duration::from_millis(1800),
-            "plain readonly batch appears sequential: {elapsed:?}"
-        );
         let tool_messages: Vec<_> = store
             .load_context_messages(&session.id)
             .unwrap()

@@ -106,15 +106,16 @@ pub fn resolve_invocation(
         None
     };
 
-    if let Some(session) = attached_session.clone() {
-        let request_ref = overrides.model.as_deref().unwrap_or(&session.model);
+    if let Some(session) = attached_session {
+        let stored_model = session.model.clone();
+        let request_ref = overrides.model.as_deref().unwrap_or(&stored_model);
         return Ok(ResolvedInvocation {
-            attached_session: Some(session.clone()),
+            attached_session: Some(session),
             request: RequestOptions {
                 model: resolve_model_ref(config, request_ref)?,
             },
             session_seed: RequestOptions {
-                model: resolve_model_ref(config, &session.model)?,
+                model: resolve_model_ref(config, &stored_model)?,
             },
         });
     }

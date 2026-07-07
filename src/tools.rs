@@ -1,3 +1,4 @@
+use std::fmt;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -101,6 +102,44 @@ pub enum BashRisk {
     Readonly,
     Reversible,
     Destructive,
+}
+
+impl BashRisk {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Readonly => "readonly",
+            Self::Reversible => "reversible",
+            Self::Destructive => "destructive",
+        }
+    }
+
+    pub fn from_value(value: &Value) -> Option<Self> {
+        value.get("risk")?.as_str()?.parse().ok()
+    }
+
+    pub fn from_args_json(args: &str) -> Option<Self> {
+        let value: Value = serde_json::from_str(args).ok()?;
+        Self::from_value(&value)
+    }
+}
+
+impl std::str::FromStr for BashRisk {
+    type Err = ();
+
+    fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
+        match value {
+            "readonly" => Ok(Self::Readonly),
+            "reversible" => Ok(Self::Reversible),
+            "destructive" => Ok(Self::Destructive),
+            _ => Err(()),
+        }
+    }
+}
+
+impl fmt::Display for BashRisk {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
 }
 
 pub fn parse_args<T: for<'de> Deserialize<'de>>(args: &Value) -> Result<T> {

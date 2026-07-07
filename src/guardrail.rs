@@ -607,17 +607,6 @@ fn parse_assessment(text: &str) -> anyhow::Result<Assessment> {
     })
 }
 
-/// Extract and validate the risk field from bash tool arguments.
-/// Returns `Some(value)` only if the field is present and one of the three
-/// valid enum strings. An invalid or missing value returns `None`.
-pub fn bash_risk(args: &Value) -> Option<String> {
-    let risk = args.get("risk")?.as_str()?;
-    match risk {
-        "readonly" | "reversible" | "destructive" => Some(risk.to_string()),
-        _ => None,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::collections::VecDeque;
@@ -626,6 +615,7 @@ mod tests {
 
     use super::*;
     use crate::config::CircuitBreakerConfig;
+    use crate::tools::BashRisk;
 
     fn test_guardrail(consecutive: u32, window_denials: u32) -> Guardrail {
         Guardrail {
@@ -681,16 +671,16 @@ mod tests {
     #[test]
     fn bash_risk_valid_values() {
         assert_eq!(
-            bash_risk(&json!({"risk": "readonly"})),
-            Some("readonly".into())
+            BashRisk::from_value(&json!({"risk": "readonly"})),
+            Some(BashRisk::Readonly)
         );
         assert_eq!(
-            bash_risk(&json!({"risk": "reversible"})),
-            Some("reversible".into())
+            BashRisk::from_value(&json!({"risk": "reversible"})),
+            Some(BashRisk::Reversible)
         );
         assert_eq!(
-            bash_risk(&json!({"risk": "destructive"})),
-            Some("destructive".into())
+            BashRisk::from_value(&json!({"risk": "destructive"})),
+            Some(BashRisk::Destructive)
         );
     }
 
