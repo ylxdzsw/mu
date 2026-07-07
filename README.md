@@ -25,10 +25,8 @@ OpenAI-compatible endpoint, API-key env var, or configured model order.
 Run a single turn by piping a prompt to `mu`, pass a prompt file directly to
 `mu` for file-backed prompts and executable prompt scripts, or source the zsh
 plugin for an integrated shell prompt mode that keeps using the same session
-across turns. The browser UI lives as a standalone Node service in `web/`.
-Arch Linux
-packaging for the current checkout lives in [`PKGBUILD`](PKGBUILD) at the repo
-root.
+across turns. Arch Linux packaging for the current checkout lives in
+[`PKGBUILD`](PKGBUILD) at the repo root.
 
 ## zsh plugin
 
@@ -93,7 +91,7 @@ MU_ZSH_EXIT_HOOKS+=(mu_restore_conflicts)
 | `mu -i image.png` | Attach an image to the turn |
 | `mu --output plain` | Render sequential plain assistant/tool text |
 | `mu --output terminal` | Render sequential interactive terminal output |
-| `mu --output json` | Render newline-delimited JSON events for integrations/web UI |
+| `mu --output json` | Render newline-delimited JSON events for integrations |
 | `mu project init [--path <dir>] [--force]` | Create minimal local `.mu` metadata in the current directory or target directory |
 | `mu status --json [--include-models]` | Report the resolved model, session, context state, and optional configured model list |
 | `mu status --json --include-commands` | Include discovered custom command entries |
@@ -136,33 +134,6 @@ frontmatter containing `name` and `description` is listed as a skill only when
 the name matches the filename stem; legacy `name/SKILL.md` files also qualify
 when the name matches the parent directory. Commands and skills are cached under
 `.mu/cache/` for fast startup.
-
-## Web UI
-
-The browser UI is a standalone Node service in `web/`. It listens on a Unix
-domain socket only; it does not implement browser-facing auth, cookies, OAuth,
-RBAC, CORS, or a documented TCP listener. Put nginx or another trusted reverse
-proxy in front of it for TLS and authentication.
-
-```bash
-npm --prefix web start -- /run/mu-web/mu-web.sock
-```
-
-The socket path is required. The service chmods the socket to `0660`, resolves
-its launch cwd from its own `pwd`, and shells out to `mu` from `PATH`. The
-service entrypoint accepts only that socket-path argument; older flag-style
-startup wrappers such as `--socket` or `--mu-exe` are not supported. For
-systemd deployment, use a checked-in unit like
-[`deploy/mu-web.service`](deploy/mu-web.service), copy it into
-`/etc/systemd/system/` rather than symlinking back into the repo, and keep
-`WorkingDirectory=/root/mu` if you want the browser to default to this repo as
-its launch project. The checked-in unit assumes `mu` is already installed on
-the system and uses `RuntimeDirectory=mu-web` plus
-`RuntimeDirectoryMode=2770` instead of an imperative pre-start directory
-creation command. Streaming turn responses set `X-Accel-Buffering: no`, so
-nginx locations proxying this socket should also disable buffering and caching.
-The browser-side e2e suite also lives in `web/` and can be run with
-`npm --prefix web run test:e2e`.
 
 ## Config
 

@@ -1,7 +1,0 @@
-{
-  "provider": {
-    "base_url": "http://127.0.0.1:65535/v1",
-    "api_key_env": "MU_WEB_E2E_API_KEY"
-  },
-  "default_model": "fake-model"
-}
