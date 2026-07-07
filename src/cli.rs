@@ -5,10 +5,6 @@ use clap::{Args as ClapArgs, Parser, Subcommand, ValueEnum};
 #[derive(Parser, Debug)]
 #[command(name = "mu", about = "Fast terminal agent harness")]
 pub struct Args {
-    /// Mark newly created sessions as coming from a surface
-    #[arg(long, global = true, value_enum, default_value_t = SessionOriginArg::Cli)]
-    pub origin: SessionOriginArg,
-
     #[command(flatten)]
     pub turn: TurnArgs,
 
@@ -115,9 +111,6 @@ pub enum SessionSub {
 
         #[arg(long, default_value_t = 20)]
         limit: usize,
-
-        #[arg(long)]
-        all_origins: bool,
     },
     /// Print a session transcript
     Transcript {
@@ -160,12 +153,6 @@ pub enum ProjectSub {
         #[arg(long)]
         json: bool,
     },
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
-pub enum SessionOriginArg {
-    Cli,
-    Web,
 }
 
 #[cfg(test)]

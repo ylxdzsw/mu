@@ -1,5 +1,4 @@
 use std::path::{Path, PathBuf};
-use std::str::FromStr;
 
 use fs2::FileExt;
 
@@ -17,42 +16,7 @@ pub struct Session {
     pub model: String,
     pub title: Option<String>,
     pub last_total_tokens: u64,
-    pub origin: SessionOrigin,
     pub archived: bool,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "lowercase")]
-pub enum SessionOrigin {
-    Cli,
-    Web,
-}
-
-impl SessionOrigin {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            SessionOrigin::Cli => "cli",
-            SessionOrigin::Web => "web",
-        }
-    }
-}
-
-impl std::fmt::Display for SessionOrigin {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
-
-impl FromStr for SessionOrigin {
-    type Err = anyhow::Error;
-
-    fn from_str(value: &str) -> Result<Self> {
-        match value {
-            "cli" => Ok(SessionOrigin::Cli),
-            "web" => Ok(SessionOrigin::Web),
-            other => bail!("unknown session origin: {other}"),
-        }
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -71,7 +35,6 @@ pub struct SessionSummary {
     pub model: String,
     pub title: Option<String>,
     pub last_total_tokens: u64,
-    pub origin: SessionOrigin,
     pub archived: bool,
     pub message_count: u64,
     pub turn_count: u64,
@@ -324,23 +287,13 @@ impl Store {
         Ok(())
     }
 
-    #[cfg(test)]
     pub fn create_session(&self, cwd: &str, model: &str) -> Result<Session> {
-        self.create_session_with_origin(cwd, model, SessionOrigin::Cli)
-    }
-
-    pub fn create_session_with_origin(
-        &self,
-        cwd: &str,
-        model: &str,
-        origin: SessionOrigin,
-    ) -> Result<Session> {
         let id = Uuid::new_v4().to_string();
         let now = chrono::Utc::now().to_rfc3339();
         self.conn.execute(
             "INSERT INTO session (id, created_at, updated_at, cwd, model, title, last_total_tokens, origin, archived)
-             VALUES (?1, ?2, ?2, ?3, ?4, NULL, 0, ?5, 0)",
-            params![id, now, cwd, model, origin.as_str()],
+             VALUES (?1, ?2, ?2, ?3, ?4, NULL, 0, 'cli', 0)",
+            params![id, now, cwd, model],
         )?;
         Ok(Session {
             id,
@@ -348,27 +301,24 @@ impl Store {
             model: model.into(),
             title: None,
             last_total_tokens: 0,
-            origin,
             archived: false,
         })
     }
 
     pub fn get_session(&self, id: &str) -> Result<Option<Session>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, cwd, model, title, last_total_tokens, origin, archived
+            "SELECT id, cwd, model, title, last_total_tokens, archived
              FROM session WHERE id = ?1",
         )?;
         let row = stmt
             .query_row(params![id], |row| {
-                let origin: String = row.get(5)?;
                 Ok(Session {
                     id: row.get(0)?,
                     cwd: row.get(1)?,
                     model: row.get(2)?,
                     title: row.get(3)?,
                     last_total_tokens: row.get::<_, i64>(4)? as u64,
-                    origin: parse_origin(origin)?,
-                    archived: row.get::<_, i64>(6)? != 0,
+                    archived: row.get::<_, i64>(5)? != 0,
                 })
             })
             .optional()?;
@@ -376,22 +326,13 @@ impl Store {
     }
 
     pub fn list_sessions(&self, limit: usize) -> Result<Vec<(Session, String)>> {
-        self.list_sessions_by_origin(SessionOrigin::Cli, limit)
-    }
-
-    pub fn list_sessions_by_origin(
-        &self,
-        origin: SessionOrigin,
-        limit: usize,
-    ) -> Result<Vec<(Session, String)>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, cwd, model, title, last_total_tokens, origin, archived, updated_at
+            "SELECT id, cwd, model, title, last_total_tokens, archived, updated_at
              FROM session
-             WHERE origin = ?1 AND archived = 0
-             ORDER BY updated_at DESC LIMIT ?2",
+             WHERE archived = 0
+             ORDER BY updated_at DESC LIMIT ?1",
         )?;
-        let rows = stmt.query_map(params![origin.as_str(), limit as i64], |row| {
-            let origin: String = row.get(5)?;
+        let rows = stmt.query_map(params![limit as i64], |row| {
             Ok((
                 Session {
                     id: row.get(0)?,
@@ -399,60 +340,33 @@ impl Store {
                     model: row.get(2)?,
                     title: row.get(3)?,
                     last_total_tokens: row.get::<_, i64>(4)? as u64,
-                    origin: parse_origin(origin)?,
-                    archived: row.get::<_, i64>(6)? != 0,
+                    archived: row.get::<_, i64>(5)? != 0,
                 },
-                row.get::<_, String>(7)?,
+                row.get::<_, String>(6)?,
             ))
         })?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
             .context("listing sessions")
     }
 
-    pub fn list_session_summaries_by_origin(
-        &self,
-        origin: SessionOrigin,
-        limit: usize,
-    ) -> Result<Vec<SessionSummary>> {
-        self.list_session_summaries(Some(origin), limit)
-    }
-
     pub fn list_all_session_summaries(&self, limit: usize) -> Result<Vec<SessionSummary>> {
-        self.list_session_summaries(None, limit)
-    }
-
-    fn list_session_summaries(
-        &self,
-        origin: Option<SessionOrigin>,
-        limit: usize,
-    ) -> Result<Vec<SessionSummary>> {
-        let (where_origin, limit_param) = if origin.is_some() {
-            ("s.origin = ?1 AND s.archived = 0", "?2")
-        } else {
-            ("s.archived = 0", "?1")
-        };
-        let sql = format!(
+        let mut stmt = self.conn.prepare(
             "SELECT
                 s.id, s.created_at, s.updated_at, s.cwd, s.model, s.title,
-                s.last_total_tokens, s.origin, s.archived,
+                s.last_total_tokens, s.archived,
                 COUNT(m.id) AS message_count,
                 COALESCE(SUM(CASE WHEN m.role = 'user' THEN 1 ELSE 0 END), 0) AS user_count
              FROM session s
              LEFT JOIN message m ON m.session_id = s.id
-             WHERE {where_origin}
+             WHERE s.archived = 0
              GROUP BY s.id
-             ORDER BY s.updated_at DESC LIMIT {limit_param}"
-        );
-        let mut stmt = self.conn.prepare(&sql)?;
-        let mut rows = match origin {
-            Some(origin) => stmt.query(params![origin.as_str(), limit as i64])?,
-            None => stmt.query(params![limit as i64])?,
-        };
+             ORDER BY s.updated_at DESC LIMIT ?1",
+        )?;
+        let mut rows = stmt.query(params![limit as i64])?;
         let mut summaries = Vec::new();
         while let Some(row) = rows.next()? {
-            let origin: String = row.get(7)?;
-            let message_count = row.get::<_, i64>(9)? as u64;
-            let user_count = row.get::<_, i64>(10)? as u64;
+            let message_count = row.get::<_, i64>(8)? as u64;
+            let user_count = row.get::<_, i64>(9)? as u64;
             summaries.push(SessionSummary {
                 id: row.get(0)?,
                 created_at: row.get(1)?,
@@ -461,8 +375,7 @@ impl Store {
                 model: row.get(4)?,
                 title: row.get(5)?,
                 last_total_tokens: row.get::<_, i64>(6)? as u64,
-                origin: parse_origin(origin)?,
-                archived: row.get::<_, i64>(8)? != 0,
+                archived: row.get::<_, i64>(7)? != 0,
                 message_count,
                 turn_count: user_count.saturating_sub(1),
             });
@@ -474,7 +387,7 @@ impl Store {
         let mut stmt = self.conn.prepare(
             "SELECT
                 s.id, s.created_at, s.updated_at, s.cwd, s.model, s.title,
-                s.last_total_tokens, s.origin, s.archived,
+                s.last_total_tokens, s.archived,
                 COUNT(m.id) AS message_count,
                 COALESCE(SUM(CASE WHEN m.role = 'user' THEN 1 ELSE 0 END), 0) AS user_count
              FROM session s
@@ -484,9 +397,8 @@ impl Store {
         )?;
         let row = stmt
             .query_row(params![id], |row| {
-                let origin: String = row.get(7)?;
-                let message_count = row.get::<_, i64>(9)? as u64;
-                let user_count = row.get::<_, i64>(10)? as u64;
+                let message_count = row.get::<_, i64>(8)? as u64;
+                let user_count = row.get::<_, i64>(9)? as u64;
                 Ok(SessionSummary {
                     id: row.get(0)?,
                     created_at: row.get(1)?,
@@ -495,8 +407,7 @@ impl Store {
                     model: row.get(4)?,
                     title: row.get(5)?,
                     last_total_tokens: row.get::<_, i64>(6)? as u64,
-                    origin: parse_origin(origin)?,
-                    archived: row.get::<_, i64>(8)? != 0,
+                    archived: row.get::<_, i64>(7)? != 0,
                     message_count,
                     turn_count: user_count.saturating_sub(1),
                 })
@@ -507,20 +418,18 @@ impl Store {
 
     pub fn latest_session(&self) -> Result<Option<Session>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, cwd, model, title, last_total_tokens, origin, archived
-             FROM session ORDER BY updated_at DESC LIMIT 1",
+            "SELECT id, cwd, model, title, last_total_tokens, archived
+             FROM session WHERE archived = 0 ORDER BY updated_at DESC LIMIT 1",
         )?;
         let row = stmt
             .query_row([], |row| {
-                let origin: String = row.get(5)?;
                 Ok(Session {
                     id: row.get(0)?,
                     cwd: row.get(1)?,
                     model: row.get(2)?,
                     title: row.get(3)?,
                     last_total_tokens: row.get::<_, i64>(4)? as u64,
-                    origin: parse_origin(origin)?,
-                    archived: row.get::<_, i64>(6)? != 0,
+                    archived: row.get::<_, i64>(5)? != 0,
                 })
             })
             .optional()?;
@@ -1103,19 +1012,6 @@ fn risk_from_args(args: &str) -> Option<String> {
     matches!(risk, "readonly" | "reversible" | "destructive").then(|| risk.to_string())
 }
 
-fn parse_origin(value: String) -> rusqlite::Result<SessionOrigin> {
-    SessionOrigin::from_str(&value).map_err(|e| {
-        rusqlite::Error::FromSqlConversionFailure(
-            0,
-            rusqlite::types::Type::Text,
-            Box::new(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                e.to_string(),
-            )),
-        )
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1172,27 +1068,30 @@ mod tests {
     }
 
     #[test]
-    fn list_sessions_defaults_to_cli_origin_and_skips_archived() {
+    fn list_sessions_includes_legacy_origins_and_skips_archived() {
         let (store, tmp) = temp_store();
         let cli = store.create_session("/tmp", "cli-model").unwrap();
-        let web = store
-            .create_session_with_origin("/tmp", "web-model", SessionOrigin::Web)
+        store
+            .conn
+            .execute(
+                "INSERT INTO session (id, created_at, updated_at, cwd, model, title, last_total_tokens, origin, archived)
+                 VALUES ('legacy-web', '2026-01-01T00:00:00Z', '2026-01-01T00:00:01Z', '/tmp', 'web-model', NULL, 0, 'web', 0)",
+                [],
+            )
             .unwrap();
         let archived = store.create_session("/tmp", "archived-model").unwrap();
         store.set_session_archived(&archived.id, true).unwrap();
 
         let sessions = store.list_sessions(20).unwrap();
 
-        assert_eq!(sessions.len(), 1);
-        assert_eq!(sessions[0].0.id, cli.id);
-        assert_eq!(sessions[0].0.origin, SessionOrigin::Cli);
-        assert!(!sessions[0].0.archived);
-
-        let web_sessions = store
-            .list_sessions_by_origin(SessionOrigin::Web, 20)
-            .unwrap();
-        assert_eq!(web_sessions.len(), 1);
-        assert_eq!(web_sessions[0].0.id, web.id);
+        let ids = sessions
+            .iter()
+            .map(|(session, _)| session.id.as_str())
+            .collect::<Vec<_>>();
+        assert!(ids.contains(&cli.id.as_str()));
+        assert!(ids.contains(&"legacy-web"));
+        assert!(!ids.contains(&archived.id.as_str()));
+        assert!(sessions.iter().all(|(session, _)| !session.archived));
         let _ = std::fs::remove_dir_all(tmp);
     }
 

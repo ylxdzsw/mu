@@ -222,8 +222,7 @@ small:
 - `mu status --json --include-commands` — include discovered custom command
   names, paths, and scope for shell completion/debugging.
 - `mu session new` — create a session and print its id.
-- `mu session list` — list recent non-archived CLI-origin sessions by default;
-  wrappers may widen this to all origins.
+- `mu session list` — list recent non-archived sessions.
 - `mu session transcript --session <id>` — print a persisted session
   transcript.
 - `mu session archive --session <id>` — hide a session from default lists.
@@ -416,7 +415,7 @@ behavior.
   and may update recent status lines for in-progress activity, but it must keep
   normal scrollback. It must not use an alternate screen, clear the screen, or
   require mouse interaction.
-- **JSON output** is for programs, integrations, and the web UI. It is a
+- **JSON output** is for programs and integrations. It is a
   delimited serialization of the same turn events used by the other output
   formats, suitable for incremental consumers (newline-delimited JSON is the V1
   shape).
@@ -602,9 +601,7 @@ Session lifecycle is exposed through CLI commands:
   plugin to an existing session.
 - `mu -c` continues the latest session in the active scope for a one-shot turn.
 - `mu session new` creates a session and prints its id.
-- `mu session list` lists recent non-archived CLI-origin sessions by default;
-  wrappers may request all origins or explicitly create/list non-CLI-origin
-  sessions.
+- `mu session list` lists recent non-archived sessions.
 - `mu session archive --session <id>` hides a session from default lists without
   deleting it.
 - `mu session unarchive --session <id>` restores an archived session to default
@@ -874,15 +871,15 @@ block each other unnecessarily.
 
 Conceptual schema (flat and small):
 
-- **session** — `id`, `created_at`, `updated_at`, `cwd`, `model`, `origin`,
-  `archived`, `title`,
+- **session** — `id`, `created_at`, `updated_at`, `cwd`, `model`, `archived`,
+  `title`,
   `last_total_tokens` (the most recent `usage.total_tokens` reported by the
   provider; used for the pre-turn overflow check, §"Context window and
-  compaction"). `origin`
-  is `cli` or `web` depending on which surface created the session. `archived`
-  is a boolean listing filter; archived sessions remain resumable by explicit
-  id. `model` is set at session creation from the effective model (lifecycle
-  step 2); a later `--model` overrides for that turn only and does **not**
+  compaction"). `archived` is a boolean listing filter; archived sessions remain
+  resumable by explicit id. Existing databases may still have a legacy `origin`
+  column, but current session listing does not filter by it. `model` is set at
+  session creation from the effective model (lifecycle step 2); a later
+  `--model` overrides for that turn only and does **not**
   rewrite the stored value. `cwd` records the last working directory used for
   that session. `title` is set lazily from the first user prompt (first ~60
   chars) and is display-only for `mu session list`.
@@ -913,7 +910,7 @@ V1 maps each interactive shell instance to at most one active session:
   never printed to stdout by the turn, so the transcript stays clean.
 - **Attach / continue.** `MU_ZSH_SESSION_ID=<id>` seeds the zsh plugin with an
   existing session, while `mu -s <id>` and `mu -c` handle one-shot re-entry from
-  the command line. `mu session list` lists non-archived CLI-origin candidates.
+  the command line. `mu session list` lists non-archived candidates.
 - **Per-turn lifecycle.** Each turn: open DB → acquire session lock → normalize
   any interrupted tail → load session messages → run turn (persisting each
   completed message as it lands) → release lock → exit. The connection opens

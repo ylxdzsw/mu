@@ -32,7 +32,7 @@ mod system_prompt;
 mod tools;
 mod truncate;
 
-use cli::{Args, Command, ProjectSub, SessionOriginArg, SessionSub};
+use cli::{Args, Command, ProjectSub, SessionSub};
 use config::Config;
 use models::RequestOptions;
 use provider::{ContentPart, ImageUrl, UserContent};
@@ -129,13 +129,6 @@ struct ProjectInitInfo {
     already_initialized: bool,
 }
 
-fn session_origin(origin: SessionOriginArg) -> store::SessionOrigin {
-    match origin {
-        SessionOriginArg::Cli => store::SessionOrigin::Cli,
-        SessionOriginArg::Web => store::SessionOrigin::Web,
-    }
-}
-
 fn resolve_existing_dir(base: &Path, path: &Path) -> Result<PathBuf> {
     let path = if path.is_absolute() {
         path.to_path_buf()
@@ -222,7 +215,6 @@ async fn run() -> Result<()> {
     let cwd = std::env::current_dir()?;
     let scope = paths::discover_scope(&cwd);
     let project_config_dir = scope.project().map(|p| p.root.join(".mu"));
-    let origin = session_origin(args.origin);
     let prompt_source = resolve_prompt_source(args.prompt_file, &scope)?;
     let default_turn = args.turn;
 
@@ -269,11 +261,7 @@ async fn run() -> Result<()> {
                             models::first_model_ref(&config)?.canonical
                         }
                     };
-                    let session = store.create_session_with_origin(
-                        &cwd.display().to_string(),
-                        &model,
-                        origin,
-                    )?;
+                    let session = store.create_session(&cwd.display().to_string(), &model)?;
                     store.append_message(
                         &session.id,
                         &provider::Message::User {
@@ -293,11 +281,7 @@ async fn run() -> Result<()> {
                         println!("{}", session.id);
                     }
                 }
-                SessionSub::List {
-                    json,
-                    limit,
-                    all_origins,
-                } => {
+                SessionSub::List { json, limit } => {
                     if !db_path.exists() {
                         if json {
                             println!("[]");
@@ -306,43 +290,15 @@ async fn run() -> Result<()> {
                     }
                     let store = store::Store::open(&db_path)?;
                     if json {
-                        let sessions = if all_origins {
-                            store.list_all_session_summaries(limit)?
-                        } else {
-                            store.list_session_summaries_by_origin(origin, limit)?
-                        };
+                        let sessions = store.list_all_session_summaries(limit)?;
                         println!("{}", serde_json::to_string(&sessions)?);
                         return Ok(());
                     }
-                    if all_origins {
-                        for s in store.list_all_session_summaries(limit)? {
-                            let title = s.title.unwrap_or_else(|| "(untitled)".into());
-                            let origin = if s.origin == store::SessionOrigin::Cli {
-                                String::new()
-                            } else {
-                                format!(" [{}]", s.origin)
-                            };
-                            println!(
-                                "{}  {}  {}{}  {}",
-                                s.id, title, s.model, origin, s.updated_at
-                            );
-                        }
-                        return Ok(());
-                    }
-                    let sessions = if origin == store::SessionOrigin::Cli {
-                        store.list_sessions(limit)?
-                    } else {
-                        store.list_sessions_by_origin(origin, limit)?
-                    };
+                    let sessions = store.list_sessions(limit)?;
                     for (s, updated) in sessions {
                         debug_assert!(!s.archived);
                         let title = s.title.unwrap_or_else(|| "(untitled)".into());
-                        let origin = if s.origin == store::SessionOrigin::Cli {
-                            String::new()
-                        } else {
-                            format!(" [{}]", s.origin)
-                        };
-                        println!("{}  {}  {}{}  {}", s.id, title, s.model, origin, updated);
+                        println!("{}  {}  {}  {}", s.id, title, s.model, updated);
                     }
                 }
                 SessionSub::Transcript { session, json } => {
@@ -515,7 +471,6 @@ async fn run() -> Result<()> {
         &cwd,
         &scope,
         project_config_dir.as_deref(),
-        origin,
         default_turn,
         prompt_source,
     )
@@ -526,7 +481,6 @@ async fn run_turn_from_source(
     cwd: &Path,
     scope: &paths::Scope,
     project_config_dir: Option<&Path>,
-    origin: store::SessionOrigin,
     turn: cli::TurnArgs,
     prompt_source: PromptSource,
 ) -> Result<()> {
@@ -557,7 +511,7 @@ async fn run_turn_from_source(
     let (session, created) = if let Some(session) = resolved.attached_session.clone() {
         (session, false)
     } else {
-        create_seeded_session(&store, cwd, scope.project(), &resolved.session_seed, origin)?
+        create_seeded_session(&store, cwd, scope.project(), &resolved.session_seed)?
     };
     let session_id = session.id.clone();
 
@@ -758,13 +712,8 @@ fn create_seeded_session(
     cwd: &std::path::Path,
     project: Option<&paths::Project>,
     seed: &RequestOptions,
-    origin: store::SessionOrigin,
 ) -> Result<(store::Session, bool)> {
-    let session = store.create_session_with_origin(
-        &cwd.display().to_string(),
-        &seed.model.canonical,
-        origin,
-    )?;
+    let session = store.create_session(&cwd.display().to_string(), &seed.model.canonical)?;
     store.append_message(
         &session.id,
         &provider::Message::User {

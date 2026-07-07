@@ -67,7 +67,6 @@ pub struct StatusSession {
     pub id: String,
     pub title: Option<String>,
     pub cwd: String,
-    pub origin: crate::store::SessionOrigin,
     pub archived: bool,
     pub created_at: String,
     pub updated_at: String,
@@ -228,7 +227,6 @@ fn status_session(summary: crate::store::SessionSummary) -> StatusSession {
         id: summary.id,
         title: summary.title,
         cwd: summary.cwd,
-        origin: summary.origin,
         archived: summary.archived,
         created_at: summary.created_at,
         updated_at: summary.updated_at,
@@ -339,11 +337,7 @@ mod tests {
     fn explicit_model_override_seeds_new_session_with_override() {
         let store = Store::open_memory().unwrap();
         store
-            .create_session_with_origin(
-                "/tmp",
-                "alpha/default-model:high",
-                crate::store::SessionOrigin::Cli,
-            )
+            .create_session("/tmp", "alpha/default-model:high")
             .unwrap();
 
         let resolved = resolve_invocation(
@@ -368,11 +362,7 @@ mod tests {
     fn status_report_reports_cleanliness() {
         let store = Store::open_memory().unwrap();
         let session = store
-            .create_session_with_origin(
-                "/tmp",
-                "alpha/default-model:high",
-                crate::store::SessionOrigin::Cli,
-            )
+            .create_session("/tmp", "alpha/default-model:high")
             .unwrap();
         // A user prompt with no assistant reply => interrupted => unclean.
         store

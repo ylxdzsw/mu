@@ -96,7 +96,7 @@ MU_ZSH_EXIT_HOOKS+=(mu_restore_conflicts)
 | `mu status --json [--include-models]` | Report the resolved model, session, context state, and optional configured model list |
 | `mu status --json --include-commands` | Include discovered custom command entries |
 | `mu session new` | Create session, print id |
-| `mu session list` | List recent non-archived CLI sessions |
+| `mu session list` | List recent non-archived sessions |
 | `mu session archive --session <id>` | Hide a session from default lists |
 | `mu session unarchive --session <id>` | Restore an archived session to default lists |
 | `mu compact --session <id>` | Force compaction |
