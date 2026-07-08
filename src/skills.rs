@@ -684,6 +684,11 @@ mod tests {
         )
         .unwrap();
         fs::write(
+            builtins.join("customize-mu.md"),
+            "---\nname: customize-mu\ndescription: Customize mu.\n---\nUse config files.\n",
+        )
+        .unwrap();
+        fs::write(
             global.join("review.md"),
             "#!/usr/bin/env mu\n---\nname: review\ndescription: Review globally.\n---\nGlobal review.\n",
         )
@@ -697,8 +702,9 @@ mod tests {
         let index =
             scan_instruction_index_with_builtins(Some(&builtins), &global, Some(&project)).unwrap();
 
-        assert_eq!(index.skills.len(), 2);
+        assert_eq!(index.skills.len(), 3);
         assert_eq!(index.skills[0].name, "background-task");
+        assert_eq!(index.skills[1].name, "customize-mu");
         let review = index
             .skills
             .iter()
@@ -719,6 +725,23 @@ mod tests {
         fs::remove_dir_all(builtins).unwrap();
         fs::remove_dir_all(global).unwrap();
         fs::remove_dir_all(project).unwrap();
+    }
+
+    #[test]
+    fn repository_builtins_have_valid_skill_metadata() {
+        let builtins = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("builtins");
+
+        let index = scan_root(&builtins, InstructionScope::Builtin, false).unwrap();
+
+        let names = index
+            .skills
+            .iter()
+            .map(|skill| skill.name.as_str())
+            .collect::<Vec<_>>();
+        assert!(names.contains(&"background-task"));
+        assert!(names.contains(&"customize-mu"));
+        assert!(names.contains(&"subagent"));
+        assert!(!builtins.join(CACHE_RELATIVE_PATH).exists());
     }
 
     fn temp_root(name: &str) -> PathBuf {

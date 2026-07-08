@@ -127,7 +127,10 @@ advisory UI/audit metadata only; it is not a sandbox or approval proof.
 Skill metadata (name + description + path) is injected into the system prompt.
 The agent loads a skill file on demand using `bash` (`sed`, `cat`, `rg`, etc.).
 No dedicated "skill" tool — this keeps the model-visible surface at one tool
-and makes skills "just files".
+and makes skills "just files". Built-in skills live in
+`/usr/share/mu/builtins` at the lowest precedence; shipped built-ins may include
+self-customization guidance such as `customize-mu` or delegation guidance such
+as `subagent`, but user and project instructions can shadow them by name.
 
 ### 2.6 Flat config, single SQLite state file
 
@@ -390,6 +393,11 @@ kernel to send SIGTERM if `mu` dies. On timeout or interrupt, `mu` sends SIGTERM
 to the process group, waits a short grace period, then sends SIGKILL; if group
 signaling fails it falls back to killing the direct child. Ordinary commands are
 expected not to outlive the tool call.
+
+For recursive `mu` delegation, the bash tool sets `MU_SUBAGENT_DEPTH` to one
+more than the current process depth. Normal management commands still work at
+any depth, but recursive agent turns are rejected once the process environment
+reports depth greater than `1`.
 
 `timeout` defaults to 120 seconds and must be greater than zero. `mu` does not
 pre-check command argv size; if `bash -lc <command>` fails with OS

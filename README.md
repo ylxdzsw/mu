@@ -63,7 +63,10 @@ Built-in command and skill files are loaded from `/usr/share/mu/builtins` with
 the lowest priority: project instructions shadow user instructions, and user
 instructions shadow built-ins with the same name. This directory is
 instruction-only; runtime state and `config.jsonc` still live under the normal
-global or project `.mu` directories.
+global or project `.mu` directories. Shipped built-in skills include
+`background-task` for persistent foreground-test services, `customize-mu` for
+editing `mu` config, commands, skills, and instruction precedence, and
+`subagent` for delegating independent work to fresh `mu` turns.
 
 While `mu>` mode is active, the plugin automatically suspends common editor
 helpers such as `zsh-syntax-highlighting` and `zsh-autosuggestions`, then

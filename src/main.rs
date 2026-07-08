@@ -39,6 +39,8 @@ use provider::{Provider, build_provider};
 use renderer::Renderer;
 use runtime::{InvocationOverrides, StatusReport, build_status_report, resolve_invocation};
 
+const MAX_SUBAGENT_TURN_DEPTH: u32 = 1;
+
 enum PromptSource {
     Stdin,
     File(PathBuf),
@@ -133,6 +135,13 @@ fn exit_session_busy(output: cli::OutputFormat) -> ! {
         eprintln!("session busy");
     }
     process::exit(2);
+}
+
+fn ensure_subagent_turn_allowed(depth: u32) -> Result<()> {
+    if depth > MAX_SUBAGENT_TURN_DEPTH {
+        bail!("subagent recursion depth exceeded: {depth} (maximum {MAX_SUBAGENT_TURN_DEPTH})");
+    }
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -353,6 +362,7 @@ async fn run() -> Result<()> {
             return Ok(());
         }
         Some(Command::Retry(retry_args)) => {
+            ensure_subagent_turn_allowed(bash::subagent_depth_from_env())?;
             let config = Config::load_for_scope(project_config_dir.as_deref())?;
 
             paths::ensure_project_layout(&scope)?;
@@ -444,6 +454,7 @@ async fn run() -> Result<()> {
         None => {}
     }
 
+    ensure_subagent_turn_allowed(bash::subagent_depth_from_env())?;
     run_turn_from_source(
         &cwd,
         &scope,
@@ -900,5 +911,16 @@ mod tests {
         bash::reset_cancellation_state();
         let err = anyhow::anyhow!("something went wrong");
         assert_eq!(exit_code_for(&err), 1);
+    }
+
+    #[test]
+    fn subagent_turn_guard_rejects_grandchild_turns() {
+        assert!(ensure_subagent_turn_allowed(0).is_ok());
+        assert!(ensure_subagent_turn_allowed(1).is_ok());
+        let err = ensure_subagent_turn_allowed(2).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("subagent recursion depth exceeded")
+        );
     }
 }

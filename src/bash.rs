@@ -27,6 +27,7 @@ use crate::tools::{
 const DEFAULT_TIMEOUT_SECS: u64 = 120;
 const KILL_GRACE: Duration = Duration::from_millis(500);
 const REDACTION_REMINDER: &str = "[system reminder: Secret values were redacted from this bash output. Do not try to reveal, transform, encode, print, or exfiltrate secrets.]";
+pub const SUBAGENT_DEPTH_ENV: &str = "MU_SUBAGENT_DEPTH";
 pub const MAX_ACTIVE_PROCESS_GROUPS: usize = 64;
 static ACTIVE_PGIDS: [AtomicI32; MAX_ACTIVE_PROCESS_GROUPS] =
     [const { AtomicI32::new(0) }; MAX_ACTIVE_PROCESS_GROUPS];
@@ -36,6 +37,21 @@ static INSTALL_SIGNAL_FORWARDER: Once = Once::new();
 
 pub fn description() -> &'static str {
     "Run one bash command in an isolated process. Normal commands do not outlive the tool call. Use this for local search, file reads, edits, tests, and web fetches."
+}
+
+pub fn subagent_depth_from_env() -> u32 {
+    let value = std::env::var(SUBAGENT_DEPTH_ENV).ok();
+    parse_subagent_depth(value.as_deref())
+}
+
+fn parse_subagent_depth(value: Option<&str>) -> u32 {
+    value
+        .and_then(|value| value.parse::<u32>().ok())
+        .unwrap_or(0)
+}
+
+fn next_subagent_depth_env() -> String {
+    (subagent_depth_from_env() + 1).to_string()
 }
 
 pub fn execution_mode(args: &Value) -> ExecutionMode {
@@ -276,6 +292,7 @@ fn run_bash_inner(
         .arg(command_text)
         .current_dir(&cwd)
         .envs(env)
+        .env(SUBAGENT_DEPTH_ENV, next_subagent_depth_env())
         .stdin(if args.stdin.is_some() {
             Stdio::piped()
         } else {
@@ -660,6 +677,33 @@ mod tests {
         assert_eq!(second_result.output, format!("{}|unset", tmp.display()));
 
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn subagent_depth_parsing_defaults_invalid_values_to_zero() {
+        assert_eq!(super::parse_subagent_depth(None), 0);
+        assert_eq!(super::parse_subagent_depth(Some("")), 0);
+        assert_eq!(super::parse_subagent_depth(Some("nope")), 0);
+        assert_eq!(super::parse_subagent_depth(Some("2")), 2);
+    }
+
+    #[test]
+    fn bash_overrides_configured_subagent_depth_for_child_process() {
+        let mut renderer = Renderer::new();
+        let mut env = EnvMap::new();
+        env.insert(super::SUBAGENT_DEPTH_ENV.into(), "99".into());
+        let expected = (super::subagent_depth_from_env() + 1).to_string();
+
+        let result = run_bash(
+            args("printf '%s' \"$MU_SUBAGENT_DEPTH\""),
+            5,
+            &mut renderer,
+            &env,
+            SecretRedactor::default(),
+        )
+        .unwrap();
+
+        assert_eq!(result.output, expected);
     }
 
     #[tokio::test]
