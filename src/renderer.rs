@@ -2,7 +2,7 @@ use std::io::{self, IsTerminal, Write};
 use std::time::{Duration, Instant};
 
 use pulldown_cmark::{Alignment, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
-use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+use unicode_width::UnicodeWidthStr;
 
 use crate::cli::OutputFormat;
 use crate::tools::ToolDisplay;
@@ -112,8 +112,7 @@ impl Renderer {
                 self.ensure_block_separator_if_needed()?;
                 self.assistant_block_open = true;
             }
-            let rendered = render_markdown(&block);
-            self.write_committed(&rendered)?;
+            self.write_committed(&block)?;
         }
         self.render_live_line()
     }
@@ -126,16 +125,18 @@ impl Renderer {
             self.assistant_block_open = false;
             return Ok(());
         }
-        let Some(block) = self.markdown.finish() else {
+        let blocks = self.markdown.finish();
+        if blocks.is_empty() {
             self.assistant_block_open = false;
             return Ok(());
-        };
+        }
         if self.styled && !self.assistant_block_open {
             self.ensure_block_separator_if_needed()?;
         }
         self.assistant_block_open = false;
-        let rendered = render_markdown(&block);
-        self.write_committed(&rendered)?;
+        for rendered in blocks {
+            self.write_committed(&rendered)?;
+        }
         self.render_live_line()
     }
 
@@ -718,7 +719,16 @@ impl Default for Renderer {
 
 #[derive(Default)]
 struct MarkdownStream {
-    pending: String,
+    pending_line: String,
+    code_fence: Option<FenceState>,
+    table_candidate: Option<String>,
+    table_buffer: Option<String>,
+}
+
+#[derive(Clone, Copy)]
+struct FenceState {
+    kind: char,
+    width: usize,
 }
 
 #[derive(Clone, Copy)]
@@ -752,63 +762,194 @@ struct BashPreviewSnapshot {
 
 impl MarkdownStream {
     fn push(&mut self, text: &str) -> Vec<String> {
-        self.pending.push_str(text);
-        let stable = stable_markdown_prefix(&self.pending);
-        if stable == 0 {
-            return Vec::new();
+        let mut out = Vec::new();
+        self.pending_line.push_str(text);
+        while let Some(newline) = self.pending_line.find('\n') {
+            let line = self.pending_line[..=newline].to_string();
+            self.pending_line.replace_range(..=newline, "");
+            self.push_complete_line(&line, &mut out);
         }
-        let rest = self.pending.split_off(stable);
-        let block = std::mem::replace(&mut self.pending, rest);
-        vec![block]
+        out
     }
 
-    fn finish(&mut self) -> Option<String> {
-        if self.pending.is_empty() {
-            return None;
+    fn finish(&mut self) -> Vec<String> {
+        let mut out = Vec::new();
+        if !self.pending_line.is_empty() {
+            let line = std::mem::take(&mut self.pending_line);
+            self.push_line(&line, false, &mut out);
         }
-        Some(std::mem::take(&mut self.pending))
+        self.flush_table_candidate(&mut out);
+        self.flush_table_buffer(&mut out);
+        if self.code_fence.take().is_some() {
+            out.push(RESET.to_string());
+        }
+        out
     }
-}
 
-fn stable_markdown_prefix(text: &str) -> usize {
-    let mut stable = 0;
-    let mut offset = 0;
-    let mut fence: Option<(char, usize)> = None;
+    fn push_complete_line(&mut self, line: &str, out: &mut Vec<String>) {
+        self.push_line(line, true, out);
+    }
 
-    for line in text.split_inclusive('\n') {
-        if !line.ends_with('\n') {
-            break;
-        }
-        offset += line.len();
-        let trimmed = line.trim();
-        let marker = fence_marker(trimmed);
-
-        if let Some((kind, width)) = fence {
-            if marker.is_some_and(|(next, count)| next == kind && count >= width) {
-                fence = None;
-                stable = offset;
+    fn push_line(&mut self, line: &str, complete: bool, out: &mut Vec<String>) {
+        if let Some(fence) = self.code_fence {
+            if complete && is_closing_fence(line, fence) {
+                self.code_fence = None;
+                out.push(format!("{RESET}\n"));
+            } else {
+                out.push(line.to_string());
             }
-            continue;
+            return;
         }
 
-        if let Some(next) = marker {
-            fence = Some(next);
-            continue;
+        if let Some(fence) = opening_fence(line) {
+            self.flush_table_candidate(out);
+            self.flush_table_buffer(out);
+            self.code_fence = Some(fence);
+            out.push(
+                code_block_styles()
+                    .iter()
+                    .map(|style| style.ansi())
+                    .collect::<String>(),
+            );
+            return;
         }
-        if trimmed.is_empty() || is_single_line_block(trimmed) {
-            stable = offset;
+
+        if self.table_buffer.is_some() {
+            if complete && is_table_row_like(line) {
+                self.table_buffer.as_mut().unwrap().push_str(line);
+                return;
+            }
+            self.flush_table_buffer(out);
+            self.push_line(line, complete, out);
+            return;
+        }
+
+        if let Some(candidate) = self.table_candidate.take() {
+            if complete && is_table_delimiter_line(line) {
+                let mut table = candidate;
+                table.push_str(line);
+                self.table_buffer = Some(table);
+                return;
+            }
+            self.push_non_table_line(&candidate, true, out);
+            self.push_line(line, complete, out);
+            return;
+        }
+
+        if complete && is_table_candidate_line(line) {
+            self.table_candidate = Some(line.to_string());
+            return;
+        }
+
+        self.push_non_table_line(line, complete, out);
+    }
+
+    fn push_non_table_line(&mut self, line: &str, complete: bool, out: &mut Vec<String>) {
+        if line.trim().is_empty() {
+            out.push(line.to_string());
+            return;
+        }
+        if is_single_line_block(line.trim()) {
+            out.push(render_single_line_block(line));
+            return;
+        }
+        if let Some(rendered) = render_list_line(line, complete) {
+            out.push(rendered);
+            return;
+        }
+        if let Some(rendered) = render_block_quote_line(line, complete) {
+            out.push(rendered);
+            return;
+        }
+        out.push(render_inline_or_raw_line(line, complete));
+    }
+
+    fn flush_table_candidate(&mut self, out: &mut Vec<String>) {
+        if let Some(candidate) = self.table_candidate.take() {
+            self.push_non_table_line(&candidate, true, out);
         }
     }
-    stable
+
+    fn flush_table_buffer(&mut self, out: &mut Vec<String>) {
+        if let Some(table) = self.table_buffer.take() {
+            out.push(render_markdown(&table));
+        }
+    }
 }
 
-fn fence_marker(line: &str) -> Option<(char, usize)> {
+fn fence_marker(line: &str) -> Option<FenceState> {
     let first = line.chars().next()?;
     if first != '`' && first != '~' {
         return None;
     }
     let count = line.chars().take_while(|ch| *ch == first).count();
-    (count >= 3).then_some((first, count))
+    (count >= 3).then_some(FenceState {
+        kind: first,
+        width: count,
+    })
+}
+
+fn opening_fence(line: &str) -> Option<FenceState> {
+    let trimmed = line.trim_start();
+    let leading = line.len().saturating_sub(trimmed.len());
+    if leading > 3 {
+        return None;
+    }
+    fence_marker(trimmed.trim_end())
+}
+
+fn is_closing_fence(line: &str, fence: FenceState) -> bool {
+    let trimmed = line.trim();
+    let Some(closing) = closing_fence_marker(trimmed) else {
+        return false;
+    };
+    closing.kind == fence.kind && closing.width >= fence.width
+}
+
+fn closing_fence_marker(line: &str) -> Option<FenceState> {
+    let first = line.chars().next()?;
+    if first != '`' && first != '~' {
+        return None;
+    }
+    let count = line.chars().take_while(|ch| *ch == first).count();
+    if count < 3 || !line[count..].trim().is_empty() {
+        return None;
+    }
+    Some(FenceState {
+        kind: first,
+        width: count,
+    })
+}
+
+fn is_table_row_like(line: &str) -> bool {
+    let trimmed = line.trim();
+    trimmed.contains('|') && !trimmed.is_empty()
+}
+
+fn is_table_candidate_line(line: &str) -> bool {
+    if !is_table_row_like(line) {
+        return false;
+    }
+    let (body, _) = split_line_ending(line);
+    let trimmed = body.trim_start_matches(' ');
+    !is_single_line_block(trimmed)
+        && parse_list_marker(trimmed).is_none()
+        && !trimmed.starts_with('>')
+}
+
+fn is_table_delimiter_line(line: &str) -> bool {
+    let trimmed = line.trim().trim_matches('|').trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    trimmed.split('|').all(|cell| {
+        let cell = cell.trim();
+        let hyphens = cell.chars().filter(|ch| *ch == '-').count();
+        hyphens >= 3
+            && cell
+                .chars()
+                .all(|ch| ch == '-' || ch == ':' || ch.is_whitespace())
+    })
 }
 
 fn is_single_line_block(line: &str) -> bool {
@@ -820,6 +961,243 @@ fn is_single_line_block(line: &str) -> bool {
             .into_iter()
             .any(|mark| line.chars().all(|ch| ch == mark || ch.is_whitespace()));
     heading || rule
+}
+
+fn render_single_line_block(line: &str) -> String {
+    if let Some((level, content)) = parse_heading_line(line) {
+        let Some(rendered) = render_inline_markdown(content) else {
+            return line.to_string();
+        };
+        let mut out = String::new();
+        let mut styles = Vec::new();
+        push_styles(&mut out, &mut styles, heading_styles(level));
+        out.push_str(&rendered);
+        out.push_str(RESET);
+        out.push_str("\n\n");
+        return out;
+    }
+    render_markdown(line)
+}
+
+fn parse_heading_line(line: &str) -> Option<(HeadingLevel, &str)> {
+    let (body, _) = split_line_ending(line);
+    let trimmed = body.trim_start_matches(' ');
+    let leading = body.len().saturating_sub(trimmed.len());
+    if leading > 3 {
+        return None;
+    }
+    let width = trimmed.chars().take_while(|ch| *ch == '#').count();
+    if width == 0 || width > 6 {
+        return None;
+    }
+    let rest = &trimmed[width..];
+    if !rest.is_empty() && !rest.starts_with(char::is_whitespace) {
+        return None;
+    }
+    let content = trim_heading_closer(rest.trim());
+    let level = match width {
+        1 => HeadingLevel::H1,
+        2 => HeadingLevel::H2,
+        3 => HeadingLevel::H3,
+        4 => HeadingLevel::H4,
+        5 => HeadingLevel::H5,
+        6 => HeadingLevel::H6,
+        _ => return None,
+    };
+    Some((level, content))
+}
+
+fn trim_heading_closer(content: &str) -> &str {
+    let Some((closer_start, _)) = content.char_indices().rev().find(|(_, ch)| *ch != '#') else {
+        return "";
+    };
+    if closer_start + 1 == content.len() {
+        return content;
+    }
+    let before_closer = &content[..=closer_start];
+    if before_closer.ends_with(char::is_whitespace) {
+        before_closer.trim_end()
+    } else {
+        content
+    }
+}
+
+fn split_line_ending(line: &str) -> (&str, &str) {
+    line.strip_suffix('\n')
+        .map(|body| (body, "\n"))
+        .unwrap_or((line, ""))
+}
+
+fn render_inline_or_raw_line(line: &str, complete: bool) -> String {
+    let (body, ending) = split_line_ending(line);
+    render_inline_markdown(body)
+        .map(|rendered| format!("{rendered}{ending}"))
+        .unwrap_or_else(|| {
+            if complete {
+                line.to_string()
+            } else {
+                body.to_string()
+            }
+        })
+}
+
+fn render_list_line(line: &str, complete: bool) -> Option<String> {
+    let (body, ending) = split_line_ending(line);
+    let trimmed = body.trim_start_matches(' ');
+    let indent = body.len().saturating_sub(trimmed.len());
+    let (marker, rest) = parse_list_marker(trimmed)?;
+    let (task, rest) = parse_task_marker(rest);
+    let rendered = render_inline_markdown(rest)?;
+
+    let mut out = String::new();
+    out.push_str(&"  ".repeat(indent / 2));
+    out.push_str(&marker);
+    if let Some(task) = task {
+        out.push_str(task);
+    }
+    out.push_str(&rendered);
+    if complete {
+        out.push_str(ending);
+    }
+    Some(out)
+}
+
+fn parse_list_marker(line: &str) -> Option<(String, &str)> {
+    let mut chars = line.char_indices();
+    let (_, first) = chars.next()?;
+    if matches!(first, '-' | '+' | '*') {
+        let (idx, next) = chars.next()?;
+        if next.is_whitespace() {
+            return Some(("• ".to_string(), line[idx + next.len_utf8()..].trim_start()));
+        }
+        return None;
+    }
+
+    let digit_end = line
+        .char_indices()
+        .take_while(|(_, ch)| ch.is_ascii_digit())
+        .last()
+        .map(|(idx, ch)| idx + ch.len_utf8())?;
+    if digit_end == 0 {
+        return None;
+    }
+    let mut rest = line[digit_end..].char_indices();
+    let (_, delimiter) = rest.next()?;
+    if delimiter != '.' && delimiter != ')' {
+        return None;
+    }
+    let (space_idx, space) = rest.next()?;
+    if !space.is_whitespace() {
+        return None;
+    }
+    let number = &line[..digit_end];
+    Some((
+        format!("{number}. "),
+        line[digit_end + space_idx + space.len_utf8()..].trim_start(),
+    ))
+}
+
+fn parse_task_marker(text: &str) -> (Option<&'static str>, &str) {
+    for (raw, rendered) in [("[ ] ", "[ ] "), ("[x] ", "[✓] "), ("[X] ", "[✓] ")] {
+        if let Some(rest) = text.strip_prefix(raw) {
+            return (Some(rendered), rest);
+        }
+    }
+    (None, text)
+}
+
+fn render_block_quote_line(line: &str, complete: bool) -> Option<String> {
+    let (body, ending) = split_line_ending(line);
+    let mut rest = body.trim_start_matches(' ');
+    let leading = body.len().saturating_sub(rest.len());
+    if leading > 3 {
+        return None;
+    }
+
+    let mut depth = 0usize;
+    while let Some(after_marker) = rest.strip_prefix('>') {
+        depth += 1;
+        rest = after_marker.strip_prefix(' ').unwrap_or(after_marker);
+    }
+    if depth == 0 {
+        return None;
+    }
+
+    let rendered = render_inline_markdown(rest)?;
+    let mut out = String::new();
+    out.push_str(DIM);
+    out.push_str(&"│ ".repeat(depth));
+    out.push_str(&rendered);
+    out.push_str(RESET);
+    if complete {
+        out.push_str(ending);
+    }
+    Some(out)
+}
+
+fn render_inline_markdown(markdown: &str) -> Option<String> {
+    let options = Options::ENABLE_STRIKETHROUGH;
+    let parser = Parser::new_ext(markdown, options);
+    let mut out = String::new();
+    let mut styles: Vec<MdStyle> = Vec::new();
+    let mut links: Vec<String> = Vec::new();
+
+    for event in parser {
+        match event {
+            Event::Start(tag) => match tag {
+                Tag::Paragraph => {}
+                Tag::Emphasis => push_styles(&mut out, &mut styles, emphasis_styles()),
+                Tag::Strong => push_styles(&mut out, &mut styles, strong_styles()),
+                Tag::Strikethrough => push_style(&mut out, &mut styles, MdStyle::Strike),
+                Tag::Link { dest_url, .. } => {
+                    links.push(dest_url.to_string());
+                    push_styles(&mut out, &mut styles, link_styles());
+                    out.push_str(&open_hyperlink(&dest_url));
+                }
+                _ => return None,
+            },
+            Event::End(tag) => match tag {
+                TagEnd::Paragraph => {}
+                TagEnd::Emphasis => pop_styles(&mut out, &mut styles, emphasis_styles().len()),
+                TagEnd::Strong => pop_styles(&mut out, &mut styles, strong_styles().len()),
+                TagEnd::Strikethrough => pop_style(&mut out, &mut styles),
+                TagEnd::Link => {
+                    out.push_str(OSC8_CLOSE);
+                    pop_styles(&mut out, &mut styles, link_styles().len());
+                    let url = links.pop()?;
+                    out.push_str(DIM);
+                    out.push_str(" (");
+                    out.push_str(&hyperlink_text(&url, &url));
+                    out.push(')');
+                    out.push_str(RESET);
+                    for style in &styles {
+                        out.push_str(style.ansi());
+                    }
+                }
+                _ => return None,
+            },
+            Event::Text(text) => out.push_str(&text),
+            Event::Code(code) => {
+                for style in inline_code_styles() {
+                    out.push_str(style.ansi());
+                }
+                out.push_str(&code);
+                out.push_str(RESET);
+                for style in &styles {
+                    out.push_str(style.ansi());
+                }
+            }
+            Event::SoftBreak | Event::HardBreak => out.push('\n'),
+            Event::Html(html) | Event::InlineHtml(html) => out.push_str(&html),
+            _ => return None,
+        }
+    }
+
+    if styles.is_empty() && links.is_empty() {
+        Some(out)
+    } else {
+        None
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -1724,6 +2102,7 @@ mod tests {
     use std::time::Duration;
 
     use serde_json::json;
+    use unicode_width::UnicodeWidthChar;
 
     use super::*;
 
@@ -1745,6 +2124,119 @@ mod tests {
         assert_table_grid_aligned(&strip_ansi(&rendered));
     }
 
+    #[test]
+    fn markdown_stream_streams_list_items_line_by_line() {
+        let mut stream = MarkdownStream::default();
+
+        let first = stream.push("- one\n").concat();
+        assert_eq!(strip_ansi(&first), "• one\n");
+        let second = stream.push("  - two\n").concat();
+        assert_eq!(strip_ansi(&second), "  • two\n");
+        let task = stream.push("- [x] done\n").concat();
+        assert_eq!(strip_ansi(&task), "• [✓] done\n");
+        let pipe = stream.push("- a | b\n").concat();
+        assert_eq!(strip_ansi(&pipe), "• a | b\n");
+    }
+
+    #[test]
+    fn markdown_stream_streams_fenced_code_without_fence_markers() {
+        let mut stream = MarkdownStream::default();
+
+        let open = stream.push("```sh\n").concat();
+        assert!(open.contains(GREEN), "{open:?}");
+        assert!(!open.contains("```"), "{open:?}");
+        let body = stream.push("echo hi\n").concat();
+        assert_eq!(strip_ansi(&body), "echo hi\n");
+        let close = stream.push("```\n").concat();
+        assert_eq!(strip_ansi(&close), "\n");
+        assert!(!close.contains("```"), "{close:?}");
+    }
+
+    #[test]
+    fn markdown_stream_buffers_tables_until_table_ends() {
+        let mut stream = MarkdownStream::default();
+
+        assert_eq!(stream.push("| Name | Value |\n").concat(), "");
+        assert_eq!(stream.push("| --- | ---: |\n").concat(), "");
+        assert_eq!(stream.push("| a | 1 |\n").concat(), "");
+        let rendered = stream.push("\n").concat();
+        let plain = strip_ansi(&rendered);
+        assert!(plain.contains("| Name | Value |"), "{plain:?}");
+        assert!(plain.contains("| a    |     1 |"), "{plain:?}");
+        assert_table_grid_aligned(&plain);
+    }
+
+    #[test]
+    fn markdown_stream_releases_non_table_pipe_lines_as_raw_markdown() {
+        let mut stream = MarkdownStream::default();
+
+        assert_eq!(stream.push("a | b\n").concat(), "");
+        let rendered = stream.push("next\n").concat();
+        assert_eq!(strip_ansi(&rendered), "a | b\nnext\n");
+    }
+
+    #[test]
+    fn markdown_stream_buffers_inline_links_until_line_is_complete() {
+        let mut stream = MarkdownStream::default();
+
+        assert_eq!(stream.push("[docs](").concat(), "");
+        let rendered = stream.push("https://example.com)\n").concat();
+        assert!(rendered.contains(&open_hyperlink("https://example.com")));
+        assert!(rendered.contains("docs"));
+        assert!(rendered.contains("https://example.com"));
+    }
+
+    #[test]
+    fn markdown_stream_outputs_unsupported_inline_markdown_raw() {
+        let mut stream = MarkdownStream::default();
+
+        let rendered = stream.push("![alt](image.png)\n").concat();
+        assert_eq!(rendered, "![alt](image.png)\n");
+        let heading = stream.push("# ![alt](image.png)\n").concat();
+        assert_eq!(heading, "# ![alt](image.png)\n");
+    }
+
+    #[test]
+    fn markdown_stream_only_closes_fences_with_plain_closing_markers() {
+        let mut stream = MarkdownStream::default();
+
+        let rendered = [
+            stream.push("```rust\n").concat(),
+            stream.push("```not-a-close\n").concat(),
+            stream.push("```\n").concat(),
+        ]
+        .concat();
+        let plain = strip_ansi(&rendered);
+        assert!(plain.contains("```not-a-close\n"), "{plain:?}");
+        assert!(!plain.contains("```rust"), "{plain:?}");
+    }
+
+    #[test]
+    fn terminal_markdown_streaming_commits_only_stable_constructs() {
+        let raw = capture_markdown_stream_pty_transcript();
+        let normalized = strip_ansi(&raw.replace('\r', ""));
+
+        assert!(
+            normalized.contains("• one\n<after-list>\n"),
+            "{normalized:?}"
+        );
+        assert!(
+            normalized.contains("echo hi\n<after-code-body>\n"),
+            "{normalized:?}"
+        );
+        assert!(!normalized.contains("```"), "{normalized:?}");
+
+        let after_table_row = normalized
+            .find("<after-table-row>")
+            .expect("table-row marker missing");
+        let table = normalized.find("| Name | Value |").expect("table missing");
+        let after_table_flush = normalized
+            .find("<after-table-flush>")
+            .expect("table-flush marker missing");
+        assert!(after_table_row < table, "{normalized:?}");
+        assert!(table < after_table_flush, "{normalized:?}");
+    }
+
     fn assert_table_grid_aligned(rendered: &str) {
         let table_lines = rendered
             .lines()
@@ -1757,6 +2249,76 @@ mod tests {
         for line in table_lines {
             assert_eq!(bar_columns(line), first_bar_columns, "{rendered:?}");
             assert_eq!(UnicodeWidthStr::width(line), first_width, "{rendered:?}");
+        }
+    }
+
+    fn capture_markdown_stream_pty_transcript() -> String {
+        let _guard = pty_test_lock().lock().unwrap();
+        let mut master: RawFd = -1;
+        let mut slave: RawFd = -1;
+        unsafe {
+            assert_eq!(
+                libc::openpty(
+                    &mut master,
+                    &mut slave,
+                    std::ptr::null_mut(),
+                    std::ptr::null(),
+                    std::ptr::null(),
+                ),
+                0
+            );
+            let pid = libc::fork();
+            assert!(pid >= 0);
+            if pid == 0 {
+                libc::close(master);
+                assert_eq!(libc::dup2(slave, libc::STDOUT_FILENO), libc::STDOUT_FILENO);
+                assert_eq!(libc::dup2(slave, libc::STDERR_FILENO), libc::STDERR_FILENO);
+                if slave > libc::STDERR_FILENO {
+                    libc::close(slave);
+                }
+
+                let mut renderer = Renderer::with_format(OutputFormat::Terminal);
+                renderer.assistant_text("- one\n").unwrap();
+                write_raw_stdout("<after-list>\n");
+                renderer.assistant_text("```sh\n").unwrap();
+                renderer.assistant_text("echo hi\n").unwrap();
+                write_raw_stdout("<after-code-body>\n");
+                renderer.assistant_text("```\n").unwrap();
+                renderer.assistant_text("| Name | Value |\n").unwrap();
+                renderer.assistant_text("| --- | ---: |\n").unwrap();
+                renderer.assistant_text("| a | 1 |\n").unwrap();
+                write_raw_stdout("<after-table-row>\n");
+                renderer.assistant_text("\n").unwrap();
+                write_raw_stdout("<after-table-flush>\n");
+                libc::_exit(0);
+            }
+
+            libc::close(slave);
+            let mut out = Vec::new();
+            let mut buf = [0u8; 4096];
+            loop {
+                let n = libc::read(master, buf.as_mut_ptr().cast(), buf.len());
+                if n <= 0 {
+                    break;
+                }
+                out.extend_from_slice(&buf[..n as usize]);
+            }
+            libc::close(master);
+            let mut status = 0;
+            assert_eq!(libc::waitpid(pid, &mut status, 0), pid);
+            assert!(libc::WIFEXITED(status));
+            assert_eq!(libc::WEXITSTATUS(status), 0);
+            String::from_utf8_lossy(&out).into_owned()
+        }
+    }
+
+    fn write_raw_stdout(text: &str) {
+        let bytes = text.as_bytes();
+        unsafe {
+            assert_eq!(
+                libc::write(libc::STDOUT_FILENO, bytes.as_ptr().cast(), bytes.len()),
+                bytes.len() as isize
+            );
         }
     }
 

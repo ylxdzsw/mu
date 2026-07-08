@@ -431,15 +431,17 @@ format. It may style output only when stdout is a TTY and `--output terminal` is
 selected. It never clears the screen, uses an alternate screen, or requires
 mouse interaction. Plain output is always ANSI-free.
 
-Assistant Markdown is parsed on TTYs. The renderer buffers only the current
-unstable Markdown block, commits completed blocks once, and flushes the tail at
-the response boundary. Headings, emphasis, links, lists, quotes, tables, inline
-code, and fenced code receive terminal styling without modifying prior output.
-Markdown tables are buffered until the table is complete enough to align and
-commit once; fenced code keeps pipes isolated so code fences do not become
-tables. When stdout is piped or redirected, assistant deltas pass through
-byte-for-byte as the model produced them, preserving raw Markdown for
-downstream consumers.
+Assistant Markdown is parsed on TTYs. The renderer commits only output whose
+terminal representation is stable: ordinary prose, headings, quotes, and list
+items stream line-by-line; inline links and inline styling wait for the current
+line/span to complete; fenced code starts terminal code styling at the opening
+fence, streams code lines without printing fence markers, and resets styling at
+the closing fence or response boundary. Markdown tables are buffered until the
+table is complete enough to align and commit once, so columns never require
+rewriting prior output. Markdown features outside this supported terminal subset
+are emitted as raw Markdown rather than partially rendered. When stdout is piped
+or redirected, assistant deltas pass through byte-for-byte as the model produced
+them, preserving raw Markdown for downstream consumers.
 
 ### 5.1 TTY block-spacing contract
 
@@ -489,8 +491,10 @@ stderr TTY detection suppresses the summary when redirected.
   time in original tool order; later calls may already be running, but their
   headers and execution output are buffered until they become the active slot.
 - **Assistant text.** `plain` and redirected output stream raw Markdown deltas
-  unchanged. TTY `terminal` display commits parsed Markdown blocks as soon as
-  they are stable; only the current incomplete block is delayed.
+  unchanged. TTY `terminal` display commits parsed Markdown as soon as the
+  relevant unit is stable: most text/list/code lines stream immediately, inline
+  spans wait for completion, tables wait for the complete table, and unsupported
+  Markdown stays raw.
 - **Errors.** Always printed and clearly prefixed, with TTY styling when
   available. Fatal turn failure produces a non-zero process exit code so the
   shell's `$?` is meaningful.
