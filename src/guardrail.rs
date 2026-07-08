@@ -706,7 +706,7 @@ mod tests {
         ];
         let action = serde_json::json!({
             "tool": "bash",
-            "script": "rm -rf /data",
+            "command": "rm -rf /data",
             "risk": "destructive"
         });
 

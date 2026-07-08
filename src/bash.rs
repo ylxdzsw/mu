@@ -35,7 +35,7 @@ static LAST_SIGNAL: AtomicI32 = AtomicI32::new(0);
 static INSTALL_SIGNAL_FORWARDER: Once = Once::new();
 
 pub fn description() -> &'static str {
-    "Run one bash script in an isolated process. Use this for local search, file reads, edits, tests, and web fetches."
+    "Run one bash command in an isolated process. Normal commands do not outlive the tool call. Use this for local search, file reads, edits, tests, and web fetches."
 }
 
 pub fn execution_mode(args: &Value) -> ExecutionMode {
@@ -57,12 +57,12 @@ pub fn parameters_schema() -> Value {
                 "enum": ["readonly", "reversible", "destructive"],
                 "description": "Advisory risk label for UI and audit only"
             },
-            "script": { "type": "string", "description": "Bash script to run with bash -lc" },
+            "command": { "type": "string", "description": "Command to run with bash -lc; it may be multiline" },
             "cwd": { "type": "string", "description": "Working directory for this invocation" },
             "timeout": { "type": "integer", "minimum": 1, "description": "Timeout in seconds (default 120)" },
-            "stdin": { "type": "string", "description": "Literal stdin bytes to pipe to the script" }
+            "stdin": { "type": "string", "description": "Literal stdin bytes to pipe to the command" }
         },
-        "required": ["title", "risk", "script"]
+        "required": ["title", "risk", "command"]
     })
 }
 
@@ -268,12 +268,12 @@ fn run_bash_inner(
         .as_deref()
         .map(resolve_path)
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
-    let script = format!("exec 2>&1\n{}", args.script);
+    let command_text = format!("exec 2>&1\n{}", args.command);
 
     let mut command = Command::new("bash");
     command
         .arg("-lc")
-        .arg(script)
+        .arg(command_text)
         .current_dir(&cwd)
         .envs(env)
         .stdin(if args.stdin.is_some() {
@@ -287,7 +287,7 @@ fn run_bash_inner(
 
     let mut child = command.spawn().map_err(|error| {
         if is_e2big(&error) {
-            anyhow::anyhow!("script is too large to execute: OS reported argument list too long")
+            anyhow::anyhow!("command is too large to execute: OS reported argument list too long")
         } else {
             anyhow::anyhow!(error).context("spawning bash")
         }
@@ -347,7 +347,7 @@ fn run_bash_inner(
                 String::new()
             };
             bail!(
-                "script timed out after {timeout_secs}s{}{}",
+                "command timed out after {timeout_secs}s{}{}",
                 partial_output_suffix(&output),
                 reminder
             );
@@ -384,7 +384,7 @@ fn run_bash_inner(
             String::new()
         };
         bail!(
-            "script interrupted by {}{}{}",
+            "command interrupted by {}{}{}",
             signal_name(last_signal()),
             partial_output_suffix(&output),
             reminder
@@ -588,11 +588,11 @@ mod tests {
     use crate::renderer::Renderer;
     use crate::tools::{BashArgs, BashRisk, ToolContext};
 
-    fn args(script: &str) -> BashArgs {
+    fn args(command: &str) -> BashArgs {
         BashArgs {
             title: "test".into(),
             risk: BashRisk::Readonly,
-            script: script.into(),
+            command: command.into(),
             timeout: None,
             cwd: None,
             stdin: None,
@@ -682,7 +682,7 @@ mod tests {
         let args = serde_json::json!({
             "title": "redact",
             "risk": "readonly",
-            "script": "printf '%s|%s' \"$OPENAI_API_KEY\" \"$CUSTOM_SECRET\""
+            "command": "printf '%s|%s' \"$OPENAI_API_KEY\" \"$CUSTOM_SECRET\""
         });
 
         let result = super::execute(args, &mut ctx).await.unwrap();

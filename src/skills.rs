@@ -29,6 +29,7 @@ pub struct CommandMeta {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum InstructionScope {
+    Builtin,
     Global,
     Project,
 }
@@ -95,10 +96,34 @@ pub fn scan_instruction_index(
     global_config_dir: &Path,
     project_config_dir: Option<&Path>,
 ) -> Result<InstructionIndex> {
+    let builtins_dir = crate::paths::builtins_dir();
+    scan_instruction_index_with_builtins(
+        Some(builtins_dir.as_path()),
+        global_config_dir,
+        project_config_dir,
+    )
+}
+
+fn scan_instruction_index_with_builtins(
+    builtins_dir: Option<&Path>,
+    global_config_dir: &Path,
+    project_config_dir: Option<&Path>,
+) -> Result<InstructionIndex> {
     let mut roots = Vec::new();
-    roots.push(scan_root(global_config_dir, InstructionScope::Global)?);
+    if let Some(builtins_dir) = builtins_dir {
+        roots.push(scan_root(builtins_dir, InstructionScope::Builtin, false)?);
+    }
+    roots.push(scan_root(
+        global_config_dir,
+        InstructionScope::Global,
+        true,
+    )?);
     if let Some(project_config_dir) = project_config_dir {
-        roots.push(scan_root(project_config_dir, InstructionScope::Project)?);
+        roots.push(scan_root(
+            project_config_dir,
+            InstructionScope::Project,
+            true,
+        )?);
     }
 
     let mut skills_by_name = BTreeMap::new();
@@ -162,7 +187,7 @@ pub fn find_command<'a>(index: &'a InstructionIndex, name: &str) -> Option<&'a C
     index.commands.iter().find(|command| command.name == name)
 }
 
-fn scan_root(root: &Path, scope: InstructionScope) -> Result<RootIndex> {
+fn scan_root(root: &Path, scope: InstructionScope, use_cache: bool) -> Result<RootIndex> {
     if !root.is_dir() {
         return Ok(RootIndex {
             skills: Vec::new(),
@@ -179,7 +204,8 @@ fn scan_root(root: &Path, scope: InstructionScope) -> Result<RootIndex> {
     let snapshot = collect_snapshot(root, limits)?;
     let cache_path = root.join(CACHE_RELATIVE_PATH);
 
-    if let Ok(text) = std::fs::read_to_string(&cache_path)
+    if use_cache
+        && let Ok(text) = std::fs::read_to_string(&cache_path)
         && let Ok(cache) = serde_json::from_str::<RootCache>(&text)
         && cache.version == CACHE_VERSION
         && cache.root == root.display().to_string()
@@ -193,18 +219,20 @@ fn scan_root(root: &Path, scope: InstructionScope) -> Result<RootIndex> {
     }
 
     let (index, warnings) = build_root_index(root, scope, &snapshot)?;
-    write_cache(
-        &cache_path,
-        &RootCache {
-            version: CACHE_VERSION,
-            root: root.display().to_string(),
-            limits,
-            snapshot: snapshot.entries,
-            skills: index.skills.clone(),
-            commands: index.commands.clone(),
-            warnings,
-        },
-    );
+    if use_cache {
+        write_cache(
+            &cache_path,
+            &RootCache {
+                version: CACHE_VERSION,
+                root: root.display().to_string(),
+                limits,
+                snapshot: snapshot.entries,
+                skills: index.skills.clone(),
+                commands: index.commands.clone(),
+                warnings,
+            },
+        );
+    }
     Ok(index)
 }
 
@@ -592,7 +620,7 @@ mod tests {
         )
         .unwrap();
 
-        let index = scan_instruction_index(&root, None).unwrap();
+        let index = scan_instruction_index_with_builtins(None, &root, None).unwrap();
 
         assert_eq!(index.commands.len(), 1);
         assert_eq!(index.commands[0].name, "review.md");
@@ -613,7 +641,7 @@ mod tests {
         )
         .unwrap();
 
-        let index = scan_instruction_index(&root, None).unwrap();
+        let index = scan_instruction_index_with_builtins(None, &root, None).unwrap();
 
         assert!(index.commands.is_empty());
         assert_eq!(index.skills.len(), 1);
@@ -631,10 +659,66 @@ mod tests {
         )
         .unwrap();
 
-        let index = scan_instruction_index(&root, None).unwrap();
+        let index = scan_instruction_index_with_builtins(None, &root, None).unwrap();
 
         assert!(index.skills.is_empty());
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn project_instructions_shadow_global_and_builtin_instructions() {
+        let builtins = temp_root("builtins");
+        let global = temp_root("global");
+        let project = temp_root("project");
+        fs::create_dir_all(&builtins).unwrap();
+        fs::create_dir_all(&global).unwrap();
+        fs::create_dir_all(&project).unwrap();
+        fs::write(
+            builtins.join("background-task.md"),
+            "---\nname: background-task\ndescription: Start background tasks.\n---\nUse systemd-run.\n",
+        )
+        .unwrap();
+        fs::write(
+            builtins.join("review.md"),
+            "#!/usr/bin/env mu\n---\nname: review\ndescription: Review builtins.\n---\nBuiltin review.\n",
+        )
+        .unwrap();
+        fs::write(
+            global.join("review.md"),
+            "#!/usr/bin/env mu\n---\nname: review\ndescription: Review globally.\n---\nGlobal review.\n",
+        )
+        .unwrap();
+        fs::write(
+            project.join("review.md"),
+            "#!/usr/bin/env mu\n---\nname: review\ndescription: Review locally.\n---\nLocal review.\n",
+        )
+        .unwrap();
+
+        let index =
+            scan_instruction_index_with_builtins(Some(&builtins), &global, Some(&project)).unwrap();
+
+        assert_eq!(index.skills.len(), 2);
+        assert_eq!(index.skills[0].name, "background-task");
+        let review = index
+            .skills
+            .iter()
+            .find(|skill| skill.name == "review")
+            .unwrap();
+        assert_eq!(review.description, "Review locally.");
+        let review_command = index
+            .commands
+            .iter()
+            .find(|command| command.name == "review.md")
+            .unwrap();
+        assert_eq!(review_command.scope, InstructionScope::Project);
+        assert_eq!(
+            review_command.path,
+            project.join("review.md").display().to_string()
+        );
+        assert!(!builtins.join(CACHE_RELATIVE_PATH).exists());
+        fs::remove_dir_all(builtins).unwrap();
+        fs::remove_dir_all(global).unwrap();
+        fs::remove_dir_all(project).unwrap();
     }
 
     fn temp_root(name: &str) -> PathBuf {

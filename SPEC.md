@@ -335,7 +335,7 @@ The model-visible tool surface is exactly:
 bash({
   title: string,
   risk: "readonly" | "reversible" | "destructive",
-  script: string,
+  command: string,
   cwd?: string,
   timeout?: number, // seconds, default 120
   stdin?: string
@@ -344,10 +344,10 @@ bash({
 
 `title` is the short human-readable action shown in the terminal. `risk` is
 advisory metadata for UI/audit; V1 does not sandbox, approve, or restrict a call
-based on it. `script` is executed as `bash -lc <script>`. `cwd`, when present,
+based on it. `command` is executed as `bash -lc <command>`. `cwd`, when present,
 applies only to that invocation; `cd`, shell variables, and exported environment
 do not persist to later bash calls. `stdin`, when present, is piped literally to
-the child process so the agent can write bytes containing `$`, backticks,
+the child process so the agent can pass bytes containing `$`, backticks,
 quotes, or heredoc delimiters without shell expansion.
 
 **Execution ordering.** Human-facing output may execute maximal contiguous
@@ -357,7 +357,7 @@ and stdin. This is an execution optimization only: stored tool-call records,
 stored tool messages, and the next model request still see the original
 assistant tool-call order.
 
-**Terminal visibility.** `bash` prints a `# <title>` line, then a `$ <script>`
+**Terminal visibility.** `bash` prints a `# <title>` line, then a `$ <command>`
 line with risk indicated by color in styled terminal output or an explicit
 `[risk]` label in plain output. It streams combined output and finishes with an
 exit status/duration line. Every tool error is visible.
@@ -388,10 +388,11 @@ literal `stdin` for content that should not be interpreted by the shell.
 in its own process group before `exec`, and on Linux `PR_SET_PDEATHSIG` asks the
 kernel to send SIGTERM if `mu` dies. On timeout or interrupt, `mu` sends SIGTERM
 to the process group, waits a short grace period, then sends SIGKILL; if group
-signaling fails it falls back to killing the direct child.
+signaling fails it falls back to killing the direct child. Ordinary commands are
+expected not to outlive the tool call.
 
 `timeout` defaults to 120 seconds and must be greater than zero. `mu` does not
-pre-check script argv size; if `bash -lc <script>` fails with OS
+pre-check command argv size; if `bash -lc <command>` fails with OS
 argument-list-too-long (`E2BIG`), the tool returns a clear error. V1 does not
 fall back to temp scripts.
 
@@ -480,10 +481,10 @@ remain visible. Stdout TTY detection selects rich versus portable rendering;
 stderr TTY detection suppresses the summary when redirected.
 
 - **Tool presentation.** Bash streams the active command header as the model
-  composes the tool-call arguments: `# <title>` first, then `$ <script>` once
+  composes the tool-call arguments: `# <title>` first, then `$ <command>` once
   the `risk` value is available so terminal output can color the command
-  consistently. The title and script are append-only and capped in place; the
-  script display is the first decoded line with a byte cap. If fields arrive
+  consistently. The title and command are append-only and capped in place; the
+  command display is the first decoded line with a byte cap. If fields arrive
   out of order, display buffers until the ordered header can be committed.
   Later tool-call headers are buffered until their original-order display slot
   becomes active. Once execution begins, a header that was already streamed is
@@ -857,7 +858,9 @@ The system prompt is intentionally minimal and assembled in this fixed order:
    system prompt lets the system prefix stay identical across turns (and across
    sessions in the same scope), which is friendlier to provider prompt caching.
 3. The `<available_skills>` block (§8), or omitted if there are no skills. Skill
-   metadata is merged from global and active-project instruction indexes.
+   metadata is merged from built-in, global, and active-project instruction
+   indexes. Priority is project > global/user > built-in for same-name skills
+   and commands.
 4. The global `AGENTS.md` contents, if the file exists.
 5. The project-local `AGENTS.md` contents, if a project is active and the file
    exists.

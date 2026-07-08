@@ -995,7 +995,7 @@ mod tests {
                             function: FunctionCall {
                                 name: "bash".into(),
                                 arguments:
-                                    "{\"title\":\"a\",\"risk\":\"readonly\",\"script\":\"echo a\"}"
+                                    "{\"title\":\"a\",\"risk\":\"readonly\",\"command\":\"echo a\"}"
                                         .into(),
                             },
                         },
@@ -1005,7 +1005,7 @@ mod tests {
                             function: FunctionCall {
                                 name: "bash".into(),
                                 arguments:
-                                    "{\"title\":\"b\",\"risk\":\"readonly\",\"script\":\"echo b\"}"
+                                    "{\"title\":\"b\",\"risk\":\"readonly\",\"command\":\"echo b\"}"
                                         .into(),
                             },
                         },
@@ -1021,7 +1021,7 @@ mod tests {
                     message_id: assistant_id,
                     id: "call-a",
                     tool: "bash",
-                    args: "{\"title\":\"a\",\"risk\":\"readonly\",\"script\":\"echo a\"}",
+                    args: "{\"title\":\"a\",\"risk\":\"readonly\",\"command\":\"echo a\"}",
                     risk: Some("readonly"),
                     output: "a",
                     status: "ok",

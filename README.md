@@ -59,6 +59,12 @@ key first.
 To keep using an existing session in zsh mode, set `MU_ZSH_SESSION_ID=<id>`
 before entering `mu>` mode.
 
+Built-in command and skill files are loaded from `/usr/share/mu/builtins` with
+the lowest priority: project instructions shadow user instructions, and user
+instructions shadow built-ins with the same name. This directory is
+instruction-only; runtime state and `config.jsonc` still live under the normal
+global or project `.mu` directories.
+
 While `mu>` mode is active, the plugin automatically suspends common editor
 helpers such as `zsh-syntax-highlighting` and `zsh-autosuggestions`, then
 restores their prior state when you return to the shell prompt. For any other

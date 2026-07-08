@@ -88,6 +88,10 @@ pub fn global_dir() -> PathBuf {
     dirs_home().join(".mu")
 }
 
+pub fn builtins_dir() -> PathBuf {
+    PathBuf::from("/usr/share/mu/builtins")
+}
+
 fn dirs_home() -> PathBuf {
     std::env::var("HOME")
         .map(PathBuf::from)

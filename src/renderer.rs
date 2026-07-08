@@ -250,7 +250,7 @@ impl Renderer {
         }
     }
 
-    pub fn bash_header_script_start(&mut self, risk: Option<&str>) -> io::Result<()> {
+    pub fn bash_header_command_start(&mut self, risk: Option<&str>) -> io::Result<()> {
         if self.final_only {
             return Ok(());
         }
@@ -266,7 +266,7 @@ impl Renderer {
         }
     }
 
-    pub fn bash_header_script_delta(&mut self, text: &str) -> io::Result<()> {
+    pub fn bash_header_command_delta(&mut self, text: &str) -> io::Result<()> {
         if self.final_only {
             return Ok(());
         }
@@ -276,7 +276,7 @@ impl Renderer {
         self.write_committed(text)
     }
 
-    pub fn bash_header_script_end(&mut self) -> io::Result<()> {
+    pub fn bash_header_command_end(&mut self) -> io::Result<()> {
         if self.final_only {
             return Ok(());
         }
@@ -299,17 +299,17 @@ impl Renderer {
             .get("title")
             .and_then(|value| value.as_str())
             .unwrap_or_default();
-        let script = args
-            .get("script")
+        let command = args
+            .get("command")
             .and_then(|value| value.as_str())
             .unwrap_or_default();
         let risk = args.get("risk").and_then(|value| value.as_str());
         self.bash_header_start(tool_call_id)?;
         self.bash_header_title_delta(&preview_first_line(title, BASH_TITLE_PREVIEW_BYTES))?;
         self.bash_header_title_end()?;
-        self.bash_header_script_start(risk)?;
-        self.bash_header_script_delta(&preview_first_line(script, BASH_COMMAND_PREVIEW_BYTES))?;
-        self.bash_header_script_end()?;
+        self.bash_header_command_start(risk)?;
+        self.bash_header_command_delta(&preview_first_line(command, BASH_COMMAND_PREVIEW_BYTES))?;
+        self.bash_header_command_end()?;
         Ok(true)
     }
 
@@ -435,7 +435,7 @@ impl Renderer {
         risk_level: &str,
         user_auth_level: &str,
         reason: &str,
-        _script: &str,
+        _command: &str,
     ) -> io::Result<()> {
         if self.final_only {
             return Ok(());
@@ -2088,8 +2088,8 @@ fn format_tool(display: &ToolDisplay, elapsed: Duration, styled: bool) -> String
 }
 
 #[cfg(test)]
-fn format_bash_header(title: &str, script: &str, risk: Option<&str>, styled: bool) -> String {
-    let command = preview_first_line(script, BASH_COMMAND_PREVIEW_BYTES);
+fn format_bash_header(title: &str, command: &str, risk: Option<&str>, styled: bool) -> String {
+    let command = preview_first_line(command, BASH_COMMAND_PREVIEW_BYTES);
     if !styled {
         let mut out = String::new();
         if !title.is_empty() {
@@ -2844,7 +2844,7 @@ mod tests {
         let args = json!({
             "title": "List files",
             "risk": "readonly",
-            "script": "printf 'a'\npwd",
+            "command": "printf 'a'\npwd",
         });
 
         assert!(renderer.bash_header_full(Some("call_1"), &args).unwrap());
@@ -2944,7 +2944,7 @@ mod tests {
                         &json!({
                             "title": "Stream demo",
                             "risk": "readonly",
-                            "script": "printf 'line01\\nline02\\nline03\\n'",
+                            "command": "printf 'line01\\nline02\\nline03\\n'",
                         }),
                         false,
                     )

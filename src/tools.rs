@@ -87,7 +87,7 @@ pub fn apply_truncation(
 pub struct BashArgs {
     pub title: String,
     pub risk: BashRisk,
-    pub script: String,
+    pub command: String,
     #[serde(default)]
     pub timeout: Option<u64>,
     #[serde(default)]
@@ -188,14 +188,15 @@ mod tests {
     }
 
     #[test]
-    fn bash_schema_requires_title_risk_and_script() {
+    fn bash_schema_requires_title_risk_and_command() {
         let schema = crate::bash::parameters_schema();
-        assert_eq!(schema["required"], json!(["title", "risk", "script"]));
+        assert_eq!(schema["required"], json!(["title", "risk", "command"]));
         assert_eq!(
             schema["properties"]["risk"]["enum"],
             json!(["readonly", "reversible", "destructive"])
         );
-        assert!(schema["properties"].get("command").is_none());
+        assert!(schema["properties"].get("command").is_some());
+        assert!(schema["properties"].get("script").is_none());
         assert!(schema["properties"].get("workdir").is_none());
         assert!(schema["properties"].get("cwd").is_some());
     }

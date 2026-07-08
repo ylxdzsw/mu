@@ -51,9 +51,9 @@ struct CommandHeaderDisplay {
     started: bool,
     title_displayed_bytes: usize,
     title_line_done: bool,
-    script_started: bool,
-    script_displayed_bytes: usize,
-    script_line_done: bool,
+    command_started: bool,
+    command_displayed_bytes: usize,
+    command_line_done: bool,
 }
 
 pub struct AgentLoop<'a> {
@@ -291,8 +291,8 @@ impl<'a> AgentLoop<'a> {
                                     let args_for_review = args.clone();
                                     let action_json =
                                         serde_json::to_string(&args_for_review).unwrap_or_default();
-                                    let script = args_for_review
-                                        .get("script")
+                                    let command = args_for_review
+                                        .get("command")
                                         .and_then(|v| v.as_str())
                                         .unwrap_or("");
                                     match g.assess(&args_for_review, &context).await {
@@ -304,7 +304,7 @@ impl<'a> AgentLoop<'a> {
                                                 &risk_level,
                                                 &user_auth_level,
                                                 &a.reason,
-                                                script,
+                                                command,
                                             )?;
                                             self.store.record_review(ReviewRecord {
                                                 session_id: self.session_id,
@@ -324,7 +324,7 @@ impl<'a> AgentLoop<'a> {
                                                 &risk_level,
                                                 &user_auth_level,
                                                 &a.reason,
-                                                script,
+                                                command,
                                             )?;
                                             self.store.record_review(ReviewRecord {
                                                 session_id: self.session_id,
@@ -694,7 +694,7 @@ fn handle_tool_call_delta(
                 header.id.as_deref(),
                 string_field_state(&header.arguments, "title"),
                 string_field_state(&header.arguments, "risk"),
-                string_field_state(&header.arguments, "script"),
+                string_field_state(&header.arguments, "command"),
             )?;
         }
         if header.display.is_done() {
@@ -728,13 +728,13 @@ impl StreamingCommandHeader {
     fn finish(&mut self, renderer: &mut Renderer, args: &Value) -> std::io::Result<bool> {
         let title = args.get("title").and_then(|value| value.as_str());
         let risk = args.get("risk").and_then(|value| value.as_str());
-        let script = args.get("script").and_then(|value| value.as_str());
+        let command = args.get("command").and_then(|value| value.as_str());
         self.display.update(
             renderer,
             self.id.as_deref(),
             StringFieldState::from_final(title),
             StringFieldState::from_final(risk),
-            StringFieldState::from_final(script),
+            StringFieldState::from_final(command),
         )?;
         Ok(self.display.started)
     }
@@ -742,7 +742,7 @@ impl StreamingCommandHeader {
 
 impl CommandHeaderDisplay {
     fn is_done(&self) -> bool {
-        self.title_line_done && self.script_line_done
+        self.title_line_done && self.command_line_done
     }
 
     fn update(
@@ -751,7 +751,7 @@ impl CommandHeaderDisplay {
         tool_call_id: Option<&str>,
         title: StringFieldState,
         risk: StringFieldState,
-        script: StringFieldState,
+        command: StringFieldState,
     ) -> std::io::Result<()> {
         if !self.started {
             self.started = renderer.bash_header_start(tool_call_id)?;
@@ -777,25 +777,25 @@ impl CommandHeaderDisplay {
             return Ok(());
         };
 
-        if self.title_line_done && !self.script_started {
-            renderer.bash_header_script_start(Some(risk))?;
-            self.script_started = true;
+        if self.title_line_done && !self.command_started {
+            renderer.bash_header_command_start(Some(risk))?;
+            self.command_started = true;
         }
 
-        if self.script_started
-            && !self.script_line_done
-            && let Some(value) = script.value()
+        if self.command_started
+            && !self.command_line_done
+            && let Some(value) = command.value()
         {
             let done = stream_first_line(
                 value,
-                script.is_complete(),
+                command.is_complete(),
                 crate::renderer::BASH_COMMAND_PREVIEW_BYTES,
-                &mut self.script_displayed_bytes,
-                |text| renderer.bash_header_script_delta(text),
+                &mut self.command_displayed_bytes,
+                |text| renderer.bash_header_command_delta(text),
             )?;
             if done {
-                renderer.bash_header_script_end()?;
-                self.script_line_done = true;
+                renderer.bash_header_command_end()?;
+                self.command_line_done = true;
             }
         }
         Ok(())
@@ -1129,11 +1129,11 @@ mod tests {
             *step += 1;
             match current {
                 0 => {
-                    let first_script = format!(
+                    let first_command = format!(
                         "while [ ! -f '{}' ]; do sleep 0.05; done; printf first",
                         self.barrier_path
                     );
-                    let second_script = format!("touch '{}'; printf second", self.barrier_path);
+                    let second_command = format!("touch '{}'; printf second", self.barrier_path);
                     Ok(StreamResult {
                         message: Message::Assistant {
                             content: None,
@@ -1146,7 +1146,7 @@ mod tests {
                                         arguments: serde_json::json!({
                                             "title": "first",
                                             "risk": "readonly",
-                                            "script": first_script,
+                                            "command": first_command,
                                             "timeout": 3,
                                         })
                                         .to_string(),
@@ -1160,7 +1160,7 @@ mod tests {
                                         arguments: serde_json::json!({
                                             "title": "second",
                                             "risk": "readonly",
-                                            "script": second_script,
+                                            "command": second_command,
                                             "timeout": 3,
                                         })
                                         .to_string(),
@@ -1222,7 +1222,7 @@ mod tests {
 
     #[test]
     fn string_field_state_distinguishes_partial_and_complete_fields() {
-        let partial = r#"{"title":"List files","risk":"readonly","script":"cargo test rende"#;
+        let partial = r#"{"title":"List files","risk":"readonly","command":"cargo test rende"#;
         assert_eq!(
             string_field_state(partial, "title"),
             StringFieldState::Complete("List files".into())
@@ -1232,27 +1232,27 @@ mod tests {
             StringFieldState::Complete("readonly".into())
         );
         assert_eq!(
-            string_field_state(partial, "script"),
+            string_field_state(partial, "command"),
             StringFieldState::Partial("cargo test rende".into())
         );
 
-        let complete = r#"{"script":"cargo test renderer::tests""#;
+        let complete = r#"{"command":"cargo test renderer::tests""#;
         assert_eq!(
-            string_field_state(complete, "script"),
+            string_field_state(complete, "command"),
             StringFieldState::Complete("cargo test renderer::tests".into())
         );
     }
 
     #[test]
     fn string_field_state_ignores_field_names_inside_values() {
-        let args = r#"{"title":"mentions \"script\"","risk":"readonly","script":"echo first""#;
+        let args = r#"{"title":"mentions \"command\"","risk":"readonly","command":"echo first""#;
 
         assert_eq!(
             string_field_state(args, "title"),
-            StringFieldState::Complete("mentions \"script\"".into())
+            StringFieldState::Complete("mentions \"command\"".into())
         );
         assert_eq!(
-            string_field_state(args, "script"),
+            string_field_state(args, "command"),
             StringFieldState::Complete("echo first".into())
         );
     }
@@ -1269,7 +1269,7 @@ mod tests {
                 index: 1,
                 id: Some("call_2".into()),
                 name: Some("bash".into()),
-                arguments_delta: r#"{"title":"Second","risk":"readonly","script":"echo second""#
+                arguments_delta: r#"{"title":"Second","risk":"readonly","command":"echo second""#
                     .into(),
             },
         )
@@ -1281,12 +1281,12 @@ mod tests {
         let first_args = serde_json::json!({
             "title": "First",
             "risk": "readonly",
-            "script": "echo first",
+            "command": "echo first",
         });
         let second_args = serde_json::json!({
             "title": "Second",
             "risk": "readonly",
-            "script": "echo second",
+            "command": "echo second",
         });
         let first_call = ToolCall {
             id: "call_1".into(),
@@ -1312,7 +1312,7 @@ mod tests {
                 index: 0,
                 id: Some("call_1".into()),
                 name: Some("bash".into()),
-                arguments_delta: r#"{"title":"First","risk":"readonly","script":"echo first""#
+                arguments_delta: r#"{"title":"First","risk":"readonly","command":"echo first""#
                     .into(),
             },
         )
@@ -1353,7 +1353,7 @@ mod tests {
 
         assert!(headers.entries[0].display.started);
         assert!(!headers.entries[0].display.title_line_done);
-        assert!(!headers.entries[0].display.script_started);
+        assert!(!headers.entries[0].display.command_started);
 
         handle_tool_call_delta(
             &mut renderer,
@@ -1363,7 +1363,7 @@ mod tests {
                 id: None,
                 name: None,
                 arguments_delta:
-                    r#"{"title":"Plain title","risk":"readonly","script":"echo plain""#.into(),
+                    r#"{"title":"Plain title","risk":"readonly","command":"echo plain""#.into(),
             },
         )
         .unwrap();
@@ -1372,7 +1372,7 @@ mod tests {
     }
 
     #[test]
-    fn streamed_command_header_waits_for_script_completion() {
+    fn streamed_command_header_waits_for_command_completion() {
         let mut renderer = Renderer::with_format(OutputFormat::Terminal);
         renderer.force_styled_for_test();
         let mut headers = StreamingCommandHeaders::default();
@@ -1384,7 +1384,8 @@ mod tests {
                 index: 0,
                 id: Some("call_1".into()),
                 name: Some("bash".into()),
-                arguments_delta: r#"{"title":"List","risk":"readonly","script":"printf 'a'"#.into(),
+                arguments_delta: r#"{"title":"List","risk":"readonly","command":"printf 'a'"#
+                    .into(),
             },
         )
         .unwrap();
@@ -1581,7 +1582,7 @@ mod tests {
                                 arguments: serde_json::json!({
                                     "title": "grow context",
                                     "risk": "readonly",
-                                    "script": "printf 'x%.0s' {1..3000}",
+                                    "command": "printf 'x%.0s' {1..3000}",
                                 })
                                 .to_string(),
                             },
