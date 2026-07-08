@@ -103,6 +103,8 @@ impl Renderer {
         }
 
         let blocks = self.markdown.push(text);
+        let table_live = self.markdown.table_live();
+        self.sync_table_live_line(table_live)?;
         if blocks.is_empty() {
             return self.render_live_line();
         }
@@ -126,6 +128,8 @@ impl Renderer {
             return Ok(());
         }
         let blocks = self.markdown.finish();
+        let table_live = self.markdown.table_live();
+        self.sync_table_live_line(table_live)?;
         if blocks.is_empty() {
             self.assistant_block_open = false;
             return Ok(());
@@ -606,6 +610,10 @@ impl Renderer {
                     approx_tokens_from_chars(reasoning.reasoning_chars),
                 ))
             }
+            Some(LiveLine::TableBuffering { chars }) => Some(format_table_live(
+                approx_tokens_from_chars(chars),
+                self.styled,
+            )),
             Some(LiveLine::BashOmitted {
                 omitted_lines,
                 omitted_bytes,
@@ -615,6 +623,22 @@ impl Renderer {
                 self.styled,
             )),
             None => None,
+        }
+    }
+
+    fn sync_table_live_line(&mut self, live: Option<TableBufferLive>) -> io::Result<()> {
+        match live {
+            Some(live) => {
+                self.live_line = Some(LiveLine::TableBuffering { chars: live.chars });
+                Ok(())
+            }
+            None => {
+                if matches!(self.live_line, Some(LiveLine::TableBuffering { .. })) {
+                    self.clear_live_line()?;
+                    self.live_line = None;
+                }
+                Ok(())
+            }
         }
     }
 
@@ -748,8 +772,16 @@ struct InlineStream {
 }
 
 #[derive(Clone, Copy)]
+struct TableBufferLive {
+    chars: usize,
+}
+
+#[derive(Clone, Copy)]
 enum LiveLine {
     Thinking,
+    TableBuffering {
+        chars: usize,
+    },
     BashOmitted {
         omitted_lines: usize,
         omitted_bytes: usize,
@@ -807,6 +839,12 @@ impl MarkdownStream {
             out.push(RESET.to_string());
         }
         out
+    }
+
+    fn table_live(&self) -> Option<TableBufferLive> {
+        self.table_buffer.as_ref().map(|table| TableBufferLive {
+            chars: table.chars().count(),
+        })
     }
 
     fn push_complete_line(&mut self, line: &str, out: &mut Vec<String>) {
@@ -2129,6 +2167,14 @@ fn format_thinking_live(elapsed: Duration, output_tokens: u64) -> String {
     )
 }
 
+fn format_table_live(output_tokens: u64, styled: bool) -> String {
+    if styled {
+        format!("{GRAY}[table ~{output_tokens} tokens]{RESET}")
+    } else {
+        format!("[table ~{output_tokens} tokens]")
+    }
+}
+
 fn format_thought_line(
     elapsed: Duration,
     reasoning_chars: usize,
@@ -2565,9 +2611,14 @@ mod tests {
         let mut stream = MarkdownStream::default();
 
         assert_eq!(stream.push("| Name | Value |\n").concat(), "");
+        assert!(stream.table_live().is_none());
         assert_eq!(stream.push("| --- | ---: |\n").concat(), "");
+        let live = stream.table_live().expect("confirmed table should be live");
+        assert!(approx_tokens_from_chars(live.chars) > 0);
         assert_eq!(stream.push("| a | 1 |\n").concat(), "");
+        assert!(stream.table_live().unwrap().chars > live.chars);
         let rendered = stream.push("\n").concat();
+        assert!(stream.table_live().is_none());
         let plain = strip_ansi(&rendered);
         assert!(plain.contains("| Name | Value |"), "{plain:?}");
         assert!(plain.contains("| a    |     1 |"), "{plain:?}");
@@ -2656,6 +2707,30 @@ mod tests {
             .expect("table-flush marker missing");
         assert!(after_table_row < table, "{normalized:?}");
         assert!(table < after_table_flush, "{normalized:?}");
+    }
+
+    #[test]
+    fn table_buffer_indicator_is_live_only_until_table_finishes() {
+        let mut stream = MarkdownStream::default();
+        let mut renderer = Renderer::with_format(OutputFormat::Terminal);
+        renderer.force_styled_for_test();
+
+        assert_eq!(stream.push("| Name | Value |\n").concat(), "");
+        renderer.sync_table_live_line(stream.table_live()).unwrap();
+        assert!(renderer.format_live_line().is_none());
+
+        assert_eq!(stream.push("| --- | ---: |\n").concat(), "");
+        renderer.sync_table_live_line(stream.table_live()).unwrap();
+        let indicator = renderer
+            .format_live_line()
+            .expect("table indicator should be live");
+        assert!(indicator.contains("[table ~"), "{indicator:?}");
+        assert!(indicator.contains("tokens"), "{indicator:?}");
+
+        let rendered = stream.push("\n").concat();
+        renderer.sync_table_live_line(stream.table_live()).unwrap();
+        assert!(renderer.format_live_line().is_none());
+        assert!(strip_ansi(&rendered).contains("| Name | Value |"));
     }
 
     fn assert_table_grid_aligned(rendered: &str) {
