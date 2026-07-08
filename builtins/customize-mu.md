@@ -23,7 +23,7 @@ Then read the relevant files from the active scopes:
 - Global config directory: `~/.mu`, or `$MU_CONFIG_DIR` when set.
 - Project config directory: `<project>/.mu` when the current directory resolves
   to a project.
-- Built-ins: `/usr/share/mu/builtins`.
+- Built-ins: `/usr/share/mu`.
 
 `mu` discovers a project by walking upward from the invoking `pwd` until it
 finds `.mu` or `.git`. The walk stops before the user's home directory and
@@ -183,4 +183,4 @@ git diff --check
 ```
 
 If you edit package-installed built-ins in this repository, remember that the
-Arch package copies `builtins/` to `/usr/share/mu/builtins`.
+Arch package copies `builtins/` to `/usr/share/mu`.

@@ -33,7 +33,7 @@ across turns. Arch Linux packaging for the current checkout lives in
 ```zsh
 source /path/to/mu/mu.zsh
 # Arch package install path:
-# source /usr/share/mu/mu.zsh
+# source /usr/share/zsh/plugins/mu/mu.zsh
 ```
 
 The plugin requires `zsh`, `jq`, and the `mu` binary on `PATH` unless
@@ -59,9 +59,9 @@ key first.
 To keep using an existing session in zsh mode, set `MU_ZSH_SESSION_ID=<id>`
 before entering `mu>` mode.
 
-Built-in command and skill files are loaded from `/usr/share/mu/builtins` with
-the lowest priority: project instructions shadow user instructions, and user
-instructions shadow built-ins with the same name. This directory is
+Built-in command and skill files are loaded from `/usr/share/mu` with the lowest
+priority: project instructions shadow user instructions, and user instructions
+shadow built-ins with the same name. This directory is
 instruction-only; runtime state and `config.jsonc` still live under the normal
 global or project `.mu` directories. Shipped built-in skills include
 `background-task` for persistent foreground-test services, `customize-mu` for

@@ -89,7 +89,7 @@ pub fn global_dir() -> PathBuf {
 }
 
 pub fn builtins_dir() -> PathBuf {
-    PathBuf::from("/usr/share/mu/builtins")
+    PathBuf::from("/usr/share/mu")
 }
 
 fn dirs_home() -> PathBuf {

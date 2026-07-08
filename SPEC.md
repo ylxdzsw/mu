@@ -127,8 +127,8 @@ advisory UI/audit metadata only; it is not a sandbox or approval proof.
 Skill metadata (name + description + path) is injected into the system prompt.
 The agent loads a skill file on demand using `bash` (`sed`, `cat`, `rg`, etc.).
 No dedicated "skill" tool — this keeps the model-visible surface at one tool
-and makes skills "just files". Built-in skills live in
-`/usr/share/mu/builtins` at the lowest precedence; shipped built-ins may include
+and makes skills "just files". Built-in skills live in `/usr/share/mu` at the
+lowest precedence; shipped built-ins may include
 self-customization guidance such as `customize-mu` or delegation guidance such
 as `subagent`, but user and project instructions can shadow them by name.
 
