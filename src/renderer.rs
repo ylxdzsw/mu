@@ -22,6 +22,7 @@ const YELLOW: &str = "\x1b[93m";
 const BLUE: &str = "\x1b[94m";
 const CYAN: &str = "\x1b[96m";
 const GRAY: &str = "\x1b[90m";
+const CODE: &str = "\x1b[38;5;215m";
 pub(crate) const BASH_COMMAND_PREVIEW_BYTES: usize = 160;
 pub(crate) const BASH_TITLE_PREVIEW_BYTES: usize = 120;
 const GUARDRAIL_REASON_PREVIEW_BYTES: usize = 180;
@@ -1616,8 +1617,7 @@ enum MdStyle {
     Underline,
     Strike,
     Blue,
-    Cyan,
-    Green,
+    Code,
 }
 
 impl MdStyle {
@@ -1629,8 +1629,7 @@ impl MdStyle {
             Self::Underline => UNDERLINE,
             Self::Strike => STRIKE,
             Self::Blue => BLUE,
-            Self::Cyan => CYAN,
-            Self::Green => GREEN,
+            Self::Code => CODE,
         }
     }
 }
@@ -2031,10 +2030,10 @@ fn visible_text_width(text: &str) -> usize {
 
 fn heading_styles(level: HeadingLevel) -> &'static [MdStyle] {
     match level {
-        HeadingLevel::H1 => &[MdStyle::Bold, MdStyle::Underline, MdStyle::Cyan],
-        HeadingLevel::H2 => &[MdStyle::Bold, MdStyle::Blue],
-        HeadingLevel::H3 => &[MdStyle::Bold, MdStyle::Green],
-        HeadingLevel::H4 => &[MdStyle::Underline, MdStyle::Green],
+        HeadingLevel::H1 => &[MdStyle::Bold, MdStyle::Underline],
+        HeadingLevel::H2 => &[MdStyle::Bold],
+        HeadingLevel::H3 => &[MdStyle::Bold],
+        HeadingLevel::H4 => &[MdStyle::Underline],
         HeadingLevel::H5 => &[MdStyle::Bold, MdStyle::Dim],
         HeadingLevel::H6 => &[MdStyle::Italic, MdStyle::Dim],
     }
@@ -2053,7 +2052,7 @@ fn link_styles() -> &'static [MdStyle] {
 }
 
 fn inline_code_styles() -> &'static [MdStyle] {
-    &[MdStyle::Green]
+    &[MdStyle::Code]
 }
 
 fn code_block_styles() -> &'static [MdStyle] {
@@ -2581,7 +2580,7 @@ mod tests {
         assert_eq!(stream.push("##").concat(), "");
         let rendered = stream.push("# Title").concat();
         assert_eq!(strip_ansi(&rendered), "Title");
-        assert!(rendered.contains(GREEN), "{rendered:?}");
+        assert!(rendered.contains(BOLD), "{rendered:?}");
     }
 
     #[test]
@@ -2597,7 +2596,7 @@ mod tests {
         let mut stream = MarkdownStream::default();
 
         let open = stream.push("```sh\n").concat();
-        assert!(open.contains(GREEN), "{open:?}");
+        assert!(open.contains(CODE), "{open:?}");
         assert!(!open.contains("```"), "{open:?}");
         let body = stream.push("echo hi\n").concat();
         assert_eq!(strip_ansi(&body), "echo hi\n");
