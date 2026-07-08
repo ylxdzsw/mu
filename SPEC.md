@@ -432,16 +432,21 @@ selected. It never clears the screen, uses an alternate screen, or requires
 mouse interaction. Plain output is always ANSI-free.
 
 Assistant Markdown is parsed on TTYs. The renderer commits only output whose
-terminal representation is stable: ordinary prose, headings, quotes, and list
-items stream line-by-line; inline links and inline styling wait for the current
-line/span to complete; fenced code starts terminal code styling at the opening
-fence, streams code lines without printing fence markers, and resets styling at
-the closing fence or response boundary. Markdown tables are buffered until the
-table is complete enough to align and commit once, so columns never require
-rewriting prior output. Markdown features outside this supported terminal subset
-are emitted as raw Markdown rather than partially rendered. When stdout is piped
-or redirected, assistant deltas pass through byte-for-byte as the model produced
-them, preserving raw Markdown for downstream consumers.
+terminal representation is stable: ordinary prose streams as soon as it is not
+being held for an inline span, while headings, quotes, and list items stream once
+their line prefix is unambiguous. A heading prefix waits for the space after the
+full opening `#` run, so `##` is not rendered as h2 until it cannot still become
+h3. Closing heading hashes are not special-cased and are rendered literally.
+Inline links, inline code, emphasis, strong text, and double-tilde
+strikethrough wait for the current span to complete; fenced code starts terminal
+code styling at the opening fence, streams code lines without printing fence
+markers, and resets styling at the closing fence or response boundary. Markdown
+tables are buffered until the table is complete enough to align and commit once,
+so columns never require rewriting prior output. Markdown features outside this
+supported terminal subset are emitted as raw Markdown rather than partially
+rendered. When stdout is piped or redirected, assistant deltas pass through
+byte-for-byte as the model produced them, preserving raw Markdown for downstream
+consumers.
 
 ### 5.1 TTY block-spacing contract
 
@@ -492,9 +497,9 @@ stderr TTY detection suppresses the summary when redirected.
   headers and execution output are buffered until they become the active slot.
 - **Assistant text.** `plain` and redirected output stream raw Markdown deltas
   unchanged. TTY `terminal` display commits parsed Markdown as soon as the
-  relevant unit is stable: most text/list/code lines stream immediately, inline
-  spans wait for completion, tables wait for the complete table, and unsupported
-  Markdown stays raw.
+  relevant unit is stable: prose streams token-by-token unless an inline span is
+  open, list/heading/quote content streams after the prefix is stable, tables
+  wait for the complete table, and unsupported Markdown stays raw.
 - **Errors.** Always printed and clearly prefixed, with TTY styling when
   available. Fatal turn failure produces a non-zero process exit code so the
   shell's `$?` is meaningful.
