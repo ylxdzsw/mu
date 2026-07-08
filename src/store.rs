@@ -79,6 +79,8 @@ pub struct Store {
     lock_dir: PathBuf,
 }
 
+const CURRENT_SCHEMA_VERSION: i32 = 1;
+
 fn session_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Session> {
     Ok(Session {
         id: row.get(0)?,
@@ -105,7 +107,7 @@ impl Store {
             conn,
             lock_dir: state_dir.join("locks"),
         };
-        store.migrate()?;
+        store.ensure_schema()?;
         Ok(store)
     }
 
@@ -119,11 +121,39 @@ impl Store {
             conn,
             lock_dir: std::env::temp_dir().join(format!("mu-memory-locks-{}", Uuid::new_v4())),
         };
-        store.migrate()?;
+        store.ensure_schema()?;
         Ok(store)
     }
 
-    fn migrate(&self) -> Result<()> {
+    fn ensure_schema(&self) -> Result<()> {
+        let version: i32 = self
+            .conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .context("reading SQLite schema version")?;
+        match version {
+            0 if !self.has_application_tables()? => self.create_schema_v1(),
+            0 => anyhow::bail!(
+                "unsupported pre-release session database schema; remove sessions.db to create a fresh release database"
+            ),
+            CURRENT_SCHEMA_VERSION => Ok(()),
+            future => anyhow::bail!(
+                "unsupported future session database schema version {future}; this mu supports version {CURRENT_SCHEMA_VERSION}"
+            ),
+        }
+    }
+
+    fn has_application_tables(&self) -> Result<bool> {
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*)
+             FROM sqlite_schema
+             WHERE type = 'table' AND name NOT LIKE 'sqlite_%'",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(count > 0)
+    }
+
+    fn create_schema_v1(&self) -> Result<()> {
         self.conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS session (
                 id TEXT PRIMARY KEY,
@@ -153,6 +183,7 @@ impl Store {
                 message_id INTEGER NOT NULL,
                 tool TEXT NOT NULL,
                 args TEXT NOT NULL,
+                risk TEXT,
                 output TEXT,
                 status TEXT NOT NULL,
                 FOREIGN KEY(message_id) REFERENCES message(id)
@@ -181,96 +212,8 @@ impl Store {
                 outcome TEXT NOT NULL,
                 reason TEXT,
                 created_at TEXT NOT NULL
-            );",
-        )?;
-        self.conn
-            .execute_batch("DROP TABLE IF EXISTS skill_cache;")?;
-        self.ensure_session_column("archived", "INTEGER NOT NULL DEFAULT 0")?;
-        self.ensure_message_column("user_content_json", "TEXT")?;
-        self.ensure_tool_call_column("risk", "TEXT")?;
-        self.rebuild_session_without_stale_columns()?;
-        Ok(())
-    }
-
-    fn ensure_session_column(&self, name: &str, sql_type: &str) -> Result<()> {
-        self.ensure_column("session", name, sql_type)
-    }
-
-    fn ensure_message_column(&self, name: &str, sql_type: &str) -> Result<()> {
-        self.ensure_column("message", name, sql_type)
-    }
-
-    fn ensure_tool_call_column(&self, name: &str, sql_type: &str) -> Result<()> {
-        self.ensure_column("tool_call", name, sql_type)
-    }
-
-    fn ensure_column(&self, table: &str, name: &str, sql_type: &str) -> Result<()> {
-        let mut stmt = self.conn.prepare(&format!("PRAGMA table_info({table})"))?;
-        let columns = stmt.query_map([], |row| row.get::<_, String>(1))?;
-        for column in columns {
-            if column? == name {
-                return Ok(());
-            }
-        }
-        self.conn.execute(
-            &format!("ALTER TABLE {table} ADD COLUMN {name} {sql_type}"),
-            [],
-        )?;
-        Ok(())
-    }
-
-    fn session_columns(&self) -> Result<Vec<String>> {
-        let mut stmt = self.conn.prepare("PRAGMA table_info(session)")?;
-        let columns = stmt
-            .query_map([], |row| row.get::<_, String>(1))?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        Ok(columns)
-    }
-
-    /// Drop any session column outside the canonical set. SQLite cannot drop
-    /// columns in place, so rebuild the table when retired columns are present.
-    fn rebuild_session_without_stale_columns(&self) -> Result<()> {
-        const CANONICAL: &[&str] = &[
-            "id",
-            "created_at",
-            "updated_at",
-            "cwd",
-            "model",
-            "title",
-            "last_total_tokens",
-            "archived",
-        ];
-        let has_stale = self
-            .session_columns()?
-            .iter()
-            .any(|column| !CANONICAL.contains(&column.as_str()));
-        if !has_stale {
-            return Ok(());
-        }
-
-        self.conn.execute_batch(
-            "PRAGMA foreign_keys=off;
-             BEGIN;
-             CREATE TABLE session_new (
-                id TEXT PRIMARY KEY,
-                created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL,
-                cwd TEXT NOT NULL,
-                model TEXT NOT NULL,
-                title TEXT,
-                last_total_tokens INTEGER NOT NULL DEFAULT 0,
-                archived INTEGER NOT NULL DEFAULT 0
-             );
-             INSERT INTO session_new (
-                id, created_at, updated_at, cwd, model, title, last_total_tokens, archived
-             )
-             SELECT
-                id, created_at, updated_at, cwd, model, title, last_total_tokens, archived
-             FROM session;
-             DROP TABLE session;
-             ALTER TABLE session_new RENAME TO session;
-             COMMIT;
-             PRAGMA foreign_keys=on;",
+            );
+            PRAGMA user_version = 1;",
         )?;
         Ok(())
     }
@@ -931,6 +874,80 @@ mod tests {
             )
             .unwrap();
         session
+    }
+
+    #[test]
+    fn new_database_creates_release_schema_version() {
+        let tmp = std::env::temp_dir().join(format!("mu-store-schema-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let db = tmp.join("mu.db");
+
+        let store = Store::open(&db).unwrap();
+
+        let version: i32 = store
+            .conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, CURRENT_SCHEMA_VERSION);
+        let tables = store
+            .conn
+            .prepare(
+                "SELECT name FROM sqlite_schema
+                 WHERE type = 'table' AND name NOT LIKE 'sqlite_%'
+                 ORDER BY name",
+            )
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(
+            tables,
+            vec!["message", "review", "session", "tool_call", "turn_usage"]
+        );
+        let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    #[test]
+    fn pre_release_database_with_tables_is_rejected() {
+        let tmp = std::env::temp_dir().join(format!("mu-store-old-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let db = tmp.join("mu.db");
+        let conn = Connection::open(&db).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE session (
+                id TEXT PRIMARY KEY,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                cwd TEXT NOT NULL,
+                model TEXT NOT NULL,
+                title TEXT,
+                last_total_tokens INTEGER NOT NULL DEFAULT 0
+             );",
+        )
+        .unwrap();
+        drop(conn);
+
+        let error = Store::open(&db).err().unwrap().to_string();
+
+        assert!(error.contains("unsupported pre-release session database schema"));
+        assert!(error.contains("remove sessions.db"));
+        let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    #[test]
+    fn future_schema_version_is_rejected() {
+        let tmp = std::env::temp_dir().join(format!("mu-store-future-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let db = tmp.join("mu.db");
+        let conn = Connection::open(&db).unwrap();
+        conn.execute_batch("PRAGMA user_version = 99;").unwrap();
+        drop(conn);
+
+        let error = Store::open(&db).err().unwrap().to_string();
+
+        assert!(error.contains("unsupported future session database schema version 99"));
+        let _ = std::fs::remove_dir_all(tmp);
     }
 
     #[test]

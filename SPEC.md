@@ -704,8 +704,9 @@ Skills are reusable, on-demand instruction files discovered inside the active
 global and project `.mu` directories.
 
 - A skill is a regular file with YAML front-matter defining `name` and
-  `description`. The `name` must match the filename stem. For compatibility,
-  `folder/SKILL.md` also qualifies when `name` matches `folder`.
+  `description`. The `name` must match the filename stem. For external
+  compatibility with the open skill spec, `folder/SKILL.md` also qualifies when
+  `name` matches `folder`.
 - On startup `mu` scans `.mu` with bounded depth/file limits, parses only
   qualifying front-matter, and injects a compact `<available_skills>` block —
   name, description, absolute file path — into the system prompt.
