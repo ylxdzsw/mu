@@ -65,7 +65,6 @@ pub struct AgentLoop<'a> {
     pub model_context_window: Option<u64>,
     pub renderer: &'a mut Renderer,
     pub state_dir: &'a Path,
-    pub system_prompt: String,
 }
 
 impl<'a> AgentLoop<'a> {
@@ -79,7 +78,6 @@ impl<'a> AgentLoop<'a> {
             &self.request,
             self.model_context_window,
             self.provider.as_ref(),
-            &self.system_prompt,
         )
         .await?;
 
@@ -125,7 +123,6 @@ impl<'a> AgentLoop<'a> {
                         self.session_id,
                         &self.request,
                         self.provider.as_ref(),
-                        &self.system_prompt,
                     )
                     .await?;
                     context = self.load_context()?;
@@ -187,7 +184,6 @@ impl<'a> AgentLoop<'a> {
                             self.session_id,
                             &self.request,
                             self.provider.as_ref(),
-                            &self.system_prompt,
                         )
                         .await?;
                         context = self.load_context()?;
@@ -462,18 +458,12 @@ impl<'a> AgentLoop<'a> {
         })
     }
 
-    /// Load the full completed-message history plus the leading system prompt.
+    /// Load the full completed-message history, including the persisted leading
+    /// system prompt.
     /// History is always valid here because the caller normalizes any
     /// interrupted tail (synthesizing missing tool results) before the turn.
     fn load_context(&self) -> Result<Vec<Message>> {
-        let mut context = self.store.load_context_messages(self.session_id)?;
-        context.insert(
-            0,
-            Message::System {
-                content: self.system_prompt.clone(),
-            },
-        );
-        Ok(context)
+        self.store.load_context_messages(self.session_id)
     }
 
     fn persist_tool_result(
@@ -1419,6 +1409,14 @@ mod tests {
         store
             .append_message(
                 &session.id,
+                &Message::System {
+                    content: "system".into(),
+                },
+            )
+            .unwrap();
+        store
+            .append_message(
+                &session.id,
                 &Message::User {
                     content: UserContent::Text("retry me".into()),
                 },
@@ -1439,7 +1437,6 @@ mod tests {
             model_context_window: None,
             renderer: &mut renderer,
             state_dir: &tmp,
-            system_prompt: "system".into(),
         };
 
         let result = agent.run_turn().await.unwrap();
@@ -1480,6 +1477,14 @@ mod tests {
         store
             .append_message(
                 &session.id,
+                &Message::System {
+                    content: "system".into(),
+                },
+            )
+            .unwrap();
+        store
+            .append_message(
+                &session.id,
                 &Message::User {
                     content: UserContent::Text("run both".into()),
                 },
@@ -1501,7 +1506,6 @@ mod tests {
             model_context_window: None,
             renderer: &mut renderer,
             state_dir: &tmp,
-            system_prompt: "system".into(),
         };
 
         let result = agent.run_turn().await.unwrap();
@@ -1621,6 +1625,14 @@ mod tests {
         let session = store.create_session("/tmp", "test/fake-model").unwrap();
         let config = test_config();
         let request_model = crate::models::resolve_model_ref(&config, "test/fake-model").unwrap();
+        store
+            .append_message(
+                &session.id,
+                &Message::System {
+                    content: "system".into(),
+                },
+            )
+            .unwrap();
 
         // Small prior history so the pre-turn check does NOT compact; the huge
         // tool result produced mid-turn is what should push us over.
@@ -1677,7 +1689,6 @@ mod tests {
             model_context_window: Some(200),
             renderer: &mut renderer,
             state_dir: &tmp,
-            system_prompt: "system".into(),
         };
 
         agent.run_turn().await.unwrap();

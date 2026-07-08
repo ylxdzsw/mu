@@ -3,8 +3,6 @@ use std::path::{Component, Path};
 
 use anyhow::{Context, Result};
 
-const CACHE_VERSION: u32 = 1;
-const CACHE_RELATIVE_PATH: &str = "cache/instruction-index-v1.json";
 const MAX_DEPTH: usize = 4;
 const MAX_FILES_PER_ROOT: usize = 512;
 const MAX_SKILLS: usize = 64;
@@ -40,35 +38,19 @@ pub struct InstructionIndex {
     pub commands: Vec<CommandMeta>,
 }
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-struct RootCache {
-    version: u32,
-    root: String,
-    limits: ScanLimits,
-    snapshot: Vec<SnapshotEntry>,
-    skills: Vec<SkillMeta>,
-    commands: Vec<CommandMeta>,
-    warnings: Vec<String>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy)]
 struct ScanLimits {
     max_depth: usize,
     max_files: usize,
-    max_skills: usize,
-    max_commands: usize,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct SnapshotEntry {
     path: String,
     kind: SnapshotKind,
-    modified: Option<u64>,
-    size: Option<u64>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "lowercase")]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum SnapshotKind {
     Dir,
     File,
@@ -111,19 +93,11 @@ fn scan_instruction_index_with_builtins(
 ) -> Result<InstructionIndex> {
     let mut roots = Vec::new();
     if let Some(builtins_dir) = builtins_dir {
-        roots.push(scan_root(builtins_dir, InstructionScope::Builtin, false)?);
+        roots.push(scan_root(builtins_dir, InstructionScope::Builtin)?);
     }
-    roots.push(scan_root(
-        global_config_dir,
-        InstructionScope::Global,
-        true,
-    )?);
+    roots.push(scan_root(global_config_dir, InstructionScope::Global)?);
     if let Some(project_config_dir) = project_config_dir {
-        roots.push(scan_root(
-            project_config_dir,
-            InstructionScope::Project,
-            true,
-        )?);
+        roots.push(scan_root(project_config_dir, InstructionScope::Project)?);
     }
 
     let mut skills_by_name = BTreeMap::new();
@@ -187,7 +161,7 @@ pub fn find_command<'a>(index: &'a InstructionIndex, name: &str) -> Option<&'a C
     index.commands.iter().find(|command| command.name == name)
 }
 
-fn scan_root(root: &Path, scope: InstructionScope, use_cache: bool) -> Result<RootIndex> {
+fn scan_root(root: &Path, scope: InstructionScope) -> Result<RootIndex> {
     if !root.is_dir() {
         return Ok(RootIndex {
             skills: Vec::new(),
@@ -198,41 +172,9 @@ fn scan_root(root: &Path, scope: InstructionScope, use_cache: bool) -> Result<Ro
     let limits = ScanLimits {
         max_depth: MAX_DEPTH,
         max_files: MAX_FILES_PER_ROOT,
-        max_skills: MAX_SKILLS,
-        max_commands: MAX_COMMANDS,
     };
     let snapshot = collect_snapshot(root, limits)?;
-    let cache_path = root.join(CACHE_RELATIVE_PATH);
-
-    if use_cache
-        && let Ok(text) = std::fs::read_to_string(&cache_path)
-        && let Ok(cache) = serde_json::from_str::<RootCache>(&text)
-        && cache.version == CACHE_VERSION
-        && cache.root == root.display().to_string()
-        && cache.limits == limits
-        && cache.snapshot == snapshot.entries
-    {
-        return Ok(RootIndex {
-            skills: cache.skills,
-            commands: cache.commands,
-        });
-    }
-
-    let (index, warnings) = build_root_index(root, scope, &snapshot)?;
-    if use_cache {
-        write_cache(
-            &cache_path,
-            &RootCache {
-                version: CACHE_VERSION,
-                root: root.display().to_string(),
-                limits,
-                snapshot: snapshot.entries,
-                skills: index.skills.clone(),
-                commands: index.commands.clone(),
-                warnings,
-            },
-        );
-    }
+    let (index, _warnings) = build_root_index(root, scope, &snapshot)?;
     Ok(index)
 }
 
@@ -294,8 +236,6 @@ fn collect_snapshot_dir(
                 entries.push(SnapshotEntry {
                     path: slash_path(&relative),
                     kind: SnapshotKind::Dir,
-                    modified: None,
-                    size: None,
                 });
                 collect_snapshot_dir(
                     root,
@@ -319,12 +259,6 @@ fn collect_snapshot_dir(
             entries.push(SnapshotEntry {
                 path: slash_path(&relative),
                 kind: SnapshotKind::File,
-                modified: metadata
-                    .modified()
-                    .ok()
-                    .and_then(|mtime| mtime.duration_since(std::time::UNIX_EPOCH).ok())
-                    .map(|duration| duration.as_secs()),
-                size: Some(metadata.len()),
             });
         }
     }
@@ -554,19 +488,6 @@ fn slash_path(path: &Path) -> String {
         .join("/")
 }
 
-fn write_cache(path: &Path, cache: &RootCache) {
-    let Some(parent) = path.parent() else {
-        return;
-    };
-    if std::fs::create_dir_all(parent).is_err() {
-        return;
-    }
-    let Ok(json) = serde_json::to_string(cache) else {
-        return;
-    };
-    let _ = std::fs::write(path, json);
-}
-
 fn kind_name(kind: &SnapshotKind) -> &'static str {
     match kind {
         SnapshotKind::Dir => "dir",
@@ -721,7 +642,6 @@ mod tests {
             review_command.path,
             project.join("review.md").display().to_string()
         );
-        assert!(!builtins.join(CACHE_RELATIVE_PATH).exists());
         fs::remove_dir_all(builtins).unwrap();
         fs::remove_dir_all(global).unwrap();
         fs::remove_dir_all(project).unwrap();
@@ -731,7 +651,7 @@ mod tests {
     fn repository_builtins_have_valid_skill_metadata() {
         let builtins = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("builtins");
 
-        let index = scan_root(&builtins, InstructionScope::Builtin, false).unwrap();
+        let index = scan_root(&builtins, InstructionScope::Builtin).unwrap();
 
         let names = index
             .skills
@@ -741,7 +661,6 @@ mod tests {
         assert!(names.contains(&"background-task"));
         assert!(names.contains(&"customize-mu"));
         assert!(names.contains(&"subagent"));
-        assert!(!builtins.join(CACHE_RELATIVE_PATH).exists());
     }
 
     fn temp_root(name: &str) -> PathBuf {

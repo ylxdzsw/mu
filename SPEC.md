@@ -266,8 +266,9 @@ it in this order:
    - If `-c/--continue-latest` is given → use the latest session in the active
      scope, or create one if no session exists.
    - If neither `--session` nor `--continue-latest` is given → create a new
-     session row, and write its id to the runtime file named by
-     `$MU_SESSION_FILE` when that env var is set (§11).
+     session row, persist the assembled system prompt as the first message, and
+     write its id to the runtime file named by `$MU_SESSION_FILE` when that env var
+     is set (§11).
 5. **Acquire the session `flock`** (§11). If held, print "session busy", exit
    non-zero.
 6. **Normalize any interrupted tail, then build the context list.** If the
@@ -275,8 +276,9 @@ it in this order:
    tool-call message (some `tool_calls` without a result). Synthesize an
    interrupted result for each result-less call so the history is API-valid
    (§11; idempotent — a no-op on a clean session). Then build the context
-   message list: the latest compaction summary message (if any) followed by all
-   messages after it, in order.
+   message list from persisted history: the leading system message, the latest
+   compaction summary message as user context (if any), then all non-system
+   messages after that summary, in order.
 7. **Pre-turn compaction check** (§11, Tier 1): if the session's stored
    `last_total_tokens` (or bytes÷4 on the first turn) exceeds the configured
    fraction of the model context window, run compaction now, then rebuild the
@@ -751,8 +753,7 @@ The project-local directory is `.mu`. It contains:
 - optional instruction files that may be plain references, custom commands,
   skills, or both.
 - `sessions.db`, the project-local session history and state database.
-- `cache/`, the local instruction index cache.
-- `.gitignore`, which ignores session database, cache, and related SQLite files.
+- `.gitignore`, which ignores session database and related SQLite files.
 
 Project state is private to the project. A project should be movable and
 understandable by inspecting its `.mu` directory, while still avoiding committing
@@ -774,7 +775,6 @@ The global and project directories have the same conceptual shape:
   .env              # optional environment values for provider lookup + bash
   AGENTS.md         # agent instructions, appended to system prompt
   review.md         # optional command/skill/reference instruction file
-  cache/            # local instruction-index cache
 ```
 
 When a project is active, global configuration is loaded first and project
@@ -839,7 +839,10 @@ one scope are not visible in another.
   Both are included; "project overrides global" means later text wins by
   convention, not that global instructions are dropped.
 
-The system prompt is intentionally minimal and assembled in this fixed order:
+The system prompt is intentionally minimal. It is assembled once when a session
+is created, persisted as the first message, and then loaded from session history
+for later turns. Existing sessions do not rebuild it when files or config change.
+The assembled prompt has this fixed order:
 
 1. A short role/behavior preamble (a few sentences). Illustrative:
    > You are mu, a terminal agent. Exactly one tool is available: `bash`. Do
@@ -863,8 +866,8 @@ The system prompt is intentionally minimal and assembled in this fixed order:
    introduced once as the first user message when the session is created, and a
    later working-directory change is announced with a `<system-reminder>` on the
    affected turn (§11, "Agent environment context"). Keeping this out of the
-   system prompt lets the system prefix stay identical across turns (and across
-   sessions in the same scope), which is friendlier to provider prompt caching.
+   persisted system prompt keeps the system prefix stable for every later turn in
+   the session.
 3. The `<available_skills>` block (§8), or omitted if there are no skills. Skill
    metadata is merged from built-in, global, and active-project instruction
    indexes. Priority is project > global/user > built-in for same-name skills
@@ -901,14 +904,17 @@ Conceptual schema (flat and small):
   rewrite the stored value. `cwd` records the last working directory used for
   that session. `title` is set lazily from the first user prompt (first ~60
   chars) and is display-only for `mu session list`.
-- **message** — `id`, `session_id`, `role` (`user`/`assistant`/`tool`/`summary`),
+- **message** — `id`, `session_id`, `role`
+  (`system`/`user`/`assistant`/`tool`/`summary`),
   `content`, optional full user content JSON for multi-part inputs, `created_at`,
   ordering index, and for tool results `tool_call_id`. Provider-neutral
-  representation. For user messages with image attachments, `content` remains a
-  textual projection for listing/token estimates, while the full text+image
-  parts are persisted and reloaded for model context. A `summary` row is a
-  compaction summary (§"Context window and compaction"); the context builder
-  starts from the latest `summary` row and includes everything after it.
+  representation. The first message in a new session is the persisted system
+  prompt. For user messages with image attachments, `content` remains a textual
+  projection for listing/token estimates, while the full text+image parts are
+  persisted and reloaded for model context. A `summary` row is a compaction
+  summary (§"Context window and compaction"); the context builder keeps the
+  leading system message, then starts from the latest `summary` row and includes
+  everything after it.
 - **tool_call** — `id`, `message_id`, `tool`, `args` (JSON), `risk`, `output`,
   `status` (`ok` / `error` / `interrupted`), timings. Records the agent's tool
   invocations for inspection and the renderer's truncation pointers. (Tool

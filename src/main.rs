@@ -59,7 +59,6 @@ struct RunTurnArgs<'a> {
     title: Option<&'a str>,
     output: cli::OutputFormat,
     state_dir: &'a std::path::Path,
-    project_config_dir: Option<&'a std::path::Path>,
     /// A short notice rendered before the turn (e.g. "resuming interrupted turn").
     preamble_notice: Option<&'a str>,
 }
@@ -248,8 +247,8 @@ async fn run() -> Result<()> {
     let cwd = std::env::current_dir()?;
     let scope = paths::discover_scope(&cwd);
     let project_config_dir = scope.project().map(|p| p.root.join(".mu"));
-    let prompt_source = resolve_prompt_source(args.prompt_file, &scope)?;
     let default_turn = args.turn;
+    let prompt_file = args.prompt_file;
 
     match args.command {
         Some(Command::Project { sub }) => {
@@ -287,6 +286,15 @@ async fn run() -> Result<()> {
                         }
                     };
                     let session = store.create_session(&cwd.display().to_string(), &model)?;
+                    store.append_message(
+                        &session.id,
+                        &provider::Message::System {
+                            content: system_prompt::build_system_prompt(
+                                &paths::global_dir(),
+                                project_config_dir.as_deref(),
+                            )?,
+                        },
+                    )?;
                     store.append_message(
                         &session.id,
                         &provider::Message::User {
@@ -407,7 +415,6 @@ async fn run() -> Result<()> {
                 title: None,
                 output: retry_args.output,
                 state_dir: &state_dir,
-                project_config_dir: project_config_dir.as_deref(),
                 preamble_notice: Some("[mu] resuming interrupted turn"),
             })
             .await?;
@@ -435,19 +442,8 @@ async fn run() -> Result<()> {
                     process::exit(2);
                 }
             };
-            let system_prompt = system_prompt::build_system_prompt(
-                &paths::global_dir(),
-                project_config_dir.as_deref(),
-            )?;
-            compaction::run_compaction(
-                &store,
-                &config,
-                &session,
-                &request,
-                provider.as_ref(),
-                &system_prompt,
-            )
-            .await?;
+            compaction::run_compaction(&store, &config, &session, &request, provider.as_ref())
+                .await?;
             eprintln!("compacted session {session}");
             return Ok(());
         }
@@ -455,6 +451,7 @@ async fn run() -> Result<()> {
     }
 
     ensure_subagent_turn_allowed(bash::subagent_depth_from_env())?;
+    let prompt_source = resolve_prompt_source(prompt_file, &scope)?;
     run_turn_from_source(
         &cwd,
         &scope,
@@ -499,7 +496,13 @@ async fn run_turn_from_source(
     let (session, created) = if let Some(session) = resolved.attached_session.clone() {
         (session, false)
     } else {
-        create_seeded_session(&store, cwd, scope.project(), &resolved.session_seed)?
+        create_seeded_session(
+            &store,
+            cwd,
+            scope.project(),
+            project_config_dir,
+            &resolved.session_seed,
+        )?
     };
     let session_id = session.id.clone();
 
@@ -547,7 +550,6 @@ async fn run_turn_from_source(
         title: Some(&title),
         output: turn.output,
         state_dir: &state_dir,
-        project_config_dir,
         preamble_notice: None,
     })
     .await?;
@@ -639,11 +641,8 @@ async fn run_turn(args: RunTurnArgs<'_>) -> Result<()> {
         title,
         output,
         state_dir,
-        project_config_dir,
         preamble_notice,
     } = args;
-    let system_prompt =
-        system_prompt::build_system_prompt(&paths::global_dir(), project_config_dir)?;
 
     let turn_done_bell_min_duration = config
         .terminal_bell
@@ -663,7 +662,6 @@ async fn run_turn(args: RunTurnArgs<'_>) -> Result<()> {
         model_context_window,
         renderer: &mut renderer,
         state_dir,
-        system_prompt,
     };
 
     let result = agent.run_turn().await;
@@ -702,9 +700,16 @@ fn create_seeded_session(
     store: &store::Store,
     cwd: &std::path::Path,
     project: Option<&paths::Project>,
+    project_config_dir: Option<&std::path::Path>,
     seed: &RequestOptions,
 ) -> Result<(store::Session, bool)> {
     let session = store.create_session(&cwd.display().to_string(), &seed.model.canonical)?;
+    store.append_message(
+        &session.id,
+        &provider::Message::System {
+            content: system_prompt::build_system_prompt(&paths::global_dir(), project_config_dir)?,
+        },
+    )?;
     store.append_message(
         &session.id,
         &provider::Message::User {

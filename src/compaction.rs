@@ -39,7 +39,6 @@ pub async fn maybe_compact(
     request: &RequestOptions,
     context_window: Option<u64>,
     provider: &dyn Provider,
-    system_prompt: &str,
 ) -> Result<()> {
     let session = store
         .get_session(session_id)?
@@ -59,7 +58,7 @@ pub async fn maybe_compact(
     };
 
     if should_compact {
-        run_compaction(store, config, session_id, request, provider, system_prompt).await?;
+        run_compaction(store, config, session_id, request, provider).await?;
     }
     Ok(())
 }
@@ -70,10 +69,10 @@ pub async fn run_compaction(
     session_id: &str,
     request: &RequestOptions,
     provider: &dyn Provider,
-    system_prompt: &str,
 ) -> Result<()> {
     bash::install_signal_forwarder();
     let messages = store.all_messages_for_session(session_id)?;
+    let system_prompt = store.system_prompt(session_id)?;
     let keep = config.compaction.keep_recent_turns;
 
     // Count user turns from the end
@@ -96,7 +95,7 @@ pub async fn run_compaction(
 
     let to_summarize: Vec<String> = messages
         .iter()
-        .filter(|m| m.seq < cut_seq && m.role != "summary")
+        .filter(|m| m.seq < cut_seq && m.role != "summary" && m.role != "system")
         .map(|m| {
             let (role, cap) = match m.role.as_str() {
                 "user" => ("user", MAX_SUMMARY_ENTRY_CHARS),
@@ -135,7 +134,7 @@ pub async fn run_compaction(
 
     let msgs = vec![
         Message::System {
-            content: system_prompt.into(),
+            content: system_prompt,
         },
         Message::User {
             content: summarize_prompt.into(),
@@ -261,6 +260,14 @@ mod tests {
         let session = store.create_session("/tmp", "test/fake-model").unwrap();
         let request_model =
             crate::models::resolve_model_ref(&test_config(), "test/fake-model").unwrap();
+        store
+            .append_message(
+                &session.id,
+                &Message::System {
+                    content: "system prompt".into(),
+                },
+            )
+            .unwrap();
 
         for n in 1..=4 {
             store
@@ -290,7 +297,6 @@ mod tests {
                 model: request_model,
             },
             &FakeProvider,
-            "system prompt",
         )
         .await
         .unwrap();

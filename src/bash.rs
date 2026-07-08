@@ -746,14 +746,21 @@ mod tests {
         let mut renderer = Renderer::new();
         let result = run_bash(
             args(&script),
-            1,
+            3,
             &mut renderer,
             &empty_env(),
             SecretRedactor::default(),
         );
         assert!(result.is_err(), "expected timeout");
 
-        let pid_text = std::fs::read_to_string(&marker).unwrap();
+        let pid_text = (0..20)
+            .find_map(|_| {
+                std::fs::read_to_string(&marker).ok().or_else(|| {
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                    None
+                })
+            })
+            .expect("background process marker should be written before timeout");
         let pid: i32 = pid_text.trim().parse().unwrap();
         std::thread::sleep(std::time::Duration::from_millis(200));
         let alive = unsafe { libc::kill(pid, 0) == 0 };

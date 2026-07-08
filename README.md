@@ -141,8 +141,8 @@ A file whose first line is a permissive `mu` shebang is a custom command and can
 be run by its relative `.mu` path, for example `mu review.md`. A file with YAML
 frontmatter containing `name` and `description` is listed as a skill only when
 the name matches the filename stem; legacy `name/SKILL.md` files also qualify
-when the name matches the parent directory. Commands and skills are cached under
-`.mu/cache/` for fast startup.
+when the name matches the parent directory. Commands and skills are discovered
+with bounded depth and file-count limits.
 
 ## Config
 

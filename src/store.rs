@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 
 use fs2::FileExt;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension, params};
 use uuid::Uuid;
 
@@ -157,10 +157,6 @@ impl Store {
                 status TEXT NOT NULL,
                 FOREIGN KEY(message_id) REFERENCES message(id)
             );
-            CREATE TABLE IF NOT EXISTS skill_cache (
-                dir_mtime INTEGER NOT NULL,
-                skills_json TEXT NOT NULL
-            );
             CREATE TABLE IF NOT EXISTS turn_usage (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 session_id TEXT NOT NULL,
@@ -187,6 +183,8 @@ impl Store {
                 created_at TEXT NOT NULL
             );",
         )?;
+        self.conn
+            .execute_batch("DROP TABLE IF EXISTS skill_cache;")?;
         self.ensure_session_column("archived", "INTEGER NOT NULL DEFAULT 0")?;
         self.ensure_message_column("user_content_json", "TEXT")?;
         self.ensure_tool_call_column("risk", "TEXT")?;
@@ -441,12 +439,13 @@ impl Store {
             "summary" => Ok(true),
             "user" => {
                 let count: i64 = self.conn.query_row(
-                    "SELECT COUNT(*) FROM message WHERE session_id = ?1",
+                    "SELECT COUNT(*) FROM message WHERE session_id = ?1 AND role != 'system'",
                     params![session_id],
                     |row| row.get(0),
                 )?;
                 Ok(count <= 1)
             }
+            "system" => Ok(true),
             _ => Ok(false),
         }
     }
@@ -519,17 +518,17 @@ impl Store {
         let start_seq = summary_seq.unwrap_or(-1);
         let mut stmt = self.conn.prepare(
             "SELECT role, content, user_content_json, tool_call_id, tool_calls_json FROM message
-             WHERE session_id = ?1 AND seq > ?2 ORDER BY seq ASC",
+             WHERE session_id = ?1 AND seq > ?2 AND role NOT IN ('system', 'summary')
+             ORDER BY seq ASC",
         )?;
         let rows = stmt.query_map(params![session_id, start_seq], load_context_row)?;
 
-        let mut messages = Vec::new();
+        let mut messages = vec![Message::System {
+            content: self.system_prompt(session_id)?,
+        }];
         if let Some(seq) = summary_seq
             && let Some(summary) = self.message_at_seq(session_id, seq)?
         {
-            // Framed as a user message (not system) so the assembled
-            // context has exactly one leading system message. Servers that
-            // reject a non-first system message would otherwise fail.
             messages.push(Message::User {
                 content: UserContent::Text(format!(
                     "[summary of earlier conversation]\n{}",
@@ -561,13 +560,23 @@ impl Store {
                     content,
                     tool_call_id: tool_call_id.unwrap_or_default(),
                 }),
-                "summary" => {}
                 other => messages.push(Message::User {
                     content: UserContent::Text(format!("[{other}] {content}")),
                 }),
             }
         }
         Ok(messages)
+    }
+
+    pub fn system_prompt(&self, session_id: &str) -> Result<String> {
+        let mut stmt = self.conn.prepare(
+            "SELECT content FROM message
+             WHERE session_id = ?1 AND role = 'system'
+             ORDER BY seq ASC LIMIT 1",
+        )?;
+        stmt.query_row(params![session_id], |row| row.get(0))
+            .optional()?
+            .ok_or_else(|| anyhow::anyhow!("session is missing persisted system prompt"))
     }
 
     fn latest_summary_seq(&self, session_id: &str) -> Result<Option<i64>> {
@@ -870,8 +879,12 @@ fn insert_message_in(
                 params![session_id, content, tool_call_id, seq, now],
             )?;
         }
-        Message::System { .. } => {
-            bail!("system messages are not persisted directly");
+        Message::System { content } => {
+            tx.execute(
+                "INSERT INTO message (session_id, role, content, seq, created_at)
+                 VALUES (?1, 'system', ?2, ?3, ?4)",
+                params![session_id, content, seq, now],
+            )?;
         }
     }
     Ok(tx.last_insert_rowid())
@@ -907,10 +920,23 @@ mod tests {
         (Store::open(&tmp.join("mu.db")).unwrap(), tmp)
     }
 
+    fn create_session_with_system(store: &Store) -> Session {
+        let session = store.create_session("/tmp", "fake-model").unwrap();
+        store
+            .append_message(
+                &session.id,
+                &Message::System {
+                    content: "system".into(),
+                },
+            )
+            .unwrap();
+        session
+    }
+
     #[test]
     fn reloads_full_user_content_with_images() {
         let (store, tmp) = temp_store();
-        let session = store.create_session("/tmp", "fake-model").unwrap();
+        let session = create_session_with_system(&store);
         let expected_image_url = "data:image/png;base64,abcd".to_string();
 
         store
@@ -934,7 +960,7 @@ mod tests {
         let messages = store.load_context_messages(&session.id).unwrap();
         let Message::User {
             content: UserContent::Parts(parts),
-        } = &messages[0]
+        } = &messages[1]
         else {
             panic!("expected user parts");
         };
@@ -973,7 +999,7 @@ mod tests {
     #[test]
     fn normalize_interrupted_tail_synthesizes_missing_tool_results() {
         let (store, tmp) = temp_store();
-        let session = store.create_session("/tmp", "fake-model").unwrap();
+        let session = create_session_with_system(&store);
 
         store
             .append_message(
@@ -1061,7 +1087,7 @@ mod tests {
     #[test]
     fn lone_environment_seed_session_is_clean() {
         let (store, tmp) = temp_store();
-        let session = store.create_session("/tmp", "fake-model").unwrap();
+        let session = create_session_with_system(&store);
         store
             .append_message(
                 &session.id,
@@ -1070,7 +1096,7 @@ mod tests {
                 },
             )
             .unwrap();
-        // A session whose only message is the synthetic env seed is clean.
+        // A session whose only non-system message is the synthetic env seed is clean.
         assert!(store.is_session_clean(&session.id).unwrap());
 
         // A completed assistant reply is clean.
