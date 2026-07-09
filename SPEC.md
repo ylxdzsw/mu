@@ -351,8 +351,9 @@ bash({
 ```
 
 `title` is the short human-readable action shown in the terminal. `risk` is
-advisory metadata for UI/audit; `mu` does not sandbox, approve, or restrict a
-call based on it. `command` is executed as `bash -lc <command>`. `cwd`, when
+advisory metadata for UI/audit and drives optional guardrail review for
+`destructive` calls; `mu` does not sandbox a call based on it. `command` is
+executed as `bash -lc <command>`. `cwd`, when
 present, applies only to that invocation; `cd`, shell variables, and exported
 environment do not persist to later bash calls. `stdin`, when present, is piped
 literally to the child process so the agent can pass bytes containing `$`, backticks,
@@ -1200,17 +1201,17 @@ The protections that remain are cheap and non-intrusive:
   follow.
 
 Sandboxing and an approval/policy layer are not part of the product. The `risk`
-field and optional guardrail review are advisory/review surfaces, not sandbox
+field and guardrail review are advisory/review surfaces, not sandbox
 boundaries.
 
-### 12.1 Guardrail (optional)
+### 12.1 Guardrail
 
-An opt-in review gate for destructive commands. When enabled, a separate model
-call assesses each `bash` call whose declared `risk` is `"destructive"` before
-execution. The reviewer returns `risk_level`, `user_auth_level`, and `reason`;
-the action executes only if `user_auth_level >= risk_level` on a fixed ordinal
-scale. There is no interactive y/n prompt — denied actions return as tool
-errors so the agent can adapt or ask the user.
+An opt-out review gate for destructive commands. Unless disabled, a separate
+model call assesses each `bash` call whose declared `risk` is `"destructive"`
+before execution. The reviewer returns `risk_level`, `user_auth_level`, and
+`reason`; the action executes only if `user_auth_level >= risk_level` on a fixed
+ordinal scale. There is no interactive y/n prompt — denied actions return as
+tool errors so the agent can adapt or ask the user.
 
 **Ordinal scale.** Both levels map to integers; the gap between `high`(2) and
 `critical`(4) ensures only `explicit`(4) authorization can approve critical-risk
@@ -1285,7 +1286,7 @@ length errors are not retried.
 
 ```jsonc
 "guardrail": {
-  "enabled": false,                          // default off (preserves yolo default)
+  "enabled": true,                           // default on; set false to opt out
   "review_model": null,                      // null -> same as active turn model
   "timeout_ms": 90000,
   "circuit_breaker": { "consecutive": 3, "window": 50, "window_denials": 10 }

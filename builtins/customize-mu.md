@@ -75,7 +75,7 @@ Common shape:
   },
   "redaction": { "env": [] },
   "guardrail": {
-    "enabled": false,
+    "enabled": true,
     "review_model": "openai/gpt-4o:low",
     "timeout_ms": 90000,
     "circuit_breaker": { "consecutive": 3, "window": 50, "window_denials": 10 }

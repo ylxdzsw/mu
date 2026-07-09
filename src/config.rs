@@ -252,7 +252,7 @@ fn default_max_line_bytes() -> usize {
     10240
 }
 fn default_guardrail_enabled() -> bool {
-    false
+    true
 }
 fn default_guardrail_timeout_ms() -> u64 {
     90_000
@@ -550,7 +550,7 @@ const STARTER_CONFIG: &str = r#"{
     "env": []
   },
   "guardrail": {
-    "enabled": false,
+    "enabled": true,
     "timeout_ms": 90000,
     "circuit_breaker": { "consecutive": 3, "window": 50, "window_denials": 10 }
   }

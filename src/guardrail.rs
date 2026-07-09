@@ -661,6 +661,35 @@ mod tests {
     }
 
     #[test]
+    fn should_review_only_destructive_by_default() {
+        let g = Guardrail {
+            config: GuardrailConfig::default(),
+            runtime: Config {
+                providers: Default::default(),
+                compaction: crate::config::CompactionConfig::default(),
+                limits: crate::config::LimitsConfig::default(),
+                guardrail: GuardrailConfig::default(),
+                terminal_bell: crate::config::TerminalBellConfig::default(),
+                redaction: crate::config::RedactionConfig::default(),
+                env: Default::default(),
+            },
+            active_model: crate::models::ResolvedModelRef {
+                canonical: "test/model".into(),
+                provider_id: "test".into(),
+                model_id: "model".into(),
+                effort: None,
+            },
+            consecutive_denials: 0,
+            recent_denials: VecDeque::new(),
+            interrupt_triggered: false,
+        };
+
+        assert!(g.should_review("destructive"));
+        assert!(!g.should_review("reversible"));
+        assert!(!g.should_review("readonly"));
+    }
+
+    #[test]
     fn should_review_only_destructive_when_enabled() {
         let g = test_guardrail(3, 10);
         assert!(g.should_review("destructive"));
