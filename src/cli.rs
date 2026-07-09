@@ -95,6 +95,9 @@ pub struct StatusArgs {
 
     #[arg(long)]
     pub include_commands: bool,
+
+    #[arg(long)]
+    pub include_skills: bool,
 }
 
 #[derive(Subcommand, Debug)]
@@ -180,6 +183,18 @@ mod tests {
         assert!(args.prompt_file.is_none());
         match args.command {
             Some(Command::Status(status)) => assert!(status.json),
+            other => panic!("expected status command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_status_include_skills() {
+        let args = Args::try_parse_from(["mu", "status", "--json", "--include-skills"]).unwrap();
+        match args.command {
+            Some(Command::Status(status)) => {
+                assert!(status.json);
+                assert!(status.include_skills);
+            }
             other => panic!("expected status command, got {other:?}"),
         }
     }

@@ -131,6 +131,9 @@ and makes skills "just files". Built-in skills live in `/usr/share/mu` at the
 lowest precedence; shipped built-ins may include
 self-customization guidance such as `customize-mu` or delegation guidance such
 as `subagent`, but user and project instructions can shadow them by name.
+Skills may declare optional `requires_env` and `requires_commands` frontmatter
+keys. Each key is a comma-separated list, and every listed requirement must be
+met before the skill is injected.
 
 ### 2.6 Flat config, single SQLite state file
 
@@ -216,8 +219,8 @@ small:
 - `mu project init [--path <dir>] [--force]` — create minimal `.mu/` project
   metadata in the current directory by default, or in an explicitly chosen
   directory.
-- `mu status --json [--include-models] [--include-commands]` — machine-readable
-  shell state for prompt rendering and completion.
+- `mu status --json [--include-models] [--include-commands] [--include-skills]`
+  — machine-readable shell state for prompt rendering and completion.
 - `mu session new` — create a session and print its id.
 - `mu session list` — list recent non-archived sessions.
 - `mu session transcript --session <id>` — print a persisted session

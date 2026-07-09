@@ -135,10 +135,18 @@ Flat file form:
 ---
 name: my-skill
 description: Use when the user asks for a focused workflow.
+requires_env: API_TOKEN, ORG_ID
+requires_commands: gh, jq
 ---
 
 Workflow instructions.
 ```
+
+Use `requires_env` when a skill only works with specific environment variables,
+and `requires_commands` when it needs CLIs on `PATH`. Each key is optional and
+comma-separated; every listed env var must be non-empty and every listed command
+must resolve before `mu` lists the skill. Do not use requirements to replace a
+clear trigger description.
 
 Folder form:
 
@@ -168,4 +176,5 @@ After editing `mu` setup, prefer cheap structured checks:
 
 ```bash
 mu status --json --include-models --include-commands
+mu status --json --include-skills
 ```

@@ -1,7 +1,11 @@
 use std::collections::BTreeMap;
+use std::ffi::OsString;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Component, Path};
 
 use anyhow::{Context, Result};
+
+use crate::env::EnvMap;
 
 const MAX_DEPTH: usize = 4;
 const MAX_FILES_PER_ROOT: usize = 512;
@@ -15,6 +19,14 @@ pub struct SkillMeta {
     pub name: String,
     pub description: String,
     pub path: String,
+    pub scope: InstructionScope,
+    pub requirements: SkillRequirements,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SkillRequirements {
+    pub env: Vec<String>,
+    pub commands: Vec<String>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -71,18 +83,36 @@ struct ScanSnapshot {
 #[derive(Debug)]
 struct ParsedInstruction {
     is_command: bool,
-    skill: Option<(String, String)>,
+    skill: Option<ParsedSkill>,
+    skill_error: Option<anyhow::Error>,
+}
+
+#[derive(Debug)]
+struct ParsedSkill {
+    name: String,
+    description: String,
+    requirements: SkillRequirements,
 }
 
 pub fn scan_instruction_index(
     global_config_dir: &Path,
     project_config_dir: Option<&Path>,
 ) -> Result<InstructionIndex> {
+    let env = crate::env::load_effective(project_config_dir)?;
+    scan_instruction_index_with_env(global_config_dir, project_config_dir, &env)
+}
+
+pub fn scan_instruction_index_with_env(
+    global_config_dir: &Path,
+    project_config_dir: Option<&Path>,
+    env: &EnvMap,
+) -> Result<InstructionIndex> {
     let builtins_dir = crate::paths::builtins_dir();
     scan_instruction_index_with_builtins(
         Some(builtins_dir.as_path()),
         global_config_dir,
         project_config_dir,
+        env,
     )
 }
 
@@ -90,14 +120,19 @@ fn scan_instruction_index_with_builtins(
     builtins_dir: Option<&Path>,
     global_config_dir: &Path,
     project_config_dir: Option<&Path>,
+    env: &EnvMap,
 ) -> Result<InstructionIndex> {
     let mut roots = Vec::new();
     if let Some(builtins_dir) = builtins_dir {
-        roots.push(scan_root(builtins_dir, InstructionScope::Builtin)?);
+        roots.push(scan_root(builtins_dir, InstructionScope::Builtin, env)?);
     }
-    roots.push(scan_root(global_config_dir, InstructionScope::Global)?);
+    roots.push(scan_root(global_config_dir, InstructionScope::Global, env)?);
     if let Some(project_config_dir) = project_config_dir {
-        roots.push(scan_root(project_config_dir, InstructionScope::Project)?);
+        roots.push(scan_root(
+            project_config_dir,
+            InstructionScope::Project,
+            env,
+        )?);
     }
 
     let mut skills_by_name = BTreeMap::new();
@@ -161,7 +196,7 @@ pub fn find_command<'a>(index: &'a InstructionIndex, name: &str) -> Option<&'a C
     index.commands.iter().find(|command| command.name == name)
 }
 
-fn scan_root(root: &Path, scope: InstructionScope) -> Result<RootIndex> {
+fn scan_root(root: &Path, scope: InstructionScope, env: &EnvMap) -> Result<RootIndex> {
     if !root.is_dir() {
         return Ok(RootIndex {
             skills: Vec::new(),
@@ -174,7 +209,7 @@ fn scan_root(root: &Path, scope: InstructionScope) -> Result<RootIndex> {
         max_files: MAX_FILES_PER_ROOT,
     };
     let snapshot = collect_snapshot(root, limits)?;
-    let (index, _warnings) = build_root_index(root, scope, &snapshot)?;
+    let (index, _warnings) = build_root_index(root, scope, &snapshot, env)?;
     Ok(index)
 }
 
@@ -270,6 +305,7 @@ fn build_root_index(
     root: &Path,
     scope: InstructionScope,
     snapshot: &ScanSnapshot,
+    env: &EnvMap,
 ) -> Result<(RootIndex, Vec<String>)> {
     let mut skills = Vec::new();
     let mut commands = Vec::new();
@@ -298,6 +334,9 @@ fn build_root_index(
             }
         };
         let parsed = parse_instruction(&content);
+        if let Some(error) = parsed.skill_error {
+            warnings.push(format!("invalid skill {}: {error}", path.display()));
+        }
         if parsed.is_command && commands.len() < MAX_COMMANDS {
             commands.push(CommandMeta {
                 name: entry.path.clone(),
@@ -309,25 +348,27 @@ fn build_root_index(
                 scope,
             });
         }
-        if let Some((name, description)) = parsed.skill {
+        if let Some(skill) = parsed.skill {
             match expected_skill_name(relative) {
-                Some(expected) if expected == name => {
-                    if skills.len() < MAX_SKILLS {
+                Some(expected) if expected == skill.name => {
+                    if skills.len() < MAX_SKILLS && requirements_met(&skill.requirements, env) {
                         skills.push(SkillMeta {
-                            name,
-                            description,
+                            name: skill.name,
+                            description: skill.description,
                             path: path
                                 .canonicalize()
                                 .unwrap_or(path.clone())
                                 .display()
                                 .to_string(),
+                            scope,
+                            requirements: skill.requirements,
                         });
                     }
                 }
                 Some(expected) => warnings.push(format!(
                     "skill {} has name {}, expected {}",
                     path.display(),
-                    name,
+                    skill.name,
                     expected
                 )),
                 None => warnings.push(format!(
@@ -347,8 +388,20 @@ fn build_root_index(
 
 fn parse_instruction(content: &str) -> ParsedInstruction {
     let (after_shebang, is_command) = strip_optional_mu_shebang(content);
-    let skill = parse_skill_frontmatter(after_shebang).ok();
-    ParsedInstruction { is_command, skill }
+    let (skill, skill_error) = match parse_skill_frontmatter(after_shebang) {
+        Ok(skill) => (Some(skill), None),
+        Err(error) if is_requirement_error(&error) => (None, Some(error)),
+        Err(_) => (None, None),
+    };
+    ParsedInstruction {
+        is_command,
+        skill,
+        skill_error,
+    }
+}
+
+fn is_requirement_error(error: &anyhow::Error) -> bool {
+    error.to_string().contains("requirement")
 }
 
 fn strip_instruction_headers(content: &str) -> &str {
@@ -379,7 +432,7 @@ fn is_mu_shebang(line: &str) -> bool {
     })
 }
 
-fn parse_skill_frontmatter(content: &str) -> Result<(String, String)> {
+fn parse_skill_frontmatter(content: &str) -> Result<ParsedSkill> {
     let content = content
         .strip_prefix("---")
         .context("missing YAML frontmatter")?;
@@ -387,12 +440,15 @@ fn parse_skill_frontmatter(content: &str) -> Result<(String, String)> {
     let yaml = &content[..end];
     let mut name = None;
     let mut description = None;
+    let mut requirements = SkillRequirements::default();
     for line in yaml.lines() {
         if let Some((key, value)) = line.split_once(':') {
             let value = value.trim().trim_matches('"');
             match key.trim() {
                 "name" => name = Some(value.to_string()),
                 "description" => description = Some(collapse_description(value)),
+                "requires_env" => requirements.env = parse_requirement_list(value)?,
+                "requires_commands" => requirements.commands = parse_requirement_list(value)?,
                 _ => {}
             }
         }
@@ -408,7 +464,82 @@ fn parse_skill_frontmatter(content: &str) -> Result<(String, String)> {
     if description.len() > MAX_DESCRIPTION_LEN {
         anyhow::bail!("description too long");
     }
-    Ok((name, description))
+    validate_requirements(&requirements)?;
+    Ok(ParsedSkill {
+        name,
+        description,
+        requirements,
+    })
+}
+
+fn parse_requirement_list(value: &str) -> Result<Vec<String>> {
+    let mut entries = Vec::new();
+    for entry in value.split(',') {
+        let entry = entry.trim();
+        if entry.is_empty() {
+            anyhow::bail!("empty requirement entry");
+        }
+        entries.push(entry.to_string());
+    }
+    if entries.is_empty() {
+        anyhow::bail!("empty requirement list");
+    }
+    Ok(entries)
+}
+
+fn validate_requirements(requirements: &SkillRequirements) -> Result<()> {
+    for name in &requirements.env {
+        if !valid_env_requirement(name) {
+            anyhow::bail!("invalid env requirement `{name}`");
+        }
+    }
+    for command in &requirements.commands {
+        if !valid_command_requirement(command) {
+            anyhow::bail!("invalid command requirement `{command}`");
+        }
+    }
+    Ok(())
+}
+
+fn valid_env_requirement(name: &str) -> bool {
+    let mut chars = name.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    (first.is_ascii_alphabetic() || first == '_')
+        && chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+}
+
+fn valid_command_requirement(command: &str) -> bool {
+    !command.is_empty()
+        && !command.contains('/')
+        && command
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.'))
+}
+
+fn requirements_met(requirements: &SkillRequirements, env: &EnvMap) -> bool {
+    requirements
+        .env
+        .iter()
+        .all(|name| env.get(name).is_some_and(|value| !value.is_empty()))
+        && requirements
+            .commands
+            .iter()
+            .all(|command| command_in_path(command, env))
+}
+
+fn command_in_path(command: &str, env: &EnvMap) -> bool {
+    let Some(path) = env.get("PATH") else {
+        return false;
+    };
+    std::env::split_paths(&OsString::from(path)).any(|dir| {
+        let candidate = dir.join(command);
+        candidate.is_file()
+            && candidate
+                .metadata()
+                .is_ok_and(|metadata| metadata.permissions().mode() & 0o111 != 0)
+    })
 }
 
 fn strip_closed_frontmatter(content: &str) -> Option<&str> {
@@ -541,7 +672,8 @@ mod tests {
         )
         .unwrap();
 
-        let index = scan_instruction_index_with_builtins(None, &root, None).unwrap();
+        let env = env_map(&[]);
+        let index = scan_instruction_index_with_builtins(None, &root, None, &env).unwrap();
 
         assert_eq!(index.commands.len(), 1);
         assert_eq!(index.commands[0].name, "review.md");
@@ -562,7 +694,8 @@ mod tests {
         )
         .unwrap();
 
-        let index = scan_instruction_index_with_builtins(None, &root, None).unwrap();
+        let env = env_map(&[]);
+        let index = scan_instruction_index_with_builtins(None, &root, None, &env).unwrap();
 
         assert!(index.commands.is_empty());
         assert_eq!(index.skills.len(), 1);
@@ -580,9 +713,72 @@ mod tests {
         )
         .unwrap();
 
-        let index = scan_instruction_index_with_builtins(None, &root, None).unwrap();
+        let env = env_map(&[]);
+        let index = scan_instruction_index_with_builtins(None, &root, None, &env).unwrap();
 
         assert!(index.skills.is_empty());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn skill_requirements_parse_comma_separated_env_and_commands() {
+        let skill = parse_skill_frontmatter(
+            "---\nname: review\ndescription: Review changes.\nrequires_env: TOKEN, OTHER_TOKEN\nrequires_commands: gh, jq\n---\nReview it.\n",
+        )
+        .unwrap();
+
+        assert_eq!(skill.requirements.env, ["TOKEN", "OTHER_TOKEN"]);
+        assert_eq!(skill.requirements.commands, ["gh", "jq"]);
+    }
+
+    #[test]
+    fn env_requirements_gate_skill_activation() {
+        let root = temp_root("env-requirements");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(
+            root.join("review.md"),
+            "---\nname: review\ndescription: Review changes.\nrequires_env: TOKEN, OTHER_TOKEN\n---\nReview it.\n",
+        )
+        .unwrap();
+
+        let missing = env_map(&[("TOKEN", "set")]);
+        let index = scan_instruction_index_with_builtins(None, &root, None, &missing).unwrap();
+        assert!(index.skills.is_empty());
+
+        let present = env_map(&[("TOKEN", "set"), ("OTHER_TOKEN", "set")]);
+        let index = scan_instruction_index_with_builtins(None, &root, None, &present).unwrap();
+        assert_eq!(index.skills.len(), 1);
+        assert_eq!(index.skills[0].requirements.env, ["TOKEN", "OTHER_TOKEN"]);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn command_requirements_gate_skill_activation() {
+        let root = temp_root("command-requirements");
+        let bin = root.join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        fs::write(bin.join("gh"), "#!/bin/sh\nexit 0\n").unwrap();
+        let mut permissions = fs::metadata(bin.join("gh")).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(bin.join("gh"), permissions).unwrap();
+        fs::write(
+            root.join("review.md"),
+            "---\nname: review\ndescription: Review changes.\nrequires_commands: gh, jq\n---\nReview it.\n",
+        )
+        .unwrap();
+
+        let missing = env_map(&[("PATH", &bin.display().to_string())]);
+        let index = scan_instruction_index_with_builtins(None, &root, None, &missing).unwrap();
+        assert!(index.skills.is_empty());
+
+        fs::write(bin.join("jq"), "#!/bin/sh\nexit 0\n").unwrap();
+        let mut permissions = fs::metadata(bin.join("jq")).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(bin.join("jq"), permissions).unwrap();
+        let present = env_map(&[("PATH", &bin.display().to_string())]);
+        let index = scan_instruction_index_with_builtins(None, &root, None, &present).unwrap();
+        assert_eq!(index.skills.len(), 1);
+        assert_eq!(index.skills[0].requirements.commands, ["gh", "jq"]);
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -620,8 +816,10 @@ mod tests {
         )
         .unwrap();
 
+        let env = env_map(&[]);
         let index =
-            scan_instruction_index_with_builtins(Some(&builtins), &global, Some(&project)).unwrap();
+            scan_instruction_index_with_builtins(Some(&builtins), &global, Some(&project), &env)
+                .unwrap();
 
         assert_eq!(index.skills.len(), 3);
         assert_eq!(index.skills[0].name, "background-task");
@@ -648,10 +846,59 @@ mod tests {
     }
 
     #[test]
+    fn inactive_project_skill_does_not_shadow_active_global_skill() {
+        let global = temp_root("global-shadow");
+        let project = temp_root("project-shadow");
+        fs::create_dir_all(&global).unwrap();
+        fs::create_dir_all(&project).unwrap();
+        fs::write(
+            global.join("review.md"),
+            "---\nname: review\ndescription: Review globally.\n---\nGlobal review.\n",
+        )
+        .unwrap();
+        fs::write(
+            project.join("review.md"),
+            "---\nname: review\ndescription: Review locally.\nrequires_env: PROJECT_ONLY\n---\nLocal review.\n",
+        )
+        .unwrap();
+
+        let env = env_map(&[]);
+        let index =
+            scan_instruction_index_with_builtins(None, &global, Some(&project), &env).unwrap();
+
+        assert_eq!(index.skills.len(), 1);
+        assert_eq!(index.skills[0].name, "review");
+        assert_eq!(index.skills[0].description, "Review globally.");
+        assert_eq!(index.skills[0].scope, InstructionScope::Global);
+        fs::remove_dir_all(global).unwrap();
+        fs::remove_dir_all(project).unwrap();
+    }
+
+    #[test]
+    fn inactive_skill_is_excluded_from_prompt_but_command_remains_available() {
+        let root = temp_root("inactive-command-skill");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(
+            root.join("review.md"),
+            "#!/usr/bin/env mu\n---\nname: review\ndescription: Review changes.\nrequires_env: TOKEN\n---\nReview it.\n",
+        )
+        .unwrap();
+
+        let env = env_map(&[]);
+        let index = scan_instruction_index_with_builtins(None, &root, None, &env).unwrap();
+
+        assert!(index.skills.is_empty());
+        assert_eq!(index.commands.len(), 1);
+        assert!(format_skills_block(&index.skills).is_empty());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn repository_builtins_have_valid_skill_metadata() {
         let builtins = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("builtins");
 
-        let index = scan_root(&builtins, InstructionScope::Builtin).unwrap();
+        let env = env_map(&[("PATH", std::env::var("PATH").unwrap_or_default().as_str())]);
+        let index = scan_root(&builtins, InstructionScope::Builtin, &env).unwrap();
 
         let names = index
             .skills
@@ -669,5 +916,12 @@ mod tests {
             .unwrap()
             .as_nanos();
         std::env::temp_dir().join(format!("mu-{name}-{}-{nanos}", std::process::id()))
+    }
+
+    fn env_map(entries: &[(&str, &str)]) -> EnvMap {
+        entries
+            .iter()
+            .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+            .collect()
     }
 }

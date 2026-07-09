@@ -104,6 +104,7 @@ MU_ZSH_EXIT_HOOKS+=(mu_restore_conflicts)
 | `mu project init [--path <dir>] [--force]` | Create minimal local `.mu` metadata in the current directory or target directory |
 | `mu status --json [--include-models]` | Report the resolved model, session, context state, and optional configured model list |
 | `mu status --json --include-commands` | Include discovered custom command entries |
+| `mu status --json --include-skills` | Include active skill entries |
 | `mu session new` | Create session, print id |
 | `mu session list` | List recent non-archived sessions |
 | `mu session archive --session <id>` | Hide a session from default lists |
@@ -142,6 +143,9 @@ be run by its relative `.mu` path, for example `mu review.md`. A file with YAML
 frontmatter containing `name` and `description` is listed as a skill only when
 the name matches the filename stem; `name/SKILL.md` files also qualify when the
 name matches the parent directory for compatibility with the open skill spec.
+Skills may also use `requires_env` and `requires_commands` frontmatter keys.
+Each key accepts comma-separated entries, and all listed env vars and commands
+must be available before the skill is listed.
 Commands and skills are discovered with bounded depth and file-count limits.
 
 ## Config

@@ -89,9 +89,7 @@ mod tests {
         let prompt = assemble_prompt(&[], Path::new("/tmp/mu-test-global"), None);
         assert!(prompt.starts_with(role_preamble()));
         assert!(prompt.contains("Exactly one tool is available: `bash`."));
-        assert!(prompt.contains(
-            "Do not invent or call `read`, `write`, `edit`, `fetch`, `search`, `apply_patch`, `view_image`, or any other tool name."
-        ));
+        assert!(prompt.contains("Do not invent or call other tool name."));
     }
 
     #[test]

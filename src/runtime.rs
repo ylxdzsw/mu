@@ -7,7 +7,7 @@ use crate::models::{
     AvailableModelsPayload, RequestOptions, ResolvedModelInfo, ResolvedModelRef, available_models,
     first_model_ref, resolve_model_info, resolve_model_ref,
 };
-use crate::skills::CommandMeta;
+use crate::skills::{CommandMeta, SkillMeta};
 use crate::store::{Session, Store};
 
 #[derive(Debug, Clone, Default)]
@@ -52,6 +52,8 @@ pub struct StatusReport {
     pub available_models: Option<AvailableModelsPayload>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub commands: Option<Vec<CommandMeta>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub skills: Option<Vec<SkillMeta>>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -149,6 +151,7 @@ pub fn build_status_report(
     project: Option<&crate::paths::Project>,
     include_models: bool,
     commands: Option<Vec<CommandMeta>>,
+    skills: Option<Vec<SkillMeta>>,
 ) -> Result<StatusReport> {
     let resolved = resolve_invocation(store, config, overrides)?;
     let model_info = resolve_model_info(config, &resolved.request.model);
@@ -196,6 +199,7 @@ pub fn build_status_report(
         compaction,
         available_models: include_models.then(|| available_models(config)),
         commands,
+        skills,
     })
 }
 
@@ -394,6 +398,7 @@ mod tests {
             None,
             false,
             None,
+            None,
         )
         .unwrap();
 
@@ -419,6 +424,7 @@ mod tests {
             },
             None,
             false,
+            None,
             None,
         )
         .unwrap();

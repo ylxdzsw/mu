@@ -339,17 +339,23 @@ async fn run() -> Result<()> {
         Some(Command::Status(status_args)) => {
             let config = Config::load_for_scope(project_config_dir.as_deref())?;
             let store = open_status_store(scope.session_db_path().as_path())?;
-            let commands = if status_args.include_commands {
-                Some(
-                    skills::scan_instruction_index(
-                        &paths::global_dir(),
-                        project_config_dir.as_deref(),
-                    )?
-                    .commands,
-                )
+            let index = if status_args.include_commands || status_args.include_skills {
+                Some(skills::scan_instruction_index_with_env(
+                    &paths::global_dir(),
+                    project_config_dir.as_deref(),
+                    &config.env,
+                )?)
             } else {
                 None
             };
+            let commands = status_args
+                .include_commands
+                .then(|| index.as_ref().map(|index| index.commands.clone()))
+                .flatten();
+            let skills = status_args
+                .include_skills
+                .then(|| index.as_ref().map(|index| index.skills.clone()))
+                .flatten();
             let report = build_status_report(
                 &store,
                 &config,
@@ -361,6 +367,7 @@ async fn run() -> Result<()> {
                 scope.project(),
                 status_args.include_models,
                 commands,
+                skills,
             )?;
             if status_args.json {
                 println!("{}", serde_json::to_string(&report)?);
