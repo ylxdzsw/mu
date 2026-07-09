@@ -287,6 +287,24 @@ impl Renderer {
         }
     }
 
+    pub fn bash_header_stdin_summary(&mut self, bytes: usize, complete: bool) -> io::Result<()> {
+        if self.final_only {
+            return Ok(());
+        }
+        if self.styled && !complete {
+            self.live_line = Some(LiveLine::BashStdin { bytes });
+            return self.render_live_line();
+        }
+        if !complete {
+            return Ok(());
+        }
+        if self.styled {
+            self.clear_live_line()?;
+            self.live_line = None;
+        }
+        self.write_stdout_committed(&format_stdin_summary_line(bytes, self.styled))
+    }
+
     pub fn bash_header_full(
         &mut self,
         tool_call_id: Option<&str>,
@@ -310,6 +328,9 @@ impl Renderer {
         self.bash_header_command_start(risk)?;
         self.bash_header_command_delta(&preview_first_line(command, BASH_COMMAND_PREVIEW_BYTES))?;
         self.bash_header_command_end()?;
+        if let Some(stdin) = args.get("stdin").and_then(|value| value.as_str()) {
+            self.bash_header_stdin_summary(stdin.len(), true)?;
+        }
         Ok(true)
     }
 
@@ -623,6 +644,7 @@ impl Renderer {
                 omitted_bytes,
                 self.styled,
             )),
+            Some(LiveLine::BashStdin { bytes }) => Some(format_stdin_summary(bytes, self.styled)),
             None => None,
         }
     }
@@ -794,6 +816,9 @@ enum LiveLine {
     BashOmitted {
         omitted_lines: usize,
         omitted_bytes: usize,
+    },
+    BashStdin {
+        bytes: usize,
     },
 }
 
@@ -2234,6 +2259,19 @@ fn format_table_live(output_tokens: u64, styled: bool) -> String {
     }
 }
 
+fn format_stdin_summary(bytes: usize, styled: bool) -> String {
+    let suffix = if bytes == 1 { "byte" } else { "bytes" };
+    if styled {
+        format!("{BLUE}< [stdin {bytes} {suffix}]{RESET}")
+    } else {
+        format!("< [stdin {bytes} {suffix}]")
+    }
+}
+
+fn format_stdin_summary_line(bytes: usize, styled: bool) -> String {
+    format!("{}\n", format_stdin_summary(bytes, styled))
+}
+
 fn format_thought_line(
     elapsed: Duration,
     reasoning_chars: usize,
@@ -2929,6 +2967,16 @@ mod tests {
         assert!(header.contains(&format!("{DIM}${RESET} {CYAN}{BOLD}printf 'a'…{RESET}\n")));
         assert!(!header.contains("  pwd\n"));
         assert!(!header.contains("[readonly]"));
+    }
+
+    #[test]
+    fn stdin_summary_uses_bracketed_byte_count() {
+        assert_eq!(format_stdin_summary_line(0, false), "< [stdin 0 bytes]\n");
+        assert_eq!(format_stdin_summary_line(1, false), "< [stdin 1 byte]\n");
+        assert_eq!(
+            format_stdin_summary_line(12, true),
+            format!("{BLUE}< [stdin 12 bytes]{RESET}\n")
+        );
     }
 
     #[test]

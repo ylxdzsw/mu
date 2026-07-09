@@ -54,6 +54,8 @@ struct CommandHeaderDisplay {
     command_started: bool,
     command_displayed_bytes: usize,
     command_line_done: bool,
+    stdin_started: bool,
+    stdin_line_done: bool,
 }
 
 pub struct AgentLoop<'a> {
@@ -678,15 +680,14 @@ fn handle_tool_call_delta(
 
     if delta.index == 0 {
         let header = &mut headers.entries[0];
-        if !header.display.is_done() {
-            header.display.update(
-                renderer,
-                header.id.as_deref(),
-                string_field_state(&header.arguments, "title"),
-                string_field_state(&header.arguments, "risk"),
-                string_field_state(&header.arguments, "command"),
-            )?;
-        }
+        header.display.update(
+            renderer,
+            header.id.as_deref(),
+            string_field_state(&header.arguments, "title"),
+            string_field_state(&header.arguments, "risk"),
+            string_field_state(&header.arguments, "command"),
+            string_field_state(&header.arguments, "stdin"),
+        )?;
         if header.display.is_done() {
             headers.next_to_render = headers.next_to_render.max(1);
         }
@@ -719,12 +720,14 @@ impl StreamingCommandHeader {
         let title = args.get("title").and_then(|value| value.as_str());
         let risk = args.get("risk").and_then(|value| value.as_str());
         let command = args.get("command").and_then(|value| value.as_str());
+        let stdin = args.get("stdin").and_then(|value| value.as_str());
         self.display.update(
             renderer,
             self.id.as_deref(),
             StringFieldState::from_final(title),
             StringFieldState::from_final(risk),
             StringFieldState::from_final(command),
+            StringFieldState::from_final(stdin),
         )?;
         Ok(self.display.started)
     }
@@ -732,7 +735,9 @@ impl StreamingCommandHeader {
 
 impl CommandHeaderDisplay {
     fn is_done(&self) -> bool {
-        self.title_line_done && self.command_line_done
+        self.title_line_done
+            && self.command_line_done
+            && (!self.stdin_started || self.stdin_line_done)
     }
 
     fn update(
@@ -742,6 +747,7 @@ impl CommandHeaderDisplay {
         title: StringFieldState,
         risk: StringFieldState,
         command: StringFieldState,
+        stdin: StringFieldState,
     ) -> std::io::Result<()> {
         if !self.started {
             self.started = renderer.bash_header_start(tool_call_id)?;
@@ -786,6 +792,16 @@ impl CommandHeaderDisplay {
             if done {
                 renderer.bash_header_command_end()?;
                 self.command_line_done = true;
+            }
+        }
+        if self.command_line_done
+            && !self.stdin_line_done
+            && let Some(value) = stdin.value()
+        {
+            self.stdin_started = true;
+            renderer.bash_header_stdin_summary(value.len(), stdin.is_complete())?;
+            if stdin.is_complete() {
+                self.stdin_line_done = true;
             }
         }
         Ok(())
@@ -1396,6 +1412,118 @@ mod tests {
 
         assert!(headers.entries[0].display.is_done());
         assert!(headers.entries[0].arguments.ends_with("\\n'\"}"));
+    }
+
+    #[test]
+    fn streamed_stdin_summary_waits_for_command_completion() {
+        let mut renderer = Renderer::with_format(OutputFormat::Terminal);
+        renderer.force_styled_for_test();
+        let mut headers = StreamingCommandHeaders::default();
+
+        handle_tool_call_delta(
+            &mut renderer,
+            &mut headers,
+            ToolCallDelta {
+                index: 0,
+                id: Some("call_1".into()),
+                name: Some("bash".into()),
+                arguments_delta:
+                    r#"{"title":"Feed stdin","risk":"readonly","stdin":"abc","command":"ca"#.into(),
+            },
+        )
+        .unwrap();
+
+        let display = &headers.entries[0].display;
+        assert!(display.command_started);
+        assert!(!display.command_line_done);
+        assert!(!display.stdin_started);
+
+        handle_tool_call_delta(
+            &mut renderer,
+            &mut headers,
+            ToolCallDelta {
+                index: 0,
+                id: None,
+                name: None,
+                arguments_delta: r#"t""#.into(),
+            },
+        )
+        .unwrap();
+
+        let display = &headers.entries[0].display;
+        assert!(display.command_line_done);
+        assert!(display.stdin_started);
+        assert!(display.stdin_line_done);
+        assert!(display.is_done());
+    }
+
+    #[test]
+    fn streamed_stdin_summary_keeps_updating_until_stdin_completes() {
+        let mut renderer = Renderer::with_format(OutputFormat::Terminal);
+        renderer.force_styled_for_test();
+        let mut headers = StreamingCommandHeaders::default();
+
+        handle_tool_call_delta(
+            &mut renderer,
+            &mut headers,
+            ToolCallDelta {
+                index: 0,
+                id: Some("call_1".into()),
+                name: Some("bash".into()),
+                arguments_delta:
+                    r#"{"title":"Feed stdin","risk":"readonly","command":"cat","stdin":"abc"#
+                        .into(),
+            },
+        )
+        .unwrap();
+
+        let display = &headers.entries[0].display;
+        assert!(display.command_line_done);
+        assert!(display.stdin_started);
+        assert!(!display.stdin_line_done);
+        assert!(!display.is_done());
+
+        handle_tool_call_delta(
+            &mut renderer,
+            &mut headers,
+            ToolCallDelta {
+                index: 0,
+                id: None,
+                name: None,
+                arguments_delta: r#"def"}"#.into(),
+            },
+        )
+        .unwrap();
+
+        let display = &headers.entries[0].display;
+        assert!(display.stdin_line_done);
+        assert!(display.is_done());
+    }
+
+    #[test]
+    fn final_header_shows_empty_stdin_summary() {
+        let mut renderer = Renderer::with_format(OutputFormat::Plain);
+        let mut headers = StreamingCommandHeaders::default();
+        let args = serde_json::json!({
+            "title": "Empty stdin",
+            "risk": "readonly",
+            "command": "cat",
+            "stdin": "",
+        });
+        let call = ToolCall {
+            id: "call_1".into(),
+            call_type: "function".into(),
+            function: crate::provider::FunctionCall {
+                name: "bash".into(),
+                arguments: args.to_string(),
+            },
+        };
+
+        assert!(finish_command_header(&mut renderer, &mut headers, 0, &call, &args).unwrap());
+        let display = &headers.entries[0].display;
+        assert!(display.stdin_started);
+        assert!(display.stdin_line_done);
+        assert!(display.is_done());
     }
 
     #[tokio::test]

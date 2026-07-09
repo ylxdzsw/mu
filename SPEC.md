@@ -364,8 +364,10 @@ assistant tool-call order.
 
 **Terminal visibility.** `bash` prints a `# <title>` line, then a `$ <command>`
 line with risk indicated by color in styled terminal output or an explicit
-`[risk]` label in plain output. It streams combined output and finishes with an
-exit status/duration line. Every tool error is visible.
+`[risk]` label in plain output. If the call includes a `stdin` field, it then
+prints a `< [stdin N bytes]` summary line before command output. It streams
+combined output and finishes with an exit status/duration line. Every tool error
+is visible.
 
 **Output truncation policy.** Following opencode's model, every bash output is
 capped before it enters the context window so a single large result cannot blow
@@ -496,6 +498,10 @@ stderr TTY detection suppresses the summary when redirected.
   consistently. The title and command are append-only and capped in place; the
   command display is the first decoded line with a byte cap. If fields arrive
   out of order, display buffers until the ordered header can be committed.
+  If a `stdin` field is provided, the optional `< [stdin N bytes]` summary starts
+  only after the command line has committed; styled terminal output may update
+  that summary as the only live line, while plain output commits it once the
+  final byte count is known.
   Later tool-call headers are buffered until their original-order display slot
   becomes active. Once execution begins, a header that was already streamed is
   not printed a second time. `plain` shows explicit risk labels such as
