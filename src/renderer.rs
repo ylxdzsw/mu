@@ -1,4 +1,5 @@
 use std::io::{self, IsTerminal, Write};
+use std::path::{Component, Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use pulldown_cmark::{Alignment, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
@@ -328,10 +329,20 @@ impl Renderer {
         self.bash_header_command_start(risk)?;
         self.bash_header_command_delta(&preview_first_line(command, BASH_COMMAND_PREVIEW_BYTES))?;
         self.bash_header_command_end()?;
+        if let Some(cwd) = args.get("cwd").and_then(|value| value.as_str()) {
+            self.bash_header_cwd_line(cwd)?;
+        }
         if let Some(stdin) = args.get("stdin").and_then(|value| value.as_str()) {
             self.bash_header_stdin_summary(stdin.len(), true)?;
         }
         Ok(true)
+    }
+
+    pub fn bash_header_cwd_line(&mut self, raw_cwd: &str) -> io::Result<()> {
+        if self.final_only || !should_render_bash_cwd(raw_cwd) {
+            return Ok(());
+        }
+        self.write_stdout_committed(&format_cwd_line(raw_cwd, self.styled))
     }
 
     pub fn cancel_live_state(&mut self) -> io::Result<()> {
@@ -2272,6 +2283,43 @@ fn format_stdin_summary_line(bytes: usize, styled: bool) -> String {
     format!("{}\n", format_stdin_summary(bytes, styled))
 }
 
+fn format_cwd_line(raw_cwd: &str, styled: bool) -> String {
+    if styled {
+        format!("{DIM}@{RESET} {GRAY}{raw_cwd}{RESET}\n")
+    } else {
+        format!("@ {raw_cwd}\n")
+    }
+}
+
+fn should_render_bash_cwd(raw_cwd: &str) -> bool {
+    let pwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let raw_path = PathBuf::from(raw_cwd);
+    let resolved = if raw_path.is_absolute() {
+        raw_path
+    } else {
+        pwd.join(raw_path)
+    };
+    lexical_normalize_path(&resolved) != lexical_normalize_path(&pwd)
+}
+
+fn lexical_normalize_path(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !normalized.pop() {
+                    normalized.push(component.as_os_str());
+                }
+            }
+            Component::Normal(_) | Component::RootDir | Component::Prefix(_) => {
+                normalized.push(component.as_os_str());
+            }
+        }
+    }
+    normalized
+}
+
 fn format_thought_line(
     elapsed: Duration,
     reasoning_chars: usize,
@@ -2977,6 +3025,23 @@ mod tests {
             format_stdin_summary_line(12, true),
             format!("{BLUE}< [stdin 12 bytes]{RESET}\n")
         );
+    }
+
+    #[test]
+    fn cwd_line_preserves_raw_cwd_text() {
+        assert_eq!(format_cwd_line("../other", false), "@ ../other\n");
+        assert_eq!(
+            format_cwd_line("../other", true),
+            format!("{DIM}@{RESET} {GRAY}../other{RESET}\n")
+        );
+    }
+
+    #[test]
+    fn cwd_line_only_renders_when_resolved_cwd_differs_from_pwd() {
+        let pwd = std::env::current_dir().unwrap();
+        assert!(!should_render_bash_cwd("."));
+        assert!(!should_render_bash_cwd(&pwd.display().to_string()));
+        assert!(should_render_bash_cwd("__mu_cwd_display_probe__"));
     }
 
     #[test]

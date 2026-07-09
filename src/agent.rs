@@ -54,6 +54,7 @@ struct CommandHeaderDisplay {
     command_started: bool,
     command_displayed_bytes: usize,
     command_line_done: bool,
+    cwd_line_done: bool,
     stdin_started: bool,
     stdin_line_done: bool,
 }
@@ -686,7 +687,9 @@ fn handle_tool_call_delta(
             string_field_state(&header.arguments, "title"),
             string_field_state(&header.arguments, "risk"),
             string_field_state(&header.arguments, "command"),
+            string_field_state(&header.arguments, "cwd"),
             string_field_state(&header.arguments, "stdin"),
+            arguments_json_complete(&header.arguments),
         )?;
         if header.display.is_done() {
             headers.next_to_render = headers.next_to_render.max(1);
@@ -727,7 +730,9 @@ impl StreamingCommandHeader {
             StringFieldState::from_final(title),
             StringFieldState::from_final(risk),
             StringFieldState::from_final(command),
+            StringFieldState::from_final(args.get("cwd").and_then(|value| value.as_str())),
             StringFieldState::from_final(stdin),
+            true,
         )?;
         Ok(self.display.started)
     }
@@ -737,6 +742,7 @@ impl CommandHeaderDisplay {
     fn is_done(&self) -> bool {
         self.title_line_done
             && self.command_line_done
+            && self.cwd_line_done
             && (!self.stdin_started || self.stdin_line_done)
     }
 
@@ -747,7 +753,9 @@ impl CommandHeaderDisplay {
         title: StringFieldState,
         risk: StringFieldState,
         command: StringFieldState,
+        cwd: StringFieldState,
         stdin: StringFieldState,
+        arguments_complete: bool,
     ) -> std::io::Result<()> {
         if !self.started {
             self.started = renderer.bash_header_start(tool_call_id)?;
@@ -794,7 +802,20 @@ impl CommandHeaderDisplay {
                 self.command_line_done = true;
             }
         }
+        if self.command_line_done && !self.cwd_line_done {
+            match cwd {
+                StringFieldState::Complete(value) => {
+                    renderer.bash_header_cwd_line(&value)?;
+                    self.cwd_line_done = true;
+                }
+                StringFieldState::Missing if arguments_complete => {
+                    self.cwd_line_done = true;
+                }
+                StringFieldState::Missing | StringFieldState::Partial(_) => {}
+            }
+        }
         if self.command_line_done
+            && self.cwd_line_done
             && !self.stdin_line_done
             && let Some(value) = stdin.value()
         {
@@ -845,6 +866,10 @@ enum JsonStringParse {
     Complete { value: String, consumed: usize },
     Partial(String),
     Invalid,
+}
+
+fn arguments_json_complete(input: &str) -> bool {
+    matches!(serde_json::from_str::<Value>(input), Ok(Value::Object(_)))
 }
 
 fn string_field_state(input: &str, field: &str) -> StringFieldState {
@@ -1324,8 +1349,9 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(headers.next_to_render, 1);
-        assert!(headers.entries[0].display.is_done());
+        assert_eq!(headers.next_to_render, 0);
+        assert!(!headers.entries[0].display.is_done());
+        assert!(!headers.entries[0].display.cwd_line_done);
         assert!(!headers.entries[1].display.started);
 
         assert!(
@@ -1369,7 +1395,7 @@ mod tests {
                 id: None,
                 name: None,
                 arguments_delta:
-                    r#"{"title":"Plain title","risk":"readonly","command":"echo plain""#.into(),
+                    r#"{"title":"Plain title","risk":"readonly","command":"echo plain"}"#.into(),
             },
         )
         .unwrap();
@@ -1445,13 +1471,98 @@ mod tests {
                 index: 0,
                 id: None,
                 name: None,
-                arguments_delta: r#"t""#.into(),
+                arguments_delta: r#"t"}"#.into(),
             },
         )
         .unwrap();
 
         let display = &headers.entries[0].display;
         assert!(display.command_line_done);
+        assert!(display.stdin_started);
+        assert!(display.stdin_line_done);
+        assert!(display.is_done());
+    }
+
+    #[test]
+    fn streamed_command_header_waits_for_argument_completion_before_missing_cwd_is_decided() {
+        let mut renderer = Renderer::with_format(OutputFormat::Plain);
+        let mut headers = StreamingCommandHeaders::default();
+
+        handle_tool_call_delta(
+            &mut renderer,
+            &mut headers,
+            ToolCallDelta {
+                index: 0,
+                id: Some("call_1".into()),
+                name: Some("bash".into()),
+                arguments_delta: r#"{"title":"Maybe cwd","risk":"readonly","command":"echo here""#
+                    .into(),
+            },
+        )
+        .unwrap();
+
+        let display = &headers.entries[0].display;
+        assert!(display.command_line_done);
+        assert!(!display.cwd_line_done);
+        assert!(!display.is_done());
+
+        handle_tool_call_delta(
+            &mut renderer,
+            &mut headers,
+            ToolCallDelta {
+                index: 0,
+                id: None,
+                name: None,
+                arguments_delta: "}".into(),
+            },
+        )
+        .unwrap();
+
+        let display = &headers.entries[0].display;
+        assert!(display.cwd_line_done);
+        assert!(display.is_done());
+    }
+
+    #[test]
+    fn streamed_stdin_summary_waits_for_cwd_decision() {
+        let mut renderer = Renderer::with_format(OutputFormat::Terminal);
+        renderer.force_styled_for_test();
+        let mut headers = StreamingCommandHeaders::default();
+
+        handle_tool_call_delta(
+            &mut renderer,
+            &mut headers,
+            ToolCallDelta {
+                index: 0,
+                id: Some("call_1".into()),
+                name: Some("bash".into()),
+                arguments_delta:
+                    r#"{"title":"Feed stdin","risk":"readonly","command":"cat","stdin":"abc""#
+                        .into(),
+            },
+        )
+        .unwrap();
+
+        let display = &headers.entries[0].display;
+        assert!(display.command_line_done);
+        assert!(!display.cwd_line_done);
+        assert!(!display.stdin_started);
+        assert!(!display.is_done());
+
+        handle_tool_call_delta(
+            &mut renderer,
+            &mut headers,
+            ToolCallDelta {
+                index: 0,
+                id: None,
+                name: None,
+                arguments_delta: r#","cwd":"./elsewhere"}"#.into(),
+            },
+        )
+        .unwrap();
+
+        let display = &headers.entries[0].display;
+        assert!(display.cwd_line_done);
         assert!(display.stdin_started);
         assert!(display.stdin_line_done);
         assert!(display.is_done());
@@ -1471,7 +1582,7 @@ mod tests {
                 id: Some("call_1".into()),
                 name: Some("bash".into()),
                 arguments_delta:
-                    r#"{"title":"Feed stdin","risk":"readonly","command":"cat","stdin":"abc"#
+                    r#"{"title":"Feed stdin","risk":"readonly","command":"cat","cwd":".","stdin":"abc"#
                         .into(),
             },
         )

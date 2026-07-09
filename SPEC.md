@@ -364,10 +364,12 @@ assistant tool-call order.
 
 **Terminal visibility.** `bash` prints a `# <title>` line, then a `$ <command>`
 line with risk indicated by color in styled terminal output or an explicit
-`[risk]` label in plain output. If the call includes a `stdin` field, it then
-prints a `< [stdin N bytes]` summary line before command output. It streams
-combined output and finishes with an exit status/duration line. Every tool error
-is visible.
+`[risk]` label in plain output. If the call includes a `cwd` field whose
+resolved path differs from `mu`'s process working directory, it then prints an
+`@ <raw cwd>` line using the exact `cwd` string supplied by the agent. If the
+call includes a `stdin` field, it then prints a `< [stdin N bytes]` summary line
+before command output. It streams combined output and finishes with an exit
+status/duration line. Every tool error is visible.
 
 **Output truncation policy.** Following opencode's model, every bash output is
 capped before it enters the context window so a single large result cannot blow
