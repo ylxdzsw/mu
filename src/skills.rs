@@ -897,7 +897,12 @@ mod tests {
     fn repository_builtins_have_valid_skill_metadata() {
         let builtins = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("builtins");
 
-        let env = env_map(&[("PATH", std::env::var("PATH").unwrap_or_default().as_str())]);
+        let path = std::env::var("PATH").unwrap_or_default();
+        let env = env_map(&[
+            ("PATH", path.as_str()),
+            ("BRAVE_API_KEY", "test-brave-key"),
+            ("EXA_API_KEY", "test-exa-key"),
+        ]);
         let index = scan_root(&builtins, InstructionScope::Builtin, &env).unwrap();
 
         let names = index
@@ -906,7 +911,9 @@ mod tests {
             .map(|skill| skill.name.as_str())
             .collect::<Vec<_>>();
         assert!(names.contains(&"background-task"));
+        assert!(names.contains(&"brave-search"));
         assert!(names.contains(&"customize-mu"));
+        assert!(names.contains(&"exa-search"));
         assert!(names.contains(&"subagent"));
     }
 
