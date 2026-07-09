@@ -897,7 +897,18 @@ mod tests {
     fn repository_builtins_have_valid_skill_metadata() {
         let builtins = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("builtins");
 
+        let root = temp_root("repository-builtins");
+        let bin = root.join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        fs::write(bin.join("agent-browser"), "#!/bin/sh\nexit 0\n").unwrap();
+        let mut permissions = fs::metadata(bin.join("agent-browser"))
+            .unwrap()
+            .permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(bin.join("agent-browser"), permissions).unwrap();
+
         let path = std::env::var("PATH").unwrap_or_default();
+        let path = format!("{}:{path}", bin.display());
         let env = env_map(&[
             ("PATH", path.as_str()),
             ("BRAVE_API_KEY", "test-brave-key"),
@@ -911,10 +922,12 @@ mod tests {
             .map(|skill| skill.name.as_str())
             .collect::<Vec<_>>();
         assert!(names.contains(&"background-task"));
+        assert!(names.contains(&"agent-browser"));
         assert!(names.contains(&"brave-search"));
         assert!(names.contains(&"customize-mu"));
         assert!(names.contains(&"exa-search"));
         assert!(names.contains(&"subagent"));
+        fs::remove_dir_all(root).unwrap();
     }
 
     fn temp_root(name: &str) -> PathBuf {
