@@ -321,8 +321,24 @@ async fn run() -> Result<()> {
                 }
                 SessionSub::Transcript { session } => {
                     let store = open_store_with_session(&db_path, &session)?;
-                    for message in store.all_messages_for_session(&session)? {
-                        println!("[{}:{}] {}", message.seq, message.role, message.content);
+                    for r in store.message_records_from_seq(&session, 0)? {
+                        println!("[{}:{}] {}", r.seq, r.role, r.content);
+
+                        // Emit toolcall requests immediately under their assistant message
+                        if r.role == "assistant" {
+                            if let Some(calls) = crate::store::parse_tool_calls(r.tool_calls_json.as_deref()) {
+                                for tc in calls {
+                                    println!("[{}:toolcall] {} {}", r.seq, tc.function.name, tc.function.arguments);
+                                }
+                            }
+                        }
+
+                        // Surface the tool schema together with the system message
+                        if r.role == "system" {
+                            if let Ok(schema) = serde_json::to_string_pretty(&crate::tools::tool_definitions()) {
+                                println!("[{}:system:toolschema]\n{}", r.seq, schema);
+                            }
+                        }
                     }
                 }
                 SessionSub::Archive { session } => {

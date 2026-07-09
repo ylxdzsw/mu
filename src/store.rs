@@ -19,12 +19,7 @@ pub struct Session {
     pub archived: bool,
 }
 
-#[derive(Debug, Clone)]
-pub struct StoredMessage {
-    pub role: String,
-    pub content: String,
-    pub seq: i64,
-}
+
 
 #[derive(Debug, Clone)]
 pub struct SessionSummary {
@@ -50,8 +45,10 @@ pub const INTERRUPTED_TOOL_RESULT: &str = "error: interrupted — this command m
 pub struct MessageRecord {
     pub id: i64,
     pub role: String,
+    pub content: String,
     pub tool_call_id: Option<String>,
     pub tool_calls_json: Option<String>,
+    pub seq: i64,
 }
 
 pub struct ToolCallRecord<'a> {
@@ -470,12 +467,12 @@ impl Store {
             content: self.system_prompt(session_id)?,
         }];
         if let Some(seq) = summary_seq
-            && let Some(summary) = self.message_at_seq(session_id, seq)?
+            && let Some(summary_content) = self.message_at_seq(session_id, seq)?
         {
             messages.push(Message::User {
                 content: UserContent::Text(format!(
                     "[summary of earlier conversation]\n{}",
-                    summary.content
+                    summary_content
                 )),
             });
         }
@@ -532,21 +529,15 @@ impl Store {
         Ok(row)
     }
 
-    fn message_at_seq(&self, session_id: &str, seq: i64) -> Result<Option<StoredMessage>> {
+    fn message_at_seq(&self, session_id: &str, seq: i64) -> Result<Option<String>> {
         let mut stmt = self.conn.prepare(
-            "SELECT role, content, seq FROM message
+            "SELECT content FROM message
              WHERE session_id = ?1 AND seq = ?2",
         )?;
-        let row = stmt
-            .query_row(params![session_id, seq], |row| {
-                Ok(StoredMessage {
-                    role: row.get(0)?,
-                    content: row.get(1)?,
-                    seq: row.get(2)?,
-                })
-            })
+        let content = stmt
+            .query_row(params![session_id, seq], |row| row.get(0))
             .optional()?;
-        Ok(row)
+        Ok(content)
     }
 
     pub fn append_message(&self, session_id: &str, message: &Message) -> Result<i64> {
@@ -659,21 +650,7 @@ impl Store {
         Ok(())
     }
 
-    pub fn all_messages_for_session(&self, session_id: &str) -> Result<Vec<StoredMessage>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT role, content, seq FROM message
-             WHERE session_id = ?1 ORDER BY seq ASC",
-        )?;
-        let rows = stmt.query_map(params![session_id], |row| {
-            Ok(StoredMessage {
-                role: row.get(0)?,
-                content: row.get(1)?,
-                seq: row.get(2)?,
-            })
-        })?;
-        rows.collect::<rusqlite::Result<Vec<_>>>()
-            .context("loading messages")
-    }
+
 
     pub fn latest_summary_sequence(&self, session_id: &str) -> Result<Option<i64>> {
         self.latest_summary_seq(session_id)
@@ -837,12 +814,14 @@ fn load_message_record_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<MessageR
     Ok(MessageRecord {
         id: row.get(0)?,
         role: row.get(1)?,
+        content: row.get(2)?,
         tool_call_id: row.get(4)?,
         tool_calls_json: row.get(5)?,
+        seq: row.get(6)?,
     })
 }
 
-fn parse_tool_calls(json: Option<&str>) -> Option<Vec<ToolCall>> {
+pub(crate) fn parse_tool_calls(json: Option<&str>) -> Option<Vec<ToolCall>> {
     let json = json?;
     let calls: Vec<ToolCall> = serde_json::from_str(json).ok()?;
     (!calls.is_empty()).then_some(calls)

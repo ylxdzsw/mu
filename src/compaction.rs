@@ -71,15 +71,15 @@ pub async fn run_compaction(
     provider: &dyn Provider,
 ) -> Result<()> {
     bash::install_signal_forwarder();
-    let messages = store.all_messages_for_session(session_id)?;
+    let records = store.message_records_from_seq(session_id, 0)?;
     let system_prompt = store.system_prompt(session_id)?;
     let keep = config.compaction.keep_recent_turns;
 
     // Count user turns from the end
     let mut user_turn_starts: Vec<i64> = Vec::new();
-    for msg in messages.iter().rev() {
-        if msg.role == "user" {
-            user_turn_starts.push(msg.seq);
+    for rec in records.iter().rev() {
+        if rec.role == "user" {
+            user_turn_starts.push(rec.seq);
             if user_turn_starts.len() >= keep {
                 break;
             }
@@ -93,7 +93,7 @@ pub async fn run_compaction(
         user_turn_starts.first().copied().unwrap_or(i64::MAX)
     };
 
-    let to_summarize: Vec<String> = messages
+    let to_summarize: Vec<String> = records
         .iter()
         .filter(|m| m.seq < cut_seq && m.role != "summary" && m.role != "system")
         .map(|m| {
@@ -103,11 +103,24 @@ pub async fn run_compaction(
                 "tool" => ("tool-result", MAX_SUMMARY_TOOL_CHARS),
                 _ => ("system", MAX_SUMMARY_ENTRY_CHARS),
             };
-            if m.content.is_empty() {
+            let mut text = if m.content.is_empty() {
                 format!("[{role}]: (no text content)")
             } else {
                 format!("[{role}]: {}", clamp_for_summary(&m.content, cap))
+            };
+            // Include toolcall requests so compaction sees what the assistant actually asked for
+            if m.role == "assistant" {
+                if let Some(calls) = crate::store::parse_tool_calls(m.tool_calls_json.as_deref()) {
+                    for c in calls {
+                        text.push_str(&format!(
+                            "\n[toolcall {}]: {}",
+                            c.function.name,
+                            clamp_for_summary(&c.function.arguments, MAX_SUMMARY_TOOL_CHARS)
+                        ));
+                    }
+                }
             }
+            text
         })
         .collect();
 
@@ -115,7 +128,7 @@ pub async fn run_compaction(
         return Ok(());
     }
 
-    let prior_summary = messages
+    let prior_summary = records
         .iter()
         .rfind(|m| m.role == "summary")
         .map(|m| m.content.as_str());
@@ -165,7 +178,7 @@ pub async fn run_compaction(
             // will eventually bail with a clear error. If there is no prior
             // summary at all, insert an honest minimal note so the model knows
             // earlier history was lost.
-            let has_prior = messages.iter().any(|m| m.role == "summary");
+            let has_prior = records.iter().any(|m| m.role == "summary");
             if !has_prior {
                 let note = "Earlier conversation history was lost due to context overflow.";
                 if keep == 0 || cut_seq == i64::MAX {
