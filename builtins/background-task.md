@@ -4,11 +4,11 @@ description: Start and stop long-running background services with systemd-run.
 ---
 
 Use this when a long-running service must survive a normal `bash` tool call so
-later foreground commands can test or inspect it.
+later foreground commands can test or inspect it, e.g., launching a dev server.
 
 Normal `bash` commands are run in an isolated process group. On timeout,
-interrupt, or process exit cleanup, `mu` sends SIGTERM and then SIGKILL to that
-group, so `server &` is not a reliable way to keep a service alive.
+interrupt, or main process exit, `mu` sends SIGTERM and then SIGKILL to that
+group, so `server &` does not reliably keep a service alive.
 
 Prefer a transient user service:
 
@@ -35,7 +35,7 @@ invocation_id=$(systemctl --user show "$unit" -P InvocationID 2>/dev/null || tru
 printf 'unit=%s\ninvocation_id=%s\nlog=%s\n' "$unit" "$invocation_id" "$log"
 ```
 
-Keep the service command in the foreground inside the unit. Do not append `&`.
+Run the service command in the foreground inside the unit. Do not append `&`.
 
 Read logs through a normal foreground `bash` command such as:
 
@@ -43,7 +43,7 @@ Read logs through a normal foreground `bash` command such as:
 tail -n 200 "$log"
 ```
 
-Stop only the same unit activation:
+Stop the service:
 
 ```bash
 actual=$(systemctl --user show "$unit" -P InvocationID 2>/dev/null || true)
@@ -54,6 +54,4 @@ else
 fi
 ```
 
-Background logs are raw local files. They may contain secrets at rest, but any
-later foreground `bash` read still passes through `mu` output redaction before
-the model sees it.
+You should always cleanup services when no longer needed. They are not automatically killed by `mu`.

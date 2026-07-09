@@ -1,6 +1,6 @@
 ---
 name: customize-mu
-description: Use ONLY when editing mu setup files: ~/.mu/config.jsonc, .mu/config.jsonc, .mu/.env, AGENTS.md, custom commands, skills, or built-in/global/project instruction precedence. Do not use for application code.
+description: Use ONLY when editing mu setup files: ~/.mu/*, custom commands, skills, or built-in/global/project instructions. Do not use for application code.
 ---
 
 # Customizing mu
@@ -106,8 +106,8 @@ Keep `AGENTS.md` short. Put reusable task workflows in skills instead.
 
 ## Commands
 
-A custom command is any valid instruction file whose first line is a permissive
-`mu` shebang:
+A custom command is any valid instruction file whose first line is a common variant
+of `mu` shebang:
 
 ```markdown
 #!/usr/bin/env -S mu --output plain
@@ -149,7 +149,6 @@ Folder form:
 The skill name must match the flat file stem or the parent directory of
 `SKILL.md`. Names are lowercase ASCII letters or digits plus `_` and `-`.
 Descriptions should say both what the skill does and when it should trigger.
-Use "Use ONLY when..." for narrow self-customization skills.
 
 ## Project initialization
 
@@ -159,10 +158,9 @@ Use "Use ONLY when..." for narrow self-customization skills.
 - `.mu/config.jsonc`
 - `.mu/.gitignore`
 
-It intentionally does not create empty skill directories, `.env`, `AGENTS.md`,
-or `sessions.db`. By default it refuses to create a nested `mu` project inside
-another discovered project; use `--force` only when the user explicitly wants a
-nested project.
+It intentionally does not create `.env`, `AGENTS.md`, or `sessions.db`. By default
+it refuses to create a nested `mu` project inside another discovered project; use
+`--force` only when the user explicitly wants a nested project.
 
 ## Verification
 
@@ -171,16 +169,3 @@ After editing `mu` setup, prefer cheap structured checks:
 ```bash
 mu status --json --include-models --include-commands
 ```
-
-When changing this repository's built-in customization behavior, also run the
-focused tests for touched areas:
-
-```bash
-cargo test skills
-cargo test config
-cargo fmt --check
-git diff --check
-```
-
-If you edit package-installed built-ins in this repository, remember that the
-Arch package copies `builtins/` to `/usr/share/mu`.
