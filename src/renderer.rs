@@ -746,6 +746,7 @@ impl Default for Renderer {
 struct MarkdownStream {
     pending_line: String,
     line_stream: Option<LineStreamState>,
+    line_prefix: Option<LineStreamPrefix>,
     inline_stream: InlineStream,
     code_fence: Option<FenceState>,
     table_candidate: Option<String>,
@@ -764,6 +765,13 @@ enum LineStreamState {
     Heading { level: HeadingLevel },
     List,
     Quote,
+}
+
+#[derive(Default)]
+struct LineStreamPrefix {
+    raw: String,
+    rendered: String,
+    emitted: bool,
 }
 
 #[derive(Default)]
@@ -852,7 +860,7 @@ impl MarkdownStream {
         if self.line_stream.is_some() {
             let (body, _) = split_line_ending(line);
             if !body.is_empty() {
-                self.inline_stream.push(body, out);
+                self.push_line_stream_text(body, out);
             }
             self.finish_line_stream(out);
             return;
@@ -871,7 +879,7 @@ impl MarkdownStream {
 
         if self.line_stream.is_some() {
             let text = std::mem::take(&mut self.pending_line);
-            self.inline_stream.push(&text, out);
+            self.push_line_stream_text(&text, out);
             return;
         }
 
@@ -882,21 +890,61 @@ impl MarkdownStream {
         };
         self.inline_stream.set_base(line_stream_base_styles(state));
         self.line_stream = Some(state);
-        if !rendered_prefix.is_empty() {
-            out.push(rendered_prefix);
-        }
+        self.line_prefix = Some(LineStreamPrefix {
+            raw: self.pending_line[..prefix_len].to_string(),
+            rendered: rendered_prefix,
+            emitted: false,
+        });
         let rest = self.pending_line[prefix_len..].to_string();
         self.pending_line.clear();
         if !rest.is_empty() {
-            self.inline_stream.push(&rest, out);
+            self.push_line_stream_text(&rest, out);
         }
+    }
+
+    fn push_line_stream_text(&mut self, text: &str, out: &mut Vec<String>) {
+        let mut rendered = Vec::new();
+        self.inline_stream.push(text, &mut rendered);
+        if rendered.is_empty() {
+            return;
+        }
+        self.emit_rendered_line_prefix(out);
+        out.extend(rendered);
+    }
+
+    fn emit_rendered_line_prefix(&mut self, out: &mut Vec<String>) {
+        let Some(prefix) = self.line_prefix.as_mut() else {
+            return;
+        };
+        if prefix.emitted {
+            return;
+        }
+        if !prefix.rendered.is_empty() {
+            out.push(prefix.rendered.clone());
+        }
+        prefix.emitted = true;
     }
 
     fn finish_line_stream(&mut self, out: &mut Vec<String>) {
         let Some(state) = self.line_stream.take() else {
             return;
         };
-        self.inline_stream.finish(out);
+        let mut rendered = Vec::new();
+        self.inline_stream.finish(&mut rendered);
+        let raw_fallback = self
+            .line_prefix
+            .as_ref()
+            .is_some_and(|prefix| !prefix.emitted);
+        if raw_fallback {
+            if let Some(prefix) = self.line_prefix.take() {
+                out.push(prefix.raw);
+            }
+            out.extend(rendered);
+            out.push("\n".to_string());
+            return;
+        }
+        self.line_prefix = None;
+        out.extend(rendered);
         if matches!(
             state,
             LineStreamState::Heading { .. } | LineStreamState::Quote
@@ -1603,7 +1651,8 @@ impl InlineStream {
 
 fn earliest_inline_marker(text: &str) -> Option<usize> {
     text.char_indices().find_map(|(idx, ch)| match ch {
-        '*' | '_' | '`' | '[' | '!' => Some(idx),
+        '*' | '_' | '`' | '[' => Some(idx),
+        '!' if text[idx..].starts_with("![") => Some(idx),
         '~' if text[idx..].starts_with("~~") => Some(idx),
         _ => None,
     })
@@ -1719,7 +1768,15 @@ fn render_markdown(markdown: &str) -> String {
                         code_block_styles(),
                     );
                 }
-                Tag::List(start) => lists.push(ListState { next: start }),
+                Tag::List(start) => {
+                    if in_item > 0 {
+                        let target = current_render_target(&mut out, &mut table_state);
+                        if !target.ends_with('\n') {
+                            target.push('\n');
+                        }
+                    }
+                    lists.push(ListState { next: start });
+                }
                 Tag::Item => {
                     in_item += 1;
                     current_render_target(&mut out, &mut table_state)
@@ -1802,7 +1859,10 @@ fn render_markdown(markdown: &str) -> String {
                 }
                 TagEnd::Item => {
                     in_item = in_item.saturating_sub(1);
-                    current_render_target(&mut out, &mut table_state).push('\n');
+                    let target = current_render_target(&mut out, &mut table_state);
+                    if !target.ends_with('\n') {
+                        target.push('\n');
+                    }
                 }
                 TagEnd::TableHead => {
                     if let Some(table) = table_state.as_mut() {
@@ -2533,6 +2593,15 @@ mod tests {
     }
 
     #[test]
+    fn markdown_renderer_keeps_nested_list_items_on_separate_lines() {
+        let rendered = render_markdown("- parent\n  - child\n");
+        let plain = strip_ansi(&rendered);
+
+        assert!(plain.contains("• parent\n  • child\n"), "{plain:?}");
+        assert!(!plain.contains("• parent  • child"), "{plain:?}");
+    }
+
+    #[test]
     fn markdown_renderer_aligns_wide_table_cells() {
         let rendered =
             render_markdown("| Name | Value |\n| --- | ---: |\n| 字 | 10 |\n| ascii | 2 |\n");
@@ -2560,13 +2629,15 @@ mod tests {
         assert_eq!(strip_ansi(&stream.push("hello").concat()), "hello");
         assert_eq!(stream.push("\n").concat(), "\n");
 
-        assert_eq!(strip_ansi(&stream.push("- ").concat()), "• ");
-        assert_eq!(strip_ansi(&stream.push("item").concat()), "item");
+        assert_eq!(stream.push("- ").concat(), "");
+        assert_eq!(strip_ansi(&stream.push("item").concat()), "• item");
         assert_eq!(stream.push("\n").concat(), "\n");
 
         let heading_start = stream.push("## ").concat();
-        assert!(heading_start.contains(BOLD), "{heading_start:?}");
-        assert_eq!(strip_ansi(&stream.push("Title").concat()), "Title");
+        assert_eq!(heading_start, "");
+        let heading_title = stream.push("Title").concat();
+        assert!(heading_title.contains(BOLD), "{heading_title:?}");
+        assert_eq!(strip_ansi(&heading_title), "Title");
         assert_eq!(strip_ansi(&stream.push("\n").concat()), "\n\n");
 
         assert_eq!(strip_ansi(&stream.push("> quoted").concat()), "│ quoted");
@@ -2652,6 +2723,28 @@ mod tests {
         assert_eq!(rendered, "![alt](image.png)\n");
         let heading = stream.push("# ![alt](image.png)\n").concat();
         assert_eq!(heading, "# ![alt](image.png)\n");
+    }
+
+    #[test]
+    fn markdown_stream_keeps_chunked_unsupported_image_lines_raw() {
+        let mut stream = MarkdownStream::default();
+
+        assert_eq!(stream.push("# ").concat(), "");
+        let heading = stream.push("![alt](image.png)\n").concat();
+        assert_eq!(heading, "# ![alt](image.png)\n");
+
+        assert_eq!(stream.push("- ").concat(), "");
+        let list = stream.push("![alt](image.png)\n").concat();
+        assert_eq!(list, "- ![alt](image.png)\n");
+    }
+
+    #[test]
+    fn markdown_stream_does_not_buffer_plain_exclamation_points() {
+        let mut stream = MarkdownStream::default();
+
+        assert_eq!(stream.push("Done!").concat(), "Done!");
+        assert_eq!(stream.push(" Next").concat(), " Next");
+        assert_eq!(stream.push("\n").concat(), "\n");
     }
 
     #[test]
