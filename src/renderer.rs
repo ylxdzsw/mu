@@ -36,8 +36,9 @@ const BASH_TAIL_LINE_CAP_BYTES: usize = 256;
 pub(crate) const ELLIPSIS: &str = "…";
 
 pub struct Renderer {
-    stdout: io::Stdout,
-    stderr: io::Stderr,
+    stdout: Box<dyn Write + Send>,
+    stderr: Box<dyn Write + Send>,
+    stderr_is_terminal: bool,
     stdout_at_line_start: bool,
     trailing_newlines: usize,
     has_committed_stdout: bool,
@@ -50,6 +51,33 @@ pub struct Renderer {
     bash_preview: Option<BashPreviewState>,
     turn_done_bell_min_duration: Option<Duration>,
     final_only: bool,
+}
+
+#[cfg(test)]
+#[derive(Clone, Default)]
+struct SharedOutput(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+#[cfg(test)]
+impl SharedOutput {
+    fn write_raw(&self, text: &str) {
+        self.0.lock().unwrap().extend_from_slice(text.as_bytes());
+    }
+
+    fn transcript(&self) -> String {
+        String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
+    }
+}
+
+#[cfg(test)]
+impl Write for SharedOutput {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 impl Renderer {
@@ -66,13 +94,17 @@ impl Renderer {
         turn_done_bell_min_duration: Option<Duration>,
     ) -> Self {
         let stdout = io::stdout();
+        let styled = format == OutputFormat::Terminal && stdout.is_terminal();
+        let stderr = io::stderr();
+        let stderr_is_terminal = stderr.is_terminal();
         Self {
-            styled: format == OutputFormat::Terminal && stdout.is_terminal(),
-            stdout,
-            stderr: io::stderr(),
+            stdout: Box::new(stdout),
+            stderr: Box::new(stderr),
+            stderr_is_terminal,
             stdout_at_line_start: true,
             trailing_newlines: 0,
             has_committed_stdout: false,
+            styled,
             markdown: MarkdownStream::default(),
             assistant_block_open: false,
             live_line: None,
@@ -87,6 +119,67 @@ impl Renderer {
     #[cfg(test)]
     pub(crate) fn force_styled_for_test(&mut self) {
         self.styled = true;
+    }
+
+    #[cfg(test)]
+    fn with_test_output(
+        format: OutputFormat,
+        stdout_is_terminal: bool,
+        stderr_is_terminal: bool,
+        turn_done_bell_min_duration: Option<Duration>,
+    ) -> (Self, SharedOutput, SharedOutput) {
+        let stdout = SharedOutput::default();
+        let stderr = SharedOutput::default();
+        (
+            Self {
+                stdout: Box::new(stdout.clone()),
+                stderr: Box::new(stderr.clone()),
+                stderr_is_terminal,
+                stdout_at_line_start: true,
+                trailing_newlines: 0,
+                has_committed_stdout: false,
+                styled: format == OutputFormat::Terminal && stdout_is_terminal,
+                markdown: MarkdownStream::default(),
+                assistant_block_open: false,
+                live_line: None,
+                live_line_rendered: false,
+                reasoning: None,
+                bash_preview: None,
+                turn_done_bell_min_duration,
+                final_only: format == OutputFormat::Final,
+            },
+            stdout,
+            stderr,
+        )
+    }
+
+    #[cfg(test)]
+    fn with_test_shared_output(
+        format: OutputFormat,
+        output_is_terminal: bool,
+        turn_done_bell_min_duration: Option<Duration>,
+    ) -> (Self, SharedOutput) {
+        let output = SharedOutput::default();
+        (
+            Self {
+                stdout: Box::new(output.clone()),
+                stderr: Box::new(output.clone()),
+                stderr_is_terminal: output_is_terminal,
+                stdout_at_line_start: true,
+                trailing_newlines: 0,
+                has_committed_stdout: false,
+                styled: format == OutputFormat::Terminal && output_is_terminal,
+                markdown: MarkdownStream::default(),
+                assistant_block_open: false,
+                live_line: None,
+                live_line_rendered: false,
+                reasoning: None,
+                bash_preview: None,
+                turn_done_bell_min_duration,
+                final_only: format == OutputFormat::Final,
+            },
+            output,
+        )
     }
 
     pub fn assistant_text(&mut self, text: &str) -> io::Result<()> {
@@ -550,7 +643,7 @@ impl Renderer {
         if self.final_only {
             return Ok(());
         }
-        if !self.stderr.is_terminal() {
+        if !self.stderr_is_terminal {
             return Ok(());
         }
         write!(
@@ -568,7 +661,7 @@ impl Renderer {
         let Some(min_duration) = self.turn_done_bell_min_duration else {
             return Ok(());
         };
-        if elapsed < min_duration || !self.styled || !self.stderr.is_terminal() {
+        if elapsed < min_duration || !self.styled || !self.stderr_is_terminal {
             return Ok(());
         }
         self.stderr.write_all(b"\x07")?;
@@ -2658,8 +2751,6 @@ struct LinePreview {
 
 #[cfg(test)]
 mod tests {
-    use std::os::fd::RawFd;
-    use std::sync::{Mutex, OnceLock};
     use std::time::Duration;
 
     use serde_json::json;
@@ -2863,7 +2954,7 @@ mod tests {
 
     #[test]
     fn terminal_markdown_streaming_commits_only_stable_constructs() {
-        let raw = capture_markdown_stream_pty_transcript();
+        let raw = capture_markdown_stream_transcript();
         let normalized = strip_ansi(&raw.replace('\r', ""));
 
         assert!(
@@ -2926,74 +3017,24 @@ mod tests {
         }
     }
 
-    fn capture_markdown_stream_pty_transcript() -> String {
-        let _guard = pty_test_lock().lock().unwrap();
-        let mut master: RawFd = -1;
-        let mut slave: RawFd = -1;
-        unsafe {
-            assert_eq!(
-                libc::openpty(
-                    &mut master,
-                    &mut slave,
-                    std::ptr::null_mut(),
-                    std::ptr::null(),
-                    std::ptr::null(),
-                ),
-                0
-            );
-            let pid = libc::fork();
-            assert!(pid >= 0);
-            if pid == 0 {
-                libc::close(master);
-                assert_eq!(libc::dup2(slave, libc::STDOUT_FILENO), libc::STDOUT_FILENO);
-                assert_eq!(libc::dup2(slave, libc::STDERR_FILENO), libc::STDERR_FILENO);
-                if slave > libc::STDERR_FILENO {
-                    libc::close(slave);
-                }
+    fn capture_markdown_stream_transcript() -> String {
+        let (mut renderer, output) =
+            Renderer::with_test_shared_output(OutputFormat::Terminal, true, None);
 
-                let mut renderer = Renderer::with_format(OutputFormat::Terminal);
-                renderer.assistant_text("- one\n").unwrap();
-                write_raw_stdout("<after-list>\n");
-                renderer.assistant_text("```sh\n").unwrap();
-                renderer.assistant_text("echo hi\n").unwrap();
-                write_raw_stdout("<after-code-body>\n");
-                renderer.assistant_text("```\n").unwrap();
-                renderer.assistant_text("| Name | Value |\n").unwrap();
-                renderer.assistant_text("| --- | ---: |\n").unwrap();
-                renderer.assistant_text("| a | 1 |\n").unwrap();
-                write_raw_stdout("<after-table-row>\n");
-                renderer.assistant_text("\n").unwrap();
-                write_raw_stdout("<after-table-flush>\n");
-                libc::_exit(0);
-            }
+        renderer.assistant_text("- one\n").unwrap();
+        output.write_raw("<after-list>\n");
+        renderer.assistant_text("```sh\n").unwrap();
+        renderer.assistant_text("echo hi\n").unwrap();
+        output.write_raw("<after-code-body>\n");
+        renderer.assistant_text("```\n").unwrap();
+        renderer.assistant_text("| Name | Value |\n").unwrap();
+        renderer.assistant_text("| --- | ---: |\n").unwrap();
+        renderer.assistant_text("| a | 1 |\n").unwrap();
+        output.write_raw("<after-table-row>\n");
+        renderer.assistant_text("\n").unwrap();
+        output.write_raw("<after-table-flush>\n");
 
-            libc::close(slave);
-            let mut out = Vec::new();
-            let mut buf = [0u8; 4096];
-            loop {
-                let n = libc::read(master, buf.as_mut_ptr().cast(), buf.len());
-                if n <= 0 {
-                    break;
-                }
-                out.extend_from_slice(&buf[..n as usize]);
-            }
-            libc::close(master);
-            let mut status = 0;
-            assert_eq!(libc::waitpid(pid, &mut status, 0), pid);
-            assert!(libc::WIFEXITED(status));
-            assert_eq!(libc::WEXITSTATUS(status), 0);
-            String::from_utf8_lossy(&out).into_owned()
-        }
-    }
-
-    fn write_raw_stdout(text: &str) {
-        let bytes = text.as_bytes();
-        unsafe {
-            assert_eq!(
-                libc::write(libc::STDOUT_FILENO, bytes.as_ptr().cast(), bytes.len()),
-                bytes.len() as isize
-            );
-        }
+        output.transcript()
     }
 
     fn bar_columns(line: &str) -> Vec<usize> {
@@ -3098,7 +3139,7 @@ mod tests {
 
     #[test]
     fn terminal_summary_leaves_a_blank_line_before_the_next_prompt() {
-        let raw = capture_renderer_pty_transcript(Duration::from_secs(12), Some("mu> "));
+        let raw = capture_renderer_transcript(Duration::from_secs(12), Some("mu> "));
         let normalized = strip_ansi(&raw.replace('\r', ""));
 
         assert!(normalized.contains(
@@ -3110,155 +3151,66 @@ mod tests {
         assert!(!normalized.contains("[mu] tokens: 12 in / 5 out  context: 25%\n\n\nmu> "));
     }
 
-    fn capture_renderer_pty_transcript(
+    fn capture_renderer_transcript(
         turn_elapsed: Duration,
         trailing_prompt: Option<&str>,
     ) -> String {
-        let _guard = pty_test_lock().lock().unwrap();
-        let mut master: RawFd = -1;
-        let mut slave: RawFd = -1;
-        unsafe {
-            assert_eq!(
-                libc::openpty(
-                    &mut master,
-                    &mut slave,
-                    std::ptr::null_mut(),
-                    std::ptr::null(),
-                    std::ptr::null(),
-                ),
-                0
-            );
-            let pid = libc::fork();
-            assert!(pid >= 0);
-            if pid == 0 {
-                libc::close(master);
-                assert_eq!(libc::dup2(slave, libc::STDOUT_FILENO), libc::STDOUT_FILENO);
-                assert_eq!(libc::dup2(slave, libc::STDERR_FILENO), libc::STDERR_FILENO);
-                if slave > libc::STDERR_FILENO {
-                    libc::close(slave);
-                }
+        let (mut renderer, output) =
+            Renderer::with_test_shared_output(OutputFormat::Terminal, true, None);
 
-                let mut renderer = Renderer::with_format(OutputFormat::Terminal);
-                renderer.reasoning_start().unwrap();
-                renderer.reasoning_delta("plan").unwrap();
-                std::thread::sleep(Duration::from_millis(40));
-                renderer.reasoning_end(Some((12, 5))).unwrap();
-                renderer
-                    .tool_start(
-                        None,
-                        "bash",
-                        &json!({
-                            "title": "Stream demo",
-                            "risk": "readonly",
-                            "command": "printf 'line01\\nline02\\nline03\\n'",
-                        }),
-                        false,
-                    )
-                    .unwrap();
-                renderer
-                    .guardrail_verdict(
-                        true,
-                        "low",
-                        "explicit",
-                        "reason is acceptable",
-                        "printf 'line01\\nline02\\nline03\\n'",
-                    )
-                    .unwrap();
-                renderer
-                    .bash_output(None, "bash", "line01\nline02\nline03\n")
-                    .unwrap();
-                renderer
-                    .tool_finished(
-                        None,
-                        "bash",
-                        &ToolDisplay::Bash { exit_code: 0 },
-                        Duration::from_millis(250),
-                    )
-                    .unwrap();
-                renderer.finish_turn().unwrap();
-                renderer.turn_summary(12, 5, Some(25.0)).unwrap();
-                renderer.turn_done_bell(turn_elapsed).unwrap();
-                if let Some(prompt) = trailing_prompt {
-                    let bytes = prompt.as_bytes();
-                    assert_eq!(
-                        libc::write(libc::STDOUT_FILENO, bytes.as_ptr().cast(), bytes.len()),
-                        bytes.len() as isize
-                    );
-                }
-                libc::_exit(0);
-            }
-
-            libc::close(slave);
-            let mut out = Vec::new();
-            let mut buf = [0u8; 4096];
-            loop {
-                let n = libc::read(master, buf.as_mut_ptr().cast(), buf.len());
-                if n <= 0 {
-                    break;
-                }
-                out.extend_from_slice(&buf[..n as usize]);
-            }
-            libc::close(master);
-            let mut status = 0;
-            assert_eq!(libc::waitpid(pid, &mut status, 0), pid);
-            assert!(libc::WIFEXITED(status));
-            assert_eq!(libc::WEXITSTATUS(status), 0);
-            String::from_utf8_lossy(&out).into_owned()
+        renderer.reasoning_start().unwrap();
+        renderer.reasoning_delta("plan").unwrap();
+        std::thread::sleep(Duration::from_millis(40));
+        renderer.reasoning_end(Some((12, 5))).unwrap();
+        renderer
+            .tool_start(
+                None,
+                "bash",
+                &json!({
+                    "title": "Stream demo",
+                    "risk": "readonly",
+                    "command": "printf 'line01\\nline02\\nline03\\n'",
+                }),
+                false,
+            )
+            .unwrap();
+        renderer
+            .guardrail_verdict(
+                true,
+                "low",
+                "explicit",
+                "reason is acceptable",
+                "printf 'line01\\nline02\\nline03\\n'",
+            )
+            .unwrap();
+        renderer
+            .bash_output(None, "bash", "line01\nline02\nline03\n")
+            .unwrap();
+        renderer
+            .tool_finished(
+                None,
+                "bash",
+                &ToolDisplay::Bash { exit_code: 0 },
+                Duration::from_millis(250),
+            )
+            .unwrap();
+        renderer.finish_turn().unwrap();
+        renderer.turn_summary(12, 5, Some(25.0)).unwrap();
+        renderer.turn_done_bell(turn_elapsed).unwrap();
+        if let Some(prompt) = trailing_prompt {
+            output.write_raw(prompt);
         }
+        output.transcript()
     }
 
     fn capture_plain_reasoning_transcript() -> String {
-        let _guard = pty_test_lock().lock().unwrap();
-        let mut master: RawFd = -1;
-        let mut slave: RawFd = -1;
-        unsafe {
-            assert_eq!(
-                libc::openpty(
-                    &mut master,
-                    &mut slave,
-                    std::ptr::null_mut(),
-                    std::ptr::null(),
-                    std::ptr::null(),
-                ),
-                0
-            );
-            let pid = libc::fork();
-            assert!(pid >= 0);
-            if pid == 0 {
-                libc::close(master);
-                assert_eq!(libc::dup2(slave, libc::STDOUT_FILENO), libc::STDOUT_FILENO);
-                if slave > libc::STDERR_FILENO {
-                    libc::close(slave);
-                }
+        let (mut renderer, output, _stderr) =
+            Renderer::with_test_output(OutputFormat::Plain, false, false, None);
 
-                let mut renderer = Renderer::with_format(OutputFormat::Plain);
-                renderer.reasoning_start().unwrap();
-                renderer.reasoning_delta("reason").unwrap();
-                renderer.reasoning_end(None).unwrap();
-                libc::_exit(0);
-            }
+        renderer.reasoning_start().unwrap();
+        renderer.reasoning_delta("reason").unwrap();
+        renderer.reasoning_end(None).unwrap();
 
-            libc::close(slave);
-            let mut out = Vec::new();
-            let mut buf = [0u8; 4096];
-            loop {
-                let n = libc::read(master, buf.as_mut_ptr().cast(), buf.len());
-                if n <= 0 {
-                    break;
-                }
-                out.extend_from_slice(&buf[..n as usize]);
-            }
-            libc::close(master);
-            let mut status = 0;
-            assert_eq!(libc::waitpid(pid, &mut status, 0), pid);
-            assert!(libc::WIFEXITED(status));
-            assert_eq!(libc::WEXITSTATUS(status), 0);
-            String::from_utf8_lossy(&out).into_owned()
-        }
-    }
-
-    fn pty_test_lock() -> &'static Mutex<()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
+        output.transcript()
     }
 }
