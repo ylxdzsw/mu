@@ -170,9 +170,9 @@ terminal gives that for free and forever; a core binary that owns a long-lived
 REPL would have to reimplement completion, job control, and PTY handling
 behavior indefinitely. The cost is (a) session state must persist across process
 invocations — handled by SQLite in the active session scope, §11 — and (b)
-interactive shell commands are not automatically visible to the agent, which V1
-accepts (§6.3). Shell integration is preferred because it is only a line-editing
-surface around repeated turn invocations, not a replacement runtime.
+interactive shell commands are not automatically visible to the agent (§6.3).
+Shell integration is preferred because it is only a line-editing surface around
+repeated turn invocations, not a replacement runtime.
 
 ### Binary module responsibilities
 
@@ -348,11 +348,11 @@ bash({
 ```
 
 `title` is the short human-readable action shown in the terminal. `risk` is
-advisory metadata for UI/audit; V1 does not sandbox, approve, or restrict a call
-based on it. `command` is executed as `bash -lc <command>`. `cwd`, when present,
-applies only to that invocation; `cd`, shell variables, and exported environment
-do not persist to later bash calls. `stdin`, when present, is piped literally to
-the child process so the agent can pass bytes containing `$`, backticks,
+advisory metadata for UI/audit; `mu` does not sandbox, approve, or restrict a
+call based on it. `command` is executed as `bash -lc <command>`. `cwd`, when
+present, applies only to that invocation; `cd`, shell variables, and exported
+environment do not persist to later bash calls. `stdin`, when present, is piped
+literally to the child process so the agent can pass bytes containing `$`, backticks,
 quotes, or heredoc delimiters without shell expansion.
 
 **Execution ordering.** Human-facing output may execute maximal contiguous
@@ -405,7 +405,7 @@ reports depth greater than `1`.
 
 `timeout` defaults to 120 seconds and must be greater than zero. `mu` does not
 pre-check command argv size; if `bash -lc <command>` fails with OS
-argument-list-too-long (`E2BIG`), the tool returns a clear error. V1 does not
+argument-list-too-long (`E2BIG`), the tool returns a clear error. `mu` does not
 fall back to temp scripts.
 
 ---
@@ -611,10 +611,10 @@ Consequences:
   tool calls in SQLite (§11). Tool output is stored with the shared
   truncation/spill policy, so the DB keeps the structured transcript and spill
   files hold oversized raw command output.
-- **No shell-command sharing (V1):** commands run outside `mu` or the shell
+- **No shell-command sharing:** commands run outside `mu` or the shell
   plugin are
-  not automatically fed to the agent. Bridging interactive shell activity into a
-  session is deferred; V1 keeps the boundary explicit and private.
+  not automatically fed to the agent. `mu` keeps the boundary explicit and
+  private.
 
 ### 6.4 Session management
 
@@ -644,13 +644,13 @@ hand-written against the provider HTTP endpoint; the needed surface is small:
 - Stream deltas for assistant text and for tool-call arguments.
 - Report token usage.
 
-**V1 target: OpenAI-protocol chat-completions over HTTP.** This is the single
+**Provider target: OpenAI-protocol chat-completions over HTTP.** This is the single
 most widely implemented contract — it covers OpenAI itself, the many compatible
 cloud gateways, and (importantly) local model servers (llama.cpp/`llama-server`,
 vLLM, LM Studio, Ollama's OpenAI endpoint, etc.). A configurable **base URL** is
 required; bearer auth is sent only when `api_key_env` is configured. Subscription
 /OAuth providers (Claude Pro, ChatGPT) and the Anthropic-native protocol are out
-of scope for V1.
+of scope.
 
 **Request shape.** `POST {base_url}/chat/completions` with optional
 `Authorization: Bearer {key}`, `stream: true`, `model`, the `messages` array,
@@ -698,9 +698,7 @@ exits immediately with a non-zero status and a clear message pointing at
 provider. There is no silent fallback once configuration has been loaded.
 
 Because the canonical message history is stored in a provider-neutral form
-(§11), swapping the base URL/model across turns is supported without migration;
-a future second protocol (e.g. Anthropic-native) can be added behind the same
-trait.
+(§11), swapping the base URL/model across turns is supported without migration.
 
 ---
 
@@ -932,7 +930,7 @@ Conceptual schema (flat and small):
 
 ### Session mapping
 
-V1 maps each interactive shell instance to at most one active session:
+`mu` maps each interactive shell instance to at most one active session:
 
 - **Lazy creation.** On the first submitted prompt, the zsh plugin invokes `mu`
   without `--session`, exporting `MU_SESSION_FILE` to a temporary path. `mu`
@@ -1042,8 +1040,7 @@ per-call "running" marker in the database.
 dangling tool calls / read back a partial rollout on resume, because they are
 long-lived. mu writes only completed messages, derives cleanliness structurally,
 and repairs the tail lazily at the next turn — the same validity guarantee with
-no persisted turn-state machine. (Richer history editing — discard, revert — is
-deferred to explicit future commands.)
+no persisted turn-state machine.
 
 ### Session concurrency lock
 
@@ -1174,7 +1171,7 @@ in-flight tool call recorded as interrupted.
 
 ## 12. Safety posture
 
-V1 is deliberately **unsandboxed and unconfirmed** — "yolo" by design. `mu` runs
+`mu` is deliberately **unsandboxed and unconfirmed** — "yolo" by design. `mu` runs
 whatever the agent asks through `bash`: commands execute directly, files can be
 read or modified directly, and there are no allow/deny lists, per-action
 confirmation prompts, or sandbox. The `risk` field is audit metadata, not an
@@ -1197,9 +1194,9 @@ The protections that remain are cheap and non-intrusive:
   results from CLIs, etc.) is treated as untrusted data, not as instructions to
   follow.
 
-Sandboxing and an approval/policy layer are explicitly out of scope for now and
-can be layered on later without changing the architecture, should the threat
-model warrant it.
+Sandboxing and an approval/policy layer are not part of the product. The `risk`
+field and optional guardrail review are advisory/review surfaces, not sandbox
+boundaries.
 
 ### 12.1 Guardrail (optional)
 
