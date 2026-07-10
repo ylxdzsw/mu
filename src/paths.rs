@@ -104,7 +104,7 @@ pub fn ensure_dir(path: &std::path::Path) -> Result<()> {
 }
 
 pub fn ensure_project_layout(scope: &Scope) -> Result<()> {
-    ensure_state_layout(&scope.state_dir(), matches!(scope, Scope::Project(_)))?;
+    ensure_state_layout(&scope.state_dir(), false)?;
     Ok(())
 }
 
@@ -118,7 +118,7 @@ pub fn init_project_layout_at(root: &Path, force: bool) -> Result<ProjectInitRes
     })
 }
 
-fn ensure_state_layout(dir: &Path, project: bool) -> Result<Vec<&'static str>> {
+fn ensure_state_layout(dir: &Path, create_project_config: bool) -> Result<Vec<&'static str>> {
     let mut created_files = Vec::new();
     if !dir.exists() {
         ensure_dir(dir)?;
@@ -126,7 +126,7 @@ fn ensure_state_layout(dir: &Path, project: bool) -> Result<Vec<&'static str>> {
     } else {
         ensure_dir(dir)?;
     }
-    if project {
+    if create_project_config {
         let config = dir.join("config.jsonc");
         if !config.exists() {
             std::fs::write(&config, PROJECT_CONFIG_TEMPLATE)?;
@@ -185,7 +185,7 @@ fn project_marker_name(marker: ProjectMarker) -> &'static str {
 const PROJECT_CONFIG_TEMPLATE: &str =
     "{\n  // Optional project-local overrides merged over ~/.mu/config.jsonc.\n}\n";
 
-const STATE_GITIGNORE: &str = ".env\nsessions.db\nsessions.db-*\nlocks/\n*.db\n*.db-*\n";
+const STATE_GITIGNORE: &str = ".gitignore\n.env\nsessions.db\nsessions.db-*\nlocks/\ntruncation/\n";
 
 fn git_worktree_info(root: &Path) -> Option<GitWorktreeInfo> {
     let dot_git = root.join(".git");
@@ -256,6 +256,29 @@ mod tests {
             STATE_GITIGNORE
         );
         assert!(!state_dir.join("skills").exists());
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn automatic_project_layout_omits_project_config() {
+        let root = std::env::temp_dir().join(format!("mu-layout-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let scope = Scope::Project(Project {
+            root: root.clone(),
+            marker: ProjectMarker::Git,
+            worktree: None,
+        });
+
+        ensure_project_layout(&scope).unwrap();
+
+        let state_dir = root.join(".mu");
+        assert!(state_dir.is_dir());
+        assert!(!state_dir.join("config.jsonc").exists());
+        assert_eq!(
+            std::fs::read_to_string(state_dir.join(".gitignore")).unwrap(),
+            STATE_GITIGNORE
+        );
 
         let _ = std::fs::remove_dir_all(root);
     }
