@@ -222,12 +222,9 @@ small:
 - `mu status --json [--include-models] [--include-commands] [--include-skills]`
   — machine-readable shell state for prompt rendering and completion.
 - `mu session new` — create a session and print its id.
-- `mu session list` — list recent non-archived sessions.
+- `mu session list` — list recent sessions.
 - `mu session transcript --session <id>` — print a persisted session
   transcript.
-- `mu session archive --session <id>` — hide a session from default lists.
-- `mu session unarchive --session <id>` — restore an archived session to
-  default lists.
 - `mu compact --session <id>` — force compaction.
 - `mu retry [-s <id>] [-c]` — resume an interrupted (unclean) turn: normalize
   the tail and continue the agent loop with no new prompt. No-op on a clean
@@ -632,11 +629,7 @@ Session lifecycle is exposed through CLI commands:
   plugin to an existing session.
 - `mu -c` continues the latest session in the active scope for a one-shot turn.
 - `mu session new` creates a session and prints its id.
-- `mu session list` lists recent non-archived sessions.
-- `mu session archive --session <id>` hides a session from default lists without
-  deleting it.
-- `mu session unarchive --session <id>` restores an archived session to default
-  lists.
+- `mu session list` lists recent sessions.
 - `mu compact --session <id>` compacts a session on demand.
 
 ---
@@ -907,12 +900,11 @@ block each other unnecessarily.
 
 Conceptual schema (flat and small):
 
-- **session** — `id`, `created_at`, `updated_at`, `cwd`, `model`, `archived`,
+- **session** — `id`, `created_at`, `updated_at`, `cwd`, `model`,
   `title`,
   `last_total_tokens` (the most recent `usage.total_tokens` reported by the
   provider; used for the pre-turn overflow check, §"Context window and
-  compaction"). `archived` is a boolean listing filter; archived sessions remain
-  resumable by explicit id. `model` is set at session creation from the
+  compaction"). `model` is set at session creation from the
   effective model (lifecycle step 2); a later `--model` overrides for that turn
   only and does **not**
   rewrite the stored value. `cwd` records the last working directory used for
@@ -948,7 +940,7 @@ Conceptual schema (flat and small):
   never printed to stdout by the turn, so the transcript stays clean.
 - **Attach / continue.** `MU_ZSH_SESSION_ID=<id>` seeds the zsh plugin with an
   existing session, while `mu -s <id>` and `mu -c` handle one-shot re-entry from
-  the command line. `mu session list` lists non-archived candidates.
+  the command line. `mu session list` lists recent candidates.
 - **Per-turn lifecycle.** Each turn: open DB → acquire session lock → normalize
   any interrupted tail → load session messages → run turn (persisting each
   completed message as it lands) → release lock → exit. The connection opens

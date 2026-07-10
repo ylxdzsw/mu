@@ -328,7 +328,6 @@ async fn run() -> Result<()> {
                     let store = store::Store::open(&db_path)?;
                     let sessions = store.list_sessions(limit)?;
                     for (s, updated) in sessions {
-                        debug_assert!(!s.archived);
                         let title = s.title.unwrap_or_else(|| "(untitled)".into());
                         println!("{}  {}  {}  {}", s.id, title, s.model, updated);
                     }
@@ -340,38 +339,27 @@ async fn run() -> Result<()> {
 
                         // Emit toolcall requests immediately under their assistant message
                         if r.role == "assistant" {
-                            if let Some(calls) = crate::store::parse_tool_calls(r.tool_calls_json.as_deref()) {
+                            if let Some(calls) =
+                                crate::store::parse_tool_calls(r.tool_calls_json.as_deref())
+                            {
                                 for tc in calls {
-                                    println!("[{}:toolcall] {} {}", r.seq, tc.function.name, tc.function.arguments);
+                                    println!(
+                                        "[{}:toolcall] {} {}",
+                                        r.seq, tc.function.name, tc.function.arguments
+                                    );
                                 }
                             }
                         }
 
                         // Surface the tool schema together with the system message
                         if r.role == "system" {
-                            if let Ok(schema) = serde_json::to_string_pretty(&crate::tools::tool_definitions()) {
+                            if let Ok(schema) =
+                                serde_json::to_string_pretty(&crate::tools::tool_definitions())
+                            {
                                 println!("[{}:system:toolschema]\n{}", r.seq, schema);
                             }
                         }
                     }
-                }
-                SessionSub::Archive { session } => {
-                    let store = open_store_with_session(&db_path, &session)?;
-                    let _lock = acquire_session_lock_or_exit(
-                        &store,
-                        &session,
-                        cli::OutputFormat::Terminal,
-                    )?;
-                    store.set_session_archived(&session, true)?;
-                }
-                SessionSub::Unarchive { session } => {
-                    let store = open_store_with_session(&db_path, &session)?;
-                    let _lock = acquire_session_lock_or_exit(
-                        &store,
-                        &session,
-                        cli::OutputFormat::Terminal,
-                    )?;
-                    store.set_session_archived(&session, false)?;
                 }
             }
             return Ok(());

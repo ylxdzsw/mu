@@ -107,9 +107,7 @@ MU_ZSH_EXIT_HOOKS+=(mu_restore_conflicts)
 | `mu status --json --include-commands` | Include discovered custom command entries |
 | `mu status --json --include-skills` | Include active skill entries |
 | `mu session new` | Create session, print id |
-| `mu session list` | List recent non-archived sessions |
-| `mu session archive --session <id>` | Hide a session from default lists |
-| `mu session unarchive --session <id>` | Restore an archived session to default lists |
+| `mu session list` | List recent sessions |
 | `mu compact --session <id>` | Force compaction |
 | `mu retry [-s <id>] [-c]` | Resume an interrupted turn (see below) |
 

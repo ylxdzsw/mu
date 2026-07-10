@@ -16,10 +16,7 @@ pub struct Session {
     pub model: String,
     pub title: Option<String>,
     pub last_total_tokens: u64,
-    pub archived: bool,
 }
-
-
 
 #[derive(Debug, Clone)]
 pub struct SessionSummary {
@@ -29,7 +26,6 @@ pub struct SessionSummary {
     pub cwd: String,
     pub title: Option<String>,
     pub last_total_tokens: u64,
-    pub archived: bool,
     pub message_count: u64,
     pub turn_count: u64,
 }
@@ -87,7 +83,7 @@ impl std::fmt::Display for SessionBusy {
 
 impl std::error::Error for SessionBusy {}
 
-const CURRENT_SCHEMA_VERSION: i32 = 2;
+const CURRENT_SCHEMA_VERSION: i32 = 3;
 
 fn session_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Session> {
     Ok(Session {
@@ -96,7 +92,6 @@ fn session_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Session> {
         model: row.get(2)?,
         title: row.get(3)?,
         last_total_tokens: row.get::<_, i64>(4)? as u64,
-        archived: row.get::<_, i64>(5)? != 0,
     })
 }
 
@@ -139,11 +134,15 @@ impl Store {
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .context("reading SQLite schema version")?;
         match version {
-            0 if !self.has_application_tables()? => self.create_schema_v2(),
+            0 if !self.has_application_tables()? => self.create_schema_v3(),
             0 => anyhow::bail!(
                 "unsupported pre-release session database schema; remove sessions.db to create a fresh release database"
             ),
-            1 => self.migrate_v1_to_v2(),
+            1 => {
+                self.migrate_v1_to_v2()?;
+                self.migrate_v2_to_v3()
+            }
+            2 => self.migrate_v2_to_v3(),
             CURRENT_SCHEMA_VERSION => Ok(()),
             future => anyhow::bail!(
                 "unsupported future session database schema version {future}; this mu supports version {CURRENT_SCHEMA_VERSION}"
@@ -162,7 +161,7 @@ impl Store {
         Ok(count > 0)
     }
 
-    fn create_schema_v2(&self) -> Result<()> {
+    fn create_schema_v3(&self) -> Result<()> {
         self.conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS session (
                 id TEXT PRIMARY KEY,
@@ -171,8 +170,7 @@ impl Store {
                 cwd TEXT NOT NULL,
                 model TEXT NOT NULL,
                 title TEXT,
-                last_total_tokens INTEGER NOT NULL DEFAULT 0,
-                archived INTEGER NOT NULL DEFAULT 0
+                last_total_tokens INTEGER NOT NULL DEFAULT 0
             );
             CREATE TABLE IF NOT EXISTS message (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -223,7 +221,7 @@ impl Store {
                 reason TEXT,
                 created_at TEXT NOT NULL
             );
-            PRAGMA user_version = 2;",
+            PRAGMA user_version = 3;",
         )?;
         Ok(())
     }
@@ -236,12 +234,20 @@ impl Store {
         Ok(())
     }
 
+    fn migrate_v2_to_v3(&self) -> Result<()> {
+        self.conn.execute_batch(
+            "ALTER TABLE session DROP COLUMN archived;
+             PRAGMA user_version = 3;",
+        )?;
+        Ok(())
+    }
+
     pub fn create_session(&self, cwd: &str, model: &str) -> Result<Session> {
         let id = Uuid::new_v4().to_string();
         let now = chrono::Utc::now().to_rfc3339();
         self.conn.execute(
-            "INSERT INTO session (id, created_at, updated_at, cwd, model, title, last_total_tokens, archived)
-             VALUES (?1, ?2, ?2, ?3, ?4, NULL, 0, 0)",
+            "INSERT INTO session (id, created_at, updated_at, cwd, model, title, last_total_tokens)
+             VALUES (?1, ?2, ?2, ?3, ?4, NULL, 0)",
             params![id, now, cwd, model],
         )?;
         Ok(Session {
@@ -250,13 +256,12 @@ impl Store {
             model: model.into(),
             title: None,
             last_total_tokens: 0,
-            archived: false,
         })
     }
 
     pub fn get_session(&self, id: &str) -> Result<Option<Session>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, cwd, model, title, last_total_tokens, archived
+            "SELECT id, cwd, model, title, last_total_tokens
              FROM session WHERE id = ?1",
         )?;
         let row = stmt.query_row(params![id], session_from_row).optional()?;
@@ -265,13 +270,12 @@ impl Store {
 
     pub fn list_sessions(&self, limit: usize) -> Result<Vec<(Session, String)>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, cwd, model, title, last_total_tokens, archived, updated_at
+            "SELECT id, cwd, model, title, last_total_tokens, updated_at
              FROM session
-             WHERE archived = 0
              ORDER BY updated_at DESC LIMIT ?1",
         )?;
         let rows = stmt.query_map(params![limit as i64], |row| {
-            Ok((session_from_row(row)?, row.get::<_, String>(6)?))
+            Ok((session_from_row(row)?, row.get::<_, String>(5)?))
         })?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
             .context("listing sessions")
@@ -281,7 +285,7 @@ impl Store {
         let mut stmt = self.conn.prepare(
             "SELECT
                 s.id, s.created_at, s.updated_at, s.cwd, s.title,
-                s.last_total_tokens, s.archived,
+                s.last_total_tokens,
                 COUNT(m.id) AS message_count,
                 COALESCE(SUM(CASE WHEN m.role = 'user' THEN 1 ELSE 0 END), 0) AS user_count
              FROM session s
@@ -298,9 +302,8 @@ impl Store {
                     cwd: row.get(3)?,
                     title: row.get(4)?,
                     last_total_tokens: row.get::<_, i64>(5)? as u64,
-                    archived: row.get::<_, i64>(6)? != 0,
-                    message_count: row.get::<_, i64>(7)? as u64,
-                    turn_count: row.get::<_, i64>(8)?.saturating_sub(1) as u64,
+                    message_count: row.get::<_, i64>(6)? as u64,
+                    turn_count: row.get::<_, i64>(7)?.saturating_sub(1) as u64,
                 })
             })
             .optional()?;
@@ -309,19 +312,11 @@ impl Store {
 
     pub fn latest_session(&self) -> Result<Option<Session>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, cwd, model, title, last_total_tokens, archived
-             FROM session WHERE archived = 0 ORDER BY updated_at DESC LIMIT 1",
+            "SELECT id, cwd, model, title, last_total_tokens
+             FROM session ORDER BY updated_at DESC LIMIT 1",
         )?;
         let row = stmt.query_row([], session_from_row).optional()?;
         Ok(row)
-    }
-
-    pub fn set_session_archived(&self, id: &str, archived: bool) -> Result<()> {
-        self.conn.execute(
-            "UPDATE session SET archived = ?1 WHERE id = ?2",
-            params![if archived { 1 } else { 0 }, id],
-        )?;
-        Ok(())
     }
 
     pub fn update_session(
@@ -679,8 +674,6 @@ impl Store {
         Ok(())
     }
 
-
-
     pub fn latest_summary_sequence(&self, session_id: &str) -> Result<Option<i64>> {
         self.latest_summary_seq(session_id)
     }
@@ -999,17 +992,36 @@ mod tests {
             .collect::<rusqlite::Result<Vec<_>>>()
             .unwrap();
         assert!(message_columns.contains(&"reasoning_content".to_string()));
+        let session_columns = store
+            .conn
+            .prepare("PRAGMA table_info(session)")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert!(!session_columns.contains(&"archived".to_string()));
         let _ = std::fs::remove_dir_all(tmp);
     }
 
     #[test]
-    fn migrates_v1_database_to_store_reasoning_content() {
+    fn migrates_v1_database_to_current_schema() {
         let tmp = std::env::temp_dir().join(format!("mu-store-v1-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&tmp).unwrap();
         let db = tmp.join("mu.db");
         let conn = Connection::open(&db).unwrap();
         conn.execute_batch(
-            "CREATE TABLE message (
+            "CREATE TABLE session (
+                id TEXT PRIMARY KEY,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                cwd TEXT NOT NULL,
+                model TEXT NOT NULL,
+                title TEXT,
+                last_total_tokens INTEGER NOT NULL DEFAULT 0,
+                archived INTEGER NOT NULL DEFAULT 0
+             );
+             CREATE TABLE message (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 session_id TEXT NOT NULL,
                 role TEXT NOT NULL,
@@ -1037,9 +1049,50 @@ mod tests {
                 "SELECT COUNT(*) > 0 FROM pragma_table_info('message') WHERE name = 'reasoning_content'",
                 [],
                 |row| row.get(0),
+        )
+        .unwrap();
+        assert!(has_reasoning_column);
+        let has_archived_column: bool = store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM pragma_table_info('session') WHERE name = 'archived'",
+                [],
+                |row| row.get(0),
             )
             .unwrap();
-        assert!(has_reasoning_column);
+        assert!(!has_archived_column);
+        let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    #[test]
+    fn migration_restores_previously_archived_v2_sessions_to_lists() {
+        let tmp = std::env::temp_dir().join(format!("mu-store-v2-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let db = tmp.join("mu.db");
+        let conn = Connection::open(&db).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE session (
+                id TEXT PRIMARY KEY,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                cwd TEXT NOT NULL,
+                model TEXT NOT NULL,
+                title TEXT,
+                last_total_tokens INTEGER NOT NULL DEFAULT 0,
+                archived INTEGER NOT NULL DEFAULT 0
+             );
+             INSERT INTO session (id, created_at, updated_at, cwd, model, archived)
+             VALUES ('previously-hidden', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z', '/tmp', 'model', 1);
+             PRAGMA user_version = 2;",
+        )
+        .unwrap();
+        drop(conn);
+
+        let store = Store::open(&db).unwrap();
+        let sessions = store.list_sessions(20).unwrap();
+
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].0.id, "previously-hidden");
         let _ = std::fs::remove_dir_all(tmp);
     }
 
@@ -1158,11 +1211,10 @@ mod tests {
     }
 
     #[test]
-    fn list_sessions_skips_archived() {
+    fn list_sessions_includes_every_session() {
         let (store, tmp) = temp_store();
-        let cli = store.create_session("/tmp", "cli-model").unwrap();
-        let archived = store.create_session("/tmp", "archived-model").unwrap();
-        store.set_session_archived(&archived.id, true).unwrap();
+        let first = store.create_session("/tmp", "first-model").unwrap();
+        let second = store.create_session("/tmp", "second-model").unwrap();
 
         let sessions = store.list_sessions(20).unwrap();
 
@@ -1170,9 +1222,8 @@ mod tests {
             .iter()
             .map(|(session, _)| session.id.as_str())
             .collect::<Vec<_>>();
-        assert!(ids.contains(&cli.id.as_str()));
-        assert!(!ids.contains(&archived.id.as_str()));
-        assert!(sessions.iter().all(|(session, _)| !session.archived));
+        assert!(ids.contains(&first.id.as_str()));
+        assert!(ids.contains(&second.id.as_str()));
         let _ = std::fs::remove_dir_all(tmp);
     }
 
