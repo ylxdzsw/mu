@@ -36,7 +36,7 @@ static LAST_SIGNAL: AtomicI32 = AtomicI32::new(0);
 static INSTALL_SIGNAL_FORWARDER: Once = Once::new();
 
 pub fn description() -> &'static str {
-    "Run one bash command in an isolated process. Normal commands do not outlive the tool call. Use this for local search, file reads, edits, tests, and web fetches."
+    "Run bash command."
 }
 
 pub fn subagent_depth_from_env() -> u32 {
@@ -71,12 +71,12 @@ pub fn parameters_schema() -> Value {
             "risk": {
                 "type": "string",
                 "enum": ["readonly", "reversible", "destructive"],
-                "description": "Advisory risk label for UI and audit only"
+                "description": "Advisory risk label for UI and auditing"
             },
-            "command": { "type": "string", "description": "Command to run with bash -lc; it may be multiline" },
-            "cwd": { "type": "string", "description": "Working directory for this invocation" },
+            "command": { "type": "string", "description": "Command to run with bash -lc; can be multiline" },
+            "cwd": { "type": "string", "description": "Working directory for this invocation; Prefer absolute path; Prefer this argument over `cd`" },
             "timeout": { "type": "integer", "minimum": 1, "description": "Timeout in seconds (default 120)" },
-            "stdin": { "type": "string", "description": "Literal stdin bytes to pipe to the command" }
+            "stdin": { "type": "string", "description": "Literal stdin bytes to pipe to the command; Prefer this argument over long heredoc" }
         },
         "required": ["title", "risk", "command"]
     })

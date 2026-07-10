@@ -10,10 +10,7 @@ Normal `bash` commands are run in an isolated process group. On timeout,
 interrupt, or main process exit, `mu` sends SIGTERM and then SIGKILL to that
 group, so `server &` does not reliably keep a service alive.
 
-Prefer a transient user service:
-
-When the runtime user's UID is not `0`, add `--user` to every `systemd-run` and
-`systemctl` command below; omit it for UID `0`.
+Prefer a transient user service over `setsid` or other hacks:
 
 ```bash
 id="mu-bg-$(date +%s)-$RANDOM"
@@ -24,7 +21,6 @@ chmod 600 "$log"
 
 systemd-run \
   --unit="$unit" \
-  --collect \
   --property=Type=exec \
   --property=KillMode=control-group \
   --property=Restart=no \
@@ -39,6 +35,7 @@ printf 'unit=%s\ninvocation_id=%s\nlog=%s\n' "$unit" "$invocation_id" "$log"
 ```
 
 Run the service command in the foreground inside the unit. Do not append `&`.
+If the runtime user is not `root`, add `--user`.
 
 Read logs through a normal foreground `bash` command such as:
 
@@ -53,7 +50,7 @@ actual=$(systemctl show "$unit" -P InvocationID 2>/dev/null || true)
 if [ "$actual" = "$invocation_id" ]; then
   systemctl stop "$unit"
 else
-  echo "not stopping: unit missing or invocation changed"
+  echo "service already disappeared"
 fi
 ```
 
