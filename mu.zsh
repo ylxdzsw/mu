@@ -448,8 +448,7 @@ _mu_zsh_has_effective_session() {
   [[ -n "$MU_ZSH_EFFECTIVE_SESSION_ID" ]]
 }
 
-_mu_zsh_slash_command_matches() {
-  local prefix=$1
+_mu_zsh_slash_command_candidates() {
   local -a commands
 
   commands=(/model)
@@ -460,7 +459,7 @@ _mu_zsh_slash_command_matches() {
 
   local command
   for command in "${commands[@]}"; do
-    [[ "$command" == "$prefix"* ]] && print -r -- "$command"
+    [[ -n "$command" ]] && print -r -- "$command"
   done
   return 0
 }
@@ -493,7 +492,7 @@ _mu_zsh_model_records() {
   ' <<< "$json"
 }
 
-_mu_zsh_model_completion_matches() {
+_mu_zsh_model_completion_candidates() {
   local fragment=$1
   local -a records matches
   local -A model_counts
@@ -511,8 +510,6 @@ _mu_zsh_model_completion_matches() {
   done
 
   if [[ "$fragment" == *:* ]]; then
-    local base=${fragment%%:*}
-    local effort_prefix=${fragment#*:}
     local effort
 
     for record in "${records[@]}"; do
@@ -521,21 +518,20 @@ _mu_zsh_model_completion_matches() {
       efforts=${${(ps:\t:)record}[3]-}
       count=0
       [[ -n "$model_id" ]] && count=${model_counts[$model_id]:-0}
-      if [[ "$base" == "$canonical" || ( "$base" == "$model_id" && $count -eq 1 ) ]]; then
-        for effort in "${(@s:,:)efforts}"; do
-          [[ -n "$effort" && "$effort" == "$effort_prefix"* ]] && matches+=("${base}:${effort}")
-        done
-        break
-      fi
+      for effort in "${(@s:,:)efforts}"; do
+        [[ -n "$effort" ]] || continue
+        matches+=("${canonical}:${effort}")
+        [[ -n "$model_id" && $count -eq 1 ]] && matches+=("${model_id}:${effort}")
+      done
     done
   else
     for record in "${records[@]}"; do
       canonical=${${(ps:\t:)record}[1]}
       model_id=${${(ps:\t:)record}[2]}
-      [[ -n "$canonical" && "$canonical" == "$fragment"* ]] && matches+=("$canonical")
+      [[ -n "$canonical" ]] && matches+=("$canonical")
       count=0
       [[ -n "$model_id" ]] && count=${model_counts[$model_id]:-0}
-      if [[ -n "$model_id" && $count -eq 1 && "$model_id" == "$fragment"* ]]; then
+      if [[ -n "$model_id" && $count -eq 1 ]]; then
         matches+=("$model_id")
       fi
     done
@@ -564,52 +560,70 @@ _mu_zsh_slash_completion_context() {
   [[ "$left" != *[[:space:]]* ]]
 }
 
-_mu_zsh_completion_matches() {
+_mu_zsh_completion_candidates() {
   local left arg
-  local -a matches
 
   left=${BUFFER[1,$CURSOR]}
 
   if [[ "$left" == "/model "* ]]; then
     arg=${left#"/model "}
     [[ "$arg" != *[[:space:]]* ]] || return 1
-    matches=("${(@f)$(_mu_zsh_model_completion_matches "$arg")}")
-    matches=("${(@)matches:#}")
-    (( ${#matches[@]} )) || return 1
-    print -rl -- "${matches[@]}"
-    return 0
+    _mu_zsh_model_completion_candidates "$arg"
+    return
   fi
 
   [[ "$left" == /* ]] || return 1
   [[ "$left" != *[[:space:]]* ]] || return 1
 
-  matches=("${(@f)$(_mu_zsh_slash_command_matches "$left")}")
-  matches=("${(@)matches:#}")
-  (( ${#matches[@]} )) || return 1
-  print -rl -- "${matches[@]}"
-  return 0
+  _mu_zsh_slash_command_candidates
 }
 
-_mu_zsh_completion() {
-  local -a matches
+_mu_zsh_fallback_completion() {
+  local -a candidates
 
-  matches=("${(@f)$(_mu_zsh_completion_matches)}")
-  (( ${#matches[@]} )) || return 1
+  candidates=("${(@f)$(_mu_zsh_completion_candidates)}")
+  candidates=("${(@)candidates:#}")
+  (( ${#candidates[@]} )) || return 1
 
-  if (( ${#matches[@]} == 1 )); then
-    compadd -Q -S ' ' -- "${matches[@]}"
-  else
-    compadd -Q -- "${matches[@]}"
-  fi
+  compadd -Q -S ' ' -- "${candidates[@]}"
+}
+
+_mu_zsh_completion_system() {
+  local -a candidates
+  local expl
+
+  candidates=("${(@f)$(_mu_zsh_completion_candidates)}")
+  candidates=("${(@)candidates:#}")
+  (( ${#candidates[@]} )) || return 1
+
+  _wanted mu-slash-command expl 'mu slash command' \
+    compadd -Q -S ' ' -- "${candidates[@]}"
+}
+
+_mu_zsh_use_completion_system() {
+  # compinit may be loaded after this plugin, so register lazily.
+  (( $+functions[_main_complete] && $+functions[compdef] )) || return 1
+  [[ ${_comps[mu-zsh-slash]-} == _mu_zsh_completion_system ]] ||
+    compdef _mu_zsh_completion_system mu-zsh-slash
 }
 
 _mu_zsh_complete_slash() {
   _mu_zsh_slash_completion_context || return 1
+  if _mu_zsh_use_completion_system; then
+    local compcontext=mu-zsh-slash
+    zle expand-or-complete
+    return
+  fi
   zle _mu_zsh_complete_widget
 }
 
 _mu_zsh_list_slash_choices() {
   _mu_zsh_slash_completion_context || return 1
+  if _mu_zsh_use_completion_system; then
+    local compcontext=mu-zsh-slash
+    zle list-choices 2>/dev/null || true
+    return
+  fi
   zle _mu_zsh_list_widget 2>/dev/null || true
 }
 
@@ -882,24 +896,6 @@ _mu_zsh_slash() {
   (( should_complete )) && _mu_zsh_list_slash_choices
 }
 
-_mu_zsh_clear_completion_if_outside_context() {
-  if [[ "$MU_ZSH_MODE" == mu ]] && ! _mu_zsh_slash_completion_context; then
-    zle -M ''
-    zle -I
-    zle -R
-  fi
-}
-
-_mu_zsh_backspace() {
-  zle backward-delete-char
-  _mu_zsh_clear_completion_if_outside_context
-}
-
-_mu_zsh_delete_char() {
-  zle delete-char
-  _mu_zsh_clear_completion_if_outside_context
-}
-
 _mu_zsh_interrupt() {
   if [[ "$MU_ZSH_MODE" != mu ]]; then
     zle send-break
@@ -975,9 +971,6 @@ _mu_zsh_configure_keymap() {
   bindkey -M mumode $'\eOA' up-line
   bindkey -M mumode $'\e[B' down-line
   bindkey -M mumode $'\eOB' down-line
-  bindkey -M mumode '^?' _mu_zsh_backspace
-  bindkey -M mumode '^H' _mu_zsh_backspace
-  bindkey -M mumode $'\e[3~' _mu_zsh_delete_char
   bindkey -M mumode '^C' _mu_zsh_interrupt
 }
 
@@ -989,14 +982,12 @@ if [[ -o zle ]]; then
   bindkey -N mumode main 2>/dev/null || true
   _mu_zsh_configure_keymap
   _mu_zsh_save_widget_bindings
-  zle -C _mu_zsh_complete_widget complete-word _mu_zsh_completion
-  zle -C _mu_zsh_list_widget list-choices _mu_zsh_completion
+  zle -C _mu_zsh_complete_widget complete-word _mu_zsh_fallback_completion
+  zle -C _mu_zsh_list_widget list-choices _mu_zsh_fallback_completion
   zle -N _mu_zsh_tab
   zle -N _mu_zsh_slash
   zle -N _mu_zsh_accept
   zle -N _mu_zsh_insert_newline
-  zle -N _mu_zsh_backspace
-  zle -N _mu_zsh_delete_char
   zle -N _mu_zsh_interrupt
   zle -N _mu_zsh_line_init
   zle -N mu-zsh-mode

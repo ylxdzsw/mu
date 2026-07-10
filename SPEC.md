@@ -600,6 +600,9 @@ Consequences:
 - Press Up or Down while editing in `mu>` mode to move within the current
   buffer only. They must not recall shell history; leave `mu>` mode first if
   shell history navigation is desired.
+- Typing `/` at the start of a `mu>` line proactively lists slash commands.
+  After that, Tab delegates matching, candidate lists, and menu selection to
+  the user's normal zsh completion settings.
 - While `mu>` mode is active, conflicting line-editor plugins should be
   suspended. Common ZLE helpers such as syntax highlighting and autosuggestions
   may be disabled automatically; additional plugin toggles may be attached with

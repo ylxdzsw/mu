@@ -54,6 +54,10 @@ CSI-u Shift+Enter sequence (`Esc [ 13 ; 2 u`). Terminal emulators may need to
 be configured to send it; if they emit ordinary Enter instead, zsh cannot
 distinguish Shift+Enter from Enter.
 
+Typing `/` at the start of a `mu>` line proactively lists slash commands.
+After that, Tab uses normal zsh completion semantics, including your configured
+matchers, candidate lists, and menu selection.
+
 The plugin owns only zsh line editing and prompt mode. Each submission still
 spawns the `mu` binary for one foreground turn, so streaming output, Ctrl-C, and
 session persistence follow the same command-line path as scripted use.

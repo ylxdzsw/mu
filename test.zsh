@@ -271,53 +271,50 @@ MU_ZSH_BIN=$prompt_fake_bin/mu
 MU_ZSH_OUTPUT=plain
 MU_ZSH_SESSION_ID=
 MU_ZSH_SESSION_SCOPE=
-command_matches=("${(@f)$(_mu_zsh_slash_command_matches /)}")
-[[ "${(j:,:)command_matches}" == "/model,/review.md" ]] || fail "hides session commands without a valid session"
+command_candidates=("${(@f)$(_mu_zsh_slash_command_candidates)}")
+[[ "${(j:,:)command_candidates}" == "/model,/review.md" ]] || fail "hides session commands without a valid session"
 MU_ZSH_SESSION_ID=tracked-session
 MU_ZSH_SESSION_SCOPE=$(_mu_zsh_current_scope_key)
-command_matches=("${(@f)$(_mu_zsh_slash_command_matches /)}")
-[[ "${(j:,:)command_matches}" == "/model,/new,/retry,/compact,/review.md" ]] || fail "shows session commands with a valid session: ${(j:,:)command_matches}"
+command_candidates=("${(@f)$(_mu_zsh_slash_command_candidates)}")
+[[ "${(j:,:)command_candidates}" == "/model,/new,/retry,/compact,/review.md" ]] || fail "shows session commands with a valid session: ${(j:,:)command_candidates}"
 BUFFER="/ret"
 CURSOR=${#BUFFER}
-completion_matches=("${(@f)$(_mu_zsh_completion_matches)}")
-[[ "${(j:,:)completion_matches}" == "/retry" ]] || fail "filters a single slash command candidate: ${(j:,:)completion_matches}"
-BUFFER="/r"
+completion_candidates=("${(@f)$(_mu_zsh_completion_candidates)}")
+[[ "${(j:,:)completion_candidates}" == "/model,/new,/retry,/compact,/review.md" ]] || fail "offers zsh the complete slash-command set: ${(j:,:)completion_candidates}"
+BUFFER="/M"
 CURSOR=${#BUFFER}
-completion_matches=("${(@f)$(_mu_zsh_completion_matches)}")
-[[ "${(j:,:)completion_matches}" == "/retry,/review.md" ]] || fail "keeps multiple common-prefix slash candidates: ${(j:,:)completion_matches}"
-BUFFER="/rev"
-CURSOR=${#BUFFER}
-completion_matches=("${(@f)$(_mu_zsh_completion_matches)}")
-[[ "${(j:,:)completion_matches}" == "/review.md" ]] || fail "filters a custom slash command candidate: ${(j:,:)completion_matches}"
+completion_candidates=("${(@f)$(_mu_zsh_completion_candidates)}")
+[[ "${(j:,:)completion_candidates}" == "/model,/new,/retry,/compact,/review.md" ]] || fail "leaves case matching to zsh: ${(j:,:)completion_candidates}"
 BUFFER="/unknown"
 CURSOR=${#BUFFER}
-if _mu_zsh_completion_matches >/dev/null; then
-  fail "unknown slash text should have no completion candidates"
-fi
+completion_candidates=("${(@f)$(_mu_zsh_completion_candidates)}")
+[[ "${(j:,:)completion_candidates}" == "/model,/new,/retry,/compact,/review.md" ]] || fail "keeps freeform slash input advisory: ${(j:,:)completion_candidates}"
 _mu_zsh_is_known_slash_command /model || fail "recognizes built-in slash command"
 _mu_zsh_is_known_slash_command /review.md || fail "recognizes custom slash command"
 if _mu_zsh_is_known_slash_command /unknown; then
   fail "unknown slash text should not dispatch as a command"
 fi
 
-model_matches=("${(@f)$(_mu_zsh_model_completion_matches "")}")
-[[ " ${(j: :)model_matches} " == *" openai/gpt "* ]] || fail "offers provider-qualified model"
-[[ " ${(j: :)model_matches} " == *" gpt "* ]] || fail "offers unique unqualified model"
-[[ " ${(j: :)model_matches} " == *" local/solo "* ]] || fail "offers second provider-qualified model"
-[[ " ${(j: :)model_matches} " == *" solo "* ]] || fail "offers second unique unqualified model"
-[[ " ${(j: :)model_matches} " == *" openai/shared "* ]] || fail "offers ambiguous model qualified"
-[[ " ${(j: :)model_matches} " == *" local/shared "* ]] || fail "offers other ambiguous model qualified"
-[[ " ${(j: :)model_matches} " != *" shared "* ]] || fail "does not offer ambiguous unqualified model"
-model_matches=("${(@f)$(_mu_zsh_model_completion_matches "gpt")}")
-[[ "${(j:,:)model_matches}" == "gpt" ]] || fail "does not show variants before colon: ${(j:,:)model_matches}"
-model_matches=("${(@f)$(_mu_zsh_model_completion_matches "gpt:")}")
-[[ "${(j:,:)model_matches}" == "gpt:low,gpt:high" ]] || fail "shows variants after colon: ${(j:,:)model_matches}"
-model_matches=("${(@f)$(_mu_zsh_model_completion_matches "openai/gpt:h")}")
-[[ "${(j:,:)model_matches}" == "openai/gpt:high" ]] || fail "filters provider-qualified variants: ${(j:,:)model_matches}"
+model_candidates=("${(@f)$(_mu_zsh_model_completion_candidates "")}")
+[[ " ${(j: :)model_candidates} " == *" openai/gpt "* ]] || fail "offers provider-qualified model"
+[[ " ${(j: :)model_candidates} " == *" gpt "* ]] || fail "offers unique unqualified model"
+[[ " ${(j: :)model_candidates} " == *" local/solo "* ]] || fail "offers second provider-qualified model"
+[[ " ${(j: :)model_candidates} " == *" solo "* ]] || fail "offers second unique unqualified model"
+[[ " ${(j: :)model_candidates} " == *" openai/shared "* ]] || fail "offers ambiguous model qualified"
+[[ " ${(j: :)model_candidates} " == *" local/shared "* ]] || fail "offers other ambiguous model qualified"
+[[ " ${(j: :)model_candidates} " != *" shared "* ]] || fail "does not offer ambiguous unqualified model"
+[[ " ${(j: :)model_candidates} " != *":low "* ]] || fail "does not show variants before colon"
+model_candidates=("${(@f)$(_mu_zsh_model_completion_candidates "gpt")}")
+[[ " ${(j: :)model_candidates} " == *" gpt "* ]] || fail "keeps all base models available for zsh matching"
+[[ " ${(j: :)model_candidates} " != *":high "* ]] || fail "does not show variants until colon"
+model_candidates=("${(@f)$(_mu_zsh_model_completion_candidates "gpt:")}")
+[[ " ${(j: :)model_candidates} " == *" gpt:low "* ]] || fail "shows unqualified variants after colon"
+[[ " ${(j: :)model_candidates} " == *" openai/gpt:high "* ]] || fail "shows provider-qualified variants after colon"
 BUFFER="/model openai/gpt:h"
 CURSOR=${#BUFFER}
-completion_matches=("${(@f)$(_mu_zsh_completion_matches)}")
-[[ "${(j:,:)completion_matches}" == "openai/gpt:high" ]] || fail "filters model completion candidates from the zle buffer: ${(j:,:)completion_matches}"
+completion_candidates=("${(@f)$(_mu_zsh_completion_candidates)}")
+[[ " ${(j: :)completion_candidates} " == *" openai/gpt:high "* ]] || fail "offers model variants to zsh from the zle buffer"
+[[ " ${(j: :)completion_candidates} " == *" local/solo:max "* ]] || fail "does not prefilter model variants in zsh"
 
 rm -f "$MU_ZSH_FAKE_LOG"
 _mu_zsh_run_slash_command "/retry"
@@ -472,7 +469,7 @@ printf '%s\n\n' "[mu] tokens: 12 in / 5 out  context: 25%" >&2
 EOF
 chmod +x "$interactive_fake_bin/mu"
 
-interactive_setup="PS1='> '; PATH=${(q)interactive_fake_bin}:\$PATH; export TEST_CAPTURE_ARGS=${(q)interactive_capture_args} TEST_CAPTURE_STDIN=${(q)interactive_capture_stdin} TEST_CAPTURE_CALLS=${(q)interactive_capture_calls}; source ${(q)root}/mu.zsh; bindkey -M mumode '^G' _mu_zsh_interrupt"
+interactive_setup="PS1='> '; PATH=${(q)interactive_fake_bin}:\$PATH; export TEST_CAPTURE_ARGS=${(q)interactive_capture_args} TEST_CAPTURE_STDIN=${(q)interactive_capture_stdin} TEST_CAPTURE_CALLS=${(q)interactive_capture_calls}; autoload -Uz compinit; compinit -D; source ${(q)root}/mu.zsh; bindkey -M mumode '^G' _mu_zsh_interrupt"
 
 interactive_transcript=$tmpdir/transcript
 rm -f -- "$interactive_capture_args" "$interactive_capture_stdin" "$interactive_capture_calls"
@@ -605,20 +602,35 @@ after_new_session=${normalized#*$'[mu] next turn will start a new session\n'}
 [[ "$after_new_session" == *$'prompt-test-model 25%'* ]] || fail "new slash command should redraw prompt"
 [[ ! -e "$interactive_capture_calls" || ! -s "$interactive_capture_calls" ]] || fail "new slash command should not submit a prompt"
 
-slash_completion_transcript=$tmpdir/slash-completion-transcript
+slash_listing_transcript=$tmpdir/slash-listing-transcript
 rm -f -- "$interactive_capture_args" "$interactive_capture_stdin" "$interactive_capture_calls"
 interactive_status=0
 {
   print -r -- "$interactive_setup"
   sleep 0.2
-  print -rn -- $'\t'"/mo"$'\t'"gpt"$'\r'
+  print -rn -- $'\t/\x07'
+  sleep 0.4
+  print -rn -- $'\x04'
+} | timeout 5 script -qfec 'TERM=xterm-256color zsh -df' "$slash_listing_transcript" >/dev/null || interactive_status=$?
+(( interactive_status == 0 )) || fail "slash listing transcript exited with status $interactive_status"
+
+normalized=$(perl -pe 's/\e\[[0-?]*[ -\/]*[@-~]//g' "$slash_listing_transcript" | col -b)
+[[ "$normalized" == *'/model'* ]] || fail "typing slash should proactively list completion candidates"
+
+slash_completion_transcript=$tmpdir/slash-completion-transcript
+rm -f -- "$interactive_capture_args" "$interactive_capture_stdin" "$interactive_capture_calls"
+interactive_status=0
+{
+  print -r -- "$interactive_setup; zstyle ':completion:*' matcher-list 'm:{a-zA-Z}={A-Za-z}'"
+  sleep 0.2
+  print -rn -- $'\t'"/MO"$'\t\t'"gpt"$'\r'
   sleep 0.4
   print -rn -- $'\x04'
 } | timeout 5 script -qfec 'TERM=xterm-256color zsh -df' "$slash_completion_transcript" >/dev/null || interactive_status=$?
 (( interactive_status == 0 )) || fail "slash completion transcript exited with status $interactive_status"
 
 normalized=$(perl -pe 's/\e\[[0-?]*[ -\/]*[@-~]//g' "$slash_completion_transcript" | col -b)
-[[ "$normalized" == *$'[mu] next turns in this scope will use openai/gpt\n'* ]] || fail "Tab should complete /mo to the /model slash command"
+[[ "$normalized" == *$'[mu] next turns in this scope will use openai/gpt\n'* ]] || fail "Tab should use zsh matcher rules to complete /MO to /model"
 [[ ! -e "$interactive_capture_calls" || ! -s "$interactive_capture_calls" ]] || fail "completed model slash command should not submit a prompt"
 
 common_prefix_transcript=$tmpdir/common-prefix-transcript
@@ -639,7 +651,7 @@ normalized=$(perl -pe 's/\e\[[0-?]*[ -\/]*[@-~]//g' "$common_prefix_transcript" 
 [[ ! -e "$interactive_capture_calls" || ! -s "$interactive_capture_calls" ]] || fail "common-prefix completion should not submit a prompt"
 
 delete_slash_transcript=$tmpdir/delete-slash-transcript
-delete_slash_setup="$interactive_setup; _mu_test_delete_slash_completion() { BUFFER='/'; CURSOR=1; _mu_zsh_list_slash_choices; _mu_zsh_backspace; if _mu_zsh_slash_completion_context; then back_state=active; else back_state=inactive; fi; back_buffer=\$BUFFER; back_cursor=\$CURSOR; BUFFER='/'; CURSOR=0; _mu_zsh_list_slash_choices; _mu_zsh_delete_char; if _mu_zsh_slash_completion_context; then forward_state=active; else forward_state=inactive; fi; zle -I; print -r -- \"[back-buffer=\$back_buffer back-cursor=\$back_cursor back-context=\$back_state forward-buffer=\$BUFFER forward-cursor=\$CURSOR forward-context=\$forward_state]\"; _mu_zsh_clear_prompt; _mu_zsh_reset_mode_prompt; }; zle -N _mu_test_delete_slash_completion; bindkey -M mumode '^Y' _mu_test_delete_slash_completion"
+delete_slash_setup="$interactive_setup; _mu_test_delete_slash_completion() { BUFFER='/'; CURSOR=1; _mu_zsh_list_slash_choices; zle backward-delete-char; if _mu_zsh_slash_completion_context; then back_state=active; else back_state=inactive; fi; back_buffer=\$BUFFER; back_cursor=\$CURSOR; BUFFER='/'; CURSOR=0; _mu_zsh_list_slash_choices; zle delete-char; if _mu_zsh_slash_completion_context; then forward_state=active; else forward_state=inactive; fi; zle -I; print -r -- \"[back-buffer=\$back_buffer back-cursor=\$back_cursor back-context=\$back_state forward-buffer=\$BUFFER forward-cursor=\$CURSOR forward-context=\$forward_state]\"; _mu_zsh_clear_prompt; _mu_zsh_reset_mode_prompt; }; zle -N _mu_test_delete_slash_completion; bindkey -M mumode '^Y' _mu_test_delete_slash_completion"
 rm -f -- "$interactive_capture_args" "$interactive_capture_stdin" "$interactive_capture_calls"
 interactive_status=0
 {
