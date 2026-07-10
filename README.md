@@ -175,6 +175,8 @@ directory by default, or at `--path <dir>` when provided. It writes `.mu/`,
 `.mu/config.jsonc`, and `.mu/.gitignore`, but does not create an empty
 `skills/` directory. By default it refuses to create a nested mu project inside
 another discovered project; pass `--force` only when you explicitly want that.
+Normal project use creates local runtime state only; it does not create a
+project `config.jsonc`.
 
 Providers and models are configured directly in `config.jsonc`. Model
 references use the same format everywhere: `provider/model[:effort]`, where the

@@ -683,4 +683,17 @@ mod tests {
             vec!["project-model", "shared-model", "global-model"]
         );
     }
+
+    #[test]
+    fn starter_config_is_the_full_global_template() {
+        let root = std::env::temp_dir().join(format!("mu-config-{}", uuid::Uuid::new_v4()));
+        let config = root.join("config.jsonc");
+
+        ensure_starter_config(&config).unwrap();
+
+        assert_eq!(std::fs::read_to_string(&config).unwrap(), STARTER_CONFIG);
+        assert!(!root.join(".gitignore").exists());
+
+        let _ = std::fs::remove_dir_all(root);
+    }
 }

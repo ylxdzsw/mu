@@ -34,6 +34,13 @@ pub struct ProjectInitResult {
     pub already_initialized: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StateLayout {
+    Global,
+    AutomaticProject,
+    ExplicitProject,
+}
+
 impl Scope {
     pub fn state_dir(&self) -> PathBuf {
         match self {
@@ -104,13 +111,17 @@ pub fn ensure_dir(path: &std::path::Path) -> Result<()> {
 }
 
 pub fn ensure_project_layout(scope: &Scope) -> Result<()> {
-    ensure_state_layout(&scope.state_dir(), false)?;
+    let layout = match scope {
+        Scope::Global => StateLayout::Global,
+        Scope::Project(_) => StateLayout::AutomaticProject,
+    };
+    ensure_state_layout(&scope.state_dir(), layout)?;
     Ok(())
 }
 
 pub fn init_project_layout_at(root: &Path, force: bool) -> Result<ProjectInitResult> {
     validate_project_init_root(root, force)?;
-    let created_files = ensure_state_layout(&root.join(".mu"), true)?;
+    let created_files = ensure_state_layout(&root.join(".mu"), StateLayout::ExplicitProject)?;
     Ok(ProjectInitResult {
         root: root.to_path_buf(),
         already_initialized: created_files.is_empty(),
@@ -118,7 +129,7 @@ pub fn init_project_layout_at(root: &Path, force: bool) -> Result<ProjectInitRes
     })
 }
 
-fn ensure_state_layout(dir: &Path, create_project_config: bool) -> Result<Vec<&'static str>> {
+fn ensure_state_layout(dir: &Path, layout: StateLayout) -> Result<Vec<&'static str>> {
     let mut created_files = Vec::new();
     if !dir.exists() {
         ensure_dir(dir)?;
@@ -126,17 +137,19 @@ fn ensure_state_layout(dir: &Path, create_project_config: bool) -> Result<Vec<&'
     } else {
         ensure_dir(dir)?;
     }
-    if create_project_config {
+    if layout == StateLayout::ExplicitProject {
         let config = dir.join("config.jsonc");
         if !config.exists() {
             std::fs::write(&config, PROJECT_CONFIG_TEMPLATE)?;
             created_files.push(".mu/config.jsonc");
         }
     }
-    let gitignore = dir.join(".gitignore");
-    if !gitignore.exists() {
-        std::fs::write(&gitignore, STATE_GITIGNORE)?;
-        created_files.push(".mu/.gitignore");
+    if layout != StateLayout::Global {
+        let gitignore = dir.join(".gitignore");
+        if !gitignore.exists() {
+            std::fs::write(&gitignore, STATE_GITIGNORE)?;
+            created_files.push(".mu/.gitignore");
+        }
     }
     Ok(created_files)
 }
@@ -279,6 +292,19 @@ mod tests {
             std::fs::read_to_string(state_dir.join(".gitignore")).unwrap(),
             STATE_GITIGNORE
         );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn automatic_global_layout_omits_project_files() {
+        let root = std::env::temp_dir().join(format!("mu-layout-{}", uuid::Uuid::new_v4()));
+
+        ensure_state_layout(&root, StateLayout::Global).unwrap();
+
+        assert!(root.is_dir());
+        assert!(!root.join("config.jsonc").exists());
+        assert!(!root.join(".gitignore").exists());
 
         let _ = std::fs::remove_dir_all(root);
     }

@@ -763,6 +763,11 @@ Project state is private to the project. A project should be movable and
 understandable by inspecting its `.mu` directory, while still avoiding committing
 volatile session state by default.
 
+Automatic project state creation writes only runtime state and `.gitignore`;
+it does not create a project `config.jsonc`. Explicit `mu project init` creates
+the minimal project config overlay. Global configuration creation writes the
+full starter `config.jsonc` and no `.gitignore`.
+
 ---
 
 ## 10. Configuration
