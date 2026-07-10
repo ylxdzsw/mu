@@ -43,6 +43,10 @@ pub struct ModelConfig {
     pub context_window: Option<u64>,
     #[serde(default)]
     pub supported_efforts: Option<Vec<EffortLevel>>,
+    /// Whether complete assistant reasoning traces are replayed in chat
+    /// history. When omitted, DeepSeek- and GLM-named models enable this automatically.
+    #[serde(default)]
+    pub preserved_thinking: Option<bool>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

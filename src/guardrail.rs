@@ -328,6 +328,7 @@ fn collect_transcript_entries(messages: &[Message]) -> Vec<TranscriptEntry> {
             Message::Assistant {
                 content,
                 tool_calls,
+                ..
             } => {
                 if let Some(text) = content.as_ref().filter(|c| !c.trim().is_empty()) {
                     entries.push(TranscriptEntry {
@@ -643,6 +644,7 @@ mod tests {
                 provider_id: "test".into(),
                 model_id: "model".into(),
                 effort: None,
+                preserved_thinking: false,
             },
             consecutive_denials: 0,
             recent_denials: VecDeque::new(),
@@ -678,6 +680,7 @@ mod tests {
                 provider_id: "test".into(),
                 model_id: "model".into(),
                 effort: None,
+                preserved_thinking: false,
             },
             consecutive_denials: 0,
             recent_denials: VecDeque::new(),
@@ -730,6 +733,7 @@ mod tests {
             },
             Message::Assistant {
                 content: Some("I'll run rm".into()),
+                reasoning_content: None,
                 tool_calls: None,
             },
         ];

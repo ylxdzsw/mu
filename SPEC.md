@@ -817,7 +817,9 @@ one scope are not visible in another.
         "models": {
           "gpt-4o": {
             "context_window": 128000,            // needed for Tier-1 compaction & context%
-            "supported_efforts": ["low", "medium", "high"]
+            "supported_efforts": ["low", "medium", "high"],
+            // Optional. Omit to enable for model ids containing "deepseek" or "glm".
+            "preserved_thinking": false
           }
         }
       }

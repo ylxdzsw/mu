@@ -76,7 +76,7 @@ pub struct Store {
     lock_dir: PathBuf,
 }
 
-const CURRENT_SCHEMA_VERSION: i32 = 1;
+const CURRENT_SCHEMA_VERSION: i32 = 2;
 
 fn session_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Session> {
     Ok(Session {
@@ -128,10 +128,11 @@ impl Store {
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .context("reading SQLite schema version")?;
         match version {
-            0 if !self.has_application_tables()? => self.create_schema_v1(),
+            0 if !self.has_application_tables()? => self.create_schema_v2(),
             0 => anyhow::bail!(
                 "unsupported pre-release session database schema; remove sessions.db to create a fresh release database"
             ),
+            1 => self.migrate_v1_to_v2(),
             CURRENT_SCHEMA_VERSION => Ok(()),
             future => anyhow::bail!(
                 "unsupported future session database schema version {future}; this mu supports version {CURRENT_SCHEMA_VERSION}"
@@ -150,7 +151,7 @@ impl Store {
         Ok(count > 0)
     }
 
-    fn create_schema_v1(&self) -> Result<()> {
+    fn create_schema_v2(&self) -> Result<()> {
         self.conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS session (
                 id TEXT PRIMARY KEY,
@@ -167,6 +168,7 @@ impl Store {
                 session_id TEXT NOT NULL,
                 role TEXT NOT NULL,
                 content TEXT NOT NULL,
+                reasoning_content TEXT,
                 user_content_json TEXT,
                 tool_call_id TEXT,
                 tool_calls_json TEXT,
@@ -210,7 +212,15 @@ impl Store {
                 reason TEXT,
                 created_at TEXT NOT NULL
             );
-            PRAGMA user_version = 1;",
+            PRAGMA user_version = 2;",
+        )?;
+        Ok(())
+    }
+
+    fn migrate_v1_to_v2(&self) -> Result<()> {
+        self.conn.execute_batch(
+            "ALTER TABLE message ADD COLUMN reasoning_content TEXT;
+             PRAGMA user_version = 2;",
         )?;
         Ok(())
     }
@@ -457,7 +467,7 @@ impl Store {
         let summary_seq = self.latest_summary_seq(session_id)?;
         let start_seq = summary_seq.unwrap_or(-1);
         let mut stmt = self.conn.prepare(
-            "SELECT role, content, user_content_json, tool_call_id, tool_calls_json FROM message
+            "SELECT role, content, reasoning_content, user_content_json, tool_call_id, tool_calls_json FROM message
              WHERE session_id = ?1 AND seq > ?2 AND role NOT IN ('system', 'summary')
              ORDER BY seq ASC",
         )?;
@@ -478,7 +488,14 @@ impl Store {
         }
 
         for row in rows {
-            let (role, content, user_content_json, tool_call_id, tool_calls_json) = row?;
+            let (
+                role,
+                content,
+                reasoning_content,
+                user_content_json,
+                tool_call_id,
+                tool_calls_json,
+            ) = row?;
             match role.as_str() {
                 "user" => messages.push(Message::User {
                     content: load_user_content(content, user_content_json),
@@ -493,6 +510,7 @@ impl Store {
                         } else {
                             Some(content)
                         },
+                        reasoning_content,
                         tool_calls,
                     });
                 }
@@ -664,9 +682,11 @@ impl Store {
                         Message::User { content } => approx_tokens(&content.text()),
                         Message::Assistant {
                             content,
+                            reasoning_content,
                             tool_calls,
                         } => {
                             approx_tokens(content.as_deref().unwrap_or(""))
+                                + approx_tokens(reasoning_content.as_deref().unwrap_or(""))
                                 + tool_calls
                                     .as_ref()
                                     .map(|t| {
@@ -723,6 +743,7 @@ type ContextRow = (
     Option<String>,
     Option<String>,
     Option<String>,
+    Option<String>,
 );
 
 pub fn write_session_id(path: &Path, id: &str) -> Result<()> {
@@ -746,6 +767,7 @@ fn load_context_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ContextRow> {
         row.get(2)?,
         row.get(3)?,
         row.get(4)?,
+        row.get(5)?,
     ))
 }
 
@@ -774,15 +796,17 @@ fn insert_message_in(
         }
         Message::Assistant {
             content,
+            reasoning_content,
             tool_calls,
         } => {
             let tc_json = tool_calls.as_ref().map(serde_json::to_string).transpose()?;
             tx.execute(
-                "INSERT INTO message (session_id, role, content, tool_calls_json, seq, created_at)
-                 VALUES (?1, 'assistant', ?2, ?3, ?4, ?5)",
+                "INSERT INTO message (session_id, role, content, reasoning_content, tool_calls_json, seq, created_at)
+                 VALUES (?1, 'assistant', ?2, ?3, ?4, ?5, ?6)",
                 params![
                     session_id,
                     content.as_deref().unwrap_or(""),
+                    reasoning_content,
                     tc_json,
                     seq,
                     now
@@ -884,6 +908,56 @@ mod tests {
             tables,
             vec!["message", "review", "session", "tool_call", "turn_usage"]
         );
+        let message_columns = store
+            .conn
+            .prepare("PRAGMA table_info(message)")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert!(message_columns.contains(&"reasoning_content".to_string()));
+        let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    #[test]
+    fn migrates_v1_database_to_store_reasoning_content() {
+        let tmp = std::env::temp_dir().join(format!("mu-store-v1-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let db = tmp.join("mu.db");
+        let conn = Connection::open(&db).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE message (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT NOT NULL,
+                role TEXT NOT NULL,
+                content TEXT NOT NULL,
+                user_content_json TEXT,
+                tool_call_id TEXT,
+                tool_calls_json TEXT,
+                seq INTEGER NOT NULL,
+                created_at TEXT NOT NULL
+             );
+             PRAGMA user_version = 1;",
+        )
+        .unwrap();
+        drop(conn);
+
+        let store = Store::open(&db).unwrap();
+        let version: i32 = store
+            .conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, CURRENT_SCHEMA_VERSION);
+        let has_reasoning_column: bool = store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM pragma_table_info('message') WHERE name = 'reasoning_content'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(has_reasoning_column);
         let _ = std::fs::remove_dir_all(tmp);
     }
 
@@ -974,6 +1048,34 @@ mod tests {
     }
 
     #[test]
+    fn reloads_reasoning_content_without_normalizing_whitespace() {
+        let (store, tmp) = temp_store();
+        let session = create_session_with_system(&store);
+        let reasoning = "  first line\n\tsecond line  ".to_string();
+
+        store
+            .append_message(
+                &session.id,
+                &Message::Assistant {
+                    content: Some("tool request".into()),
+                    reasoning_content: Some(reasoning.clone()),
+                    tool_calls: None,
+                },
+            )
+            .unwrap();
+
+        let messages = store.load_context_messages(&session.id).unwrap();
+        assert!(matches!(
+            &messages[1],
+            Message::Assistant {
+                reasoning_content: Some(saved),
+                ..
+            } if saved == &reasoning
+        ));
+        let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    #[test]
     fn list_sessions_skips_archived() {
         let (store, tmp) = temp_store();
         let cli = store.create_session("/tmp", "cli-model").unwrap();
@@ -1010,6 +1112,7 @@ mod tests {
                 &session.id,
                 &Message::Assistant {
                     content: None,
+                    reasoning_content: None,
                     tool_calls: Some(vec![
                         ToolCall {
                             id: "call-a".into(),
@@ -1110,6 +1213,7 @@ mod tests {
                 &session.id,
                 &Message::Assistant {
                     content: Some("hello".into()),
+                    reasoning_content: None,
                     tool_calls: None,
                 },
             )

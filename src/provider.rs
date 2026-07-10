@@ -19,6 +19,10 @@ pub enum Message {
     Assistant {
         #[serde(skip_serializing_if = "Option::is_none")]
         content: Option<String>,
+        /// Opaque provider reasoning. This is persisted and replayed verbatim
+        /// only for models that require it (for example DeepSeek thinking mode).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        reasoning_content: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         tool_calls: Option<Vec<ToolCall>>,
     },

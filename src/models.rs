@@ -56,6 +56,7 @@ pub struct ResolvedModelRef {
     pub provider_id: String,
     pub model_id: String,
     pub effort: Option<EffortLevel>,
+    pub preserved_thinking: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -67,6 +68,7 @@ pub struct RequestOptions {
 pub struct ResolvedModelInfo {
     pub context_window: Option<u64>,
     pub supported_effort_levels: Vec<EffortLevel>,
+    pub preserved_thinking: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -87,6 +89,7 @@ pub struct AvailableModel {
     pub supported_efforts: Vec<EffortLevel>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub context_window: Option<u64>,
+    pub preserved_thinking: bool,
 }
 
 pub fn validate_config(config: &Config) -> Result<()> {
@@ -129,6 +132,7 @@ pub fn resolve_model_info(config: &Config, model: &ResolvedModelRef) -> Resolved
         supported_effort_levels: cfg
             .and_then(|item| item.supported_efforts.clone())
             .unwrap_or_default(),
+        preserved_thinking: model.preserved_thinking,
     }
 }
 
@@ -178,6 +182,7 @@ pub fn available_models(config: &Config) -> AvailableModelsPayload {
                     model_id: model_id.clone(),
                     supported_efforts: model.supported_efforts.clone().unwrap_or_default(),
                     context_window: model.context_window,
+                    preserved_thinking: should_preserve_thinking(model_id, model),
                 })
                 .collect::<Vec<_>>();
             AvailableProvider {
@@ -216,7 +221,7 @@ fn resolve_exact_model(
     if model_id.trim().is_empty() {
         bail!("model reference `{provider_id}/` is missing a model id");
     }
-    config
+    let model_config = config
         .model_config(provider_id, model_id)
         .with_context(|| format!("model not configured: {provider_id}/{model_id}"))?;
 
@@ -225,9 +230,17 @@ fn resolve_exact_model(
         provider_id: provider_id.to_string(),
         model_id: model_id.to_string(),
         effort,
+        preserved_thinking: should_preserve_thinking(model_id, model_config),
     };
     validate_model_effort(config, &resolved)?;
     Ok(resolved)
+}
+
+fn should_preserve_thinking(model_id: &str, model: &crate::config::ModelConfig) -> bool {
+    model.preserved_thinking.unwrap_or_else(|| {
+        let model_id = model_id.to_ascii_lowercase();
+        model_id.contains("deepseek") || model_id.contains("glm")
+    })
 }
 
 fn resolve_implicit_model(
@@ -296,6 +309,7 @@ mod tests {
                                         EffortLevel::Medium,
                                         EffortLevel::High,
                                     ]),
+                                    preserved_thinking: None,
                                 },
                             ),
                             (
@@ -303,6 +317,39 @@ mod tests {
                                 ModelConfig {
                                     context_window: Some(200),
                                     supported_efforts: None,
+                                    preserved_thinking: None,
+                                },
+                            ),
+                            (
+                                "DeepSeek-V4".into(),
+                                ModelConfig {
+                                    context_window: Some(300),
+                                    supported_efforts: None,
+                                    preserved_thinking: None,
+                                },
+                            ),
+                            (
+                                "GLM-5".into(),
+                                ModelConfig {
+                                    context_window: Some(300),
+                                    supported_efforts: None,
+                                    preserved_thinking: None,
+                                },
+                            ),
+                            (
+                                "replay-override".into(),
+                                ModelConfig {
+                                    context_window: None,
+                                    supported_efforts: None,
+                                    preserved_thinking: Some(true),
+                                },
+                            ),
+                            (
+                                "deepseek-disabled".into(),
+                                ModelConfig {
+                                    context_window: None,
+                                    supported_efforts: None,
+                                    preserved_thinking: Some(false),
                                 },
                             ),
                         ]),
@@ -318,6 +365,7 @@ mod tests {
                             ModelConfig {
                                 context_window: Some(300),
                                 supported_efforts: Some(vec![EffortLevel::Max]),
+                                preserved_thinking: None,
                             },
                         )]),
                     },
@@ -344,6 +392,32 @@ mod tests {
         assert_eq!(resolved.model_id, "common-model");
         assert_eq!(resolved.effort, Some(EffortLevel::High));
         assert_eq!(resolved.canonical, "alpha/common-model:high");
+        assert!(!resolved.preserved_thinking);
+    }
+
+    #[test]
+    fn reasoning_replay_defaults_to_deepseek_and_honors_overrides() {
+        let config = test_config();
+        assert!(
+            resolve_model_ref(&config, "alpha/DeepSeek-V4")
+                .unwrap()
+                .preserved_thinking
+        );
+        assert!(
+            resolve_model_ref(&config, "alpha/GLM-5")
+                .unwrap()
+                .preserved_thinking
+        );
+        assert!(
+            resolve_model_ref(&config, "alpha/replay-override")
+                .unwrap()
+                .preserved_thinking
+        );
+        assert!(
+            !resolve_model_ref(&config, "alpha/deepseek-disabled")
+                .unwrap()
+                .preserved_thinking
+        );
     }
 
     #[test]
@@ -389,6 +463,7 @@ mod tests {
                         ModelConfig {
                             context_window: None,
                             supported_efforts: None,
+                            preserved_thinking: None,
                         },
                     )]),
                 },

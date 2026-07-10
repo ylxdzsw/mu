@@ -95,6 +95,7 @@ type ToolCallAccumulator = BTreeMap<usize, (Option<String>, Option<String>, Stri
 
 struct StreamParseState {
     content: String,
+    reasoning_content: String,
     tool_accum: ToolCallAccumulator,
     finish_reason: FinishReason,
     usage: Option<Usage>,
@@ -106,6 +107,7 @@ impl Default for StreamParseState {
     fn default() -> Self {
         Self {
             content: String::new(),
+            reasoning_content: String::new(),
             tool_accum: BTreeMap::new(),
             finish_reason: FinishReason::Stop,
             usage: None,
@@ -228,6 +230,11 @@ impl Provider for OpenAiProvider {
             } else {
                 Some(stream_state.content)
             },
+            reasoning_content: if stream_state.reasoning_content.is_empty() {
+                None
+            } else {
+                Some(stream_state.reasoning_content)
+            },
             tool_calls,
         };
 
@@ -257,7 +264,25 @@ fn build_chat_request_body(
         // is rejected by real OpenAI `/chat/completions`.)
         body["reasoning_effort"] = Value::String(effort.as_str().to_string());
     }
+    if request.model.preserved_thinking && is_glm_model(&request.model.model_id) {
+        // Zhipu's GLM API requires this switch as well as the verbatim
+        // reasoning_content history to preserve cross-turn thinking.
+        body["thinking"] = serde_json::json!({ "clear_thinking": false });
+    }
+    if !request.model.preserved_thinking {
+        if let Some(messages) = body["messages"].as_array_mut() {
+            for message in messages {
+                if let Some(message) = message.as_object_mut() {
+                    message.remove("reasoning_content");
+                }
+            }
+        }
+    }
     body
+}
+
+fn is_glm_model(model_id: &str) -> bool {
+    model_id.to_ascii_lowercase().contains("glm")
 }
 
 fn consume_sse_buffer(
@@ -306,6 +331,7 @@ fn consume_sse_buffer(
                     .as_ref()
                     .and_then(reasoning_text_from_value);
                 if let Some(text) = reasoning_delta {
+                    state.reasoning_content.push_str(&text);
                     if !state.reasoning_active {
                         on_event(StreamEvent::ReasoningStart)?;
                         state.reasoning_active = true;
@@ -513,6 +539,7 @@ mod tests {
             provider_id: "test".into(),
             model_id: "gpt-test".into(),
             effort,
+            preserved_thinking: false,
         }
     }
 
@@ -674,6 +701,23 @@ mod tests {
     }
 
     #[test]
+    fn preserves_reasoning_content_verbatim_across_stream_chunks() {
+        let mut on_event = |_event: StreamEvent| -> Result<(), ProviderError> { Ok(()) };
+        let mut buffer = String::new();
+        let mut state = StreamParseState::default();
+
+        for chunk in [
+            "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"  first line\\n\"},\"finish_reason\":null}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"\\tsecond line  \"},\"finish_reason\":\"tool_calls\"}]}\n\n",
+        ] {
+            buffer.push_str(chunk);
+            consume_sse_buffer(&mut buffer, &mut state, &mut on_event).unwrap();
+        }
+
+        assert_eq!(state.reasoning_content, "  first line\n\tsecond line  ");
+    }
+
+    #[test]
     fn request_includes_reasoning_effort_when_set() {
         let body = build_chat_request_body(
             &RequestOptions {
@@ -684,6 +728,58 @@ mod tests {
         );
 
         assert_eq!(body["reasoning_effort"], "high");
+    }
+
+    #[test]
+    fn replays_reasoning_content_only_when_preserved_thinking_is_enabled() {
+        let messages = vec![Message::Assistant {
+            content: None,
+            reasoning_content: Some("  exact\\ntrace  ".into()),
+            tool_calls: None,
+        }];
+
+        let disabled = build_chat_request_body(
+            &RequestOptions {
+                model: test_model(None),
+            },
+            &messages,
+            &[],
+        );
+        assert!(disabled["messages"][0].get("reasoning_content").is_none());
+
+        let mut enabled_model = test_model(None);
+        enabled_model.preserved_thinking = true;
+        let enabled = build_chat_request_body(
+            &RequestOptions {
+                model: enabled_model,
+            },
+            &messages,
+            &[],
+        );
+        assert_eq!(
+            enabled["messages"][0]["reasoning_content"],
+            "  exact\\ntrace  "
+        );
+    }
+
+    #[test]
+    fn enables_glm_preserved_thinking_mode() {
+        let mut model = test_model(None);
+        model.model_id = "GLM-5".into();
+        model.preserved_thinking = true;
+
+        let body = build_chat_request_body(
+            &RequestOptions { model },
+            &[Message::Assistant {
+                content: Some("answer".into()),
+                reasoning_content: Some("exact reasoning".into()),
+                tool_calls: None,
+            }],
+            &[],
+        );
+
+        assert_eq!(body["thinking"]["clear_thinking"], false);
+        assert_eq!(body["messages"][0]["reasoning_content"], "exact reasoning");
     }
 
     #[test]

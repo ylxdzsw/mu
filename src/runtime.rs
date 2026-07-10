@@ -314,6 +314,7 @@ mod tests {
                         ModelConfig {
                             context_window: Some(100),
                             supported_efforts: Some(vec![EffortLevel::Low, EffortLevel::High]),
+                            preserved_thinking: None,
                         },
                     )]),
                 },
@@ -410,6 +411,7 @@ mod tests {
                 &session.id,
                 &crate::provider::Message::Assistant {
                     content: Some("hello".into()),
+                    reasoning_content: None,
                     tool_calls: None,
                 },
             )

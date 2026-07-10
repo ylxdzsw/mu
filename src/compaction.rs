@@ -224,6 +224,7 @@ mod tests {
             Ok(StreamResult {
                 message: Message::Assistant {
                     content: Some("summary".into()),
+                    reasoning_content: None,
                     tool_calls: None,
                 },
                 finish_reason: FinishReason::Stop,
@@ -249,6 +250,7 @@ mod tests {
                         crate::config::ModelConfig {
                             context_window: None,
                             supported_efforts: None,
+                            preserved_thinking: None,
                         },
                     )]),
                 },
@@ -296,6 +298,7 @@ mod tests {
                     &session.id,
                     &Message::Assistant {
                         content: Some(format!("assistant {n}")),
+                        reasoning_content: None,
                         tool_calls: None,
                     },
                 )

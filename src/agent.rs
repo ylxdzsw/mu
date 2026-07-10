@@ -645,9 +645,11 @@ fn approx_context_tokens(context: &[Message]) -> u64 {
             Message::User { content } => approx_tokens(&content.text()),
             Message::Assistant {
                 content,
+                reasoning_content,
                 tool_calls,
             } => {
                 approx_tokens(content.as_deref().unwrap_or(""))
+                    + approx_tokens(reasoning_content.as_deref().unwrap_or(""))
                     + tool_calls
                         .as_ref()
                         .map(|calls| {
@@ -1126,6 +1128,7 @@ mod tests {
                 1 => Ok(StreamResult {
                     message: Message::Assistant {
                         content: Some("done".into()),
+                        reasoning_content: None,
                         tool_calls: None,
                     },
                     finish_reason: FinishReason::Stop,
@@ -1168,6 +1171,7 @@ mod tests {
                     Ok(StreamResult {
                         message: Message::Assistant {
                             content: None,
+                            reasoning_content: None,
                             tool_calls: Some(vec![
                                 ToolCall {
                                     id: "call_first".into(),
@@ -1211,6 +1215,7 @@ mod tests {
                 1 => Ok(StreamResult {
                     message: Message::Assistant {
                         content: Some("done".into()),
+                        reasoning_content: None,
                         tool_calls: None,
                     },
                     finish_reason: FinishReason::Stop,
@@ -1238,6 +1243,7 @@ mod tests {
                         crate::config::ModelConfig {
                             context_window: None,
                             supported_efforts: None,
+                            preserved_thinking: None,
                         },
                     )]),
                 },
@@ -1697,6 +1703,7 @@ mod tests {
             Some(Message::Assistant {
                 content: Some(content),
                 tool_calls: None,
+                ..
             }) if content == "done"
         ));
         let _ = std::fs::remove_dir_all(tmp);
@@ -1798,6 +1805,7 @@ mod tests {
                 return Ok(StreamResult {
                     message: Message::Assistant {
                         content: Some("summary".into()),
+                        reasoning_content: None,
                         tool_calls: None,
                     },
                     finish_reason: FinishReason::Stop,
@@ -1817,6 +1825,7 @@ mod tests {
                 0 => Ok(StreamResult {
                     message: Message::Assistant {
                         content: None,
+                        reasoning_content: None,
                         tool_calls: Some(vec![ToolCall {
                             id: "call_grow".into(),
                             call_type: "function".into(),
@@ -1842,6 +1851,7 @@ mod tests {
                 _ => Ok(StreamResult {
                     message: Message::Assistant {
                         content: Some("done".into()),
+                        reasoning_content: None,
                         tool_calls: None,
                     },
                     finish_reason: FinishReason::Stop,
@@ -1889,6 +1899,7 @@ mod tests {
                     &session.id,
                     &Message::Assistant {
                         content: Some(format!("reply {turn}")),
+                        reasoning_content: None,
                         tool_calls: None,
                     },
                 )
@@ -1946,6 +1957,7 @@ mod tests {
             Some(Message::Assistant {
                 content: Some(content),
                 tool_calls: None,
+                ..
             }) if content == "done"
         ));
 
