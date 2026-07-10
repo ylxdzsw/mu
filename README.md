@@ -121,6 +121,17 @@ MU_ZSH_EXIT_HOOKS+=(mu_restore_conflicts)
 
 Prompt-file mode accepts the same turn options as stdin mode. Put the prompt
 file last, for example `mu --output plain --model openai/gpt-5:high prompt.md`.
+When stdin is not a terminal, its non-empty contents are appended to the prompt
+file after `---`; use a quoted heredoc for custom instructions:
+
+```sh
+mu prompt.md <<'EOF'
+Use a concise style and include risks.
+EOF
+```
+
+Terminal stdin is not read in prompt-file mode, so `mu prompt.md` runs without
+blocking. Bare `mu` still uses stdin as its complete prompt.
 
 If a turn is interrupted (Ctrl-C, a dropped connection, a crash), only the
 completed messages are kept — any tool command that started running is recorded,
@@ -144,6 +155,14 @@ Prompt-file mode removes the shebang line before sending the prompt to the
 model. Stdin mode does not trim shebang-like input. Prompt-file mode keeps the
 same working directory as the invoking shell.
 
+The same heredoc form works for executable prompt files:
+
+```sh
+./release-note.md <<'EOF'
+Mention the authentication change.
+EOF
+```
+
 Files under global or project `.mu` can also act as a small instruction library.
 A file whose first line is a permissive `mu` shebang is a custom command and can
 be run by its relative `.mu` path, for example `mu review.md`. A file with YAML
@@ -154,6 +173,11 @@ Skills may also use `requires_env` and `requires_commands` frontmatter keys.
 Each key accepts comma-separated entries, and all listed env vars and commands
 must be available before the skill is listed.
 Commands and skills are discovered with bounded depth and file-count limits.
+
+In `mu>` mode, `/review.md Focus on authentication` runs that command with the
+text after its name as the custom instruction. Shift+Enter may add more
+instruction lines before submitting. A leading `/` is always slash-command
+syntax; an unknown name reports an error.
 
 ## Config
 

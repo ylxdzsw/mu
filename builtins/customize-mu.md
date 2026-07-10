@@ -118,6 +118,20 @@ Commands are invoked by their relative `.mu` path, including extension, for
 example `mu review.md` or `/review.md` in the zsh prompt mode. Built-in
 subcommands and explicit prompt paths such as `./status` win over command names.
 
+Every prompt file can take an optional custom instruction from non-terminal
+stdin. Prefer a quoted heredoc for multiline text:
+
+```sh
+mu review.md <<'EOF'
+Focus on authentication and authorization.
+EOF
+```
+
+For file-backed turns, terminal stdin is not read, and an empty pipe leaves the
+file prompt unchanged. Non-empty stdin is appended after `---`. In zsh prompt
+mode, `/review.md Focus on authentication` passes the text after the command as
+that custom instruction; Shift+Enter may add more lines.
+
 Prompt-file mode strips the shebang before sending the prompt. If a command also
 has skill frontmatter, `mu` strips both the shebang and frontmatter for command
 execution.

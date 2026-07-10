@@ -194,7 +194,8 @@ repeated turn invocations, not a replacement runtime.
 - **Store.** SQLite load/append in either project-local or global scope (§11).
 
 The binary runs on a single `tokio` runtime. There is no input thread or line
-editor — stdin is read once, fully, as the prompt.
+editor. Bare `mu` reads stdin once as the prompt; file-backed turns read
+non-terminal stdin once as an optional custom instruction.
 
 ### Binary CLI surface
 
@@ -206,7 +207,8 @@ small:
   — run one turn; prompt read from stdin. `-i/--image` is repeatable.
 - `mu [-s <id>] [-c] [--model <id>] [-i <image>] [--output final|plain|terminal] <prompt-file>`
   — run one turn from a prompt file; if the first line starts with `#!`, drop
-  it before sending the prompt. `-i/--image` is repeatable.
+  it before sending the prompt. Non-terminal stdin is appended as a custom
+  instruction. `-i/--image` is repeatable.
 - `mu [-s <id>] [-c] [--model <id>] [--output final|plain|terminal] <custom-command>`
   — run a discovered shebang command from the active project/global `.mu`
   instruction index. Command names are relative `.mu` paths including
@@ -234,6 +236,10 @@ The turn runner remains one completed turn per invocation. Bare `mu` reads the
 prompt from stdin; a positional name first resolves to a discovered custom
 command unless it is an explicit path such as `./prompt.md`, then falls back to
 prompt-file mode. Prompt-file mode trims a leading shebang line when present.
+For any file-backed turn, terminal stdin is left alone so the command does not
+block; non-terminal stdin is read through EOF and, when non-empty, appended to
+the loaded file body with `\n---\n\n`. Bare `mu` continues to use stdin as its
+complete prompt.
 Exact subcommand names win at the top level, so a prompt file that collides with
 a subcommand name must be passed with a disambiguating path such as `./status`.
 `mu session list`, `mu session transcript`, and project inspection/init do
@@ -603,6 +609,10 @@ Consequences:
 - Typing `/` at the start of a `mu>` line proactively lists slash commands.
   After that, Tab delegates matching, candidate lists, and menu selection to
   the user's normal zsh completion settings.
+- A buffer beginning with `/` is a slash command. Known custom commands take
+  everything after their name as a custom instruction, including inserted
+  newlines; unknown names report a slash-command error. Built-in slash commands
+  keep their own argument rules.
 - While `mu>` mode is active, conflicting line-editor plugins should be
   suspended. Common ZLE helpers such as syntax highlighting and autosuggestions
   may be disabled automatically; additional plugin toggles may be attached with

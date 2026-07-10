@@ -1,4 +1,4 @@
-use std::io::{self, Read, Write};
+use std::io::{self, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process;
 use std::sync::Arc;
@@ -582,20 +582,49 @@ async fn run_turn_from_source(
 }
 
 fn load_prompt(source: PromptSource) -> Result<String> {
-    let raw = match source {
+    let stdin = io::stdin();
+    load_prompt_with_stdin(source, stdin.is_terminal(), &mut stdin.lock())
+}
+
+fn load_prompt_with_stdin(
+    source: PromptSource,
+    stdin_is_terminal: bool,
+    stdin: &mut impl Read,
+) -> Result<String> {
+    match source {
         PromptSource::Stdin => {
-            let mut stdin = String::new();
-            io::stdin().read_to_string(&mut stdin)?;
-            normalize_prompt(&stdin, false)?
+            let mut prompt = String::new();
+            stdin.read_to_string(&mut prompt)?;
+            normalize_prompt(&prompt, false)
         }
         PromptSource::File(path) => {
             let raw = std::fs::read_to_string(&path)
                 .with_context(|| format!("reading prompt file {}", path.display()))?;
-            normalize_prompt(&raw, true)?
+            let prompt = normalize_prompt(&raw, true)?;
+            append_stdin_instruction(prompt, stdin_is_terminal, stdin)
         }
-        PromptSource::Command(path) => skills::command_prompt(&path)?,
-    };
-    Ok(raw)
+        PromptSource::Command(path) => {
+            let prompt = skills::command_prompt(&path)?;
+            append_stdin_instruction(prompt, stdin_is_terminal, stdin)
+        }
+    }
+}
+
+fn append_stdin_instruction(
+    prompt: String,
+    stdin_is_terminal: bool,
+    stdin: &mut impl Read,
+) -> Result<String> {
+    if stdin_is_terminal {
+        return Ok(prompt);
+    }
+
+    let mut instruction = String::new();
+    stdin.read_to_string(&mut instruction)?;
+    if instruction.is_empty() {
+        return Ok(prompt);
+    }
+    Ok(format!("{prompt}\n---\n\n{instruction}"))
 }
 
 fn resolve_prompt_source(
@@ -893,6 +922,7 @@ fn base64_encode(bytes: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::io::Cursor;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::*;
@@ -909,16 +939,61 @@ mod tests {
     fn load_prompt_file_trims_shebang_line() {
         let path = temp_file_path("shebang");
         std::fs::write(&path, "#!/usr/bin/env -S mu --output plain\nhello\n").unwrap();
-        let prompt = load_prompt(PromptSource::File(path.clone())).unwrap();
+        let mut stdin = Cursor::new("ignored instruction");
+        let prompt =
+            load_prompt_with_stdin(PromptSource::File(path.clone()), true, &mut stdin).unwrap();
         std::fs::remove_file(path).unwrap();
         assert_eq!(prompt, "hello");
+        assert_eq!(stdin.position(), 0);
+    }
+
+    #[test]
+    fn prompt_file_appends_non_terminal_stdin_verbatim() {
+        let path = temp_file_path("instruction");
+        std::fs::write(&path, "Use the release-note format.\n").unwrap();
+        let mut stdin = Cursor::new("Focus on auth.\nKeep the second line.\n");
+        let prompt =
+            load_prompt_with_stdin(PromptSource::File(path.clone()), false, &mut stdin).unwrap();
+        std::fs::remove_file(path).unwrap();
+        assert_eq!(
+            prompt,
+            "Use the release-note format.\n---\n\nFocus on auth.\nKeep the second line.\n"
+        );
+    }
+
+    #[test]
+    fn prompt_file_ignores_empty_non_terminal_stdin() {
+        let path = temp_file_path("empty-instruction");
+        std::fs::write(&path, "Use the release-note format.\n").unwrap();
+        let mut stdin = Cursor::new("");
+        let prompt =
+            load_prompt_with_stdin(PromptSource::File(path.clone()), false, &mut stdin).unwrap();
+        std::fs::remove_file(path).unwrap();
+        assert_eq!(prompt, "Use the release-note format.");
+    }
+
+    #[test]
+    fn command_appends_non_terminal_stdin_after_headers_are_stripped() {
+        let path = temp_file_path("command-instruction");
+        std::fs::write(
+            &path,
+            "#!/usr/bin/env mu\n---\nname: review\ndescription: Review changes.\n---\nReview the checkout.\n",
+        )
+        .unwrap();
+        let mut stdin = Cursor::new("Focus on auth.");
+        let prompt =
+            load_prompt_with_stdin(PromptSource::Command(path.clone()), false, &mut stdin).unwrap();
+        std::fs::remove_file(path).unwrap();
+        assert_eq!(prompt, "Review the checkout.\n---\n\nFocus on auth.");
     }
 
     #[test]
     fn load_prompt_file_reports_utf8_errors_with_path() {
         let path = temp_file_path("invalid-utf8");
         std::fs::write(&path, [0xff, 0xfe, 0xfd]).unwrap();
-        let err = load_prompt(PromptSource::File(path.clone())).unwrap_err();
+        let mut stdin = Cursor::new("");
+        let err =
+            load_prompt_with_stdin(PromptSource::File(path.clone()), true, &mut stdin).unwrap_err();
         std::fs::remove_file(&path).unwrap();
         assert!(err.to_string().contains("reading prompt file"));
         assert!(err.to_string().contains(path.to_string_lossy().as_ref()));

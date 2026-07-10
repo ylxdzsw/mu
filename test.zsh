@@ -73,6 +73,10 @@ if [[ "$1" == "status" ]]; then
 fi
 if [[ "$1" == "--output" && "$3" == "review.md" ]]; then
   print -r -- "$*" >> "$MU_ZSH_FAKE_LOG"
+  if [[ ! -t 0 ]]; then
+    prompt=$(cat)
+    [[ -n "$prompt" ]] && print -r -- "prompt=$prompt" >> "$MU_ZSH_FAKE_LOG"
+  fi
   if [[ -n "$MU_SESSION_FILE" ]]; then
     print -r -- "created-session" > "$MU_SESSION_FILE"
   fi
@@ -325,11 +329,24 @@ grep -q -- "compact --session tracked-session" "$MU_ZSH_FAKE_LOG" || fail "compa
 rm -f "$MU_ZSH_FAKE_LOG"
 _mu_zsh_run_slash_command "/review.md"
 grep -q -- "--output plain -s tracked-session review.md" "$MU_ZSH_FAKE_LOG" || fail "custom slash command targets tracked session"
+rm -f "$MU_ZSH_FAKE_LOG"
+_mu_zsh_run_slash_command "/review.md Focus on authentication"
+grep -q -- "--output plain -s tracked-session review.md" "$MU_ZSH_FAKE_LOG" || fail "custom slash command keeps tracked session with instruction"
+grep -Fxq -- "prompt=Focus on authentication" "$MU_ZSH_FAKE_LOG" || fail "custom slash command pipes instruction"
+rm -f "$MU_ZSH_FAKE_LOG"
+_mu_zsh_run_slash_command $'/review.md First line\nSecond line'
+custom_prompt=$(cat "$MU_ZSH_FAKE_LOG")
+[[ "$custom_prompt" == *$'prompt=First line\nSecond line'* ]] || fail "custom slash command preserves multiline instruction"
 _mu_zsh_run_slash_command "/new"
 [[ -z "$MU_ZSH_SESSION_ID" && -z "$MU_ZSH_SESSION_SCOPE" ]] || fail "new slash command lazily clears tracked session"
 rm -f "$MU_ZSH_FAKE_LOG" "$MU_ZSH_SESSION_FILE"
 _mu_zsh_run_slash_command "/review.md"
 [[ "$MU_ZSH_SESSION_ID" == "created-session" ]] || fail "custom slash command captures new session id"
+_mu_zsh_clear_session_state
+rm -f "$MU_ZSH_FAKE_LOG" "$MU_ZSH_SESSION_FILE"
+_mu_zsh_run_slash_command "/review.md Start a fresh session"
+[[ "$MU_ZSH_SESSION_ID" == "created-session" ]] || fail "custom slash instruction captures new session id"
+grep -Fxq -- "prompt=Start a fresh session" "$MU_ZSH_FAKE_LOG" || fail "fresh custom slash command pipes instruction"
 _mu_zsh_clear_session_state
 if _mu_zsh_run_slash_command "/retry"; then
   fail "retry without a valid tracked session should fail"
@@ -538,6 +555,26 @@ shift_enter_expected_stdin=$tmpdir/shift-enter-expected-stdin
 print -rn -- 'first line'$'\n''second line'$'\n' > "$shift_enter_expected_stdin"
 cmp -- "$shift_enter_expected_stdin" "$interactive_capture_stdin" || fail "Shift+Enter draft should be passed as one multiline prompt"
 
+custom_slash_transcript=$tmpdir/custom-slash-transcript
+custom_slash_setup="$interactive_setup; export TEST_EXTRA_COMMAND=review.md"
+rm -f -- "$interactive_capture_args" "$interactive_capture_stdin" "$interactive_capture_calls"
+interactive_status=0
+{
+  print -r -- "$custom_slash_setup"
+  sleep 0.2
+  print -rn -- $'\t'"/review.md First line"$'\e[13;2u'"Second line"$'\r'
+  sleep 0.4
+  print -rn -- $'\x04'
+} | timeout 5 script -qfec 'TERM=xterm-256color zsh -df' "$custom_slash_transcript" >/dev/null || interactive_status=$?
+(( interactive_status == 0 )) || fail "custom slash transcript exited with status $interactive_status"
+[[ $(<"$interactive_capture_calls") == x ]] || fail "custom slash command should run once"
+custom_slash_expected_stdin=$tmpdir/custom-slash-expected-stdin
+print -rn -- 'First line'$'\n''Second line' > "$custom_slash_expected_stdin"
+cmp -- "$custom_slash_expected_stdin" "$interactive_capture_stdin" || fail "custom slash instruction should preserve multiline text"
+interactive_args=("${(@f)$(<"$interactive_capture_args")}")
+expected_custom_slash_args=(--output terminal review.md)
+[[ "${(j:\0:)interactive_args}" == "${(j:\0:)expected_custom_slash_args}" ]] || fail "custom slash command should use the command path"
+
 plain_transcript=$tmpdir/plain-transcript
 plain_setup="$interactive_setup; MU_ZSH_OUTPUT=plain"
 rm -f -- "$interactive_capture_args" "$interactive_capture_stdin" "$interactive_capture_calls"
@@ -679,9 +716,9 @@ interactive_status=0
 } | timeout 5 script -qfec 'TERM=xterm-256color zsh -df' "$unknown_slash_transcript" >/dev/null || interactive_status=$?
 (( interactive_status == 0 )) || fail "unknown slash transcript exited with status $interactive_status"
 
-[[ $(<"$interactive_capture_calls") == x ]] || fail "unknown slash input should submit as a normal prompt"
-print -rn -- '/not-a-command custom'$'\n' > "$interactive_expected_stdin"
-cmp -- "$interactive_expected_stdin" "$interactive_capture_stdin" || fail "unknown slash input should be passed on stdin"
+[[ ! -e "$interactive_capture_calls" || ! -s "$interactive_capture_calls" ]] || fail "unknown slash input should not submit a prompt"
+normalized=$(perl -pe 's/\e\[[0-?]*[ -\/]*[@-~]//g' "$unknown_slash_transcript" | col -b)
+[[ "$normalized" == *"[mu] unknown slash command: /not-a-command"* ]] || fail "unknown slash input should report a command error"
 
 toggle_transcript=$tmpdir/toggle-transcript
 toggle_setup="$interactive_setup; _mu_test_tab_roundtrip() { BUFFER='echo toggled'; CURSOR=0; _mu_zsh_tab; _mu_zsh_tab; }; zle -N _mu_test_tab_roundtrip; bindkey '^T' _mu_test_tab_roundtrip"

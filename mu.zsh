@@ -673,6 +673,7 @@ _mu_zsh_validate_model_ref() {
 
 _mu_zsh_run_custom_slash_command() {
   local slash_command=$1
+  local instruction=${2-}
   local name=${slash_command#/}
   local exit_status scope session_id
   local -a command
@@ -686,12 +687,22 @@ _mu_zsh_run_custom_slash_command() {
   command+=("$name")
 
   if [[ -n "$session_id" ]]; then
-    "${command[@]}"
-    exit_status=$?
+    if [[ -n "$instruction" ]]; then
+      print -rn -- "$instruction" | "${command[@]}"
+      exit_status=${pipestatus[2]}
+    else
+      "${command[@]}"
+      exit_status=$?
+    fi
   else
     rm -f -- "$MU_ZSH_SESSION_FILE" 2>/dev/null || true
-    MU_SESSION_FILE=$MU_ZSH_SESSION_FILE "${command[@]}"
-    exit_status=$?
+    if [[ -n "$instruction" ]]; then
+      print -rn -- "$instruction" | MU_SESSION_FILE=$MU_ZSH_SESSION_FILE "${command[@]}"
+      exit_status=${pipestatus[2]}
+    else
+      MU_SESSION_FILE=$MU_ZSH_SESSION_FILE "${command[@]}"
+      exit_status=$?
+    fi
     _mu_zsh_read_session_file "$scope"
   fi
 
@@ -700,14 +711,18 @@ _mu_zsh_run_custom_slash_command() {
 
 _mu_zsh_run_slash_command() {
   local line=$1
-  local command rest session_id scope resolved_model
+  local command instruction rest session_id scope resolved_model
   local exit_status=0
 
   command=${line%%[[:space:]]*}
   if [[ "$command" == "$line" ]]; then
-    rest=
+    instruction=
   else
-    rest=${line#"$command"}
+    instruction=${line#"$command"}
+    instruction=${instruction#?}
+  fi
+  rest=$instruction
+  if [[ -n "$rest" ]]; then
     while [[ "$rest" == [[:space:]]* ]]; do
       rest=${rest#[[:space:]]}
     done
@@ -768,8 +783,7 @@ _mu_zsh_run_slash_command() {
       ;;
     *)
       if _mu_zsh_has_custom_slash_command "$command"; then
-        _mu_zsh_validate_no_args "$command" "$rest" || return 1
-        _mu_zsh_run_custom_slash_command "$command"
+        _mu_zsh_run_custom_slash_command "$command" "$instruction"
         exit_status=$?
       else
         _mu_zsh_print_block_message "[mu] unknown slash command: $command"
@@ -912,7 +926,6 @@ _mu_zsh_accept() {
   fi
 
   local prompt=$BUFFER
-  local command
   local prompt_rows=$MU_ZSH_MODE_PROMPT_ROWS
   if [[ -z "${prompt//[[:space:]]/}" ]]; then
     _mu_zsh_redraw_mode_prompt
@@ -922,15 +935,8 @@ _mu_zsh_accept() {
   _mu_zsh_clear_prompt
   zle -I
   MU_ZSH_OUTPUT_SEPARATOR_PENDING=1
-  # A multiline draft is always a normal prompt. This keeps a leading slash in
-  # prose or examples from dispatching a shell-side slash command.
-  if [[ "$prompt" == /* && "$prompt" != *$'\n'* ]]; then
-    command=${prompt%%[[:space:]]*}
-    if _mu_zsh_is_known_slash_command "$command"; then
-      _mu_zsh_run_slash_command "$prompt"
-    else
-      _mu_zsh_submit_prompt "$prompt"
-    fi
+  if [[ "$prompt" == /* ]]; then
+    _mu_zsh_run_slash_command "$prompt"
   else
     _mu_zsh_submit_prompt "$prompt"
   fi
