@@ -32,7 +32,12 @@ pub fn assemble_prompt(
 
     let os = std::env::consts::OS;
     let date = Local::now().format("%Y-%m-%d").to_string();
-    parts.push(format!("<runtime>\nos: {}\ndate: {}\n</runtime>", os, date));
+    let user = std::env::var("USER").unwrap_or_else(|_| "unknown".to_string());
+    let uid = unsafe { libc::geteuid() };
+    parts.push(format!(
+        "<runtime>\nos: {}\ndate: {}\nuser: {} (uid {})\n</runtime>",
+        os, date, user, uid
+    ));
 
     let skills_block = format_skills_block(skills);
     if !skills_block.is_empty() {
@@ -90,6 +95,8 @@ mod tests {
         assert!(prompt.starts_with(role_preamble()));
         assert!(prompt.contains("Exactly one tool is available: `bash`."));
         assert!(prompt.contains("Do not invent or call other tool name."));
+        assert!(prompt.contains("\nuser: "));
+        assert!(prompt.contains(" (uid "));
     }
 
     #[test]

@@ -872,6 +872,7 @@ The assembled prompt has this fixed order:
    <runtime>
    os: linux
    date: 2026-06-18
+   user: alice (uid 1000)
    </runtime>
    ```
    Per-session environment — current working directory, project root, session

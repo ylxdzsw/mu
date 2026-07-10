@@ -12,6 +12,9 @@ group, so `server &` does not reliably keep a service alive.
 
 Prefer a transient user service:
 
+When the runtime user's UID is not `0`, add `--user` to every `systemd-run` and
+`systemctl` command below; omit it for UID `0`.
+
 ```bash
 id="mu-bg-$(date +%s)-$RANDOM"
 unit="$id.service"
@@ -19,7 +22,7 @@ log="${TMPDIR:-/tmp}/$id.log"
 : > "$log"
 chmod 600 "$log"
 
-systemd-run --user \
+systemd-run \
   --unit="$unit" \
   --collect \
   --property=Type=exec \
@@ -31,7 +34,7 @@ systemd-run --user \
   --expand-environment=no \
   bash -lc 'exec your-server-command-here'
 
-invocation_id=$(systemctl --user show "$unit" -P InvocationID 2>/dev/null || true)
+invocation_id=$(systemctl show "$unit" -P InvocationID 2>/dev/null || true)
 printf 'unit=%s\ninvocation_id=%s\nlog=%s\n' "$unit" "$invocation_id" "$log"
 ```
 
@@ -46,9 +49,9 @@ tail -n 200 "$log"
 Stop the service:
 
 ```bash
-actual=$(systemctl --user show "$unit" -P InvocationID 2>/dev/null || true)
+actual=$(systemctl show "$unit" -P InvocationID 2>/dev/null || true)
 if [ "$actual" = "$invocation_id" ]; then
-  systemctl --user stop "$unit"
+  systemctl stop "$unit"
 else
   echo "not stopping: unit missing or invocation changed"
 fi
