@@ -29,10 +29,10 @@ pub(crate) const BASH_TITLE_PREVIEW_BYTES: usize = 120;
 const GUARDRAIL_REASON_PREVIEW_BYTES: usize = 180;
 const BASH_HEAD_LINE_BUDGET: usize = 3;
 const BASH_HEAD_BYTE_BUDGET: usize = 1024;
-const BASH_HEAD_LINE_CAP_BYTES: usize = 256;
+const BASH_HEAD_LINE_CAP_BYTES: usize = 120;
 const BASH_TAIL_LINE_RESERVE: usize = 2;
 const BASH_TAIL_FALLBACK_BYTES: usize = 512;
-const BASH_TAIL_LINE_CAP_BYTES: usize = 256;
+const BASH_TAIL_LINE_CAP_BYTES: usize = 120;
 pub(crate) const ELLIPSIS: &str = "…";
 
 pub struct Renderer {
@@ -3129,6 +3129,23 @@ mod tests {
         assert_eq!(snapshot.tail_rendered, "");
         assert_eq!(snapshot.omitted_lines, 0);
         assert_eq!(snapshot.omitted_bytes, 0);
+    }
+
+    #[test]
+    fn bash_preview_caps_head_and_tail_output_lines() {
+        let head = "h".repeat(BASH_HEAD_LINE_CAP_BYTES + 80);
+        let tail_a = "t".repeat(BASH_TAIL_LINE_CAP_BYTES + 80);
+        let tail_b = "u".repeat(BASH_TAIL_LINE_CAP_BYTES + 80);
+        let raw = format!("{head}\nhead two\nhead three\nomitted\n{tail_a}\n{tail_b}\n");
+
+        let snapshot = compute_bash_preview_snapshot(&raw, true);
+
+        let rendered_head = snapshot.head_rendered.lines().next().unwrap();
+        let rendered_tail = snapshot.tail_rendered.lines().next().unwrap();
+        assert_eq!(rendered_head.len(), BASH_HEAD_LINE_CAP_BYTES);
+        assert!(rendered_head.ends_with(ELLIPSIS));
+        assert!(rendered_tail.starts_with(ELLIPSIS));
+        assert!(rendered_tail.len() < BASH_TAIL_LINE_CAP_BYTES);
     }
 
     #[test]
