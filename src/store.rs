@@ -76,6 +76,17 @@ pub struct Store {
     lock_dir: PathBuf,
 }
 
+#[derive(Debug)]
+pub struct SessionBusy;
+
+impl std::fmt::Display for SessionBusy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("session busy")
+    }
+}
+
+impl std::error::Error for SessionBusy {}
+
 const CURRENT_SCHEMA_VERSION: i32 = 2;
 
 fn session_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Session> {
@@ -711,20 +722,27 @@ impl Store {
             .truncate(false)
             .open(&lock_path)
             .context("opening session lock file")?;
-        file.try_lock_exclusive()
-            .map_err(|_| anyhow::anyhow!("session busy"))?;
-        Ok(SessionLock { _file: file })
+        match file.try_lock_exclusive() {
+            Ok(()) => Ok(SessionLock { _file: file }),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                Err(anyhow::Error::new(SessionBusy))
+            }
+            Err(error) => Err(error).context("acquiring session lock"),
+        }
     }
 
-    pub fn is_session_busy(&self, session_id: &str) -> bool {
+    pub fn is_session_busy(&self, session_id: &str) -> Result<bool> {
         let lock_path = self.session_lock_path(session_id);
-        if !lock_path.exists() {
-            return false;
-        }
-        let Ok(file) = std::fs::OpenOptions::new().write(true).open(&lock_path) else {
-            return true;
+        let file = match std::fs::OpenOptions::new().write(true).open(&lock_path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(error).context("opening session lock file"),
         };
-        file.try_lock_exclusive().is_err()
+        match file.try_lock_exclusive() {
+            Ok(()) => Ok(false),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => Ok(true),
+            Err(error) => Err(error).context("checking session lock"),
+        }
     }
 
     fn session_lock_path(&self, session_id: &str) -> PathBuf {
@@ -877,6 +895,70 @@ mod tests {
             )
             .unwrap();
         session
+    }
+
+    #[test]
+    #[ignore = "invoked only by the session-lock subprocess test"]
+    fn session_lock_holder_for_subprocess_test() {
+        let db = std::env::var("MU_STORE_LOCK_TEST_DB").unwrap();
+        let session_id = std::env::var("MU_STORE_LOCK_TEST_SESSION").unwrap();
+        let ready = std::env::var("MU_STORE_LOCK_TEST_READY").unwrap();
+        let store = Store::open(Path::new(&db)).unwrap();
+        let _lock = store.acquire_session_lock(&session_id).unwrap();
+        std::fs::write(ready, "locked").unwrap();
+
+        loop {
+            std::thread::sleep(std::time::Duration::from_secs(1));
+        }
+    }
+
+    #[test]
+    fn session_lock_blocks_other_process_and_releases_after_holder_exits() {
+        let (store, tmp) = temp_store();
+        let session = create_session_with_system(&store);
+        let db = tmp.join("mu.db");
+        let ready = tmp.join("lock-ready");
+        let mut holder = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "store::tests::session_lock_holder_for_subprocess_test",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("MU_STORE_LOCK_TEST_DB", &db)
+            .env("MU_STORE_LOCK_TEST_SESSION", &session.id)
+            .env("MU_STORE_LOCK_TEST_READY", &ready)
+            .spawn()
+            .unwrap();
+
+        let contention = (|| -> Result<()> {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while !ready.exists() {
+                if let Some(status) = holder.try_wait()? {
+                    anyhow::bail!("lock holder exited before becoming ready: {status}");
+                }
+                if std::time::Instant::now() >= deadline {
+                    anyhow::bail!("timed out waiting for lock holder");
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+
+            let contender = Store::open(&db)?;
+            assert!(contender.is_session_busy(&session.id)?);
+            let error = contender.acquire_session_lock(&session.id).unwrap_err();
+            assert!(error.downcast_ref::<SessionBusy>().is_some());
+            Ok(())
+        })();
+
+        let _ = holder.kill();
+        let _ = holder.wait();
+        contention.unwrap();
+
+        let contender = Store::open(&db).unwrap();
+        assert!(!contender.is_session_busy(&session.id).unwrap());
+        let lock = contender.acquire_session_lock(&session.id).unwrap();
+        drop(lock);
+        let _ = std::fs::remove_dir_all(tmp);
     }
 
     #[test]

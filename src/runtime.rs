@@ -164,7 +164,9 @@ pub fn build_status_report(
     let active = resolved
         .attached_session
         .as_ref()
-        .is_some_and(|session| store.is_session_busy(&session.id));
+        .map(|session| store.is_session_busy(&session.id))
+        .transpose()?
+        .unwrap_or(false);
     let clean = resolved
         .attached_session
         .as_ref()

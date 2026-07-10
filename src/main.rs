@@ -136,6 +136,20 @@ fn exit_session_busy(output: cli::OutputFormat) -> ! {
     process::exit(2);
 }
 
+fn acquire_session_lock_or_exit(
+    store: &store::Store,
+    session_id: &str,
+    output: cli::OutputFormat,
+) -> Result<store::SessionLock> {
+    match store.acquire_session_lock(session_id) {
+        Ok(lock) => Ok(lock),
+        Err(error) if error.downcast_ref::<store::SessionBusy>().is_some() => {
+            exit_session_busy(output)
+        }
+        Err(error) => Err(error),
+    }
+}
+
 fn ensure_subagent_turn_allowed(depth: u32) -> Result<()> {
     if depth > MAX_SUBAGENT_TURN_DEPTH {
         bail!("subagent recursion depth exceeded: {depth} (maximum {MAX_SUBAGENT_TURN_DEPTH})");
@@ -343,10 +357,20 @@ async fn run() -> Result<()> {
                 }
                 SessionSub::Archive { session } => {
                     let store = open_store_with_session(&db_path, &session)?;
+                    let _lock = acquire_session_lock_or_exit(
+                        &store,
+                        &session,
+                        cli::OutputFormat::Terminal,
+                    )?;
                     store.set_session_archived(&session, true)?;
                 }
                 SessionSub::Unarchive { session } => {
                     let store = open_store_with_session(&db_path, &session)?;
+                    let _lock = acquire_session_lock_or_exit(
+                        &store,
+                        &session,
+                        cli::OutputFormat::Terminal,
+                    )?;
                     store.set_session_archived(&session, false)?;
                 }
             }
@@ -405,10 +429,7 @@ async fn run() -> Result<()> {
             let store = store::Store::open(&db_path)?;
             let session = resolve_retry_session(&store, &retry_args)?
                 .ok_or_else(|| anyhow::anyhow!("no sessions found in active scope"))?;
-            let _lock = match store.acquire_session_lock(&session.id) {
-                Ok(lock) => lock,
-                Err(_) => exit_session_busy(retry_args.output),
-            };
+            let _lock = acquire_session_lock_or_exit(&store, &session.id, retry_args.output)?;
 
             // Nothing to resume on a session whose last turn already finished.
             if store.is_session_clean(&session.id)? {
@@ -458,13 +479,8 @@ async fn run() -> Result<()> {
                 model: models::resolve_model_ref(&config, &session_state.model)?,
             };
             let provider = build_provider(&config, &request.model.provider_id)?;
-            let _lock = match store.acquire_session_lock(&session) {
-                Ok(lock) => lock,
-                Err(_) => {
-                    eprintln!("session busy");
-                    process::exit(2);
-                }
-            };
+            let _lock =
+                acquire_session_lock_or_exit(&store, &session, cli::OutputFormat::Terminal)?;
             compaction::run_compaction(&store, &config, &session, &request, provider.as_ref())
                 .await?;
             eprintln!("compacted session {session}");
@@ -529,10 +545,7 @@ async fn run_turn_from_source(
     };
     let session_id = session.id.clone();
 
-    let _lock = match store.acquire_session_lock(&session_id) {
-        Ok(lock) => lock,
-        Err(_) => exit_session_busy(turn.output),
-    };
+    let _lock = acquire_session_lock_or_exit(&store, &session_id, turn.output)?;
 
     // If the previous turn was interrupted, normalize its tail (synthesize
     // interrupted results for any dangling tool calls) so history is valid.
