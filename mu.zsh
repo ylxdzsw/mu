@@ -781,6 +781,16 @@ _mu_zsh_clear_prompt() {
   CURSOR=0
 }
 
+_mu_zsh_insert_newline() {
+  [[ "$MU_ZSH_MODE" == mu ]] || {
+    zle self-insert
+    return
+  }
+
+  BUFFER="${BUFFER[1,CURSOR]}"$'\n'"${BUFFER[CURSOR+1,-1]}"
+  (( CURSOR += 1 ))
+}
+
 _mu_zsh_submit_prompt() {
   local prompt=$1
   local exit_status
@@ -896,7 +906,9 @@ _mu_zsh_accept() {
   zle -I
   _mu_zsh_clear_prompt
   MU_ZSH_OUTPUT_SEPARATOR_PENDING=1
-  if [[ "$prompt" == /* ]]; then
+  # A multiline draft is always a normal prompt. This keeps a leading slash in
+  # prose or examples from dispatching a shell-side slash command.
+  if [[ "$prompt" == /* && "$prompt" != *$'\n'* ]]; then
     command=${prompt%%[[:space:]]*}
     if _mu_zsh_is_known_slash_command "$command"; then
       _mu_zsh_run_slash_command "$prompt"
@@ -930,6 +942,7 @@ mu-zsh-exit-mode() {
 _mu_zsh_configure_keymap() {
   bindkey -M mumode '^M' _mu_zsh_accept
   bindkey -M mumode '^J' _mu_zsh_accept
+  bindkey -M mumode $'\e[13;2u' _mu_zsh_insert_newline
   bindkey -M mumode '^I' _mu_zsh_tab
   bindkey -M mumode '/' _mu_zsh_slash
   bindkey -M mumode $'\e[A' up-line
@@ -955,6 +968,7 @@ if [[ -o zle ]]; then
   zle -N _mu_zsh_tab
   zle -N _mu_zsh_slash
   zle -N _mu_zsh_accept
+  zle -N _mu_zsh_insert_newline
   zle -N _mu_zsh_backspace
   zle -N _mu_zsh_delete_char
   zle -N _mu_zsh_interrupt

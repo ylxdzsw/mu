@@ -604,8 +604,8 @@ Consequences:
   suspended. Common ZLE helpers such as syntax highlighting and autosuggestions
   may be disabled automatically; additional plugin toggles may be attached with
   mode enter/exit hooks.
-- Ctrl-D is the normal terminal EOT key (`^D`). xterm-style terminals, including
-  WebTerm's xterm.js input path, forward it as input when the browser or OS has
+- Ctrl-D is the normal terminal EOT key (`^D`). xterm-style and browser-terminal
+  input paths forward it as input when the browser or OS has
   not intercepted the key before the terminal receives it.
 
 ### 6.3 Context boundaries

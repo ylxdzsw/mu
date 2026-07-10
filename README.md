@@ -49,12 +49,16 @@ prompt. Backspace always deletes. Ctrl-D keeps normal shell EOF behavior even in
 the current `mu>` buffer and never browse shell history; leave `mu>` mode first
 if you want normal shell history navigation.
 
+Shift+Enter inserts a newline without submitting when the terminal sends the
+CSI-u Shift+Enter sequence (`Esc [ 13 ; 2 u`). Terminal emulators may need to
+be configured to send it; if they emit ordinary Enter instead, zsh cannot
+distinguish Shift+Enter from Enter.
+
 The plugin owns only zsh line editing and prompt mode. Each submission still
 spawns the `mu` binary for one foreground turn, so streaming output, Ctrl-C, and
 session persistence follow the same command-line path as scripted use.
-Ctrl-D is handled as the normal terminal EOT key (`^D`); browser terminals such
-as xterm.js/WebTerm forward it as input when the browser has not intercepted the
-key first.
+Ctrl-D is handled as the normal terminal EOT key (`^D`); browser terminals
+forward it as input when the browser has not intercepted the key first.
 
 To keep using an existing session in zsh mode, set `MU_ZSH_SESSION_ID=<id>`
 before entering `mu>` mode.

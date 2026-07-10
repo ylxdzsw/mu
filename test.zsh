@@ -147,6 +147,13 @@ _mu_zsh_clear_prompt
 [[ "$BUFFER" == "" ]] || fail "clears prompt buffer"
 [[ "$CURSOR" -eq 0 ]] || fail "resets prompt cursor"
 
+MU_ZSH_MODE=mu
+BUFFER="first second"
+CURSOR=5
+_mu_zsh_insert_newline
+[[ "$BUFFER" == $'first\n second' ]] || fail "Shift+Enter inserts a newline at the cursor"
+[[ "$CURSOR" -eq 6 ]] || fail "Shift+Enter advances the cursor past the newline"
+
 BUFFER="draft prompt"
 CURSOR=${#BUFFER}
 PROMPT="%# "
@@ -518,6 +525,22 @@ cmp -- "$interactive_expected_stdin" "$interactive_capture_stdin" || fail "inter
 interactive_args=("${(@f)$(<"$interactive_capture_args")}")
 expected_interactive_args=(--output terminal)
 [[ "${(j:\0:)interactive_args}" == "${(j:\0:)expected_interactive_args}" ]] || fail "unexpected interactive args: ${interactive_args[*]}"
+
+shift_enter_transcript=$tmpdir/shift-enter-transcript
+rm -f -- "$interactive_capture_args" "$interactive_capture_stdin" "$interactive_capture_calls"
+interactive_status=0
+{
+  print -r -- "$interactive_setup"
+  sleep 0.2
+  print -rn -- $'\t'"first line"$'\e[13;2u'"second line"$'\r'
+  sleep 0.4
+  print -rn -- $'\x04'
+} | timeout 5 script -qfec 'TERM=xterm-256color zsh -df' "$shift_enter_transcript" >/dev/null || interactive_status=$?
+(( interactive_status == 0 )) || fail "Shift+Enter transcript exited with status $interactive_status"
+[[ $(<"$interactive_capture_calls") == x ]] || fail "Shift+Enter should not submit before Enter"
+shift_enter_expected_stdin=$tmpdir/shift-enter-expected-stdin
+print -rn -- 'first line'$'\n''second line'$'\n' > "$shift_enter_expected_stdin"
+cmp -- "$shift_enter_expected_stdin" "$interactive_capture_stdin" || fail "Shift+Enter draft should be passed as one multiline prompt"
 
 plain_transcript=$tmpdir/plain-transcript
 plain_setup="$interactive_setup; MU_ZSH_OUTPUT=plain"
