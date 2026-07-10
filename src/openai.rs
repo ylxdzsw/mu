@@ -31,8 +31,11 @@ impl OpenAiProvider {
 
 #[derive(Debug, Deserialize)]
 struct ChunkResponse {
+    #[serde(default)]
     choices: Vec<ChunkChoice>,
     usage: Option<UsageJson>,
+    #[serde(default)]
+    error: Option<Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -278,6 +281,13 @@ fn consume_sse_buffer(
             let parsed: ChunkResponse =
                 serde_json::from_str(data).map_err(|e| ProviderError::SseParse(e.to_string()))?;
 
+            if let Some(error) = parsed.error {
+                return Err(ProviderError::Other(format!(
+                    "stream error: {}",
+                    stream_error_message(&error)
+                )));
+            }
+
             if let Some(u) = parsed.usage {
                 state.usage = Some(Usage {
                     input_tokens: u.prompt_tokens,
@@ -320,21 +330,28 @@ fn consume_sse_buffer(
                             .tool_accum
                             .entry(tc.index)
                             .or_insert_with(|| (None, None, String::new(), "function".into()));
-                        if let Some(ref id) = tc.id {
-                            entry.0 = Some(id.clone());
+                        if let Some(id) = tc.id.as_deref().filter(|id| !id.is_empty()) {
+                            entry.0 = Some(id.to_string());
                         }
-                        if let Some(ref t) = tc.call_type {
-                            entry.3 = t.clone();
+                        if let Some(call_type) =
+                            tc.call_type.as_deref().filter(|kind| !kind.is_empty())
+                        {
+                            entry.3 = call_type.to_string();
                         }
                         if let Some(ref f) = tc.function {
-                            if let Some(ref name) = f.name {
-                                entry.1 = Some(name.clone());
+                            if let Some(name) = f.name.as_deref().filter(|name| !name.is_empty()) {
+                                entry.1 = Some(name.to_string());
                             }
                             if let Some(ref args) = f.arguments {
                                 entry.2.push_str(args);
                             }
                         }
-                        let name = tc.function.as_ref().and_then(|f| f.name.clone());
+                        let name = tc
+                            .function
+                            .as_ref()
+                            .and_then(|f| f.name.as_deref())
+                            .filter(|name| !name.is_empty())
+                            .map(str::to_owned);
                         let arguments_delta = tc
                             .function
                             .as_ref()
@@ -361,6 +378,14 @@ fn consume_sse_buffer(
     }
 
     Ok(())
+}
+
+fn stream_error_message(error: &Value) -> String {
+    error
+        .get("message")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .unwrap_or_else(|| error.to_string())
 }
 
 /// Classify an error response as a context-length overflow.
@@ -510,7 +535,7 @@ mod tests {
         for chunk in [
             "data: {\"choices\":[{\"delta\":{\"content\":\"hel\"},\"finish_reason\":null}]}\n\n",
             "data: {\"choices\":[{\"delta\":{\"content\":\"lo\",\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"bash\",\"arguments\":\"{\\\"title\\\":\\\"Inspect\\\",\\\"risk\\\":\\\"readonly\\\",\\\"command\\\":\"}}]},\"finish_reason\":null}]}\n\n",
-            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"\\\"pwd\\\"}\"}}]},\"finish_reason\":\"tool_calls\"}],\"usage\":{\"prompt_tokens\":12,\"completion_tokens\":5,\"total_tokens\":17,\"prompt_tokens_details\":{\"cached_tokens\":3,\"cache_creation_tokens\":2},\"completion_tokens_details\":{\"reasoning_tokens\":4}}}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"name\":\"\",\"arguments\":\"\\\"pwd\\\"}\"}}]},\"finish_reason\":\"tool_calls\"}],\"usage\":{\"prompt_tokens\":12,\"completion_tokens\":5,\"total_tokens\":17,\"prompt_tokens_details\":{\"cached_tokens\":3,\"cache_creation_tokens\":2},\"completion_tokens_details\":{\"reasoning_tokens\":4}}}\n\n",
             "data: [DONE]\n\n",
         ] {
             buffer.push_str(chunk);
@@ -526,10 +551,86 @@ mod tests {
             tool_call_deltas[0].arguments_delta,
             "{\"title\":\"Inspect\",\"risk\":\"readonly\",\"command\":"
         );
+        assert!(tool_call_deltas[1].name.is_none());
         assert_eq!(tool_call_deltas[1].arguments_delta, "\"pwd\"}");
+        assert_eq!(state.tool_accum.get(&0).unwrap().1.as_deref(), Some("bash"));
         assert_eq!(state.content, "hello");
         assert_eq!(state.finish_reason, FinishReason::ToolCalls);
         assert_eq!(state.usage.unwrap().total_tokens, 17);
+    }
+
+    #[test]
+    fn accepts_standard_usage_chunk_with_empty_choices() {
+        let mut on_event = |_event: StreamEvent| -> Result<(), ProviderError> { Ok(()) };
+        let mut buffer = concat!(
+            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":12,\"completion_tokens\":5,\"total_tokens\":17}}\n\n",
+            "data: [DONE]\n\n",
+        )
+        .to_string();
+        let mut state = StreamParseState::default();
+
+        consume_sse_buffer(&mut buffer, &mut state, &mut on_event).unwrap();
+
+        let usage = state.usage.unwrap();
+        assert_eq!(usage.input_tokens, 12);
+        assert_eq!(usage.output_tokens, 5);
+        assert_eq!(usage.total_tokens, 17);
+    }
+
+    #[test]
+    fn ignores_metadata_chunk_without_choices() {
+        let mut on_event = |_event: StreamEvent| -> Result<(), ProviderError> { Ok(()) };
+        let mut buffer = concat!(
+            "data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"gpt-5.4-mini\"}\n\n",
+            "data: [DONE]\n\n",
+        )
+        .to_string();
+        let mut state = StreamParseState::default();
+
+        consume_sse_buffer(&mut buffer, &mut state, &mut on_event).unwrap();
+
+        assert!(state.content.is_empty());
+        assert!(state.tool_accum.is_empty());
+        assert!(state.usage.is_none());
+    }
+
+    #[test]
+    fn reports_in_stream_error_payload() {
+        let mut on_event = |_event: StreamEvent| -> Result<(), ProviderError> { Ok(()) };
+        let mut buffer =
+            "data: {\"error\":{\"message\":\"upstream unavailable\",\"type\":\"server_error\"}}\n\n"
+                .to_string();
+        let mut state = StreamParseState::default();
+
+        let error = consume_sse_buffer(&mut buffer, &mut state, &mut on_event).unwrap_err();
+
+        assert!(matches!(
+            error,
+            ProviderError::Other(message) if message == "stream error: upstream unavailable"
+        ));
+    }
+
+    #[test]
+    fn preserves_done_marker_in_model_content() {
+        let mut seen = String::new();
+        let mut on_event = |event: StreamEvent| -> Result<(), ProviderError> {
+            if let StreamEvent::TextDelta(delta) = event {
+                seen.push_str(&delta);
+            }
+            Ok(())
+        };
+        let mut buffer = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"[DONE]\"},\"finish_reason\":\"stop\"}]}\n\n",
+            "data: [DONE]\n\n",
+        )
+        .to_string();
+        let mut state = StreamParseState::default();
+
+        consume_sse_buffer(&mut buffer, &mut state, &mut on_event).unwrap();
+
+        assert_eq!(seen, "[DONE]");
+        assert_eq!(state.content, "[DONE]");
+        assert_eq!(state.finish_reason, FinishReason::Stop);
     }
 
     #[test]
