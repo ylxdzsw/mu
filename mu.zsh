@@ -19,6 +19,7 @@ typeset -g MU_ZSH_BIN=${MU_ZSH_BIN:-mu}
 typeset -g MU_ZSH_OUTPUT=${MU_ZSH_OUTPUT:-terminal}
 typeset -g MU_ZSH_PROMPT_INPUT=${MU_ZSH_PROMPT_INPUT:-${MU_ZSH_PROMPT:-'mu> '}}
 typeset -g MU_ZSH_PROMPT=${MU_ZSH_PROMPT:-$MU_ZSH_PROMPT_INPUT}
+typeset -gi MU_ZSH_MODE_PROMPT_ROWS=${MU_ZSH_MODE_PROMPT_ROWS:-2}
 typeset -g MU_ZSH_PROMPT_MODEL_COLOR=${MU_ZSH_PROMPT_MODEL_COLOR:-45}
 typeset -g MU_ZSH_PROMPT_CONTEXT_COLOR=${MU_ZSH_PROMPT_CONTEXT_COLOR:-244}
 typeset -g MU_ZSH_PROMPT_PWD_COLOR=${MU_ZSH_PROMPT_PWD_COLOR:-39}
@@ -363,7 +364,25 @@ _mu_zsh_refresh_prompt() {
 
   mode_prompt=$(_mu_zsh_build_mode_prompt) || mode_prompt=$MU_ZSH_PROMPT_INPUT
   MU_ZSH_PROMPT=$mode_prompt
+  _mu_zsh_set_mode_prompt_rows "$mode_prompt"
   [[ "$MU_ZSH_MODE" == mu ]] && PROMPT=$mode_prompt
+}
+
+_mu_zsh_set_mode_prompt_rows() {
+  local prompt=$1 rendered line width
+  local cols=${COLUMNS:-80}
+  local rows=0
+  local -a lines
+
+  (( cols > 0 )) || cols=80
+  rendered=$(print -P -- "$prompt" | sed $'s/\033\\[[0-?]*[ -\\/]*[@-~]//g')
+  lines=("${(@f)rendered}")
+  (( ${#lines[@]} )) || lines=("")
+  for line in "${lines[@]}"; do
+    width=${#line}
+    (( rows += width > 0 ? (width + cols - 1) / cols : 1 ))
+  done
+  MU_ZSH_MODE_PROMPT_ROWS=$rows
 }
 
 _mu_zsh_disable_editor_plugins() {
@@ -898,13 +917,14 @@ _mu_zsh_accept() {
 
   local prompt=$BUFFER
   local command
+  local prompt_rows=$MU_ZSH_MODE_PROMPT_ROWS
   if [[ -z "${prompt//[[:space:]]/}" ]]; then
     _mu_zsh_redraw_mode_prompt
     return
   fi
 
-  zle -I
   _mu_zsh_clear_prompt
+  zle -I
   MU_ZSH_OUTPUT_SEPARATOR_PENDING=1
   # A multiline draft is always a normal prompt. This keeps a leading slash in
   # prose or examples from dispatching a shell-side slash command.
@@ -918,6 +938,12 @@ _mu_zsh_accept() {
   else
     _mu_zsh_submit_prompt "$prompt"
   fi
+  # `reset-prompt` reclaims the active prompt's screen rows. Reserve those rows
+  # below the child transcript so the redraw cannot overwrite its final block.
+  while (( prompt_rows > 0 )); do
+    print
+    (( prompt_rows -= 1 ))
+  done
   _mu_zsh_reset_mode_prompt
 }
 

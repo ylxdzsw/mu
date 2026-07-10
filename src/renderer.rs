@@ -646,6 +646,9 @@ impl Renderer {
         if !self.stderr_is_terminal {
             return Ok(());
         }
+        if self.has_committed_stdout {
+            self.stderr.write_all(b"\n")?;
+        }
         write!(
             self.stderr,
             "{}\n\n",
@@ -3147,7 +3150,10 @@ mod tests {
         ));
         assert!(normalized.contains("reason is acceptable\nline01\n"));
         assert!(!normalized.contains("reason is acceptable\n\nline01\n"));
-        assert!(normalized.contains("[mu] tokens: 12 in / 5 out  context: 25%\n\nmu> "));
+        assert!(
+            normalized
+                .contains("✓ exit 0 · 250ms\n\n[mu] tokens: 12 in / 5 out  context: 25%\n\nmu> ")
+        );
         assert!(!normalized.contains("[mu] tokens: 12 in / 5 out  context: 25%\n\n\nmu> "));
     }
 

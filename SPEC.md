@@ -482,9 +482,9 @@ human-facing sections. The renderer owns the spacing contract for those blocks.
 - A bash tool block includes its header, streamed preview/output, omission
   marker, and final exit line; those pieces are not separated from each other by
   extra blank lines.
-- At normal turn completion, the renderer leaves exactly one empty line between
-  the final turn output (including the stderr summary line) and the next shell
-  prompt.
+- The turn summary is its own final transcript block. When a turn produced
+  transcript output, it has exactly one empty line before the summary and one
+  empty line between the summary and the next shell prompt.
 
 This contract applies to human-facing `terminal` and `plain` output.
 
