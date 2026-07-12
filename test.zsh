@@ -656,6 +656,7 @@ normalized=$(perl -pe 's/\e\[[0-?]*[ -\/]*[@-~]//g' "$model_switch_transcript" |
 [[ "$normalized" == *$'[mu] next turns in this scope will use openai/gpt\n'* ]] || fail "model slash command should confirm the canonical model"
 after_model_switch=${normalized#*$'[mu] next turns in this scope will use openai/gpt\n'}
 [[ "$after_model_switch" == $'\n'* ]] || fail "model slash command should leave an empty line before the next prompt"
+[[ "$after_model_switch" != $'\n\n'* ]] || fail "model slash command should not leave two empty lines before the next prompt"
 [[ "$after_model_switch" == *$'openai/gpt 25%'* ]] || fail "model slash command should redraw prompt with selected model"
 [[ ! -e "$interactive_capture_calls" || ! -s "$interactive_capture_calls" ]] || fail "model slash command should not submit a prompt"
 
@@ -676,6 +677,7 @@ normalized=$(perl -pe 's/\e\[[0-?]*[ -\/]*[@-~]//g' "$new_session_transcript" | 
 [[ "$normalized" == *$'[mu] next turn will start a new session\n'* ]] || fail "new slash command should confirm the next turn starts fresh"
 after_new_session=${normalized#*$'[mu] next turn will start a new session\n'}
 [[ "$after_new_session" == $'\n'* ]] || fail "new slash command should leave an empty line before the next prompt"
+[[ "$after_new_session" != $'\n\n'* ]] || fail "new slash command should not leave two empty lines before the next prompt"
 [[ "$after_new_session" == *$'prompt-test-model 25%'* ]] || fail "new slash command should redraw prompt"
 [[ ! -e "$interactive_capture_calls" || ! -s "$interactive_capture_calls" ]] || fail "new slash command should not submit a prompt"
 

@@ -882,6 +882,7 @@ impl Default for Renderer {
 #[derive(Default)]
 struct MarkdownStream {
     pending_line: String,
+    pending_block_separator: bool,
     line_stream: Option<LineStreamState>,
     line_prefix: Option<LineStreamPrefix>,
     inline_stream: InlineStream,
@@ -894,6 +895,7 @@ struct MarkdownStream {
 struct FenceState {
     kind: char,
     width: usize,
+    has_content: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -984,6 +986,7 @@ impl MarkdownStream {
         }
         self.flush_table_candidate(&mut out);
         self.flush_table_buffer(&mut out);
+        self.flush_pending_block_separator(&mut out);
         if self.code_fence.take().is_some() {
             out.push(RESET.to_string());
         }
@@ -1021,6 +1024,10 @@ impl MarkdownStream {
             let text = std::mem::take(&mut self.pending_line);
             self.push_line_stream_text(&text, out);
             return;
+        }
+
+        if !self.pending_line.trim().is_empty() {
+            self.flush_pending_block_separator(out);
         }
 
         let Some((state, prefix_len, rendered_prefix)) =
@@ -1092,18 +1099,24 @@ impl MarkdownStream {
             out.push(RESET.to_string());
         }
         if matches!(state, LineStreamState::Heading { .. }) {
-            out.push("\n\n".to_string());
+            out.push("\n".to_string());
+            self.pending_block_separator = true;
         } else {
             out.push("\n".to_string());
         }
     }
 
     fn push_line(&mut self, line: &str, complete: bool, out: &mut Vec<String>) {
+        self.resolve_pending_block_separator(line, out);
         if let Some(fence) = self.code_fence {
             if complete && is_closing_fence(line, fence) {
                 self.code_fence = None;
-                out.push(format!("{RESET}\n"));
+                out.push(RESET.to_string());
+                if !fence.has_content {
+                    out.push("\n".to_string());
+                }
             } else {
+                self.code_fence.as_mut().unwrap().has_content = true;
                 out.push(line.to_string());
             }
             return;
@@ -1157,8 +1170,17 @@ impl MarkdownStream {
             out.push(line.to_string());
             return;
         }
+        if parse_heading_line(line).is_some() {
+            if let Some(rendered) = render_heading_line(line) {
+                out.push(rendered);
+                self.pending_block_separator = true;
+            } else {
+                out.push(line.to_string());
+            }
+            return;
+        }
         if is_single_line_block(line.trim()) {
-            out.push(render_single_line_block(line));
+            out.push(render_markdown(line));
             return;
         }
         if let Some(rendered) = render_list_line(line, complete) {
@@ -1183,6 +1205,23 @@ impl MarkdownStream {
             out.push(render_markdown(&table));
         }
     }
+
+    fn resolve_pending_block_separator(&mut self, line: &str, out: &mut Vec<String>) {
+        if !self.pending_block_separator {
+            return;
+        }
+        self.pending_block_separator = false;
+        if !line.trim().is_empty() {
+            out.push("\n".to_string());
+        }
+    }
+
+    fn flush_pending_block_separator(&mut self, out: &mut Vec<String>) {
+        if self.pending_block_separator {
+            self.pending_block_separator = false;
+            out.push("\n".to_string());
+        }
+    }
 }
 
 fn fence_marker(line: &str) -> Option<FenceState> {
@@ -1194,6 +1233,7 @@ fn fence_marker(line: &str) -> Option<FenceState> {
     (count >= 3).then_some(FenceState {
         kind: first,
         width: count,
+        has_content: false,
     })
 }
 
@@ -1203,7 +1243,10 @@ fn opening_fence(line: &str) -> Option<FenceState> {
     if leading > 3 {
         return None;
     }
-    fence_marker(trimmed.trim_end())
+    fence_marker(trimmed.trim_end()).map(|fence| FenceState {
+        has_content: false,
+        ..fence
+    })
 }
 
 fn is_closing_fence(line: &str, fence: FenceState) -> bool {
@@ -1226,6 +1269,7 @@ fn closing_fence_marker(line: &str) -> Option<FenceState> {
     Some(FenceState {
         kind: first,
         width: count,
+        has_content: false,
     })
 }
 
@@ -1426,20 +1470,16 @@ fn is_single_line_block(line: &str) -> bool {
     heading || rule
 }
 
-fn render_single_line_block(line: &str) -> String {
-    if let Some((level, content)) = parse_heading_line(line) {
-        let Some(rendered) = render_inline_markdown(content) else {
-            return line.to_string();
-        };
-        let mut out = String::new();
-        let mut styles = Vec::new();
-        push_styles(&mut out, &mut styles, heading_styles(level));
-        out.push_str(&rendered);
-        out.push_str(RESET);
-        out.push_str("\n\n");
-        return out;
-    }
-    render_markdown(line)
+fn render_heading_line(line: &str) -> Option<String> {
+    let (level, content) = parse_heading_line(line)?;
+    let rendered = render_inline_markdown(content)?;
+    let mut out = String::new();
+    let mut styles = Vec::new();
+    push_styles(&mut out, &mut styles, heading_styles(level));
+    out.push_str(&rendered);
+    out.push_str(RESET);
+    out.push('\n');
+    Some(out)
 }
 
 fn parse_heading_line(line: &str) -> Option<(HeadingLevel, &str)> {
@@ -2849,9 +2889,9 @@ mod tests {
         let heading_title = stream.push("Title").concat();
         assert!(heading_title.contains(BOLD), "{heading_title:?}");
         assert_eq!(strip_ansi(&heading_title), "Title");
-        assert_eq!(strip_ansi(&stream.push("\n").concat()), "\n\n");
+        assert_eq!(strip_ansi(&stream.push("\n").concat()), "\n");
 
-        assert_eq!(strip_ansi(&stream.push("> quoted").concat()), "│ quoted");
+        assert_eq!(strip_ansi(&stream.push("> quoted").concat()), "\n│ quoted");
         assert_eq!(strip_ansi(&stream.push("\n").concat()), "\n");
     }
 
@@ -2869,8 +2909,33 @@ mod tests {
     fn markdown_stream_renders_heading_closing_hashes_literally() {
         let mut stream = MarkdownStream::default();
 
-        let rendered = stream.push("# title #\n").concat();
+        let rendered = [
+            stream.push("# title #\n").concat(),
+            stream.finish().concat(),
+        ]
+        .concat();
         assert_eq!(strip_ansi(&rendered), "title #\n\n");
+    }
+
+    #[test]
+    fn markdown_stream_keeps_exactly_one_empty_line_after_headings() {
+        let mut stream = MarkdownStream::default();
+
+        let rendered = [
+            stream.push("## Heading\n").concat(),
+            stream.push("\n").concat(),
+            stream.push("body\n").concat(),
+        ]
+        .concat();
+        assert_eq!(strip_ansi(&rendered), "Heading\n\nbody\n");
+
+        let mut no_source_blank = MarkdownStream::default();
+        let rendered = [
+            no_source_blank.push("## Heading\n").concat(),
+            no_source_blank.push("body\n").concat(),
+        ]
+        .concat();
+        assert_eq!(strip_ansi(&rendered), "Heading\n\nbody\n");
     }
 
     #[test]
@@ -2883,8 +2948,23 @@ mod tests {
         let body = stream.push("echo hi\n").concat();
         assert_eq!(strip_ansi(&body), "echo hi\n");
         let close = stream.push("```\n").concat();
-        assert_eq!(strip_ansi(&close), "\n");
+        assert_eq!(strip_ansi(&close), "");
         assert!(!close.contains("```"), "{close:?}");
+    }
+
+    #[test]
+    fn markdown_stream_keeps_exactly_one_empty_line_after_fenced_code() {
+        let mut stream = MarkdownStream::default();
+
+        let rendered = [
+            stream.push("```sh\n").concat(),
+            stream.push("echo hi\n").concat(),
+            stream.push("```\n").concat(),
+            stream.push("\n").concat(),
+            stream.push("body\n").concat(),
+        ]
+        .concat();
+        assert_eq!(strip_ansi(&rendered), "echo hi\n\nbody\n");
     }
 
     #[test]
