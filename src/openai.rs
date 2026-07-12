@@ -13,18 +13,33 @@ use crate::provider::{
     ToolCall, ToolCallDelta as ProviderToolCallDelta, Usage,
 };
 
+/// Bound the connect phase so a dead host fails fast instead of hanging the turn.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+/// Maximum gap between received stream bytes before the connection is treated as
+/// black-holed. This is an inter-chunk idle bound, not a total-turn bound: a
+/// model can legitimately reason silently for a long time, and GPT-5.x pauses
+/// generation for several seconds mid-stream while safety classifiers run, so
+/// the window is deliberately generous and only trips on true silence.
+const DEFAULT_STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(600);
+
 pub struct OpenAiProvider {
     client: Client,
     base_url: String,
     api_key: Option<String>,
+    idle_timeout: Duration,
 }
 
 impl OpenAiProvider {
     pub fn new(base_url: String, api_key: Option<String>) -> Self {
+        let client = Client::builder()
+            .connect_timeout(CONNECT_TIMEOUT)
+            .build()
+            .unwrap_or_else(|_| Client::new());
         Self {
-            client: Client::new(),
+            client,
             base_url: base_url.trim_end_matches('/').to_string(),
             api_key,
+            idle_timeout: DEFAULT_STREAM_IDLE_TIMEOUT,
         }
     }
 }
@@ -157,14 +172,22 @@ impl Provider for OpenAiProvider {
 
         let mut buffer = String::new();
         let mut byte_buf: Vec<u8> = Vec::new();
+        let mut last_activity = std::time::Instant::now();
         let mut tick = time::interval(Duration::from_millis(250));
         tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
         loop {
             let chunk = tokio::select! {
                 chunk = response.chunk() => {
+                    last_activity = std::time::Instant::now();
                     chunk.map_err(|e| ProviderError::Transport(e.to_string()))?
                 }
                 _ = tick.tick() => {
+                    if last_activity.elapsed() > self.idle_timeout {
+                        return Err(ProviderError::Transport(format!(
+                            "stream idle for over {}s",
+                            self.idle_timeout.as_secs()
+                        )));
+                    }
                     on_event(StreamEvent::Tick)?;
                     continue;
                 }
@@ -821,5 +844,64 @@ mod tests {
         ));
         // 401 auth failure.
         assert!(!is_context_length_error(401, "invalid api key"));
+    }
+
+    #[tokio::test]
+    async fn stalled_stream_trips_idle_timeout() {
+        use tokio::io::AsyncWriteExt;
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        // Server: accept, send a valid SSE prelude and one partial chunk, then
+        // hold the socket open forever without sending the boundary or [DONE].
+        // The response is close-delimited (no Content-Length / chunked framing),
+        // so reqwest keeps reading until EOF — which never comes, modeling a
+        // black-holed connection.
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 1024];
+            // Read at least the request line/headers so the client finishes
+            // sending before we respond.
+            let _ = tokio::io::AsyncReadExt::read(&mut socket, &mut request).await;
+            socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\n\
+                      Content-Type: text/event-stream\r\n\
+                      Connection: close\r\n\r\n\
+                      data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n",
+                )
+                .await
+                .unwrap();
+            socket.flush().await.unwrap();
+            // Stall: never send more bytes and never close. The client observes
+            // silence rather than EOF.
+            tokio::time::sleep(Duration::from_secs(30)).await;
+        });
+
+        let mut provider =
+            OpenAiProvider::new(format!("http://{addr}"), None);
+        provider.idle_timeout = Duration::from_millis(200);
+
+        let request = RequestOptions {
+            model: test_model(None),
+        };
+        let mut on_event = |_event: StreamEvent| -> Result<(), ProviderError> { Ok(()) };
+        let result = provider
+            .stream_chat(&request, &[], &[], &mut on_event)
+            .await;
+
+        server.abort();
+
+        match result {
+            Err(ProviderError::Transport(message)) => {
+                assert!(
+                    message.contains("idle"),
+                    "unexpected transport error: {message}"
+                );
+            }
+            other => panic!("expected transport idle-timeout error, got {other:?}"),
+        }
     }
 }

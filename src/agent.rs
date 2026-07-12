@@ -22,6 +22,11 @@ use bash::RunningBash;
 
 pub struct TurnResult {
     pub usage: Usage,
+    /// Total tokens reported by the *last* model call of the turn — i.e. the
+    /// current context size. Distinct from `usage.total_tokens`, which is
+    /// cumulative across every call in the turn. Drives the context-fullness
+    /// gauge and `session.last_total_tokens`.
+    pub context_tokens: u64,
     pub final_assistant: Option<String>,
 }
 
@@ -100,6 +105,7 @@ impl<'a> AgentLoop<'a> {
         let max_iter = self.config.limits.max_iterations;
 
         let mut total_usage = Usage::default();
+        let mut context_tokens = 0;
         let mut overflow_retries: u32 = 0;
         let mut live_provider_retries: u32 = 0;
         let mut proactive_compaction_exhausted = false;
@@ -220,7 +226,8 @@ impl<'a> AgentLoop<'a> {
                 }
                 total_usage.output_tokens += u.output_tokens;
                 total_usage.reasoning_output_tokens += u.reasoning_output_tokens;
-                total_usage.total_tokens = u.total_tokens;
+                total_usage.total_tokens += u.total_tokens;
+                context_tokens = u.total_tokens;
             }
 
             let msg_id = self
@@ -446,6 +453,9 @@ impl<'a> AgentLoop<'a> {
                     }
                 }
                 FinishReason::Other(reason) => {
+                    if let Message::Assistant { content, .. } = &stream_result.message {
+                        final_assistant = content.clone();
+                    }
                     self.renderer
                         .notice(&format!("[mu] stopped: finish_reason={reason}"))?;
                     break;
@@ -461,6 +471,7 @@ impl<'a> AgentLoop<'a> {
 
         Ok(TurnResult {
             usage: total_usage,
+            context_tokens,
             final_assistant,
         })
     }
@@ -1964,6 +1975,203 @@ mod tests {
                 ..
             }) if content == "done"
         ));
+
+        let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    /// Two model calls in one turn: a `readonly` bash call, then a stop. Each
+    /// call reports its own `total_tokens` so the test can distinguish the
+    /// cumulative turn total from the last-call context size.
+    struct TwoCallUsageProvider {
+        step: Mutex<usize>,
+    }
+
+    #[async_trait(?Send)]
+    impl Provider for TwoCallUsageProvider {
+        async fn stream_chat(
+            &self,
+            _request: &RequestOptions,
+            _messages: &[Message],
+            _tools: &[Value],
+            _on_event: &mut dyn FnMut(crate::provider::StreamEvent) -> Result<(), ProviderError>,
+        ) -> Result<StreamResult, ProviderError> {
+            let mut step = self.step.lock().unwrap();
+            let current = *step;
+            *step += 1;
+            match current {
+                0 => Ok(StreamResult {
+                    message: Message::Assistant {
+                        content: None,
+                        reasoning_content: None,
+                        tool_calls: Some(vec![ToolCall {
+                            id: "call_readonly".into(),
+                            call_type: "function".into(),
+                            function: crate::provider::FunctionCall {
+                                name: "bash".into(),
+                                arguments: serde_json::json!({
+                                    "title": "noop",
+                                    "risk": "readonly",
+                                    "command": "true",
+                                })
+                                .to_string(),
+                            },
+                        }]),
+                    },
+                    finish_reason: FinishReason::ToolCalls,
+                    usage: Some(Usage {
+                        input_tokens: 100,
+                        output_tokens: 20,
+                        total_tokens: 120,
+                        ..Usage::default()
+                    }),
+                }),
+                _ => Ok(StreamResult {
+                    message: Message::Assistant {
+                        content: Some("done".into()),
+                        reasoning_content: None,
+                        tool_calls: None,
+                    },
+                    finish_reason: FinishReason::Stop,
+                    usage: Some(Usage {
+                        input_tokens: 130,
+                        output_tokens: 10,
+                        total_tokens: 140,
+                        ..Usage::default()
+                    }),
+                }),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn turn_usage_is_cumulative_but_context_tokens_is_last_call() {
+        let tmp = std::env::temp_dir().join(format!("mu-agent-usage-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let store = Store::open(&tmp.join("mu.db")).unwrap();
+        let session = store.create_session("/tmp", "test/fake-model").unwrap();
+        let config = test_config();
+        let request_model = crate::models::resolve_model_ref(&config, "test/fake-model").unwrap();
+        store
+            .append_message(
+                &session.id,
+                &Message::System {
+                    content: "system".into(),
+                },
+            )
+            .unwrap();
+        store
+            .append_message(
+                &session.id,
+                &Message::User {
+                    content: UserContent::Text("go".into()),
+                },
+            )
+            .unwrap();
+        let provider = Arc::new(TwoCallUsageProvider {
+            step: Mutex::new(0),
+        });
+        let mut renderer = Renderer::with_format(OutputFormat::Plain);
+        let mut agent = AgentLoop {
+            config: &config,
+            provider,
+            store: &store,
+            session_id: &session.id,
+            request: RequestOptions {
+                model: request_model,
+            },
+            model_context_window: None,
+            renderer: &mut renderer,
+            state_dir: &tmp,
+        };
+
+        let result = agent.run_turn().await.unwrap();
+
+        // input/output are summed across both calls; total_tokens is now also
+        // cumulative and therefore self-consistent (>= input_tokens).
+        assert_eq!(result.usage.input_tokens, 230);
+        assert_eq!(result.usage.output_tokens, 30);
+        assert_eq!(result.usage.total_tokens, 260);
+        assert!(result.usage.total_tokens >= result.usage.input_tokens);
+        // context_tokens reflects only the final call — the current context size.
+        assert_eq!(result.context_tokens, 140);
+
+        let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    /// A single model call that ends on a non-`stop`, non-`tool_calls` finish
+    /// reason (e.g. `length`) while still carrying assistant content.
+    struct LengthFinishProvider;
+
+    #[async_trait(?Send)]
+    impl Provider for LengthFinishProvider {
+        async fn stream_chat(
+            &self,
+            _request: &RequestOptions,
+            _messages: &[Message],
+            _tools: &[Value],
+            _on_event: &mut dyn FnMut(crate::provider::StreamEvent) -> Result<(), ProviderError>,
+        ) -> Result<StreamResult, ProviderError> {
+            Ok(StreamResult {
+                message: Message::Assistant {
+                    content: Some("partial answer".into()),
+                    reasoning_content: None,
+                    tool_calls: None,
+                },
+                finish_reason: FinishReason::Other("length".into()),
+                usage: Some(Usage {
+                    input_tokens: 5,
+                    output_tokens: 3,
+                    total_tokens: 8,
+                    ..Usage::default()
+                }),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn captures_final_assistant_on_non_stop_finish() {
+        let tmp = std::env::temp_dir().join(format!("mu-agent-length-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let store = Store::open(&tmp.join("mu.db")).unwrap();
+        let session = store.create_session("/tmp", "test/fake-model").unwrap();
+        let config = test_config();
+        let request_model = crate::models::resolve_model_ref(&config, "test/fake-model").unwrap();
+        store
+            .append_message(
+                &session.id,
+                &Message::System {
+                    content: "system".into(),
+                },
+            )
+            .unwrap();
+        store
+            .append_message(
+                &session.id,
+                &Message::User {
+                    content: UserContent::Text("write a lot".into()),
+                },
+            )
+            .unwrap();
+        let provider = Arc::new(LengthFinishProvider);
+        let mut renderer = Renderer::with_format(OutputFormat::Plain);
+        let mut agent = AgentLoop {
+            config: &config,
+            provider,
+            store: &store,
+            session_id: &session.id,
+            request: RequestOptions {
+                model: request_model,
+            },
+            model_context_window: None,
+            renderer: &mut renderer,
+            state_dir: &tmp,
+        };
+
+        let result = agent.run_turn().await.unwrap();
+
+        // A `length` finish still surfaces the streamed assistant text to
+        // `--output final`, rather than emitting nothing.
+        assert_eq!(result.final_assistant.as_deref(), Some("partial answer"));
 
         let _ = std::fs::remove_dir_all(tmp);
     }

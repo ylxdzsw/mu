@@ -323,6 +323,7 @@ impl Store {
         &self,
         id: &str,
         usage: &Usage,
+        context_tokens: u64,
         title: Option<&str>,
         model: &str,
     ) -> Result<()> {
@@ -332,13 +333,13 @@ impl Store {
             tx.execute(
                 "UPDATE session SET updated_at = ?1, last_total_tokens = ?2,
                  title = COALESCE(title, ?3), model = ?4 WHERE id = ?5",
-                params![now, usage.total_tokens as i64, t, model, id],
+                params![now, context_tokens as i64, t, model, id],
             )?;
         } else {
             tx.execute(
                 "UPDATE session SET updated_at = ?1, last_total_tokens = ?2,
                  model = ?3 WHERE id = ?4",
-                params![now, usage.total_tokens as i64, model, id],
+                params![now, context_tokens as i64, model, id],
             )?;
         }
         tx.execute(

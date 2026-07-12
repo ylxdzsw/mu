@@ -742,8 +742,14 @@ async fn run_turn(args: RunTurnArgs<'_>) -> Result<()> {
     match &result {
         Ok(r) => {
             let ctx_pct =
-                model_context_window.map(|cw| (r.usage.total_tokens as f64 / cw as f64) * 100.0);
-            store.update_session(session_id, &r.usage, title, &request.model.canonical)?;
+                model_context_window.map(|cw| (r.context_tokens as f64 / cw as f64) * 100.0);
+            store.update_session(
+                session_id,
+                &r.usage,
+                r.context_tokens,
+                title,
+                &request.model.canonical,
+            )?;
             renderer.finish_turn()?;
             if output == cli::OutputFormat::Final {
                 write_final_stdout(r.final_assistant.as_deref())?;
