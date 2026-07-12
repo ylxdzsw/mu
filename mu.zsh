@@ -19,7 +19,10 @@ typeset -g MU_ZSH_BIN=${MU_ZSH_BIN:-mu}
 typeset -g MU_ZSH_OUTPUT=${MU_ZSH_OUTPUT:-terminal}
 typeset -g MU_ZSH_PROMPT_INPUT=${MU_ZSH_PROMPT_INPUT:-${MU_ZSH_PROMPT:-'mu> '}}
 typeset -g MU_ZSH_PROMPT=${MU_ZSH_PROMPT:-$MU_ZSH_PROMPT_INPUT}
-typeset -gi MU_ZSH_MODE_PROMPT_ROWS=${MU_ZSH_MODE_PROMPT_ROWS:-2}
+typeset -g MU_ZSH_PENDING_INPUT=
+typeset -g MU_ZSH_PENDING_PROMPT=
+typeset -gi MU_ZSH_PENDING_SUBMIT=0
+typeset -gi MU_ZSH_RESTORE_PROMPT_SP=0
 typeset -g MU_ZSH_PROMPT_MODEL_COLOR=${MU_ZSH_PROMPT_MODEL_COLOR:-45}
 typeset -g MU_ZSH_PROMPT_CONTEXT_COLOR=${MU_ZSH_PROMPT_CONTEXT_COLOR:-244}
 typeset -g MU_ZSH_PROMPT_PWD_COLOR=${MU_ZSH_PROMPT_PWD_COLOR:-39}
@@ -204,12 +207,12 @@ _mu_zsh_remember_session_for_scope() {
 }
 
 _mu_zsh_record_history() {
-  local prompt=$1
+  local input=$1
   local scope=${2:-}
   local quoted
   local session_id
   local model
-  quoted=$(_mu_zsh_quote_prompt "$prompt")
+  quoted=$(_mu_zsh_quote_prompt "$input")
   _mu_zsh_sync_state "$scope"
   session_id=$MU_ZSH_EFFECTIVE_SESSION_ID
   model=$MU_ZSH_EFFECTIVE_MODEL
@@ -364,25 +367,7 @@ _mu_zsh_refresh_prompt() {
 
   mode_prompt=$(_mu_zsh_build_mode_prompt) || mode_prompt=$MU_ZSH_PROMPT_INPUT
   MU_ZSH_PROMPT=$mode_prompt
-  _mu_zsh_set_mode_prompt_rows "$mode_prompt"
   [[ "$MU_ZSH_MODE" == mu ]] && PROMPT=$mode_prompt
-}
-
-_mu_zsh_set_mode_prompt_rows() {
-  local prompt=$1 rendered line width
-  local cols=${COLUMNS:-80}
-  local rows=0
-  local -a lines
-
-  (( cols > 0 )) || cols=80
-  rendered=$(print -P -- "$prompt" | sed $'s/\033\\[[0-?]*[ -\\/]*[@-~]//g')
-  lines=("${(@f)rendered}")
-  (( ${#lines[@]} )) || lines=("")
-  for line in "${lines[@]}"; do
-    width=${#line}
-    (( rows += width > 0 ? (width + cols - 1) / cols : 1 ))
-  done
-  MU_ZSH_MODE_PROMPT_ROWS=$rows
 }
 
 _mu_zsh_disable_editor_plugins() {
@@ -839,7 +824,7 @@ _mu_zsh_insert_newline() {
 }
 
 _mu_zsh_submit_prompt() {
-  local prompt=$1
+  local input=$1
   local exit_status
   local scope session_id
   local -a command
@@ -847,19 +832,19 @@ _mu_zsh_submit_prompt() {
   scope=$(_mu_zsh_current_scope_key)
   _mu_zsh_forget_state_outside_scope "$scope"
 
-  _mu_zsh_record_history "$prompt" "$scope"
+  _mu_zsh_record_history "$input" "$scope"
   _mu_zsh_base_command_reply "$scope"
   session_id=$MU_ZSH_EFFECTIVE_SESSION_ID
   command=("${MU_ZSH_COMMAND_REPLY[@]}")
 
   if [[ -n "$session_id" ]]; then
     _mu_zsh_print_output_separator_if_pending
-    "${command[@]}" <<< "$prompt"
+    "${command[@]}" <<< "$input"
     exit_status=$?
   else
     rm -f -- "$MU_ZSH_SESSION_FILE" 2>/dev/null || true
     _mu_zsh_print_output_separator_if_pending
-    MU_SESSION_FILE=$MU_ZSH_SESSION_FILE "${command[@]}" <<< "$prompt"
+    MU_SESSION_FILE=$MU_ZSH_SESSION_FILE "${command[@]}" <<< "$input"
     exit_status=$?
     _mu_zsh_read_session_file "$scope"
   fi
@@ -925,28 +910,50 @@ _mu_zsh_accept() {
     return
   fi
 
-  local prompt=$BUFFER
-  local prompt_rows=$MU_ZSH_MODE_PROMPT_ROWS
-  if [[ -z "${prompt//[[:space:]]/}" ]]; then
+  local input=$BUFFER
+  if [[ -z "${input//[[:space:]]/}" ]]; then
     _mu_zsh_redraw_mode_prompt
     return
   fi
 
-  _mu_zsh_clear_prompt
+  MU_ZSH_PENDING_INPUT=$input
+  MU_ZSH_PENDING_PROMPT=$PROMPT
+  MU_ZSH_PENDING_SUBMIT=1
+  # Freeze the visible draft, then accept an empty shell line. The precmd hook
+  # runs the saved turn outside ZLE, so submitted prose is never shell code.
   zle -I
-  MU_ZSH_OUTPUT_SEPARATOR_PENDING=1
-  if [[ "$prompt" == /* ]]; then
-    _mu_zsh_run_slash_command "$prompt"
-  else
-    _mu_zsh_submit_prompt "$prompt"
+  print -Pn -- "$PROMPT"
+  print -r -- "$input"
+  PROMPT=
+  if [[ -o PROMPT_SP ]]; then
+    unsetopt PROMPT_SP
+    MU_ZSH_RESTORE_PROMPT_SP=1
   fi
-  # `reset-prompt` reclaims the active prompt's screen rows. Reserve those rows
-  # below the child transcript so the redraw cannot overwrite its final block.
-  while (( prompt_rows > 0 )); do
-    print
-    (( prompt_rows -= 1 ))
-  done
-  _mu_zsh_reset_mode_prompt
+  BUFFER=
+  CURSOR=0
+  zle .accept-line
+}
+
+_mu_zsh_dispatch_pending() {
+  (( MU_ZSH_PENDING_SUBMIT )) || return 0
+
+  local input=$MU_ZSH_PENDING_INPUT
+  PROMPT=$MU_ZSH_PENDING_PROMPT
+  if (( MU_ZSH_RESTORE_PROMPT_SP )); then
+    setopt PROMPT_SP
+    MU_ZSH_RESTORE_PROMPT_SP=0
+  fi
+  MU_ZSH_PENDING_INPUT=
+  MU_ZSH_PENDING_PROMPT=
+  MU_ZSH_PENDING_SUBMIT=0
+  MU_ZSH_OUTPUT_SEPARATOR_PENDING=0
+
+  if [[ "$input" == /* ]]; then
+    _mu_zsh_run_slash_command "$input"
+  else
+    _mu_zsh_submit_prompt "$input"
+  fi
+  [[ "$MU_ZSH_MODE" == mu ]] && _mu_zsh_refresh_prompt
 }
 
 _mu_zsh_line_init() {
@@ -999,5 +1006,6 @@ if [[ -o zle ]]; then
   zle -N mu-zsh-mode
   zle -N mu-zsh-exit-mode
   add-zle-hook-widget line-init _mu_zsh_line_init 2>/dev/null || true
+  add-zsh-hook precmd _mu_zsh_dispatch_pending 2>/dev/null || true
   bindkey '^I' _mu_zsh_tab
 fi

@@ -9,6 +9,13 @@ fail() {
   exit 1
 }
 
+submitted_display_before_response() {
+  local transcript=$1 stream before_response
+  stream=$(perl -pe 's/\e\[[0-9;]*m//g' "$transcript")
+  before_response=${stream%%"Hello! I'm your terminal agent."*}
+  REPLY=$before_response
+}
+
 assert_command_reply() {
   local label=$1
   shift
@@ -507,13 +514,13 @@ interactive_status=0
 (( interactive_status == 0 )) || fail "interactive transcript exited with status $interactive_status"
 
 normalized=$(perl -pe 's/\e\[[0-?]*[ -\/]*[@-~]//g' "$interactive_transcript" | col -b)
-hello_count=0
-for line in "${(@f)normalized}"; do
-  [[ "$line" == 'mu> hello' ]] && (( hello_count += 1 ))
-done
-(( hello_count == 1 )) || fail "submitted prompt should appear once, saw $hello_count copies"
+submitted_display_before_response "$interactive_transcript"
+expected_submitted_display="prompt-test-model 25% $root"$'\r\nmu> hello\r\n'
+[[ "$REPLY" == *"$expected_submitted_display"* ]] || fail "submitted prompt should remain complete in terminal scrollback"
+after_submitted_display=${REPLY#*"$expected_submitted_display"}
+[[ "$after_submitted_display" != *"$expected_submitted_display"* ]] || fail "submitted prompt should be committed exactly once"
 [[ "$normalized" == *"Hello! I'm your terminal agent."* ]] || fail "interactive response should be rendered"
-after_submitted_prompt=${normalized#*$'mu> hello\n'}
+after_submitted_prompt=${normalized##*$'mu> hello\n'}
 [[ "$after_submitted_prompt" == $'\nHello! I'* ]] || fail "submitted prompt should have one empty line before terminal output"
 [[ "$after_submitted_prompt" != $'\n\nHello! I'* ]] || fail "submitted prompt should not have two empty lines before terminal output"
 [[ "$normalized" == *'mu> cancel-me'* ]] || fail "Ctrl-C should leave the cancelled mu line in scrollback"
@@ -551,9 +558,29 @@ interactive_status=0
 } | timeout 5 script -qfec 'TERM=xterm-256color zsh -df' "$shift_enter_transcript" >/dev/null || interactive_status=$?
 (( interactive_status == 0 )) || fail "Shift+Enter transcript exited with status $interactive_status"
 [[ $(<"$interactive_capture_calls") == x ]] || fail "Shift+Enter should not submit before Enter"
+submitted_display_before_response "$shift_enter_transcript"
+expected_submitted_display="prompt-test-model 25% $root"$'\r\nmu> first line\r\nsecond line\r\n'
+[[ "$REPLY" == *"$expected_submitted_display"* ]] || fail "multiline submitted prompt should remain complete in terminal scrollback"
 shift_enter_expected_stdin=$tmpdir/shift-enter-expected-stdin
 print -rn -- 'first line'$'\n''second line'$'\n' > "$shift_enter_expected_stdin"
 cmp -- "$shift_enter_expected_stdin" "$interactive_capture_stdin" || fail "Shift+Enter draft should be passed as one multiline prompt"
+
+wrapped_transcript=$tmpdir/wrapped-transcript
+wrapped_prompt=
+wrapped_prompt=${(l:120::x:)wrapped_prompt}
+rm -f -- "$interactive_capture_args" "$interactive_capture_stdin" "$interactive_capture_calls"
+interactive_status=0
+{
+  print -r -- "$interactive_setup"
+  sleep 0.2
+  print -rn -- $'\t'"$wrapped_prompt"$'\r'
+  sleep 0.4
+  print -rn -- $'\x04'
+} | timeout 5 script -qfec 'TERM=xterm-256color zsh -df' "$wrapped_transcript" >/dev/null || interactive_status=$?
+(( interactive_status == 0 )) || fail "wrapped prompt transcript exited with status $interactive_status"
+submitted_display_before_response "$wrapped_transcript"
+expected_submitted_display="prompt-test-model 25% $root"$'\r\nmu> '"$wrapped_prompt"$'\r\n'
+[[ "$REPLY" == *"$expected_submitted_display"* ]] || fail "wrapped submitted prompt should remain complete in terminal scrollback"
 
 custom_slash_transcript=$tmpdir/custom-slash-transcript
 custom_slash_setup="$interactive_setup; export TEST_EXTRA_COMMAND=review.md"
@@ -589,7 +616,7 @@ interactive_status=0
 (( interactive_status == 0 )) || fail "plain transcript exited with status $interactive_status"
 
 normalized=$(perl -pe 's/\e\[[0-?]*[ -\/]*[@-~]//g' "$plain_transcript" | col -b)
-after_submitted_prompt=${normalized#*$'mu> plain prompt\n'}
+after_submitted_prompt=${normalized##*$'mu> plain prompt\n'}
 [[ "$after_submitted_prompt" == $'\nHello! I'* ]] || fail "submitted prompt should have one empty line before plain output"
 [[ "$after_submitted_prompt" != $'\n\nHello! I'* ]] || fail "submitted prompt should not have two empty lines before plain output"
 after_response=${normalized#*"Hello! I'm your terminal agent."}
