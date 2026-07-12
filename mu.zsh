@@ -22,7 +22,6 @@ typeset -g MU_ZSH_PROMPT=${MU_ZSH_PROMPT:-$MU_ZSH_PROMPT_INPUT}
 typeset -g MU_ZSH_PENDING_INPUT=
 typeset -g MU_ZSH_PENDING_PROMPT=
 typeset -gi MU_ZSH_PENDING_SUBMIT=0
-typeset -gi MU_ZSH_RESTORE_PROMPT_SP=0
 typeset -g MU_ZSH_PROMPT_MODEL_COLOR=${MU_ZSH_PROMPT_MODEL_COLOR:-45}
 typeset -g MU_ZSH_PROMPT_CONTEXT_COLOR=${MU_ZSH_PROMPT_CONTEXT_COLOR:-244}
 typeset -g MU_ZSH_PROMPT_PWD_COLOR=${MU_ZSH_PROMPT_PWD_COLOR:-39}
@@ -923,16 +922,10 @@ _mu_zsh_accept() {
   MU_ZSH_PENDING_INPUT=$input
   MU_ZSH_PENDING_PROMPT=$PROMPT
   MU_ZSH_PENDING_SUBMIT=1
-  # Freeze the visible draft, then accept an empty shell line. The precmd hook
-  # runs the saved turn outside ZLE, so submitted prose is never shell code.
+  # End the active editor with an empty shell line. The precmd hook runs the
+  # saved turn outside ZLE, so submitted prose is never shell code.
   zle -I
-  print -Pn -- "$PROMPT"
-  print -r -- "$input"
   PROMPT=
-  if [[ -o PROMPT_SP ]]; then
-    unsetopt PROMPT_SP
-    MU_ZSH_RESTORE_PROMPT_SP=1
-  fi
   BUFFER=
   CURSOR=0
   zle .accept-line
@@ -943,10 +936,6 @@ _mu_zsh_dispatch_pending() {
 
   local input=$MU_ZSH_PENDING_INPUT
   PROMPT=$MU_ZSH_PENDING_PROMPT
-  if (( MU_ZSH_RESTORE_PROMPT_SP )); then
-    setopt PROMPT_SP
-    MU_ZSH_RESTORE_PROMPT_SP=0
-  fi
   MU_ZSH_PENDING_INPUT=
   MU_ZSH_PENDING_PROMPT=
   MU_ZSH_PENDING_SUBMIT=0

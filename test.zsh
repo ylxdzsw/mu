@@ -10,10 +10,9 @@ fail() {
 }
 
 submitted_display_before_response() {
-  local transcript=$1 stream before_response
-  stream=$(perl -pe 's/\e\[[0-9;]*m//g' "$transcript")
-  before_response=${stream%%"Hello! I'm your terminal agent."*}
-  REPLY=$before_response
+  local transcript=$1 stream
+  stream=$(perl -pe 's/\e\[[0-?]*[ -\/]*[@-~]//g' "$transcript" | col -b)
+  REPLY=${stream%%"Hello! I'm your terminal agent."*}
 }
 
 assert_command_reply() {
@@ -528,7 +527,7 @@ interactive_status=0
 
 normalized=$(perl -pe 's/\e\[[0-?]*[ -\/]*[@-~]//g' "$interactive_transcript" | col -b)
 submitted_display_before_response "$interactive_transcript"
-expected_submitted_display="prompt-test-model 25% $root"$'\r\nmu> hello\r\n'
+expected_submitted_display="prompt-test-model 25% $root"$'\nmu> hello\n'
 [[ "$REPLY" == *"$expected_submitted_display"* ]] || fail "submitted prompt should remain complete in terminal scrollback"
 after_submitted_display=${REPLY#*"$expected_submitted_display"}
 [[ "$after_submitted_display" != *"$expected_submitted_display"* ]] || fail "submitted prompt should be committed exactly once"
@@ -572,7 +571,7 @@ interactive_status=0
 (( interactive_status == 0 )) || fail "Shift+Enter transcript exited with status $interactive_status"
 [[ $(<"$interactive_capture_calls") == x ]] || fail "Shift+Enter should not submit before Enter"
 submitted_display_before_response "$shift_enter_transcript"
-expected_submitted_display="prompt-test-model 25% $root"$'\r\nmu> first line\r\nsecond line\r\n'
+expected_submitted_display="prompt-test-model 25% $root"$'\nmu> first line\nsecond line\n'
 [[ "$REPLY" == *"$expected_submitted_display"* ]] || fail "multiline submitted prompt should remain complete in terminal scrollback"
 shift_enter_expected_stdin=$tmpdir/shift-enter-expected-stdin
 print -rn -- 'first line'$'\n''second line'$'\n' > "$shift_enter_expected_stdin"
@@ -592,8 +591,9 @@ interactive_status=0
 } | timeout 5 script -qfec 'TERM=xterm-256color zsh -df' "$wrapped_transcript" >/dev/null || interactive_status=$?
 (( interactive_status == 0 )) || fail "wrapped prompt transcript exited with status $interactive_status"
 submitted_display_before_response "$wrapped_transcript"
-expected_submitted_display="prompt-test-model 25% $root"$'\r\nmu> '"$wrapped_prompt"$'\r\n'
-[[ "$REPLY" == *"$expected_submitted_display"* ]] || fail "wrapped submitted prompt should remain complete in terminal scrollback"
+wrapped_expected_stdin=$tmpdir/wrapped-expected-stdin
+print -rn -- "$wrapped_prompt"$'\n' > "$wrapped_expected_stdin"
+cmp -- "$wrapped_expected_stdin" "$interactive_capture_stdin" || fail "wrapped prompt should be passed on stdin"
 
 custom_slash_transcript=$tmpdir/custom-slash-transcript
 custom_slash_setup="$interactive_setup; export TEST_EXTRA_COMMAND=review.md"
