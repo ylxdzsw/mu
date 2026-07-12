@@ -454,6 +454,7 @@ async fn run() -> Result<()> {
             return Ok(());
         }
         Some(Command::Compact { session }) => {
+            let custom_focus = load_optional_stdin_instruction()?;
             let config = Config::load_for_scope(project_config_dir.as_deref())?;
             let db_path = scope.session_db_path();
             if !db_path.exists() {
@@ -469,8 +470,15 @@ async fn run() -> Result<()> {
             let provider = build_provider(&config, &request.model.provider_id)?;
             let _lock =
                 acquire_session_lock_or_exit(&store, &session, cli::OutputFormat::Terminal)?;
-            compaction::run_compaction(&store, &config, &session, &request, provider.as_ref())
-                .await?;
+            compaction::run_compaction(
+                &store,
+                &config,
+                &session,
+                &request,
+                provider.as_ref(),
+                custom_focus.as_deref(),
+            )
+            .await?;
             eprintln!("compacted session {session}");
             return Ok(());
         }
@@ -610,21 +618,33 @@ fn load_prompt_with_stdin(
     }
 }
 
+fn load_optional_stdin_instruction() -> Result<Option<String>> {
+    let stdin = io::stdin();
+    read_optional_stdin_instruction(stdin.is_terminal(), &mut stdin.lock())
+}
+
+fn read_optional_stdin_instruction(
+    stdin_is_terminal: bool,
+    stdin: &mut impl Read,
+) -> Result<Option<String>> {
+    if stdin_is_terminal {
+        return Ok(None);
+    }
+
+    let mut instruction = String::new();
+    stdin.read_to_string(&mut instruction)?;
+    Ok((!instruction.is_empty()).then_some(instruction))
+}
+
 fn append_stdin_instruction(
     prompt: String,
     stdin_is_terminal: bool,
     stdin: &mut impl Read,
 ) -> Result<String> {
-    if stdin_is_terminal {
-        return Ok(prompt);
+    match read_optional_stdin_instruction(stdin_is_terminal, stdin)? {
+        Some(instruction) => Ok(format!("{prompt}\n---\n\n{instruction}")),
+        None => Ok(prompt),
     }
-
-    let mut instruction = String::new();
-    stdin.read_to_string(&mut instruction)?;
-    if instruction.is_empty() {
-        return Ok(prompt);
-    }
-    Ok(format!("{prompt}\n---\n\n{instruction}"))
 }
 
 fn resolve_prompt_source(
@@ -972,6 +992,28 @@ mod tests {
             load_prompt_with_stdin(PromptSource::File(path.clone()), false, &mut stdin).unwrap();
         std::fs::remove_file(path).unwrap();
         assert_eq!(prompt, "Use the release-note format.");
+    }
+
+    #[test]
+    fn optional_instruction_uses_custom_command_stdin_rules() {
+        let mut terminal_stdin = Cursor::new("do not read");
+        assert_eq!(
+            read_optional_stdin_instruction(true, &mut terminal_stdin).unwrap(),
+            None
+        );
+        assert_eq!(terminal_stdin.position(), 0);
+
+        let mut empty_stdin = Cursor::new("");
+        assert_eq!(
+            read_optional_stdin_instruction(false, &mut empty_stdin).unwrap(),
+            None
+        );
+
+        let mut piped_stdin = Cursor::new("Focus on auth.\nKeep details.\n");
+        assert_eq!(
+            read_optional_stdin_instruction(false, &mut piped_stdin).unwrap(),
+            Some("Focus on auth.\nKeep details.\n".to_string())
+        );
     }
 
     #[test]

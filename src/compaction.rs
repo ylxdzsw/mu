@@ -58,7 +58,7 @@ pub async fn maybe_compact(
     };
 
     if should_compact {
-        run_compaction(store, config, session_id, request, provider).await?;
+        run_compaction(store, config, session_id, request, provider, None).await?;
     }
     Ok(())
 }
@@ -69,6 +69,7 @@ pub async fn run_compaction(
     session_id: &str,
     request: &RequestOptions,
     provider: &dyn Provider,
+    custom_focus: Option<&str>,
 ) -> Result<()> {
     bash::install_signal_forwarder();
     let records = store.message_records_from_seq(session_id, 0)?;
@@ -133,17 +134,8 @@ pub async fn run_compaction(
         .rfind(|m| m.role == "summary")
         .map(|m| m.content.as_str());
 
-    let summarize_prompt = if let Some(prior) = prior_summary {
-        format!(
-            "Update this conversation summary. Preserve still-true details, remove stale facts.\n\nPrior summary:\n{prior}\n\nNew messages to incorporate:\n{}",
-            to_summarize.join("\n---\n")
-        )
-    } else {
-        format!(
-            "Summarize this conversation concisely for future context:\n\n{}",
-            to_summarize.join("\n---\n")
-        )
-    };
+    let summarize_prompt =
+        build_summarize_prompt(prior_summary, &to_summarize.join("\n---\n"), custom_focus);
 
     let msgs = vec![
         Message::System {
@@ -193,6 +185,38 @@ pub async fn run_compaction(
         }
     }
     Ok(())
+}
+
+fn build_summarize_prompt(
+    prior_summary: Option<&str>,
+    transcript: &str,
+    custom_focus: Option<&str>,
+) -> String {
+    let mut prompt = if prior_summary.is_some() {
+        "Update this conversation summary for future context. Remove stale facts."
+    } else {
+        "Summarize this conversation concisely for future context."
+    }
+    .to_string();
+
+    prompt.push_str(
+        "\n\nPreserve all important facts needed to continue the work correctly, including requirements, constraints, decisions, current state, unresolved problems, and next steps.",
+    );
+    if let Some(focus) = custom_focus {
+        prompt.push_str(
+            "\n\nGive material relevant to the custom focus more of the available detail and summary budget. The focus does not permit omitting other important facts.\n\nCustom focus:\n",
+        );
+        prompt.push_str(focus);
+    }
+    if let Some(prior) = prior_summary {
+        prompt.push_str("\n\nPrior summary:\n");
+        prompt.push_str(prior);
+        prompt.push_str("\n\nNew messages to incorporate:\n");
+    } else {
+        prompt.push_str("\n\nConversation:\n");
+    }
+    prompt.push_str(transcript);
+    prompt
 }
 
 pub fn prune_spills(state_dir: &Path) {
@@ -267,6 +291,34 @@ mod tests {
         }
     }
 
+    #[test]
+    fn focused_prompt_preserves_general_context_and_prioritizes_focus() {
+        let prompt = build_summarize_prompt(
+            Some("Existing decisions."),
+            "[user]: New evidence.",
+            Some("Focus on auth.\nKeep concrete API shapes.\n"),
+        );
+
+        assert!(prompt.contains("Preserve all important facts needed to continue"));
+        assert!(prompt.contains(
+            "Give material relevant to the custom focus more of the available detail and summary budget"
+        ));
+        assert!(prompt.contains("Custom focus:\nFocus on auth.\nKeep concrete API shapes.\n"));
+        assert!(prompt.contains("Prior summary:\nExisting decisions."));
+        assert!(prompt.find("Custom focus:") < prompt.find("Prior summary:"));
+        assert!(prompt.contains("New messages to incorporate:\n[user]: New evidence."));
+    }
+
+    #[test]
+    fn unfocused_prompt_omits_focus_guidance() {
+        let prompt = build_summarize_prompt(None, "[user]: Hello.", None);
+
+        assert!(prompt.contains("Preserve all important facts needed to continue"));
+        assert!(!prompt.contains("custom focus"));
+        assert!(!prompt.contains("Custom focus:"));
+        assert!(prompt.contains("Conversation:\n[user]: Hello."));
+    }
+
     #[tokio::test]
     async fn compaction_keeps_only_requested_recent_turns() {
         let tmp = std::env::temp_dir().join(format!("mu-compaction-{}", uuid::Uuid::new_v4()));
@@ -313,6 +365,7 @@ mod tests {
                 model: request_model,
             },
             &FakeProvider,
+            None,
         )
         .await
         .unwrap();

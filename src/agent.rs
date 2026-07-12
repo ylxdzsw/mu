@@ -126,6 +126,7 @@ impl<'a> AgentLoop<'a> {
                         self.session_id,
                         &self.request,
                         self.provider.as_ref(),
+                        None,
                     )
                     .await?;
                     context = self.load_context()?;
@@ -187,6 +188,7 @@ impl<'a> AgentLoop<'a> {
                             self.session_id,
                             &self.request,
                             self.provider.as_ref(),
+                            None,
                         )
                         .await?;
                         context = self.load_context()?;

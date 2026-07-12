@@ -756,13 +756,17 @@ _mu_zsh_run_slash_command() {
       fi
       ;;
     /compact)
-      _mu_zsh_validate_no_args "$command" "$rest" || return 1
       _mu_zsh_require_effective_session "$command" || return 1
       session_id=$MU_ZSH_EFFECTIVE_SESSION_ID
-      if "$MU_ZSH_BIN" compact --session "$session_id"; then
-        exit_status=0
+      if [[ -n "$instruction" ]]; then
+        print -rn -- "$instruction" | "$MU_ZSH_BIN" compact --session "$session_id"
+        exit_status=${pipestatus[2]}
       else
-        exit_status=$?
+        if "$MU_ZSH_BIN" compact --session "$session_id"; then
+          exit_status=0
+        else
+          exit_status=$?
+        fi
       fi
       print
       ;;

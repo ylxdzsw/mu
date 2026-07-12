@@ -116,7 +116,7 @@ MU_ZSH_EXIT_HOOKS+=(mu_restore_conflicts)
 | `mu status --json --include-skills` | Include active skill entries |
 | `mu session new` | Create session, print id |
 | `mu session list` | List recent sessions |
-| `mu compact --session <id>` | Force compaction |
+| `mu compact --session <id>` | Force compaction; non-terminal stdin supplies an optional focus |
 | `mu retry [-s <id>] [-c]` | Resume an interrupted turn (see below) |
 
 Prompt-file mode accepts the same turn options as stdin mode. Put the prompt
@@ -132,6 +132,16 @@ EOF
 
 Terminal stdin is not read in prompt-file mode, so `mu prompt.md` runs without
 blocking. Bare `mu` still uses stdin as its complete prompt.
+
+Manual compaction accepts the same optional custom-instruction input as a
+prompt file or custom command. The instruction gives relevant material more of
+the summary budget without allowing other important context to be omitted:
+
+```sh
+mu compact --session <id> <<'EOF'
+Focus on the provider redesign and unresolved API decisions.
+EOF
+```
 
 If a turn is interrupted (Ctrl-C, a dropped connection, a crash), only the
 completed messages are kept — any tool command that started running is recorded,

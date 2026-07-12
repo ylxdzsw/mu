@@ -89,7 +89,15 @@ if [[ "$1" == "--output" && "$3" == "review.md" ]]; then
   fi
   exit 0
 fi
-if [[ "$1" == "retry" || "$1" == "compact" ]]; then
+if [[ "$1" == "compact" ]]; then
+  print -r -- "$*" >> "$MU_ZSH_FAKE_LOG"
+  if [[ -p /dev/stdin ]]; then
+    prompt=$(cat)
+    [[ -n "$prompt" ]] && print -r -- "prompt=$prompt" >> "$MU_ZSH_FAKE_LOG"
+  fi
+  exit 0
+fi
+if [[ "$1" == "retry" ]]; then
   print -r -- "$*" >> "$MU_ZSH_FAKE_LOG"
   exit 0
 fi
@@ -333,6 +341,11 @@ grep -q -- "retry -s tracked-session --output plain" "$MU_ZSH_FAKE_LOG" || fail 
 rm -f "$MU_ZSH_FAKE_LOG"
 _mu_zsh_run_slash_command "/compact"
 grep -q -- "compact --session tracked-session" "$MU_ZSH_FAKE_LOG" || fail "compact slash command targets tracked session"
+rm -f "$MU_ZSH_FAKE_LOG"
+_mu_zsh_run_slash_command $'/compact Focus on authentication\nKeep concrete API shapes'
+grep -q -- "compact --session tracked-session" "$MU_ZSH_FAKE_LOG" || fail "focused compact targets tracked session"
+compact_prompt=$(cat "$MU_ZSH_FAKE_LOG")
+[[ "$compact_prompt" == *$'prompt=Focus on authentication\nKeep concrete API shapes'* ]] || fail "focused compact pipes multiline instruction"
 rm -f "$MU_ZSH_FAKE_LOG"
 _mu_zsh_run_slash_command "/review.md"
 grep -q -- "--output plain -s tracked-session review.md" "$MU_ZSH_FAKE_LOG" || fail "custom slash command targets tracked session"
