@@ -637,6 +637,8 @@ impl Renderer {
     pub fn turn_summary(
         &mut self,
         input_tokens: u64,
+        cache_read_input_tokens: u64,
+        cache_write_input_tokens: Option<u64>,
         output_tokens: u64,
         context_pct: Option<f64>,
     ) -> io::Result<()> {
@@ -652,7 +654,13 @@ impl Renderer {
         write!(
             self.stderr,
             "{}\n\n",
-            format_turn_summary(input_tokens, output_tokens, context_pct)
+            format_turn_summary(
+                input_tokens,
+                cache_read_input_tokens,
+                cache_write_input_tokens,
+                output_tokens,
+                context_pct,
+            )
         )?;
         self.stderr.flush()
     }
@@ -2745,11 +2753,29 @@ fn strip_ansi(input: &str) -> String {
     out
 }
 
-fn format_turn_summary(input_tokens: u64, output_tokens: u64, context_pct: Option<f64>) -> String {
+fn format_turn_summary(
+    input_tokens: u64,
+    cache_read_input_tokens: u64,
+    cache_write_input_tokens: Option<u64>,
+    output_tokens: u64,
+    context_pct: Option<f64>,
+) -> String {
     let ctx = context_pct
         .map(|p| format!("{p:.0}%"))
         .unwrap_or_else(|| "?".into());
-    format!("[mu] tokens: {input_tokens} in / {output_tokens} out  context: {ctx}")
+    let mut cache = Vec::new();
+    if cache_read_input_tokens > 0 {
+        cache.push(format!("{cache_read_input_tokens} cache read"));
+    }
+    if let Some(cache_write_input_tokens) = cache_write_input_tokens {
+        cache.push(format!("{cache_write_input_tokens} cache write"));
+    }
+    let cache = if cache.is_empty() {
+        String::new()
+    } else {
+        format!(" ({})", cache.join(", "))
+    };
+    format!("[mu] tokens: {input_tokens} in{cache} / {output_tokens} out  context: {ctx}")
 }
 
 struct LinePreview {
@@ -3216,6 +3242,22 @@ mod tests {
         assert!(!normalized.contains("[mu] tokens: 12 in / 5 out  context: 25%\n\n\nmu> "));
     }
 
+    #[test]
+    fn turn_summary_shows_reported_cache_usage_without_a_total() {
+        assert_eq!(
+            format_turn_summary(600, 500, Some(134), 456, Some(12.0)),
+            "[mu] tokens: 600 in (500 cache read, 134 cache write) / 456 out  context: 12%"
+        );
+        assert_eq!(
+            format_turn_summary(600, 500, None, 456, Some(12.0)),
+            "[mu] tokens: 600 in (500 cache read) / 456 out  context: 12%"
+        );
+        assert_eq!(
+            format_turn_summary(600, 0, None, 456, Some(12.0)),
+            "[mu] tokens: 600 in / 456 out  context: 12%"
+        );
+    }
+
     fn capture_renderer_transcript(
         turn_elapsed: Duration,
         trailing_prompt: Option<&str>,
@@ -3260,7 +3302,7 @@ mod tests {
             )
             .unwrap();
         renderer.finish_turn().unwrap();
-        renderer.turn_summary(12, 5, Some(25.0)).unwrap();
+        renderer.turn_summary(12, 0, None, 5, Some(25.0)).unwrap();
         renderer.turn_done_bell(turn_elapsed).unwrap();
         if let Some(prompt) = trailing_prompt {
             output.write_raw(prompt);

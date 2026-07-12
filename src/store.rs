@@ -352,7 +352,7 @@ impl Store {
                 model,
                 usage.input_tokens as i64,
                 usage.cache_read_input_tokens as i64,
-                usage.cache_write_input_tokens as i64,
+                usage.cache_write_input_tokens.unwrap_or(0) as i64,
                 usage.output_tokens as i64,
                 usage.reasoning_output_tokens as i64,
                 usage.total_tokens as i64,

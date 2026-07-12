@@ -322,7 +322,8 @@ For the **context fullness** figure (`last_total_tokens`, the summary's
 `prompt_tokens` already includes the entire prior context, the last response's
 `total_tokens` is the true current context size (summing across iterations would
 double-count). For the `in`/`out` token display, sum `prompt_tokens` and
-`completion_tokens` across all iterations of the turn.
+`completion_tokens` across all iterations of the turn. Subtract provider-reported
+cache reads and writes from `in`, and display those cache figures separately.
 
 **Interruption.** Steps 9d/9e persist only *after* a message is fully formed. If
 SIGINT / a dropped connection / a provider error occurs mid-stream, the partial
@@ -536,11 +537,13 @@ stderr TTY detection suppresses the summary when redirected.
 single structured summary line to stderr:
 
 ```
-[mu] tokens: 1234 in / 456 out  context: 12%
+[mu] tokens: 1234 in (567 cache read, 89 cache write) / 456 out  context: 12%
 ```
 
-All figures come from the provider's reported `usage` for the turn: `in`/`out`
-are `prompt_tokens`/`completion_tokens`; `context` is the new
+All figures come from the provider's reported `usage` for the turn: `in` is
+`prompt_tokens` excluding cache reads and writes, `out` is `completion_tokens`,
+and cache usage is shown parenthetically when reported. Cache write is omitted
+when the provider does not report it; `context` is the new
 `total_tokens` ÷ model context window. This is the *only* stderr output in the normal case. It appears after all
 stdout, and goes to stderr so it stays out of a captured stdout transcript. It
 is suppressed if stderr is not a TTY (piped/redirected), since it would pollute

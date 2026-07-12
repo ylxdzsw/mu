@@ -730,6 +730,8 @@ async fn run_turn(args: RunTurnArgs<'_>) -> Result<()> {
             } else {
                 renderer.turn_summary(
                     r.usage.visible_input_tokens(),
+                    r.usage.cache_read_input_tokens,
+                    r.usage.cache_write_input_tokens,
                     r.usage.visible_output_tokens(),
                     ctx_pct,
                 )?;

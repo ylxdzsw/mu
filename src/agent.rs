@@ -213,7 +213,9 @@ impl<'a> AgentLoop<'a> {
             if let Some(u) = &stream_result.usage {
                 total_usage.input_tokens += u.input_tokens;
                 total_usage.cache_read_input_tokens += u.cache_read_input_tokens;
-                total_usage.cache_write_input_tokens += u.cache_write_input_tokens;
+                if let Some(cache_write_tokens) = u.cache_write_input_tokens {
+                    *total_usage.cache_write_input_tokens.get_or_insert(0) += cache_write_tokens;
+                }
                 total_usage.output_tokens += u.output_tokens;
                 total_usage.reasoning_output_tokens += u.reasoning_output_tokens;
                 total_usage.total_tokens = u.total_tokens;

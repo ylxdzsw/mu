@@ -81,8 +81,7 @@ struct UsageJson {
 struct PromptTokensDetailsJson {
     #[serde(default)]
     cached_tokens: u64,
-    #[serde(default)]
-    cache_creation_tokens: u64,
+    cache_creation_tokens: Option<u64>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -583,7 +582,10 @@ mod tests {
         assert_eq!(state.tool_accum.get(&0).unwrap().1.as_deref(), Some("bash"));
         assert_eq!(state.content, "hello");
         assert_eq!(state.finish_reason, FinishReason::ToolCalls);
-        assert_eq!(state.usage.unwrap().total_tokens, 17);
+        let usage = state.usage.unwrap();
+        assert_eq!(usage.cache_read_input_tokens, 3);
+        assert_eq!(usage.cache_write_input_tokens, Some(2));
+        assert_eq!(usage.total_tokens, 17);
     }
 
     #[test]
@@ -602,6 +604,7 @@ mod tests {
         assert_eq!(usage.input_tokens, 12);
         assert_eq!(usage.output_tokens, 5);
         assert_eq!(usage.total_tokens, 17);
+        assert_eq!(usage.cache_write_input_tokens, None);
     }
 
     #[test]
