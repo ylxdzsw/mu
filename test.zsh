@@ -290,23 +290,24 @@ MU_ZSH_OUTPUT=plain
 MU_ZSH_SESSION_ID=
 MU_ZSH_SESSION_SCOPE=
 command_candidates=("${(@f)$(_mu_zsh_slash_command_candidates)}")
-[[ "${(j:,:)command_candidates}" == "/model,/review.md" ]] || fail "hides session commands without a valid session"
+[[ "${(j:,:)command_candidates}" == "/attach,/model,/review.md" ]] || fail "hides session commands without a valid session"
 MU_ZSH_SESSION_ID=tracked-session
 MU_ZSH_SESSION_SCOPE=$(_mu_zsh_current_scope_key)
 command_candidates=("${(@f)$(_mu_zsh_slash_command_candidates)}")
-[[ "${(j:,:)command_candidates}" == "/model,/new,/retry,/compact,/review.md" ]] || fail "shows session commands with a valid session: ${(j:,:)command_candidates}"
+[[ "${(j:,:)command_candidates}" == "/attach,/model,/new,/retry,/compact,/review.md" ]] || fail "shows session commands with a valid session: ${(j:,:)command_candidates}"
 BUFFER="/ret"
 CURSOR=${#BUFFER}
 completion_candidates=("${(@f)$(_mu_zsh_completion_candidates)}")
-[[ "${(j:,:)completion_candidates}" == "/model,/new,/retry,/compact,/review.md" ]] || fail "offers zsh the complete slash-command set: ${(j:,:)completion_candidates}"
+[[ "${(j:,:)completion_candidates}" == "/attach,/model,/new,/retry,/compact,/review.md" ]] || fail "offers zsh the complete slash-command set: ${(j:,:)completion_candidates}"
 BUFFER="/M"
 CURSOR=${#BUFFER}
 completion_candidates=("${(@f)$(_mu_zsh_completion_candidates)}")
-[[ "${(j:,:)completion_candidates}" == "/model,/new,/retry,/compact,/review.md" ]] || fail "leaves case matching to zsh: ${(j:,:)completion_candidates}"
+[[ "${(j:,:)completion_candidates}" == "/attach,/model,/new,/retry,/compact,/review.md" ]] || fail "leaves case matching to zsh: ${(j:,:)completion_candidates}"
 BUFFER="/unknown"
 CURSOR=${#BUFFER}
 completion_candidates=("${(@f)$(_mu_zsh_completion_candidates)}")
-[[ "${(j:,:)completion_candidates}" == "/model,/new,/retry,/compact,/review.md" ]] || fail "keeps freeform slash input advisory: ${(j:,:)completion_candidates}"
+[[ "${(j:,:)completion_candidates}" == "/attach,/model,/new,/retry,/compact,/review.md" ]] || fail "keeps freeform slash input advisory: ${(j:,:)completion_candidates}"
+_mu_zsh_is_known_slash_command /attach || fail "recognizes attach slash command"
 _mu_zsh_is_known_slash_command /model || fail "recognizes built-in slash command"
 _mu_zsh_is_known_slash_command /review.md || fail "recognizes custom slash command"
 if _mu_zsh_is_known_slash_command /unknown; then
@@ -333,6 +334,36 @@ CURSOR=${#BUFFER}
 completion_candidates=("${(@f)$(_mu_zsh_completion_candidates)}")
 [[ " ${(j: :)completion_candidates} " == *" openai/gpt:high "* ]] || fail "offers model variants to zsh from the zle buffer"
 [[ " ${(j: :)completion_candidates} " == *" local/solo:max "* ]] || fail "does not prefilter model variants in zsh"
+
+attachment_one=$tmpdir/screenshot.png
+attachment_two=$tmpdir/recording.wav
+touch -- "$attachment_one" "$attachment_two"
+MU_ZSH_PENDING_ATTACHMENTS=()
+_mu_zsh_run_slash_command "/attach $attachment_one"
+_mu_zsh_run_slash_command "/attach $attachment_two"
+(( ${#MU_ZSH_PENDING_ATTACHMENTS[@]} == 2 )) || fail "attach slash command queues repeated files"
+pending_prompt=$(_mu_zsh_build_mode_prompt)
+[[ "$pending_prompt" == *'[2 attachments]'* ]] || fail "prompt shows pending attachment count"
+_mu_zsh_run_slash_command "/model gpt"
+(( ${#MU_ZSH_PENDING_ATTACHMENTS[@]} == 2 )) || fail "model command preserves pending attachments"
+_mu_zsh_clear_model_state
+rm -f "$MU_ZSH_FAKE_LOG"
+_mu_zsh_submit_prompt "inspect these"
+grep -Fq -- "-a $attachment_one -a $attachment_two" "$MU_ZSH_FAKE_LOG" || fail "prompt forwards every pending attachment"
+(( ${#MU_ZSH_PENDING_ATTACHMENTS[@]} == 0 )) || fail "prompt consumes pending attachments"
+
+_mu_zsh_run_slash_command "/attach $attachment_one"
+rm -f "$MU_ZSH_FAKE_LOG"
+_mu_zsh_run_slash_command "/review.md Inspect image"
+grep -Fq -- "-a $attachment_one review.md" "$MU_ZSH_FAKE_LOG" || fail "custom command forwards pending attachments"
+(( ${#MU_ZSH_PENDING_ATTACHMENTS[@]} == 0 )) || fail "custom command consumes pending attachments"
+
+_mu_zsh_run_slash_command "/attach $attachment_one"
+_mu_zsh_run_slash_command "/attach --clear"
+(( ${#MU_ZSH_PENDING_ATTACHMENTS[@]} == 0 )) || fail "attach clear discards pending attachments"
+if _mu_zsh_run_slash_command "/attach $tmpdir/missing.png"; then
+  fail "attach should reject unreadable files"
+fi
 
 rm -f "$MU_ZSH_FAKE_LOG"
 _mu_zsh_run_slash_command "/retry"

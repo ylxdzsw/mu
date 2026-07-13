@@ -58,6 +58,12 @@ Typing `/` at the start of a `mu>` line proactively lists slash commands.
 After that, Tab uses normal zsh completion semantics, including your configured
 matchers, candidate lists, and menu selection.
 
+`/attach <file>` stages an image or audio file for the next user message and
+may be repeated. It does not contact the agent or write to the session by
+itself. `/attach` lists pending files, and `/attach --clear` discards them.
+Pending files survive draft cancellation and leaving prompt mode, are shown as
+a count in the prompt, and are consumed by the next prompt or custom command.
+
 The plugin owns only zsh line editing and prompt mode. Each submission still
 spawns the `mu` binary for one foreground turn, so streaming output, Ctrl-C, and
 session persistence follow the same command-line path as scripted use.

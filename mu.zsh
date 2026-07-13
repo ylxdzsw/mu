@@ -22,6 +22,7 @@ typeset -g MU_ZSH_PROMPT=${MU_ZSH_PROMPT:-$MU_ZSH_PROMPT_INPUT}
 typeset -g MU_ZSH_PENDING_INPUT=
 typeset -g MU_ZSH_PENDING_PROMPT=
 typeset -gi MU_ZSH_PENDING_SUBMIT=0
+typeset -ga MU_ZSH_PENDING_ATTACHMENTS
 typeset -g MU_ZSH_PROMPT_MODEL_COLOR=${MU_ZSH_PROMPT_MODEL_COLOR:-45}
 typeset -g MU_ZSH_PROMPT_CONTEXT_COLOR=${MU_ZSH_PROMPT_CONTEXT_COLOR:-244}
 typeset -g MU_ZSH_PROMPT_PWD_COLOR=${MU_ZSH_PROMPT_PWD_COLOR:-39}
@@ -216,16 +217,22 @@ _mu_zsh_record_history() {
   session_id=$MU_ZSH_EFFECTIVE_SESSION_ID
   model=$MU_ZSH_EFFECTIVE_MODEL
 
+  local attachments=
+  local attachment
+  for attachment in "${MU_ZSH_PENDING_ATTACHMENTS[@]}"; do
+    attachments+=" -a ${(q)attachment}"
+  done
+
   if [[ -n "$session_id" ]]; then
     if [[ -n "$model" ]]; then
-      print -sr -- "$MU_ZSH_BIN -s ${(q)session_id} --model ${(q)model} --output ${(q)MU_ZSH_OUTPUT} <<< $quoted"
+      print -sr -- "$MU_ZSH_BIN -s ${(q)session_id} --model ${(q)model}${attachments} --output ${(q)MU_ZSH_OUTPUT} <<< $quoted"
     else
-      print -sr -- "$MU_ZSH_BIN -s ${(q)session_id} --output ${(q)MU_ZSH_OUTPUT} <<< $quoted"
+      print -sr -- "$MU_ZSH_BIN -s ${(q)session_id}${attachments} --output ${(q)MU_ZSH_OUTPUT} <<< $quoted"
     fi
   elif [[ -n "$model" ]]; then
-    print -sr -- "$MU_ZSH_BIN --model ${(q)model} --output ${(q)MU_ZSH_OUTPUT} <<< $quoted"
+    print -sr -- "$MU_ZSH_BIN --model ${(q)model}${attachments} --output ${(q)MU_ZSH_OUTPUT} <<< $quoted"
   else
-    print -sr -- "$MU_ZSH_BIN --output ${(q)MU_ZSH_OUTPUT} <<< $quoted"
+    print -sr -- "$MU_ZSH_BIN${attachments} --output ${(q)MU_ZSH_OUTPUT} <<< $quoted"
   fi
 }
 
@@ -301,7 +308,7 @@ _mu_zsh_json_value_reply() {
 }
 
 _mu_zsh_build_mode_prompt() {
-  local status_json model context_raw context cwd project_root project_segment
+  local status_json model context_raw context cwd project_root project_segment attachment_segment
   local clean unclean_segment
   local escaped_model escaped_context escaped_project_root escaped_unclean_text
 
@@ -342,6 +349,12 @@ _mu_zsh_build_mode_prompt() {
     project_segment=
   fi
 
+  if (( ${#MU_ZSH_PENDING_ATTACHMENTS[@]} )); then
+    attachment_segment=" %F{$MU_ZSH_PROMPT_CONTEXT_COLOR}[${#MU_ZSH_PENDING_ATTACHMENTS[@]} attachments]%f"
+  else
+    attachment_segment=
+  fi
+
   # When the tracked session's last turn was interrupted (unclean), surface it
   # so the user knows they can /retry to resume or just type to redirect.
   if _mu_zsh_json_value_reply "$status_json" 'if has("clean") then .clean else empty end' 2>/dev/null; then
@@ -357,7 +370,7 @@ _mu_zsh_build_mode_prompt() {
     unclean_segment=
   fi
 
-  print -r -- "%F{$MU_ZSH_PROMPT_MODEL_COLOR}${escaped_model}%f %F{$MU_ZSH_PROMPT_CONTEXT_COLOR}${escaped_context}%f %F{$MU_ZSH_PROMPT_PWD_COLOR}${cwd}%f${project_segment}${unclean_segment}
+  print -r -- "%F{$MU_ZSH_PROMPT_MODEL_COLOR}${escaped_model}%f %F{$MU_ZSH_PROMPT_CONTEXT_COLOR}${escaped_context}%f %F{$MU_ZSH_PROMPT_PWD_COLOR}${cwd}%f${project_segment}${unclean_segment}${attachment_segment}
 ${MU_ZSH_PROMPT_INPUT}"
 }
 
@@ -435,7 +448,7 @@ _mu_zsh_has_effective_session() {
 _mu_zsh_slash_command_candidates() {
   local -a commands
 
-  commands=(/model)
+  commands=(/attach /model)
   if _mu_zsh_has_effective_session; then
     commands+=(/new /retry /compact)
   fi
@@ -541,6 +554,8 @@ _mu_zsh_slash_completion_context() {
     return
   fi
 
+  [[ "$left" == "/attach "* ]] && return 0
+
   [[ "$left" != *[[:space:]]* ]]
 }
 
@@ -555,6 +570,8 @@ _mu_zsh_completion_candidates() {
     _mu_zsh_model_completion_candidates "$arg"
     return
   fi
+
+  [[ "$left" == "/attach "* ]] && return 1
 
   [[ "$left" == /* ]] || return 1
   [[ "$left" != *[[:space:]]* ]] || return 1
@@ -575,6 +592,12 @@ _mu_zsh_fallback_completion() {
 _mu_zsh_completion_system() {
   local -a candidates
   local expl
+
+  if [[ "${BUFFER[1,$CURSOR]}" == "/attach "* ]]; then
+    compset -P '/attach '
+    _files
+    return
+  fi
 
   candidates=("${(@f)$(_mu_zsh_completion_candidates)}")
   candidates=("${(@)candidates:#}")
@@ -615,7 +638,7 @@ _mu_zsh_is_known_slash_command() {
   local command=$1
 
   case "$command" in
-    /model|/new|/retry|/compact)
+    /attach|/model|/new|/retry|/compact)
       return 0
       ;;
   esac
@@ -668,7 +691,12 @@ _mu_zsh_run_custom_slash_command() {
   session_id=$MU_ZSH_EFFECTIVE_SESSION_ID
 
   command=("${MU_ZSH_COMMAND_REPLY[@]}")
+  local attachment
+  for attachment in "${MU_ZSH_PENDING_ATTACHMENTS[@]}"; do
+    command+=(-a "$attachment")
+  done
   command+=("$name")
+  MU_ZSH_PENDING_ATTACHMENTS=()
 
   if [[ -n "$session_id" ]]; then
     if [[ -n "$instruction" ]]; then
@@ -719,6 +747,37 @@ _mu_zsh_run_slash_command() {
   _mu_zsh_print_output_separator_if_pending
 
   case "$command" in
+    /attach)
+      if [[ -z "$rest" ]]; then
+        if (( ${#MU_ZSH_PENDING_ATTACHMENTS[@]} )); then
+          _mu_zsh_print_block_message "[mu] pending attachments: ${(j:, :)MU_ZSH_PENDING_ATTACHMENTS}"
+        else
+          _mu_zsh_print_block_message "[mu] no pending attachments"
+        fi
+        return 0
+      fi
+      if [[ "$rest" == --clear ]]; then
+        MU_ZSH_PENDING_ATTACHMENTS=()
+        _mu_zsh_print_block_message "[mu] cleared pending attachments"
+        return 0
+      fi
+      if [[ "$rest" == *$'\n'* ]]; then
+        _mu_zsh_print_block_message "[mu] /attach accepts exactly one file"
+        return 1
+      fi
+      local attachment_path=$rest
+      [[ "$attachment_path" == '~/'* ]] && attachment_path="${HOME:-}${attachment_path#\~}"
+      attachment_path=${attachment_path:A}
+      if [[ ! -f "$attachment_path" || ! -r "$attachment_path" ]]; then
+        _mu_zsh_print_block_message "[mu] attachment is not a readable file: $rest"
+        return 1
+      fi
+      MU_ZSH_PENDING_ATTACHMENTS+=("$attachment_path")
+      local attachment_count=${#MU_ZSH_PENDING_ATTACHMENTS[@]}
+      local attachment_label=files
+      (( attachment_count == 1 )) && attachment_label=file
+      _mu_zsh_print_block_message "[mu] attached ${attachment_path:t} for the next message ($attachment_count $attachment_label)"
+      ;;
     /model)
       if [[ -z "$rest" ]]; then
         _mu_zsh_print_block_message "[mu] usage: /model <model>"
@@ -839,6 +898,11 @@ _mu_zsh_submit_prompt() {
   _mu_zsh_base_command_reply "$scope"
   session_id=$MU_ZSH_EFFECTIVE_SESSION_ID
   command=("${MU_ZSH_COMMAND_REPLY[@]}")
+  local attachment
+  for attachment in "${MU_ZSH_PENDING_ATTACHMENTS[@]}"; do
+    command+=(-a "$attachment")
+  done
+  MU_ZSH_PENDING_ATTACHMENTS=()
 
   if [[ -n "$session_id" ]]; then
     _mu_zsh_print_output_separator_if_pending

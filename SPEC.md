@@ -622,6 +622,13 @@ Consequences:
   newlines; `/compact` accepts the same instruction syntax as a custom focus.
   Unknown names report a slash-command error. Other built-in slash commands keep
   their own argument rules.
+- `/attach <file>` resolves and stages one readable regular file in shell
+  memory for the next user message and may be repeated. It creates no session
+  message itself. `/attach` lists pending files and `/attach --clear` discards
+  them. The prompt shows the pending count. Empty Enter, draft cancellation,
+  mode changes, `/model`, `/new`, `/retry`, and `/compact` do not consume the
+  queue; the next ordinary prompt or custom command passes every staged file as
+  a repeatable `-a` argument and clears the queue before launching `mu`.
 - While `mu>` mode is active, conflicting line-editor plugins should be
   suspended. Common ZLE helpers such as syntax highlighting and autosuggestions
   may be disabled automatically; additional plugin toggles may be attached with
