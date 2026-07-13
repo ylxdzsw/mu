@@ -754,14 +754,16 @@ async fn run_turn(args: RunTurnArgs<'_>) -> Result<()> {
             if output == cli::OutputFormat::Final {
                 write_final_stdout(r.final_assistant.as_deref())?;
             } else {
+                let turn_elapsed = turn_started.elapsed();
                 renderer.turn_summary(
                     r.usage.visible_input_tokens(),
                     r.usage.cache_read_input_tokens,
                     r.usage.cache_write_input_tokens,
                     r.usage.visible_output_tokens(),
                     ctx_pct,
+                    turn_elapsed,
                 )?;
-                renderer.turn_done_bell(turn_started.elapsed())?;
+                renderer.turn_done_bell(turn_elapsed)?;
             }
         }
         Err(error) => {

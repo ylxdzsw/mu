@@ -650,6 +650,7 @@ impl Renderer {
         cache_write_input_tokens: Option<u64>,
         output_tokens: u64,
         context_pct: Option<f64>,
+        elapsed: Duration,
     ) -> io::Result<()> {
         if self.final_only {
             return Ok(());
@@ -660,17 +661,19 @@ impl Renderer {
         if self.has_committed_stdout {
             self.stderr.write_all(b"\n")?;
         }
-        write!(
-            self.stderr,
-            "{}\n\n",
-            format_turn_summary(
-                input_tokens,
-                cache_read_input_tokens,
-                cache_write_input_tokens,
-                output_tokens,
-                context_pct,
-            )
-        )?;
+        let summary = format_turn_summary(
+            input_tokens,
+            cache_read_input_tokens,
+            cache_write_input_tokens,
+            output_tokens,
+            context_pct,
+            elapsed,
+        );
+        if self.styled {
+            write!(self.stderr, "{GRAY}{summary}{RESET}\n\n")?;
+        } else {
+            write!(self.stderr, "{summary}\n\n")?;
+        }
         self.stderr.flush()
     }
 
@@ -3026,23 +3029,47 @@ fn format_turn_summary(
     cache_write_input_tokens: Option<u64>,
     output_tokens: u64,
     context_pct: Option<f64>,
+    elapsed: Duration,
 ) -> String {
     let ctx = context_pct
         .map(|p| format!("{p:.0}%"))
         .unwrap_or_else(|| "?".into());
     let mut cache = Vec::new();
     if cache_read_input_tokens > 0 {
-        cache.push(format!("{cache_read_input_tokens} cache read"));
+        cache.push(format!(
+            "+{} cache read",
+            format_number(cache_read_input_tokens)
+        ));
     }
     if let Some(cache_write_input_tokens) = cache_write_input_tokens {
-        cache.push(format!("{cache_write_input_tokens} cache write"));
+        cache.push(format!(
+            "+{} cache write",
+            format_number(cache_write_input_tokens)
+        ));
     }
     let cache = if cache.is_empty() {
         String::new()
     } else {
         format!(" ({})", cache.join(", "))
     };
-    format!("[mu] tokens: {input_tokens} in{cache} / {output_tokens} out  context: {ctx}")
+    format!(
+        "[mu] tokens: {} in{cache} / {} out  context: {ctx}  time: {}",
+        format_number(input_tokens),
+        format_number(output_tokens),
+        format_duration(elapsed),
+    )
+}
+
+fn format_number(number: u64) -> String {
+    let digits = number.to_string();
+    let mut grouped = String::with_capacity(digits.len() + digits.len() / 3);
+    for (index, byte) in digits.bytes().enumerate() {
+        if index > 0 && (digits.len() - index) % 3 == 0 {
+            grouped.push(',');
+        }
+        grouped.push(byte as char);
+    }
+    grouped
 }
 
 struct LinePreview {
@@ -3679,6 +3706,10 @@ mod tests {
         let raw = capture_renderer_transcript(Duration::from_secs(12), Some("mu> "));
         let normalized = strip_ansi(&raw.replace('\r', ""));
 
+        assert!(raw.contains(&format!(
+            "{GRAY}[mu] tokens: 12 in / 5 out  context: 25%  time: 12.0s{RESET}"
+        )));
+
         assert!(normalized.contains(
             "$ printf 'line01\\nline02\\nline03\\n'\n[guardrail: allow] risk=low auth=explicit"
         ));
@@ -3690,24 +3721,33 @@ mod tests {
             "{normalized:?}"
         );
         assert!(normalized.contains(
-            "✓ exit 0 · 250ms\n\nDone.\n\n[mu] tokens: 12 in / 5 out  context: 25%\n\nmu> "
+            "✓ exit 0 · 250ms\n\nDone.\n\n[mu] tokens: 12 in / 5 out  context: 25%  time: 12.0s\n\nmu> "
         ));
-        assert!(!normalized.contains("[mu] tokens: 12 in / 5 out  context: 25%\n\n\nmu> "));
+        assert!(
+            !normalized.contains("[mu] tokens: 12 in / 5 out  context: 25%  time: 12.0s\n\n\nmu> ")
+        );
     }
 
     #[test]
     fn turn_summary_shows_reported_cache_usage_without_a_total() {
         assert_eq!(
-            format_turn_summary(600, 500, Some(134), 456, Some(12.0)),
-            "[mu] tokens: 600 in (500 cache read, 134 cache write) / 456 out  context: 12%"
+            format_turn_summary(
+                1_234,
+                567,
+                Some(89),
+                12_345,
+                Some(12.0),
+                Duration::from_millis(4200),
+            ),
+            "[mu] tokens: 1,234 in (+567 cache read, +89 cache write) / 12,345 out  context: 12%  time: 4.2s"
         );
         assert_eq!(
-            format_turn_summary(600, 500, None, 456, Some(12.0)),
-            "[mu] tokens: 600 in (500 cache read) / 456 out  context: 12%"
+            format_turn_summary(600, 500, None, 456, Some(12.0), Duration::from_millis(932),),
+            "[mu] tokens: 600 in (+500 cache read) / 456 out  context: 12%  time: 932ms"
         );
         assert_eq!(
-            format_turn_summary(600, 0, None, 456, Some(12.0)),
-            "[mu] tokens: 600 in / 456 out  context: 12%"
+            format_turn_summary(600, 0, None, 456, Some(12.0), Duration::from_millis(1100),),
+            "[mu] tokens: 600 in / 456 out  context: 12%  time: 1.1s"
         );
     }
 
@@ -3757,7 +3797,9 @@ mod tests {
         renderer.assistant_text("Done.\n").unwrap();
         renderer.assistant_end().unwrap();
         renderer.finish_turn().unwrap();
-        renderer.turn_summary(12, 0, None, 5, Some(25.0)).unwrap();
+        renderer
+            .turn_summary(12, 0, None, 5, Some(25.0), turn_elapsed)
+            .unwrap();
         renderer.turn_done_bell(turn_elapsed).unwrap();
         if let Some(prompt) = trailing_prompt {
             output.write_raw(prompt);
