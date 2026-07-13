@@ -9,8 +9,8 @@ use tokio::time::{self, MissedTickBehavior};
 
 use crate::models::RequestOptions;
 use crate::provider::{
-    FinishReason, FunctionCall, Message, Provider, ProviderError, StreamEvent, StreamResult,
-    ToolCall, ToolCallDelta as ProviderToolCallDelta, Usage,
+    ContentPart, FinishReason, FunctionCall, Message, Provider, ProviderError, StreamEvent,
+    StreamResult, ToolCall, ToolCallDelta as ProviderToolCallDelta, Usage, UserContent,
 };
 
 /// Bound the connect phase so a dead host fails fast instead of hanging the turn.
@@ -275,7 +275,7 @@ fn build_chat_request_body(
 ) -> Value {
     let mut body = serde_json::json!({
         "model": request.model.model_id.as_str(),
-        "messages": messages,
+        "messages": messages.iter().map(message_json).collect::<Vec<_>>(),
         "tools": tools,
         "stream": true,
         "stream_options": { "include_usage": true }
@@ -301,6 +301,107 @@ fn build_chat_request_body(
         }
     }
     body
+}
+
+fn message_json(message: &Message) -> Value {
+    match message {
+        Message::System { content } => serde_json::json!({
+            "role": "system",
+            "content": content,
+        }),
+        Message::User { content } => serde_json::json!({
+            "role": "user",
+            "content": user_content_json(content),
+        }),
+        Message::Assistant {
+            content,
+            reasoning_content,
+            tool_calls,
+        } => {
+            let mut value = serde_json::json!({
+                "role": "assistant",
+                "content": content,
+            });
+            if let Some(reasoning_content) = reasoning_content {
+                value["reasoning_content"] = Value::String(reasoning_content.clone());
+            }
+            if let Some(tool_calls) = tool_calls {
+                value["tool_calls"] =
+                    serde_json::to_value(tool_calls).expect("serializing tool calls");
+            }
+            value
+        }
+        Message::Tool {
+            content,
+            tool_call_id,
+        } => serde_json::json!({
+            "role": "tool",
+            "content": content,
+            "tool_call_id": tool_call_id,
+        }),
+    }
+}
+
+fn user_content_json(content: &UserContent) -> Value {
+    match content {
+        UserContent::Text(text) => Value::String(text.clone()),
+        UserContent::Parts(parts) => Value::Array(parts.iter().map(content_part_json).collect()),
+    }
+}
+
+fn content_part_json(part: &ContentPart) -> Value {
+    match part {
+        ContentPart::Text { text } => serde_json::json!({
+            "type": "text",
+            "text": text,
+        }),
+        ContentPart::Attachment { attachment } if attachment.media_type.starts_with("image/") => {
+            let encoded = base64_encode(&attachment.data);
+            serde_json::json!({
+                "type": "image_url",
+                "image_url": {
+                    "url": format!("data:{};base64,{encoded}", attachment.media_type),
+                },
+            })
+        }
+        ContentPart::Attachment { attachment } => {
+            let format = match attachment.media_type.as_str() {
+                "audio/wav" => "wav",
+                "audio/mpeg" => "mp3",
+                other => panic!("unsupported attachment media type reached provider: {other}"),
+            };
+            serde_json::json!({
+                "type": "input_audio",
+                "input_audio": {
+                    "data": base64_encode(&attachment.data),
+                    "format": format,
+                },
+            })
+        }
+    }
+}
+
+fn base64_encode(bytes: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let b0 = chunk[0];
+        let b1 = *chunk.get(1).unwrap_or(&0);
+        let b2 = *chunk.get(2).unwrap_or(&0);
+        out.push(TABLE[(b0 >> 2) as usize] as char);
+        out.push(TABLE[(((b0 & 0b0000_0011) << 4) | (b1 >> 4)) as usize] as char);
+        if chunk.len() > 1 {
+            out.push(TABLE[(((b1 & 0b0000_1111) << 2) | (b2 >> 6)) as usize] as char);
+        } else {
+            out.push('=');
+        }
+        if chunk.len() > 2 {
+            out.push(TABLE[(b2 & 0b0011_1111) as usize] as char);
+        } else {
+            out.push('=');
+        }
+    }
+    out
 }
 
 fn is_glm_model(model_id: &str) -> bool {
@@ -757,6 +858,52 @@ mod tests {
     }
 
     #[test]
+    fn serializes_image_and_audio_attachments_for_chat_completions() {
+        let messages = vec![Message::User {
+            content: UserContent::Parts(vec![
+                ContentPart::Text {
+                    text: "inspect these".into(),
+                },
+                ContentPart::Attachment {
+                    attachment: crate::provider::Attachment {
+                        filename: "pixel.png".into(),
+                        media_type: "image/png".into(),
+                        data: vec![1, 2, 3],
+                    },
+                },
+                ContentPart::Attachment {
+                    attachment: crate::provider::Attachment {
+                        filename: "beeps.wav".into(),
+                        media_type: "audio/wav".into(),
+                        data: vec![4, 5, 6],
+                    },
+                },
+            ]),
+        }];
+
+        let body = build_chat_request_body(
+            &RequestOptions {
+                model: test_model(None),
+            },
+            &messages,
+            &[],
+        );
+
+        assert_eq!(body["messages"][0]["content"][0]["type"], "text");
+        assert_eq!(
+            body["messages"][0]["content"][1]["image_url"]["url"],
+            "data:image/png;base64,AQID"
+        );
+        assert_eq!(
+            body["messages"][0]["content"][2],
+            serde_json::json!({
+                "type": "input_audio",
+                "input_audio": { "data": "BAUG", "format": "wav" }
+            })
+        );
+    }
+
+    #[test]
     fn replays_reasoning_content_only_when_preserved_thinking_is_enabled() {
         let messages = vec![Message::Assistant {
             content: None,
@@ -880,8 +1027,7 @@ mod tests {
             tokio::time::sleep(Duration::from_secs(30)).await;
         });
 
-        let mut provider =
-            OpenAiProvider::new(format!("http://{addr}"), None);
+        let mut provider = OpenAiProvider::new(format!("http://{addr}"), None);
         provider.idle_timeout = Duration::from_millis(200);
 
         let request = RequestOptions {

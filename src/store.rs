@@ -4,9 +4,13 @@ use fs2::FileExt;
 
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension, params};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-use crate::provider::{Message, ToolCall, Usage, UserContent, approx_tokens};
+use crate::provider::{
+    Attachment, ContentPart, Message, ToolCall, Usage, UserContent, approx_tokens,
+};
 use crate::tools::BashRisk;
 
 #[derive(Debug, Clone)]
@@ -83,7 +87,7 @@ impl std::fmt::Display for SessionBusy {
 
 impl std::error::Error for SessionBusy {}
 
-const CURRENT_SCHEMA_VERSION: i32 = 3;
+const CURRENT_SCHEMA_VERSION: i32 = 4;
 
 fn session_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Session> {
     Ok(Session {
@@ -134,15 +138,20 @@ impl Store {
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .context("reading SQLite schema version")?;
         match version {
-            0 if !self.has_application_tables()? => self.create_schema_v3(),
+            0 if !self.has_application_tables()? => self.create_schema_v4(),
             0 => anyhow::bail!(
                 "unsupported pre-release session database schema; remove sessions.db to create a fresh release database"
             ),
             1 => {
                 self.migrate_v1_to_v2()?;
-                self.migrate_v2_to_v3()
+                self.migrate_v2_to_v3()?;
+                self.migrate_v3_to_v4()
             }
-            2 => self.migrate_v2_to_v3(),
+            2 => {
+                self.migrate_v2_to_v3()?;
+                self.migrate_v3_to_v4()
+            }
+            3 => self.migrate_v3_to_v4(),
             CURRENT_SCHEMA_VERSION => Ok(()),
             future => anyhow::bail!(
                 "unsupported future session database schema version {future}; this mu supports version {CURRENT_SCHEMA_VERSION}"
@@ -161,7 +170,7 @@ impl Store {
         Ok(count > 0)
     }
 
-    fn create_schema_v3(&self) -> Result<()> {
+    fn create_schema_v4(&self) -> Result<()> {
         self.conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS session (
                 id TEXT PRIMARY KEY,
@@ -210,6 +219,12 @@ impl Store {
                 FOREIGN KEY(session_id) REFERENCES session(id)
             );
             CREATE INDEX IF NOT EXISTS idx_turn_usage_session_id ON turn_usage(session_id);
+            CREATE TABLE IF NOT EXISTS attachment_blob (
+                id TEXT PRIMARY KEY,
+                data BLOB NOT NULL,
+                size INTEGER NOT NULL,
+                created_at TEXT NOT NULL
+            );
             CREATE TABLE IF NOT EXISTS review (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 session_id TEXT NOT NULL,
@@ -221,7 +236,7 @@ impl Store {
                 reason TEXT,
                 created_at TEXT NOT NULL
             );
-            PRAGMA user_version = 3;",
+            PRAGMA user_version = 4;",
         )?;
         Ok(())
     }
@@ -238,6 +253,19 @@ impl Store {
         self.conn.execute_batch(
             "ALTER TABLE session DROP COLUMN archived;
              PRAGMA user_version = 3;",
+        )?;
+        Ok(())
+    }
+
+    fn migrate_v3_to_v4(&self) -> Result<()> {
+        self.conn.execute_batch(
+            "CREATE TABLE attachment_blob (
+                id TEXT PRIMARY KEY,
+                data BLOB NOT NULL,
+                size INTEGER NOT NULL,
+                created_at TEXT NOT NULL
+             );
+             PRAGMA user_version = 4;",
         )?;
         Ok(())
     }
@@ -505,7 +533,7 @@ impl Store {
             ) = row?;
             match role.as_str() {
                 "user" => messages.push(Message::User {
-                    content: load_user_content(content, user_content_json),
+                    content: load_user_content(&self.conn, content, user_content_json)?,
                 }),
                 "assistant" => {
                     let tool_calls = tool_calls_json
@@ -766,10 +794,113 @@ pub fn write_session_id(path: &Path, id: &str) -> Result<()> {
     Ok(())
 }
 
-fn load_user_content(content: String, user_content_json: Option<String>) -> UserContent {
-    user_content_json
-        .and_then(|json| serde_json::from_str(&json).ok())
-        .unwrap_or(UserContent::Text(content))
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(untagged)]
+enum PersistedUserContent {
+    Text(String),
+    Parts(Vec<PersistedContentPart>),
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum PersistedContentPart {
+    Text { text: String },
+    Attachment { attachment: PersistedAttachment },
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct PersistedAttachment {
+    blob_id: String,
+    filename: String,
+    media_type: String,
+}
+
+fn load_user_content(
+    conn: &Connection,
+    content: String,
+    user_content_json: Option<String>,
+) -> Result<UserContent> {
+    let Some(json) = user_content_json else {
+        return Ok(UserContent::Text(content));
+    };
+    let persisted = match serde_json::from_str::<PersistedUserContent>(&json) {
+        Ok(persisted) => persisted,
+        Err(_) => return Ok(UserContent::Text(content)),
+    };
+    match persisted {
+        PersistedUserContent::Text(text) => Ok(UserContent::Text(text)),
+        PersistedUserContent::Parts(parts) => parts
+            .into_iter()
+            .map(|part| match part {
+                PersistedContentPart::Text { text } => Ok(ContentPart::Text { text }),
+                PersistedContentPart::Attachment { attachment } => {
+                    let data = conn
+                        .query_row(
+                            "SELECT data FROM attachment_blob WHERE id = ?1",
+                            params![attachment.blob_id],
+                            |row| row.get::<_, Vec<u8>>(0),
+                        )
+                        .optional()?
+                        .with_context(|| {
+                            format!("missing attachment blob {}", attachment.blob_id)
+                        })?;
+                    let actual_id = attachment_blob_id(&data);
+                    if actual_id != attachment.blob_id {
+                        anyhow::bail!("corrupt attachment blob {}", attachment.blob_id);
+                    }
+                    Ok(ContentPart::Attachment {
+                        attachment: Attachment {
+                            filename: attachment.filename,
+                            media_type: attachment.media_type,
+                            data,
+                        },
+                    })
+                }
+            })
+            .collect::<Result<Vec<_>>>()
+            .map(UserContent::Parts),
+    }
+}
+
+fn persist_user_content(
+    tx: &rusqlite::Transaction<'_>,
+    content: &UserContent,
+    now: &str,
+) -> Result<String> {
+    let persisted = match content {
+        UserContent::Text(text) => PersistedUserContent::Text(text.clone()),
+        UserContent::Parts(parts) => PersistedUserContent::Parts(
+            parts
+                .iter()
+                .map(|part| match part {
+                    ContentPart::Text { text } => {
+                        Ok(PersistedContentPart::Text { text: text.clone() })
+                    }
+                    ContentPart::Attachment { attachment } => {
+                        let blob_id = attachment_blob_id(&attachment.data);
+                        tx.execute(
+                            "INSERT OR IGNORE INTO attachment_blob (id, data, size, created_at)
+                             VALUES (?1, ?2, ?3, ?4)",
+                            params![blob_id, attachment.data, attachment.data.len() as i64, now],
+                        )?;
+                        Ok(PersistedContentPart::Attachment {
+                            attachment: PersistedAttachment {
+                                blob_id,
+                                filename: attachment.filename.clone(),
+                                media_type: attachment.media_type.clone(),
+                            },
+                        })
+                    }
+                })
+                .collect::<Result<Vec<_>>>()?,
+        ),
+    };
+    Ok(serde_json::to_string(&persisted)?)
+}
+
+fn attachment_blob_id(data: &[u8]) -> String {
+    let digest = Sha256::digest(data);
+    digest.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 fn load_context_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ContextRow> {
@@ -799,7 +930,7 @@ fn insert_message_in(
     let seq = next_seq_in(tx, session_id)?;
     match message {
         Message::User { content } => {
-            let user_content_json = serde_json::to_string(content)?;
+            let user_content_json = persist_user_content(tx, content, now)?;
             tx.execute(
                 "INSERT INTO message (session_id, role, content, user_content_json, seq, created_at)
                  VALUES (?1, 'user', ?2, ?3, ?4, ?5)",
@@ -870,7 +1001,7 @@ fn has_tool_calls(json: Option<&str>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::provider::{ContentPart, FunctionCall, ImageUrl, ToolCall};
+    use crate::provider::{Attachment, ContentPart, FunctionCall, ToolCall};
 
     fn temp_store() -> (Store, std::path::PathBuf) {
         let tmp = std::env::temp_dir().join(format!("mu-store-{}", uuid::Uuid::new_v4()));
@@ -982,7 +1113,14 @@ mod tests {
             .unwrap();
         assert_eq!(
             tables,
-            vec!["message", "review", "session", "tool_call", "turn_usage"]
+            vec![
+                "attachment_blob",
+                "message",
+                "review",
+                "session",
+                "tool_call",
+                "turn_usage"
+            ]
         );
         let message_columns = store
             .conn
@@ -1140,28 +1278,60 @@ mod tests {
     }
 
     #[test]
-    fn reloads_full_user_content_with_images() {
-        let (store, tmp) = temp_store();
-        let session = create_session_with_system(&store);
-        let expected_image_url = "data:image/png;base64,abcd".to_string();
+    fn migrates_v3_database_with_attachment_blob_table() {
+        let tmp = std::env::temp_dir().join(format!("mu-store-v3-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let db = tmp.join("mu.db");
+        let conn = Connection::open(&db).unwrap();
+        conn.execute_batch("PRAGMA user_version = 3;").unwrap();
+        drop(conn);
 
-        store
-            .append_message(
-                &session.id,
-                &Message::User {
-                    content: UserContent::Parts(vec![
-                        ContentPart::Text {
-                            text: "describe this".to_string(),
-                        },
-                        ContentPart::ImageUrl {
-                            image_url: ImageUrl {
-                                url: expected_image_url.clone(),
-                            },
-                        },
-                    ]),
-                },
+        let store = Store::open(&db).unwrap();
+        let version: i32 = store
+            .conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, CURRENT_SCHEMA_VERSION);
+        let has_blob_table: bool = store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM sqlite_schema WHERE type = 'table' AND name = 'attachment_blob'",
+                [],
+                |row| row.get(0),
             )
             .unwrap();
+        assert!(has_blob_table);
+
+        let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    #[test]
+    fn reloads_full_user_content_with_attachments_and_deduplicates_blobs() {
+        let (store, tmp) = temp_store();
+        let session = create_session_with_system(&store);
+        let expected_data = vec![1, 2, 3, 4];
+
+        for filename in ["first.png", "second.png"] {
+            store
+                .append_message(
+                    &session.id,
+                    &Message::User {
+                        content: UserContent::Parts(vec![
+                            ContentPart::Text {
+                                text: "describe this".to_string(),
+                            },
+                            ContentPart::Attachment {
+                                attachment: Attachment {
+                                    filename: filename.into(),
+                                    media_type: "image/png".into(),
+                                    data: expected_data.clone(),
+                                },
+                            },
+                        ]),
+                    },
+                )
+                .unwrap();
+        }
 
         let messages = store.load_context_messages(&session.id).unwrap();
         let Message::User {
@@ -1177,8 +1347,30 @@ mod tests {
         ));
         assert!(matches!(
             &parts[1],
-            ContentPart::ImageUrl { image_url } if image_url.url == expected_image_url
+            ContentPart::Attachment { attachment }
+                if attachment.filename == "first.png"
+                    && attachment.media_type == "image/png"
+                    && attachment.data == expected_data
         ));
+        let blob_count: i64 = store
+            .conn
+            .query_row("SELECT COUNT(*) FROM attachment_blob", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(blob_count, 1);
+
+        store
+            .conn
+            .execute("UPDATE attachment_blob SET data = X'FF'", [])
+            .unwrap();
+        let error = store.load_context_messages(&session.id).unwrap_err();
+        assert!(error.to_string().contains("corrupt attachment blob"));
+
+        store
+            .conn
+            .execute("DELETE FROM attachment_blob", [])
+            .unwrap();
+        let error = store.load_context_messages(&session.id).unwrap_err();
+        assert!(error.to_string().contains("missing attachment blob"));
 
         let _ = std::fs::remove_dir_all(tmp);
     }

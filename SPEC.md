@@ -2,7 +2,7 @@
 
 `mu` is a small, composable agent runtime for the terminal: one prompt in, one
 completed agent turn out. The core `mu` binary reads a prompt on stdin, accepts
-attached inputs such as images, runs an agent loop, streams turn events in the
+attached image and audio inputs, runs an agent loop, streams turn events in the
 selected output format, persists completed messages, and exits. Interactive
 shell use builds around that simple turn unit instead of changing it.
 
@@ -180,7 +180,7 @@ repeated turn invocations, not a replacement runtime.
 ### Binary module responsibilities
 
 - **Entry.** Resolve project/config/session scope, parse args (`--session`,
-  `--continue-latest`, `--image`, `--output`, subcommands), read the prompt from
+  `--continue-latest`, `--attach`, `--output`, subcommands), read the prompt from
   stdin, run one turn, persisting each completed message as it lands (§11), exit.
 - **Agent loop.** Send context to the provider, stream the response, execute
   tool calls, loop until the model stops requesting tools, yield final text.
@@ -203,12 +203,13 @@ The core binary is invoked one of two ways: as a **turn** (default, reads a
 prompt on stdin) or as a **subcommand** (management; manual compaction alone
 accepts optional non-terminal stdin as a custom focus). The surface is small:
 
-- `mu [-s <id>] [-c] [--model <id>] [-i <image>] [--output final|plain|terminal]`
-  — run one turn; prompt read from stdin. `-i/--image` is repeatable.
-- `mu [-s <id>] [-c] [--model <id>] [-i <image>] [--output final|plain|terminal] <prompt-file>`
+- `mu [-s <id>] [-c] [--model <id>] [-a <file>] [--output final|plain|terminal]`
+  — run one turn; prompt read from stdin. `-a/--attach` is repeatable and accepts
+  supported image or audio files.
+- `mu [-s <id>] [-c] [--model <id>] [-a <file>] [--output final|plain|terminal] <prompt-file>`
   — run one turn from a prompt file; if the first line starts with `#!`, drop
   it before sending the prompt. Non-terminal stdin is appended as a custom
-  instruction. `-i/--image` is repeatable.
+  instruction. `-a/--attach` is repeatable.
 - `mu [-s <id>] [-c] [--model <id>] [--output final|plain|terminal] <custom-command>`
   — run a discovered shebang command from the active project/global `.mu`
   instruction index. Command names are relative `.mu` paths including
@@ -256,7 +257,9 @@ it in this order:
 
 1. **Parse args**, resolve the active scope from the invoking `pwd` (§9), read
    the resolved prompt source (stdin, prompt file, or custom command), and load
-   any attached inputs such as repeatable `-i/--image` image files.
+   any repeatable `-a/--attach` image or audio files. Each attachment must be at
+   most 20 MiB and must be PNG, JPEG, WebP, GIF, WAV, or MP3 content matching
+   its filename extension.
 2. **Load config** (§9): global first, then project config over it when a
    project is active. If the provider's required fields are missing, print an
    error to stderr and exit non-zero (§7). Resolve the effective model:
@@ -290,9 +293,10 @@ it in this order:
    `last_total_tokens` (or bytes÷4 on the first turn) exceeds the configured
    fraction of the model context window, run compaction now, then rebuild the
    context list.
-8. **Append the new user message** to the DB and to the context list. If images
-   were attached, persist and reload the full multi-part user content
-   (text + image URLs), not only the textual projection. (`mu retry` skips this
+8. **Append the new user message** to the DB and to the context list. If files
+   were attached, persist attachment metadata with the multi-part user content,
+   store deduplicated bytes in SQLite, and reload the hydrated text + attachment
+   parts rather than only the textual projection. (`mu retry` skips this
    step: it resumes the existing, now-normalized history with no new prompt.)
 9. **Agent loop** — repeat until the model returns `finish_reason: "stop"` or the
    max-iterations cap is hit:
@@ -938,12 +942,16 @@ Conceptual schema (flat and small):
   `content`, optional full user content JSON for multi-part inputs, `created_at`,
   ordering index, and for tool results `tool_call_id`. Provider-neutral
   representation. The first message in a new session is the persisted system
-  prompt. For user messages with image attachments, `content` remains a textual
-  projection for listing/token estimates, while the full text+image parts are
-  persisted and reloaded for model context. A `summary` row is a compaction
+  prompt. For user messages with image or audio attachments, `content` remains
+  a textual projection for listing/token estimates, while attachment metadata
+  references content-addressed bytes stored once in SQLite. The full hydrated
+  parts are reloaded for model context. A `summary` row is a compaction
   summary (§"Context window and compaction"); the context builder keeps the
   leading system message, then starts from the latest `summary` row and includes
   everything after it.
+- **attachment_blob** — content-addressed attachment bytes keyed by SHA-256,
+  with byte size and creation time. Message content stores filename, MIME type,
+  and blob reference metadata; identical bytes are stored once per scope DB.
 - **tool_call** — `id`, `message_id`, `tool`, `args` (JSON), `risk`, `output`,
   `status` (`ok` / `error` / `interrupted`), timings. Records the agent's tool
   invocations for inspection and the renderer's truncation pointers. (Tool

@@ -33,8 +33,8 @@ pub struct TurnArgs {
     #[command(flatten)]
     pub selection: SelectionArgs,
 
-    #[arg(short = 'i', long = "image")]
-    pub images: Vec<PathBuf>,
+    #[arg(short = 'a', long = "attach", value_name = "FILE")]
+    pub attachments: Vec<PathBuf>,
 
     #[arg(long, value_enum, default_value_t = OutputFormat::Terminal)]
     pub output: OutputFormat,
@@ -149,8 +149,10 @@ mod tests {
             "plain",
             "--model",
             "gpt-test",
-            "-i",
+            "-a",
             "image.png",
+            "--attach",
+            "audio.wav",
             "prompt.md",
         ])
         .unwrap();
@@ -158,7 +160,15 @@ mod tests {
         assert!(args.command.is_none());
         assert_eq!(args.turn.output, OutputFormat::Plain);
         assert_eq!(args.turn.selection.model.as_deref(), Some("gpt-test"));
-        assert_eq!(args.turn.images, vec![PathBuf::from("image.png")]);
+        assert_eq!(
+            args.turn.attachments,
+            vec![PathBuf::from("image.png"), PathBuf::from("audio.wav")]
+        );
+    }
+
+    #[test]
+    fn rejects_removed_image_option() {
+        assert!(Args::try_parse_from(["mu", "-i", "image.png"]).is_err());
     }
 
     #[test]

@@ -34,7 +34,7 @@ mod truncate;
 use cli::{Args, Command, ProjectSub, SessionSub};
 use config::Config;
 use models::RequestOptions;
-use provider::{ContentPart, ImageUrl, UserContent};
+use provider::{Attachment, ContentPart, UserContent};
 use provider::{Provider, build_provider};
 use renderer::Renderer;
 use runtime::{InvocationOverrides, StatusReport, build_status_report, resolve_invocation};
@@ -505,7 +505,7 @@ async fn run_turn_from_source(
     prompt_source: PromptSource,
 ) -> Result<()> {
     let prompt = load_prompt(prompt_source)?;
-    let attachments = load_image_attachments(&turn.images)?;
+    let attachments = load_attachments(&turn.attachments)?;
 
     let config = Config::load_for_scope(project_config_dir)?;
 
@@ -893,59 +893,83 @@ fn print_status_report(report: &StatusReport) {
     println!("supported effort levels: {effort_levels}");
 }
 
-fn load_image_attachments(paths: &[PathBuf]) -> Result<Vec<ContentPart>> {
+const MAX_ATTACHMENT_BYTES: u64 = 20 * 1024 * 1024;
+
+fn load_attachments(paths: &[PathBuf]) -> Result<Vec<ContentPart>> {
     paths
         .iter()
         .map(|path| {
-            let mime = image_mime(path)?;
+            let metadata = std::fs::metadata(path)
+                .with_context(|| format!("reading attachment metadata {}", path.display()))?;
+            if metadata.len() > MAX_ATTACHMENT_BYTES {
+                bail!(
+                    "attachment exceeds 20 MiB limit: {} ({} bytes)",
+                    path.display(),
+                    metadata.len()
+                );
+            }
             let bytes = std::fs::read(path)
-                .with_context(|| format!("reading image attachment {}", path.display()))?;
-            let encoded = base64_encode(&bytes);
-            Ok(ContentPart::ImageUrl {
-                image_url: ImageUrl {
-                    url: format!("data:{mime};base64,{encoded}"),
+                .with_context(|| format!("reading attachment {}", path.display()))?;
+            if bytes.len() as u64 > MAX_ATTACHMENT_BYTES {
+                bail!(
+                    "attachment exceeds 20 MiB limit: {} ({} bytes)",
+                    path.display(),
+                    bytes.len()
+                );
+            }
+            let media_type = attachment_media_type(path, &bytes)?;
+            let filename = path
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| path.display().to_string());
+            Ok(ContentPart::Attachment {
+                attachment: Attachment {
+                    filename,
+                    media_type: media_type.to_string(),
+                    data: bytes,
                 },
             })
         })
         .collect()
 }
 
-fn image_mime(path: &std::path::Path) -> Result<&'static str> {
-    match path
+fn attachment_media_type(path: &std::path::Path, bytes: &[u8]) -> Result<&'static str> {
+    let extension = path
         .extension()
         .and_then(|ext| ext.to_str())
         .map(|ext| ext.to_ascii_lowercase())
-        .as_deref()
+        .unwrap_or_default();
+    let detected = if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        Some(("png", "image/png"))
+    } else if bytes.starts_with(&[0xff, 0xd8, 0xff]) {
+        Some(("jpeg", "image/jpeg"))
+    } else if bytes.len() >= 12 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
+        Some(("webp", "image/webp"))
+    } else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        Some(("gif", "image/gif"))
+    } else if bytes.len() >= 12 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WAVE" {
+        Some(("wav", "audio/wav"))
+    } else if bytes.starts_with(b"ID3")
+        || (bytes.len() >= 2 && bytes[0] == 0xff && bytes[1] & 0xe0 == 0xe0)
     {
-        Some("png") => Ok("image/png"),
-        Some("jpg") | Some("jpeg") => Ok("image/jpeg"),
-        Some("webp") => Ok("image/webp"),
-        Some("gif") => Ok("image/gif"),
-        _ => bail!("unsupported image attachment type: {}", path.display()),
+        Some(("mp3", "audio/mpeg"))
+    } else {
+        None
+    };
+    let Some((format, media_type)) = detected else {
+        bail!("unsupported attachment type: {}", path.display());
+    };
+    let extension_matches = match format {
+        "jpeg" => matches!(extension.as_str(), "jpg" | "jpeg"),
+        other => extension == other,
+    };
+    if !extension_matches {
+        bail!(
+            "attachment extension does not match detected {format} content: {}",
+            path.display()
+        );
     }
-}
-
-fn base64_encode(bytes: &[u8]) -> String {
-    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
-    for chunk in bytes.chunks(3) {
-        let b0 = chunk[0];
-        let b1 = *chunk.get(1).unwrap_or(&0);
-        let b2 = *chunk.get(2).unwrap_or(&0);
-        out.push(TABLE[(b0 >> 2) as usize] as char);
-        out.push(TABLE[(((b0 & 0b0000_0011) << 4) | (b1 >> 4)) as usize] as char);
-        if chunk.len() > 1 {
-            out.push(TABLE[(((b1 & 0b0000_1111) << 2) | (b2 >> 6)) as usize] as char);
-        } else {
-            out.push('=');
-        }
-        if chunk.len() > 2 {
-            out.push(TABLE[(b2 & 0b0011_1111) as usize] as char);
-        } else {
-            out.push('=');
-        }
-    }
-    out
+    Ok(media_type)
 }
 
 #[cfg(test)]
@@ -1047,6 +1071,42 @@ mod tests {
         std::fs::remove_file(&path).unwrap();
         assert!(err.to_string().contains("reading prompt file"));
         assert!(err.to_string().contains(path.to_string_lossy().as_ref()));
+    }
+
+    #[test]
+    fn detects_supported_attachment_media_types_and_mismatches() {
+        assert_eq!(
+            attachment_media_type(std::path::Path::new("image.png"), b"\x89PNG\r\n\x1a\nrest")
+                .unwrap(),
+            "image/png"
+        );
+        assert_eq!(
+            attachment_media_type(
+                std::path::Path::new("audio.wav"),
+                b"RIFF\x00\x00\x00\x00WAVErest"
+            )
+            .unwrap(),
+            "audio/wav"
+        );
+        assert_eq!(
+            attachment_media_type(std::path::Path::new("audio.mp3"), b"ID3rest").unwrap(),
+            "audio/mpeg"
+        );
+        let error =
+            attachment_media_type(std::path::Path::new("wrong.jpg"), b"\x89PNG\r\n\x1a\nrest")
+                .unwrap_err();
+        assert!(error.to_string().contains("extension does not match"));
+    }
+
+    #[test]
+    fn rejects_oversized_attachment_before_reading_it() {
+        let path = std::env::temp_dir().join(format!("mu-oversized-{}.wav", uuid::Uuid::new_v4()));
+        let file = std::fs::File::create(&path).unwrap();
+        file.set_len(MAX_ATTACHMENT_BYTES + 1).unwrap();
+        drop(file);
+        let error = load_attachments(std::slice::from_ref(&path)).unwrap_err();
+        std::fs::remove_file(path).unwrap();
+        assert!(error.to_string().contains("exceeds 20 MiB limit"));
     }
 
     #[test]

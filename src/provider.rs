@@ -7,8 +7,7 @@ use serde_json::Value;
 use crate::config::Config;
 use crate::models::RequestOptions;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "role", rename_all = "lowercase")]
+#[derive(Debug, Clone)]
 pub enum Message {
     System {
         content: String,
@@ -17,13 +16,10 @@ pub enum Message {
         content: UserContent,
     },
     Assistant {
-        #[serde(skip_serializing_if = "Option::is_none")]
         content: Option<String>,
         /// Opaque provider reasoning. This is persisted and replayed verbatim
         /// only for models that require it (for example DeepSeek thinking mode).
-        #[serde(skip_serializing_if = "Option::is_none")]
         reasoning_content: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
         tool_calls: Option<Vec<ToolCall>>,
     },
     Tool {
@@ -32,8 +28,7 @@ pub enum Message {
     },
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(untagged)]
+#[derive(Debug, Clone)]
 pub enum UserContent {
     Text(String),
     Parts(Vec<ContentPart>),
@@ -47,7 +42,7 @@ impl UserContent {
                 .iter()
                 .filter_map(|part| match part {
                     ContentPart::Text { text, .. } => Some(text.as_str()),
-                    ContentPart::ImageUrl { .. } => None,
+                    ContentPart::Attachment { .. } => None,
                 })
                 .collect::<Vec<_>>()
                 .join("\n"),
@@ -67,16 +62,17 @@ impl From<&str> for UserContent {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
+#[derive(Debug, Clone)]
 pub enum ContentPart {
     Text { text: String },
-    ImageUrl { image_url: ImageUrl },
+    Attachment { attachment: Attachment },
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ImageUrl {
-    pub url: String,
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Attachment {
+    pub filename: String,
+    pub media_type: String,
+    pub data: Vec<u8>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
