@@ -214,6 +214,39 @@ MU_ZSH_BIN=$prompt_fake_bin/mu
 escaped_global_pwd=${global_pwd//\%/%%}
 [[ "$global_prompt" == *"%F{39}${escaped_global_pwd}%f %F{245}(global)%f"* ]] || fail "shows global marker outside project scope"
 
+unclean_fake_bin=$tmpdir/unclean-bin
+mkdir -p -- "$unclean_fake_bin"
+cat > "$unclean_fake_bin/mu" <<'EOF'
+#!/usr/bin/env zsh
+if [[ "$1" == "status" ]]; then
+  print -r -- '{"model":{"provider_id":"test","model_id":"m","effort":null,"canonical":"m"},"context_percent":25.0,"project_root":null,"clean":false}'
+  exit 0
+fi
+exit 1
+EOF
+chmod +x "$unclean_fake_bin/mu"
+MU_ZSH_BIN=$unclean_fake_bin/mu
+unclean_prompt=$(_mu_zsh_build_mode_prompt)
+MU_ZSH_BIN=$prompt_fake_bin/mu
+escaped_unclean=${MU_ZSH_PROMPT_UNCLEAN_TEXT//\%/%%}
+[[ "$unclean_prompt" == *"%F{$MU_ZSH_PROMPT_UNCLEAN_COLOR}[${escaped_unclean}]%f"* ]] || fail "shows unclean marker when last turn was interrupted"
+
+clean_fake_bin=$tmpdir/clean-bin
+mkdir -p -- "$clean_fake_bin"
+cat > "$clean_fake_bin/mu" <<'EOF'
+#!/usr/bin/env zsh
+if [[ "$1" == "status" ]]; then
+  print -r -- '{"model":{"provider_id":"test","model_id":"m","effort":null,"canonical":"m"},"context_percent":25.0,"project_root":null,"clean":true}'
+  exit 0
+fi
+exit 1
+EOF
+chmod +x "$clean_fake_bin/mu"
+MU_ZSH_BIN=$clean_fake_bin/mu
+clean_prompt=$(_mu_zsh_build_mode_prompt)
+MU_ZSH_BIN=$prompt_fake_bin/mu
+[[ "$clean_prompt" != *"[${escaped_unclean}]"* ]] || fail "omits unclean marker when last turn was clean"
+
 MU_ZSH_ORIGINAL_TAB_WIDGET=
 MU_ZSH_ORIGINAL_SLASH_WIDGET=
 _mu_zsh_save_widget_bindings
@@ -542,7 +575,7 @@ printf '%s\n\n' "[mu] tokens: 12 in / 5 out  context: 25%" >&2
 EOF
 chmod +x "$interactive_fake_bin/mu"
 
-interactive_setup="PS1='> '; PATH=${(q)interactive_fake_bin}:\$PATH; export TEST_CAPTURE_ARGS=${(q)interactive_capture_args} TEST_CAPTURE_STDIN=${(q)interactive_capture_stdin} TEST_CAPTURE_CALLS=${(q)interactive_capture_calls}; autoload -Uz compinit; compinit -D; source ${(q)root}/mu.zsh; bindkey -M mumode '^G' _mu_zsh_interrupt"
+interactive_setup="PS1='> '; PATH=${(q)interactive_fake_bin}:\$PATH; export TEST_CAPTURE_ARGS=${(q)interactive_capture_args} TEST_CAPTURE_STDIN=${(q)interactive_capture_stdin} TEST_CAPTURE_CALLS=${(q)interactive_capture_calls}; autoload -Uz compinit; compinit -D; source ${(q)root}/mu.zsh"
 
 interactive_transcript=$tmpdir/transcript
 rm -f -- "$interactive_capture_args" "$interactive_capture_stdin" "$interactive_capture_calls"
@@ -554,13 +587,18 @@ interactive_status=0
   sleep 0.2
   print -rn -- '   '$'\r'
   sleep 0.2
-  print -rn -- 'cancel-me'$'\x07'
+  print -rn -- 'cancel-me'
+  sleep 0.3
+  print -rn -- $'\x03'
   sleep 0.4
   print -rn -- 'hello'$'\r'
   sleep 0.4
   print -rn -- $'\x04'
 } | timeout 5 script -qfec 'TERM=xterm-256color zsh -df' "$interactive_transcript" >/dev/null || interactive_status=$?
-(( interactive_status == 0 )) || fail "interactive transcript exited with status $interactive_status"
+# The real Ctrl-C above is delivered as SIGINT by the tty, so the interactive
+# shell's final status is 130 (128 + SIGINT); the draft cancel is verified from
+# the transcript below rather than from a bespoke interrupt widget.
+(( interactive_status == 0 || interactive_status == 130 )) || fail "interactive transcript exited with status $interactive_status"
 
 normalized=$(perl -pe 's/\e\[[0-?]*[ -\/]*[@-~]//g' "$interactive_transcript" | col -b)
 submitted_display_before_response "$interactive_transcript"
@@ -720,11 +758,15 @@ interactive_status=0
 {
   print -r -- "$interactive_setup"
   sleep 0.2
-  print -rn -- $'\t/\x07'
+  print -rn -- $'\t/'
   sleep 0.4
+  # Real Ctrl-C (SIGINT) cancels the draft and returns to an empty mu> prompt,
+  # so the following Ctrl-D can EOF the shell cleanly.
+  print -rn -- $'\x03'
+  sleep 0.3
   print -rn -- $'\x04'
 } | timeout 5 script -qfec 'TERM=xterm-256color zsh -df' "$slash_listing_transcript" >/dev/null || interactive_status=$?
-(( interactive_status == 0 )) || fail "slash listing transcript exited with status $interactive_status"
+(( interactive_status == 0 || interactive_status == 130 )) || fail "slash listing transcript exited with status $interactive_status"
 
 normalized=$(perl -pe 's/\e\[[0-?]*[ -\/]*[@-~]//g' "$slash_listing_transcript" | col -b)
 [[ "$normalized" == *'/model'* ]] || fail "typing slash should proactively list completion candidates"

@@ -96,11 +96,6 @@ _mu_zsh_set_scope_key_for_dir() {
   REPLY=global
 }
 
-_mu_zsh_scope_key_for_dir() {
-  _mu_zsh_set_scope_key_for_dir "$1"
-  print -r -- "$REPLY"
-}
-
 _mu_zsh_set_current_scope_key() {
   _mu_zsh_set_scope_key_for_dir "$PWD"
 }
@@ -312,22 +307,20 @@ _mu_zsh_build_mode_prompt() {
   local clean unclean_segment
   local escaped_model escaped_context escaped_project_root escaped_unclean_text
 
+  # One jq pass extracts every prompt field as TSV; forking jq per field
+  # dominates prompt-draw latency, so keep this to a single invocation.
+  local tsv
+  local -a fields
   status_json=$(_mu_zsh_status_json) || status_json=
-  if _mu_zsh_json_value_reply "$status_json" '.model.canonical // empty' 2>/dev/null; then
-    model=$REPLY
-  else
-    model=mu
+  if [[ -n "$status_json" ]] && command -v jq >/dev/null 2>&1; then
+    tsv=$(jq -r '[(.model.canonical // ""), (.context_percent // ""), (.project_root // ""), (if has("clean") then (.clean|tostring) else "" end)] | @tsv' <<< "$status_json" 2>/dev/null) || tsv=
   fi
-  if _mu_zsh_json_value_reply "$status_json" '.context_percent // empty' 2>/dev/null; then
-    context_raw=$REPLY
-  else
-    context_raw=
-  fi
-  if _mu_zsh_json_value_reply "$status_json" '.project_root // empty' 2>/dev/null; then
-    project_root=$REPLY
-  else
-    project_root=
-  fi
+  fields=("${(@ps:\t:)tsv}")
+  model=${fields[1]:-}
+  [[ -n "$model" ]] || model=mu
+  context_raw=${fields[2]:-}
+  project_root=${fields[3]:-}
+  clean=${fields[4]:-}
   if [[ -z "$context_raw" || "$context_raw" == null ]]; then
     context=0%
   elif ! printf -v context '%.0f%%' "$context_raw" 2>/dev/null; then
@@ -357,11 +350,6 @@ _mu_zsh_build_mode_prompt() {
 
   # When the tracked session's last turn was interrupted (unclean), surface it
   # so the user knows they can /retry to resume or just type to redirect.
-  if _mu_zsh_json_value_reply "$status_json" 'if has("clean") then .clean else empty end' 2>/dev/null; then
-    clean=$REPLY
-  else
-    clean=
-  fi
   if [[ "$clean" == false ]]; then
     escaped_unclean_text=$MU_ZSH_PROMPT_UNCLEAN_TEXT
     escaped_unclean_text=${escaped_unclean_text//\%/%%}
@@ -489,6 +477,20 @@ _mu_zsh_model_records() {
   ' <<< "$json"
 }
 
+# Count how many providers expose each bare model_id, so a model_id that is
+# unique across providers can be offered as a shorthand alongside its canonical.
+_mu_zsh_count_model_ids() {
+  local counts_var=$1
+  shift
+  local -A counts
+  local record model_id
+  for record in "$@"; do
+    model_id=${${(ps:\t:)record}[2]}
+    [[ -n "$model_id" ]] && counts[$model_id]=$(( ${counts[$model_id]:-0} + 1 ))
+  done
+  set -A "$counts_var" "${(kv)counts[@]}"
+}
+
 _mu_zsh_model_completion_candidates() {
   local fragment=$1
   local -a records matches
@@ -498,13 +500,7 @@ _mu_zsh_model_completion_candidates() {
   records=("${(@f)$(_mu_zsh_model_records 2>/dev/null || true)}")
   (( ${#records[@]} )) || return 0
 
-  for record in "${records[@]}"; do
-    model_id=${${(ps:\t:)record}[2]}
-    if [[ -n "$model_id" ]]; then
-      count=${model_counts[$model_id]:-0}
-      model_counts[$model_id]=$(( count + 1 ))
-    fi
-  done
+  _mu_zsh_count_model_ids model_counts "${records[@]}"
 
   if [[ "$fragment" == *:* ]]; then
     local effort
@@ -552,13 +548,7 @@ _mu_zsh_model_effort_suffixes() {
   records=("${(@f)$(_mu_zsh_model_records 2>/dev/null || true)}")
   (( ${#records[@]} )) || return 0
 
-  for record in "${records[@]}"; do
-    model_id=${${(ps:\t:)record}[2]}
-    if [[ -n "$model_id" ]]; then
-      count=${model_counts[$model_id]:-0}
-      model_counts[$model_id]=$(( count + 1 ))
-    fi
-  done
+  _mu_zsh_count_model_ids model_counts "${records[@]}"
 
   for record in "${records[@]}"; do
     canonical=${${(ps:\t:)record}[1]}
@@ -763,7 +753,8 @@ _mu_zsh_run_custom_slash_command() {
   local exit_status scope session_id
   local -a command
 
-  scope=$(_mu_zsh_current_scope_key)
+  _mu_zsh_set_current_scope_key
+  scope=$REPLY
   _mu_zsh_forget_state_outside_scope "$scope"
   _mu_zsh_base_command_reply "$scope"
   session_id=$MU_ZSH_EFFECTIVE_SESSION_ID
@@ -871,7 +862,8 @@ _mu_zsh_run_slash_command() {
       fi
       resolved_model=$REPLY
       MU_ZSH_MODEL=$resolved_model
-      MU_ZSH_MODEL_SCOPE=$(_mu_zsh_current_scope_key)
+      _mu_zsh_set_current_scope_key
+      MU_ZSH_MODEL_SCOPE=$REPLY
       MU_ZSH_EFFECTIVE_MODEL=$resolved_model
       _mu_zsh_print_block_message "[mu] next turns in this scope will use $resolved_model"
       ;;
@@ -917,7 +909,8 @@ _mu_zsh_run_slash_command() {
       ;;
   esac
 
-  scope=$(_mu_zsh_current_scope_key)
+  _mu_zsh_set_current_scope_key
+  scope=$REPLY
   _mu_zsh_sync_state "$scope"
   _mu_zsh_forget_state_outside_scope "$scope"
   return $exit_status
@@ -969,7 +962,8 @@ _mu_zsh_submit_prompt() {
   local scope session_id
   local -a command
 
-  scope=$(_mu_zsh_current_scope_key)
+  _mu_zsh_set_current_scope_key
+  scope=$REPLY
   _mu_zsh_forget_state_outside_scope "$scope"
 
   _mu_zsh_record_history "$input" "$scope"
@@ -1038,15 +1032,6 @@ _mu_zsh_slash() {
   fi
 
   (( should_complete )) && _mu_zsh_list_slash_choices
-}
-
-_mu_zsh_interrupt() {
-  if [[ "$MU_ZSH_MODE" != mu ]]; then
-    zle send-break
-    return
-  fi
-
-  _mu_zsh_redraw_mode_prompt
 }
 
 _mu_zsh_accept() {
@@ -1119,7 +1104,9 @@ _mu_zsh_configure_keymap() {
   bindkey -M mumode $'\eOA' up-line
   bindkey -M mumode $'\e[B' down-line
   bindkey -M mumode $'\eOB' down-line
-  bindkey -M mumode '^C' _mu_zsh_interrupt
+  # Ctrl-C is intentionally left inherited from the main keymap: real terminals
+  # deliver it as SIGINT (the tty intercepts it before ZLE), which the shell
+  # already handles by cancelling the draft and redrawing a fresh mu> prompt.
 }
 
 _mu_zsh_sync_state
@@ -1136,7 +1123,6 @@ if [[ -o zle ]]; then
   zle -N _mu_zsh_slash
   zle -N _mu_zsh_accept
   zle -N _mu_zsh_insert_newline
-  zle -N _mu_zsh_interrupt
   zle -N _mu_zsh_line_init
   zle -N mu-zsh-mode
   zle -N mu-zsh-exit-mode
