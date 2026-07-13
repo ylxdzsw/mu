@@ -501,6 +501,7 @@ cat > "$interactive_fake_bin/mu" <<'EOF'
 if [ "$1" = "status" ]; then
   model=prompt-test-model
   include_commands=0
+  include_models=0
   while [ "$#" -gt 0 ]; do
     case "$1" in
       --model)
@@ -510,6 +511,9 @@ if [ "$1" = "status" ]; then
       --include-commands)
         include_commands=1
         ;;
+      --include-models)
+        include_models=1
+        ;;
     esac
     shift
   done
@@ -518,7 +522,9 @@ if [ "$1" = "status" ]; then
   model_id=${model#*/}
   [ "$provider" = "$model" ] && provider=test
   model_json="\"model\":{\"provider_id\":\"$provider\",\"model_id\":\"$model_id\",\"effort\":null,\"canonical\":\"$model\"}"
-  if [ "$include_commands" -eq 1 ] && [ -n "$TEST_EXTRA_COMMAND" ]; then
+  if [ "$include_models" -eq 1 ]; then
+    printf '%s\n' "{$model_json,\"context_percent\":25.0,\"project_root\":\"$MU_ZSH_TEST_PROJECT_ROOT\",\"available_models\":{\"providers\":[{\"id\":\"local\",\"models\":[{\"id\":\"local/solo\",\"model_id\":\"solo\",\"supported_efforts\":[\"max\"]},{\"id\":\"local/shared\",\"model_id\":\"shared\",\"supported_efforts\":[]}]},{\"id\":\"openai\",\"models\":[{\"id\":\"openai/gpt\",\"model_id\":\"gpt\",\"supported_efforts\":[\"low\",\"high\"]},{\"id\":\"openai/shared\",\"model_id\":\"shared\",\"supported_efforts\":[\"medium\"]}]}]}}"
+  elif [ "$include_commands" -eq 1 ] && [ -n "$TEST_EXTRA_COMMAND" ]; then
     printf '%s\n' "{$model_json,\"context_percent\":25.0,\"project_root\":\"$MU_ZSH_TEST_PROJECT_ROOT\",\"commands\":[{\"name\":\"$TEST_EXTRA_COMMAND\",\"path\":\"$MU_ZSH_TEST_PROJECT_ROOT/.mu/$TEST_EXTRA_COMMAND\",\"scope\":\"project\"}]}"
   else
     printf '%s\n' "{$model_json,\"context_percent\":25.0,\"project_root\":\"$MU_ZSH_TEST_PROJECT_ROOT\"}"
@@ -759,6 +765,24 @@ interactive_status=0
 normalized=$(perl -pe 's/\e\[[0-?]*[ -\/]*[@-~]//g' "$common_prefix_transcript" | col -b)
 [[ "$normalized" == *'[completion-buffer=/model cursor=6]'* ]] || fail "common-prefix completion should not add a suffix space"
 [[ ! -e "$interactive_capture_calls" || ! -s "$interactive_capture_calls" ]] || fail "common-prefix completion should not submit a prompt"
+
+model_effort_transcript=$tmpdir/model-effort-transcript
+model_effort_setup="$interactive_setup; _mu_test_model_effort_completion() { BUFFER='/model gp'; CURSOR=\${#BUFFER}; _mu_zsh_complete_slash; first_buffer=\$BUFFER; first_cursor=\$CURSOR; _mu_zsh_complete_slash; zle -I; print -r -- \"[first-buffer=\$first_buffer first-cursor=\$first_cursor second-buffer=\$BUFFER second-cursor=\$CURSOR]\"; _mu_zsh_clear_prompt; _mu_zsh_reset_mode_prompt; }; zle -N _mu_test_model_effort_completion; bindkey -M mumode '^T' _mu_test_model_effort_completion"
+rm -f -- "$interactive_capture_args" "$interactive_capture_stdin" "$interactive_capture_calls"
+interactive_status=0
+{
+  print -r -- "$model_effort_setup"
+  sleep 0.2
+  print -rn -- $'\t\x14'
+  sleep 0.4
+  print -rn -- $'\x04'
+} | timeout 5 script -qfec 'TERM=xterm-256color zsh -df' "$model_effort_transcript" >/dev/null || interactive_status=$?
+(( interactive_status == 0 )) || fail "model effort completion transcript exited with status $interactive_status"
+
+normalized=$(perl -pe 's/\e\[[0-?]*[ -\/]*[@-~]//g' "$model_effort_transcript" | col -b)
+[[ "$normalized" == *'[first-buffer=/model gpt first-cursor=10 second-buffer=/model gpt:high second-cursor=15]'* ]] || fail "model completion should leave the cursor at the model, then let zsh select an effort suffix"
+[[ "$normalized" == *':low'* && "$normalized" == *':high'* ]] || fail "model completion should list supported effort suffixes"
+[[ ! -e "$interactive_capture_calls" || ! -s "$interactive_capture_calls" ]] || fail "model effort completion should not submit a prompt"
 
 delete_slash_transcript=$tmpdir/delete-slash-transcript
 delete_slash_setup="$interactive_setup; _mu_test_delete_slash_completion() { BUFFER='/'; CURSOR=1; _mu_zsh_list_slash_choices; zle backward-delete-char; if _mu_zsh_slash_completion_context; then back_state=active; else back_state=inactive; fi; back_buffer=\$BUFFER; back_cursor=\$CURSOR; BUFFER='/'; CURSOR=0; _mu_zsh_list_slash_choices; zle delete-char; if _mu_zsh_slash_completion_context; then forward_state=active; else forward_state=inactive; fi; zle -I; print -r -- \"[back-buffer=\$back_buffer back-cursor=\$back_cursor back-context=\$back_state forward-buffer=\$BUFFER forward-cursor=\$CURSOR forward-context=\$forward_state]\"; _mu_zsh_clear_prompt; _mu_zsh_reset_mode_prompt; }; zle -N _mu_test_delete_slash_completion; bindkey -M mumode '^Y' _mu_test_delete_slash_completion"

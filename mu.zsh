@@ -542,6 +542,45 @@ _mu_zsh_model_completion_candidates() {
   return 0
 }
 
+_mu_zsh_model_effort_suffixes() {
+  local fragment=$1
+  local -a records suffixes
+  local -A model_counts
+  local record canonical model_id efforts count effort
+
+  [[ -n "$fragment" && "$fragment" != *:* ]] || return 0
+  records=("${(@f)$(_mu_zsh_model_records 2>/dev/null || true)}")
+  (( ${#records[@]} )) || return 0
+
+  for record in "${records[@]}"; do
+    model_id=${${(ps:\t:)record}[2]}
+    if [[ -n "$model_id" ]]; then
+      count=${model_counts[$model_id]:-0}
+      model_counts[$model_id]=$(( count + 1 ))
+    fi
+  done
+
+  for record in "${records[@]}"; do
+    canonical=${${(ps:\t:)record}[1]}
+    model_id=${${(ps:\t:)record}[2]}
+    efforts=${${(ps:\t:)record}[3]-}
+    count=0
+    [[ -n "$model_id" ]] && count=${model_counts[$model_id]:-0}
+    if [[ "$fragment" != "$canonical" && ( "$fragment" != "$model_id" || $count -ne 1 ) ]]; then
+      continue
+    fi
+    for effort in "${(@s:,:)efforts}"; do
+      [[ -n "$effort" ]] && suffixes+=(":$effort")
+    done
+    break
+  done
+
+  for effort in "${suffixes[@]}"; do
+    print -r -- "$effort"
+  done
+  return 0
+}
+
 _mu_zsh_slash_completion_context() {
   local left
 
@@ -580,31 +619,62 @@ _mu_zsh_completion_candidates() {
 }
 
 _mu_zsh_fallback_completion() {
-  local -a candidates
+  local left arg suffix
+  local -a candidates effort_suffixes
 
-  candidates=("${(@f)$(_mu_zsh_completion_candidates)}")
-  candidates=("${(@)candidates:#}")
-  (( ${#candidates[@]} )) || return 1
-
-  compadd -Q -S ' ' -- "${candidates[@]}"
-}
-
-_mu_zsh_completion_system() {
-  local -a candidates
-  local expl
-
-  if [[ "${BUFFER[1,$CURSOR]}" == "/attach "* ]]; then
-    compset -P '/attach '
-    _files
-    return
+  left=${BUFFER[1,$CURSOR]}
+  if [[ "$left" == "/model "* ]]; then
+    arg=${left#"/model "}
+    effort_suffixes=("${(@f)$(_mu_zsh_model_effort_suffixes "$arg")}")
+    effort_suffixes=("${(@)effort_suffixes:#}")
+    if (( ${#effort_suffixes[@]} )); then
+      compset -P "${(b)arg}"
+      compadd -Q -S '' -- "${effort_suffixes[@]}"
+      return
+    fi
   fi
 
   candidates=("${(@f)$(_mu_zsh_completion_candidates)}")
   candidates=("${(@)candidates:#}")
   (( ${#candidates[@]} )) || return 1
 
+  suffix=' '
+  [[ "$left" == "/model "* ]] && suffix=''
+  compadd -Q -S "$suffix" -- "${candidates[@]}"
+}
+
+_mu_zsh_completion_system() {
+  local left arg suffix
+  local -a candidates effort_suffixes
+  local expl
+
+  left=${BUFFER[1,$CURSOR]}
+  if [[ "$left" == "/attach "* ]]; then
+    compset -P '/attach '
+    _files
+    return
+  fi
+
+  if [[ "$left" == "/model "* ]]; then
+    arg=${left#"/model "}
+    effort_suffixes=("${(@f)$(_mu_zsh_model_effort_suffixes "$arg")}")
+    effort_suffixes=("${(@)effort_suffixes:#}")
+    if (( ${#effort_suffixes[@]} )); then
+      compset -P "${(b)arg}"
+      _wanted mu-model-effort expl 'model effort' \
+        compadd -Q -S '' -- "${effort_suffixes[@]}"
+      return
+    fi
+  fi
+
+  candidates=("${(@f)$(_mu_zsh_completion_candidates)}")
+  candidates=("${(@)candidates:#}")
+  (( ${#candidates[@]} )) || return 1
+
+  suffix=' '
+  [[ "$left" == "/model "* ]] && suffix=''
   _wanted mu-slash-command expl 'mu slash command' \
-    compadd -Q -S ' ' -- "${candidates[@]}"
+    compadd -Q -S "$suffix" -- "${candidates[@]}"
 }
 
 _mu_zsh_use_completion_system() {
@@ -615,13 +685,21 @@ _mu_zsh_use_completion_system() {
 }
 
 _mu_zsh_complete_slash() {
+  local before_buffer=$BUFFER before_cursor=$CURSOR
+
   _mu_zsh_slash_completion_context || return 1
   if _mu_zsh_use_completion_system; then
     local compcontext=mu-zsh-slash
     zle expand-or-complete
-    return
+  else
+    zle _mu_zsh_complete_widget
   fi
-  zle _mu_zsh_complete_widget
+
+  if [[ "${before_buffer[1,$before_cursor]}" == "/model "* ]] &&
+    [[ "$BUFFER" != "$before_buffer" || $CURSOR -ne $before_cursor ]] &&
+    [[ "${BUFFER[1,$CURSOR]}" == "/model "* && "${BUFFER[1,$CURSOR]}" != *:* ]]; then
+    _mu_zsh_list_slash_choices
+  fi
 }
 
 _mu_zsh_list_slash_choices() {
