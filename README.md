@@ -20,26 +20,26 @@ export PATH="$PWD/target/release:$PATH"
 
 `mu` targets Unix-like systems and expects `bash` on `PATH`.
 
-Set an API key:
+Add an API key to `~/.mu/.env` (create the file if needed):
 
-```sh
-export OPENAI_API_KEY=...
+```dotenv
+OPENAI_API_KEY=...
 ```
 
 On first use, `mu` creates `~/.mu/config.jsonc` with a starter
 OpenAI-compatible provider. Edit that file to select another endpoint, API-key
 environment variable, or model.
 
-Run a turn by piping in a prompt:
+Run a turn with a prompt:
 
 ```sh
-printf '%s\n' 'Summarize the changes in this repository.' | mu
+mu <<< 'Summarize the changes in this repository.'
 ```
 
 Continue the latest session for another turn:
 
 ```sh
-printf '%s\n' 'Now identify the riskiest change.' | mu -c
+mu -c <<< 'Now identify the riskiest change.'
 ```
 
 ## Interactive zsh usage
@@ -64,31 +64,29 @@ Common prompt-mode commands include:
 - `/retry` resumes a turn interrupted by Ctrl-C, a crash, or a lost connection.
 - `/compact` compacts a long session, optionally with a focus instruction.
 
-Typing `/` lists available commands. Shift+Enter inserts a newline when the
-terminal is configured to send the CSI-u Shift+Enter sequence.
+Typing `/` lists available commands.
 
-## Other typical workflows
+## Examples
 
 Use a specific model or attach files to a one-shot turn:
 
 ```sh
-printf '%s\n' 'Describe these inputs.' | \
-  mu --model openai/gpt-5:high -a screenshot.png -a recording.wav
+mu --model openai/gpt-5:high -a screenshot.png -a recording.wav <<"EOF"
+Describe these inputs.
+EOF
 ```
 
 Keep reusable prompts in files:
 
 ```sh
-mu release-note.md
+mu review.md
 
 mu release-note.md <<'EOF'
 Emphasize compatibility and migration risks.
 EOF
 ```
 
-Prompt files may be executable with a `mu` shebang. Instruction files under a
-global or project `.mu` directory can also provide reusable custom commands and
-skills.
+`mu` is designed to be compatible with shebang.
 
 Choose output for the caller:
 
