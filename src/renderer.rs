@@ -205,6 +205,9 @@ impl Renderer {
         }
 
         for block in blocks {
+            if !self.assistant_block_open && rendered_block_is_blank(&block) {
+                continue;
+            }
             if !self.assistant_block_open {
                 self.ensure_block_separator_if_needed()?;
                 self.assistant_block_open = true;
@@ -229,13 +232,17 @@ impl Renderer {
             self.assistant_block_open = false;
             return Ok(());
         }
-        if self.styled && !self.assistant_block_open {
-            self.ensure_block_separator_if_needed()?;
-        }
-        self.assistant_block_open = false;
         for rendered in blocks {
+            if !self.assistant_block_open && rendered_block_is_blank(&rendered) {
+                continue;
+            }
+            if !self.assistant_block_open {
+                self.ensure_block_separator_if_needed()?;
+                self.assistant_block_open = true;
+            }
             self.write_committed(&rendered)?;
         }
+        self.assistant_block_open = false;
         self.render_live_line()
     }
 
@@ -2762,6 +2769,10 @@ fn append_ellipsis_in_place(text: &mut String, max_bytes: usize) {
     text.push_str(ELLIPSIS);
 }
 
+fn rendered_block_is_blank(input: &str) -> bool {
+    strip_ansi(input).trim().is_empty()
+}
+
 fn strip_ansi(input: &str) -> String {
     let mut out = String::with_capacity(input.len());
     let mut chars = input.chars().peekable();
@@ -3306,6 +3317,21 @@ mod tests {
     }
 
     #[test]
+    fn terminal_ignores_empty_assistant_blocks_before_first_visible_block() {
+        let (mut renderer, output) =
+            Renderer::with_test_shared_output(OutputFormat::Terminal, true, None);
+
+        renderer.assistant_text("\n\n").unwrap();
+        renderer.assistant_end().unwrap();
+        renderer.reasoning_start().unwrap();
+        renderer.reasoning_delta("plan").unwrap();
+        renderer.reasoning_end(Some((12, 5))).unwrap();
+
+        let normalized = strip_ansi(&output.transcript().replace('\r', ""));
+        assert!(normalized.starts_with("[thought "), "{normalized:?}");
+    }
+
+    #[test]
     fn terminal_summary_leaves_a_blank_line_before_the_next_prompt() {
         let raw = capture_renderer_transcript(Duration::from_secs(12), Some("mu> "));
         let normalized = strip_ansi(&raw.replace('\r', ""));
@@ -3317,8 +3343,12 @@ mod tests {
         assert!(!normalized.contains("reason is acceptable\n\nline01\n"));
         assert!(
             normalized
-                .contains("✓ exit 0 · 250ms\n\n[mu] tokens: 12 in / 5 out  context: 25%\n\nmu> ")
+                .contains(", 5 tokens]\n\n# Stream demo\n$ printf 'line01\\nline02\\nline03\\n'"),
+            "{normalized:?}"
         );
+        assert!(normalized.contains(
+            "✓ exit 0 · 250ms\n\nDone.\n\n[mu] tokens: 12 in / 5 out  context: 25%\n\nmu> "
+        ));
         assert!(!normalized.contains("[mu] tokens: 12 in / 5 out  context: 25%\n\n\nmu> "));
     }
 
@@ -3381,6 +3411,8 @@ mod tests {
                 Duration::from_millis(250),
             )
             .unwrap();
+        renderer.assistant_text("Done.\n").unwrap();
+        renderer.assistant_end().unwrap();
         renderer.finish_turn().unwrap();
         renderer.turn_summary(12, 0, None, 5, Some(25.0)).unwrap();
         renderer.turn_done_bell(turn_elapsed).unwrap();
