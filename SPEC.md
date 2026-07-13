@@ -470,7 +470,9 @@ strikethrough wait for the current span to complete; fenced code starts terminal
 code styling at the opening fence, streams code lines without printing fence
 markers, and resets styling at the closing fence or response boundary. Markdown
 tables are buffered until the table is complete enough to align and commit once,
-so columns never require rewriting prior output. While a confirmed table is
+so columns never require rewriting prior output. Each column is at most 80
+visible terminal cells wide; longer header or body cells wrap into aligned
+continuation rows without truncating their content. While a confirmed table is
 buffered, TTY terminal output shows a mutable `[table ~N tokens]` live indicator;
 the completed table clears and overwrites that indicator instead of committing a
 final table-status line. Markdown features outside this supported terminal

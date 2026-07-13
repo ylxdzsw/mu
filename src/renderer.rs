@@ -3,6 +3,7 @@ use std::path::{Component, Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use pulldown_cmark::{Alignment, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
+use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
 use crate::cli::OutputFormat;
@@ -27,6 +28,7 @@ const CODE: &str = "\x1b[38;5;215m";
 pub(crate) const BASH_COMMAND_PREVIEW_BYTES: usize = 160;
 pub(crate) const BASH_TITLE_PREVIEW_BYTES: usize = 120;
 const GUARDRAIL_REASON_PREVIEW_BYTES: usize = 180;
+const MAX_TABLE_COLUMN_WIDTH: usize = 80;
 const BASH_HEAD_LINE_BUDGET: usize = 3;
 const BASH_HEAD_BYTE_BUDGET: usize = 1024;
 const BASH_HEAD_LINE_CAP_BYTES: usize = 120;
@@ -2207,6 +2209,9 @@ fn render_table(table: &TableState) -> String {
             widths[idx] = widths[idx].max(visible_text_width(cell));
         }
     }
+    for width in &mut widths {
+        *width = (*width).min(MAX_TABLE_COLUMN_WIDTH);
+    }
 
     let mut out = String::new();
     out.push_str(&render_table_row(&table.header, &widths, &table.alignments));
@@ -2219,19 +2224,230 @@ fn render_table(table: &TableState) -> String {
 }
 
 fn render_table_row(row: &[String], widths: &[usize], alignments: &[Alignment]) -> String {
-    let mut out = String::from("|");
-    for (idx, width) in widths.iter().copied().enumerate() {
-        let cell = row.get(idx).map(String::as_str).unwrap_or("");
-        out.push(' ');
-        out.push_str(&pad_table_cell(
-            cell,
-            width,
-            alignments.get(idx).copied().unwrap_or(Alignment::None),
-        ));
-        out.push(' ');
+    let cells = widths
+        .iter()
+        .copied()
+        .enumerate()
+        .map(|(idx, width)| wrap_table_cell(row.get(idx).map(String::as_str).unwrap_or(""), width))
+        .collect::<Vec<_>>();
+    let height = cells.iter().map(Vec::len).max().unwrap_or(1);
+    let mut out = String::new();
+
+    for line_idx in 0..height {
         out.push('|');
+        for (idx, width) in widths.iter().copied().enumerate() {
+            let cell = cells[idx].get(line_idx).map(String::as_str).unwrap_or("");
+            out.push(' ');
+            out.push_str(&pad_table_cell(
+                cell,
+                width,
+                alignments.get(idx).copied().unwrap_or(Alignment::None),
+            ));
+            out.push(' ');
+            out.push('|');
+        }
+        out.push('\n');
     }
-    out.push('\n');
+    out
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct TableTextStyle {
+    sgr: Vec<String>,
+    hyperlink: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+struct StyledGrapheme {
+    text: String,
+    width: usize,
+    whitespace: bool,
+    style: TableTextStyle,
+    controls: String,
+}
+
+fn wrap_table_cell(cell: &str, width: usize) -> Vec<String> {
+    if visible_text_width(cell) <= width {
+        return vec![cell.to_string()];
+    }
+
+    let units = styled_graphemes(cell);
+    wrap_styled_graphemes(&units, width)
+        .into_iter()
+        .map(|line| render_styled_graphemes(&line))
+        .collect()
+}
+
+fn styled_graphemes(input: &str) -> Vec<StyledGrapheme> {
+    let mut units = Vec::new();
+    let mut style = TableTextStyle::default();
+    let mut controls = String::new();
+    let mut offset = 0;
+
+    while offset < input.len() {
+        if input.as_bytes()[offset] == b'\x1b' {
+            let end = ansi_sequence_end(input, offset);
+            let sequence = &input[offset..end];
+            if sequence.starts_with("\x1b[") && sequence.ends_with('m') {
+                if sequence == RESET || sequence == "\x1b[m" {
+                    style.sgr.clear();
+                } else {
+                    style.sgr.push(sequence.to_string());
+                }
+            } else if sequence.starts_with(OSC8_OPEN) {
+                if sequence == OSC8_CLOSE {
+                    style.hyperlink = None;
+                } else {
+                    style.hyperlink = Some(sequence.to_string());
+                }
+            } else {
+                controls.push_str(sequence);
+            }
+            offset = end;
+            continue;
+        }
+
+        let next_escape = input[offset..]
+            .find('\x1b')
+            .map(|relative| offset + relative)
+            .unwrap_or(input.len());
+        for grapheme in input[offset..next_escape].graphemes(true) {
+            units.push(StyledGrapheme {
+                text: grapheme.to_string(),
+                width: UnicodeWidthStr::width(grapheme),
+                whitespace: grapheme.chars().all(char::is_whitespace),
+                style: style.clone(),
+                controls: std::mem::take(&mut controls),
+            });
+        }
+        offset = next_escape;
+    }
+
+    if !controls.is_empty() {
+        if let Some(last) = units.last_mut() {
+            last.controls.push_str(&controls);
+        }
+    }
+    units
+}
+
+fn ansi_sequence_end(input: &str, start: usize) -> usize {
+    let bytes = input.as_bytes();
+    match bytes.get(start + 1) {
+        Some(b'[') => bytes[start + 2..]
+            .iter()
+            .position(|byte| (b'@'..=b'~').contains(byte))
+            .map(|relative| start + 3 + relative)
+            .unwrap_or(input.len()),
+        Some(b']') => {
+            let mut idx = start + 2;
+            while idx < bytes.len() {
+                if bytes[idx] == b'\x07' {
+                    return idx + 1;
+                }
+                if bytes[idx] == b'\x1b' && bytes.get(idx + 1) == Some(&b'\\') {
+                    return idx + 2;
+                }
+                idx += 1;
+            }
+            input.len()
+        }
+        Some(_) => (start + 2).min(input.len()),
+        None => input.len(),
+    }
+}
+
+fn wrap_styled_graphemes(units: &[StyledGrapheme], width: usize) -> Vec<Vec<StyledGrapheme>> {
+    let mut lines = Vec::new();
+    let mut line = Vec::new();
+    let mut pending_whitespace = Vec::new();
+    let mut idx = 0;
+
+    while idx < units.len() {
+        if units[idx].whitespace {
+            pending_whitespace.push(units[idx].clone());
+            idx += 1;
+            continue;
+        }
+
+        let word_start = idx;
+        while idx < units.len() && !units[idx].whitespace {
+            idx += 1;
+        }
+        let word = &units[word_start..idx];
+        let line_width = styled_graphemes_width(&line);
+        let whitespace_width = styled_graphemes_width(&pending_whitespace);
+        let word_width = styled_graphemes_width(word);
+
+        if !line.is_empty() && line_width + whitespace_width + word_width <= width {
+            line.append(&mut pending_whitespace);
+            line.extend_from_slice(word);
+            continue;
+        }
+
+        if !line.is_empty() {
+            lines.push(std::mem::take(&mut line));
+        }
+        pending_whitespace.clear();
+
+        if word_width <= width {
+            line.extend_from_slice(word);
+            continue;
+        }
+
+        for unit in word {
+            if !line.is_empty() && styled_graphemes_width(&line) + unit.width > width {
+                lines.push(std::mem::take(&mut line));
+            }
+            line.push(unit.clone());
+        }
+    }
+
+    if !line.is_empty() {
+        lines.push(line);
+    }
+    if lines.is_empty() {
+        lines.push(Vec::new());
+    }
+    lines
+}
+
+fn styled_graphemes_width(units: &[StyledGrapheme]) -> usize {
+    units.iter().map(|unit| unit.width).sum()
+}
+
+fn render_styled_graphemes(units: &[StyledGrapheme]) -> String {
+    let mut out = String::new();
+    let mut active = TableTextStyle::default();
+
+    for unit in units {
+        if unit.style != active {
+            if active.hyperlink.is_some() {
+                out.push_str(OSC8_CLOSE);
+            }
+            if active.sgr != unit.style.sgr {
+                if !active.sgr.is_empty() {
+                    out.push_str(RESET);
+                }
+                for sgr in &unit.style.sgr {
+                    out.push_str(sgr);
+                }
+            }
+            if let Some(hyperlink) = &unit.style.hyperlink {
+                out.push_str(hyperlink);
+            }
+            active = unit.style.clone();
+        }
+        out.push_str(&unit.controls);
+        out.push_str(&unit.text);
+    }
+
+    if active.hyperlink.is_some() {
+        out.push_str(OSC8_CLOSE);
+    }
+    if !active.sgr.is_empty() {
+        out.push_str(RESET);
+    }
     out
 }
 
@@ -2871,6 +3087,106 @@ mod tests {
     }
 
     #[test]
+    fn markdown_renderer_caps_table_columns_at_eighty_cells() {
+        let eighty = "a".repeat(MAX_TABLE_COLUMN_WIDTH);
+        let eighty_one = "b".repeat(MAX_TABLE_COLUMN_WIDTH + 1);
+        let rendered = render_markdown(&format!(
+            "| Text | Side |\n| --- | --- |\n| {eighty} | x |\n| {eighty_one} | y |\n"
+        ));
+        let plain = strip_ansi(&rendered);
+        let table_lines = plain
+            .lines()
+            .filter(|line| line.starts_with('|') && line.ends_with('|'))
+            .collect::<Vec<_>>();
+
+        assert_eq!(bar_columns(table_lines[0])[1], MAX_TABLE_COLUMN_WIDTH + 3);
+        assert_eq!(table_lines.len(), 5, "{plain:?}");
+        assert!(table_lines[2].contains(&eighty), "{plain:?}");
+        assert!(table_lines[3].contains(&"b".repeat(80)), "{plain:?}");
+        assert!(table_lines[4].contains("b"), "{plain:?}");
+        assert_table_grid_aligned(&plain);
+    }
+
+    #[test]
+    fn table_rows_wrap_words_and_pad_shorter_cells() {
+        let rendered = render_table_row(
+            &["alpha beta gamma".into(), "x".into()],
+            &[10, 3],
+            &[Alignment::Left, Alignment::Left],
+        );
+
+        assert_eq!(
+            strip_ansi(&rendered),
+            "| alpha beta | x   |\n| gamma      |     |\n"
+        );
+    }
+
+    #[test]
+    fn wrapped_table_fragments_keep_column_alignment() {
+        let row = vec!["alpha beta gamma".into()];
+
+        assert_eq!(
+            strip_ansi(&render_table_row(&row, &[10], &[Alignment::Right])),
+            "| alpha beta |\n|      gamma |\n"
+        );
+        assert_eq!(
+            strip_ansi(&render_table_row(&row, &[10], &[Alignment::Center])),
+            "| alpha beta |\n|   gamma    |\n"
+        );
+    }
+
+    #[test]
+    fn table_cell_wrapping_keeps_unicode_graphemes_intact() {
+        let wide = wrap_table_cell("界界界", 4)
+            .into_iter()
+            .map(|line| strip_ansi(&line))
+            .collect::<Vec<_>>();
+        let emoji = wrap_table_cell("👩‍💻👩‍💻👩‍💻", 4)
+            .into_iter()
+            .map(|line| strip_ansi(&line))
+            .collect::<Vec<_>>();
+        let combining = wrap_table_cell("e\u{301}e\u{301}e\u{301}", 2)
+            .into_iter()
+            .map(|line| strip_ansi(&line))
+            .collect::<Vec<_>>();
+
+        assert_eq!(wide, ["界界", "界"]);
+        assert_eq!(emoji, ["👩‍💻👩‍💻", "👩‍💻"]);
+        assert_eq!(combining, ["e\u{301}e\u{301}", "e\u{301}"]);
+        for line in wide.iter().chain(&emoji).chain(&combining) {
+            assert!(UnicodeWidthStr::width(line.as_str()) <= 4, "{line:?}");
+        }
+    }
+
+    #[test]
+    fn wrapped_table_cells_close_and_reopen_styles_and_links() {
+        let styled = format!("{BOLD}abcdefgh{RESET}");
+        let styled_lines = wrap_table_cell(&styled, 4);
+        assert_eq!(styled_lines.len(), 2);
+        for line in &styled_lines {
+            assert!(line.starts_with(BOLD), "{line:?}");
+            assert!(line.ends_with(RESET), "{line:?}");
+            assert_eq!(visible_text_width(line), 4);
+        }
+
+        let open = open_hyperlink("https://example.com");
+        let linked = format!("{open}abcdefgh{OSC8_CLOSE}");
+        let linked_lines = wrap_table_cell(&linked, 4);
+        assert_eq!(linked_lines.len(), 2);
+        for line in &linked_lines {
+            assert!(line.starts_with(&open), "{line:?}");
+            assert!(line.ends_with(OSC8_CLOSE), "{line:?}");
+            assert_eq!(visible_text_width(line), 4);
+        }
+    }
+
+    #[test]
+    fn short_styled_table_cells_are_not_rewritten() {
+        let cell = format!("{BOLD}short{RESET}");
+        assert_eq!(wrap_table_cell(&cell, 10), [cell]);
+    }
+
+    #[test]
     fn markdown_stream_streams_list_items_line_by_line() {
         let mut stream = MarkdownStream::default();
 
@@ -2994,6 +3310,33 @@ mod tests {
         let plain = strip_ansi(&rendered);
         assert!(plain.contains("| Name | Value |"), "{plain:?}");
         assert!(plain.contains("| a    |     1 |"), "{plain:?}");
+        assert_table_grid_aligned(&plain);
+    }
+
+    #[test]
+    fn markdown_stream_wraps_long_table_headers_and_cells_on_commit() {
+        let mut stream = MarkdownStream::default();
+        let header = "heading ".repeat(12);
+        let body = "x".repeat(MAX_TABLE_COLUMN_WIDTH + 1);
+
+        assert!(stream.push(&format!("| {header} | Side |\n")).is_empty());
+        assert!(stream.push("| --- | --- |\n").is_empty());
+        assert!(stream.push(&format!("| {body} | y |\n")).is_empty());
+        assert!(stream.table_live().is_some());
+        let rendered = stream.push("\n").concat();
+        assert!(stream.table_live().is_none());
+
+        let plain = strip_ansi(&rendered);
+        let table_lines = plain
+            .lines()
+            .filter(|line| line.starts_with('|') && line.ends_with('|'))
+            .collect::<Vec<_>>();
+        let separator = table_lines
+            .iter()
+            .position(|line| line.contains("---"))
+            .expect("table separator missing");
+        assert_eq!(separator, 2, "{plain:?}");
+        assert_eq!(table_lines.len(), 5, "{plain:?}");
         assert_table_grid_aligned(&plain);
     }
 
