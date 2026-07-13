@@ -291,12 +291,12 @@ fn build_chat_request_body(
         // reasoning_content history to preserve cross-turn thinking.
         body["thinking"] = serde_json::json!({ "clear_thinking": false });
     }
-    if !request.model.preserved_thinking {
-        if let Some(messages) = body["messages"].as_array_mut() {
-            for message in messages {
-                if let Some(message) = message.as_object_mut() {
-                    message.remove("reasoning_content");
-                }
+    if !request.model.preserved_thinking
+        && let Some(messages) = body["messages"].as_array_mut()
+    {
+        for message in messages {
+            if let Some(message) = message.as_object_mut() {
+                message.remove("reasoning_content");
             }
         }
     }

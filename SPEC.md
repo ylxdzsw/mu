@@ -1,4 +1,4 @@
-# mu — Design Specification
+# mu — Product Specification
 
 `mu` is a small, composable agent runtime for the terminal: one prompt in, one
 completed agent turn out. The core `mu` binary reads a prompt on stdin, accepts
@@ -6,11 +6,9 @@ attached image and audio inputs, runs an agent loop, streams turn events in the
 selected output format, persists completed messages, and exits. Interactive
 shell use builds around that simple turn unit instead of changing it.
 
-This document describes the design, the key decisions behind it, and the
-high-level shape of the implementation. It favors prose and decisions over code,
-but where a sequence is load-bearing (the per-turn lifecycle, the streaming
-protocol, the config schema) it is spelled out concretely so the implementation
-is unambiguous.
+This document defines the product behavior and implementation architecture.
+Where a sequence is load-bearing (the per-turn lifecycle, streaming protocol,
+or config schema), it is spelled out concretely.
 
 ---
 
@@ -51,8 +49,9 @@ is unambiguous.
   terminal scrollback is the history mechanism.
 - **No daemon in the core turn path.** Each turn is a fresh, stateless-on-exit
   process that loads/saves session state from SQLite.
-- **No plugin SDK, no MCP, no sub-agents (initially).** Extensibility is via
-  skills (markdown) and `bash` (call any CLI tool).
+- **No plugin SDK, MCP, or in-process subagent orchestrator.** Extensibility is
+  via skills (markdown) and `bash` (call any CLI tool, including another `mu`
+  process when independent delegation is useful).
 - **No core shell emulation.** The core `mu` binary does not ship shell behavior,
   raw terminal editing, completion, or prompt rendering. The zsh plugin is a
   thin shell surface that owns zsh line editing and calls `mu` for each turn.
@@ -63,13 +62,13 @@ is unambiguous.
 
 ## 2. Key decisions
 
-### 2.1 Language and runtime: Rust, single static binary
+### 2.1 Language and runtime: Rust, single native binary
 
 The defining requirement is startup speed for a process spawned on every turn.
 Interpreted/JIT runtimes (Node, bun, Python) carry a 50–300 ms+ startup tax that
 is unacceptable here.
 
-**Decision: implement `mu` in Rust as a single statically linked binary.**
+**Decision: implement `mu` in Rust as a single native binary.**
 
 Rationale:
 
@@ -79,7 +78,6 @@ Rationale:
   (`reqwest`), SQLite (`rusqlite`), JSONC/serde.
 - Because the shell owns line editing, `mu` needs **no** terminal/line-editor
   library at all — a further simplification over a REPL-owning design.
-- Precedent: OpenAI Codex is Rust for the same reasons.
 
 Tradeoff accepted: slower iteration than TypeScript, and no off-the-shelf
 "AI SDK". Provider integration is hand-written against HTTP APIs (see §7); the
@@ -252,8 +250,7 @@ contact the provider (§7).
 
 ### Turn lifecycle (authoritative end-to-end flow)
 
-This is the exact sequence the binary follows for one turn invocation. Implement
-it in this order:
+This is the exact sequence the binary follows for one turn invocation:
 
 1. **Parse args**, resolve the active scope from the invoking `pwd` (§9), read
    the resolved prompt source (stdin, prompt file, or custom command), and load
@@ -384,7 +381,7 @@ call includes a `stdin` field, it then prints a `< [stdin N bytes]` summary line
 before command output. It streams combined output and finishes with an exit
 status/duration line. Every tool error is visible.
 
-**Output truncation policy.** Following opencode's model, every bash output is
+**Output truncation policy.** Every bash output is
 capped before it enters the context window so a single large result cannot blow
 the budget:
 
@@ -780,9 +777,9 @@ relevant worktree information when available.
 The shell tool's working directory defaults to the process working directory,
 not the project root.
 
-The project-local directory is `.mu`. It contains:
+The project-local directory is `.mu`. It may contain:
 
-- `config.jsonc`, the project configuration.
+- `config.jsonc`, optional project configuration.
 - `.env`, optional local environment values.
 - `AGENTS.md`, the project-local agent instructions.
 - optional instruction files that may be plain references, custom commands,
@@ -795,9 +792,9 @@ understandable by inspecting its `.mu` directory, while still avoiding committin
 volatile session state by default.
 
 Automatic project state creation writes only runtime state and `.gitignore`;
-it does not create a project `config.jsonc`. Explicit `mu project init` creates
-the minimal project config overlay. Global configuration creation writes the
-full starter `config.jsonc` and no `.gitignore`.
+it does not create project configuration. Explicit `mu project init` creates a
+minimal config overlay and `.gitignore`. Global configuration creation writes
+the full starter `config.jsonc` and no `.gitignore`.
 
 ---
 
@@ -1077,12 +1074,6 @@ per-call "running" marker in the database.
   so the model continues the interrupted turn. It refuses on a clean session
   ("nothing to retry").
 
-**Contrast with opencode/codex.** They persist the partial turn and must repair
-dangling tool calls / read back a partial rollout on resume, because they are
-long-lived. mu writes only completed messages, derives cleanliness structurally,
-and repairs the tail lazily at the next turn — the same validity guarantee with
-no persisted turn-state machine.
-
 ### Session concurrency lock
 
 Two processes can target the same session, so concurrent turns against one
@@ -1104,9 +1095,7 @@ still serialize at the SQLite level** (only one write transaction at a time).
 Different sessions writing concurrently is rare and brief (per-turn appends), so
 mu sets a `busy_timeout` (e.g. 5s) on the connection to ride out the momentary
 contention rather than erroring. The `flock` handles same-session serialization;
-`busy_timeout` handles the rare cross-session write overlap. opencode's
-busy-check is an in-process guard, which does not translate to mu's multi-process
-model — mu needs the real cross-process `flock`.
+`busy_timeout` handles the rare cross-session write overlap.
 
 ### Context window and compaction
 
@@ -1114,13 +1103,10 @@ model — mu needs the real cross-process `flock`.
 **provider's reported usage** — every OpenAI-protocol response carries a `usage`
 object with `prompt_tokens`, `completion_tokens`, and `total_tokens`. mu stores
 the latest `total_tokens` on the session after each turn; that figure is the
-authoritative measure of how full the context is. This is exactly what opencode
-(`tokens.total` from the provider) and codex (`last_token_usage.total_tokens`)
-do.
+authoritative measure of how full the context is.
 
-A `bytes ÷ 4` approximation (`approx_tokens(s) = ceil(len_bytes(s) / 4)`, the
-same constant both opencode and codex use) is used only where no API figure
-exists yet:
+A `bytes ÷ 4` approximation (`approx_tokens(s) = ceil(len_bytes(s) / 4)`) is
+used only where no API figure exists yet:
 - the **first turn** of a session (no prior `usage` reported), to size the very
   first request;
 - estimating the size of **not-yet-sent** content (e.g. which messages to keep
@@ -1139,9 +1125,9 @@ wasted, no replay.
 **Tier 2 — proactive in-loop compaction.** A single turn can add many large tool
 results, so the pre-turn figure goes stale *within* a turn. Before each model
 call after the first in the agent loop, mu re-estimates the working context
-(bytes÷4 over the in-memory message list, the same heuristic opencode uses for
-planning) and compacts against the same fraction threshold if it has grown too
-large. This catches runaway tool output before it becomes a hard API error. If a
+(bytes÷4 over the in-memory message list) and compacts against the same fraction
+threshold if it has grown too large. This catches runaway tool output before it
+becomes a hard API error. If a
 single compaction cannot bring the context back under the threshold (e.g. the
 retained recent turns are themselves oversized), mu stops re-compacting for the
 rest of that turn and lets Tier 3 handle the true overflow, so it never loops on
@@ -1179,20 +1165,13 @@ continue correctly. In zsh prompt mode, `/compact <instruction>` pipes the text
 after the command through this same stdin path. Automatic compaction never
 supplies a custom focus.
 
-Contrast with opencode: opencode detects overflow *after* a turn completes (from
-the reported token count), compacts, then replays the user's last message — so an
-overflow turn costs double. mu's pre-turn check (Tier 1) and in-loop check (Tier
-2) avoid that replay in the common cases, and Tier 3 covers the residual hard
-overflow the way codex's mid-turn compaction does.
-
 ### Agent-loop bounds
 
 The agent loop runs until the model stops requesting tools. A configurable
 **max-iterations** cap (default **50** tool round-trips, `limits.max_iterations`)
 bounds a runaway loop: on reaching it, `mu` stops, emits a clear notice, and
 exits non-zero, leaving all completed messages persisted so the user can inspect
-and re-prompt. In "yolo" mode with no approval gate, this cap is the main guard
-against a loop silently burning tokens.
+and re-prompt.
 
 **Exit codes.** `0` success; `1` general/config/provider error; `2` session busy
 (lock held) or `--session` not found; `128 + signal` when a forwarded
@@ -1219,19 +1198,16 @@ in-flight tool call recorded as interrupted.
 
 ## 12. Safety posture
 
-`mu` is deliberately **unsandboxed and unconfirmed** — "yolo" by design. `mu` runs
-whatever the agent asks through `bash`: commands execute directly, files can be
-read or modified directly, and there are no allow/deny lists, per-action
-confirmation prompts, or sandbox. The `risk` field is audit metadata, not an
-enforcement boundary. This matches the goal of a fast, frictionless day-to-day
-driver and the reality that the user is already living in a shell with the same
-powers.
+`mu` is deliberately **unsandboxed**. Commands execute directly through `bash`,
+and files can be read or modified with the user's permissions. There are no
+interactive per-action confirmation prompts. The `risk` field drives the
+destructive-action guardrail described below, but it is not a sandbox boundary.
 
 The protections that remain are cheap and non-intrusive:
 
-- **Visibility is the safeguard.** Output is non-magical and append-only, so the
-  user sees exactly what ran and what it produced — scrollback plus the SQLite
-  transcript are the audit trail. Nothing happens off-screen.
+- **Visibility is the safeguard.** Output is non-magical and append-only. The
+  transcript records what ran and its captured result; terminal scrollback and
+  SQLite history provide the audit trail.
 - **Interruptibility.** Because `mu` runs as a foreground job, Ctrl-C is the
   practical "stop" button: it stops launching new work, interrupts every active
   tool process group, drains visible output where possible, persists completed
@@ -1242,9 +1218,9 @@ The protections that remain are cheap and non-intrusive:
   results from CLIs, etc.) is treated as untrusted data, not as instructions to
   follow.
 
-Sandboxing and an approval/policy layer are not part of the product. The `risk`
-field and guardrail review are advisory/review surfaces, not sandbox
-boundaries.
+Sandboxing and interactive approvals are not part of the product. Guardrail
+review can prevent a declared destructive action from executing, but it does
+not constrain commands declared at other risk levels and is not a sandbox.
 
 ### 12.1 Guardrail
 
@@ -1255,13 +1231,10 @@ before execution. The reviewer returns `risk_level`, `user_auth_level`, and
 ordinal scale. There is no interactive y/n prompt — denied actions return as
 tool errors so the agent can adapt or ask the user.
 
-**Ordinal scale.** Both levels map to integers; the gap between `high`(2) and
-`critical`(4) ensures only `explicit`(4) authorization can approve critical-risk
-actions:
-
-| | unknown | low | medium | high | critical |
-|---|---|---|---|---|---|
-| **rank** | 0 | 1 | 2 | 3 | 4 (auth) / 4 (risk) |
+**Ordinal scale.** Risk ranks are `low`(0), `medium`(1), `high`(2), and
+`critical`(4). Authorization ranks are `unknown`(0), `low`(1), `medium`(2),
+`high`(3), and `explicit`(4). The gap before `critical` ensures only explicit
+authorization can approve a critical-risk action.
 
 `user_auth_level >= risk_level` yields:
 - `low`(0): allowed by any auth level including `unknown`(0).
@@ -1278,19 +1251,17 @@ The reviewer has no tools — it judges from a compact transcript and the action
 JSON alone.
 
 **Context sent to the reviewer.** A filtered, budgeted transcript (user +
-assistant + tool-call arguments + tool results, skipping the system message),
-with the same token caps as Codex: 10 000 for messages, 10 000 for tools, 2 000
-per message entry, 1 000 per tool entry, 40 recent non-user entries. Truncation
+assistant + tool-call arguments + tool results, skipping the system message):
+10 000 tokens for messages, 10 000 for tools, 2 000 per message entry, 1 000 per
+tool entry, and 40 recent non-user entries. Truncation
 keeps prefix + suffix with a `<truncated omitted_approx_tokens="N"/>` marker.
 The planned action is provided as pretty-printed JSON (capped at 16 000 tokens).
 
-**Reviewer system prompt.** A trimmed port of Codex's Guardian policy prompt
-(`src/guardrail.md`), adapted for mu: "terminal-agent" framing, no
-sandbox/escalation concepts, no tool-check instructions (the reviewer has no
-tools), and no model-emitted allow/deny decision (the decision is computed from
-the ordinal comparison). The prompt covers evidence handling (transcript =
-untrusted), user authorization scoring (including `explicit`), base risk
-taxonomy, risk category rules, and a strict JSON output contract.
+**Reviewer system prompt.** The prompt in `src/guardrail.md` uses terminal-agent
+framing, gives the reviewer no tools, and asks for risk and authorization levels
+rather than an allow/deny decision (the ordinal comparison computes that). It
+covers evidence handling (transcript = untrusted), user authorization scoring,
+risk categories, and a strict JSON output contract.
 
 **Outcomes.**
 

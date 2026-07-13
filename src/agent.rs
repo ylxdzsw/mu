@@ -700,13 +700,15 @@ fn handle_tool_call_delta(
         let header = &mut headers.entries[0];
         header.display.update(
             renderer,
-            header.id.as_deref(),
-            string_field_state(&header.arguments, "title"),
-            string_field_state(&header.arguments, "risk"),
-            string_field_state(&header.arguments, "command"),
-            string_field_state(&header.arguments, "cwd"),
-            string_field_state(&header.arguments, "stdin"),
-            arguments_json_complete(&header.arguments),
+            CommandHeaderUpdate {
+                tool_call_id: header.id.as_deref(),
+                title: string_field_state(&header.arguments, "title"),
+                risk: string_field_state(&header.arguments, "risk"),
+                command: string_field_state(&header.arguments, "command"),
+                cwd: string_field_state(&header.arguments, "cwd"),
+                stdin: string_field_state(&header.arguments, "stdin"),
+                arguments_complete: arguments_json_complete(&header.arguments),
+            },
         )?;
         if header.display.is_done() {
             headers.next_to_render = headers.next_to_render.max(1);
@@ -743,13 +745,15 @@ impl StreamingCommandHeader {
         let stdin = args.get("stdin").and_then(|value| value.as_str());
         self.display.update(
             renderer,
-            self.id.as_deref(),
-            StringFieldState::from_final(title),
-            StringFieldState::from_final(risk),
-            StringFieldState::from_final(command),
-            StringFieldState::from_final(args.get("cwd").and_then(|value| value.as_str())),
-            StringFieldState::from_final(stdin),
-            true,
+            CommandHeaderUpdate {
+                tool_call_id: self.id.as_deref(),
+                title: StringFieldState::from_final(title),
+                risk: StringFieldState::from_final(risk),
+                command: StringFieldState::from_final(command),
+                cwd: StringFieldState::from_final(args.get("cwd").and_then(|value| value.as_str())),
+                stdin: StringFieldState::from_final(stdin),
+                arguments_complete: true,
+            },
         )?;
         Ok(self.display.started)
     }
@@ -766,14 +770,17 @@ impl CommandHeaderDisplay {
     fn update(
         &mut self,
         renderer: &mut Renderer,
-        tool_call_id: Option<&str>,
-        title: StringFieldState,
-        risk: StringFieldState,
-        command: StringFieldState,
-        cwd: StringFieldState,
-        stdin: StringFieldState,
-        arguments_complete: bool,
+        update: CommandHeaderUpdate<'_>,
     ) -> std::io::Result<()> {
+        let CommandHeaderUpdate {
+            tool_call_id,
+            title,
+            risk,
+            command,
+            cwd,
+            stdin,
+            arguments_complete,
+        } = update;
         if !self.started {
             self.started = renderer.bash_header_start(tool_call_id)?;
         }
@@ -844,6 +851,16 @@ impl CommandHeaderDisplay {
         }
         Ok(())
     }
+}
+
+struct CommandHeaderUpdate<'a> {
+    tool_call_id: Option<&'a str>,
+    title: StringFieldState,
+    risk: StringFieldState,
+    command: StringFieldState,
+    cwd: StringFieldState,
+    stdin: StringFieldState,
+    arguments_complete: bool,
 }
 
 #[derive(Debug, PartialEq, Eq)]

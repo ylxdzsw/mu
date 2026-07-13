@@ -99,7 +99,7 @@ pub fn resolve_invocation(
         Some(
             store
                 .get_session(id)?
-                .ok_or_else(|| crate::exit::ExitError::session_not_found(id))?,
+                .ok_or_else(|| crate::ExitError::session_not_found(id))?,
         )
     } else if overrides.continue_latest {
         store.latest_session()?

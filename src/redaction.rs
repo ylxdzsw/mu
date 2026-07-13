@@ -48,7 +48,7 @@ impl SecretRedactor {
             });
         }
 
-        secrets.sort_by(|a, b| b.value.len().cmp(&a.value.len()));
+        secrets.sort_by_key(|secret| std::cmp::Reverse(secret.value.len()));
         let max_secret_chars = secrets
             .iter()
             .map(|secret| secret.value.chars().count())

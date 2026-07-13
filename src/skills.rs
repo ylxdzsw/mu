@@ -5,7 +5,7 @@ use std::path::{Component, Path};
 
 use anyhow::{Context, Result};
 
-use crate::env::EnvMap;
+use crate::config::EnvMap;
 
 const MAX_DEPTH: usize = 4;
 const MAX_FILES_PER_ROOT: usize = 512;
@@ -98,7 +98,7 @@ pub fn scan_instruction_index(
     global_config_dir: &Path,
     project_config_dir: Option<&Path>,
 ) -> Result<InstructionIndex> {
-    let env = crate::env::load_effective(project_config_dir)?;
+    let env = crate::config::load_effective_env(project_config_dir)?;
     scan_instruction_index_with_env(global_config_dir, project_config_dir, &env)
 }
 

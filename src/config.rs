@@ -6,9 +6,33 @@ use anyhow::{Context, Result, bail};
 use serde::de::{MapAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize};
 
-use crate::env::EnvMap;
 use crate::models::EffortLevel;
 use crate::paths;
+
+pub type EnvMap = HashMap<String, String>;
+
+pub fn load_effective_env(project_config_dir: Option<&Path>) -> Result<EnvMap> {
+    let mut env: EnvMap = std::env::vars().collect();
+    load_dotenv_into(&paths::global_dir().join(".env"), &mut env)?;
+    if let Some(dir) = project_config_dir {
+        load_dotenv_into(&dir.join(".env"), &mut env)?;
+    }
+    Ok(env)
+}
+
+fn load_dotenv_into(path: &Path, env: &mut EnvMap) -> Result<()> {
+    if !path.exists() {
+        return Ok(());
+    }
+
+    let iter =
+        dotenvy::from_path_iter(path).with_context(|| format!("parsing {}", path.display()))?;
+    for item in iter {
+        let (key, value) = item.with_context(|| format!("parsing {}", path.display()))?;
+        env.insert(key, value);
+    }
+    Ok(())
+}
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Config {
@@ -345,7 +369,7 @@ impl Config {
 
         let mut config = config_from_value(value)?;
         apply_config_order(&mut config, &order);
-        config.env = crate::env::load_effective(project_config_dir)?;
+        config.env = load_effective_env(project_config_dir)?;
         config.validate_runtime()?;
         Ok(config)
     }
@@ -695,5 +719,26 @@ mod tests {
         assert!(!root.join(".gitignore").exists());
 
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn dotenv_overlays_in_order() {
+        let tmp = std::env::temp_dir().join(format!("mu-env-{}", uuid::Uuid::new_v4()));
+        let global = tmp.join("global");
+        let project = tmp.join("project/.mu");
+        std::fs::create_dir_all(&global).unwrap();
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(global.join(".env"), "SAME=global\nGLOBAL_ONLY=1\n").unwrap();
+        std::fs::write(project.join(".env"), "SAME=project\nPROJECT_ONLY=2\n").unwrap();
+
+        let mut env = EnvMap::new();
+        load_dotenv_into(&global.join(".env"), &mut env).unwrap();
+        load_dotenv_into(&project.join(".env"), &mut env).unwrap();
+
+        assert_eq!(env.get("SAME").map(String::as_str), Some("project"));
+        assert_eq!(env.get("GLOBAL_ONLY").map(String::as_str), Some("1"));
+        assert_eq!(env.get("PROJECT_ONLY").map(String::as_str), Some("2"));
+
+        let _ = std::fs::remove_dir_all(tmp);
     }
 }

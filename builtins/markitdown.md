@@ -18,17 +18,9 @@ Only handle these formats in this skill:
 - `.pptx`
 - `.xlsx`
 
-Assume MarkItDown is installed with the relevant extras:
-
-```bash
-pip install 'markitdown[pdf,docx,pptx,xlsx]'
-```
-
-If `markitdown` is missing, report the missing command and suggest that install command.
-
 ## Workflow
 
-1. Confirm the input path exists and is one of the supported format.
+1. Confirm the input path exists and uses one of the supported formats.
 2. Convert local files with the CLI for ordinary one-off extraction:
 
 ```bash

@@ -15,7 +15,7 @@ use serde_json::{Value, json};
 use tokio::task::JoinHandle;
 
 use crate::config::Config;
-use crate::env::EnvMap;
+use crate::config::EnvMap;
 use crate::redaction::SecretRedactor;
 use crate::renderer::Renderer;
 
@@ -597,10 +597,10 @@ fn wait_for_exit(child: &mut std::process::Child, grace: Duration) -> bool {
 #[cfg(test)]
 mod tests {
     use super::run_bash;
+    use crate::config::EnvMap;
     use crate::config::{
         CompactionConfig, Config, GuardrailConfig, LimitsConfig, ProviderConfig, RedactionConfig,
     };
-    use crate::env::EnvMap;
     use crate::redaction::SecretRedactor;
     use crate::renderer::Renderer;
     use crate::tools::{BashArgs, BashRisk, ToolContext};

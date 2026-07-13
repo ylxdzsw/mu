@@ -167,11 +167,6 @@ mod tests {
     }
 
     #[test]
-    fn rejects_removed_image_option() {
-        assert!(Args::try_parse_from(["mu", "-i", "image.png"]).is_err());
-    }
-
-    #[test]
     fn parses_final_output_mode() {
         let args = Args::try_parse_from(["mu", "--output", "final"]).unwrap();
         assert_eq!(args.turn.output, OutputFormat::Final);

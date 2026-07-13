@@ -571,12 +571,10 @@ after_submitted_display=${REPLY#*"$expected_submitted_display"}
 [[ "$normalized" == *"Hello! I'm your terminal agent."* ]] || fail "interactive response should be rendered"
 after_submitted_prompt=${normalized##*$'mu> hello\n'}
 [[ "$after_submitted_prompt" == $'\nHello! I'* ]] || fail "submitted prompt should have one empty line before terminal output"
-[[ "$after_submitted_prompt" != $'\n\nHello! I'* ]] || fail "submitted prompt should not have two empty lines before terminal output"
 [[ "$normalized" == *'mu> cancel-me'* ]] || fail "Ctrl-C should leave the cancelled mu line in scrollback"
 [[ $(<"$interactive_capture_calls") == x ]] || fail "interactive fake mu should run exactly once"
 after_response=${normalized#*"Hello! I'm your terminal agent."}
 [[ "$after_response" == $'\n\n[mu] tokens: 12 in / 5 out  context: 25%\n\n'* ]] || fail "token summary should be a separate block after assistant output"
-[[ "$after_response" == *$'[mu] tokens: 12 in / 5 out  context: 25%\n\n'* ]] || fail "token summary should own one trailing empty line"
 [[ "$after_response" != *$'[mu] tokens: 12 in / 5 out  context: 25%\n\n\n'* ]] || fail "token summary should not leave two trailing empty lines"
 post_turn_prompt_count=0
 native_exit_count=0
@@ -668,10 +666,8 @@ interactive_status=0
 normalized=$(perl -pe 's/\e\[[0-?]*[ -\/]*[@-~]//g' "$plain_transcript" | col -b)
 after_submitted_prompt=${normalized##*$'mu> plain prompt\n'}
 [[ "$after_submitted_prompt" == $'\nHello! I'* ]] || fail "submitted prompt should have one empty line before plain output"
-[[ "$after_submitted_prompt" != $'\n\nHello! I'* ]] || fail "submitted prompt should not have two empty lines before plain output"
 after_response=${normalized#*"Hello! I'm your terminal agent."}
 [[ "$after_response" == $'\n\n[mu] tokens: 12 in / 5 out  context: 25%\n\n'* ]] || fail "plain token summary should be a separate block after assistant output"
-[[ "$after_response" == *$'[mu] tokens: 12 in / 5 out  context: 25%\n\n'* ]] || fail "plain token summary should own one trailing empty line"
 [[ "$after_response" != *$'[mu] tokens: 12 in / 5 out  context: 25%\n\n\n'* ]] || fail "plain token summary should not leave two trailing empty lines"
 interactive_args=("${(@f)$(<"$interactive_capture_args")}")
 expected_plain_args=(--output plain)

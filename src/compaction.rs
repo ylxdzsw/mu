@@ -6,7 +6,7 @@ use crate::config::Config;
 use crate::models::RequestOptions;
 use crate::provider::{Message, Provider, ProviderError};
 use crate::store::Store;
-use crate::{bash, truncate};
+use crate::{bash, tools};
 
 /// Per-message caps applied only to the *summarization input*, so a very large
 /// history (e.g. many big tool outputs) cannot make the compaction request
@@ -110,15 +110,15 @@ pub async fn run_compaction(
                 format!("[{role}]: {}", clamp_for_summary(&m.content, cap))
             };
             // Include toolcall requests so compaction sees what the assistant actually asked for
-            if m.role == "assistant" {
-                if let Some(calls) = crate::store::parse_tool_calls(m.tool_calls_json.as_deref()) {
-                    for c in calls {
-                        text.push_str(&format!(
-                            "\n[toolcall {}]: {}",
-                            c.function.name,
-                            clamp_for_summary(&c.function.arguments, MAX_SUMMARY_TOOL_CHARS)
-                        ));
-                    }
+            if m.role == "assistant"
+                && let Some(calls) = crate::store::parse_tool_calls(m.tool_calls_json.as_deref())
+            {
+                for c in calls {
+                    text.push_str(&format!(
+                        "\n[toolcall {}]: {}",
+                        c.function.name,
+                        clamp_for_summary(&c.function.arguments, MAX_SUMMARY_TOOL_CHARS)
+                    ));
                 }
             }
             text
@@ -220,7 +220,7 @@ fn build_summarize_prompt(
 }
 
 pub fn prune_spills(state_dir: &Path) {
-    truncate::prune_truncation_spills(state_dir, 7);
+    tools::prune_truncation_spills(state_dir, 7);
 }
 
 #[cfg(test)]

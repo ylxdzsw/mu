@@ -1,3 +1,4 @@
+use std::fmt;
 use std::io::{self, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process;
@@ -15,8 +16,6 @@ mod bash;
 mod cli;
 mod compaction;
 mod config;
-mod env;
-mod exit;
 mod guardrail;
 mod models;
 mod openai;
@@ -29,7 +28,6 @@ mod skills;
 mod store;
 mod system_prompt;
 mod tools;
-mod truncate;
 
 use cli::{Args, Command, ProjectSub, SessionSub};
 use config::Config;
@@ -40,6 +38,35 @@ use renderer::Renderer;
 use runtime::{InvocationOverrides, StatusReport, build_status_report, resolve_invocation};
 
 const MAX_SUBAGENT_TURN_DEPTH: u32 = 1;
+
+/// An error that carries a specific process exit code.
+///
+/// `main` downcasts to this to map well-known failure classes to the exit
+/// codes documented in SPEC §11. Errors without an `ExitError` fall back to
+/// the general error code `1`.
+#[derive(Debug)]
+struct ExitError {
+    code: i32,
+    message: String,
+}
+
+impl ExitError {
+    /// A `--session <id>` (or `-c`) that does not resolve in the active scope.
+    fn session_not_found(id: &str) -> anyhow::Error {
+        anyhow::Error::new(Self {
+            code: 2,
+            message: format!("session not found in active scope: {id}"),
+        })
+    }
+}
+
+impl fmt::Display for ExitError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for ExitError {}
 
 enum PromptSource {
     Stdin,
@@ -85,7 +112,7 @@ fn exit_code_for(error: &anyhow::Error) -> i32 {
     if let Some(signal) = bash::cancellation_signal() {
         return 128 + signal;
     }
-    if let Some(exit) = error.downcast_ref::<exit::ExitError>() {
+    if let Some(exit) = error.downcast_ref::<ExitError>() {
         return exit.code;
     }
     1
@@ -247,11 +274,11 @@ fn print_project_init_info(info: &ProjectInitInfo) {
 
 fn open_store_with_session(db_path: &Path, session: &str) -> Result<store::Store> {
     if !db_path.exists() {
-        return Err(exit::ExitError::session_not_found(session));
+        return Err(ExitError::session_not_found(session));
     }
     let store = store::Store::open(db_path)?;
     if store.get_session(session)?.is_none() {
-        return Err(exit::ExitError::session_not_found(session));
+        return Err(ExitError::session_not_found(session));
     }
     Ok(store)
 }
@@ -338,26 +365,24 @@ async fn run() -> Result<()> {
                         println!("[{}:{}] {}", r.seq, r.role, r.content);
 
                         // Emit toolcall requests immediately under their assistant message
-                        if r.role == "assistant" {
-                            if let Some(calls) =
+                        if r.role == "assistant"
+                            && let Some(calls) =
                                 crate::store::parse_tool_calls(r.tool_calls_json.as_deref())
-                            {
-                                for tc in calls {
-                                    println!(
-                                        "[{}:toolcall] {} {}",
-                                        r.seq, tc.function.name, tc.function.arguments
-                                    );
-                                }
+                        {
+                            for tc in calls {
+                                println!(
+                                    "[{}:toolcall] {} {}",
+                                    r.seq, tc.function.name, tc.function.arguments
+                                );
                             }
                         }
 
                         // Surface the tool schema together with the system message
-                        if r.role == "system" {
-                            if let Ok(schema) =
+                        if r.role == "system"
+                            && let Ok(schema) =
                                 serde_json::to_string_pretty(&crate::tools::tool_definitions())
-                            {
-                                println!("[{}:system:toolschema]\n{}", r.seq, schema);
-                            }
+                        {
+                            println!("[{}:system:toolschema]\n{}", r.seq, schema);
                         }
                     }
                 }
@@ -458,12 +483,12 @@ async fn run() -> Result<()> {
             let config = Config::load_for_scope(project_config_dir.as_deref())?;
             let db_path = scope.session_db_path();
             if !db_path.exists() {
-                return Err(exit::ExitError::session_not_found(&session));
+                return Err(ExitError::session_not_found(&session));
             }
             let store = store::Store::open(&db_path)?;
             let session_state = store
                 .get_session(&session)?
-                .ok_or_else(|| exit::ExitError::session_not_found(&session))?;
+                .ok_or_else(|| ExitError::session_not_found(&session))?;
             let request = RequestOptions {
                 model: models::resolve_model_ref(&config, &session_state.model)?,
             };
@@ -824,7 +849,7 @@ fn resolve_retry_session(
         return Ok(Some(
             store
                 .get_session(id)?
-                .ok_or_else(|| exit::ExitError::session_not_found(id))?,
+                .ok_or_else(|| ExitError::session_not_found(id))?,
         ));
     }
     store.latest_session()
@@ -1114,7 +1139,7 @@ mod tests {
     #[test]
     fn exit_code_maps_session_not_found_to_two() {
         bash::reset_cancellation_state();
-        let err = exit::ExitError::session_not_found("abc123");
+        let err = ExitError::session_not_found("abc123");
         assert_eq!(exit_code_for(&err), 2);
         assert!(
             err.to_string()

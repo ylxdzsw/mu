@@ -2326,10 +2326,10 @@ fn styled_graphemes(input: &str) -> Vec<StyledGrapheme> {
         offset = next_escape;
     }
 
-    if !controls.is_empty() {
-        if let Some(last) = units.last_mut() {
-            last.controls.push_str(&controls);
-        }
+    if !controls.is_empty()
+        && let Some(last) = units.last_mut()
+    {
+        last.controls.push_str(&controls);
     }
     units
 }
@@ -3064,7 +3064,7 @@ fn format_number(number: u64) -> String {
     let digits = number.to_string();
     let mut grouped = String::with_capacity(digits.len() + digits.len() / 3);
     for (index, byte) in digits.bytes().enumerate() {
-        if index > 0 && (digits.len() - index) % 3 == 0 {
+        if index > 0 && (digits.len() - index).is_multiple_of(3) {
             grouped.push(',');
         }
         grouped.push(byte as char);

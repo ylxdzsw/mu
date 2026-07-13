@@ -75,13 +75,10 @@ before entering `mu>` mode.
 
 Built-in command and skill files are loaded from `/usr/share/mu` with the lowest
 priority: project instructions shadow user instructions, and user instructions
-shadow built-ins with the same name. This directory is
-instruction-only; runtime state and `config.jsonc` still live under the normal
-global or project `.mu` directories. Shipped built-in skills include
-`background-task` for persistent foreground-test services, `customize-mu` for
-editing `mu` config, commands, skills, and instruction precedence, `exa-search`
-and `brave-search` for conditional API-backed web research when their keys are
-configured, and `subagent` for delegating independent work to fresh `mu` turns.
+shadow built-ins with the same name. This directory is instruction-only;
+runtime state and configuration remain in the global or project `.mu`
+directory. Built-ins with unmet command or environment requirements are not
+listed to the agent.
 
 While `mu>` mode is active, the plugin automatically suspends common editor
 helpers such as `zsh-syntax-highlighting` and `zsh-autosuggestions`, then
@@ -116,12 +113,14 @@ MU_ZSH_EXIT_HOOKS+=(mu_restore_conflicts)
 | `mu --output final` | Print only the final raw assistant message after the turn finishes |
 | `mu --output plain` | Render sequential plain assistant/tool text |
 | `mu --output terminal` | Render sequential interactive terminal output |
+| `mu project inspect --path <dir>` | Report the project scope and marker resolved for a directory |
 | `mu project init [--path <dir>] [--force]` | Create minimal local `.mu` metadata in the current directory or target directory |
 | `mu status --json [--include-models]` | Report the resolved model, session, context state, and optional configured model list |
 | `mu status --json --include-commands` | Include discovered custom command entries |
 | `mu status --json --include-skills` | Include active skill entries |
 | `mu session new` | Create session, print id |
 | `mu session list` | List recent sessions |
+| `mu session transcript --session <id>` | Print a persisted session transcript |
 | `mu compact --session <id>` | Force compaction; non-terminal stdin supplies an optional focus |
 | `mu retry [-s <id>] [-c]` | Resume an interrupted turn (see below) |
 
@@ -243,6 +242,6 @@ global scope. Project session history is stored in `<project>/.mu/sessions.db`;
 global session history is stored in `~/.mu/sessions.db`. Sessions from one
 scope are not visible in another.
 
-## Architecture
+## Product contract
 
-See [SPEC.md](SPEC.md) for the current design.
+See [SPEC.md](SPEC.md) for the complete behavior and architecture.
