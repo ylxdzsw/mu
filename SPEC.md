@@ -577,6 +577,10 @@ not browse shell history; the user leaves `mu>` mode first if they want normal
 shell history navigation. The plugin must not duplicate agent-loop, provider,
 store, or tool semantics.
 
+The plugin requires zsh, `jq`, and the `mu` binary on `PATH`. Setting
+`MU_ZSH_BIN` to a specific executable overrides the binary name/path used by
+the plugin.
+
 ### 6.1 Invocation pattern
 
 Submitting a non-empty prompt runs `mu` as an ordinary foreground child process.
@@ -613,6 +617,10 @@ Consequences:
 - Press Up or Down while editing in `mu>` mode to move within the current
   buffer only. They must not recall shell history; leave `mu>` mode first if
   shell history navigation is desired.
+- Shift+Enter inserts a newline without submitting when the terminal sends the
+  CSI-u sequence `Esc [ 13 ; 2 u`. Terminals that send ordinary Enter for this
+  key combination cannot be distinguished by zsh and require a matching key
+  configuration.
 - Typing `/` at the start of a `mu>` line proactively lists slash commands.
   After that, Tab delegates matching, candidate lists, and menu selection to
   the user's normal zsh completion settings.
@@ -631,7 +639,9 @@ Consequences:
 - While `mu>` mode is active, conflicting line-editor plugins should be
   suspended. Common ZLE helpers such as syntax highlighting and autosuggestions
   may be disabled automatically; additional plugin toggles may be attached with
-  mode enter/exit hooks.
+  mode enter/exit hooks. The arrays `MU_ZSH_ENTER_HOOKS` and
+  `MU_ZSH_EXIT_HOOKS` contain zsh function names; enter hooks run after prompt
+  mode is active, and exit hooks run after the normal shell prompt is restored.
 - Ctrl-D is the normal terminal EOT key (`^D`). xterm-style and browser-terminal
   input paths forward it as input when the browser or OS has
   not intercepted the key before the terminal receives it.
@@ -738,6 +748,10 @@ global and project `.mu` directories.
   `description`. The `name` must match the filename stem. For external
   compatibility with the open skill spec, `folder/SKILL.md` also qualifies when
   `name` matches `folder`.
+- Optional `requires_env` and `requires_commands` keys contain comma-separated
+  environment-variable and executable names. A skill is active and listed only
+  when every declared variable is present and every declared command resolves
+  on `PATH`.
 - On startup `mu` scans `.mu` with bounded depth/file limits, parses only
   qualifying front-matter, and injects a compact `<available_skills>` block —
   name, description, absolute file path — into the system prompt.
@@ -793,8 +807,10 @@ volatile session state by default.
 
 Automatic project state creation writes only runtime state and `.gitignore`;
 it does not create project configuration. Explicit `mu project init` creates a
-minimal config overlay and `.gitignore`. Global configuration creation writes
-the full starter `config.jsonc` and no `.gitignore`.
+minimal config overlay and `.gitignore`, but no empty skills directory. It
+refuses to create a nested mu project inside another discovered project unless
+`--force` is supplied. Global configuration creation writes the full starter
+`config.jsonc` and no `.gitignore`.
 
 ---
 
