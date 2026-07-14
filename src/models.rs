@@ -1,61 +1,14 @@
-use std::fmt;
-use std::str::FromStr;
-
 use anyhow::{Context, Result, bail};
-use clap::ValueEnum;
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 
 use crate::config::Config;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, ValueEnum)]
-#[serde(rename_all = "lowercase")]
-pub enum EffortLevel {
-    Low,
-    Medium,
-    High,
-    Xhigh,
-    Max,
-}
-
-impl EffortLevel {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Low => "low",
-            Self::Medium => "medium",
-            Self::High => "high",
-            Self::Xhigh => "xhigh",
-            Self::Max => "max",
-        }
-    }
-}
-
-impl fmt::Display for EffortLevel {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
-
-impl FromStr for EffortLevel {
-    type Err = anyhow::Error;
-
-    fn from_str(value: &str) -> Result<Self> {
-        match value {
-            "low" => Ok(Self::Low),
-            "medium" => Ok(Self::Medium),
-            "high" => Ok(Self::High),
-            "xhigh" => Ok(Self::Xhigh),
-            "max" => Ok(Self::Max),
-            other => bail!("unsupported effort level `{other}`"),
-        }
-    }
-}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedModelRef {
     pub canonical: String,
     pub provider_id: String,
     pub model_id: String,
-    pub effort: Option<EffortLevel>,
+    pub effort: Option<String>,
     pub preserved_thinking: bool,
 }
 
@@ -67,7 +20,7 @@ pub struct RequestOptions {
 #[derive(Debug, Clone, Serialize)]
 pub struct ResolvedModelInfo {
     pub context_window: Option<u64>,
-    pub supported_effort_levels: Vec<EffortLevel>,
+    pub supported_effort_levels: Vec<String>,
     pub preserved_thinking: bool,
 }
 
@@ -86,7 +39,7 @@ pub struct AvailableProvider {
 pub struct AvailableModel {
     pub id: String,
     pub model_id: String,
-    pub supported_efforts: Vec<EffortLevel>,
+    pub supported_efforts: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub context_window: Option<u64>,
     pub preserved_thinking: bool,
@@ -116,13 +69,23 @@ pub fn resolve_model_ref(config: &Config, raw: &str) -> Result<ResolvedModelRef>
         bail!("empty model reference");
     }
 
-    let (base, effort) = split_effort(raw);
-
-    if let Some((provider_id, model_id)) = explicit_provider(config, base) {
-        return resolve_exact_model(config, provider_id, model_id, effort);
+    if let Some(resolved) = try_resolve_model(config, raw, None)? {
+        return Ok(resolved);
     }
 
-    resolve_implicit_model(config, base, effort)
+    if let Some((base, effort)) = raw.rsplit_once(':')
+        && !base.is_empty()
+        && !effort.is_empty()
+        && let Some(resolved) = try_resolve_model(config, base, Some(effort.to_string()))?
+    {
+        return Ok(resolved);
+    }
+
+    if let Some((provider_id, model_id)) = explicit_provider(config, raw) {
+        resolve_exact_model(config, provider_id, model_id, None)
+    } else {
+        resolve_implicit_model(config, raw, None)
+    }
 }
 
 pub fn resolve_model_info(config: &Config, model: &ResolvedModelRef) -> ResolvedModelInfo {
@@ -134,39 +97,6 @@ pub fn resolve_model_info(config: &Config, model: &ResolvedModelRef) -> Resolved
             .unwrap_or_default(),
         preserved_thinking: model.preserved_thinking,
     }
-}
-
-pub fn validate_model_effort(config: &Config, model: &ResolvedModelRef) -> Result<()> {
-    let Some(effort) = model.effort else {
-        return Ok(());
-    };
-
-    let cfg = config
-        .model_config(&model.provider_id, &model.model_id)
-        .ok_or_else(|| anyhow::anyhow!("model not configured: {}", model.canonical))?;
-    let Some(levels) = cfg.supported_efforts.as_ref() else {
-        bail!(
-            "reasoning effort `{effort}` is not supported by model `{}`; no `supported_efforts` configured",
-            canonical_base(&model.provider_id, &model.model_id)
-        );
-    };
-    if levels.contains(&effort) {
-        return Ok(());
-    }
-
-    let supported = if levels.is_empty() {
-        "(none)".to_string()
-    } else {
-        levels
-            .iter()
-            .map(ToString::to_string)
-            .collect::<Vec<_>>()
-            .join(", ")
-    };
-    bail!(
-        "reasoning effort `{effort}` is not supported by model `{}`; supported levels: {supported}",
-        canonical_base(&model.provider_id, &model.model_id)
-    );
 }
 
 pub fn available_models(config: &Config) -> AvailableModelsPayload {
@@ -194,16 +124,6 @@ pub fn available_models(config: &Config) -> AvailableModelsPayload {
     AvailableModelsPayload { providers }
 }
 
-fn split_effort(raw: &str) -> (&str, Option<EffortLevel>) {
-    let Some((base, suffix)) = raw.rsplit_once(':') else {
-        return (raw, None);
-    };
-    match <EffortLevel as FromStr>::from_str(suffix) {
-        Ok(level) if !base.is_empty() => (base, Some(level)),
-        _ => (raw, None),
-    }
-}
-
 fn explicit_provider<'a>(config: &'a Config, base: &'a str) -> Option<(&'a str, &'a str)> {
     let (provider_id, model_id) = base.split_once('/')?;
     config
@@ -212,11 +132,44 @@ fn explicit_provider<'a>(config: &'a Config, base: &'a str) -> Option<(&'a str, 
         .then_some((provider_id, model_id))
 }
 
+fn try_resolve_model(
+    config: &Config,
+    raw: &str,
+    effort: Option<String>,
+) -> Result<Option<ResolvedModelRef>> {
+    if let Some((provider_id, model_id)) = explicit_provider(config, raw) {
+        return config
+            .model_config(provider_id, model_id)
+            .map(|_| resolve_exact_model(config, provider_id, model_id, effort))
+            .transpose();
+    }
+
+    let matches = config
+        .providers
+        .iter()
+        .filter(|(_, provider)| provider.models.contains_key(raw))
+        .map(|(provider_id, _)| provider_id.as_str())
+        .collect::<Vec<_>>();
+
+    match matches.as_slice() {
+        [] => Ok(None),
+        [provider_id] => resolve_exact_model(config, provider_id, raw, effort).map(Some),
+        _ => bail!(
+            "ambiguous model `{raw}`; use one of: {}",
+            matches
+                .iter()
+                .map(|provider_id| canonical_base(provider_id, raw))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    }
+}
+
 fn resolve_exact_model(
     config: &Config,
     provider_id: &str,
     model_id: &str,
-    effort: Option<EffortLevel>,
+    effort: Option<String>,
 ) -> Result<ResolvedModelRef> {
     if model_id.trim().is_empty() {
         bail!("model reference `{provider_id}/` is missing a model id");
@@ -226,13 +179,12 @@ fn resolve_exact_model(
         .with_context(|| format!("model not configured: {provider_id}/{model_id}"))?;
 
     let resolved = ResolvedModelRef {
-        canonical: canonical_ref(provider_id, model_id, effort),
+        canonical: canonical_ref(provider_id, model_id, effort.as_deref()),
         provider_id: provider_id.to_string(),
         model_id: model_id.to_string(),
         effort,
         preserved_thinking: should_preserve_thinking(model_id, model_config),
     };
-    validate_model_effort(config, &resolved)?;
     Ok(resolved)
 }
 
@@ -246,7 +198,7 @@ fn should_preserve_thinking(model_id: &str, model: &crate::config::ModelConfig) 
 fn resolve_implicit_model(
     config: &Config,
     model_id: &str,
-    effort: Option<EffortLevel>,
+    effort: Option<String>,
 ) -> Result<ResolvedModelRef> {
     let matches = config
         .providers
@@ -269,7 +221,7 @@ fn resolve_implicit_model(
     }
 }
 
-fn canonical_ref(provider_id: &str, model_id: &str, effort: Option<EffortLevel>) -> String {
+fn canonical_ref(provider_id: &str, model_id: &str, effort: Option<&str>) -> String {
     let base = canonical_base(provider_id, model_id);
     match effort {
         Some(level) => format!("{base}:{level}"),
@@ -305,15 +257,23 @@ mod tests {
                                 ModelConfig {
                                     context_window: Some(100),
                                     supported_efforts: Some(vec![
-                                        EffortLevel::Low,
-                                        EffortLevel::Medium,
-                                        EffortLevel::High,
+                                        "low".into(),
+                                        "medium".into(),
+                                        "high".into(),
                                     ]),
                                     preserved_thinking: None,
                                 },
                             ),
                             (
                                 "nested/model".into(),
+                                ModelConfig {
+                                    context_window: Some(200),
+                                    supported_efforts: None,
+                                    preserved_thinking: None,
+                                },
+                            ),
+                            (
+                                "version:latest".into(),
                                 ModelConfig {
                                     context_window: Some(200),
                                     supported_efforts: None,
@@ -364,7 +324,7 @@ mod tests {
                             "common-model".into(),
                             ModelConfig {
                                 context_window: Some(300),
-                                supported_efforts: Some(vec![EffortLevel::Max]),
+                                supported_efforts: Some(vec!["max".into()]),
                                 preserved_thinking: None,
                             },
                         )]),
@@ -390,9 +350,32 @@ mod tests {
         let resolved = resolve_model_ref(&test_config(), "alpha/common-model:high").unwrap();
         assert_eq!(resolved.provider_id, "alpha");
         assert_eq!(resolved.model_id, "common-model");
-        assert_eq!(resolved.effort, Some(EffortLevel::High));
+        assert_eq!(resolved.effort.as_deref(), Some("high"));
         assert_eq!(resolved.canonical, "alpha/common-model:high");
         assert!(!resolved.preserved_thinking);
+    }
+
+    #[test]
+    fn resolves_arbitrary_effort_without_allowlist_validation() {
+        let resolved =
+            resolve_model_ref(&test_config(), "alpha/common-model:provider-custom").unwrap();
+        assert_eq!(resolved.model_id, "common-model");
+        assert_eq!(resolved.effort.as_deref(), Some("provider-custom"));
+        assert_eq!(resolved.canonical, "alpha/common-model:provider-custom");
+
+        let unlisted = resolve_model_ref(&test_config(), "alpha/nested/model:none").unwrap();
+        assert_eq!(unlisted.effort.as_deref(), Some("none"));
+    }
+
+    #[test]
+    fn exact_model_id_takes_precedence_over_effort_suffix() {
+        let exact = resolve_model_ref(&test_config(), "alpha/version:latest").unwrap();
+        assert_eq!(exact.model_id, "version:latest");
+        assert_eq!(exact.effort, None);
+
+        let with_effort = resolve_model_ref(&test_config(), "alpha/version:latest:max").unwrap();
+        assert_eq!(with_effort.model_id, "version:latest");
+        assert_eq!(with_effort.effort.as_deref(), Some("max"));
     }
 
     #[test]

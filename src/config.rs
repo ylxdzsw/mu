@@ -6,7 +6,6 @@ use anyhow::{Context, Result, bail};
 use serde::de::{MapAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize};
 
-use crate::models::EffortLevel;
 use crate::paths;
 
 pub type EnvMap = HashMap<String, String>;
@@ -66,7 +65,7 @@ pub struct ProviderConfig {
 pub struct ModelConfig {
     pub context_window: Option<u64>,
     #[serde(default)]
-    pub supported_efforts: Option<Vec<EffortLevel>>,
+    pub supported_efforts: Option<Vec<String>>,
     /// Whether complete assistant reasoning traces are replayed in chat
     /// history. When omitted, DeepSeek- and GLM-named models enable this automatically.
     #[serde(default)]
@@ -671,6 +670,32 @@ mod tests {
         });
 
         config_from_value(value).unwrap();
+    }
+
+    #[test]
+    fn parse_accepts_provider_defined_effort_strings() {
+        let value = serde_json::json!({
+            "providers": {
+                "openai": {
+                    "base_url": "http://localhost",
+                    "models": {
+                        "custom": {
+                            "context_window": 128000,
+                            "supported_efforts": ["none", "minimal", "provider-custom"]
+                        }
+                    }
+                }
+            }
+        });
+
+        let config = config_from_value(value).unwrap();
+        let efforts = config
+            .model_config("openai", "custom")
+            .unwrap()
+            .supported_efforts
+            .as_ref()
+            .unwrap();
+        assert_eq!(efforts, &["none", "minimal", "provider-custom"]);
     }
 
     #[test]

@@ -1037,13 +1037,17 @@ _mu_zsh_accept() {
   MU_ZSH_PENDING_INPUT=$input
   MU_ZSH_PENDING_PROMPT=$PROMPT
   MU_ZSH_PENDING_SUBMIT=1
-  # End the active editor with an empty shell line. The precmd hook runs the
-  # saved turn outside ZLE, so submitted prose is never shell code.
+  # Accept the visible draft normally. The line-finish hook freezes that
+  # display and clears the command before zsh can parse it.
+  zle .accept-line
+}
+
+_mu_zsh_finish_pending() {
+  (( MU_ZSH_PENDING_SUBMIT )) || return 0
+
   zle -I
-  PROMPT=
   BUFFER=
   CURSOR=0
-  zle .accept-line
 }
 
 _mu_zsh_dispatch_pending() {
@@ -1110,9 +1114,11 @@ if [[ -o zle ]]; then
   zle -N _mu_zsh_slash
   zle -N _mu_zsh_accept
   zle -N _mu_zsh_insert_newline
+  zle -N _mu_zsh_finish_pending
   zle -N _mu_zsh_line_init
   zle -N mu-zsh-mode
   zle -N mu-zsh-exit-mode
+  add-zle-hook-widget line-finish _mu_zsh_finish_pending 2>/dev/null || true
   add-zle-hook-widget line-init _mu_zsh_line_init 2>/dev/null || true
   add-zsh-hook precmd _mu_zsh_dispatch_pending 2>/dev/null || true
   bindkey '^I' _mu_zsh_tab

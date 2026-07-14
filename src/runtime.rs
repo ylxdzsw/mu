@@ -28,7 +28,7 @@ pub struct ResolvedInvocation {
 pub struct StatusModel {
     pub provider_id: String,
     pub model_id: String,
-    pub effort: Option<crate::models::EffortLevel>,
+    pub effort: Option<String>,
     pub canonical: String,
 }
 
@@ -39,7 +39,7 @@ pub struct StatusReport {
     pub context_percent: Option<f64>,
     pub project_root: Option<String>,
     pub context_window: Option<u64>,
-    pub supported_effort_levels: Vec<crate::models::EffortLevel>,
+    pub supported_effort_levels: Vec<String>,
     pub git: Option<GitStatus>,
     pub session: Option<StatusSession>,
     pub active: StatusActiveTurn,
@@ -208,7 +208,7 @@ fn status_model(model: &ResolvedModelRef) -> StatusModel {
     StatusModel {
         provider_id: model.provider_id.clone(),
         model_id: model.model_id.clone(),
-        effort: model.effort,
+        effort: model.effort.clone(),
         canonical: model.canonical.clone(),
     }
 }
@@ -300,7 +300,6 @@ mod tests {
         CompactionConfig, Config, GuardrailConfig, LimitsConfig, ModelConfig, OrderedMap,
         ProviderConfig, RedactionConfig, TerminalBellConfig,
     };
-    use crate::models::EffortLevel;
 
     fn test_config() -> Config {
         Config {
@@ -313,7 +312,7 @@ mod tests {
                         "default-model".into(),
                         ModelConfig {
                             context_window: Some(100),
-                            supported_efforts: Some(vec![EffortLevel::Low, EffortLevel::High]),
+                            supported_efforts: Some(vec!["low".into(), "high".into()]),
                             preserved_thinking: None,
                         },
                     )]),

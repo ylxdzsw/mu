@@ -280,11 +280,11 @@ fn build_chat_request_body(
         "stream": true,
         "stream_options": { "include_usage": true }
     });
-    if let Some(effort) = request.model.effort {
+    if let Some(effort) = request.model.effort.as_deref() {
         // Chat Completions uses a top-level `reasoning_effort` string. (The
         // nested `reasoning: { effort }` object is the Responses API shape and
         // is rejected by real OpenAI `/chat/completions`.)
-        body["reasoning_effort"] = Value::String(effort.as_str().to_string());
+        body["reasoning_effort"] = Value::String(effort.to_string());
     }
     if request.model.preserved_thinking && is_glm_model(&request.model.model_id) {
         // Zhipu's GLM API requires this switch as well as the verbatim
@@ -651,9 +651,9 @@ fn next_event_boundary(buffer: &str) -> Option<(usize, usize)> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::{EffortLevel, ResolvedModelRef};
+    use crate::models::ResolvedModelRef;
 
-    fn test_model(effort: Option<EffortLevel>) -> ResolvedModelRef {
+    fn test_model(effort: Option<&str>) -> ResolvedModelRef {
         ResolvedModelRef {
             canonical: match effort {
                 Some(level) => format!("test/gpt-test:{level}"),
@@ -661,7 +661,7 @@ mod tests {
             },
             provider_id: "test".into(),
             model_id: "gpt-test".into(),
-            effort,
+            effort: effort.map(str::to_string),
             preserved_thinking: false,
         }
     }
@@ -848,13 +848,13 @@ mod tests {
     fn request_includes_reasoning_effort_when_set() {
         let body = build_chat_request_body(
             &RequestOptions {
-                model: test_model(Some(EffortLevel::High)),
+                model: test_model(Some("provider-custom")),
             },
             &[],
             &[],
         );
 
-        assert_eq!(body["reasoning_effort"], "high");
+        assert_eq!(body["reasoning_effort"], "provider-custom");
     }
 
     #[test]

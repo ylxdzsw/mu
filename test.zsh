@@ -15,6 +15,16 @@ submitted_display_before_response() {
   REPLY=${stream%%"Hello! I'm your terminal agent."*}
 }
 
+raw_newline_count_between() {
+  local transcript=$1 start=$2 end=$3
+  REPLY=$(START="$start" END="$end" perl -0777 -ne '
+    if (/.*\Q$ENV{START}\E(.*?)\Q$ENV{END}\E/s) {
+      my $between = $1;
+      print $between =~ tr/\n//;
+    }
+  ' "$transcript")
+}
+
 assert_command_reply() {
   local label=$1
   shift
@@ -69,7 +79,7 @@ if [[ "$1" == "status" ]]; then
   [[ "$provider" == "$model" ]] && provider=test
   model_json="\"model\":{\"provider_id\":\"$provider\",\"model_id\":\"$model_id\",\"effort\":null,\"canonical\":\"$model\"}"
   if (( include_models )); then
-    print -r -- "{$model_json,\"context_percent\":25.0,\"project_root\":\"$MU_ZSH_TEST_PROJECT_ROOT\",\"available_models\":{\"providers\":[{\"id\":\"local\",\"models\":[{\"id\":\"local/solo\",\"model_id\":\"solo\",\"supported_efforts\":[\"max\"]},{\"id\":\"local/shared\",\"model_id\":\"shared\",\"supported_efforts\":[]}]},{\"id\":\"openai\",\"models\":[{\"id\":\"openai/gpt\",\"model_id\":\"gpt\",\"supported_efforts\":[\"low\",\"high\"]},{\"id\":\"openai/shared\",\"model_id\":\"shared\",\"supported_efforts\":[\"medium\"]}]}]}}"
+    print -r -- "{$model_json,\"context_percent\":25.0,\"project_root\":\"$MU_ZSH_TEST_PROJECT_ROOT\",\"available_models\":{\"providers\":[{\"id\":\"local\",\"models\":[{\"id\":\"local/solo\",\"model_id\":\"solo\",\"supported_efforts\":[\"max\"]},{\"id\":\"local/shared\",\"model_id\":\"shared\",\"supported_efforts\":[]}]},{\"id\":\"openai\",\"models\":[{\"id\":\"openai/gpt\",\"model_id\":\"gpt\",\"supported_efforts\":[\"low\",\"high\",\"provider-custom\"]},{\"id\":\"openai/shared\",\"model_id\":\"shared\",\"supported_efforts\":[\"medium\"]}]}]}}"
   elif (( include_commands )); then
     print -r -- "{$model_json,\"context_percent\":25.0,\"project_root\":\"$MU_ZSH_TEST_PROJECT_ROOT\",\"commands\":[{\"name\":\"review.md\",\"path\":\"$MU_ZSH_TEST_PROJECT_ROOT/.mu/review.md\",\"scope\":\"project\"}]}"
   else
@@ -362,6 +372,7 @@ model_candidates=("${(@f)$(_mu_zsh_model_completion_candidates "gpt")}")
 model_candidates=("${(@f)$(_mu_zsh_model_completion_candidates "gpt:")}")
 [[ " ${(j: :)model_candidates} " == *" gpt:low "* ]] || fail "shows unqualified variants after colon"
 [[ " ${(j: :)model_candidates} " == *" openai/gpt:high "* ]] || fail "shows provider-qualified variants after colon"
+[[ " ${(j: :)model_candidates} " == *" gpt:provider-custom "* ]] || fail "shows provider-defined effort strings"
 BUFFER="/model openai/gpt:h"
 CURSOR=${#BUFFER}
 completion_candidates=("${(@f)$(_mu_zsh_completion_candidates)}")
@@ -611,8 +622,9 @@ after_submitted_display=${REPLY#*"$expected_submitted_display"}
 [[ "$after_submitted_display" != *"$expected_submitted_display"* ]] || fail "submitted prompt should be committed exactly once"
 [[ "$normalized" == *"Hello! I'm your terminal agent."* ]] || fail "interactive response should be rendered"
 after_submitted_prompt=${normalized##*$'mu> hello\n'}
-[[ "$after_submitted_prompt" == $'\n[thought '* ]] || fail "submitted prompt should have one empty line before the first thinking indicator"
-[[ "$after_submitted_prompt" != $'\n\n[thought '* ]] || fail "submitted prompt should not have two empty lines before the first thinking indicator"
+[[ "$after_submitted_prompt" == *'[thought '* ]] || fail "thinking indicator should follow the submitted prompt"
+raw_newline_count_between "$interactive_transcript" hello '[thought '
+[[ "$REPLY" == 1 ]] || fail "submitted prompt handoff should advance one raw line before thinking, saw $REPLY"
 [[ "$normalized" == *'mu> cancel-me'* ]] || fail "Ctrl-C should leave the cancelled mu line in scrollback"
 [[ $(<"$interactive_capture_calls") == x ]] || fail "interactive fake mu should run exactly once"
 after_response=${normalized#*"Hello! I'm your terminal agent."}
@@ -634,6 +646,20 @@ cmp -- "$interactive_expected_stdin" "$interactive_capture_stdin" || fail "inter
 interactive_args=("${(@f)$(<"$interactive_capture_args")}")
 expected_interactive_args=(--output terminal)
 [[ "${(j:\0:)interactive_args}" == "${(j:\0:)expected_interactive_args}" ]] || fail "unexpected interactive args: ${interactive_args[*]}"
+
+no_prompt_sp_transcript=$tmpdir/no-prompt-sp-transcript
+rm -f -- "$interactive_capture_args" "$interactive_capture_stdin" "$interactive_capture_calls"
+interactive_status=0
+{
+  print -r -- "$interactive_setup; unsetopt PROMPT_SP"
+  sleep 0.2
+  print -rn -- $'\t'"spacing probe"$'\r'
+  sleep 0.4
+  print -rn -- $'\x04'
+} | timeout 5 script -qfec 'TERM=xterm-256color zsh -df' "$no_prompt_sp_transcript" >/dev/null || interactive_status=$?
+(( interactive_status == 0 )) || fail "PROMPT_SP-disabled transcript exited with status $interactive_status"
+raw_newline_count_between "$no_prompt_sp_transcript" 'spacing probe' '[thought '
+[[ "$REPLY" == 1 ]] || fail "PROMPT_SP-disabled handoff should advance one raw line before thinking, saw $REPLY"
 
 shift_enter_transcript=$tmpdir/shift-enter-transcript
 rm -f -- "$interactive_capture_args" "$interactive_capture_stdin" "$interactive_capture_calls"
@@ -707,7 +733,9 @@ interactive_status=0
 
 normalized=$(perl -pe 's/\e\[[0-?]*[ -\/]*[@-~]//g' "$plain_transcript" | col -b)
 after_submitted_prompt=${normalized##*$'mu> plain prompt\n'}
-[[ "$after_submitted_prompt" == $'\nHello! I'* ]] || fail "submitted prompt should have one empty line before plain output"
+[[ "$after_submitted_prompt" == *"Hello! I'm your terminal agent."* ]] || fail "plain output should follow the submitted prompt"
+raw_newline_count_between "$plain_transcript" 'plain prompt' "Hello! I'm your terminal agent."
+[[ "$REPLY" == 1 ]] || fail "plain prompt handoff should advance one raw line before output, saw $REPLY"
 after_response=${normalized#*"Hello! I'm your terminal agent."}
 [[ "$after_response" == $'\n\n[mu] tokens: 12 in / 5 out  context: 25%\n\n'* ]] || fail "plain token summary should be a separate block after assistant output"
 [[ "$after_response" != *$'[mu] tokens: 12 in / 5 out  context: 25%\n\n\n'* ]] || fail "plain token summary should not leave two trailing empty lines"
@@ -750,6 +778,8 @@ new_session_setup="$interactive_setup; MU_ZSH_SESSION_ID=tracked-session; MU_ZSH
 
 normalized=$(perl -pe 's/\e\[[0-?]*[ -\/]*[@-~]//g' "$new_session_transcript" | col -b)
 [[ "$normalized" == *$'[mu] next turn will start a new session\n'* ]] || fail "new slash command should confirm the next turn starts fresh"
+raw_newline_count_between "$new_session_transcript" /new '[mu] next turn will start a new session'
+[[ "$REPLY" == 1 ]] || fail "new slash command handoff should advance one raw line before output, saw $REPLY"
 after_new_session=${normalized#*$'[mu] next turn will start a new session\n'}
 [[ "$after_new_session" == $'\n'* ]] || fail "new slash command should leave an empty line before the next prompt"
 [[ "$after_new_session" != $'\n\n'* ]] || fail "new slash command should not leave two empty lines before the next prompt"

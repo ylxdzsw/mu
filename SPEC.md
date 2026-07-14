@@ -710,9 +710,11 @@ and a **`tools` array** carrying the `bash` tool definition
 Tool definitions go in this dedicated `tools` parameter — **not** embedded in the
 system prompt. Request `stream_options:{include_usage:true}` so the final SSE
 chunk carries `usage`. When the resolved model reference includes a
-reasoning-effort suffix, it is sent as the top-level Chat Completions field
-`reasoning_effort: "<level>"` (not the Responses-API `reasoning:{effort}`
-object, which real OpenAI `/chat/completions` rejects).
+reasoning-effort suffix, its provider-defined string is sent unchanged as the
+top-level Chat Completions field `reasoning_effort: "<level>"` (not the
+Responses-API `reasoning:{effort}` object, which real OpenAI
+`/chat/completions` rejects). Mu does not validate this value against a built-in
+enum or the model's `supported_efforts`; the provider is authoritative.
 
 **Streaming accumulation (implement exactly).** The response is an SSE stream of
 `data: {json}` lines ending with `data: [DONE]`. For each chunk, look at
@@ -873,6 +875,7 @@ one scope are not visible in another.
         "models": {
           "gpt-4o": {
             "context_window": 128000,            // needed for Tier-1 compaction & context%
+            // Optional ordered suggestions for status output and shell completion.
             "supported_efforts": ["low", "medium", "high"],
             // Optional. Omit to enable for model ids containing "deepseek" or "glm".
             "preserved_thinking": false
@@ -895,9 +898,11 @@ one scope are not visible in another.
   At least one provider and one model are required; everything else has the
   defaults shown. Provider and model order is meaningful: project config entries
   are listed before inherited global entries, and model suggestions follow that
-  order. If global `config.jsonc` is missing, `mu` creates a starter file
-  automatically. `mu` hard-fails on a turn if the required fields are missing or
-  the API-key env var is unset (§7).
+  order. `supported_efforts` contains arbitrary provider-defined strings and is
+  advisory: it drives status output and shell completion but does not restrict
+  manually entered effort suffixes. If global `config.jsonc` is missing, `mu`
+  creates a starter file automatically. `mu` hard-fails on a turn if the required
+  fields are missing or the API-key env var is unset (§7).
 - **.env** — optional dotenv data. Values are visible to `bash`; this is
   convenience, not sandboxing. Values from provider `api_key_env` and
   `redaction.env` are exact-value redacted from bash output before the output is
