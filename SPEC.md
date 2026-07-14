@@ -206,8 +206,9 @@ accepts optional non-terminal stdin as a custom focus). The surface is small:
   supported image or audio files.
 - `mu [-s <id>] [-c] [--model <id>] [-a <file>] [--output final|plain|terminal] <prompt-file>`
   — run one turn from a prompt file; if the first line starts with `#!`, drop
-  it before sending the prompt. Non-terminal stdin is appended as a custom
-  instruction. `-a/--attach` is repeatable.
+  it before sending the prompt. A `mu` shebang may contain exactly
+  `--model <id>` as a turn-local default. Non-terminal stdin is appended as a
+  custom instruction. `-a/--attach` is repeatable.
 - `mu [-s <id>] [-c] [--model <id>] [--output final|plain|terminal] <custom-command>`
   — run a discovered shebang command from the active project/global `.mu`
   instruction index. Command names are relative `.mu` paths including
@@ -776,8 +777,13 @@ global and project `.mu` directories.
   skill file resolve against that file's containing directory.
 
 The same file may also be a custom command when its first line is a permissive
-`mu` shebang. Progressive disclosure remains: only short metadata is always in
-context; full instructions are pulled in on demand.
+`mu` shebang. The shebang may contain no arguments or exactly
+`--model <provider/model[:effort]>`; all other arguments are rejected when the
+file is invoked. An explicit invocation `--model` overrides the shebang model,
+which otherwise overrides the attached session or configured default for that
+turn without rewriting stored session state. Progressive disclosure remains:
+only short metadata is always in context; full instructions are pulled in on
+demand.
 
 ---
 

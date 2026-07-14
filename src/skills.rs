@@ -36,6 +36,17 @@ pub struct CommandMeta {
     pub scope: InstructionScope,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommandPrompt {
+    pub text: String,
+    pub model: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MuShebang {
+    pub model: Option<String>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum InstructionScope {
@@ -181,15 +192,50 @@ pub fn read_agents_md(path: &Path) -> Option<String> {
     std::fs::read_to_string(path).ok()
 }
 
-pub fn command_prompt(path: &Path) -> Result<String> {
+pub fn command_prompt(path: &Path) -> Result<CommandPrompt> {
     let raw = std::fs::read_to_string(path)
         .with_context(|| format!("reading custom command {}", path.display()))?;
+    let shebang = parse_mu_shebang(raw.lines().next().unwrap_or_default())
+        .with_context(|| format!("invalid custom command {} shebang", path.display()))?
+        .with_context(|| format!("custom command {} has no mu shebang", path.display()))?;
     let body = strip_instruction_headers(&raw);
-    let prompt = body.trim_end_matches(['\r', '\n']).to_string();
-    if prompt.is_empty() {
+    let text = body.trim_end_matches(['\r', '\n']).to_string();
+    if text.is_empty() {
         anyhow::bail!("empty custom command {}", path.display());
     }
-    Ok(prompt)
+    Ok(CommandPrompt {
+        text,
+        model: shebang.model,
+    })
+}
+
+pub fn parse_mu_shebang(line: &str) -> Result<Option<MuShebang>> {
+    let Some(args) = mu_shebang_args(line) else {
+        return Ok(None);
+    };
+
+    match args.as_slice() {
+        [] => Ok(Some(MuShebang { model: None })),
+        ["--model"] => anyhow::bail!("mu shebang --model requires a value"),
+        ["--model", model] => Ok(Some(MuShebang {
+            model: Some((*model).to_string()),
+        })),
+        _ => anyhow::bail!("unsupported mu shebang arguments: {}", args.join(" ")),
+    }
+}
+
+fn mu_shebang_args(line: &str) -> Option<Vec<&str>> {
+    let tokens = line
+        .strip_prefix("#!")?
+        .split_whitespace()
+        .collect::<Vec<_>>();
+    let mu_index = tokens.iter().position(|token| {
+        *token == "mu"
+            || Path::new(token)
+                .file_name()
+                .is_some_and(|file_name| file_name == "mu")
+    })?;
+    Some(tokens[mu_index + 1..].to_vec())
 }
 
 pub fn find_command<'a>(index: &'a InstructionIndex, name: &str) -> Option<&'a CommandMeta> {
@@ -421,15 +467,7 @@ fn strip_optional_mu_shebang(content: &str) -> (&str, bool) {
 }
 
 fn is_mu_shebang(line: &str) -> bool {
-    let Some(rest) = line.strip_prefix("#!") else {
-        return false;
-    };
-    rest.split_whitespace().any(|token| {
-        token == "mu"
-            || Path::new(token)
-                .file_name()
-                .is_some_and(|file_name| file_name == "mu")
-    })
+    mu_shebang_args(line).is_some()
 }
 
 fn parse_skill_frontmatter(content: &str) -> Result<ParsedSkill> {
@@ -640,6 +678,51 @@ mod tests {
         assert!(is_mu_shebang("#!/usr/bin/mu"));
         assert!(!is_mu_shebang("#!/usr/bin/env bash"));
         assert!(!is_mu_shebang("not a shebang"));
+    }
+
+    #[test]
+    fn parses_optional_model_from_mu_shebang() {
+        assert_eq!(
+            parse_mu_shebang("#!/usr/bin/env mu").unwrap(),
+            Some(MuShebang { model: None })
+        );
+        assert_eq!(
+            parse_mu_shebang("#!/usr/bin/env -S mu --model openai/gpt-5:high").unwrap(),
+            Some(MuShebang {
+                model: Some("openai/gpt-5:high".into())
+            })
+        );
+        assert_eq!(parse_mu_shebang("#!/usr/bin/env bash").unwrap(), None);
+    }
+
+    #[test]
+    fn rejects_other_mu_shebang_arguments() {
+        for line in [
+            "#!/usr/bin/env -S mu --model",
+            "#!/usr/bin/env -S mu --output plain",
+            "#!/usr/bin/env -S mu --model=openai/gpt-5",
+            "#!/usr/bin/env -S mu --model openai/gpt-5 extra",
+            "#!/usr/bin/env -S mu --model one --model two",
+        ] {
+            assert!(parse_mu_shebang(line).is_err(), "accepted {line}");
+        }
+    }
+
+    #[test]
+    fn command_prompt_rejects_other_mu_shebang_arguments() {
+        let root = temp_root("invalid-command-shebang");
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("review.md");
+        fs::write(
+            &path,
+            "#!/usr/bin/env -S mu --output plain\nReview the tree.\n",
+        )
+        .unwrap();
+
+        let error = command_prompt(&path).unwrap_err();
+        fs::remove_dir_all(root).unwrap();
+        assert!(error.to_string().contains("invalid custom command"));
+        assert!(format!("{error:#}").contains("unsupported mu shebang arguments"));
     }
 
     #[test]

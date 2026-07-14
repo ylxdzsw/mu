@@ -110,9 +110,13 @@ A custom command is any valid instruction file whose first line is a common vari
 of `mu` shebang:
 
 ```markdown
-#!/usr/bin/env -S mu --output plain
+#!/usr/bin/env -S mu --model openai/gpt-5:high
 Summarize the current checkout and suggest the next release note.
 ```
+
+The shebang accepts no arguments or exactly `--model <model-ref>`. Other
+arguments are rejected. An explicit invocation `--model` wins over the
+shebang, and `env -S` is the recommended form when passing the model option.
 
 Commands are invoked by their relative `.mu` path, including extension, for
 example `mu review.md` or `/review.md` in the zsh prompt mode. Built-in
@@ -132,9 +136,10 @@ file prompt unchanged. Non-empty stdin is appended after `---`. In zsh prompt
 mode, `/review.md Focus on authentication` passes the text after the command as
 that custom instruction; Shift+Enter may add more lines.
 
-Prompt-file mode strips the shebang before sending the prompt. If a command also
-has skill frontmatter, `mu` strips both the shebang and frontmatter for command
-execution.
+Prompt-file mode strips the shebang before sending the prompt. A `mu` shebang's
+model default applies equally to an explicit prompt path and a discovered
+command. If a command also has skill frontmatter, `mu` strips both the shebang
+and frontmatter for command execution.
 
 ## Skills
 

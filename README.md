@@ -86,7 +86,8 @@ Emphasize compatibility and migration risks.
 EOF
 ```
 
-`mu` is designed to be compatible with shebang.
+`mu` is designed to be compatible with shebang; executable prompts may select
+a turn-local model with `#!/usr/bin/env -S mu --model <model>`.
 
 Choose output for the caller:
 

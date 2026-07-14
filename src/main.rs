@@ -74,6 +74,12 @@ enum PromptSource {
     Command(PathBuf),
 }
 
+#[derive(Debug)]
+struct LoadedPrompt {
+    text: String,
+    model: Option<String>,
+}
+
 struct RunTurnArgs<'a> {
     config: &'a Config,
     provider: Arc<dyn Provider>,
@@ -529,7 +535,8 @@ async fn run_turn_from_source(
     turn: cli::TurnArgs,
     prompt_source: PromptSource,
 ) -> Result<()> {
-    let prompt = load_prompt(prompt_source)?;
+    let loaded_prompt = load_prompt(prompt_source)?;
+    let prompt = loaded_prompt.text;
     let attachments = load_attachments(&turn.attachments)?;
 
     let config = Config::load_for_scope(project_config_dir)?;
@@ -547,7 +554,7 @@ async fn run_turn_from_source(
         &InvocationOverrides {
             session: turn.selection.session.clone(),
             continue_latest: turn.selection.continue_latest,
-            model: turn.selection.model.clone(),
+            model: model_override(turn.selection.model.clone(), loaded_prompt.model),
         },
     )?;
     let model_info = models::resolve_model_info(&config, &resolved.request.model);
@@ -614,7 +621,7 @@ async fn run_turn_from_source(
     Ok(())
 }
 
-fn load_prompt(source: PromptSource) -> Result<String> {
+fn load_prompt(source: PromptSource) -> Result<LoadedPrompt> {
     let stdin = io::stdin();
     load_prompt_with_stdin(source, stdin.is_terminal(), &mut stdin.lock())
 }
@@ -623,24 +630,40 @@ fn load_prompt_with_stdin(
     source: PromptSource,
     stdin_is_terminal: bool,
     stdin: &mut impl Read,
-) -> Result<String> {
+) -> Result<LoadedPrompt> {
     match source {
         PromptSource::Stdin => {
             let mut prompt = String::new();
             stdin.read_to_string(&mut prompt)?;
-            normalize_prompt(&prompt, false)
+            Ok(LoadedPrompt {
+                text: normalize_prompt(&prompt, false)?,
+                model: None,
+            })
         }
         PromptSource::File(path) => {
             let raw = std::fs::read_to_string(&path)
                 .with_context(|| format!("reading prompt file {}", path.display()))?;
+            let model = skills::parse_mu_shebang(raw.lines().next().unwrap_or_default())
+                .with_context(|| format!("invalid prompt file {} shebang", path.display()))?
+                .and_then(|shebang| shebang.model);
             let prompt = normalize_prompt(&raw, true)?;
-            append_stdin_instruction(prompt, stdin_is_terminal, stdin)
+            Ok(LoadedPrompt {
+                text: append_stdin_instruction(prompt, stdin_is_terminal, stdin)?,
+                model,
+            })
         }
         PromptSource::Command(path) => {
             let prompt = skills::command_prompt(&path)?;
-            append_stdin_instruction(prompt, stdin_is_terminal, stdin)
+            Ok(LoadedPrompt {
+                text: append_stdin_instruction(prompt.text, stdin_is_terminal, stdin)?,
+                model: prompt.model,
+            })
         }
     }
+}
+
+fn model_override(explicit: Option<String>, shebang: Option<String>) -> Option<String> {
+    explicit.or(shebang)
 }
 
 fn load_optional_stdin_instruction() -> Result<Option<String>> {
@@ -1017,13 +1040,42 @@ mod tests {
     #[test]
     fn load_prompt_file_trims_shebang_line() {
         let path = temp_file_path("shebang");
-        std::fs::write(&path, "#!/usr/bin/env -S mu --output plain\nhello\n").unwrap();
+        std::fs::write(
+            &path,
+            "#!/usr/bin/env -S mu --model openai/gpt-5:high\nhello\n",
+        )
+        .unwrap();
         let mut stdin = Cursor::new("ignored instruction");
         let prompt =
             load_prompt_with_stdin(PromptSource::File(path.clone()), true, &mut stdin).unwrap();
         std::fs::remove_file(path).unwrap();
-        assert_eq!(prompt, "hello");
+        assert_eq!(prompt.text, "hello");
+        assert_eq!(prompt.model.as_deref(), Some("openai/gpt-5:high"));
         assert_eq!(stdin.position(), 0);
+    }
+
+    #[test]
+    fn prompt_file_rejects_other_mu_shebang_arguments() {
+        let path = temp_file_path("invalid-shebang");
+        std::fs::write(&path, "#!/usr/bin/env -S mu --output plain\nhello\n").unwrap();
+        let mut stdin = Cursor::new("");
+        let error =
+            load_prompt_with_stdin(PromptSource::File(path.clone()), true, &mut stdin).unwrap_err();
+        std::fs::remove_file(path).unwrap();
+        assert!(error.to_string().contains("invalid prompt file"));
+        assert!(format!("{error:#}").contains("unsupported mu shebang arguments"));
+    }
+
+    #[test]
+    fn explicit_model_overrides_shebang_model() {
+        assert_eq!(
+            model_override(Some("explicit/model".into()), Some("command/model".into())).as_deref(),
+            Some("explicit/model")
+        );
+        assert_eq!(
+            model_override(None, Some("command/model".into())).as_deref(),
+            Some("command/model")
+        );
     }
 
     #[test]
@@ -1035,9 +1087,10 @@ mod tests {
             load_prompt_with_stdin(PromptSource::File(path.clone()), false, &mut stdin).unwrap();
         std::fs::remove_file(path).unwrap();
         assert_eq!(
-            prompt,
+            prompt.text,
             "Use the release-note format.\n---\n\nFocus on auth.\nKeep the second line.\n"
         );
+        assert_eq!(prompt.model, None);
     }
 
     #[test]
@@ -1048,7 +1101,8 @@ mod tests {
         let prompt =
             load_prompt_with_stdin(PromptSource::File(path.clone()), false, &mut stdin).unwrap();
         std::fs::remove_file(path).unwrap();
-        assert_eq!(prompt, "Use the release-note format.");
+        assert_eq!(prompt.text, "Use the release-note format.");
+        assert_eq!(prompt.model, None);
     }
 
     #[test]
@@ -1078,14 +1132,15 @@ mod tests {
         let path = temp_file_path("command-instruction");
         std::fs::write(
             &path,
-            "#!/usr/bin/env mu\n---\nname: review\ndescription: Review changes.\n---\nReview the checkout.\n",
+            "#!/usr/bin/env -S mu --model openai/gpt-5:high\n---\nname: review\ndescription: Review changes.\n---\nReview the checkout.\n",
         )
         .unwrap();
         let mut stdin = Cursor::new("Focus on auth.");
         let prompt =
             load_prompt_with_stdin(PromptSource::Command(path.clone()), false, &mut stdin).unwrap();
         std::fs::remove_file(path).unwrap();
-        assert_eq!(prompt, "Review the checkout.\n---\n\nFocus on auth.");
+        assert_eq!(prompt.text, "Review the checkout.\n---\n\nFocus on auth.");
+        assert_eq!(prompt.model.as_deref(), Some("openai/gpt-5:high"));
     }
 
     #[test]
