@@ -87,7 +87,7 @@ impl std::fmt::Display for SessionBusy {
 
 impl std::error::Error for SessionBusy {}
 
-const CURRENT_SCHEMA_VERSION: i32 = 4;
+const CURRENT_SCHEMA_VERSION: i32 = 5;
 
 fn session_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Session> {
     Ok(Session {
@@ -138,20 +138,26 @@ impl Store {
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .context("reading SQLite schema version")?;
         match version {
-            0 if !self.has_application_tables()? => self.create_schema_v4(),
+            0 if !self.has_application_tables()? => self.create_schema_v5(),
             0 => anyhow::bail!(
                 "unsupported pre-release session database schema; remove sessions.db to create a fresh release database"
             ),
             1 => {
                 self.migrate_v1_to_v2()?;
                 self.migrate_v2_to_v3()?;
-                self.migrate_v3_to_v4()
+                self.migrate_v3_to_v4()?;
+                self.migrate_v4_to_v5()
             }
             2 => {
                 self.migrate_v2_to_v3()?;
-                self.migrate_v3_to_v4()
+                self.migrate_v3_to_v4()?;
+                self.migrate_v4_to_v5()
             }
-            3 => self.migrate_v3_to_v4(),
+            3 => {
+                self.migrate_v3_to_v4()?;
+                self.migrate_v4_to_v5()
+            }
+            4 => self.migrate_v4_to_v5(),
             CURRENT_SCHEMA_VERSION => Ok(()),
             future => anyhow::bail!(
                 "unsupported future session database schema version {future}; this mu supports version {CURRENT_SCHEMA_VERSION}"
@@ -170,7 +176,7 @@ impl Store {
         Ok(count > 0)
     }
 
-    fn create_schema_v4(&self) -> Result<()> {
+    fn create_schema_v5(&self) -> Result<()> {
         self.conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS session (
                 id TEXT PRIMARY KEY,
@@ -187,6 +193,7 @@ impl Store {
                 role TEXT NOT NULL,
                 content TEXT NOT NULL,
                 reasoning_content TEXT,
+                native_replay_json TEXT,
                 user_content_json TEXT,
                 tool_call_id TEXT,
                 tool_calls_json TEXT,
@@ -236,7 +243,7 @@ impl Store {
                 reason TEXT,
                 created_at TEXT NOT NULL
             );
-            PRAGMA user_version = 4;",
+            PRAGMA user_version = 5;",
         )?;
         Ok(())
     }
@@ -267,6 +274,20 @@ impl Store {
              );
              PRAGMA user_version = 4;",
         )?;
+        Ok(())
+    }
+
+    fn migrate_v4_to_v5(&self) -> Result<()> {
+        let has_message: bool = self.conn.query_row(
+            "SELECT COUNT(*) > 0 FROM sqlite_schema WHERE type = 'table' AND name = 'message'",
+            [],
+            |row| row.get(0),
+        )?;
+        if has_message {
+            self.conn
+                .execute_batch("ALTER TABLE message ADD COLUMN native_replay_json TEXT;")?;
+        }
+        self.conn.pragma_update(None, "user_version", 5)?;
         Ok(())
     }
 
@@ -502,7 +523,7 @@ impl Store {
         let summary_seq = self.latest_summary_seq(session_id)?;
         let start_seq = summary_seq.unwrap_or(-1);
         let mut stmt = self.conn.prepare(
-            "SELECT role, content, reasoning_content, user_content_json, tool_call_id, tool_calls_json FROM message
+            "SELECT role, content, reasoning_content, user_content_json, tool_call_id, tool_calls_json, native_replay_json FROM message
              WHERE session_id = ?1 AND seq > ?2 AND role NOT IN ('system', 'summary')
              ORDER BY seq ASC",
         )?;
@@ -530,6 +551,7 @@ impl Store {
                 user_content_json,
                 tool_call_id,
                 tool_calls_json,
+                native_replay_json,
             ) = row?;
             match role.as_str() {
                 "user" => messages.push(Message::User {
@@ -547,6 +569,9 @@ impl Store {
                         },
                         reasoning_content,
                         tool_calls,
+                        native_replay: native_replay_json
+                            .as_deref()
+                            .and_then(|json| serde_json::from_str(json).ok()),
                     });
                 }
                 "tool" => messages.push(Message::Tool {
@@ -717,6 +742,7 @@ impl Store {
                             content,
                             reasoning_content,
                             tool_calls,
+                            native_replay,
                         } => {
                             approx_tokens(content.as_deref().unwrap_or(""))
                                 + approx_tokens(reasoning_content.as_deref().unwrap_or(""))
@@ -724,6 +750,14 @@ impl Store {
                                     .as_ref()
                                     .map(|t| {
                                         approx_tokens(&serde_json::to_string(t).unwrap_or_default())
+                                    })
+                                    .unwrap_or(0)
+                                + native_replay
+                                    .as_ref()
+                                    .map(|native| {
+                                        approx_tokens(
+                                            &serde_json::to_string(native).unwrap_or_default(),
+                                        )
                                     })
                                     .unwrap_or(0)
                         }
@@ -780,6 +814,7 @@ pub struct SessionLock {
 type ContextRow = (
     String,
     String,
+    Option<String>,
     Option<String>,
     Option<String>,
     Option<String>,
@@ -911,6 +946,7 @@ fn load_context_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ContextRow> {
         row.get(3)?,
         row.get(4)?,
         row.get(5)?,
+        row.get(6)?,
     ))
 }
 
@@ -941,16 +977,22 @@ fn insert_message_in(
             content,
             reasoning_content,
             tool_calls,
+            native_replay,
         } => {
             let tc_json = tool_calls.as_ref().map(serde_json::to_string).transpose()?;
+            let native_json = native_replay
+                .as_ref()
+                .map(serde_json::to_string)
+                .transpose()?;
             tx.execute(
-                "INSERT INTO message (session_id, role, content, reasoning_content, tool_calls_json, seq, created_at)
-                 VALUES (?1, 'assistant', ?2, ?3, ?4, ?5, ?6)",
+                "INSERT INTO message (session_id, role, content, reasoning_content, tool_calls_json, native_replay_json, seq, created_at)
+                 VALUES (?1, 'assistant', ?2, ?3, ?4, ?5, ?6, ?7)",
                 params![
                     session_id,
                     content.as_deref().unwrap_or(""),
                     reasoning_content,
                     tc_json,
+                    native_json,
                     seq,
                     now
                 ],
@@ -1001,7 +1043,9 @@ fn has_tool_calls(json: Option<&str>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::provider::{Attachment, ContentPart, FunctionCall, ToolCall};
+    use crate::provider::{
+        Attachment, ContentPart, FunctionCall, NativeReplay, NativeReplayPayload, ToolCall,
+    };
 
     fn temp_store() -> (Store, std::path::PathBuf) {
         let tmp = std::env::temp_dir().join(format!("mu-store-{}", uuid::Uuid::new_v4()));
@@ -1131,6 +1175,7 @@ mod tests {
             .collect::<rusqlite::Result<Vec<_>>>()
             .unwrap();
         assert!(message_columns.contains(&"reasoning_content".to_string()));
+        assert!(message_columns.contains(&"native_replay_json".to_string()));
         let session_columns = store
             .conn
             .prepare("PRAGMA table_info(session)")
@@ -1387,6 +1432,7 @@ mod tests {
                 &Message::Assistant {
                     content: Some("tool request".into()),
                     reasoning_content: Some(reasoning.clone()),
+                    native_replay: None,
                     tool_calls: None,
                 },
             )
@@ -1400,6 +1446,36 @@ mod tests {
                 ..
             } if saved == &reasoning
         ));
+        let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    #[test]
+    fn reloads_exact_native_responses_items_and_origin() {
+        let (store, tmp) = temp_store();
+        let session = create_session_with_system(&store);
+        let native = NativeReplay {
+            endpoint: "https://api.test/v1/responses".into(),
+            model: "gpt-test".into(),
+            payload: NativeReplayPayload::ResponsesOutput(vec![serde_json::json!({
+                "type": "reasoning", "id": "rs_1", "encrypted_content": "opaque"
+            })]),
+        };
+        store
+            .append_message(
+                &session.id,
+                &Message::Assistant {
+                    content: None,
+                    reasoning_content: None,
+                    tool_calls: None,
+                    native_replay: Some(native.clone()),
+                },
+            )
+            .unwrap();
+
+        let messages = store.load_context_messages(&session.id).unwrap();
+        assert!(matches!(&messages[1], Message::Assistant {
+            native_replay: Some(saved), ..
+        } if saved == &native));
         let _ = std::fs::remove_dir_all(tmp);
     }
 
@@ -1439,6 +1515,7 @@ mod tests {
                 &Message::Assistant {
                     content: None,
                     reasoning_content: None,
+                    native_replay: None,
                     tool_calls: Some(vec![
                         ToolCall {
                             id: "call-a".into(),
@@ -1540,6 +1617,7 @@ mod tests {
                 &Message::Assistant {
                     content: Some("hello".into()),
                     reasoning_content: None,
+                    native_replay: None,
                     tool_calls: None,
                 },
             )

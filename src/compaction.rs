@@ -249,6 +249,7 @@ mod tests {
                 message: Message::Assistant {
                     content: Some("summary".into()),
                     reasoning_content: None,
+                    native_replay: None,
                     tool_calls: None,
                 },
                 finish_reason: FinishReason::Stop,
@@ -267,14 +268,13 @@ mod tests {
             providers: crate::config::OrderedMap::from_iter([(
                 "test".into(),
                 crate::config::ProviderConfig {
-                    base_url: "http://localhost".into(),
+                    endpoint: "http://localhost/chat/completions".into(),
                     api_key_env: "TEST_KEY".into(),
                     models: crate::config::OrderedMap::from_iter([(
                         "fake-model".into(),
                         crate::config::ModelConfig {
                             context_window: None,
                             supported_efforts: None,
-                            preserved_thinking: None,
                         },
                     )]),
                 },
@@ -351,6 +351,7 @@ mod tests {
                     &Message::Assistant {
                         content: Some(format!("assistant {n}")),
                         reasoning_content: None,
+                        native_replay: None,
                         tool_calls: None,
                     },
                 )

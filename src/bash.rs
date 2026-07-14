@@ -625,7 +625,7 @@ mod tests {
             providers: crate::config::OrderedMap::from_iter([(
                 "test".into(),
                 ProviderConfig {
-                    base_url: "https://example.test".into(),
+                    endpoint: "https://example.test/chat/completions".into(),
                     api_key_env: "OPENAI_API_KEY".into(),
                     models: crate::config::OrderedMap::default(),
                 },

@@ -662,6 +662,7 @@ fn approx_context_tokens(context: &[Message]) -> u64 {
                 content,
                 reasoning_content,
                 tool_calls,
+                native_replay,
             } => {
                 approx_tokens(content.as_deref().unwrap_or(""))
                     + approx_tokens(reasoning_content.as_deref().unwrap_or(""))
@@ -669,6 +670,12 @@ fn approx_context_tokens(context: &[Message]) -> u64 {
                         .as_ref()
                         .map(|calls| {
                             approx_tokens(&serde_json::to_string(calls).unwrap_or_default())
+                        })
+                        .unwrap_or(0)
+                    + native_replay
+                        .as_ref()
+                        .map(|native| {
+                            approx_tokens(&serde_json::to_string(native).unwrap_or_default())
                         })
                         .unwrap_or(0)
             }
@@ -1161,6 +1168,7 @@ mod tests {
                     message: Message::Assistant {
                         content: Some("done".into()),
                         reasoning_content: None,
+                        native_replay: None,
                         tool_calls: None,
                     },
                     finish_reason: FinishReason::Stop,
@@ -1204,6 +1212,7 @@ mod tests {
                         message: Message::Assistant {
                             content: None,
                             reasoning_content: None,
+                            native_replay: None,
                             tool_calls: Some(vec![
                                 ToolCall {
                                     id: "call_first".into(),
@@ -1248,6 +1257,7 @@ mod tests {
                     message: Message::Assistant {
                         content: Some("done".into()),
                         reasoning_content: None,
+                        native_replay: None,
                         tool_calls: None,
                     },
                     finish_reason: FinishReason::Stop,
@@ -1268,14 +1278,13 @@ mod tests {
             providers: crate::config::OrderedMap::from_iter([(
                 "test".into(),
                 ProviderConfig {
-                    base_url: "http://localhost".into(),
+                    endpoint: "http://localhost/chat/completions".into(),
                     api_key_env: "MU_TEST_KEY".into(),
                     models: crate::config::OrderedMap::from_iter([(
                         "fake-model".into(),
                         crate::config::ModelConfig {
                             context_window: None,
                             supported_efforts: None,
-                            preserved_thinking: None,
                         },
                     )]),
                 },
@@ -1838,6 +1847,7 @@ mod tests {
                     message: Message::Assistant {
                         content: Some("summary".into()),
                         reasoning_content: None,
+                        native_replay: None,
                         tool_calls: None,
                     },
                     finish_reason: FinishReason::Stop,
@@ -1858,6 +1868,7 @@ mod tests {
                     message: Message::Assistant {
                         content: None,
                         reasoning_content: None,
+                        native_replay: None,
                         tool_calls: Some(vec![ToolCall {
                             id: "call_grow".into(),
                             call_type: "function".into(),
@@ -1884,6 +1895,7 @@ mod tests {
                     message: Message::Assistant {
                         content: Some("done".into()),
                         reasoning_content: None,
+                        native_replay: None,
                         tool_calls: None,
                     },
                     finish_reason: FinishReason::Stop,
@@ -1932,6 +1944,7 @@ mod tests {
                     &Message::Assistant {
                         content: Some(format!("reply {turn}")),
                         reasoning_content: None,
+                        native_replay: None,
                         tool_calls: None,
                     },
                 )
@@ -2020,6 +2033,7 @@ mod tests {
                     message: Message::Assistant {
                         content: None,
                         reasoning_content: None,
+                        native_replay: None,
                         tool_calls: Some(vec![ToolCall {
                             id: "call_readonly".into(),
                             call_type: "function".into(),
@@ -2046,6 +2060,7 @@ mod tests {
                     message: Message::Assistant {
                         content: Some("done".into()),
                         reasoning_content: None,
+                        native_replay: None,
                         tool_calls: None,
                     },
                     finish_reason: FinishReason::Stop,
@@ -2132,6 +2147,7 @@ mod tests {
                 message: Message::Assistant {
                     content: Some("partial answer".into()),
                     reasoning_content: None,
+                    native_replay: None,
                     tool_calls: None,
                 },
                 finish_reason: FinishReason::Other("length".into()),

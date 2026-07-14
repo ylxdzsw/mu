@@ -306,14 +306,13 @@ mod tests {
             providers: OrderedMap::from_iter([(
                 "alpha".into(),
                 ProviderConfig {
-                    base_url: "http://localhost".into(),
+                    endpoint: "http://localhost/chat/completions".into(),
                     api_key_env: "MU_TEST_KEY".into(),
                     models: OrderedMap::from_iter([(
                         "default-model".into(),
                         ModelConfig {
                             context_window: Some(100),
                             supported_efforts: Some(vec!["low".into(), "high".into()]),
-                            preserved_thinking: None,
                         },
                     )]),
                 },
@@ -411,6 +410,7 @@ mod tests {
                 &crate::provider::Message::Assistant {
                     content: Some("hello".into()),
                     reasoning_content: None,
+                    native_replay: None,
                     tool_calls: None,
                 },
             )

@@ -55,12 +55,12 @@ Common shape:
 {
   "providers": {
     "openai": {
-      "base_url": "https://api.openai.com/v1",
+      "endpoint": "https://api.openai.com/v1/responses",
       "api_key_env": "OPENAI_API_KEY",
       "models": {
-        "gpt-4o": {
-          "context_window": 128000,
-          "supported_efforts": ["low", "medium", "high"]
+        "gpt-5.6-terra": {
+          "context_window": 1050000,
+          "supported_efforts": ["none", "low", "medium", "high", "xhigh", "max"]
         }
       }
     }

@@ -689,47 +689,52 @@ Session lifecycle is exposed through CLI commands:
 
 ## 7. Provider / model integration
 
-A single internal trait abstracts the model API. The implementation is
-hand-written against the provider HTTP endpoint; the needed surface is small:
+Mu supports exactly two hand-written HTTP/SSE protocols: OpenAI-compatible
+Chat Completions and OpenAI Responses. Each configured provider has a required
+complete `endpoint`. After URL parsing and optional trailing-slash
+normalization, a case-sensitive path ending in `/chat/completions` selects Chat
+Completions and a path ending in `/responses` selects Responses. Query parameters
+are preserved but do not affect classification. Every other path fails during
+configuration loading; Mu never infers a protocol from a hostname, provider id,
+or model name. A gateway exposing both protocols is represented by two provider
+entries.
 
-- Send messages + tool definitions, receive a streamed response.
-- Stream deltas for assistant text and for tool-call arguments.
-- Report token usage.
+Both adapters accept the semantic transcript and Mu's `bash` function schema,
+stream protocol-neutral text/reasoning/tool-call events, and return a semantic
+assistant result plus usage. The renderer, tool executor, guardrail, retries,
+and compaction remain protocol-neutral.
 
-**Provider target: OpenAI-protocol chat-completions over HTTP.** This is the single
-most widely implemented contract — it covers OpenAI itself, the many compatible
-cloud gateways, and (importantly) local model servers (llama.cpp/`llama-server`,
-vLLM, LM Studio, Ollama's OpenAI endpoint, etc.). A configurable **base URL** is
-required; bearer auth is sent only when `api_key_env` is configured. Subscription
-/OAuth providers (Claude Pro, ChatGPT) and the Anthropic-native protocol are out
-of scope.
+**Chat Completions.** Mu posts directly to the configured endpoint with
+`messages`, the Chat function wrapper, `stream:true`, and
+`stream_options:{include_usage:true}`. It accumulates indexed
+`delta.tool_calls`, assistant text, and optional `reasoning_content`. A resolved
+effort is sent as top-level `reasoning_effort`. Complete reasoning attached to
+an assistant tool-call response is persisted and replayed verbatim only when
+the current endpoint and wire model id match its origin. This supports
+DeepSeek thinking tool loops without model-name heuristics.
 
-**Request shape.** `POST {base_url}/chat/completions` with optional
-`Authorization: Bearer {key}`, `stream: true`, `model`, the `messages` array,
-and a **`tools` array** carrying the `bash` tool definition
-`{type:"function", function:{name, description, parameters: <JSON schema>}}`).
-Tool definitions go in this dedicated `tools` parameter — **not** embedded in the
-system prompt. Request `stream_options:{include_usage:true}` so the final SSE
-chunk carries `usage`. When the resolved model reference includes a
-reasoning-effort suffix, its provider-defined string is sent unchanged as the
-top-level Chat Completions field `reasoning_effort: "<level>"` (not the
-Responses-API `reasoning:{effort}` object, which real OpenAI
-`/chat/completions` rejects). Mu does not validate this value against a built-in
-enum or the model's `supported_efforts`; the provider is authoritative.
+**Responses.** Mu posts directly to the configured endpoint with `stream:true`,
+`store:false`, `include:["reasoning.encrypted_content"]`, locally reconstructed
+`input`, and a flat Responses function-tool definition. It never sends
+`previous_response_id` or a conversation identifier. A resolved effort is sent
+as `reasoning:{effort}`. Typed SSE events provide output-text and function-call
+argument deltas; the complete successful `response.output` item array is stored
+unchanged, including encrypted reasoning, and replayed as input only for the
+same endpoint and wire model. Semantic tool results become
+`function_call_output` items connected by `call_id`.
 
-**Streaming accumulation (implement exactly).** The response is an SSE stream of
-`data: {json}` lines ending with `data: [DONE]`. For each chunk, look at
-`choices[0]`:
-- `delta.content` (string, may be null) — append to the assistant text buffer.
-- `delta.tool_calls` — an array of partial entries, each with an `index`. For a
-  given `index`, the first delta carries `id`, `type`, and `function.name`;
-  later deltas carry only `function.arguments` *string fragments* that must be
-  **concatenated** (they are not valid JSON until joined). Maintain one
-  accumulator per `index`.
-- `finish_reason` — `"stop"` (assistant is done, end the loop) or `"tool_calls"`
-  (execute the accumulated tool calls, then loop). Parse each tool call's joined
-  `function.arguments` as JSON only after the stream ends.
-- The trailing chunk with `usage` populates this response's token counts.
+The semantic transcript remains authoritative for display, compaction, and
+cross-model continuation. Switching model or protocol inside a session keeps
+semantic messages and reconstructs function calls/results, but omits native
+state whose endpoint or model origin does not match. Changing only effort does
+not invalidate native replay. Compaction excludes native state before the
+active summary boundary and retains it with the recent semantic suffix.
+
+Text and images are supported by both adapters. Images serialize as Chat
+`image_url` or Responses `input_image`. Existing audio inputs serialize as Chat
+`input_audio`; a Responses endpoint rejects audio locally with a clear error.
+Only successfully completed streams produce replay state, so retries never
+depend on a partial or remote response chain.
 
 **Model context window.** The 75% threshold needs the model's max context size.
 Source it from `config.jsonc`: each configured model entry carries a
@@ -738,7 +743,7 @@ configured `context_window`, the threshold-based tiers (Tier 1 pre-turn and Tier
 2 in-loop) are skipped for it and the Tier 3 API-error fallback is the only
 guard.
 
-Model and provider selection come from `config.jsonc`: a `base_url`, optional
+Model and provider selection come from `config.jsonc`: a complete `endpoint`, optional
 env var holding the API key, and ordered provider/model definitions. If the
 global config file is missing, `mu` creates a starter `~/.mu/config.jsonc`
 automatically before loading configuration. In a scope with no sessions, the
@@ -746,13 +751,13 @@ first configured model is used. API keys are read from environment variables;
 `mu` does not store secrets in its database.
 
 **No provider, hard fail.** If no provider is configured, a provider has no
-base URL, or a non-empty configured key env var is unset, a *turn* invocation
+valid supported endpoint, or a non-empty configured key env var is unset, a *turn* invocation
 exits immediately with a non-zero status and a clear message pointing at
 `config.jsonc`. `mu compact` follows the same rule because it calls the
 provider. There is no silent fallback once configuration has been loaded.
 
-Because the canonical message history is stored in a provider-neutral form
-(§11), swapping the base URL/model across turns is supported without migration.
+Because the semantic message history is stored separately from origin-bound
+native replay (§11), swapping endpoint/model across turns is supported.
 
 ---
 
@@ -846,7 +851,7 @@ The global and project directories have the same conceptual shape:
 
 ```
 ~/.mu/ or <project>/.mu/
-  config.jsonc      # provider base_url + key env var + model; optional tuning
+  config.jsonc      # provider endpoint + key env var + model; optional tuning
   .env              # optional environment values for provider lookup + bash
   AGENTS.md         # agent instructions, appended to system prompt
   review.md         # optional command/skill/reference instruction file
@@ -876,15 +881,13 @@ one scope are not visible in another.
   {
     "providers": {
       "openai": {
-        "base_url": "https://api.openai.com/v1", // required
+        "endpoint": "https://api.openai.com/v1/responses", // required complete POST URL
         "api_key_env": "OPENAI_API_KEY",         // optional: env var NAME, not the key
         "models": {
-          "gpt-4o": {
-            "context_window": 128000,            // needed for Tier-1 compaction & context%
+          "gpt-5.6-terra": {
+            "context_window": 1050000,           // needed for Tier-1 compaction & context%
             // Optional ordered suggestions for status output and shell completion.
-            "supported_efforts": ["low", "medium", "high"],
-            // Optional. Omit to enable for model ids containing "deepseek" or "glm".
-            "preserved_thinking": false
+            "supported_efforts": ["none", "low", "medium", "high", "xhigh", "max"]
           }
         }
       }
@@ -987,8 +990,11 @@ Conceptual schema (flat and small):
 - **message** — `id`, `session_id`, `role`
   (`system`/`user`/`assistant`/`tool`/`summary`),
   `content`, optional full user content JSON for multi-part inputs, `created_at`,
-  ordering index, and for tool results `tool_call_id`. Provider-neutral
-  representation. The first message in a new session is the persisted system
+  ordering index, and for tool results `tool_call_id`. Assistant rows may also
+  contain exact origin-bound native replay: Chat reasoning for a tool-call
+  message or a complete Responses output-item array. This native payload
+  augments rather than replaces the semantic fields and is never rendered. The
+  first message in a new session is the persisted system
   prompt. For user messages with image or audio attachments, `content` remains
   a textual projection for listing/token estimates, while attachment metadata
   references content-addressed bytes stored once in SQLite. The full hydrated
@@ -1141,8 +1147,9 @@ contention rather than erroring. The `flock` handles same-session serialization;
 ### Context window and compaction
 
 **Token counting (source of truth).** mu does not run a tokenizer. It uses the
-**provider's reported usage** — every OpenAI-protocol response carries a `usage`
-object with `prompt_tokens`, `completion_tokens`, and `total_tokens`. mu stores
+**provider's reported usage** — both adapters map native Chat or Responses usage
+into input, output, total, cache-read, optional cache-write, and reasoning-output
+token fields. mu stores
 the latest `total_tokens` on the session after each turn; that figure is the
 authoritative measure of how full the context is.
 

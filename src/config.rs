@@ -54,7 +54,7 @@ pub struct Config {
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct ProviderConfig {
     #[serde(default)]
-    pub base_url: String,
+    pub endpoint: String,
     #[serde(default)]
     pub api_key_env: String,
     #[serde(default)]
@@ -66,10 +66,6 @@ pub struct ModelConfig {
     pub context_window: Option<u64>,
     #[serde(default)]
     pub supported_efforts: Option<Vec<String>>,
-    /// Whether complete assistant reasoning traces are replayed in chat
-    /// history. When omitted, DeepSeek- and GLM-named models enable this automatically.
-    #[serde(default)]
-    pub preserved_thinking: Option<bool>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -411,9 +407,14 @@ impl Config {
             bail!("no providers configured in config.jsonc: set `providers`");
         }
         for (provider_id, provider) in &self.providers {
-            if provider.base_url.trim().is_empty() {
-                bail!("provider `{provider_id}` is missing `base_url` in config.jsonc");
+            if provider.endpoint.trim().is_empty() {
+                bail!(
+                    "provider `{provider_id}` is missing `endpoint` in config.jsonc; configure the complete URL ending in `/chat/completions` or `/responses`"
+                );
             }
+            crate::provider::classify_endpoint(&provider.endpoint).map_err(|error| {
+                anyhow::anyhow!("invalid provider `{provider_id}` in config.jsonc: {error}")
+            })?;
         }
         Ok(())
     }
@@ -552,7 +553,7 @@ fn merge_json(base: &mut serde_json::Value, overlay: serde_json::Value) {
 const STARTER_CONFIG: &str = r#"{
   "providers": {
     "openai": {
-      "base_url": "https://api.openai.com/v1",
+      "endpoint": "https://api.openai.com/v1/chat/completions",
       "api_key_env": "OPENAI_API_KEY",
       "models": {
         "gpt-4o": {
@@ -595,7 +596,7 @@ mod tests {
         let mut base = serde_json::json!({
             "providers": {
                 "alpha": {
-                    "base_url": "a",
+                    "endpoint": "https://a.test/chat/completions",
                     "api_key_env": "KEY",
                     "models": {"one": {"context_window": 1}}
                 }
@@ -608,7 +609,7 @@ mod tests {
                     "models": {"two": {"context_window": 2}}
                 },
                 "beta": {
-                    "base_url": "b",
+                    "endpoint": "https://b.test/chat/completions",
                     "api_key_env": "BETA_KEY",
                     "models": {"three": {"context_window": 3}}
                 }
@@ -639,7 +640,7 @@ mod tests {
             providers: OrderedMap::from_iter([(
                 "alpha".into(),
                 ProviderConfig {
-                    base_url: "http://localhost".into(),
+                    endpoint: "http://localhost/chat/completions".into(),
                     api_key_env: "TEST_KEY".into(),
                     models: OrderedMap::default(),
                 },
@@ -663,7 +664,7 @@ mod tests {
         let value = serde_json::json!({
             "providers": {
                 "openai": {
-                    "base_url": "http://localhost",
+                    "endpoint": "http://localhost/chat/completions",
                     "models": {"gpt-4o": {"context_window": 128000}}
                 }
             }
@@ -677,7 +678,7 @@ mod tests {
         let value = serde_json::json!({
             "providers": {
                 "openai": {
-                    "base_url": "http://localhost",
+                    "endpoint": "http://localhost/chat/completions",
                     "models": {
                         "custom": {
                             "context_window": 128000,
@@ -696,6 +697,40 @@ mod tests {
             .as_ref()
             .unwrap();
         assert_eq!(efforts, &["none", "minimal", "provider-custom"]);
+    }
+
+    #[test]
+    fn rejects_unsupported_endpoint_paths_before_runtime() {
+        let error = config_from_value(serde_json::json!({
+            "providers": {
+                "openai": {
+                    "endpoint": "https://api.openai.com/v1",
+                    "models": {"gpt": {}}
+                }
+            }
+        }))
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("must end in `/chat/completions` or `/responses`")
+        );
+    }
+
+    #[test]
+    fn legacy_base_url_fails_with_endpoint_migration_hint() {
+        let error = config_from_value(serde_json::json!({
+            "providers": {
+                "openai": {
+                    "base_url": "https://api.openai.com/v1",
+                    "models": {"gpt": {}}
+                }
+            }
+        }))
+        .unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("missing `endpoint`"));
+        assert!(message.contains("complete URL"));
     }
 
     #[test]

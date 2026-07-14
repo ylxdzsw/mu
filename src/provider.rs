@@ -21,11 +21,55 @@ pub enum Message {
         /// only for models that require it (for example DeepSeek thinking mode).
         reasoning_content: Option<String>,
         tool_calls: Option<Vec<ToolCall>>,
+        /// Exact protocol-native continuation state, replayed only when its
+        /// endpoint and wire model still match the current request.
+        native_replay: Option<NativeReplay>,
     },
     Tool {
         content: String,
         tool_call_id: String,
     },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct NativeReplay {
+    pub endpoint: String,
+    pub model: String,
+    pub payload: NativeReplayPayload,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "api", content = "data", rename_all = "snake_case")]
+pub enum NativeReplayPayload {
+    ChatReasoning(String),
+    ResponsesOutput(Vec<Value>),
+}
+
+impl NativeReplay {
+    pub fn matches(&self, endpoint: &str, model: &str) -> bool {
+        self.endpoint == endpoint && self.model == model
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModelApi {
+    ChatCompletions,
+    Responses,
+}
+
+pub fn classify_endpoint(endpoint: &str) -> anyhow::Result<ModelApi> {
+    let parsed = reqwest::Url::parse(endpoint)
+        .map_err(|error| anyhow::anyhow!("invalid provider endpoint `{endpoint}`: {error}"))?;
+    let path = parsed.path().trim_end_matches('/');
+    if path.ends_with("/chat/completions") {
+        Ok(ModelApi::ChatCompletions)
+    } else if path.ends_with("/responses") {
+        Ok(ModelApi::Responses)
+    } else {
+        anyhow::bail!(
+            "unsupported provider endpoint `{endpoint}`; path must end in `/chat/completions` or `/responses`"
+        )
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -192,7 +236,31 @@ pub fn build_provider(config: &Config, provider_id: &str) -> anyhow::Result<Arc<
     let provider = config.provider(provider_id)?;
     let api_key = config.api_key_for_provider(provider_id)?;
     Ok(Arc::new(crate::openai::OpenAiProvider::new(
-        provider.base_url.clone(),
+        provider.endpoint.clone(),
         api_key,
-    )) as Arc<dyn Provider>)
+    )?) as Arc<dyn Provider>)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn classifies_only_supported_endpoint_paths() {
+        assert_eq!(
+            classify_endpoint("https://gateway.test/v1/chat/completions?route=a").unwrap(),
+            ModelApi::ChatCompletions
+        );
+        assert_eq!(
+            classify_endpoint("https://gateway.test/custom/responses/").unwrap(),
+            ModelApi::Responses
+        );
+        for endpoint in [
+            "https://gateway.test/v1",
+            "https://gateway.test/v1/Responses",
+            "https://gateway.test/v1/chat/completions/extra",
+        ] {
+            assert!(classify_endpoint(endpoint).is_err(), "accepted {endpoint}");
+        }
+    }
 }

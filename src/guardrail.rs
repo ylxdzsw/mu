@@ -644,7 +644,6 @@ mod tests {
                 provider_id: "test".into(),
                 model_id: "model".into(),
                 effort: None,
-                preserved_thinking: false,
             },
             consecutive_denials: 0,
             recent_denials: VecDeque::new(),
@@ -680,7 +679,6 @@ mod tests {
                 provider_id: "test".into(),
                 model_id: "model".into(),
                 effort: None,
-                preserved_thinking: false,
             },
             consecutive_denials: 0,
             recent_denials: VecDeque::new(),
@@ -734,6 +732,7 @@ mod tests {
             Message::Assistant {
                 content: Some("I'll run rm".into()),
                 reasoning_content: None,
+                native_replay: None,
                 tool_calls: None,
             },
         ];

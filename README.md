@@ -119,7 +119,8 @@ CLI surface.
 
 ## Key features
 
-- Multiple OpenAI-compatible providers and ordered model selection, with
+- OpenAI-compatible Chat Completions and OpenAI Responses providers, with
+  strict full-endpoint selection, ordered model selection, and
   per-turn model and reasoning-effort overrides.
 - Persistent global or project-scoped sessions, continuation, transcripts,
   automatic context compaction, and interrupted-turn recovery.

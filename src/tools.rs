@@ -285,7 +285,7 @@ mod tests {
             providers: OrderedMap::from_iter([(
                 "test".into(),
                 ProviderConfig {
-                    base_url: "http://localhost".into(),
+                    endpoint: "http://localhost/chat/completions".into(),
                     api_key_env: "MU_TEST_KEY".into(),
                     models: OrderedMap::default(),
                 },
