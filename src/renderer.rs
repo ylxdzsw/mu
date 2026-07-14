@@ -3702,6 +3702,36 @@ mod tests {
     }
 
     #[test]
+    fn first_visible_renderer_blocks_have_no_leading_separator() {
+        let (mut assistant, assistant_output) =
+            Renderer::with_test_shared_output(OutputFormat::Terminal, true, None);
+        assistant.assistant_text("Hello.\n").unwrap();
+        assistant.assistant_end().unwrap();
+        assert!(
+            strip_ansi(&assistant_output.transcript()).starts_with("Hello."),
+            "{:?}",
+            assistant_output.transcript()
+        );
+
+        let (mut tool, tool_output) =
+            Renderer::with_test_shared_output(OutputFormat::Terminal, true, None);
+        tool.bash_header_start(None).unwrap();
+        tool.bash_header_title_delta("Inspect").unwrap();
+        tool.bash_header_title_end().unwrap();
+        assert!(
+            strip_ansi(&tool_output.transcript()).starts_with("# Inspect"),
+            "{:?}",
+            tool_output.transcript()
+        );
+
+        let (mut plain, plain_output) =
+            Renderer::with_test_shared_output(OutputFormat::Plain, false, None);
+        plain.assistant_text("Hello.\n").unwrap();
+        plain.assistant_end().unwrap();
+        assert_eq!(plain_output.transcript(), "Hello.\n");
+    }
+
+    #[test]
     fn terminal_summary_leaves_a_blank_line_before_the_next_prompt() {
         let raw = capture_renderer_transcript(Duration::from_secs(12), Some("mu> "));
         let normalized = strip_ansi(&raw.replace('\r', ""));

@@ -34,7 +34,6 @@ typeset -g MU_ZSH_ORIGINAL_RPROMPT=${MU_ZSH_ORIGINAL_RPROMPT:-}
 typeset -g MU_ZSH_SAVED_KEYMAP=${MU_ZSH_SAVED_KEYMAP:-main}
 typeset -g MU_ZSH_ORIGINAL_TAB_WIDGET=${MU_ZSH_ORIGINAL_TAB_WIDGET:-}
 typeset -g MU_ZSH_ORIGINAL_SLASH_WIDGET=${MU_ZSH_ORIGINAL_SLASH_WIDGET:-}
-typeset -gi MU_ZSH_OUTPUT_SEPARATOR_PENDING=${MU_ZSH_OUTPUT_SEPARATOR_PENDING:-0}
 typeset -gi MU_ZSH_HAD_HIGHLIGHTERS=${MU_ZSH_HAD_HIGHLIGHTERS:-0}
 typeset -gi MU_ZSH_DISABLED_AUTOSUGGESTIONS=${MU_ZSH_DISABLED_AUTOSUGGESTIONS:-0}
 typeset -ga MU_ZSH_COMMAND_REPLY
@@ -228,13 +227,6 @@ _mu_zsh_record_history() {
     print -sr -- "$MU_ZSH_BIN --model ${(q)model}${attachments} --output ${(q)MU_ZSH_OUTPUT} <<< $quoted"
   else
     print -sr -- "$MU_ZSH_BIN${attachments} --output ${(q)MU_ZSH_OUTPUT} <<< $quoted"
-  fi
-}
-
-_mu_zsh_print_output_separator_if_pending() {
-  if (( MU_ZSH_OUTPUT_SEPARATOR_PENDING )); then
-    MU_ZSH_OUTPUT_SEPARATOR_PENDING=0
-    print
   fi
 }
 
@@ -813,8 +805,6 @@ _mu_zsh_run_slash_command() {
   fi
 
   print -sr -- "$line"
-  _mu_zsh_print_output_separator_if_pending
-
   case "$command" in
     /attach)
       if [[ -z "$rest" ]]; then
@@ -977,12 +967,10 @@ _mu_zsh_submit_prompt() {
   MU_ZSH_PENDING_ATTACHMENTS=()
 
   if [[ -n "$session_id" ]]; then
-    _mu_zsh_print_output_separator_if_pending
     "${command[@]}" <<< "$input"
     exit_status=$?
   else
     rm -f -- "$MU_ZSH_SESSION_FILE" 2>/dev/null || true
-    _mu_zsh_print_output_separator_if_pending
     MU_SESSION_FILE=$MU_ZSH_SESSION_FILE "${command[@]}" <<< "$input"
     exit_status=$?
     _mu_zsh_read_session_file "$scope"
@@ -1066,7 +1054,6 @@ _mu_zsh_dispatch_pending() {
   MU_ZSH_PENDING_INPUT=
   MU_ZSH_PENDING_PROMPT=
   MU_ZSH_PENDING_SUBMIT=0
-  MU_ZSH_OUTPUT_SEPARATOR_PENDING=0
 
   if [[ "$input" == /* ]]; then
     _mu_zsh_run_slash_command "$input"

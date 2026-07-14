@@ -570,6 +570,9 @@ cat > "$TEST_CAPTURE_STDIN"
 if [ -n "$MU_SESSION_FILE" ]; then
   printf '%s\n' "created-session" > "$MU_SESSION_FILE"
 fi
+if [ "$2" = terminal ]; then
+  printf '%s\n\n' "[thought 100ms, 2 tokens]"
+fi
 printf '%s\n\n' "Hello! I'm your terminal agent."
 printf '%s\n\n' "[mu] tokens: 12 in / 5 out  context: 25%" >&2
 EOF
@@ -608,7 +611,8 @@ after_submitted_display=${REPLY#*"$expected_submitted_display"}
 [[ "$after_submitted_display" != *"$expected_submitted_display"* ]] || fail "submitted prompt should be committed exactly once"
 [[ "$normalized" == *"Hello! I'm your terminal agent."* ]] || fail "interactive response should be rendered"
 after_submitted_prompt=${normalized##*$'mu> hello\n'}
-[[ "$after_submitted_prompt" == $'\nHello! I'* ]] || fail "submitted prompt should have one empty line before terminal output"
+[[ "$after_submitted_prompt" == $'\n[thought '* ]] || fail "submitted prompt should have one empty line before the first thinking indicator"
+[[ "$after_submitted_prompt" != $'\n\n[thought '* ]] || fail "submitted prompt should not have two empty lines before the first thinking indicator"
 [[ "$normalized" == *'mu> cancel-me'* ]] || fail "Ctrl-C should leave the cancelled mu line in scrollback"
 [[ $(<"$interactive_capture_calls") == x ]] || fail "interactive fake mu should run exactly once"
 after_response=${normalized#*"Hello! I'm your terminal agent."}

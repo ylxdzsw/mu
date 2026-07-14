@@ -480,16 +480,30 @@ produced them, preserving raw Markdown for downstream consumers.
 ### 5.1 TTY block-spacing contract
 
 Terminal output is structured as a sequence of top-level transcript blocks:
-assistant text, committed thought lines, bash tool blocks, notices, and similar
-human-facing sections. The renderer owns the spacing contract for those blocks.
+the zsh `mu>` prompt, assistant text, committed thought lines, bash tool blocks,
+notices, and similar human-facing sections. Spacing has exactly one owner at
+each boundary: zsh owns the transition from a submitted `mu>` prompt to the
+child process's first visible block, and the renderer owns subsequent
+renderer-to-renderer block transitions.
 
 - Top-level transcript blocks are separated by exactly one empty line.
+- After submission, the canonical normalized prefix is
+  `mu> prompt\n\n[first visible block]`. Neither a missing empty line
+  (`mu> prompt\n[first visible block]`) nor two empty lines
+  (`mu> prompt\n\n\n[first visible block]`) are valid.
+- The renderer never adds leading spacing before its first visible block. That
+  block may be a live thought indicator, assistant text, a tool call, or a
+  notice. In styled TTY output, provider-emitted whitespace before it is
+  boundary noise: it does not render and does not mark a block as committed.
+  Blank lines inside visible assistant content remain intact, and plain output
+  continues to preserve raw assistant deltas.
 - The *next* top-level block owns that separator. Committed block formatters
   should end with exactly one newline; they must not rely on trailing blank
   lines baked into their own text.
 - Live status lines such as the updating `[thought ...]` line or the tool
   composition placeholder may reserve the top separator on first render, but
-  subsequent ticks only redraw that one mutable trailing line.
+  subsequent ticks only redraw that one mutable trailing line. A first live
+  status line does not add spacing on behalf of a preceding shell prompt.
 - A bash tool block includes its header, streamed preview/output, omission
   marker, and final exit line; those pieces are not separated from each other by
   extra blank lines.
