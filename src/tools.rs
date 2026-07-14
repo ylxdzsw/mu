@@ -43,7 +43,8 @@ pub fn bash_tool_definition() -> Value {
         "function": {
             "name": "bash",
             "description": crate::bash::description(),
-            "parameters": crate::bash::parameters_schema()
+            "parameters": crate::bash::parameters_schema(),
+            "strict": false
         }
     })
 }
@@ -305,6 +306,7 @@ mod tests {
         let definitions = tool_definitions();
         assert_eq!(definitions.len(), 1);
         assert_eq!(definitions[0]["function"]["name"].as_str(), Some("bash"));
+        assert_eq!(definitions[0]["function"]["strict"], json!(false));
         assert!(execution_mode("bash", &json!({"risk": "readonly"})).is_some());
     }
 
@@ -312,6 +314,7 @@ mod tests {
     fn bash_schema_requires_title_risk_and_command() {
         let schema = crate::bash::parameters_schema();
         assert_eq!(schema["required"], json!(["title", "risk", "command"]));
+        assert_eq!(schema["additionalProperties"], json!(false));
         assert_eq!(
             schema["properties"]["risk"]["enum"],
             json!(["readonly", "reversible", "destructive"])
@@ -320,6 +323,11 @@ mod tests {
         assert!(schema["properties"].get("script").is_none());
         assert!(schema["properties"].get("workdir").is_none());
         assert!(schema["properties"].get("cwd").is_some());
+        assert!(
+            schema["properties"]["stdin"]["description"]
+                .as_str()
+                .is_some_and(|description| description.contains("omit unless"))
+        );
     }
 
     #[test]

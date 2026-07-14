@@ -1403,6 +1403,7 @@ mod tests {
         assert!(body.get("previous_response_id").is_none());
         assert!(body.get("conversation").is_none());
         assert_eq!(body["tools"][0]["name"], "bash");
+        assert_eq!(body["tools"][0]["strict"], true);
         assert!(body["tools"][0].get("function").is_none());
         assert_eq!(body["input"][0]["content"][0]["type"], "input_text");
         assert_eq!(

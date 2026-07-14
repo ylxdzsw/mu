@@ -76,9 +76,10 @@ pub fn parameters_schema() -> Value {
             "command": { "type": "string", "description": "Command to run with bash -lc; can be multiline" },
             "cwd": { "type": "string", "description": "Working directory for this invocation; Prefer absolute path; Prefer this argument over `cd`" },
             "timeout": { "type": "integer", "minimum": 1, "description": "Timeout in seconds (default 120)" },
-            "stdin": { "type": "string", "description": "Literal stdin bytes to pipe to the command; Prefer this argument over long heredoc" }
+            "stdin": { "type": "string", "description": "Literal stdin bytes to pipe to the command; omit unless the command needs non-empty piped input; prefer this argument over long heredoc" }
         },
-        "required": ["title", "risk", "command"]
+        "required": ["title", "risk", "command"],
+        "additionalProperties": false
     })
 }
 
