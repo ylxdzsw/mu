@@ -54,6 +54,7 @@ struct StreamingCommandHeaders {
 #[derive(Default)]
 struct CommandHeaderDisplay {
     started: bool,
+    title_started: bool,
     title_displayed_bytes: usize,
     title_line_done: bool,
     command_started: bool,
@@ -792,18 +793,27 @@ impl CommandHeaderDisplay {
             self.started = renderer.bash_header_start(tool_call_id)?;
         }
 
-        if !self.title_line_done
-            && let Some(value) = title.value()
-        {
-            let done = stream_first_line(
-                value,
-                title.is_complete(),
-                crate::renderer::BASH_TITLE_PREVIEW_BYTES,
-                &mut self.title_displayed_bytes,
-                |text| renderer.bash_header_title_delta(text),
-            )?;
-            if done {
+        if !self.title_line_done {
+            if let Some(value) = title.value() {
+                if !self.title_started {
+                    renderer.bash_header_title_start()?;
+                    self.title_started = true;
+                }
+                let done = stream_first_line(
+                    value,
+                    title.is_complete(),
+                    crate::renderer::BASH_TITLE_PREVIEW_BYTES,
+                    &mut self.title_displayed_bytes,
+                    |text| renderer.bash_header_title_delta(text),
+                )?;
+                if done {
+                    renderer.bash_header_title_end()?;
+                    self.title_line_done = true;
+                }
+            } else if arguments_complete {
+                renderer.bash_header_title_start()?;
                 renderer.bash_header_title_end()?;
+                self.title_started = true;
                 self.title_line_done = true;
             }
         }
@@ -1431,6 +1441,7 @@ mod tests {
         .unwrap();
 
         assert!(headers.entries[0].display.started);
+        assert!(!headers.entries[0].display.title_started);
         assert!(!headers.entries[0].display.title_line_done);
         assert!(!headers.entries[0].display.command_started);
 
@@ -1448,6 +1459,7 @@ mod tests {
         .unwrap();
 
         assert!(headers.entries[0].display.is_done());
+        assert!(headers.entries[0].display.title_started);
     }
 
     #[test]

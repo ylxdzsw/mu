@@ -373,9 +373,13 @@ and stdin. This is an execution optimization only: stored tool-call records,
 stored tool messages, and the next model request still see the original
 assistant tool-call order.
 
-**Terminal visibility.** `bash` prints a `# <title>` line, then a `$ <command>`
-line with risk indicated by color in styled terminal output or an explicit
-`[risk]` label in plain output. If the call includes a `cwd` field whose
+**Terminal visibility.** While a tool call has started but its title has not
+begun streaming, styled terminal output shows a mutable
+`[preparing toolcall]` indicator. The indicator is cleared when `bash` begins
+committing its `# <title>` line, followed by a `$ <command>` line. In styled
+terminal output, `#` shares the title styling and `$` shares the command's risk
+color; plain output instead includes an explicit `[risk]` label. If the call
+includes a `cwd` field whose
 resolved path differs from `mu`'s process working directory, it then prints an
 `@ <raw cwd>` line using the exact `cwd` string supplied by the agent. If the
 call includes a `stdin` field, it then prints a `< [stdin N bytes]` summary line
@@ -501,10 +505,11 @@ renderer-to-renderer block transitions.
 - The *next* top-level block owns that separator. Committed block formatters
   should end with exactly one newline; they must not rely on trailing blank
   lines baked into their own text.
-- Live status lines such as the updating `[thought ...]` line or the tool
-  composition placeholder may reserve the top separator on first render, but
-  subsequent ticks only redraw that one mutable trailing line. A first live
-  status line does not add spacing on behalf of a preceding shell prompt.
+- Live status lines such as the updating `[thought ...]` line or the
+  `[preparing toolcall]` indicator may reserve the top separator on first
+  render, but subsequent ticks only redraw that one mutable trailing line. A
+  first live status line does not add spacing on behalf of a preceding shell
+  prompt.
 - A bash tool block includes its header, streamed preview/output, omission
   marker, and final exit line; those pieces are not separated from each other by
   extra blank lines.
@@ -521,12 +526,15 @@ captures the complete portable transcript while fatal diagnostics/summary
 remain visible. Stdout TTY detection selects rich versus portable rendering;
 stderr TTY detection suppresses the summary when redirected.
 
-- **Tool presentation.** Bash streams the active command header as the model
-  composes the tool-call arguments: `# <title>` first, then `$ <command>` once
-  the `risk` value is available so terminal output can color the command
-  consistently. The title and command are append-only and capped in place; the
-  command display is the first decoded line with a byte cap. If fields arrive
-  out of order, display buffers until the ordered header can be committed.
+- **Tool presentation.** Styled terminal output shows `[preparing toolcall]` as
+  its one mutable live line after a tool call starts and before title bytes are
+  available; plain output omits this transient status. Bash then streams the
+  active command header as the model composes the tool-call arguments:
+  `# <title>` first, then `$ <command>` once the `risk` value is available so
+  terminal output can color the whole command line consistently. The title and
+  command are append-only and capped in place; the command display is the first
+  decoded line with a byte cap. If fields arrive out of order, display buffers
+  until the ordered header can be committed.
   If a `stdin` field is provided, the optional `< [stdin N bytes]` summary starts
   only after the command line has committed; styled terminal output may update
   that summary as the only live line, while plain output commits it once the

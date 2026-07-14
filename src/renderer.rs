@@ -322,14 +322,25 @@ impl Renderer {
         }
         self.assistant_block_open = false;
         self.reasoning_end(None)?;
+        if self.styled {
+            self.live_line = Some(LiveLine::ToolComposition);
+            self.render_live_line()?;
+        }
+        Ok(true)
+    }
+
+    pub fn bash_header_title_start(&mut self) -> io::Result<()> {
+        if self.final_only {
+            return Ok(());
+        }
+        self.clear_live_line()?;
         self.live_line = None;
         self.ensure_block_separator_if_needed()?;
         if self.styled {
-            self.write_committed(&format!("{GRAY}# {RESET}{BOLD}"))?;
+            self.write_committed(&format!("{BOLD}# "))
         } else {
-            self.write_committed("# ")?;
+            self.write_committed("# ")
         }
-        Ok(true)
     }
 
     pub fn bash_header_title_delta(&mut self, text: &str) -> io::Result<()> {
@@ -358,7 +369,7 @@ impl Renderer {
             return Ok(());
         }
         if self.styled {
-            self.write_committed(&format!("{DIM}${RESET} {}{BOLD}", bash_risk_color(risk)))
+            self.write_committed(&format!("{}{BOLD}$ ", bash_risk_color(risk)))
         } else {
             let mut out = String::from("$ ");
             if let Some(risk) = risk {
@@ -426,6 +437,7 @@ impl Renderer {
             .unwrap_or_default();
         let risk = args.get("risk").and_then(|value| value.as_str());
         self.bash_header_start(tool_call_id)?;
+        self.bash_header_title_start()?;
         self.bash_header_title_delta(&preview_first_line(title, BASH_TITLE_PREVIEW_BYTES))?;
         self.bash_header_title_end()?;
         self.bash_header_command_start(risk)?;
@@ -729,7 +741,10 @@ impl Renderer {
         }
         if self.live_line_rendered {
             self.stdout.write_all(b"\r\x1b[2K")?;
-        } else if matches!(self.live_line, Some(LiveLine::Thinking)) {
+        } else if matches!(
+            self.live_line,
+            Some(LiveLine::Thinking | LiveLine::ToolComposition)
+        ) {
             self.ensure_block_separator_if_needed()?;
         } else if !self.stdout_at_line_start {
             self.write_stdout("\n")?;
@@ -759,6 +774,7 @@ impl Renderer {
                     approx_tokens_from_chars(reasoning.reasoning_chars),
                 ))
             }
+            Some(LiveLine::ToolComposition) => Some(format!("{GRAY}[preparing toolcall]{RESET}")),
             Some(LiveLine::TableBuffering { chars }) => Some(format_table_live(
                 approx_tokens_from_chars(chars),
                 self.styled,
@@ -939,6 +955,7 @@ struct TableBufferLive {
 #[derive(Clone, Copy)]
 enum LiveLine {
     Thinking,
+    ToolComposition,
     TableBuffering {
         chars: usize,
     },
@@ -2576,20 +2593,16 @@ fn format_bash_header(title: &str, command: &str, risk: Option<&str>, styled: bo
 
     let mut out = String::new();
     if !title.is_empty() {
-        out.push_str(GRAY);
-        out.push_str("# ");
-        out.push_str(RESET);
         out.push_str(BOLD);
+        out.push_str("# ");
         out.push_str(title);
         out.push_str(RESET);
         out.push('\n');
     }
-    out.push_str(DIM);
-    out.push('$');
-    out.push_str(RESET);
-    out.push(' ');
     out.push_str(bash_risk_color(risk));
     out.push_str(BOLD);
+    out.push('$');
+    out.push(' ');
     out.push_str(&command);
     out.push_str(RESET);
     out.push('\n');
@@ -3547,10 +3560,56 @@ mod tests {
     #[test]
     fn bash_header_renders_title_and_risk_colored_script_without_risk_label() {
         let header = format_bash_header("List files", "printf 'a'\npwd", Some("readonly"), true);
-        assert!(header.starts_with(&format!("{GRAY}# {RESET}{BOLD}List files{RESET}\n")));
-        assert!(header.contains(&format!("{DIM}${RESET} {CYAN}{BOLD}printf 'a'…{RESET}\n")));
+        assert!(header.starts_with(&format!("{BOLD}# List files{RESET}\n")));
+        assert!(header.contains(&format!("{CYAN}{BOLD}$ printf 'a'…{RESET}\n")));
         assert!(!header.contains("  pwd\n"));
         assert!(!header.contains("[readonly]"));
+    }
+
+    #[test]
+    fn tool_composition_indicator_is_replaced_before_title_commits() {
+        let (mut renderer, output) =
+            Renderer::with_test_shared_output(OutputFormat::Terminal, true, None);
+
+        renderer.bash_header_start(Some("call_1")).unwrap();
+        assert_eq!(
+            output.transcript(),
+            format!("{GRAY}[preparing toolcall]{RESET}")
+        );
+        assert!(matches!(
+            renderer.live_line,
+            Some(LiveLine::ToolComposition)
+        ));
+
+        renderer.bash_header_title_start().unwrap();
+        renderer.bash_header_title_delta("Inspect").unwrap();
+        renderer.bash_header_title_end().unwrap();
+
+        assert!(renderer.live_line.is_none());
+        assert_eq!(
+            output.transcript(),
+            format!("{GRAY}[preparing toolcall]{RESET}\r\x1b[2K{BOLD}# Inspect{RESET}\n")
+        );
+    }
+
+    #[test]
+    fn plain_tool_header_omits_composition_indicator() {
+        let (mut renderer, output) =
+            Renderer::with_test_shared_output(OutputFormat::Plain, false, None);
+
+        renderer.bash_header_start(Some("call_1")).unwrap();
+        assert_eq!(output.transcript(), "");
+
+        renderer.bash_header_title_start().unwrap();
+        renderer.bash_header_title_delta("Inspect").unwrap();
+        renderer.bash_header_title_end().unwrap();
+        renderer
+            .bash_header_command_start(Some("readonly"))
+            .unwrap();
+        renderer.bash_header_command_delta("pwd").unwrap();
+        renderer.bash_header_command_end().unwrap();
+
+        assert_eq!(output.transcript(), "# Inspect\n$ [readonly] pwd\n");
     }
 
     #[test]
@@ -3716,10 +3775,20 @@ mod tests {
         let (mut tool, tool_output) =
             Renderer::with_test_shared_output(OutputFormat::Terminal, true, None);
         tool.bash_header_start(None).unwrap();
+        tool.bash_header_title_start().unwrap();
         tool.bash_header_title_delta("Inspect").unwrap();
         tool.bash_header_title_end().unwrap();
         assert!(
-            strip_ansi(&tool_output.transcript()).starts_with("# Inspect"),
+            tool_output
+                .transcript()
+                .starts_with(&format!("{GRAY}[preparing toolcall]{RESET}")),
+            "{:?}",
+            tool_output.transcript()
+        );
+        assert!(
+            tool_output
+                .transcript()
+                .contains(&format!("\r\x1b[2K{BOLD}# Inspect{RESET}\n")),
             "{:?}",
             tool_output.transcript()
         );
@@ -3746,10 +3815,14 @@ mod tests {
         assert!(normalized.contains("reason is acceptable\nline01\n"));
         assert!(!normalized.contains("reason is acceptable\n\nline01\n"));
         assert!(
-            normalized
-                .contains(", 5 tokens]\n\n# Stream demo\n$ printf 'line01\\nline02\\nline03\\n'"),
+            normalized.contains(
+                ", 5 tokens]\n\n[preparing toolcall]# Stream demo\n$ printf 'line01\\nline02\\nline03\\n'"
+            ),
             "{normalized:?}"
         );
+        assert!(raw.contains(&format!(
+            "{GRAY}[preparing toolcall]{RESET}\r\x1b[2K{BOLD}# Stream demo{RESET}\n"
+        )));
         assert!(normalized.contains(
             "✓ exit 0 · 250ms\n\nDone.\n\n[mu] tokens: 12 in / 5 out  context: 25%  time: 12.0s\n\nmu> "
         ));
