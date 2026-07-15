@@ -1,60 +1,15 @@
 use std::collections::BTreeMap;
-use std::time::Duration;
 
-use async_trait::async_trait;
-use reqwest::Client;
 use serde::Deserialize;
 use serde_json::Value;
-use tokio::time::{self, MissedTickBehavior};
 
 use crate::models::RequestOptions;
 use crate::provider::{
-    ContentPart, FinishReason, FunctionCall, Message, ModelApi, NativeReplay, NativeReplayPayload,
-    Provider, ProviderError, ReasoningVisibility, StreamEvent, StreamResult, ToolCall,
-    ToolCallDelta as ProviderToolCallDelta, Usage, UserContent, classify_endpoint,
+    ContentPart, FinishReason, FunctionCall, HttpProvider, Message, NativeReplay,
+    NativeReplayPayload, ProviderError, ReasoningVisibility, SseEvent, StreamEvent, StreamResult,
+    ToolCall, ToolCallDelta as ProviderToolCallDelta, Usage, UserContent, base64_encode,
+    stream_error_message,
 };
-
-/// Bound the connect phase so a dead host fails fast instead of hanging the turn.
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
-/// Maximum gap between received stream bytes before the connection is treated as
-/// black-holed. This is an inter-chunk idle bound, not a total-turn bound: a
-/// model can legitimately reason silently for a long time, and GPT-5.x pauses
-/// generation for several seconds mid-stream while safety classifiers run, so
-/// the window is deliberately generous and only trips on true silence.
-const DEFAULT_STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(600);
-
-pub struct OpenAiProvider {
-    client: Client,
-    endpoint: String,
-    api: ModelApi,
-    api_key: Option<String>,
-    idle_timeout: Duration,
-}
-
-impl OpenAiProvider {
-    pub fn new(endpoint: String, api_key: Option<String>) -> anyhow::Result<Self> {
-        let endpoint = normalize_endpoint(&endpoint)?;
-        let api = classify_endpoint(&endpoint)?;
-        let client = Client::builder()
-            .connect_timeout(CONNECT_TIMEOUT)
-            .build()
-            .unwrap_or_else(|_| Client::new());
-        Ok(Self {
-            client,
-            endpoint,
-            api,
-            api_key,
-            idle_timeout: DEFAULT_STREAM_IDLE_TIMEOUT,
-        })
-    }
-}
-
-fn normalize_endpoint(endpoint: &str) -> anyhow::Result<String> {
-    let mut url = reqwest::Url::parse(endpoint)?;
-    let path = url.path().trim_end_matches('/').to_string();
-    url.set_path(&path);
-    Ok(url.to_string())
-}
 
 #[derive(Debug, Deserialize)]
 struct ChunkResponse {
@@ -147,612 +102,61 @@ impl Default for StreamParseState {
     }
 }
 
-#[async_trait(?Send)]
-impl Provider for OpenAiProvider {
-    async fn stream_chat(
-        &self,
-        request: &RequestOptions,
-        messages: &[Message],
-        tools: &[Value],
-        on_event: &mut dyn FnMut(StreamEvent) -> Result<(), ProviderError>,
-    ) -> Result<StreamResult, ProviderError> {
-        match self.api {
-            ModelApi::ChatCompletions => {
-                self.stream_chat_completions(request, messages, tools, on_event)
-                    .await
-            }
-            ModelApi::Responses => {
-                self.stream_responses(request, messages, tools, on_event)
-                    .await
-            }
-        }
-    }
-}
-
-impl OpenAiProvider {
-    async fn stream_chat_completions(
-        &self,
-        request: &RequestOptions,
-        messages: &[Message],
-        tools: &[Value],
-        on_event: &mut dyn FnMut(StreamEvent) -> Result<(), ProviderError>,
-    ) -> Result<StreamResult, ProviderError> {
-        let body = build_chat_request_body(request, &self.endpoint, messages, tools);
-
-        let mut req = self.client.post(&self.endpoint).json(&body);
-        if let Some(ref key) = self.api_key {
-            req = req.bearer_auth(key);
-        }
-        let response = req
-            .send()
-            .await
-            .map_err(|e| ProviderError::Transport(e.to_string()))?;
-
-        if !response.status().is_success() {
-            let status = response.status();
-            let text = response.text().await.unwrap_or_default();
-            if is_context_length_error(status.as_u16(), &text) {
-                return Err(ProviderError::ContextLength);
-            }
-            if status.as_u16() == 429 {
-                return Err(ProviderError::RateLimit { message: text });
-            }
-            return Err(ProviderError::HttpStatus {
-                status: status.as_u16(),
-                body: text,
-            });
-        }
-
-        let mut response = response;
-        let mut stream_state = StreamParseState::default();
-
-        let mut buffer = String::new();
-        let mut byte_buf: Vec<u8> = Vec::new();
-        let mut last_activity = std::time::Instant::now();
-        let mut tick = time::interval(Duration::from_millis(250));
-        tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
-        loop {
-            let chunk = tokio::select! {
-                chunk = response.chunk() => {
-                    last_activity = std::time::Instant::now();
-                    chunk.map_err(|e| ProviderError::Transport(e.to_string()))?
-                }
-                _ = tick.tick() => {
-                    if last_activity.elapsed() > self.idle_timeout {
-                        return Err(ProviderError::Transport(format!(
-                            "stream idle for over {}s",
-                            self.idle_timeout.as_secs()
-                        )));
-                    }
-                    on_event(StreamEvent::Tick)?;
-                    continue;
-                }
-            };
-            let Some(chunk) = chunk else {
-                break;
-            };
-            byte_buf.extend_from_slice(&chunk);
-            // Decode only the longest valid UTF-8 prefix; keep trailing bytes
-            // of a split multi-byte codepoint for the next chunk.
-            let valid_up_to = match std::str::from_utf8(&byte_buf) {
-                Ok(s) => {
-                    buffer.push_str(s);
-                    byte_buf.len()
-                }
-                Err(e) => {
-                    let valid = e.valid_up_to();
-                    // SAFETY: bytes [..valid] are guaranteed valid UTF-8.
-                    buffer.push_str(unsafe { std::str::from_utf8_unchecked(&byte_buf[..valid]) });
-                    valid
-                }
-            };
-            byte_buf.drain(..valid_up_to);
-            consume_sse_buffer(&mut buffer, &mut stream_state, on_event)?;
-        }
-        // Flush any remaining undecodable trailing bytes (lossy) so a final
-        // event without a trailing blank line is not silently dropped.
-        if !byte_buf.is_empty() {
-            buffer.push_str(&String::from_utf8_lossy(&byte_buf));
-        }
-        if !buffer.trim().is_empty() {
-            buffer.push_str("\n\n");
-            consume_sse_buffer(&mut buffer, &mut stream_state, on_event)?;
-        }
-        if stream_state.reasoning_active {
-            on_event(StreamEvent::ReasoningEnd)?;
-            stream_state.reasoning_active = false;
-        }
-
-        let has_tool_calls = !stream_state.tool_accum.is_empty();
-        let tool_calls = if !has_tool_calls {
-            None
-        } else {
-            Some(
-                stream_state
-                    .tool_accum
-                    .into_values()
-                    .map(|(id, name, args, call_type)| ToolCall {
-                        id: id.unwrap_or_else(|| "call".into()),
-                        call_type,
-                        function: FunctionCall {
-                            name: name.unwrap_or_default(),
-                            arguments: args,
-                        },
-                    })
-                    .collect(),
-            )
-        };
-
-        let message = Message::Assistant {
-            content: if stream_state.content.is_empty() {
-                None
-            } else {
-                Some(stream_state.content)
-            },
-            reasoning_content: if stream_state.reasoning_content.is_empty() {
-                None
-            } else {
-                Some(stream_state.reasoning_content.clone())
-            },
-            tool_calls,
-            native_replay: if stream_state.reasoning_content.is_empty() || !has_tool_calls {
-                None
-            } else {
-                Some(NativeReplay {
-                    endpoint: self.endpoint.clone(),
-                    model: request.model.model_id.clone(),
-                    payload: NativeReplayPayload::ChatReasoning(
-                        stream_state.reasoning_content.clone(),
-                    ),
-                })
-            },
-        };
-
-        Ok(StreamResult {
-            message,
-            finish_reason: stream_state.finish_reason,
-            usage: stream_state.usage,
-        })
-    }
-
-    async fn stream_responses(
-        &self,
-        request: &RequestOptions,
-        messages: &[Message],
-        tools: &[Value],
-        on_event: &mut dyn FnMut(StreamEvent) -> Result<(), ProviderError>,
-    ) -> Result<StreamResult, ProviderError> {
-        let body = build_responses_request_body(request, &self.endpoint, messages, tools)?;
-        let mut req = self.client.post(&self.endpoint).json(&body);
-        if let Some(ref key) = self.api_key {
-            req = req.bearer_auth(key);
-        }
-        let response = req
-            .send()
-            .await
-            .map_err(|error| ProviderError::Transport(error.to_string()))?;
-        if !response.status().is_success() {
-            let status = response.status();
-            let text = response.text().await.unwrap_or_default();
-            return Err(classify_http_error(status.as_u16(), text));
-        }
-
-        let mut response = response;
-        let mut state = ResponsesStreamState::default();
-        let mut buffer = String::new();
-        let mut byte_buf = Vec::new();
-        let mut last_activity = std::time::Instant::now();
-        let mut tick = time::interval(Duration::from_millis(250));
-        tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
-        loop {
-            let chunk = tokio::select! {
-                chunk = response.chunk() => {
-                    last_activity = std::time::Instant::now();
-                    chunk.map_err(|error| ProviderError::Transport(error.to_string()))?
-                }
-                _ = tick.tick() => {
-                    if last_activity.elapsed() > self.idle_timeout {
-                        return Err(ProviderError::Transport(format!(
-                            "stream idle for over {}s", self.idle_timeout.as_secs()
-                        )));
-                    }
-                    on_event(StreamEvent::Tick)?;
-                    continue;
-                }
-            };
-            let Some(chunk) = chunk else { break };
-            byte_buf.extend_from_slice(&chunk);
-            let valid_up_to = match std::str::from_utf8(&byte_buf) {
-                Ok(text) => {
-                    buffer.push_str(text);
-                    byte_buf.len()
-                }
-                Err(error) => {
-                    let valid = error.valid_up_to();
-                    // SAFETY: `valid_up_to` is guaranteed to end on UTF-8 boundary.
-                    buffer.push_str(unsafe { std::str::from_utf8_unchecked(&byte_buf[..valid]) });
-                    valid
-                }
-            };
-            byte_buf.drain(..valid_up_to);
-            consume_responses_sse_buffer(&mut buffer, &mut state, on_event)?;
-        }
-        if !byte_buf.is_empty() {
-            buffer.push_str(&String::from_utf8_lossy(&byte_buf));
-        }
-        if !buffer.trim().is_empty() {
-            buffer.push_str("\n\n");
-            consume_responses_sse_buffer(&mut buffer, &mut state, on_event)?;
-        }
-        if state.reasoning_active {
-            on_event(StreamEvent::ReasoningEnd)?;
-        }
-        if !state.terminal {
-            return Err(ProviderError::Other(state.failure.unwrap_or_else(|| {
-                "Responses stream ended before response.completed".into()
-            })));
-        }
-
-        let output = state.output;
-        let tool_calls = responses_tool_calls(&output);
-        let content = if state.content.is_empty() {
-            responses_output_text(&output)
-        } else {
-            Some(state.content)
-        };
-        let finish_reason = state.finish_reason.unwrap_or({
-            if tool_calls.is_empty() {
-                FinishReason::Stop
-            } else {
-                FinishReason::ToolCalls
-            }
-        });
-        Ok(StreamResult {
-            message: Message::Assistant {
-                content,
-                reasoning_content: None,
-                tool_calls: (!tool_calls.is_empty()).then_some(tool_calls),
-                native_replay: state.replayable.then(|| NativeReplay {
-                    endpoint: self.endpoint.clone(),
-                    model: request.model.model_id.clone(),
-                    payload: NativeReplayPayload::ResponsesOutput(output),
-                }),
-            },
-            finish_reason,
-            usage: state.usage,
-        })
-    }
-}
-
-fn classify_http_error(status: u16, body: String) -> ProviderError {
-    if is_context_length_error(status, &body) {
-        ProviderError::ContextLength
-    } else if status == 429 {
-        ProviderError::RateLimit { message: body }
-    } else {
-        ProviderError::HttpStatus { status, body }
-    }
-}
-
-fn build_responses_request_body(
+pub(crate) async fn stream(
+    provider: &HttpProvider,
     request: &RequestOptions,
-    endpoint: &str,
     messages: &[Message],
     tools: &[Value],
-) -> Result<Value, ProviderError> {
-    let mut input = Vec::new();
-    for message in messages {
-        responses_input_items(message, endpoint, &request.model.model_id, &mut input)?;
-    }
-    let response_tools = tools
-        .iter()
-        .map(|tool| {
-            let function = tool.get("function").unwrap_or(tool);
-            let mut flat = serde_json::Map::new();
-            flat.insert("type".into(), Value::String("function".into()));
-            for key in ["name", "description", "parameters", "strict"] {
-                if let Some(value) = function.get(key) {
-                    flat.insert(key.into(), value.clone());
-                }
-            }
-            Value::Object(flat)
-        })
-        .collect::<Vec<_>>();
-    let mut body = serde_json::json!({
-        "model": request.model.model_id,
-        "input": input,
-        "tools": response_tools,
-        "stream": true,
-        "store": false,
-        "include": ["reasoning.encrypted_content"]
-    });
-    let mut reasoning = serde_json::Map::new();
-    reasoning.insert("summary".into(), Value::String("auto".into()));
-    if let Some(effort) = request.model.effort.as_deref() {
-        reasoning.insert("effort".into(), Value::String(effort.to_string()));
-    }
-    body["reasoning"] = Value::Object(reasoning);
-    Ok(body)
-}
-
-fn responses_input_items(
-    message: &Message,
-    endpoint: &str,
-    model: &str,
-    input: &mut Vec<Value>,
-) -> Result<(), ProviderError> {
-    match message {
-        Message::System { content } => input.push(serde_json::json!({
-            "role": "system", "content": content
-        })),
-        Message::User { content } => input.push(serde_json::json!({
-            "role": "user", "content": responses_user_content(content)?
-        })),
-        Message::Assistant {
-            content,
-            tool_calls,
-            native_replay,
-            ..
-        } => {
-            if let Some(NativeReplay {
-                payload: NativeReplayPayload::ResponsesOutput(items),
-                ..
-            }) = native_replay
-                .as_ref()
-                .filter(|native| native.matches(endpoint, model))
-            {
-                input.extend(items.iter().cloned());
-            } else {
-                if let Some(content) = content {
-                    input.push(serde_json::json!({ "role": "assistant", "content": content }));
-                }
-                if let Some(tool_calls) = tool_calls {
-                    input.extend(tool_calls.iter().map(|call| {
-                        serde_json::json!({
-                            "type": "function_call",
-                            "call_id": call.id,
-                            "name": call.function.name,
-                            "arguments": call.function.arguments
-                        })
-                    }));
-                }
-            }
-        }
-        Message::Tool {
-            content,
-            artifacts,
-            tool_call_id,
-        } => {
-            let output = if artifacts.is_empty() {
-                Value::String(content.clone())
-            } else {
-                let mut parts = vec![serde_json::json!({
-                    "type": "input_text",
-                    "text": content,
-                })];
-                parts.extend(artifacts.iter().map(|artifact| {
-                    serde_json::json!({
-                        "type": "input_image",
-                        "image_url": format!(
-                            "data:{};base64,{}",
-                            artifact.attachment.media_type,
-                            base64_encode(&artifact.attachment.data)
-                        ),
-                        "detail": artifact.detail.to_string(),
-                    })
-                }));
-                Value::Array(parts)
-            };
-            input.push(serde_json::json!({
-                "type": "function_call_output", "call_id": tool_call_id, "output": output
-            }));
-        }
-    }
-    Ok(())
-}
-
-fn responses_user_content(content: &UserContent) -> Result<Value, ProviderError> {
-    match content {
-        UserContent::Text(text) => Ok(Value::String(text.clone())),
-        UserContent::Parts(parts) => parts
-            .iter()
-            .map(|part| match part {
-                ContentPart::Text { text } => Ok(serde_json::json!({
-                    "type": "input_text", "text": text
-                })),
-                ContentPart::Attachment { attachment }
-                    if attachment.media_type.starts_with("image/") =>
-                {
-                    Ok(serde_json::json!({
-                        "type": "input_image",
-                        "image_url": format!(
-                            "data:{};base64,{}", attachment.media_type, base64_encode(&attachment.data)
-                        )
-                    }))
-                }
-                ContentPart::Attachment { attachment } => Err(ProviderError::Other(format!(
-                    "Responses endpoints do not support audio attachment `{}` ({})",
-                    attachment.filename, attachment.media_type
-                ))),
-            })
-            .collect::<Result<Vec<_>, _>>()
-            .map(Value::Array),
-    }
-}
-
-#[derive(Default)]
-struct ResponsesStreamState {
-    content: String,
-    output: Vec<Value>,
-    usage: Option<Usage>,
-    terminal: bool,
-    replayable: bool,
-    finish_reason: Option<FinishReason>,
-    failure: Option<String>,
-    reasoning_active: bool,
-    reasoning_output_index: Option<usize>,
-    tool_indexes: BTreeMap<usize, usize>,
-}
-
-fn consume_responses_sse_buffer(
-    buffer: &mut String,
-    state: &mut ResponsesStreamState,
     on_event: &mut dyn FnMut(StreamEvent) -> Result<(), ProviderError>,
-) -> Result<(), ProviderError> {
-    while let Some((pos, sep_len)) = next_event_boundary(buffer) {
-        let event = buffer[..pos].to_string();
-        buffer.replace_range(..pos + sep_len, "");
-        let data = event
-            .lines()
-            .filter_map(|line| line.trim().strip_prefix("data:"))
-            .map(str::trim_start)
-            .collect::<Vec<_>>()
-            .join("\n");
-        if data.is_empty() || data == "[DONE]" {
-            continue;
-        }
-        let value: Value = serde_json::from_str(&data)
-            .map_err(|error| ProviderError::SseParse(error.to_string()))?;
-        let event_type = value.get("type").and_then(Value::as_str).unwrap_or("");
-        match event_type {
-            "response.output_item.added" => {
-                let item = &value["item"];
-                if item["type"] == "reasoning" && !state.reasoning_active {
-                    state.reasoning_active = true;
-                    let output_index = value["output_index"].as_u64().unwrap_or(0) as usize;
-                    state.reasoning_output_index = Some(output_index);
-                    on_event(StreamEvent::ReasoningStart(ReasoningVisibility::Opaque))?;
-                } else if item["type"] == "function_call" {
-                    let output_index = value["output_index"].as_u64().unwrap_or(0) as usize;
-                    let tool_index = state.tool_indexes.len();
-                    state.tool_indexes.insert(output_index, tool_index);
-                    on_event(StreamEvent::ToolCallDelta(ProviderToolCallDelta {
-                        index: tool_index,
-                        id: item["call_id"].as_str().map(str::to_owned),
-                        name: item["name"].as_str().map(str::to_owned),
-                        arguments_delta: item["arguments"].as_str().unwrap_or("").to_string(),
-                    }))?;
-                }
+) -> Result<StreamResult, ProviderError> {
+    let body = build_chat_request_body(request, &provider.endpoint, messages, tools);
+    let mut state = StreamParseState::default();
+    provider
+        .stream_sse(&body, &mut |event| match event {
+            SseEvent::Tick => on_event(StreamEvent::Tick),
+            SseEvent::Data(data) => {
+                let mut frame = format!("data: {data}\n\n");
+                consume_sse_buffer(&mut frame, &mut state, on_event)
             }
-            "response.output_item.done" => {
-                let output_index = value["output_index"].as_u64().unwrap_or(0) as usize;
-                if value["item"]["type"] == "reasoning"
-                    && state.reasoning_active
-                    && state.reasoning_output_index == Some(output_index)
-                {
-                    state.reasoning_active = false;
-                    state.reasoning_output_index = None;
-                    on_event(StreamEvent::ReasoningEnd)?;
-                }
-            }
-            "response.reasoning_summary_text.delta" => {
-                let output_index = value["output_index"].as_u64().unwrap_or(u64::MAX) as usize;
-                let summary_index = value["summary_index"].as_u64().unwrap_or(u64::MAX) as usize;
-                if state.reasoning_active
-                    && state.reasoning_output_index == Some(output_index)
-                    && summary_index == 0
-                    && let Some(delta) = value["delta"].as_str()
-                {
-                    on_event(StreamEvent::ReasoningSummaryDelta(delta.to_string()))?;
-                }
-            }
-            "response.output_text.delta" | "response.refusal.delta" => {
-                if let Some(delta) = value["delta"].as_str() {
-                    state.content.push_str(delta);
-                    on_event(StreamEvent::TextDelta(delta.to_string()))?;
-                }
-            }
-            "response.function_call_arguments.delta" => {
-                let output_index = value["output_index"].as_u64().unwrap_or(0) as usize;
-                let index = state
-                    .tool_indexes
-                    .get(&output_index)
-                    .copied()
-                    .unwrap_or(output_index);
-                let delta = value["delta"].as_str().unwrap_or("").to_string();
-                on_event(StreamEvent::ToolCallDelta(ProviderToolCallDelta {
-                    index,
-                    id: None,
-                    name: None,
-                    arguments_delta: delta,
-                }))?;
-            }
-            "response.completed" => {
-                state.terminal = true;
-                state.replayable = true;
-                state.output = value["response"]["output"]
-                    .as_array()
-                    .cloned()
-                    .unwrap_or_default();
-                state.usage = responses_usage(&value["response"]["usage"]);
-            }
-            "response.incomplete" => {
-                state.terminal = true;
-                state.output = value["response"]["output"]
-                    .as_array()
-                    .cloned()
-                    .unwrap_or_default();
-                state.usage = responses_usage(&value["response"]["usage"]);
-                let reason = value["response"]["incomplete_details"]["reason"]
-                    .as_str()
-                    .unwrap_or("incomplete");
-                state.finish_reason = Some(FinishReason::Other(reason.to_string()));
-            }
-            "response.failed" | "error" => {
-                state.failure = Some(stream_error_message(
-                    value.get("error").unwrap_or(&value["response"]["error"]),
-                ));
-            }
-            _ => {}
-        }
+        })
+        .await?;
+    if state.reasoning_active {
+        on_event(StreamEvent::ReasoningEnd)?;
     }
-    Ok(())
-}
 
-fn responses_usage(value: &Value) -> Option<Usage> {
-    value.is_object().then(|| Usage {
-        input_tokens: value["input_tokens"].as_u64().unwrap_or(0),
-        cache_read_input_tokens: value["input_tokens_details"]["cached_tokens"]
-            .as_u64()
-            .unwrap_or(0),
-        cache_write_input_tokens: value["input_tokens_details"]["cache_write_tokens"]
-            .as_u64()
-            .or_else(|| value["input_tokens_details"]["cache_creation_tokens"].as_u64()),
-        output_tokens: value["output_tokens"].as_u64().unwrap_or(0),
-        reasoning_output_tokens: value["output_tokens_details"]["reasoning_tokens"]
-            .as_u64()
-            .unwrap_or(0),
-        total_tokens: value["total_tokens"].as_u64().unwrap_or(0),
+    let has_tool_calls = !state.tool_accum.is_empty();
+    let tool_calls = has_tool_calls.then(|| {
+        state
+            .tool_accum
+            .into_values()
+            .map(|(id, name, arguments, call_type)| ToolCall {
+                id: id.unwrap_or_else(|| "call".into()),
+                call_type,
+                function: FunctionCall {
+                    name: name.unwrap_or_default(),
+                    arguments,
+                },
+            })
+            .collect()
+    });
+    let message = Message::Assistant {
+        content: (!state.content.is_empty()).then_some(state.content),
+        reasoning_content: (!state.reasoning_content.is_empty())
+            .then_some(state.reasoning_content.clone()),
+        tool_calls,
+        native_replay: (!state.reasoning_content.is_empty() && has_tool_calls).then(|| {
+            NativeReplay {
+                endpoint: provider.endpoint.clone(),
+                model: request.model.model_id.clone(),
+                payload: NativeReplayPayload::ChatReasoning(state.reasoning_content),
+            }
+        }),
+    };
+    Ok(StreamResult {
+        message,
+        finish_reason: state.finish_reason,
+        usage: state.usage,
     })
-}
-
-fn responses_tool_calls(output: &[Value]) -> Vec<ToolCall> {
-    output
-        .iter()
-        .filter(|item| item["type"] == "function_call")
-        .map(|item| ToolCall {
-            id: item["call_id"].as_str().unwrap_or("call").to_string(),
-            call_type: "function".into(),
-            function: FunctionCall {
-                name: item["name"].as_str().unwrap_or("").to_string(),
-                arguments: item["arguments"].as_str().unwrap_or("").to_string(),
-            },
-        })
-        .collect()
-}
-
-fn responses_output_text(output: &[Value]) -> Option<String> {
-    let text = output
-        .iter()
-        .filter(|item| item["type"] == "message")
-        .flat_map(|item| item["content"].as_array().into_iter().flatten())
-        .filter_map(|part| match part["type"].as_str() {
-            Some("output_text") => part["text"].as_str(),
-            Some("refusal") => part["refusal"].as_str(),
-            _ => None,
-        })
-        .collect::<String>();
-    (!text.is_empty()).then_some(text)
 }
 
 fn build_chat_request_body(
@@ -908,29 +312,6 @@ fn content_part_json(part: &ContentPart) -> Value {
     }
 }
 
-fn base64_encode(bytes: &[u8]) -> String {
-    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
-    for chunk in bytes.chunks(3) {
-        let b0 = chunk[0];
-        let b1 = *chunk.get(1).unwrap_or(&0);
-        let b2 = *chunk.get(2).unwrap_or(&0);
-        out.push(TABLE[(b0 >> 2) as usize] as char);
-        out.push(TABLE[(((b0 & 0b0000_0011) << 4) | (b1 >> 4)) as usize] as char);
-        if chunk.len() > 1 {
-            out.push(TABLE[(((b1 & 0b0000_1111) << 2) | (b2 >> 6)) as usize] as char);
-        } else {
-            out.push('=');
-        }
-        if chunk.len() > 2 {
-            out.push(TABLE[(b2 & 0b0011_1111) as usize] as char);
-        } else {
-            out.push('=');
-        }
-    }
-    out
-}
-
 fn consume_sse_buffer(
     buffer: &mut String,
     state: &mut StreamParseState,
@@ -1061,63 +442,6 @@ fn consume_sse_buffer(
     Ok(())
 }
 
-fn stream_error_message(error: &Value) -> String {
-    error
-        .get("message")
-        .and_then(Value::as_str)
-        .map(str::to_owned)
-        .unwrap_or_else(|| error.to_string())
-}
-
-/// Classify an error response as a context-length overflow.
-///
-/// Overflow is always a client error. We accept three independent signals so
-/// differently-worded providers are still recognized:
-///   1. HTTP 413 (Payload Too Large) — some gateways use this for prompt size.
-///   2. A structured `error.code`/`error.type` of `context_length_exceeded`
-///      (OpenAI et al.) or `string_above_max_length`.
-///   3. A known context-overflow phrase in the body, but only for 4xx so a 5xx
-///      stack trace that happens to mention "context length" is not misread.
-fn is_context_length_error(status: u16, body: &str) -> bool {
-    if status == 413 {
-        return true;
-    }
-    let is_client_error = (400..500).contains(&status);
-
-    if let Ok(value) = serde_json::from_str::<Value>(body) {
-        let code = value["error"]["code"]
-            .as_str()
-            .or_else(|| value["error"]["type"].as_str())
-            .unwrap_or("");
-        if code.eq_ignore_ascii_case("context_length_exceeded")
-            || code.eq_ignore_ascii_case("string_above_max_length")
-        {
-            return true;
-        }
-    }
-
-    if !is_client_error {
-        return false;
-    }
-
-    const PATTERNS: &[&str] = &[
-        "context_length_exceeded",
-        "context length",
-        "maximum context length",
-        "context window",
-        "exceeds the context",
-        "exceed the context",
-        "prompt is too long",
-        "input is too long",
-        "too many tokens",
-        "maximum number of tokens",
-        "reduce the length",
-        "reduce the amount",
-    ];
-    let lower = body.to_ascii_lowercase();
-    PATTERNS.iter().any(|pattern| lower.contains(pattern))
-}
-
 fn reasoning_text_from_value(value: &Value) -> Option<String> {
     match value {
         Value::String(text) => (!text.is_empty()).then(|| text.clone()),
@@ -1184,6 +508,12 @@ fn next_event_boundary(buffer: &str) -> Option<(usize, usize)> {
 mod tests {
     use super::*;
     use crate::models::ResolvedModelRef;
+    use crate::provider::{Provider, is_context_length_error};
+    use crate::responses::{
+        ResponsesStreamState, build_responses_request_body, consume_responses_sse_buffer,
+        responses_tool_calls,
+    };
+    use std::time::Duration;
     const CHAT_ENDPOINT: &str = "https://example.test/v1/chat/completions";
 
     fn test_model(effort: Option<&str>) -> ResolvedModelRef {
@@ -1949,7 +1279,7 @@ mod tests {
         });
 
         let mut provider =
-            OpenAiProvider::new(format!("http://{addr}/chat/completions"), None).unwrap();
+            HttpProvider::new(format!("http://{addr}/chat/completions"), None).unwrap();
         provider.idle_timeout = Duration::from_millis(200);
 
         let request = RequestOptions {

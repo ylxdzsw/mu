@@ -1,6 +1,5 @@
 use std::collections::VecDeque;
 use std::fmt;
-use std::sync::Arc;
 use std::time::Duration;
 
 use serde::Deserialize;
@@ -8,7 +7,7 @@ use serde_json::Value;
 
 use crate::config::{Config, GuardrailConfig};
 use crate::models::{RequestOptions, ResolvedModelRef};
-use crate::provider::{Message, Provider, ProviderError, approx_tokens};
+use crate::provider::{Message, ProviderError, approx_tokens};
 use crate::{bash, provider};
 
 const MAX_ATTEMPTS: u32 = 3;
@@ -122,11 +121,7 @@ pub struct Guardrail {
 }
 
 impl Guardrail {
-    pub fn new(
-        config: &Config,
-        active_model: &ResolvedModelRef,
-        _provider: Arc<dyn Provider>,
-    ) -> Self {
+    pub fn new(config: &Config, active_model: &ResolvedModelRef) -> Self {
         Self {
             config: config.guardrail.clone(),
             runtime: config.clone(),

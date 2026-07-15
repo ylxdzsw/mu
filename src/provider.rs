@@ -1,9 +1,12 @@
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use clap::ValueEnum;
+use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use tokio::time::{self, MissedTickBehavior};
 
 use crate::config::Config;
 use crate::models::RequestOptions;
@@ -57,6 +60,141 @@ impl NativeReplay {
 pub enum ModelApi {
     ChatCompletions,
     Responses,
+}
+
+/// Bound the connect phase so a dead host fails fast instead of hanging the turn.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+/// Maximum gap between stream bytes. This is an inter-chunk idle bound, not a
+/// total-turn bound; models may legitimately reason for a long time.
+const DEFAULT_STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(600);
+
+pub struct HttpProvider {
+    client: Client,
+    pub(crate) endpoint: String,
+    api: ModelApi,
+    api_key: Option<String>,
+    pub(crate) idle_timeout: Duration,
+}
+
+pub(crate) enum SseEvent {
+    Data(String),
+    Tick,
+}
+
+impl HttpProvider {
+    pub fn new(endpoint: String, api_key: Option<String>) -> anyhow::Result<Self> {
+        let endpoint = normalize_endpoint(&endpoint)?;
+        let api = classify_endpoint(&endpoint)?;
+        let client = Client::builder()
+            .connect_timeout(CONNECT_TIMEOUT)
+            .build()
+            .unwrap_or_else(|_| Client::new());
+        Ok(Self {
+            client,
+            endpoint,
+            api,
+            api_key,
+            idle_timeout: DEFAULT_STREAM_IDLE_TIMEOUT,
+        })
+    }
+
+    pub(crate) async fn stream_sse(
+        &self,
+        body: &Value,
+        on_sse: &mut dyn FnMut(SseEvent) -> Result<(), ProviderError>,
+    ) -> Result<(), ProviderError> {
+        let mut request = self.client.post(&self.endpoint).json(body);
+        if let Some(key) = &self.api_key {
+            request = request.bearer_auth(key);
+        }
+        let response = request
+            .send()
+            .await
+            .map_err(|error| ProviderError::Transport(error.to_string()))?;
+        if !response.status().is_success() {
+            let status = response.status().as_u16();
+            let body = response.text().await.unwrap_or_default();
+            return Err(classify_http_error(status, body));
+        }
+
+        let mut response = response;
+        let mut buffer = String::new();
+        let mut byte_buffer = Vec::new();
+        let mut last_activity = std::time::Instant::now();
+        let mut tick = time::interval(Duration::from_millis(250));
+        tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
+
+        loop {
+            let chunk = tokio::select! {
+                chunk = response.chunk() => {
+                    last_activity = std::time::Instant::now();
+                    chunk.map_err(|error| ProviderError::Transport(error.to_string()))?
+                }
+                _ = tick.tick() => {
+                    if last_activity.elapsed() > self.idle_timeout {
+                        return Err(ProviderError::Transport(format!(
+                            "stream idle for over {}s", self.idle_timeout.as_secs()
+                        )));
+                    }
+                    on_sse(SseEvent::Tick)?;
+                    continue;
+                }
+            };
+            let Some(chunk) = chunk else { break };
+            byte_buffer.extend_from_slice(&chunk);
+            let valid_up_to = match std::str::from_utf8(&byte_buffer) {
+                Ok(text) => {
+                    buffer.push_str(text);
+                    byte_buffer.len()
+                }
+                Err(error) => {
+                    let valid = error.valid_up_to();
+                    // SAFETY: `valid_up_to` is guaranteed to end on a UTF-8 boundary.
+                    buffer
+                        .push_str(unsafe { std::str::from_utf8_unchecked(&byte_buffer[..valid]) });
+                    valid
+                }
+            };
+            byte_buffer.drain(..valid_up_to);
+            consume_sse_events(&mut buffer, on_sse)?;
+        }
+
+        if !byte_buffer.is_empty() {
+            buffer.push_str(&String::from_utf8_lossy(&byte_buffer));
+        }
+        if !buffer.trim().is_empty() {
+            buffer.push_str("\n\n");
+            consume_sse_events(&mut buffer, on_sse)?;
+        }
+        Ok(())
+    }
+}
+
+fn normalize_endpoint(endpoint: &str) -> anyhow::Result<String> {
+    let mut url = reqwest::Url::parse(endpoint)?;
+    let path = url.path().trim_end_matches('/').to_string();
+    url.set_path(&path);
+    Ok(url.to_string())
+}
+
+fn consume_sse_events(
+    buffer: &mut String,
+    on_sse: &mut dyn FnMut(SseEvent) -> Result<(), ProviderError>,
+) -> Result<(), ProviderError> {
+    while let Some((position, separator_length)) = next_event_boundary(buffer) {
+        let event = buffer[..position].to_string();
+        buffer.replace_range(..position + separator_length, "");
+        let data = event
+            .lines()
+            .filter_map(|line| line.trim().strip_prefix("data:"))
+            .map(str::trim_start)
+            .collect::<Vec<_>>()
+            .join("\n");
+        if !data.is_empty() {
+            on_sse(SseEvent::Data(data))?;
+        }
+    }
+    Ok(())
 }
 
 pub fn classify_endpoint(endpoint: &str) -> anyhow::Result<ModelApi> {
@@ -265,6 +403,26 @@ pub trait Provider: Send + Sync {
     ) -> Result<StreamResult, ProviderError>;
 }
 
+#[async_trait(?Send)]
+impl Provider for HttpProvider {
+    async fn stream_chat(
+        &self,
+        request: &RequestOptions,
+        messages: &[Message],
+        tools: &[Value],
+        on_event: &mut dyn FnMut(StreamEvent) -> Result<(), ProviderError>,
+    ) -> Result<StreamResult, ProviderError> {
+        match self.api {
+            ModelApi::ChatCompletions => {
+                crate::chat_completions::stream(self, request, messages, tools, on_event).await
+            }
+            ModelApi::Responses => {
+                crate::responses::stream(self, request, messages, tools, on_event).await
+            }
+        }
+    }
+}
+
 pub fn approx_tokens(s: &str) -> u64 {
     (s.len() as u64).div_ceil(4)
 }
@@ -272,10 +430,97 @@ pub fn approx_tokens(s: &str) -> u64 {
 pub fn build_provider(config: &Config, provider_id: &str) -> anyhow::Result<Arc<dyn Provider>> {
     let provider = config.provider(provider_id)?;
     let api_key = config.api_key_for_provider(provider_id)?;
-    Ok(Arc::new(crate::openai::OpenAiProvider::new(
-        provider.endpoint.clone(),
-        api_key,
-    )?) as Arc<dyn Provider>)
+    Ok(Arc::new(HttpProvider::new(provider.endpoint.clone(), api_key)?) as Arc<dyn Provider>)
+}
+
+pub(crate) fn classify_http_error(status: u16, body: String) -> ProviderError {
+    if is_context_length_error(status, &body) {
+        ProviderError::ContextLength
+    } else if status == 429 {
+        ProviderError::RateLimit { message: body }
+    } else {
+        ProviderError::HttpStatus { status, body }
+    }
+}
+
+pub(crate) fn stream_error_message(error: &Value) -> String {
+    error
+        .get("message")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .unwrap_or_else(|| error.to_string())
+}
+
+pub(crate) fn is_context_length_error(status: u16, body: &str) -> bool {
+    if status == 413 {
+        return true;
+    }
+    let is_client_error = (400..500).contains(&status);
+    if let Ok(value) = serde_json::from_str::<Value>(body) {
+        let code = value["error"]["code"]
+            .as_str()
+            .or_else(|| value["error"]["type"].as_str())
+            .unwrap_or("");
+        if code.eq_ignore_ascii_case("context_length_exceeded")
+            || code.eq_ignore_ascii_case("string_above_max_length")
+        {
+            return true;
+        }
+    }
+    if !is_client_error {
+        return false;
+    }
+    const PATTERNS: &[&str] = &[
+        "context_length_exceeded",
+        "context length",
+        "maximum context length",
+        "context window",
+        "exceeds the context",
+        "exceed the context",
+        "prompt is too long",
+        "input is too long",
+        "too many tokens",
+        "maximum number of tokens",
+        "reduce the length",
+        "reduce the amount",
+    ];
+    let lower = body.to_ascii_lowercase();
+    PATTERNS.iter().any(|pattern| lower.contains(pattern))
+}
+
+pub(crate) fn base64_encode(bytes: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let b0 = chunk[0];
+        let b1 = *chunk.get(1).unwrap_or(&0);
+        let b2 = *chunk.get(2).unwrap_or(&0);
+        out.push(TABLE[(b0 >> 2) as usize] as char);
+        out.push(TABLE[(((b0 & 0b0000_0011) << 4) | (b1 >> 4)) as usize] as char);
+        if chunk.len() > 1 {
+            out.push(TABLE[(((b1 & 0b0000_1111) << 2) | (b2 >> 6)) as usize] as char);
+        } else {
+            out.push('=');
+        }
+        if chunk.len() > 2 {
+            out.push(TABLE[(b2 & 0b0011_1111) as usize] as char);
+        } else {
+            out.push('=');
+        }
+    }
+    out
+}
+
+pub(crate) fn next_event_boundary(buffer: &str) -> Option<(usize, usize)> {
+    let lf = buffer.find("\n\n");
+    let crlf = buffer.find("\r\n\r\n");
+    match (lf, crlf) {
+        (Some(a), Some(b)) if a <= b => Some((a, 2)),
+        (Some(_), Some(b)) => Some((b, 4)),
+        (Some(a), None) => Some((a, 2)),
+        (None, Some(b)) => Some((b, 4)),
+        (None, None) => None,
+    }
 }
 
 #[cfg(test)]

@@ -91,11 +91,7 @@ impl<'a> AgentLoop<'a> {
         .await?;
 
         let mut guardrail = if self.config.guardrail.enabled {
-            Some(Guardrail::new(
-                self.config,
-                &self.request.model,
-                self.provider.clone(),
-            ))
+            Some(Guardrail::new(self.config, &self.request.model))
         } else {
             None
         };
