@@ -153,8 +153,13 @@ impl<'a> AgentLoop<'a> {
                 let mut on_stream_event = |event: StreamEvent| -> Result<(), ProviderError> {
                     let result = match event {
                         StreamEvent::TextDelta(text) => self.renderer.assistant_text(&text),
-                        StreamEvent::ReasoningStart => self.renderer.reasoning_start(),
+                        StreamEvent::ReasoningStart(visibility) => {
+                            self.renderer.reasoning_start(visibility)
+                        }
                         StreamEvent::ReasoningDelta(text) => self.renderer.reasoning_delta(&text),
+                        StreamEvent::ReasoningSummaryDelta(text) => {
+                            self.renderer.reasoning_summary_delta(&text)
+                        }
                         StreamEvent::ReasoningEnd => self.renderer.reasoning_end(None),
                         StreamEvent::ToolCallDelta(delta) => {
                             handle_tool_call_delta(self.renderer, &mut command_headers, delta)
@@ -364,6 +369,7 @@ impl<'a> AgentLoop<'a> {
                                             );
                                             let deny_msg = Message::Tool {
                                                 content: format!("error: {deny_err}"),
+                                                artifacts: Vec::new(),
                                                 tool_call_id: tc.id.clone(),
                                             };
                                             self.store
@@ -494,7 +500,7 @@ impl<'a> AgentLoop<'a> {
         context: &mut Vec<Message>,
         emit_renderer: bool,
     ) -> Result<()> {
-        let (output, status) = match result {
+        let (output, artifacts, status) = match result {
             Ok(result) => {
                 if emit_renderer {
                     self.renderer.tool_finished(
@@ -504,7 +510,7 @@ impl<'a> AgentLoop<'a> {
                         elapsed,
                     )?;
                 }
-                (result.output, "ok")
+                (result.output, result.artifacts, "ok")
             }
             Err(error) => {
                 let message = format!("error: {error}");
@@ -516,13 +522,14 @@ impl<'a> AgentLoop<'a> {
                         elapsed,
                     )?;
                 }
-                (message, "error")
+                (message, Vec::new(), "error")
             }
         };
 
         let risk = BashRisk::from_args_json(&call.function.arguments);
         let message = Message::Tool {
             content: output.clone(),
+            artifacts,
             tool_call_id: call.id.clone(),
         };
         self.store.persist_tool_result(
@@ -537,6 +544,10 @@ impl<'a> AgentLoop<'a> {
                 status,
             },
             &output,
+            match &message {
+                Message::Tool { artifacts, .. } => artifacts,
+                _ => unreachable!(),
+            },
         )?;
         context.push(message);
         Ok(())
@@ -1818,6 +1829,7 @@ mod tests {
                 Message::Tool {
                     content,
                     tool_call_id,
+                    ..
                 } => Some((tool_call_id, content)),
                 _ => None,
             })

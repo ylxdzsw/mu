@@ -1,4 +1,6 @@
 use std::io::Write;
+use std::os::fd::AsRawFd;
+use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
 use std::os::unix::process::ExitStatusExt;
 use std::path::Path;
@@ -14,8 +16,10 @@ use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 use tokio::task::JoinHandle;
 
+use crate::artifact::{ARTIFACT_FD, ARTIFACT_FD_ENV, read_artifacts};
 use crate::config::Config;
 use crate::config::EnvMap;
+use crate::provider::ToolArtifact;
 use crate::redaction::SecretRedactor;
 use crate::renderer::Renderer;
 
@@ -102,6 +106,7 @@ pub async fn execute(args: Value, ctx: &mut ToolContext<'_>) -> Result<ToolResul
 
     let result = run_bash(args, timeout, renderer, &ctx.config.env, redactor)?;
     let exit_code = result.exit_code;
+    let artifacts = result.artifacts;
 
     let output = if result.redacted {
         format!("{}\n\n{}", result.output, REDACTION_REMINDER)
@@ -111,6 +116,7 @@ pub async fn execute(args: Value, ctx: &mut ToolContext<'_>) -> Result<ToolResul
     let full = format!("{}\n[exit code: {}]", output, exit_code);
     let mut result = apply_truncation(full, &ctx.config.limits, "bash", ctx.state_dir, true)?;
     result.display = ToolDisplay::Bash { exit_code };
+    result.artifacts = artifacts;
     Ok(result)
 }
 
@@ -119,6 +125,7 @@ struct BashRunResult {
     output: String,
     exit_code: i32,
     redacted: bool,
+    artifacts: Vec<ToolArtifact>,
 }
 
 #[derive(Default)]
@@ -261,6 +268,7 @@ fn execute_bash_task(
     let mut target = BufferedBashTarget::new(shared);
     let result = run_bash_inner(args, timeout, &mut target, &config.env, &mut redactor)?;
     let exit_code = result.exit_code;
+    let artifacts = result.artifacts;
     let output = if result.redacted {
         format!("{}\n\n{}", result.output, REDACTION_REMINDER)
     } else {
@@ -269,6 +277,7 @@ fn execute_bash_task(
     let full = format!("{output}\n[exit code: {exit_code}]");
     let mut result = apply_truncation(full, &config.limits, "bash", state_dir, true)?;
     result.display = ToolDisplay::Bash { exit_code };
+    result.artifacts = artifacts;
     Ok(result)
 }
 
@@ -285,7 +294,14 @@ fn run_bash_inner(
         .as_deref()
         .map(resolve_path)
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
-    let command_text = format!("exec 2>&1\n{}", args.command);
+    let command_text = format!(
+        "export PATH=/usr/libexec/mu:$PATH\nexec 2>&1\n{}",
+        args.command
+    );
+
+    let (artifact_reader, artifact_writer) =
+        UnixStream::pair().context("creating Mu artifact channel")?;
+    let artifact_writer_fd = artifact_writer.as_raw_fd();
 
     let mut command = Command::new("bash");
     command
@@ -293,6 +309,7 @@ fn run_bash_inner(
         .arg(command_text)
         .current_dir(&cwd)
         .envs(env)
+        .env(ARTIFACT_FD_ENV, ARTIFACT_FD.to_string())
         .env(SUBAGENT_DEPTH_ENV, next_subagent_depth_env())
         .stdin(if args.stdin.is_some() {
             Stdio::piped()
@@ -302,6 +319,7 @@ fn run_bash_inner(
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
     configure_process_group(&mut command);
+    configure_artifact_fd(&mut command, artifact_writer_fd);
 
     let mut child = command.spawn().map_err(|error| {
         if is_e2big(&error) {
@@ -310,6 +328,8 @@ fn run_bash_inner(
             anyhow::anyhow!(error).context("spawning bash")
         }
     })?;
+    drop(artifact_writer);
+    let artifact_task = std::thread::spawn(move || read_artifacts(artifact_reader));
     let child_id = child.id();
     let _active = ActiveProcessGroup::new(child_id);
 
@@ -343,6 +363,7 @@ fn run_bash_inner(
     let mut status: Option<ExitStatus> = None;
     let mut stdout_closed = false;
     let mut interrupted = false;
+    let mut terminal_error: Option<anyhow::Error> = None;
 
     loop {
         if cancellation_requested() {
@@ -351,6 +372,17 @@ fn run_bash_inner(
             drain_available(&rx, target, &mut output, redactor)?;
             flush_redactor(target, &mut output, redactor)?;
             let _ = child.wait();
+            let reminder = if redactor.did_redact() {
+                format!("\n\n{REDACTION_REMINDER}")
+            } else {
+                String::new()
+            };
+            terminal_error = Some(anyhow::anyhow!(
+                "command interrupted by {}{}{}",
+                signal_name(last_signal()),
+                partial_output_suffix(&output),
+                reminder
+            ));
             break;
         }
 
@@ -364,11 +396,12 @@ fn run_bash_inner(
             } else {
                 String::new()
             };
-            bail!(
+            terminal_error = Some(anyhow::anyhow!(
                 "command timed out after {timeout_secs}s{}{}",
                 partial_output_suffix(&output),
                 reminder
-            );
+            ));
+            break;
         }
 
         if status.is_none() {
@@ -395,6 +428,12 @@ fn run_bash_inner(
 
     let status = status.unwrap_or_else(|| child.wait().expect("bash status"));
     flush_redactor(target, &mut output, redactor)?;
+    let artifacts = artifact_task
+        .join()
+        .map_err(|_| anyhow::anyhow!("Mu artifact reader panicked"))??;
+    if let Some(error) = terminal_error {
+        return Err(error);
+    }
     if interrupted || (cancellation_requested() && status.signal().is_some()) {
         let reminder = if redactor.did_redact() {
             format!("\n\n{REDACTION_REMINDER}")
@@ -412,6 +451,7 @@ fn run_bash_inner(
         output: output.trim_end_matches('\n').to_string(),
         exit_code: status.code().unwrap_or(1),
         redacted: redactor.did_redact(),
+        artifacts,
     })
 }
 
@@ -569,6 +609,20 @@ fn configure_process_group(command: &mut Command) {
     }
 }
 
+fn configure_artifact_fd(command: &mut Command, source_fd: i32) {
+    unsafe {
+        command.pre_exec(move || {
+            if libc::dup2(source_fd, ARTIFACT_FD) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if libc::fcntl(ARTIFACT_FD, libc::F_SETFD, 0) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+}
+
 fn terminate_child_group(child_id: u32, child: &mut std::process::Child) {
     let pgid = -(child_id as i32);
     unsafe {
@@ -705,6 +759,63 @@ mod tests {
         .unwrap();
 
         assert_eq!(result.output, expected);
+    }
+
+    #[test]
+    fn bash_prepends_mu_libexec_after_login_initialization() {
+        let mut renderer = Renderer::new();
+        let result = run_bash(
+            args("printf '%s' \"$PATH\""),
+            5,
+            &mut renderer,
+            &empty_env(),
+            SecretRedactor::default(),
+        )
+        .unwrap();
+        assert!(
+            result.output.starts_with("/usr/libexec/mu:"),
+            "{}",
+            result.output
+        );
+    }
+
+    #[test]
+    fn bash_collects_framed_image_artifacts_separately_from_stdout() {
+        let mut renderer = Renderer::new();
+        let command = r#"python - <<'PY'
+import json, os, struct
+data = b'\x89PNG\r\n\x1a\nrest'
+header = json.dumps({
+    'version': 1,
+    'kind': 'image',
+    'filename': 'tool.png',
+    'media_type': 'image/png',
+    'detail': 'high',
+    'byte_length': len(data),
+}, separators=(',', ':')).encode()
+fd = int(os.environ['MU_ARTIFACT_FD'])
+os.write(fd, struct.pack('>I', len(header)) + header + struct.pack('>Q', len(data)) + data)
+print('visible')
+PY"#;
+        let result = run_bash(
+            args(command),
+            5,
+            &mut renderer,
+            &empty_env(),
+            SecretRedactor::default(),
+        )
+        .unwrap();
+        assert_eq!(result.output, "visible");
+        assert_eq!(result.artifacts.len(), 1);
+        assert_eq!(result.artifacts[0].attachment.filename, "tool.png");
+        assert_eq!(
+            result.artifacts[0].attachment.data,
+            b"\x89PNG\r\n\x1a\nrest"
+        );
+        assert_eq!(
+            result.artifacts[0].detail,
+            crate::provider::ImageDetail::High
+        );
     }
 
     #[tokio::test]

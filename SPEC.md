@@ -28,7 +28,8 @@ or config schema), it is spelled out concretely.
   just reads a prompt and appends output. Output streams as it is produced (a
   tool line may appear before its output), but once a line is printed it is never
   rewritten or erased.
-- **Minimal.** One model-visible tool: `bash`. A flat config directory. A
+- **Minimal.** One model-visible function tool: `bash`, with a small Mu-owned
+  command suite available inside it. A flat config directory. A
   SQLite file for state in the active scope. The core binary itself has no
   interactive input handling.
 - **Unix-like terminal native.** `mu` runs as an ordinary foreground process in
@@ -73,7 +74,8 @@ is unacceptable here.
 Rationale:
 
 - Cold start in single-digit milliseconds. No runtime bootstrap, no JIT warmup.
-- One binary to drop on `PATH`. Trivial to install, update, and distribute.
+- One physical binary to install and update. Private `apply_patch` and
+  `view_image` symlinks dispatch back into it by `argv[0]`.
 - Mature ecosystem for everything needed: async runtime (`tokio`), HTTP/SSE
   (`reqwest`), SQLite (`rusqlite`), JSONC/serde.
 - Because the shell owns line editing, `mu` needs **no** terminal/line-editor
@@ -357,6 +359,30 @@ bash({
 })
 ```
 
+`bash` prepends `/usr/libexec/mu` to its post-login `PATH`. That directory owns
+two private symlinks to the physical `/usr/bin/mu` binary. Before normal CLI
+parsing or async-runtime startup, `mu` checks the basename of `argv[0]` and
+dispatches these applets:
+
+- **`apply_patch`** accepts one patch argument or reads it from stdin. Its
+  `*** Begin Patch` / `*** End Patch` format supports add, update, move, and
+  delete operations with context hunks. It preflights the whole patch, rejects
+  absolute paths, symlinks, conflicting operations, and existing add/move
+  destinations, then applies validated file changes.
+- **`view_image [--detail auto|low|high|original] PATH`** loads a validated PNG,
+  JPEG, WebP, or GIF through the same attachment loader and 20 MiB limit used by
+  `mu -a`. `--detail` is optional and defaults to `auto`. The command writes a
+  text summary normally and sends image bytes over a dedicated inherited
+  artifact descriptor; it fails when invoked without Mu's artifact channel.
+
+These are ordinary commands called through `bash`, not additional model-visible
+function tools. The artifact channel is versioned and length-framed, is drained
+concurrently with stdout, and is scoped to one bash call. A call may emit at
+most eight images. Tool-image metadata and SHA-256-deduplicated bytes persist
+with the tool message. Responses adapters serialize images in the native
+`function_call_output`; Chat Completions adapters retain the tool text and add a
+labeled multimodal user-message projection on the wire only.
+
 `title` is the short human-readable action shown in the terminal. `risk` is
 advisory metadata for UI/audit and drives optional guardrail review for
 `destructive` calls; `mu` does not sandbox a call based on it. `command` is
@@ -556,6 +582,17 @@ stderr TTY detection suppresses the summary when redirected.
   relevant unit is stable: prose streams token-by-token unless an inline span is
   open, list/heading/quote content streams after the prefix is stable, tables
   wait for the complete table, and unsupported Markdown stays raw.
+- **Reasoning progress.** A definite reasoning-block start immediately creates
+  the terminal's mutable thought line. Chat Completions reasoning keeps the
+  existing `[thought <duration>, <tokens> tokens]` form, using its streamed
+  reasoning text for the live estimate. Responses reasoning is opaque and uses
+  `[thought <duration>]` without a per-thought token count. When an opted-in
+  Responses summary begins with a complete bold-only line or ATX heading, Mu
+  conservatively extracts that first line and updates the live display to
+  `[thought <duration>] <title>`; prose, missing summaries, and unrecognized
+  formats remain timer-only. Titles are normalized to one line and capped at 80
+  visible terminal cells. Reasoning completion commits the current thought line
+  in both human-facing modes even when no reasoning or summary text was exposed.
 - **Errors.** Always printed and clearly prefixed, with TTY styling when
   available. Fatal turn failure produces a non-zero process exit code so the
   shell's `$?` is meaningful.
@@ -724,12 +761,15 @@ DeepSeek thinking tool loops without model-name heuristics.
 **Responses.** Mu posts directly to the configured endpoint with `stream:true`,
 `store:false`, `include:["reasoning.encrypted_content"]`, locally reconstructed
 `input`, and a flat Responses function-tool definition. It never sends
-`previous_response_id` or a conversation identifier. A resolved effort is sent
-as `reasoning:{effort}`. Typed SSE events provide output-text and function-call
-argument deltas; the complete successful `response.output` item array is stored
-unchanged, including encrypted reasoning, and replayed as input only for the
-same endpoint and wire model. Semantic tool results become
-`function_call_output` items connected by `call_id`.
+`previous_response_id` or a conversation identifier. Every request opts into
+reasoning summaries with `reasoning:{summary:"auto"}` and adds `effort` to that
+object when one is resolved. Providers that reject the summary option fail the
+request normally; Mu does not retry without it. Typed SSE events provide
+reasoning-item boundaries, optional reasoning-summary text, output text, and
+function-call argument deltas. The complete successful `response.output` item
+array is stored unchanged, including encrypted reasoning and any summary, and
+replayed as input only for the same endpoint and wire model. Semantic tool
+results become `function_call_output` items connected by `call_id`.
 
 The semantic transcript remains authoritative for display, compaction, and
 cross-model continuation. Switching model or protocol inside a session keeps
@@ -936,14 +976,12 @@ for later turns. Existing sessions do not rebuild it when files or config change
 The assembled prompt has this fixed order:
 
 1. A short role/behavior preamble (a few sentences). Illustrative:
-   > You are mu, a terminal agent. Exactly one tool is available: `bash`. Do
-   > not invent or call `read`, `write`, `edit`, `fetch`, `search`,
-   > `apply_patch`, `view_image`, or any other tool name. If a skill or
-   > `AGENTS.md` mentions another tool, treat it as historical shorthand and
-   > accomplish the task with `bash` and ordinary CLI programs instead. Use
-   > `bash` for local search, file reads, writes, edits, web fetches, tests,
-   > and any other CLI work. Each bash call is isolated; pass `cwd` explicitly
-   > when needed. Keep responses concise.
+   > You are mu, a terminal agent. Exactly one function tool is available:
+   > `bash`; do not call any other function tool. Inside `bash`, Mu provides
+   > `apply_patch` for structured file edits and `view_image` for loading an
+   > image into the tool result. These are shell commands, not function tools.
+   > Each bash call is isolated; pass `cwd` explicitly when needed. Keep
+   > responses concise.
    The exact wording lives in `src/system_preamble.md`; keep it short.
 2. A `<runtime>` block of host-stable facts only, as plain `key: value` lines:
    ```

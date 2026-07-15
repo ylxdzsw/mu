@@ -12,6 +12,9 @@ use clap::Parser;
 compile_error!("mu is supported only on Unix-like systems");
 
 mod agent;
+mod applets;
+mod artifact;
+mod attachment;
 mod bash;
 mod cli;
 mod compaction;
@@ -29,10 +32,13 @@ mod store;
 mod system_prompt;
 mod tools;
 
+#[cfg(test)]
+use attachment::MAX_ATTACHMENT_BYTES;
+use attachment::load_attachments;
 use cli::{Args, Command, ProjectSub, SessionSub};
 use config::Config;
 use models::RequestOptions;
-use provider::{Attachment, ContentPart, UserContent};
+use provider::{ContentPart, UserContent};
 use provider::{Provider, build_provider};
 use renderer::Renderer;
 use runtime::{InvocationOverrides, StatusReport, build_status_report, resolve_invocation};
@@ -96,9 +102,18 @@ struct RunTurnArgs<'a> {
     preamble_notice: Option<&'a str>,
 }
 
-#[tokio::main]
-async fn main() {
-    if let Err(e) = run().await {
+fn main() {
+    let argv0 = std::env::args_os().next().unwrap_or_default();
+    if let Some(applet) = applets::from_argv0(&argv0) {
+        process::exit(applets::dispatch(applet));
+    }
+
+    let result = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("initializing Mu async runtime")
+        .and_then(|runtime| runtime.block_on(run()));
+    if let Err(e) = result {
         if error_output_format() == cli::OutputFormat::Final {
             let _ = write_final_error(&e.to_string());
         } else {
@@ -943,85 +958,6 @@ fn print_status_report(report: &StatusReport) {
     println!("supported effort levels: {effort_levels}");
 }
 
-const MAX_ATTACHMENT_BYTES: u64 = 20 * 1024 * 1024;
-
-fn load_attachments(paths: &[PathBuf]) -> Result<Vec<ContentPart>> {
-    paths
-        .iter()
-        .map(|path| {
-            let metadata = std::fs::metadata(path)
-                .with_context(|| format!("reading attachment metadata {}", path.display()))?;
-            if metadata.len() > MAX_ATTACHMENT_BYTES {
-                bail!(
-                    "attachment exceeds 20 MiB limit: {} ({} bytes)",
-                    path.display(),
-                    metadata.len()
-                );
-            }
-            let bytes = std::fs::read(path)
-                .with_context(|| format!("reading attachment {}", path.display()))?;
-            if bytes.len() as u64 > MAX_ATTACHMENT_BYTES {
-                bail!(
-                    "attachment exceeds 20 MiB limit: {} ({} bytes)",
-                    path.display(),
-                    bytes.len()
-                );
-            }
-            let media_type = attachment_media_type(path, &bytes)?;
-            let filename = path
-                .file_name()
-                .map(|name| name.to_string_lossy().into_owned())
-                .unwrap_or_else(|| path.display().to_string());
-            Ok(ContentPart::Attachment {
-                attachment: Attachment {
-                    filename,
-                    media_type: media_type.to_string(),
-                    data: bytes,
-                },
-            })
-        })
-        .collect()
-}
-
-fn attachment_media_type(path: &std::path::Path, bytes: &[u8]) -> Result<&'static str> {
-    let extension = path
-        .extension()
-        .and_then(|ext| ext.to_str())
-        .map(|ext| ext.to_ascii_lowercase())
-        .unwrap_or_default();
-    let detected = if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
-        Some(("png", "image/png"))
-    } else if bytes.starts_with(&[0xff, 0xd8, 0xff]) {
-        Some(("jpeg", "image/jpeg"))
-    } else if bytes.len() >= 12 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
-        Some(("webp", "image/webp"))
-    } else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
-        Some(("gif", "image/gif"))
-    } else if bytes.len() >= 12 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WAVE" {
-        Some(("wav", "audio/wav"))
-    } else if bytes.starts_with(b"ID3")
-        || (bytes.len() >= 2 && bytes[0] == 0xff && bytes[1] & 0xe0 == 0xe0)
-    {
-        Some(("mp3", "audio/mpeg"))
-    } else {
-        None
-    };
-    let Some((format, media_type)) = detected else {
-        bail!("unsupported attachment type: {}", path.display());
-    };
-    let extension_matches = match format {
-        "jpeg" => matches!(extension.as_str(), "jpg" | "jpeg"),
-        other => extension == other,
-    };
-    if !extension_matches {
-        bail!(
-            "attachment extension does not match detected {format} content: {}",
-            path.display()
-        );
-    }
-    Ok(media_type)
-}
-
 #[cfg(test)]
 mod tests {
     use std::io::Cursor;
@@ -1153,31 +1089,6 @@ mod tests {
         std::fs::remove_file(&path).unwrap();
         assert!(err.to_string().contains("reading prompt file"));
         assert!(err.to_string().contains(path.to_string_lossy().as_ref()));
-    }
-
-    #[test]
-    fn detects_supported_attachment_media_types_and_mismatches() {
-        assert_eq!(
-            attachment_media_type(std::path::Path::new("image.png"), b"\x89PNG\r\n\x1a\nrest")
-                .unwrap(),
-            "image/png"
-        );
-        assert_eq!(
-            attachment_media_type(
-                std::path::Path::new("audio.wav"),
-                b"RIFF\x00\x00\x00\x00WAVErest"
-            )
-            .unwrap(),
-            "audio/wav"
-        );
-        assert_eq!(
-            attachment_media_type(std::path::Path::new("audio.mp3"), b"ID3rest").unwrap(),
-            "audio/mpeg"
-        );
-        let error =
-            attachment_media_type(std::path::Path::new("wrong.jpg"), b"\x89PNG\r\n\x1a\nrest")
-                .unwrap_err();
-        assert!(error.to_string().contains("extension does not match"));
     }
 
     #[test]

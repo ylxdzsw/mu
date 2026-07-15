@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use clap::ValueEnum;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -27,6 +28,7 @@ pub enum Message {
     },
     Tool {
         content: String,
+        artifacts: Vec<ToolArtifact>,
         tool_call_id: String,
     },
 }
@@ -119,6 +121,34 @@ pub struct Attachment {
     pub data: Vec<u8>,
 }
 
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, ValueEnum, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+#[value(rename_all = "lower")]
+pub enum ImageDetail {
+    #[default]
+    Auto,
+    Low,
+    High,
+    Original,
+}
+
+impl std::fmt::Display for ImageDetail {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Auto => "auto",
+            Self::Low => "low",
+            Self::High => "high",
+            Self::Original => "original",
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolArtifact {
+    pub attachment: Attachment,
+    pub detail: ImageDetail,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolCall {
     pub id: String,
@@ -166,11 +196,18 @@ pub struct StreamResult {
 #[derive(Debug, Clone)]
 pub enum StreamEvent {
     TextDelta(String),
-    ReasoningStart,
+    ReasoningStart(ReasoningVisibility),
     ReasoningDelta(String),
+    ReasoningSummaryDelta(String),
     ReasoningEnd,
     ToolCallDelta(ToolCallDelta),
     Tick,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReasoningVisibility {
+    StreamedTrace,
+    Opaque,
 }
 
 #[derive(Debug, Clone, Default)]

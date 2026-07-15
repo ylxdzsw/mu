@@ -31,6 +31,9 @@ check() {
 
 package() {
   install -Dm755 "$srcdir/target/release/mu" "$pkgdir/usr/bin/mu"
+  install -dm755 "$pkgdir/usr/libexec/mu"
+  ln -s ../../bin/mu "$pkgdir/usr/libexec/mu/apply_patch"
+  ln -s ../../bin/mu "$pkgdir/usr/libexec/mu/view_image"
   install -Dm644 "$srcdir/$pkgname/mu.zsh" "$pkgdir/usr/share/zsh/plugins/mu/mu.zsh"
   install -dm755 "$pkgdir/usr/share/mu"
   cp -a "$srcdir/$pkgname/builtins/." "$pkgdir/usr/share/mu/"

@@ -6,12 +6,14 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use crate::config::{Config, LimitsConfig};
+use crate::provider::ToolArtifact;
 use crate::renderer::Renderer;
 
 #[derive(Debug, Clone)]
 pub struct ToolResult {
     pub output: String,
     pub display: ToolDisplay,
+    pub artifacts: Vec<ToolArtifact>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -81,6 +83,7 @@ pub fn apply_truncation(
     Ok(ToolResult {
         output,
         display: ToolDisplay::None,
+        artifacts: Vec::new(),
     })
 }
 

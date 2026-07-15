@@ -7,6 +7,7 @@ use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
 use crate::cli::OutputFormat;
+use crate::provider::ReasoningVisibility;
 use crate::tools::ToolDisplay;
 
 const RESET: &str = "\x1b[0m";
@@ -28,6 +29,7 @@ const CODE: &str = "\x1b[38;5;215m";
 pub(crate) const BASH_COMMAND_PREVIEW_BYTES: usize = 160;
 pub(crate) const BASH_TITLE_PREVIEW_BYTES: usize = 120;
 const GUARDRAIL_REASON_PREVIEW_BYTES: usize = 180;
+const REASONING_TITLE_MAX_WIDTH: usize = 80;
 const MAX_TABLE_COLUMN_WIDTH: usize = 80;
 const BASH_HEAD_LINE_BUDGET: usize = 3;
 const BASH_HEAD_BYTE_BUDGET: usize = 1024;
@@ -248,16 +250,23 @@ impl Renderer {
         self.render_live_line()
     }
 
-    pub fn reasoning_start(&mut self) -> io::Result<()> {
+    pub fn reasoning_start(&mut self, visibility: ReasoningVisibility) -> io::Result<()> {
         if self.final_only {
             return Ok(());
         }
         self.assistant_block_open = false;
         self.reasoning = Some(ReasoningState {
             started: Instant::now(),
+            visibility,
             reasoning_chars: 0,
+            summary: String::new(),
+            title: None,
             committed: false,
         });
+        if self.styled {
+            self.live_line = Some(LiveLine::Thinking);
+            self.render_live_line()?;
+        }
         Ok(())
     }
 
@@ -284,6 +293,27 @@ impl Renderer {
         self.render_live_line()
     }
 
+    pub fn reasoning_summary_delta(&mut self, text: &str) -> io::Result<()> {
+        if self.final_only || text.is_empty() {
+            return Ok(());
+        }
+        let Some(reasoning) = self.reasoning.as_mut() else {
+            return Ok(());
+        };
+        if reasoning.committed || reasoning.visibility != ReasoningVisibility::Opaque {
+            return Ok(());
+        }
+        reasoning.summary.push_str(text);
+        if reasoning.title.is_none() {
+            reasoning.title = extract_reasoning_summary_title(&reasoning.summary, false);
+        }
+        if self.styled {
+            self.live_line = Some(LiveLine::Thinking);
+            self.render_live_line()?;
+        }
+        Ok(())
+    }
+
     pub fn thinking_tick(&mut self) -> io::Result<()> {
         if self.final_only {
             return Ok(());
@@ -301,13 +331,26 @@ impl Renderer {
         let Some(reasoning) = self.reasoning.as_mut() else {
             return Ok(());
         };
-        if reasoning.committed || reasoning.reasoning_chars == 0 {
+        if reasoning.committed {
             return Ok(());
         }
+        if reasoning.title.is_none() {
+            reasoning.title = extract_reasoning_summary_title(&reasoning.summary, true);
+        }
+        let tokens = match reasoning.visibility {
+            ReasoningVisibility::StreamedTrace => Some(
+                usage
+                    .map(|(_, completion_tokens)| completion_tokens.to_string())
+                    .unwrap_or_else(|| {
+                        format!("~{}", approx_tokens_from_chars(reasoning.reasoning_chars))
+                    }),
+            ),
+            ReasoningVisibility::Opaque => None,
+        };
         let line = format_thought_line(
             reasoning.started.elapsed(),
-            reasoning.reasoning_chars,
-            usage,
+            tokens,
+            reasoning.title.as_deref(),
             self.styled,
         );
         reasoning.committed = true;
@@ -771,7 +814,9 @@ impl Renderer {
                 let reasoning = self.reasoning.as_ref()?;
                 Some(format_thinking_live(
                     reasoning.started.elapsed(),
-                    approx_tokens_from_chars(reasoning.reasoning_chars),
+                    (reasoning.visibility == ReasoningVisibility::StreamedTrace)
+                        .then(|| approx_tokens_from_chars(reasoning.reasoning_chars)),
+                    reasoning.title.as_deref(),
                 ))
             }
             Some(LiveLine::ToolComposition) => Some(format!("{GRAY}[preparing toolcall]{RESET}")),
@@ -970,7 +1015,10 @@ enum LiveLine {
 
 struct ReasoningState {
     started: Instant,
+    visibility: ReasoningVisibility,
     reasoning_chars: usize,
+    summary: String,
+    title: Option<String>,
     committed: bool,
 }
 
@@ -2637,11 +2685,16 @@ fn format_duration(duration: Duration) -> String {
     format!("{:.1}s", duration.as_secs_f64())
 }
 
-fn format_thinking_live(elapsed: Duration, output_tokens: u64) -> String {
-    format!(
-        "{GRAY}[thought {}, ~{} tokens]{RESET}",
-        format_duration(elapsed),
-        output_tokens
+fn format_thinking_live(
+    elapsed: Duration,
+    output_tokens: Option<u64>,
+    title: Option<&str>,
+) -> String {
+    format_thought(
+        elapsed,
+        output_tokens.map(|tokens| format!("~{tokens}")),
+        title,
+        true,
     )
 }
 
@@ -2705,19 +2758,87 @@ fn lexical_normalize_path(path: &Path) -> PathBuf {
 
 fn format_thought_line(
     elapsed: Duration,
-    reasoning_chars: usize,
-    usage: Option<(u64, u64)>,
+    output_tokens: Option<String>,
+    title: Option<&str>,
+    styled: bool,
+) -> String {
+    format!(
+        "{}\n",
+        format_thought(elapsed, output_tokens, title, styled,)
+    )
+}
+
+fn format_thought(
+    elapsed: Duration,
+    output_tokens: Option<String>,
+    title: Option<&str>,
     styled: bool,
 ) -> String {
     let elapsed = format_duration(elapsed);
-    let tokens = usage
-        .map(|(_, completion_tokens)| completion_tokens.to_string())
-        .unwrap_or_else(|| format!("~{}", approx_tokens_from_chars(reasoning_chars)));
+    let tokens = output_tokens
+        .map(|tokens| format!(", {tokens} tokens"))
+        .unwrap_or_default();
+    let title = title.map(|title| format!(" {title}")).unwrap_or_default();
     if styled {
-        format!("{GRAY}[thought {elapsed}, {tokens} tokens]{RESET}\n")
+        format!("{GRAY}[thought {elapsed}{tokens}]{title}{RESET}")
     } else {
-        format!("[thought {elapsed}, {tokens} tokens]\n")
+        format!("[thought {elapsed}{tokens}]{title}")
     }
+}
+
+fn extract_reasoning_summary_title(summary: &str, finalized: bool) -> Option<String> {
+    let mut lines = summary.split_inclusive('\n');
+    while let Some(raw_line) = lines.next() {
+        let terminated = raw_line.ends_with('\n');
+        let line = raw_line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if !terminated && !finalized {
+            return None;
+        }
+        return parse_reasoning_summary_title(line)
+            .map(|title| truncate_visible_text(&title, REASONING_TITLE_MAX_WIDTH));
+    }
+    None
+}
+
+fn parse_reasoning_summary_title(line: &str) -> Option<String> {
+    let title = if line.starts_with("**") && line.ends_with("**") && line.len() > 4 {
+        let inner = &line[2..line.len() - 2];
+        (!inner.contains("**")).then_some(inner)
+    } else {
+        let hashes = line.bytes().take_while(|byte| *byte == b'#').count();
+        if !(1..=6).contains(&hashes) || line.as_bytes().get(hashes) != Some(&b' ') {
+            return None;
+        }
+        let mut inner = line[hashes + 1..].trim();
+        if let Some(without_hashes) = inner.trim_end_matches('#').strip_suffix(' ') {
+            inner = without_hashes.trim_end();
+        }
+        Some(inner)
+    }?;
+    let normalized = title.split_whitespace().collect::<Vec<_>>().join(" ");
+    (!normalized.is_empty()).then_some(normalized)
+}
+
+fn truncate_visible_text(text: &str, max_width: usize) -> String {
+    if UnicodeWidthStr::width(text) <= max_width {
+        return text.to_string();
+    }
+    let budget = max_width.saturating_sub(UnicodeWidthStr::width(ELLIPSIS));
+    let mut out = String::new();
+    let mut width = 0;
+    for grapheme in text.graphemes(true) {
+        let next = UnicodeWidthStr::width(grapheme);
+        if width + next > budget {
+            break;
+        }
+        out.push_str(grapheme);
+        width += next;
+    }
+    out.push_str(ELLIPSIS);
+    out
 }
 
 fn format_omitted_line(omitted_lines: usize, omitted_bytes: usize, styled: bool) -> String {
@@ -3746,13 +3867,155 @@ mod tests {
     }
 
     #[test]
+    fn streamed_trace_commits_even_without_reasoning_text_and_keeps_tokens() {
+        let (mut renderer, output, _stderr) =
+            Renderer::with_test_output(OutputFormat::Plain, false, false, None);
+
+        renderer
+            .reasoning_start(ReasoningVisibility::StreamedTrace)
+            .unwrap();
+        renderer.reasoning_end(None).unwrap();
+
+        let transcript = output.transcript();
+        assert!(transcript.starts_with("[thought "), "{transcript:?}");
+        assert!(transcript.contains(", ~0 tokens]\n"), "{transcript:?}");
+    }
+
+    #[test]
+    fn opaque_reasoning_commits_duration_and_conservative_summary_title_without_tokens() {
+        let (mut renderer, output, _stderr) =
+            Renderer::with_test_output(OutputFormat::Plain, false, false, None);
+
+        renderer
+            .reasoning_start(ReasoningVisibility::Opaque)
+            .unwrap();
+        renderer.reasoning_summary_delta("**Inspecting").unwrap();
+        renderer
+            .reasoning_summary_delta(" renderer state**\n\nDetails")
+            .unwrap();
+        renderer.reasoning_end(Some((20, 7))).unwrap();
+
+        let transcript = output.transcript();
+        assert!(
+            transcript.contains("] Inspecting renderer state\n"),
+            "{transcript:?}"
+        );
+        assert!(!transcript.contains("token"), "{transcript:?}");
+    }
+
+    #[test]
+    fn opaque_reasoning_without_summary_commits_timer_only() {
+        let (mut renderer, output, _stderr) =
+            Renderer::with_test_output(OutputFormat::Plain, false, false, None);
+
+        renderer
+            .reasoning_start(ReasoningVisibility::Opaque)
+            .unwrap();
+        renderer.reasoning_end(Some((20, 7))).unwrap();
+
+        let transcript = output.transcript();
+        assert!(transcript.starts_with("[thought "), "{transcript:?}");
+        assert!(transcript.ends_with("]\n"), "{transcript:?}");
+        assert!(!transcript.contains("token"), "{transcript:?}");
+    }
+
+    #[test]
+    fn multiple_opaque_reasoning_items_commit_separate_titles() {
+        let (mut renderer, output, _stderr) =
+            Renderer::with_test_output(OutputFormat::Plain, false, false, None);
+
+        for title in ["First pass", "Second pass"] {
+            renderer
+                .reasoning_start(ReasoningVisibility::Opaque)
+                .unwrap();
+            renderer
+                .reasoning_summary_delta(&format!("**{title}**\n"))
+                .unwrap();
+            renderer.reasoning_end(None).unwrap();
+        }
+
+        let transcript = output.transcript();
+        assert_eq!(transcript.matches("[thought ").count(), 2, "{transcript:?}");
+        assert!(transcript.contains("] First pass\n"), "{transcript:?}");
+        assert!(transcript.contains("] Second pass\n"), "{transcript:?}");
+    }
+
+    #[test]
+    fn final_output_suppresses_opaque_reasoning_and_summary() {
+        let (mut renderer, output, _stderr) =
+            Renderer::with_test_output(OutputFormat::Final, false, false, None);
+
+        renderer
+            .reasoning_start(ReasoningVisibility::Opaque)
+            .unwrap();
+        renderer
+            .reasoning_summary_delta("**Hidden title**\n")
+            .unwrap();
+        renderer.reasoning_end(None).unwrap();
+
+        assert!(output.transcript().is_empty());
+    }
+
+    #[test]
+    fn terminal_reasoning_title_updates_the_live_line() {
+        let (mut renderer, _output) =
+            Renderer::with_test_shared_output(OutputFormat::Terminal, true, None);
+
+        renderer
+            .reasoning_start(ReasoningVisibility::Opaque)
+            .unwrap();
+        renderer
+            .reasoning_summary_delta("## Inspecting renderer state\n")
+            .unwrap();
+
+        let live = strip_ansi(&renderer.format_live_line().unwrap());
+        assert!(live.ends_with("] Inspecting renderer state"), "{live:?}");
+        assert!(!live.contains("token"), "{live:?}");
+    }
+
+    #[test]
+    fn summary_title_extraction_rejects_prose_and_accepts_only_title_lines() {
+        assert_eq!(
+            extract_reasoning_summary_title("**Inspecting   renderer**\n\nDetails", false),
+            Some("Inspecting renderer".into())
+        );
+        assert_eq!(
+            extract_reasoning_summary_title("\n### Checking tests ###\n", false),
+            Some("Checking tests".into())
+        );
+        assert_eq!(
+            extract_reasoning_summary_title("I am inspecting the renderer.\n", false),
+            None
+        );
+        assert_eq!(
+            extract_reasoning_summary_title("**Incomplete title**", false),
+            None
+        );
+        assert_eq!(
+            extract_reasoning_summary_title("**Complete at end**", true),
+            Some("Complete at end".into())
+        );
+    }
+
+    #[test]
+    fn summary_title_is_capped_by_visible_terminal_width() {
+        let summary = format!("**{}**\n", "界".repeat(50));
+        let title = extract_reasoning_summary_title(&summary, false).unwrap();
+
+        assert!(UnicodeWidthStr::width(title.as_str()) <= REASONING_TITLE_MAX_WIDTH);
+        assert!(title.ends_with(ELLIPSIS));
+    }
+
+    #[test]
     fn terminal_ignores_empty_assistant_blocks_before_first_visible_block() {
         let (mut renderer, output) =
             Renderer::with_test_shared_output(OutputFormat::Terminal, true, None);
 
         renderer.assistant_text("\n\n").unwrap();
         renderer.assistant_end().unwrap();
-        renderer.reasoning_start().unwrap();
+        renderer
+            .reasoning_start(ReasoningVisibility::StreamedTrace)
+            .unwrap();
         renderer.reasoning_delta("plan").unwrap();
         renderer.reasoning_end(Some((12, 5))).unwrap();
 
@@ -3861,7 +4124,9 @@ mod tests {
         let (mut renderer, output) =
             Renderer::with_test_shared_output(OutputFormat::Terminal, true, None);
 
-        renderer.reasoning_start().unwrap();
+        renderer
+            .reasoning_start(ReasoningVisibility::StreamedTrace)
+            .unwrap();
         renderer.reasoning_delta("plan").unwrap();
         std::thread::sleep(Duration::from_millis(40));
         renderer.reasoning_end(Some((12, 5))).unwrap();
@@ -3914,7 +4179,9 @@ mod tests {
         let (mut renderer, output, _stderr) =
             Renderer::with_test_output(OutputFormat::Plain, false, false, None);
 
-        renderer.reasoning_start().unwrap();
+        renderer
+            .reasoning_start(ReasoningVisibility::StreamedTrace)
+            .unwrap();
         renderer.reasoning_delta("reason").unwrap();
         renderer.reasoning_end(None).unwrap();
 

@@ -10,7 +10,7 @@ use tokio::time::{self, MissedTickBehavior};
 use crate::models::RequestOptions;
 use crate::provider::{
     ContentPart, FinishReason, FunctionCall, Message, ModelApi, NativeReplay, NativeReplayPayload,
-    Provider, ProviderError, StreamEvent, StreamResult, ToolCall,
+    Provider, ProviderError, ReasoningVisibility, StreamEvent, StreamResult, ToolCall,
     ToolCallDelta as ProviderToolCallDelta, Usage, UserContent, classify_endpoint,
 };
 
@@ -466,9 +466,12 @@ fn build_responses_request_body(
         "store": false,
         "include": ["reasoning.encrypted_content"]
     });
+    let mut reasoning = serde_json::Map::new();
+    reasoning.insert("summary".into(), Value::String("auto".into()));
     if let Some(effort) = request.model.effort.as_deref() {
-        body["reasoning"] = serde_json::json!({ "effort": effort });
+        reasoning.insert("effort".into(), Value::String(effort.to_string()));
     }
+    body["reasoning"] = Value::Object(reasoning);
     Ok(body)
 }
 
@@ -517,10 +520,33 @@ fn responses_input_items(
         }
         Message::Tool {
             content,
+            artifacts,
             tool_call_id,
-        } => input.push(serde_json::json!({
-            "type": "function_call_output", "call_id": tool_call_id, "output": content
-        })),
+        } => {
+            let output = if artifacts.is_empty() {
+                Value::String(content.clone())
+            } else {
+                let mut parts = vec![serde_json::json!({
+                    "type": "input_text",
+                    "text": content,
+                })];
+                parts.extend(artifacts.iter().map(|artifact| {
+                    serde_json::json!({
+                        "type": "input_image",
+                        "image_url": format!(
+                            "data:{};base64,{}",
+                            artifact.attachment.media_type,
+                            base64_encode(&artifact.attachment.data)
+                        ),
+                        "detail": artifact.detail.to_string(),
+                    })
+                }));
+                Value::Array(parts)
+            };
+            input.push(serde_json::json!({
+                "type": "function_call_output", "call_id": tool_call_id, "output": output
+            }));
+        }
     }
     Ok(())
 }
@@ -564,6 +590,7 @@ struct ResponsesStreamState {
     finish_reason: Option<FinishReason>,
     failure: Option<String>,
     reasoning_active: bool,
+    reasoning_output_index: Option<usize>,
     tool_indexes: BTreeMap<usize, usize>,
 }
 
@@ -592,7 +619,9 @@ fn consume_responses_sse_buffer(
                 let item = &value["item"];
                 if item["type"] == "reasoning" && !state.reasoning_active {
                     state.reasoning_active = true;
-                    on_event(StreamEvent::ReasoningStart)?;
+                    let output_index = value["output_index"].as_u64().unwrap_or(0) as usize;
+                    state.reasoning_output_index = Some(output_index);
+                    on_event(StreamEvent::ReasoningStart(ReasoningVisibility::Opaque))?;
                 } else if item["type"] == "function_call" {
                     let output_index = value["output_index"].as_u64().unwrap_or(0) as usize;
                     let tool_index = state.tool_indexes.len();
@@ -606,9 +635,25 @@ fn consume_responses_sse_buffer(
                 }
             }
             "response.output_item.done" => {
-                if value["item"]["type"] == "reasoning" && state.reasoning_active {
+                let output_index = value["output_index"].as_u64().unwrap_or(0) as usize;
+                if value["item"]["type"] == "reasoning"
+                    && state.reasoning_active
+                    && state.reasoning_output_index == Some(output_index)
+                {
                     state.reasoning_active = false;
+                    state.reasoning_output_index = None;
                     on_event(StreamEvent::ReasoningEnd)?;
+                }
+            }
+            "response.reasoning_summary_text.delta" => {
+                let output_index = value["output_index"].as_u64().unwrap_or(u64::MAX) as usize;
+                let summary_index = value["summary_index"].as_u64().unwrap_or(u64::MAX) as usize;
+                if state.reasoning_active
+                    && state.reasoning_output_index == Some(output_index)
+                    && summary_index == 0
+                    && let Some(delta) = value["delta"].as_str()
+                {
+                    on_event(StreamEvent::ReasoningSummaryDelta(delta.to_string()))?;
                 }
             }
             "response.output_text.delta" | "response.refusal.delta" => {
@@ -718,7 +763,7 @@ fn build_chat_request_body(
 ) -> Value {
     let mut body = serde_json::json!({
         "model": request.model.model_id.as_str(),
-        "messages": messages.iter().map(|message| chat_message_json(message, endpoint, &request.model.model_id)).collect::<Vec<_>>(),
+        "messages": chat_messages_json(messages, endpoint, &request.model.model_id),
         "tools": tools,
         "stream": true,
         "stream_options": { "include_usage": true }
@@ -732,16 +777,33 @@ fn build_chat_request_body(
     body
 }
 
-fn chat_message_json(message: &Message, endpoint: &str, model: &str) -> Value {
+fn chat_messages_json(messages: &[Message], endpoint: &str, model: &str) -> Vec<Value> {
+    let mut serialized = Vec::new();
+    let mut pending_tool_artifacts = Vec::new();
+    for message in messages {
+        let mut values = chat_message_json(message, endpoint, model);
+        if matches!(message, Message::Tool { .. }) {
+            serialized.push(values.remove(0));
+            pending_tool_artifacts.extend(values);
+        } else {
+            serialized.append(&mut pending_tool_artifacts);
+            serialized.append(&mut values);
+        }
+    }
+    serialized.append(&mut pending_tool_artifacts);
+    serialized
+}
+
+fn chat_message_json(message: &Message, endpoint: &str, model: &str) -> Vec<Value> {
     match message {
-        Message::System { content } => serde_json::json!({
+        Message::System { content } => vec![serde_json::json!({
             "role": "system",
             "content": content,
-        }),
-        Message::User { content } => serde_json::json!({
+        })],
+        Message::User { content } => vec![serde_json::json!({
             "role": "user",
             "content": user_content_json(content),
-        }),
+        })],
         Message::Assistant {
             content,
             reasoning_content: _,
@@ -765,16 +827,45 @@ fn chat_message_json(message: &Message, endpoint: &str, model: &str) -> Value {
                 value["tool_calls"] =
                     serde_json::to_value(tool_calls).expect("serializing tool calls");
             }
-            value
+            vec![value]
         }
         Message::Tool {
             content,
+            artifacts,
             tool_call_id,
-        } => serde_json::json!({
-            "role": "tool",
-            "content": content,
-            "tool_call_id": tool_call_id,
-        }),
+        } => {
+            let mut messages = vec![serde_json::json!({
+                "role": "tool",
+                "content": content,
+                "tool_call_id": tool_call_id,
+            })];
+            if !artifacts.is_empty() {
+                let mut content = vec![serde_json::json!({
+                    "type": "text",
+                    "text": format!(
+                        "Images returned by the preceding tool call `{tool_call_id}`."
+                    ),
+                })];
+                content.extend(artifacts.iter().map(|artifact| {
+                    serde_json::json!({
+                        "type": "image_url",
+                        "image_url": {
+                            "url": format!(
+                                "data:{};base64,{}",
+                                artifact.attachment.media_type,
+                                base64_encode(&artifact.attachment.data)
+                            ),
+                            "detail": artifact.detail.to_string(),
+                        },
+                    })
+                }));
+                messages.push(serde_json::json!({
+                    "role": "user",
+                    "content": content,
+                }));
+            }
+            messages
+        }
     }
 }
 
@@ -895,7 +986,9 @@ fn consume_sse_buffer(
                 if let Some(text) = reasoning_delta {
                     state.reasoning_content.push_str(&text);
                     if !state.reasoning_active {
-                        on_event(StreamEvent::ReasoningStart)?;
+                        on_event(StreamEvent::ReasoningStart(
+                            ReasoningVisibility::StreamedTrace,
+                        ))?;
                         state.reasoning_active = true;
                     }
                     on_event(StreamEvent::ReasoningDelta(text))?;
@@ -1248,9 +1341,17 @@ mod tests {
         let mut seen_events = Vec::new();
         let mut on_event = |event: StreamEvent| -> Result<(), ProviderError> {
             match event {
-                StreamEvent::ReasoningStart => seen_events.push("reasoning_start".to_string()),
+                StreamEvent::ReasoningStart(ReasoningVisibility::StreamedTrace) => {
+                    seen_events.push("reasoning_start".to_string())
+                }
+                StreamEvent::ReasoningStart(ReasoningVisibility::Opaque) => {
+                    seen_events.push("opaque_reasoning_start".to_string())
+                }
                 StreamEvent::ReasoningDelta(text) => {
                     seen_events.push(format!("reasoning_delta:{text}"))
+                }
+                StreamEvent::ReasoningSummaryDelta(text) => {
+                    seen_events.push(format!("reasoning_summary_delta:{text}"))
                 }
                 StreamEvent::ReasoningEnd => seen_events.push("reasoning_end".to_string()),
                 StreamEvent::TextDelta(text) => seen_events.push(format!("text:{text}")),
@@ -1400,6 +1501,7 @@ mod tests {
         assert_eq!(body["stream"], true);
         assert_eq!(body["include"][0], "reasoning.encrypted_content");
         assert_eq!(body["reasoning"]["effort"], "max");
+        assert_eq!(body["reasoning"]["summary"], "auto");
         assert!(body.get("previous_response_id").is_none());
         assert!(body.get("conversation").is_none());
         assert_eq!(body["tools"][0]["name"], "bash");
@@ -1410,6 +1512,21 @@ mod tests {
             body["input"][0]["content"][1]["image_url"],
             "data:image/png;base64,AQID"
         );
+    }
+
+    #[test]
+    fn responses_request_includes_summary_without_explicit_effort() {
+        let body = build_responses_request_body(
+            &RequestOptions {
+                model: test_model(None),
+            },
+            "https://api.test/v1/responses",
+            &[],
+            &[],
+        )
+        .unwrap();
+
+        assert_eq!(body["reasoning"], serde_json::json!({"summary": "auto"}));
     }
 
     #[test]
@@ -1439,6 +1556,7 @@ mod tests {
             assistant,
             Message::Tool {
                 content: "ok".into(),
+                artifacts: Vec::new(),
                 tool_call_id: "call_1".into(),
             },
         ];
@@ -1466,6 +1584,87 @@ mod tests {
         .unwrap();
         assert_eq!(switched["input"][0]["type"], "function_call");
         assert!(switched.to_string().find("opaque").is_none());
+    }
+
+    #[test]
+    fn serializes_tool_images_natively_for_responses_and_as_chat_fallback() {
+        let artifact = crate::provider::ToolArtifact {
+            attachment: crate::provider::Attachment {
+                filename: "tool.png".into(),
+                media_type: "image/png".into(),
+                data: b"png".to_vec(),
+            },
+            detail: crate::provider::ImageDetail::Original,
+        };
+        let messages = vec![Message::Tool {
+            content: "Viewed image".into(),
+            artifacts: vec![artifact],
+            tool_call_id: "call-image".into(),
+        }];
+
+        let responses = build_responses_request_body(
+            &RequestOptions {
+                model: test_model(None),
+            },
+            "https://api.test/v1/responses",
+            &messages,
+            &[],
+        )
+        .unwrap();
+        assert_eq!(responses["input"][0]["output"][0]["type"], "input_text");
+        assert_eq!(responses["input"][0]["output"][1]["type"], "input_image");
+        assert_eq!(responses["input"][0]["output"][1]["detail"], "original");
+
+        let chat = build_chat_request_body(
+            &RequestOptions {
+                model: test_model(None),
+            },
+            CHAT_ENDPOINT,
+            &messages,
+            &[],
+        );
+        assert_eq!(chat["messages"][0]["role"], "tool");
+        assert_eq!(chat["messages"][1]["role"], "user");
+        assert_eq!(
+            chat["messages"][1]["content"][1]["image_url"]["detail"],
+            "original"
+        );
+    }
+
+    #[test]
+    fn chat_serializes_parallel_tool_replies_before_image_fallbacks() {
+        let artifact = |filename: &str| crate::provider::ToolArtifact {
+            attachment: crate::provider::Attachment {
+                filename: filename.into(),
+                media_type: "image/png".into(),
+                data: b"png".to_vec(),
+            },
+            detail: crate::provider::ImageDetail::Auto,
+        };
+        let messages = vec![
+            Message::Tool {
+                content: "first".into(),
+                artifacts: vec![artifact("first.png")],
+                tool_call_id: "call-1".into(),
+            },
+            Message::Tool {
+                content: "second".into(),
+                artifacts: vec![artifact("second.png")],
+                tool_call_id: "call-2".into(),
+            },
+        ];
+        let chat = build_chat_request_body(
+            &RequestOptions {
+                model: test_model(None),
+            },
+            CHAT_ENDPOINT,
+            &messages,
+            &[],
+        );
+        assert_eq!(chat["messages"][0]["tool_call_id"], "call-1");
+        assert_eq!(chat["messages"][1]["tool_call_id"], "call-2");
+        assert_eq!(chat["messages"][2]["role"], "user");
+        assert_eq!(chat["messages"][3]["role"], "user");
     }
 
     #[test]
@@ -1578,7 +1777,10 @@ mod tests {
         let usage = state.usage.unwrap();
         assert_eq!(usage.cache_read_input_tokens, 8);
         assert_eq!(usage.reasoning_output_tokens, 4);
-        assert!(matches!(events[0], StreamEvent::ReasoningStart));
+        assert!(matches!(
+            events[0],
+            StreamEvent::ReasoningStart(ReasoningVisibility::Opaque)
+        ));
         assert!(events.iter().any(|event| matches!(event,
             StreamEvent::ToolCallDelta(delta) if delta.id.as_deref() == Some("call_1")
         )));
@@ -1586,6 +1788,42 @@ mod tests {
             responses_tool_calls(&state.output)[0].function.arguments,
             "{\"command\":\"pwd\"}"
         );
+    }
+
+    #[test]
+    fn streams_summary_text_only_for_the_active_first_summary_part() {
+        let mut state = ResponsesStreamState::default();
+        let mut events = Vec::new();
+        let mut on_event = |event| {
+            events.push(event);
+            Ok(())
+        };
+        let mut buffer = concat!(
+            "data: {\"type\":\"response.output_item.added\",\"output_index\":2,\"item\":{\"type\":\"reasoning\",\"id\":\"rs_1\"}}\n\n",
+            "data: {\"type\":\"response.reasoning_summary_text.delta\",\"output_index\":1,\"summary_index\":0,\"delta\":\"ignored output\"}\n\n",
+            "data: {\"type\":\"response.reasoning_summary_text.delta\",\"output_index\":2,\"summary_index\":1,\"delta\":\"ignored part\"}\n\n",
+            "data: {\"type\":\"response.reasoning_summary_text.delta\",\"output_index\":2,\"summary_index\":0,\"delta\":\"**Inspecting\"}\n\n",
+            "data: {\"type\":\"response.reasoning_summary_text.delta\",\"output_index\":2,\"summary_index\":0,\"delta\":\" renderer**\\n\"}\n\n",
+            "data: {\"type\":\"response.output_item.done\",\"output_index\":2,\"item\":{\"type\":\"reasoning\"}}\n\n",
+        )
+        .to_string();
+
+        consume_responses_sse_buffer(&mut buffer, &mut state, &mut on_event).unwrap();
+
+        assert!(matches!(
+            events.first(),
+            Some(StreamEvent::ReasoningStart(ReasoningVisibility::Opaque))
+        ));
+        assert!(matches!(
+            events.get(1),
+            Some(StreamEvent::ReasoningSummaryDelta(text)) if text == "**Inspecting"
+        ));
+        assert!(matches!(
+            events.get(2),
+            Some(StreamEvent::ReasoningSummaryDelta(text)) if text == " renderer**\n"
+        ));
+        assert!(matches!(events.get(3), Some(StreamEvent::ReasoningEnd)));
+        assert_eq!(events.len(), 4);
     }
 
     #[test]

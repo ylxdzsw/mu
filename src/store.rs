@@ -9,7 +9,8 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::provider::{
-    Attachment, ContentPart, Message, ToolCall, Usage, UserContent, approx_tokens,
+    Attachment, ContentPart, ImageDetail, Message, ToolArtifact, ToolCall, Usage, UserContent,
+    approx_tokens,
 };
 use crate::tools::BashRisk;
 
@@ -87,7 +88,7 @@ impl std::fmt::Display for SessionBusy {
 
 impl std::error::Error for SessionBusy {}
 
-const CURRENT_SCHEMA_VERSION: i32 = 5;
+const CURRENT_SCHEMA_VERSION: i32 = 6;
 
 fn session_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Session> {
     Ok(Session {
@@ -138,7 +139,7 @@ impl Store {
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .context("reading SQLite schema version")?;
         match version {
-            0 if !self.has_application_tables()? => self.create_schema_v5(),
+            0 if !self.has_application_tables()? => self.create_schema_v6(),
             0 => anyhow::bail!(
                 "unsupported pre-release session database schema; remove sessions.db to create a fresh release database"
             ),
@@ -146,18 +147,25 @@ impl Store {
                 self.migrate_v1_to_v2()?;
                 self.migrate_v2_to_v3()?;
                 self.migrate_v3_to_v4()?;
-                self.migrate_v4_to_v5()
+                self.migrate_v4_to_v5()?;
+                self.migrate_v5_to_v6()
             }
             2 => {
                 self.migrate_v2_to_v3()?;
                 self.migrate_v3_to_v4()?;
-                self.migrate_v4_to_v5()
+                self.migrate_v4_to_v5()?;
+                self.migrate_v5_to_v6()
             }
             3 => {
                 self.migrate_v3_to_v4()?;
-                self.migrate_v4_to_v5()
+                self.migrate_v4_to_v5()?;
+                self.migrate_v5_to_v6()
             }
-            4 => self.migrate_v4_to_v5(),
+            4 => {
+                self.migrate_v4_to_v5()?;
+                self.migrate_v5_to_v6()
+            }
+            5 => self.migrate_v5_to_v6(),
             CURRENT_SCHEMA_VERSION => Ok(()),
             future => anyhow::bail!(
                 "unsupported future session database schema version {future}; this mu supports version {CURRENT_SCHEMA_VERSION}"
@@ -176,7 +184,7 @@ impl Store {
         Ok(count > 0)
     }
 
-    fn create_schema_v5(&self) -> Result<()> {
+    fn create_schema_v6(&self) -> Result<()> {
         self.conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS session (
                 id TEXT PRIMARY KEY,
@@ -195,6 +203,7 @@ impl Store {
                 reasoning_content TEXT,
                 native_replay_json TEXT,
                 user_content_json TEXT,
+                tool_content_json TEXT,
                 tool_call_id TEXT,
                 tool_calls_json TEXT,
                 seq INTEGER NOT NULL,
@@ -243,7 +252,7 @@ impl Store {
                 reason TEXT,
                 created_at TEXT NOT NULL
             );
-            PRAGMA user_version = 5;",
+            PRAGMA user_version = 6;",
         )?;
         Ok(())
     }
@@ -288,6 +297,20 @@ impl Store {
                 .execute_batch("ALTER TABLE message ADD COLUMN native_replay_json TEXT;")?;
         }
         self.conn.pragma_update(None, "user_version", 5)?;
+        Ok(())
+    }
+
+    fn migrate_v5_to_v6(&self) -> Result<()> {
+        let has_message: bool = self.conn.query_row(
+            "SELECT COUNT(*) > 0 FROM sqlite_schema WHERE type = 'table' AND name = 'message'",
+            [],
+            |row| row.get(0),
+        )?;
+        if has_message {
+            self.conn
+                .execute_batch("ALTER TABLE message ADD COLUMN tool_content_json TEXT;")?;
+        }
+        self.conn.pragma_update(None, "user_version", 6)?;
         Ok(())
     }
 
@@ -497,6 +520,7 @@ impl Store {
                     status: "interrupted",
                 },
                 INTERRUPTED_TOOL_RESULT,
+                &[],
             )?;
             synthesized += 1;
         }
@@ -523,7 +547,7 @@ impl Store {
         let summary_seq = self.latest_summary_seq(session_id)?;
         let start_seq = summary_seq.unwrap_or(-1);
         let mut stmt = self.conn.prepare(
-            "SELECT role, content, reasoning_content, user_content_json, tool_call_id, tool_calls_json, native_replay_json FROM message
+            "SELECT role, content, reasoning_content, user_content_json, tool_content_json, tool_call_id, tool_calls_json, native_replay_json FROM message
              WHERE session_id = ?1 AND seq > ?2 AND role NOT IN ('system', 'summary')
              ORDER BY seq ASC",
         )?;
@@ -549,6 +573,7 @@ impl Store {
                 content,
                 reasoning_content,
                 user_content_json,
+                tool_content_json,
                 tool_call_id,
                 tool_calls_json,
                 native_replay_json,
@@ -576,6 +601,7 @@ impl Store {
                 }
                 "tool" => messages.push(Message::Tool {
                     content,
+                    artifacts: load_tool_artifacts(&self.conn, tool_content_json)?,
                     tool_call_id: tool_call_id.unwrap_or_default(),
                 }),
                 other => messages.push(Message::User {
@@ -680,6 +706,7 @@ impl Store {
         session_id: &str,
         record: ToolCallRecord<'_>,
         content: &str,
+        artifacts: &[ToolArtifact],
     ) -> Result<i64> {
         let now = chrono::Utc::now().to_rfc3339();
         let tx = self.conn.unchecked_transaction()?;
@@ -698,6 +725,7 @@ impl Store {
         )?;
         let message = Message::Tool {
             content: content.to_string(),
+            artifacts: artifacts.to_vec(),
             tool_call_id: record.id.to_string(),
         };
         let message_id = insert_message_in(&tx, session_id, &message, &now)?;
@@ -819,6 +847,7 @@ type ContextRow = (
     Option<String>,
     Option<String>,
     Option<String>,
+    Option<String>,
 );
 
 pub fn write_session_id(path: &Path, id: &str) -> Result<()> {
@@ -850,6 +879,101 @@ struct PersistedAttachment {
     media_type: String,
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+struct PersistedToolContent {
+    artifacts: Vec<PersistedToolArtifact>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct PersistedToolArtifact {
+    attachment: PersistedAttachment,
+    detail: ImageDetail,
+}
+
+fn load_tool_artifacts(
+    conn: &Connection,
+    tool_content_json: Option<String>,
+) -> Result<Vec<ToolArtifact>> {
+    let Some(json) = tool_content_json else {
+        return Ok(Vec::new());
+    };
+    let persisted: PersistedToolContent =
+        serde_json::from_str(&json).context("decoding persisted tool artifacts")?;
+    persisted
+        .artifacts
+        .into_iter()
+        .map(|artifact| {
+            Ok(ToolArtifact {
+                attachment: load_persisted_attachment(conn, artifact.attachment)?,
+                detail: artifact.detail,
+            })
+        })
+        .collect()
+}
+
+fn persist_tool_artifacts(
+    tx: &rusqlite::Transaction<'_>,
+    artifacts: &[ToolArtifact],
+    now: &str,
+) -> Result<Option<String>> {
+    if artifacts.is_empty() {
+        return Ok(None);
+    }
+    let artifacts = artifacts
+        .iter()
+        .map(|artifact| {
+            Ok(PersistedToolArtifact {
+                attachment: persist_attachment(tx, &artifact.attachment, now)?,
+                detail: artifact.detail,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(Some(serde_json::to_string(&PersistedToolContent {
+        artifacts,
+    })?))
+}
+
+fn load_persisted_attachment(
+    conn: &Connection,
+    attachment: PersistedAttachment,
+) -> Result<Attachment> {
+    let data = conn
+        .query_row(
+            "SELECT data FROM attachment_blob WHERE id = ?1",
+            params![attachment.blob_id],
+            |row| row.get::<_, Vec<u8>>(0),
+        )
+        .optional()?
+        .with_context(|| format!("missing attachment blob {}", attachment.blob_id))?;
+    let actual_id = attachment_blob_id(&data);
+    if actual_id != attachment.blob_id {
+        anyhow::bail!("corrupt attachment blob {}", attachment.blob_id);
+    }
+    Ok(Attachment {
+        filename: attachment.filename,
+        media_type: attachment.media_type,
+        data,
+    })
+}
+
+fn persist_attachment(
+    tx: &rusqlite::Transaction<'_>,
+    attachment: &Attachment,
+    now: &str,
+) -> Result<PersistedAttachment> {
+    let blob_id = attachment_blob_id(&attachment.data);
+    tx.execute(
+        "INSERT OR IGNORE INTO attachment_blob (id, data, size, created_at)
+         VALUES (?1, ?2, ?3, ?4)",
+        params![blob_id, attachment.data, attachment.data.len() as i64, now],
+    )?;
+    Ok(PersistedAttachment {
+        blob_id,
+        filename: attachment.filename.clone(),
+        media_type: attachment.media_type.clone(),
+    })
+}
+
 fn load_user_content(
     conn: &Connection,
     content: String,
@@ -868,29 +992,9 @@ fn load_user_content(
             .into_iter()
             .map(|part| match part {
                 PersistedContentPart::Text { text } => Ok(ContentPart::Text { text }),
-                PersistedContentPart::Attachment { attachment } => {
-                    let data = conn
-                        .query_row(
-                            "SELECT data FROM attachment_blob WHERE id = ?1",
-                            params![attachment.blob_id],
-                            |row| row.get::<_, Vec<u8>>(0),
-                        )
-                        .optional()?
-                        .with_context(|| {
-                            format!("missing attachment blob {}", attachment.blob_id)
-                        })?;
-                    let actual_id = attachment_blob_id(&data);
-                    if actual_id != attachment.blob_id {
-                        anyhow::bail!("corrupt attachment blob {}", attachment.blob_id);
-                    }
-                    Ok(ContentPart::Attachment {
-                        attachment: Attachment {
-                            filename: attachment.filename,
-                            media_type: attachment.media_type,
-                            data,
-                        },
-                    })
-                }
+                PersistedContentPart::Attachment { attachment } => Ok(ContentPart::Attachment {
+                    attachment: load_persisted_attachment(conn, attachment)?,
+                }),
             })
             .collect::<Result<Vec<_>>>()
             .map(UserContent::Parts),
@@ -912,18 +1016,8 @@ fn persist_user_content(
                         Ok(PersistedContentPart::Text { text: text.clone() })
                     }
                     ContentPart::Attachment { attachment } => {
-                        let blob_id = attachment_blob_id(&attachment.data);
-                        tx.execute(
-                            "INSERT OR IGNORE INTO attachment_blob (id, data, size, created_at)
-                             VALUES (?1, ?2, ?3, ?4)",
-                            params![blob_id, attachment.data, attachment.data.len() as i64, now],
-                        )?;
                         Ok(PersistedContentPart::Attachment {
-                            attachment: PersistedAttachment {
-                                blob_id,
-                                filename: attachment.filename.clone(),
-                                media_type: attachment.media_type.clone(),
-                            },
+                            attachment: persist_attachment(tx, attachment, now)?,
                         })
                     }
                 })
@@ -947,6 +1041,7 @@ fn load_context_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ContextRow> {
         row.get(4)?,
         row.get(5)?,
         row.get(6)?,
+        row.get(7)?,
     ))
 }
 
@@ -1000,12 +1095,14 @@ fn insert_message_in(
         }
         Message::Tool {
             content,
+            artifacts,
             tool_call_id,
         } => {
+            let tool_content_json = persist_tool_artifacts(tx, artifacts, now)?;
             tx.execute(
-                "INSERT INTO message (session_id, role, content, tool_call_id, seq, created_at)
-                 VALUES (?1, 'tool', ?2, ?3, ?4, ?5)",
-                params![session_id, content, tool_call_id, seq, now],
+                "INSERT INTO message (session_id, role, content, tool_content_json, tool_call_id, seq, created_at)
+                 VALUES (?1, 'tool', ?2, ?3, ?4, ?5, ?6)",
+                params![session_id, content, tool_content_json, tool_call_id, seq, now],
             )?;
         }
         Message::System { content } => {
@@ -1176,6 +1273,7 @@ mod tests {
             .unwrap();
         assert!(message_columns.contains(&"reasoning_content".to_string()));
         assert!(message_columns.contains(&"native_replay_json".to_string()));
+        assert!(message_columns.contains(&"tool_content_json".to_string()));
         let session_columns = store
             .conn
             .prepare("PRAGMA table_info(session)")
@@ -1421,6 +1519,54 @@ mod tests {
     }
 
     #[test]
+    fn reloads_tool_image_artifacts_and_reuses_attachment_blobs() {
+        let (store, tmp) = temp_store();
+        let session = create_session_with_system(&store);
+        let data = b"\x89PNG\r\n\x1a\nrest".to_vec();
+        let artifact = ToolArtifact {
+            attachment: Attachment {
+                filename: "tool.png".into(),
+                media_type: "image/png".into(),
+                data: data.clone(),
+            },
+            detail: ImageDetail::High,
+        };
+        store
+            .append_message(
+                &session.id,
+                &Message::Tool {
+                    content: "Viewed image".into(),
+                    artifacts: vec![artifact.clone()],
+                    tool_call_id: "call-image".into(),
+                },
+            )
+            .unwrap();
+        store
+            .append_message(
+                &session.id,
+                &Message::User {
+                    content: UserContent::Parts(vec![ContentPart::Attachment {
+                        attachment: artifact.attachment.clone(),
+                    }]),
+                },
+            )
+            .unwrap();
+
+        let messages = store.load_context_messages(&session.id).unwrap();
+        assert!(matches!(
+            &messages[1],
+            Message::Tool { artifacts, .. }
+                if artifacts == &vec![artifact]
+        ));
+        let blob_count: i64 = store
+            .conn
+            .query_row("SELECT COUNT(*) FROM attachment_blob", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(blob_count, 1);
+        let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    #[test]
     fn reloads_reasoning_content_without_normalizing_whitespace() {
         let (store, tmp) = temp_store();
         let session = create_session_with_system(&store);
@@ -1555,6 +1701,7 @@ mod tests {
                     status: "ok",
                 },
                 "a",
+                &[],
             )
             .unwrap();
 
@@ -1574,6 +1721,7 @@ mod tests {
                 Message::Tool {
                     tool_call_id,
                     content,
+                    ..
                 } => Some((tool_call_id, content)),
                 _ => None,
             })
