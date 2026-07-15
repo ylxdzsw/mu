@@ -412,6 +412,11 @@ fi
 rm -f "$MU_ZSH_FAKE_LOG"
 _mu_zsh_run_slash_command "/retry"
 grep -q -- "retry -s tracked-session --output plain" "$MU_ZSH_FAKE_LOG" || fail "retry slash command targets tracked session"
+_mu_zsh_run_slash_command "/model gpt"
+rm -f "$MU_ZSH_FAKE_LOG"
+_mu_zsh_run_slash_command "/retry"
+grep -q -- "retry -s tracked-session --model openai/gpt --output plain" "$MU_ZSH_FAKE_LOG" || fail "retry slash command forwards pending model"
+_mu_zsh_clear_model_state
 rm -f "$MU_ZSH_FAKE_LOG"
 _mu_zsh_run_slash_command "/compact"
 grep -q -- "compact --session tracked-session" "$MU_ZSH_FAKE_LOG" || fail "compact slash command targets tracked session"

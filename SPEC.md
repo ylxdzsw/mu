@@ -231,9 +231,9 @@ accepts optional non-terminal stdin as a custom focus). The surface is small:
   transcript.
 - `mu compact --session <id>` — force compaction. Terminal stdin is not read;
   non-terminal stdin is an optional verbatim custom focus instruction.
-- `mu retry [-s <id>] [-c]` — resume an interrupted (unclean) turn: normalize
-  the tail and continue the agent loop with no new prompt. No-op on a clean
-  session.
+- `mu retry [-s <id>] [-c] [--model <id>]` — resume an interrupted (unclean)
+  turn: normalize the tail and continue the agent loop with no new prompt.
+  `--model` overrides the session model for the retry. No-op on a clean session.
 
 The turn runner remains one completed turn per invocation. Bare `mu` reads the
 prompt from stdin; a positional name first resolves to a discovered custom
@@ -1028,11 +1028,11 @@ Conceptual schema (flat and small):
   `last_total_tokens` (the most recent `usage.total_tokens` reported by the
   provider; used for the pre-turn overflow check, §"Context window and
   compaction"). `model` is set at session creation from the
-  effective model (lifecycle step 2); a later `--model` overrides for that turn
-  only and does **not**
-  rewrite the stored value. `cwd` records the last working directory used for
-  that session. `title` is set lazily from the first user prompt (first ~60
-  chars) and is display-only for `mu session list`.
+  effective model (lifecycle step 2). After a successful turn or retry, `model`
+  is updated to that invocation's effective model; failed invocations do not
+  update it. `cwd` records the last working directory used for that session.
+  `title` is set lazily from the first user prompt (first ~60 chars) and is
+  display-only for `mu session list`.
 - **message** — `id`, `session_id`, `role`
   (`system`/`user`/`assistant`/`tool`/`summary`),
   `content`, optional full user content JSON for multi-part inputs, `created_at`,
@@ -1164,8 +1164,9 @@ per-call "running" marker in the database.
   just type the next instruction; the agent sees the interrupted results and the
   new prompt and continues or redirects. No forced retry, no stuck session.
 - **`mu retry`** normalizes the tail and re-runs the loop with *no* new prompt,
-  so the model continues the interrupted turn. It refuses on a clean session
-  ("nothing to retry").
+  so the model continues the interrupted turn. `--model` overrides the stored
+  session model for that retry; the zsh `/retry` command forwards an active
+  `/model` selection. It refuses on a clean session ("nothing to retry").
 
 ### Session concurrency lock
 

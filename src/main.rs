@@ -478,7 +478,13 @@ async fn run() -> Result<()> {
             store.normalize_interrupted_tail(&session.id)?;
 
             let request = RequestOptions {
-                model: models::resolve_model_ref(&config, &session.model)?,
+                model: models::resolve_model_ref(
+                    &config,
+                    effective_retry_model_ref(
+                        &session.model,
+                        retry_args.selection.model.as_deref(),
+                    ),
+                )?,
             };
             let model_info = models::resolve_model_info(&config, &request.model);
             let provider = build_provider(&config, &request.model.provider_id)?;
@@ -880,10 +886,10 @@ fn resolve_retry_session(
     store: &store::Store,
     retry: &cli::RetryArgs,
 ) -> Result<Option<store::Session>> {
-    if retry.session.is_some() && retry.continue_latest {
+    if retry.selection.session.is_some() && retry.selection.continue_latest {
         bail!("use either -s/--session or -c/--continue-latest, not both");
     }
-    if let Some(id) = retry.session.as_deref() {
+    if let Some(id) = retry.selection.session.as_deref() {
         return Ok(Some(
             store
                 .get_session(id)?
@@ -891,6 +897,10 @@ fn resolve_retry_session(
         ));
     }
     store.latest_session()
+}
+
+fn effective_retry_model_ref<'a>(stored: &'a str, override_ref: Option<&'a str>) -> &'a str {
+    override_ref.unwrap_or(stored)
 }
 
 fn open_status_store(path: &std::path::Path) -> Result<store::Store> {
@@ -1011,6 +1021,21 @@ mod tests {
         assert_eq!(
             model_override(None, Some("command/model".into())).as_deref(),
             Some("command/model")
+        );
+    }
+
+    #[test]
+    fn retry_model_override_wins_over_stored_model() {
+        assert_eq!(
+            effective_retry_model_ref(
+                "opencode/deepseek-v4-flash-free",
+                Some("opencode/mimo-v2.5-free"),
+            ),
+            "opencode/mimo-v2.5-free"
+        );
+        assert_eq!(
+            effective_retry_model_ref("opencode/deepseek-v4-flash-free", None),
+            "opencode/deepseek-v4-flash-free"
         );
     }
 

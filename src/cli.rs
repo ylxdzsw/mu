@@ -42,11 +42,8 @@ pub struct TurnArgs {
 
 #[derive(ClapArgs, Debug, Clone)]
 pub struct RetryArgs {
-    #[arg(short = 's', long)]
-    pub session: Option<String>,
-
-    #[arg(short = 'c', long)]
-    pub continue_latest: bool,
+    #[command(flatten)]
+    pub selection: SelectionArgs,
 
     #[arg(long, value_enum, default_value_t = OutputFormat::Terminal)]
     pub output: OutputFormat,
@@ -191,6 +188,32 @@ mod tests {
                 assert!(status.include_skills);
             }
             other => panic!("expected status command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_retry_model_override() {
+        let args = Args::try_parse_from([
+            "mu",
+            "retry",
+            "-s",
+            "session-1",
+            "--model",
+            "opencode/mimo-v2.5-free",
+            "--output",
+            "plain",
+        ])
+        .unwrap();
+        match args.command {
+            Some(Command::Retry(retry)) => {
+                assert_eq!(retry.selection.session.as_deref(), Some("session-1"));
+                assert_eq!(
+                    retry.selection.model.as_deref(),
+                    Some("opencode/mimo-v2.5-free")
+                );
+                assert_eq!(retry.output, OutputFormat::Plain);
+            }
+            other => panic!("expected retry command, got {other:?}"),
         }
     }
 }

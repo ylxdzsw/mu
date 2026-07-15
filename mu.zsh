@@ -867,7 +867,11 @@ _mu_zsh_run_slash_command() {
       _mu_zsh_validate_no_args "$command" "$rest" || return 1
       _mu_zsh_require_effective_session "$command" || return 1
       session_id=$MU_ZSH_EFFECTIVE_SESSION_ID
-      if "$MU_ZSH_BIN" retry -s "$session_id" --output "$MU_ZSH_OUTPUT"; then
+      local -a retry_command
+      retry_command=("$MU_ZSH_BIN" retry -s "$session_id")
+      [[ -n "$MU_ZSH_EFFECTIVE_MODEL" ]] && retry_command+=(--model "$MU_ZSH_EFFECTIVE_MODEL")
+      retry_command+=(--output "$MU_ZSH_OUTPUT")
+      if "${retry_command[@]}"; then
         exit_status=0
       else
         exit_status=$?

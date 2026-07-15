@@ -73,7 +73,8 @@ Common prompt-mode commands include:
 - `/new` starts a new session.
 - `/model` selects a configured model.
 - `/attach <file>` adds an image or audio file to the next turn.
-- `/retry` resumes a turn interrupted by Ctrl-C, a crash, or a lost connection.
+- `/retry` resumes a turn interrupted by Ctrl-C, a crash, or a lost connection,
+  using the model selected by `/model` when one is active.
 - `/compact` compacts a long session, optionally with a focus instruction.
 
 Typing `/` lists available commands.
