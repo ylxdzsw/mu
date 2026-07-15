@@ -37,8 +37,6 @@ struct ChunkDelta {
 struct ToolCallDelta {
     index: usize,
     id: Option<String>,
-    #[serde(rename = "type")]
-    call_type: Option<String>,
     function: Option<FunctionDelta>,
 }
 
@@ -76,7 +74,7 @@ struct CompletionTokensDetailsJson {
     reasoning_tokens: u64,
 }
 
-type ToolCallAccumulator = BTreeMap<usize, (Option<String>, Option<String>, String, String)>;
+type ToolCallAccumulator = BTreeMap<usize, (Option<String>, Option<String>, String)>;
 
 struct StreamParseState {
     content: String,
@@ -129,9 +127,8 @@ pub(crate) async fn stream(
         state
             .tool_accum
             .into_values()
-            .map(|(id, name, arguments, call_type)| ToolCall {
+            .map(|(id, name, arguments)| ToolCall {
                 id: id.unwrap_or_else(|| "call".into()),
-                call_type,
                 function: FunctionCall {
                     name: name.unwrap_or_default(),
                     arguments,
@@ -228,8 +225,18 @@ fn chat_message_json(message: &Message, endpoint: &str, model: &str) -> Vec<Valu
                 value["reasoning_content"] = Value::String(reasoning.clone());
             }
             if let Some(tool_calls) = tool_calls {
-                value["tool_calls"] =
-                    serde_json::to_value(tool_calls).expect("serializing tool calls");
+                value["tool_calls"] = Value::Array(
+                    tool_calls
+                        .iter()
+                        .map(|call| {
+                            serde_json::json!({
+                                "id": call.id,
+                                "type": "function",
+                                "function": &call.function,
+                            })
+                        })
+                        .collect(),
+                );
             }
             vec![value]
         }
@@ -391,14 +398,9 @@ fn consume_sse_buffer(
                         let entry = state
                             .tool_accum
                             .entry(tc.index)
-                            .or_insert_with(|| (None, None, String::new(), "function".into()));
+                            .or_insert_with(|| (None, None, String::new()));
                         if let Some(id) = tc.id.as_deref().filter(|id| !id.is_empty()) {
                             entry.0 = Some(id.to_string());
-                        }
-                        if let Some(call_type) =
-                            tc.call_type.as_deref().filter(|kind| !kind.is_empty())
-                        {
-                            entry.3 = call_type.to_string();
                         }
                         if let Some(ref f) = tc.function {
                             if let Some(name) = f.name.as_deref().filter(|name| !name.is_empty()) {
@@ -870,7 +872,6 @@ mod tests {
             reasoning_content: None,
             tool_calls: Some(vec![ToolCall {
                 id: "call_1".into(),
-                call_type: "function".into(),
                 function: FunctionCall {
                     name: "bash".into(),
                     arguments: "{}".into(),
@@ -1001,7 +1002,6 @@ mod tests {
     fn switching_between_apis_keeps_semantics_without_foreign_native_state() {
         let call = ToolCall {
             id: "call_1".into(),
-            call_type: "function".into(),
             function: FunctionCall {
                 name: "bash".into(),
                 arguments: "{}".into(),
@@ -1050,6 +1050,7 @@ mod tests {
             &[],
         );
         assert_eq!(chat["messages"][0]["tool_calls"][0]["id"], "call_1");
+        assert_eq!(chat["messages"][0]["tool_calls"][0]["type"], "function");
         assert!(!chat.to_string().contains("opaque"));
     }
 

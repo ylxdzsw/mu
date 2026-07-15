@@ -265,7 +265,7 @@ This is the exact sequence the binary follows for one turn invocation:
    error to stderr and exit non-zero (§7). Resolve the effective model:
    `--model` if given, else the session's stored `model`, else the merged
    config default.
-3. **Open the active-scope SQLite DB** (create + run migrations if absent):
+3. **Open the active-scope SQLite DB** (create the current schema if absent; reject non-current schemas with instructions to remove `sessions.db`):
    project-local when inside a project, global otherwise.
 4. **Resolve the session:**
    - If `--session <id>` is given and the row exists in the active scope → use

@@ -139,36 +139,13 @@ impl Store {
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .context("reading SQLite schema version")?;
         match version {
-            0 if !self.has_application_tables()? => self.create_schema_v6(),
+            0 if !self.has_application_tables()? => self.create_schema(),
             0 => anyhow::bail!(
                 "unsupported pre-release session database schema; remove sessions.db to create a fresh release database"
             ),
-            1 => {
-                self.migrate_v1_to_v2()?;
-                self.migrate_v2_to_v3()?;
-                self.migrate_v3_to_v4()?;
-                self.migrate_v4_to_v5()?;
-                self.migrate_v5_to_v6()
-            }
-            2 => {
-                self.migrate_v2_to_v3()?;
-                self.migrate_v3_to_v4()?;
-                self.migrate_v4_to_v5()?;
-                self.migrate_v5_to_v6()
-            }
-            3 => {
-                self.migrate_v3_to_v4()?;
-                self.migrate_v4_to_v5()?;
-                self.migrate_v5_to_v6()
-            }
-            4 => {
-                self.migrate_v4_to_v5()?;
-                self.migrate_v5_to_v6()
-            }
-            5 => self.migrate_v5_to_v6(),
             CURRENT_SCHEMA_VERSION => Ok(()),
-            future => anyhow::bail!(
-                "unsupported future session database schema version {future}; this mu supports version {CURRENT_SCHEMA_VERSION}"
+            version => anyhow::bail!(
+                "unsupported session database schema version {version}; remove sessions.db to create version {CURRENT_SCHEMA_VERSION}"
             ),
         }
     }
@@ -184,7 +161,7 @@ impl Store {
         Ok(count > 0)
     }
 
-    fn create_schema_v6(&self) -> Result<()> {
+    fn create_schema(&self) -> Result<()> {
         self.conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS session (
                 id TEXT PRIMARY KEY,
@@ -254,63 +231,6 @@ impl Store {
             );
             PRAGMA user_version = 6;",
         )?;
-        Ok(())
-    }
-
-    fn migrate_v1_to_v2(&self) -> Result<()> {
-        self.conn.execute_batch(
-            "ALTER TABLE message ADD COLUMN reasoning_content TEXT;
-             PRAGMA user_version = 2;",
-        )?;
-        Ok(())
-    }
-
-    fn migrate_v2_to_v3(&self) -> Result<()> {
-        self.conn.execute_batch(
-            "ALTER TABLE session DROP COLUMN archived;
-             PRAGMA user_version = 3;",
-        )?;
-        Ok(())
-    }
-
-    fn migrate_v3_to_v4(&self) -> Result<()> {
-        self.conn.execute_batch(
-            "CREATE TABLE attachment_blob (
-                id TEXT PRIMARY KEY,
-                data BLOB NOT NULL,
-                size INTEGER NOT NULL,
-                created_at TEXT NOT NULL
-             );
-             PRAGMA user_version = 4;",
-        )?;
-        Ok(())
-    }
-
-    fn migrate_v4_to_v5(&self) -> Result<()> {
-        let has_message: bool = self.conn.query_row(
-            "SELECT COUNT(*) > 0 FROM sqlite_schema WHERE type = 'table' AND name = 'message'",
-            [],
-            |row| row.get(0),
-        )?;
-        if has_message {
-            self.conn
-                .execute_batch("ALTER TABLE message ADD COLUMN native_replay_json TEXT;")?;
-        }
-        self.conn.pragma_update(None, "user_version", 5)?;
-        Ok(())
-    }
-
-    fn migrate_v5_to_v6(&self) -> Result<()> {
-        let has_message: bool = self.conn.query_row(
-            "SELECT COUNT(*) > 0 FROM sqlite_schema WHERE type = 'table' AND name = 'message'",
-            [],
-            |row| row.get(0),
-        )?;
-        if has_message {
-            self.conn
-                .execute_batch("ALTER TABLE message ADD COLUMN tool_content_json TEXT;")?;
-        }
-        self.conn.pragma_update(None, "user_version", 6)?;
         Ok(())
     }
 
@@ -1287,98 +1207,6 @@ mod tests {
     }
 
     #[test]
-    fn migrates_v1_database_to_current_schema() {
-        let tmp = std::env::temp_dir().join(format!("mu-store-v1-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&tmp).unwrap();
-        let db = tmp.join("mu.db");
-        let conn = Connection::open(&db).unwrap();
-        conn.execute_batch(
-            "CREATE TABLE session (
-                id TEXT PRIMARY KEY,
-                created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL,
-                cwd TEXT NOT NULL,
-                model TEXT NOT NULL,
-                title TEXT,
-                last_total_tokens INTEGER NOT NULL DEFAULT 0,
-                archived INTEGER NOT NULL DEFAULT 0
-             );
-             CREATE TABLE message (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                session_id TEXT NOT NULL,
-                role TEXT NOT NULL,
-                content TEXT NOT NULL,
-                user_content_json TEXT,
-                tool_call_id TEXT,
-                tool_calls_json TEXT,
-                seq INTEGER NOT NULL,
-                created_at TEXT NOT NULL
-             );
-             PRAGMA user_version = 1;",
-        )
-        .unwrap();
-        drop(conn);
-
-        let store = Store::open(&db).unwrap();
-        let version: i32 = store
-            .conn
-            .pragma_query_value(None, "user_version", |row| row.get(0))
-            .unwrap();
-        assert_eq!(version, CURRENT_SCHEMA_VERSION);
-        let has_reasoning_column: bool = store
-            .conn
-            .query_row(
-                "SELECT COUNT(*) > 0 FROM pragma_table_info('message') WHERE name = 'reasoning_content'",
-                [],
-                |row| row.get(0),
-        )
-        .unwrap();
-        assert!(has_reasoning_column);
-        let has_archived_column: bool = store
-            .conn
-            .query_row(
-                "SELECT COUNT(*) > 0 FROM pragma_table_info('session') WHERE name = 'archived'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert!(!has_archived_column);
-        let _ = std::fs::remove_dir_all(tmp);
-    }
-
-    #[test]
-    fn migration_restores_previously_archived_v2_sessions_to_lists() {
-        let tmp = std::env::temp_dir().join(format!("mu-store-v2-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&tmp).unwrap();
-        let db = tmp.join("mu.db");
-        let conn = Connection::open(&db).unwrap();
-        conn.execute_batch(
-            "CREATE TABLE session (
-                id TEXT PRIMARY KEY,
-                created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL,
-                cwd TEXT NOT NULL,
-                model TEXT NOT NULL,
-                title TEXT,
-                last_total_tokens INTEGER NOT NULL DEFAULT 0,
-                archived INTEGER NOT NULL DEFAULT 0
-             );
-             INSERT INTO session (id, created_at, updated_at, cwd, model, archived)
-             VALUES ('previously-hidden', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z', '/tmp', 'model', 1);
-             PRAGMA user_version = 2;",
-        )
-        .unwrap();
-        drop(conn);
-
-        let store = Store::open(&db).unwrap();
-        let sessions = store.list_sessions(20).unwrap();
-
-        assert_eq!(sessions.len(), 1);
-        assert_eq!(sessions[0].0.id, "previously-hidden");
-        let _ = std::fs::remove_dir_all(tmp);
-    }
-
-    #[test]
     fn pre_release_database_with_tables_is_rejected() {
         let tmp = std::env::temp_dir().join(format!("mu-store-old-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&tmp).unwrap();
@@ -1406,45 +1234,18 @@ mod tests {
     }
 
     #[test]
-    fn future_schema_version_is_rejected() {
-        let tmp = std::env::temp_dir().join(format!("mu-store-future-{}", uuid::Uuid::new_v4()));
+    fn non_current_schema_version_is_rejected() {
+        let tmp = std::env::temp_dir().join(format!("mu-store-old-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&tmp).unwrap();
         let db = tmp.join("mu.db");
         let conn = Connection::open(&db).unwrap();
-        conn.execute_batch("PRAGMA user_version = 99;").unwrap();
+        conn.execute_batch("PRAGMA user_version = 5;").unwrap();
         drop(conn);
 
         let error = Store::open(&db).err().unwrap().to_string();
 
-        assert!(error.contains("unsupported future session database schema version 99"));
-        let _ = std::fs::remove_dir_all(tmp);
-    }
-
-    #[test]
-    fn migrates_v3_database_with_attachment_blob_table() {
-        let tmp = std::env::temp_dir().join(format!("mu-store-v3-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&tmp).unwrap();
-        let db = tmp.join("mu.db");
-        let conn = Connection::open(&db).unwrap();
-        conn.execute_batch("PRAGMA user_version = 3;").unwrap();
-        drop(conn);
-
-        let store = Store::open(&db).unwrap();
-        let version: i32 = store
-            .conn
-            .pragma_query_value(None, "user_version", |row| row.get(0))
-            .unwrap();
-        assert_eq!(version, CURRENT_SCHEMA_VERSION);
-        let has_blob_table: bool = store
-            .conn
-            .query_row(
-                "SELECT COUNT(*) > 0 FROM sqlite_schema WHERE type = 'table' AND name = 'attachment_blob'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert!(has_blob_table);
-
+        assert!(error.contains("unsupported session database schema version 5"));
+        assert!(error.contains("remove sessions.db"));
         let _ = std::fs::remove_dir_all(tmp);
     }
 
@@ -1665,7 +1466,6 @@ mod tests {
                     tool_calls: Some(vec![
                         ToolCall {
                             id: "call-a".into(),
-                            call_type: "function".into(),
                             function: FunctionCall {
                                 name: "bash".into(),
                                 arguments:
@@ -1675,7 +1475,6 @@ mod tests {
                         },
                         ToolCall {
                             id: "call-b".into(),
-                            call_type: "function".into(),
                             function: FunctionCall {
                                 name: "bash".into(),
                                 arguments:

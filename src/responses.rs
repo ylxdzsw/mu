@@ -44,7 +44,7 @@ pub(crate) async fn stream(
     } else {
         Some(state.content)
     };
-    let finish_reason = state.finish_reason.unwrap_or_else(|| {
+    let finish_reason = state.finish_reason.unwrap_or({
         if tool_calls.is_empty() {
             FinishReason::Stop
         } else {
@@ -365,7 +365,6 @@ pub(crate) fn responses_tool_calls(output: &[Value]) -> Vec<ToolCall> {
         .filter(|item| item["type"] == "function_call")
         .map(|item| ToolCall {
             id: item["call_id"].as_str().unwrap_or("call").to_string(),
-            call_type: "function".into(),
             function: FunctionCall {
                 name: item["name"].as_str().unwrap_or("").to_string(),
                 arguments: item["arguments"].as_str().unwrap_or("").to_string(),

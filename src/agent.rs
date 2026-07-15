@@ -1,5 +1,4 @@
 use std::path::Path;
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Result, bail};
@@ -16,7 +15,7 @@ use crate::provider::{
 };
 use crate::renderer::Renderer;
 use crate::store::{ReviewRecord, Store, ToolCallRecord};
-use crate::tools::{BashRisk, ExecutionMode, ToolContext, ToolResult, missing_tool_message};
+use crate::tools::{BashRisk, ExecutionMode, ToolContext, ToolResult};
 use crate::{bash, tools};
 use bash::RunningBash;
 
@@ -67,7 +66,7 @@ struct CommandHeaderDisplay {
 
 pub struct AgentLoop<'a> {
     pub config: &'a Config,
-    pub provider: Arc<dyn Provider>,
+    pub provider: Box<dyn Provider>,
     pub store: &'a Store,
     pub session_id: &'a str,
     pub request: RequestOptions,
@@ -402,12 +401,12 @@ impl<'a> AgentLoop<'a> {
                             let tool_result = if tc.function.name == "bash" {
                                 let mut ctx = ToolContext {
                                     config: self.config,
-                                    renderer: Some(self.renderer),
+                                    renderer: self.renderer,
                                     state_dir: self.state_dir,
                                 };
-                                tools::execute_bash_tool(args, &mut ctx).await
+                                bash::execute(args, &mut ctx).await
                             } else {
-                                unknown_tool_result(&tc.function.name)
+                                Err(anyhow::anyhow!("unknown tool: {}", tc.function.name))
                             };
 
                             self.persist_tool_result(
@@ -499,12 +498,7 @@ impl<'a> AgentLoop<'a> {
         let (output, artifacts, status) = match result {
             Ok(result) => {
                 if emit_renderer {
-                    self.renderer.tool_finished(
-                        Some(&call.id),
-                        &call.function.name,
-                        &result.display,
-                        elapsed,
-                    )?;
+                    self.renderer.tool_finished(result.exit_code, elapsed)?;
                 }
                 (result.output, result.artifacts, "ok")
             }
@@ -523,11 +517,6 @@ impl<'a> AgentLoop<'a> {
         };
 
         let risk = BashRisk::from_args_json(&call.function.arguments);
-        let message = Message::Tool {
-            content: output.clone(),
-            artifacts,
-            tool_call_id: call.id.clone(),
-        };
         self.store.persist_tool_result(
             self.session_id,
             ToolCallRecord {
@@ -540,12 +529,13 @@ impl<'a> AgentLoop<'a> {
                 status,
             },
             &output,
-            match &message {
-                Message::Tool { artifacts, .. } => artifacts,
-                _ => unreachable!(),
-            },
+            &artifacts,
         )?;
-        context.push(message);
+        context.push(Message::Tool {
+            content: output,
+            artifacts,
+            tool_call_id: call.id.clone(),
+        });
         Ok(())
     }
 
@@ -555,10 +545,10 @@ impl<'a> AgentLoop<'a> {
         call: &ToolCall,
         args: &Value,
     ) -> bool {
-        let Some(mode) = tools::execution_mode(&call.function.name, args) else {
+        if call.function.name != "bash" {
             return false;
-        };
-        if mode != ExecutionMode::Concurrent {
+        }
+        if bash::execution_mode(args) != ExecutionMode::Concurrent {
             return false;
         }
         !guardrail_review_required(guardrail, call, args)
@@ -1141,10 +1131,6 @@ fn guardrail_review_required(guardrail: Option<&Guardrail>, call: &ToolCall, arg
     guardrail.should_review(risk.as_str())
 }
 
-fn unknown_tool_result(name: &str) -> Result<ToolResult> {
-    Err(anyhow::anyhow!(missing_tool_message(name)))
-}
-
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
@@ -1233,7 +1219,6 @@ mod tests {
                             tool_calls: Some(vec![
                                 ToolCall {
                                     id: "call_first".into(),
-                                    call_type: "function".into(),
                                     function: crate::provider::FunctionCall {
                                         name: "bash".into(),
                                         arguments: serde_json::json!({
@@ -1247,7 +1232,6 @@ mod tests {
                                 },
                                 ToolCall {
                                     id: "call_second".into(),
-                                    call_type: "function".into(),
                                     function: crate::provider::FunctionCall {
                                         name: "bash".into(),
                                         arguments: serde_json::json!({
@@ -1385,7 +1369,6 @@ mod tests {
         });
         let first_call = ToolCall {
             id: "call_1".into(),
-            call_type: "function".into(),
             function: crate::provider::FunctionCall {
                 name: "bash".into(),
                 arguments: first_args.to_string(),
@@ -1393,7 +1376,6 @@ mod tests {
         };
         let second_call = ToolCall {
             id: "call_2".into(),
-            call_type: "function".into(),
             function: crate::provider::FunctionCall {
                 name: "bash".into(),
                 arguments: second_args.to_string(),
@@ -1689,7 +1671,6 @@ mod tests {
         });
         let call = ToolCall {
             id: "call_1".into(),
-            call_type: "function".into(),
             function: crate::provider::FunctionCall {
                 name: "bash".into(),
                 arguments: args.to_string(),
@@ -1727,7 +1708,7 @@ mod tests {
                 },
             )
             .unwrap();
-        let provider = Arc::new(RetryThenStopProvider {
+        let provider = Box::new(RetryThenStopProvider {
             step: Mutex::new(0),
         });
         let mut renderer = Renderer::with_format(OutputFormat::Plain);
@@ -1796,7 +1777,7 @@ mod tests {
                 },
             )
             .unwrap();
-        let provider = Arc::new(TwoReadonlyThenStopProvider {
+        let provider = Box::new(TwoReadonlyThenStopProvider {
             step: Mutex::new(0),
             barrier_path: tmp.join("second-started").display().to_string(),
         });
@@ -1891,7 +1872,6 @@ mod tests {
                         native_replay: None,
                         tool_calls: Some(vec![ToolCall {
                             id: "call_grow".into(),
-                            call_type: "function".into(),
                             function: crate::provider::FunctionCall {
                                 name: "bash".into(),
                                 arguments: serde_json::json!({
@@ -1987,7 +1967,7 @@ mod tests {
                 .is_none()
         );
 
-        let provider = Arc::new(GrowThenStopProvider {
+        let provider = Box::new(GrowThenStopProvider {
             turn_step: Mutex::new(0),
         });
         let mut renderer = Renderer::with_format(OutputFormat::Plain);
@@ -2056,7 +2036,6 @@ mod tests {
                         native_replay: None,
                         tool_calls: Some(vec![ToolCall {
                             id: "call_readonly".into(),
-                            call_type: "function".into(),
                             function: crate::provider::FunctionCall {
                                 name: "bash".into(),
                                 arguments: serde_json::json!({
@@ -2119,7 +2098,7 @@ mod tests {
                 },
             )
             .unwrap();
-        let provider = Arc::new(TwoCallUsageProvider {
+        let provider = Box::new(TwoCallUsageProvider {
             step: Mutex::new(0),
         });
         let mut renderer = Renderer::with_format(OutputFormat::Plain);
@@ -2205,7 +2184,7 @@ mod tests {
                 },
             )
             .unwrap();
-        let provider = Arc::new(LengthFinishProvider);
+        let provider = Box::new(LengthFinishProvider);
         let mut renderer = Renderer::with_format(OutputFormat::Plain);
         let mut agent = AgentLoop {
             config: &config,

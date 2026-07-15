@@ -12,24 +12,13 @@ use crate::renderer::Renderer;
 #[derive(Debug, Clone)]
 pub struct ToolResult {
     pub output: String,
-    pub display: ToolDisplay,
+    pub exit_code: i32,
     pub artifacts: Vec<ToolArtifact>,
-}
-
-#[derive(Debug, Clone, Default)]
-pub enum ToolDisplay {
-    #[default]
-    None,
-    Bash {
-        exit_code: i32,
-    },
 }
 
 pub struct ToolContext<'a> {
     pub config: &'a Config,
-    /// Only sequential tools may write live output. Concurrent tools return
-    /// their complete output for ordered rendering by the agent loop.
-    pub renderer: Option<&'a mut Renderer>,
+    pub renderer: &'a mut Renderer,
     pub state_dir: &'a Path,
 }
 
@@ -39,8 +28,8 @@ pub enum ExecutionMode {
     Concurrent,
 }
 
-pub fn bash_tool_definition() -> Value {
-    serde_json::json!({
+pub fn tool_definitions() -> Vec<Value> {
+    vec![serde_json::json!({
         "type": "function",
         "function": {
             "name": "bash",
@@ -48,19 +37,7 @@ pub fn bash_tool_definition() -> Value {
             "parameters": crate::bash::parameters_schema(),
             "strict": false
         }
-    })
-}
-
-pub fn tool_definitions() -> Vec<Value> {
-    vec![bash_tool_definition()]
-}
-
-pub fn execution_mode(name: &str, args: &Value) -> Option<ExecutionMode> {
-    (name == "bash").then(|| crate::bash::execution_mode(args))
-}
-
-pub async fn execute_bash_tool(args: Value, ctx: &mut ToolContext<'_>) -> Result<ToolResult> {
-    crate::bash::execute(args, ctx).await
+    })]
 }
 
 pub fn resolve_path(path: &str) -> PathBuf {
@@ -78,13 +55,8 @@ pub fn apply_truncation(
     prefix: &str,
     state_dir: &Path,
     use_tail: bool,
-) -> Result<ToolResult> {
-    let output = truncate_output(&output, limits, prefix, state_dir, use_tail)?;
-    Ok(ToolResult {
-        output,
-        display: ToolDisplay::None,
-        artifacts: Vec::new(),
-    })
+) -> Result<String> {
+    truncate_output(&output, limits, prefix, state_dir, use_tail)
 }
 
 fn truncate_output(
@@ -271,46 +243,18 @@ pub fn parse_args<T: for<'de> Deserialize<'de>>(args: &Value) -> Result<T> {
     serde_json::from_value(args.clone()).context("invalid tool arguments")
 }
 
-pub fn missing_tool_message(name: &str) -> String {
-    format!("unknown tool: {name}")
-}
-
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
-
     use serde_json::json;
 
-    use super::{execution_mode, tool_definitions, truncate_line};
-    use crate::config::{CompactionConfig, Config, LimitsConfig, OrderedMap, ProviderConfig};
-
-    fn test_config() -> Config {
-        Config {
-            providers: OrderedMap::from_iter([(
-                "test".into(),
-                ProviderConfig {
-                    endpoint: "http://localhost/chat/completions".into(),
-                    api_key_env: "MU_TEST_KEY".into(),
-                    models: OrderedMap::default(),
-                },
-            )]),
-            compaction: CompactionConfig::default(),
-            limits: LimitsConfig::default(),
-            guardrail: crate::config::GuardrailConfig::default(),
-            terminal_bell: crate::config::TerminalBellConfig::default(),
-            redaction: crate::config::RedactionConfig::default(),
-            env: HashMap::new(),
-        }
-    }
+    use super::{tool_definitions, truncate_line};
 
     #[test]
     fn tool_definitions_expose_only_bash() {
-        let _config = test_config();
         let definitions = tool_definitions();
         assert_eq!(definitions.len(), 1);
         assert_eq!(definitions[0]["function"]["name"].as_str(), Some("bash"));
         assert_eq!(definitions[0]["function"]["strict"], json!(false));
-        assert!(execution_mode("bash", &json!({"risk": "readonly"})).is_some());
     }
 
     #[test]

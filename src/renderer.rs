@@ -8,7 +8,6 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::cli::OutputFormat;
 use crate::provider::ReasoningVisibility;
-use crate::tools::ToolDisplay;
 
 const RESET: &str = "\x1b[0m";
 const BOLD: &str = "\x1b[1m";
@@ -576,21 +575,12 @@ impl Renderer {
         }
     }
 
-    pub fn tool_finished(
-        &mut self,
-        _tool_call_id: Option<&str>,
-        _tool: &str,
-        display: &ToolDisplay,
-        elapsed: Duration,
-    ) -> io::Result<()> {
+    pub fn tool_finished(&mut self, exit_code: i32, elapsed: Duration) -> io::Result<()> {
         if self.final_only {
             return Ok(());
         }
         self.finalize_bash_preview()?;
-        let text = format_tool(display, elapsed, self.styled);
-        if text.is_empty() {
-            return Ok(());
-        }
+        let text = format_tool(exit_code, elapsed, self.styled);
         self.ensure_line_start()?;
         self.write_stdout_committed(&terminal_trim_committed_text(&text))
     }
@@ -2598,23 +2588,18 @@ fn hyperlink_text(url: &str, text: &str) -> String {
     format!("{}{text}{OSC8_CLOSE}", open_hyperlink(url))
 }
 
-fn format_tool(display: &ToolDisplay, elapsed: Duration, styled: bool) -> String {
+fn format_tool(exit_code: i32, elapsed: Duration, styled: bool) -> String {
     let elapsed = format_duration(elapsed);
-    match display {
-        ToolDisplay::None => String::new(),
-        ToolDisplay::Bash { exit_code } => {
-            if styled {
-                let (color, icon) = if *exit_code == 0 {
-                    (GREEN, "✓")
-                } else {
-                    (RED, "✗")
-                };
-                format!("{color}{icon} exit {exit_code}{RESET}{DIM} · {elapsed}{RESET}\n")
-            } else {
-                let icon = if *exit_code == 0 { "✓" } else { "✗" };
-                format!("{icon} exit {exit_code} · {elapsed}\n")
-            }
-        }
+    if styled {
+        let (color, icon) = if exit_code == 0 {
+            (GREEN, "✓")
+        } else {
+            (RED, "✗")
+        };
+        format!("{color}{icon} exit {exit_code}{RESET}{DIM} · {elapsed}{RESET}\n")
+    } else {
+        let icon = if exit_code == 0 { "✓" } else { "✗" };
+        format!("{icon} exit {exit_code} · {elapsed}\n")
     }
 }
 
@@ -2787,8 +2772,7 @@ fn format_thought(
 }
 
 fn extract_reasoning_summary_title(summary: &str, finalized: bool) -> Option<String> {
-    let mut lines = summary.split_inclusive('\n');
-    while let Some(raw_line) = lines.next() {
+    for raw_line in summary.split_inclusive('\n') {
         let terminated = raw_line.ends_with('\n');
         let line = raw_line.trim();
         if line.is_empty() {
@@ -3774,14 +3758,7 @@ mod tests {
             .tool_start(Some("call_1"), "bash", &args, true)
             .unwrap();
         renderer.bash_output(Some("call_1"), "bash", "a\n").unwrap();
-        renderer
-            .tool_finished(
-                Some("call_1"),
-                "bash",
-                &ToolDisplay::Bash { exit_code: 0 },
-                Duration::from_millis(1),
-            )
-            .unwrap();
+        renderer.tool_finished(0, Duration::from_millis(1)).unwrap();
     }
 
     #[test]
@@ -4155,12 +4132,7 @@ mod tests {
             .bash_output(None, "bash", "line01\nline02\nline03\n")
             .unwrap();
         renderer
-            .tool_finished(
-                None,
-                "bash",
-                &ToolDisplay::Bash { exit_code: 0 },
-                Duration::from_millis(250),
-            )
+            .tool_finished(0, Duration::from_millis(250))
             .unwrap();
         renderer.assistant_text("Done.\n").unwrap();
         renderer.assistant_end().unwrap();

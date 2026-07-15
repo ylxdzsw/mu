@@ -1,4 +1,3 @@
-use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -83,12 +82,12 @@ pub(crate) enum SseEvent {
 
 impl HttpProvider {
     pub fn new(endpoint: String, api_key: Option<String>) -> anyhow::Result<Self> {
-        let endpoint = normalize_endpoint(&endpoint)?;
+        let mut url = reqwest::Url::parse(&endpoint)?;
+        let path = url.path().trim_end_matches('/').to_string();
+        url.set_path(&path);
+        let endpoint = url.to_string();
         let api = classify_endpoint(&endpoint)?;
-        let client = Client::builder()
-            .connect_timeout(CONNECT_TIMEOUT)
-            .build()
-            .unwrap_or_else(|_| Client::new());
+        let client = Client::builder().connect_timeout(CONNECT_TIMEOUT).build()?;
         Ok(Self {
             client,
             endpoint,
@@ -168,13 +167,6 @@ impl HttpProvider {
         }
         Ok(())
     }
-}
-
-fn normalize_endpoint(endpoint: &str) -> anyhow::Result<String> {
-    let mut url = reqwest::Url::parse(endpoint)?;
-    let path = url.path().trim_end_matches('/').to_string();
-    url.set_path(&path);
-    Ok(url.to_string())
 }
 
 fn consume_sse_events(
@@ -290,8 +282,6 @@ pub struct ToolArtifact {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolCall {
     pub id: String,
-    #[serde(rename = "type")]
-    pub call_type: String,
     pub function: FunctionCall,
 }
 
@@ -427,10 +417,13 @@ pub fn approx_tokens(s: &str) -> u64 {
     (s.len() as u64).div_ceil(4)
 }
 
-pub fn build_provider(config: &Config, provider_id: &str) -> anyhow::Result<Arc<dyn Provider>> {
+pub fn build_provider(config: &Config, provider_id: &str) -> anyhow::Result<Box<dyn Provider>> {
     let provider = config.provider(provider_id)?;
     let api_key = config.api_key_for_provider(provider_id)?;
-    Ok(Arc::new(HttpProvider::new(provider.endpoint.clone(), api_key)?) as Arc<dyn Provider>)
+    Ok(Box::new(HttpProvider::new(
+        provider.endpoint.clone(),
+        api_key,
+    )?))
 }
 
 pub(crate) fn classify_http_error(status: u16, body: String) -> ProviderError {

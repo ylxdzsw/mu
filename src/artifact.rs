@@ -65,8 +65,7 @@ pub fn read_artifacts(mut reader: impl Read) -> Result<Vec<ToolArtifact>> {
         let mut header_len = [0u8; 4];
         match reader.read(&mut header_len[..1]) {
             Ok(0) => break,
-            Ok(1) => reader.read_exact(&mut header_len[1..])?,
-            Ok(_) => unreachable!(),
+            Ok(_) => reader.read_exact(&mut header_len[1..])?,
             Err(error) if error.kind() == ErrorKind::Interrupted => continue,
             Err(error) => return Err(error.into()),
         }

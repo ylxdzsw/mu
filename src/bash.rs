@@ -24,8 +24,7 @@ use crate::redaction::SecretRedactor;
 use crate::renderer::Renderer;
 
 use crate::tools::{
-    BashArgs, ExecutionMode, ToolContext, ToolDisplay, ToolResult, apply_truncation, parse_args,
-    resolve_path,
+    BashArgs, ExecutionMode, ToolContext, ToolResult, apply_truncation, parse_args, resolve_path,
 };
 
 const DEFAULT_TIMEOUT_SECS: u64 = 120;
@@ -95,16 +94,12 @@ pub async fn execute(args: Value, ctx: &mut ToolContext<'_>) -> Result<ToolResul
         bail!("timeout must be greater than 0");
     }
 
-    let renderer = ctx
-        .renderer
-        .as_deref_mut()
-        .ok_or_else(|| anyhow::anyhow!("bash requires sequential execution"))?;
     let redactor = SecretRedactor::from_config(ctx.config);
     for warning in redactor.warnings() {
-        renderer.notice(&format!("[redaction] {warning}"))?;
+        ctx.renderer.notice(&format!("[redaction] {warning}"))?;
     }
 
-    let result = run_bash(args, timeout, renderer, &ctx.config.env, redactor)?;
+    let result = run_bash(args, timeout, ctx.renderer, &ctx.config.env, redactor)?;
     let exit_code = result.exit_code;
     let artifacts = result.artifacts;
 
@@ -114,10 +109,11 @@ pub async fn execute(args: Value, ctx: &mut ToolContext<'_>) -> Result<ToolResul
         result.output
     };
     let full = format!("{}\n[exit code: {}]", output, exit_code);
-    let mut result = apply_truncation(full, &ctx.config.limits, "bash", ctx.state_dir, true)?;
-    result.display = ToolDisplay::Bash { exit_code };
-    result.artifacts = artifacts;
-    Ok(result)
+    Ok(ToolResult {
+        output: apply_truncation(full, &ctx.config.limits, "bash", ctx.state_dir, true)?,
+        exit_code,
+        artifacts,
+    })
 }
 
 #[derive(Debug)]
@@ -275,10 +271,11 @@ fn execute_bash_task(
         result.output
     };
     let full = format!("{output}\n[exit code: {exit_code}]");
-    let mut result = apply_truncation(full, &config.limits, "bash", state_dir, true)?;
-    result.display = ToolDisplay::Bash { exit_code };
-    result.artifacts = artifacts;
-    Ok(result)
+    Ok(ToolResult {
+        output: apply_truncation(full, &config.limits, "bash", state_dir, true)?,
+        exit_code,
+        artifacts,
+    })
 }
 
 fn run_bash_inner(
@@ -832,7 +829,7 @@ PY"#;
         );
         let mut ctx = ToolContext {
             config: &config,
-            renderer: Some(&mut renderer),
+            renderer: &mut renderer,
             state_dir: &tmp,
         };
         let args = serde_json::json!({

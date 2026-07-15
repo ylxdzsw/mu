@@ -2,7 +2,6 @@ use std::fmt;
 use std::io::{self, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process;
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
@@ -89,7 +88,7 @@ struct LoadedPrompt {
 
 struct RunTurnArgs<'a> {
     config: &'a Config,
-    provider: Arc<dyn Provider>,
+    provider: Box<dyn Provider>,
     store: &'a store::Store,
     session_id: &'a str,
     request: &'a RequestOptions,
