@@ -599,7 +599,7 @@ interactive_ready=$tmpdir/interactive-ready
 
 send_interactive_setup() {
   rm -f -- "$interactive_ready"
-  print -r -- "$1; : > ${(q)interactive_ready}"
+  print -rn -- "$1; : > ${(q)interactive_ready}"$'\r'
   local attempt
   for attempt in {1..100}; do
     [[ -e "$interactive_ready" ]] && return 0
