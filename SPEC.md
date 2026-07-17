@@ -366,9 +366,13 @@ dispatches these applets:
 
 - **`apply_patch`** accepts one patch argument or reads it from stdin. Its
   `*** Begin Patch` / `*** End Patch` format supports add, update, move, and
-  delete operations with context hunks. It preflights the whole patch, rejects
-  absolute paths, symlinks, conflicting operations, and existing add/move
-  destinations, then applies validated file changes.
+  delete operations with context hunks. Relative paths resolve from the shell
+  call's working directory; absolute paths are used as written. It preflights
+  the whole patch, rejects conflicting operations and existing add/move
+  destinations, then applies validated file changes. Updating through a
+  symlink edits its regular-file target while preserving the link; deleting a
+  symlink removes only the link; moving a symlink renames the link. Dangling
+  links can therefore be deleted or moved but cannot be updated.
 - **`view_image [--detail auto|low|high|original] PATH`** loads a validated PNG,
   JPEG, WebP, or GIF through the same attachment loader and 20 MiB limit used by
   `mu -a`. `--detail` is optional and defaults to `auto`. The command writes a

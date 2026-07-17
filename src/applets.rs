@@ -71,6 +71,7 @@ mod apply_patch {
         },
         Update {
             path: PathBuf,
+            reported_path: PathBuf,
             content: String,
             permissions: fs::Permissions,
         },
@@ -80,6 +81,11 @@ mod apply_patch {
             content: String,
             permissions: fs::Permissions,
         },
+        MoveSymlink {
+            from: PathBuf,
+            to: PathBuf,
+            target_update: Option<(PathBuf, String, fs::Permissions)>,
+        },
     }
 
     pub fn main() -> i32 {
@@ -87,7 +93,7 @@ mod apply_patch {
             && std::env::args_os().nth(2).is_none()
         {
             println!(
-                "Usage: apply_patch 'PATCH'\n       apply_patch < patch.txt\n\nApply a Mu/Codex-style *** Begin Patch envelope relative to the current directory."
+                "Usage: apply_patch 'PATCH'\n       apply_patch < patch.txt\n\nApply a Mu/Codex-style *** Begin Patch envelope. Relative paths resolve from the current directory; absolute paths are used as written."
             );
             return 0;
         }
@@ -253,10 +259,15 @@ mod apply_patch {
         if path.as_os_str().is_empty() {
             bail!("patch path cannot be empty");
         }
-        if path.is_absolute() {
-            bail!("patch paths must be relative: {}", path.display());
-        }
         Ok(path)
+    }
+
+    fn resolve_path(cwd: &Path, path: &Path) -> PathBuf {
+        if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            cwd.join(path)
+        }
     }
 
     fn preflight(cwd: &Path, operations: Vec<Operation>) -> Result<Vec<PlannedChange>> {
@@ -265,10 +276,13 @@ mod apply_patch {
         for operation in operations {
             match operation {
                 Operation::Add { path, content } => {
-                    claim_path(&mut touched, &path)?;
-                    let full = cwd.join(&path);
+                    let full = resolve_path(cwd, &path);
+                    claim_path(&mut touched, &full, &path)?;
                     if fs::symlink_metadata(&full).is_ok() {
-                        bail!("add destination already exists: {}", path.display());
+                        bail!(
+                            "add destination already exists: {}; inspect it first, then use bash to move or remove the existing file if necessary before retrying apply_patch",
+                            path.display()
+                        );
                     }
                     changes.push(PlannedChange::Add {
                         path: full,
@@ -276,9 +290,9 @@ mod apply_patch {
                     });
                 }
                 Operation::Delete { path } => {
-                    claim_path(&mut touched, &path)?;
-                    let full = cwd.join(&path);
-                    regular_file_metadata(&full, "delete")?;
+                    let full = resolve_path(cwd, &path);
+                    claim_path(&mut touched, &full, &path)?;
+                    file_or_symlink_metadata(&full, "delete")?;
                     changes.push(PlannedChange::Delete { path: full });
                 }
                 Operation::Update {
@@ -286,12 +300,65 @@ mod apply_patch {
                     move_to,
                     chunks,
                 } => {
-                    claim_path(&mut touched, &path)?;
-                    if let Some(destination) = &move_to {
-                        claim_path(&mut touched, destination)?;
+                    let full = resolve_path(cwd, &path);
+                    claim_path(&mut touched, &full, &path)?;
+                    let destination_full = move_to
+                        .as_ref()
+                        .map(|destination| resolve_path(cwd, destination));
+                    if let (Some(destination), Some(destination_full)) =
+                        (&move_to, &destination_full)
+                    {
+                        claim_path(&mut touched, destination_full, destination)?;
+                        if fs::symlink_metadata(destination_full).is_ok() {
+                            bail!(
+                                "move destination already exists: {}; inspect it first, then use bash to move or remove the existing file if necessary before retrying apply_patch",
+                                destination.display()
+                            );
+                        }
                     }
-                    let full = cwd.join(&path);
-                    let metadata = regular_file_metadata(&full, "update")?;
+
+                    let entry_metadata = fs::symlink_metadata(&full).with_context(|| {
+                        format!("cannot update missing file {}", path.display())
+                    })?;
+                    if entry_metadata.file_type().is_symlink() {
+                        if chunks.is_empty() {
+                            let destination = destination_full
+                                .expect("an update without chunks must have a move destination");
+                            changes.push(PlannedChange::MoveSymlink {
+                                from: full,
+                                to: destination,
+                                target_update: None,
+                            });
+                            continue;
+                        }
+                        let target = fs::canonicalize(&full).with_context(|| {
+                            format!("resolving symlink to update {}", path.display())
+                        })?;
+                        claim_path(&mut touched, &target, &path)?;
+                        let metadata = regular_file_metadata(&target, "update symlink target")?;
+                        let original = fs::read_to_string(&target).with_context(|| {
+                            format!("reading symlink target to update {}", path.display())
+                        })?;
+                        let content = apply_chunks(&original, &path, &chunks)?;
+                        if let Some(destination) = destination_full {
+                            changes.push(PlannedChange::MoveSymlink {
+                                from: full,
+                                to: destination,
+                                target_update: Some((target, content, metadata.permissions())),
+                            });
+                        } else {
+                            changes.push(PlannedChange::Update {
+                                path: target,
+                                reported_path: full,
+                                content,
+                                permissions: metadata.permissions(),
+                            });
+                        }
+                        continue;
+                    }
+                    if !entry_metadata.is_file() {
+                        bail!("cannot update non-regular file {}", path.display());
+                    }
                     let original = fs::read_to_string(&full)
                         .with_context(|| format!("reading file to update {}", path.display()))?;
                     let content = if chunks.is_empty() {
@@ -299,22 +366,19 @@ mod apply_patch {
                     } else {
                         apply_chunks(&original, &path, &chunks)?
                     };
-                    if let Some(destination) = move_to {
-                        let destination_full = cwd.join(&destination);
-                        if fs::symlink_metadata(&destination_full).is_ok() {
-                            bail!("move destination already exists: {}", destination.display());
-                        }
+                    if let Some(destination_full) = destination_full {
                         changes.push(PlannedChange::Move {
                             from: full,
                             to: destination_full,
                             content,
-                            permissions: metadata.permissions(),
+                            permissions: entry_metadata.permissions(),
                         });
                     } else {
                         changes.push(PlannedChange::Update {
+                            reported_path: full.clone(),
                             path: full,
                             content,
-                            permissions: metadata.permissions(),
+                            permissions: entry_metadata.permissions(),
                         });
                     }
                 }
@@ -323,42 +387,50 @@ mod apply_patch {
         Ok(changes)
     }
 
-    fn claim_path(touched: &mut HashSet<PathBuf>, path: &Path) -> Result<()> {
-        if !touched.insert(normalize_relative_path(path)) {
+    fn claim_path(touched: &mut HashSet<PathBuf>, resolved: &Path, reported: &Path) -> Result<()> {
+        if !touched.insert(normalize_path(resolved)) {
             bail!(
                 "patch contains conflicting operations for {}",
-                path.display()
+                reported.display()
             );
         }
         Ok(())
     }
 
-    fn normalize_relative_path(path: &Path) -> PathBuf {
+    fn normalize_path(path: &Path) -> PathBuf {
         let mut normalized = PathBuf::new();
         for component in path.components() {
             match component {
                 Component::CurDir => {}
                 Component::Normal(part) => normalized.push(part),
                 Component::ParentDir => {
-                    if normalized.file_name() == Some(std::ffi::OsStr::new(".."))
-                        || !normalized.pop()
-                    {
+                    if normalized.file_name() == Some(std::ffi::OsStr::new("..")) {
                         normalized.push("..");
+                    } else {
+                        let _ = normalized.pop();
                     }
                 }
-                Component::RootDir | Component::Prefix(_) => {
-                    unreachable!("relative path validated")
-                }
+                Component::RootDir => normalized.push(Path::new(std::path::MAIN_SEPARATOR_STR)),
+                Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
             }
         }
         normalized
     }
 
     fn regular_file_metadata(path: &Path, action: &str) -> Result<fs::Metadata> {
+        let metadata = fs::metadata(path)
+            .with_context(|| format!("cannot {action} missing file {}", path.display()))?;
+        if !metadata.is_file() {
+            bail!("cannot {action} non-regular file {}", path.display());
+        }
+        Ok(metadata)
+    }
+
+    fn file_or_symlink_metadata(path: &Path, action: &str) -> Result<fs::Metadata> {
         let metadata = fs::symlink_metadata(path)
             .with_context(|| format!("cannot {action} missing file {}", path.display()))?;
-        if metadata.file_type().is_symlink() || !metadata.is_file() {
-            bail!("cannot {action} non-regular file {}", path.display());
+        if !metadata.is_file() && !metadata.file_type().is_symlink() {
+            bail!("cannot {action} non-file {}", path.display());
         }
         Ok(metadata)
     }
@@ -500,6 +572,7 @@ mod apply_patch {
                 }
                 PlannedChange::Update {
                     path,
+                    reported_path: _,
                     content,
                     permissions,
                 } => atomic_write(path, content, Some(permissions.clone()), true),
@@ -511,6 +584,37 @@ mod apply_patch {
                 } => atomic_write(to, content, Some(permissions.clone()), false).and_then(|()| {
                     fs::remove_file(from).with_context(|| format!("removing {}", from.display()))
                 }),
+                PlannedChange::MoveSymlink {
+                    from,
+                    to,
+                    target_update,
+                } => (|| -> Result<()> {
+                    let parent = to.parent().unwrap_or_else(|| Path::new("."));
+                    fs::create_dir_all(parent).with_context(|| {
+                        format!("creating parent directory {}", parent.display())
+                    })?;
+                    fs::rename(from, to).with_context(|| {
+                        format!("moving symlink {} to {}", from.display(), to.display())
+                    })?;
+                    if let Some((target, content, permissions)) = target_update
+                        && let Err(error) =
+                            atomic_write(target, content, Some(permissions.clone()), true)
+                    {
+                        return match fs::rename(to, from) {
+                            Ok(()) => Err(error.context(format!(
+                                "updating symlink target after moving {}; move rolled back",
+                                target.display()
+                            ))),
+                            Err(rollback_error) => Err(error.context(format!(
+                                "updating symlink target after moving {}; also failed to roll back {} to {}: {rollback_error}",
+                                target.display(),
+                                to.display(),
+                                from.display()
+                            ))),
+                        };
+                    }
+                    Ok(())
+                })(),
             };
             if let Err(error) = result {
                 let completed = if completed.is_empty() {
@@ -581,8 +685,13 @@ mod apply_patch {
         match change {
             PlannedChange::Add { path, .. } => format!("A {}", relative(path)),
             PlannedChange::Delete { path } => format!("D {}", relative(path)),
-            PlannedChange::Update { path, .. } => format!("M {}", relative(path)),
+            PlannedChange::Update { reported_path, .. } => {
+                format!("M {}", relative(reported_path))
+            }
             PlannedChange::Move { from, to, .. } => {
+                format!("R {} -> {}", relative(from), relative(to))
+            }
+            PlannedChange::MoveSymlink { from, to, .. } => {
                 format!("R {} -> {}", relative(from), relative(to))
             }
         }
@@ -592,8 +701,13 @@ mod apply_patch {
         match change {
             PlannedChange::Add { path, .. } => format!("A {}", path.display()),
             PlannedChange::Delete { path } => format!("D {}", path.display()),
-            PlannedChange::Update { path, .. } => format!("M {}", path.display()),
+            PlannedChange::Update { reported_path, .. } => {
+                format!("M {}", reported_path.display())
+            }
             PlannedChange::Move { from, to, .. } => {
+                format!("R {} -> {}", from.display(), to.display())
+            }
+            PlannedChange::MoveSymlink { from, to, .. } => {
                 format!("R {} -> {}", from.display(), to.display())
             }
         }
@@ -637,11 +751,31 @@ mod apply_patch {
             fs::write(dir.join("one.txt"), "old\n").unwrap();
             fs::write(dir.join("exists.txt"), "keep\n").unwrap();
             let patch = "*** Begin Patch\n*** Update File: one.txt\n@@\n-old\n+new\n*** Add File: exists.txt\n+replace\n*** End Patch\n";
-            assert!(preflight(&dir, parse_patch(patch).unwrap()).is_err());
+            let error = preflight(&dir, parse_patch(patch).unwrap()).unwrap_err();
+            assert!(error.to_string().contains("inspect it first"));
+            assert!(error.to_string().contains("use bash to move or remove"));
             assert_eq!(fs::read_to_string(dir.join("one.txt")).unwrap(), "old\n");
             assert_eq!(
                 fs::read_to_string(dir.join("exists.txt")).unwrap(),
                 "keep\n"
+            );
+            fs::remove_dir_all(dir).unwrap();
+        }
+
+        #[test]
+        fn existing_move_destination_error_is_actionable() {
+            let dir = temp_dir();
+            fs::write(dir.join("source.txt"), "source\n").unwrap();
+            fs::write(dir.join("destination.txt"), "destination\n").unwrap();
+            let patch = "*** Begin Patch\n*** Update File: source.txt\n*** Move to: destination.txt\n*** End Patch\n";
+            let error = preflight(&dir, parse_patch(patch).unwrap()).unwrap_err();
+            let message = error.to_string();
+            assert!(message.contains("move destination already exists"));
+            assert!(message.contains("inspect it first"));
+            assert!(message.contains("use bash to move or remove"));
+            assert_eq!(
+                fs::read_to_string(dir.join("destination.txt")).unwrap(),
+                "destination\n"
             );
             fs::remove_dir_all(dir).unwrap();
         }
@@ -666,11 +800,17 @@ mod apply_patch {
         }
 
         #[test]
-        fn rejects_absolute_paths() {
-            let error =
-                parse_patch("*** Begin Patch\n*** Add File: /tmp/nope\n+x\n*** End Patch\n")
-                    .unwrap_err();
-            assert!(error.to_string().contains("must be relative"));
+        fn accepts_absolute_paths() {
+            let dir = temp_dir();
+            let path = dir.join("absolute.txt");
+            let patch = format!(
+                "*** Begin Patch\n*** Add File: {}\n+absolute\n*** End Patch\n",
+                path.display()
+            );
+            let changes = preflight(&dir, parse_patch(&patch).unwrap()).unwrap();
+            commit(&changes).unwrap();
+            assert_eq!(fs::read_to_string(&path).unwrap(), "absolute\n");
+            fs::remove_dir_all(dir).unwrap();
         }
 
         #[test]
@@ -679,6 +819,132 @@ mod apply_patch {
             let patch = "*** Begin Patch\n*** Add File: sub/../same.txt\n+one\n*** Add File: same.txt\n+two\n*** End Patch\n";
             let error = preflight(&dir, parse_patch(patch).unwrap()).unwrap_err();
             assert!(error.to_string().contains("conflicting operations"));
+            fs::remove_dir_all(dir).unwrap();
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn update_through_symlink_preserves_link_and_updates_target() {
+            use std::os::unix::fs::symlink;
+
+            let dir = temp_dir();
+            fs::write(dir.join("target.txt"), "old\n").unwrap();
+            symlink("target.txt", dir.join("link.txt")).unwrap();
+            let patch =
+                "*** Begin Patch\n*** Update File: link.txt\n@@\n-old\n+new\n*** End Patch\n";
+            let changes = preflight(&dir, parse_patch(patch).unwrap()).unwrap();
+            commit(&changes).unwrap();
+            assert!(
+                fs::symlink_metadata(dir.join("link.txt"))
+                    .unwrap()
+                    .file_type()
+                    .is_symlink()
+            );
+            assert_eq!(fs::read_to_string(dir.join("target.txt")).unwrap(), "new\n");
+            fs::remove_dir_all(dir).unwrap();
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn delete_symlink_removes_only_the_link() {
+            use std::os::unix::fs::symlink;
+
+            let dir = temp_dir();
+            fs::write(dir.join("target.txt"), "keep\n").unwrap();
+            symlink("target.txt", dir.join("link.txt")).unwrap();
+            let patch = "*** Begin Patch\n*** Delete File: link.txt\n*** End Patch\n";
+            let changes = preflight(&dir, parse_patch(patch).unwrap()).unwrap();
+            commit(&changes).unwrap();
+            assert!(fs::symlink_metadata(dir.join("link.txt")).is_err());
+            assert_eq!(
+                fs::read_to_string(dir.join("target.txt")).unwrap(),
+                "keep\n"
+            );
+            fs::remove_dir_all(dir).unwrap();
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn pure_move_renames_symlink_without_touching_target() {
+            use std::os::unix::fs::symlink;
+
+            let dir = temp_dir();
+            fs::write(dir.join("target.txt"), "keep\n").unwrap();
+            symlink("target.txt", dir.join("link.txt")).unwrap();
+            let patch = "*** Begin Patch\n*** Update File: link.txt\n*** Move to: moved.txt\n*** End Patch\n";
+            let changes = preflight(&dir, parse_patch(patch).unwrap()).unwrap();
+            commit(&changes).unwrap();
+            assert!(fs::symlink_metadata(dir.join("link.txt")).is_err());
+            assert!(
+                fs::symlink_metadata(dir.join("moved.txt"))
+                    .unwrap()
+                    .file_type()
+                    .is_symlink()
+            );
+            assert_eq!(
+                fs::read_to_string(dir.join("target.txt")).unwrap(),
+                "keep\n"
+            );
+            fs::remove_dir_all(dir).unwrap();
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn move_with_update_edits_target_and_renames_symlink() {
+            use std::os::unix::fs::symlink;
+
+            let dir = temp_dir();
+            fs::write(dir.join("target.txt"), "old\n").unwrap();
+            symlink("target.txt", dir.join("link.txt")).unwrap();
+            let patch = "*** Begin Patch\n*** Update File: link.txt\n*** Move to: moved.txt\n@@\n-old\n+new\n*** End Patch\n";
+            let changes = preflight(&dir, parse_patch(patch).unwrap()).unwrap();
+            commit(&changes).unwrap();
+            assert!(fs::symlink_metadata(dir.join("link.txt")).is_err());
+            assert!(
+                fs::symlink_metadata(dir.join("moved.txt"))
+                    .unwrap()
+                    .file_type()
+                    .is_symlink()
+            );
+            assert_eq!(fs::read_to_string(dir.join("target.txt")).unwrap(), "new\n");
+            fs::remove_dir_all(dir).unwrap();
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn failed_symlink_move_does_not_update_target() {
+            use std::os::unix::fs::symlink;
+
+            let dir = temp_dir();
+            fs::write(dir.join("target.txt"), "old\n").unwrap();
+            fs::write(dir.join("not-a-directory"), "blocking file\n").unwrap();
+            symlink("target.txt", dir.join("link.txt")).unwrap();
+            let patch = "*** Begin Patch\n*** Update File: link.txt\n*** Move to: not-a-directory/moved.txt\n@@\n-old\n+new\n*** End Patch\n";
+            let changes = preflight(&dir, parse_patch(patch).unwrap()).unwrap();
+            commit(&changes).unwrap_err();
+            assert!(
+                fs::symlink_metadata(dir.join("link.txt"))
+                    .unwrap()
+                    .file_type()
+                    .is_symlink()
+            );
+            assert_eq!(fs::read_to_string(dir.join("target.txt")).unwrap(), "old\n");
+            fs::remove_dir_all(dir).unwrap();
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn rejects_updates_through_two_symlinks_to_the_same_target() {
+            use std::os::unix::fs::symlink;
+
+            let dir = temp_dir();
+            fs::write(dir.join("target.txt"), "old\n").unwrap();
+            symlink("target.txt", dir.join("one.txt")).unwrap();
+            symlink("target.txt", dir.join("two.txt")).unwrap();
+            let patch = "*** Begin Patch\n*** Update File: one.txt\n@@\n-old\n+one\n*** Update File: two.txt\n@@\n-old\n+two\n*** End Patch\n";
+            let error = preflight(&dir, parse_patch(patch).unwrap()).unwrap_err();
+            assert!(error.to_string().contains("conflicting operations"));
+            assert_eq!(fs::read_to_string(dir.join("target.txt")).unwrap(), "old\n");
             fs::remove_dir_all(dir).unwrap();
         }
     }
