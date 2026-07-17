@@ -535,6 +535,11 @@ builtin cd "$saved_pwd"
 MU_ZSH_BIN=$prompt_fake_bin/mu
 rm -f "$MU_ZSH_SCOPE_LOG" "$MU_ZSH_SESSION_FILE"
 
+if [[ ${MU_ZSH_SKIP_PTY:-0} == 1 ]]; then
+  print -- ok
+  exit 0
+fi
+
 for dependency in script timeout perl col cmp jq; do
   command -v "$dependency" >/dev/null || fail "missing test dependency: $dependency"
 done

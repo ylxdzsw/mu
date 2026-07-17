@@ -38,7 +38,7 @@ jobs:
       - name: Test zsh integration
         run: |
           zsh -n mu.zsh test.zsh
-          zsh test.zsh
+          MU_ZSH_SKIP_PTY=1 zsh test.zsh
 
       - name: Check package recipe
         run: bash -n PKGBUILD
