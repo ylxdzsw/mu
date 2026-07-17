@@ -990,11 +990,13 @@ The assembled prompt has this fixed order:
 2. A `<runtime>` block of host-stable facts only, as plain `key: value` lines:
    ```
    <runtime>
-   os: linux
+   os: linux (Ubuntu 24.04.2 LTS)
    date: 2026-06-18
    user: alice (uid 1000)
    </runtime>
    ```
+   On Linux, Mu appends the distribution's `PRETTY_NAME` from the standard
+   `os-release` file when available, falling back to `NAME`, then `ID`.
    Per-session environment — current working directory, project root, session
    id, and git worktree details — is **not** part of the system prompt. It is
    introduced once as the first user message when the session is created, and a

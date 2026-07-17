@@ -30,7 +30,7 @@ pub fn assemble_prompt(
 ) -> String {
     let mut parts = vec![role_preamble().to_string()];
 
-    let os = std::env::consts::OS;
+    let os = os_description();
     let date = Local::now().format("%Y-%m-%d").to_string();
     let user = std::env::var("USER").unwrap_or_else(|_| "unknown".to_string());
     let uid = unsafe { libc::geteuid() };
@@ -54,6 +54,52 @@ pub fn assemble_prompt(
     }
 
     parts.join("\n\n")
+}
+
+fn os_description() -> String {
+    let os = std::env::consts::OS;
+    if os != "linux" {
+        return os.to_string();
+    }
+
+    ["/etc/os-release", "/usr/lib/os-release"]
+        .into_iter()
+        .find_map(|path| {
+            std::fs::read_to_string(path)
+                .ok()
+                .and_then(|contents| linux_distribution(&contents))
+        })
+        .map_or_else(
+            || os.to_string(),
+            |distribution| format!("{os} ({distribution})"),
+        )
+}
+
+fn linux_distribution(os_release: &str) -> Option<String> {
+    ["PRETTY_NAME", "NAME", "ID"]
+        .into_iter()
+        .find_map(|key| os_release_value(os_release, key))
+}
+
+fn os_release_value(os_release: &str, key: &str) -> Option<String> {
+    os_release.lines().find_map(|line| {
+        let (candidate, value) = line.split_once('=')?;
+        if candidate != key {
+            return None;
+        }
+
+        let value = value.trim();
+        let value = value
+            .strip_prefix('"')
+            .and_then(|value| value.strip_suffix('"'))
+            .or_else(|| {
+                value
+                    .strip_prefix('\'')
+                    .and_then(|value| value.strip_suffix('\''))
+            })
+            .unwrap_or(value);
+        (!value.is_empty()).then(|| value.replace("\\\"", "\"").replace("\\\\", "\\"))
+    })
 }
 
 pub fn initial_environment_context(cwd: &Path, project: Option<&Project>) -> String {
@@ -86,7 +132,10 @@ pub fn cwd_changed_context(cwd: &Path) -> String {
 mod tests {
     use std::path::{Path, PathBuf};
 
-    use super::{assemble_prompt, cwd_changed_context, initial_environment_context, role_preamble};
+    use super::{
+        assemble_prompt, cwd_changed_context, initial_environment_context, linux_distribution,
+        role_preamble,
+    };
     use crate::paths::{Project, ProjectMarker};
 
     #[test]
@@ -96,6 +145,19 @@ mod tests {
         assert!(prompt.contains("Exactly one tool is available: `bash`"));
         assert!(prompt.contains("\nuser: "));
         assert!(prompt.contains(" (uid "));
+    }
+
+    #[test]
+    fn linux_distribution_prefers_pretty_name_with_fallbacks() {
+        assert_eq!(
+            linux_distribution("NAME=Ubuntu\nPRETTY_NAME=\"Ubuntu 24.04.2 LTS\"\nID=ubuntu"),
+            Some("Ubuntu 24.04.2 LTS".into())
+        );
+        assert_eq!(
+            linux_distribution("NAME='Alpine Linux'\nID=alpine"),
+            Some("Alpine Linux".into())
+        );
+        assert_eq!(linux_distribution("ID=arch"), Some("arch".into()));
     }
 
     #[test]
