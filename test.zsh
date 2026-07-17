@@ -595,13 +595,24 @@ EOF
 chmod +x "$interactive_fake_bin/mu"
 
 interactive_setup="PS1='> '; PATH=${(q)interactive_fake_bin}:\$PATH; export TEST_CAPTURE_ARGS=${(q)interactive_capture_args} TEST_CAPTURE_STDIN=${(q)interactive_capture_stdin} TEST_CAPTURE_CALLS=${(q)interactive_capture_calls}; autoload -Uz compinit; compinit -D; source ${(q)root}/mu.zsh"
+interactive_ready=$tmpdir/interactive-ready
+
+send_interactive_setup() {
+  rm -f -- "$interactive_ready"
+  print -r -- "$1; : > ${(q)interactive_ready}"
+  local attempt
+  for attempt in {1..100}; do
+    [[ -e "$interactive_ready" ]] && return 0
+    sleep 0.05
+  done
+  fail "interactive shell did not finish setup"
+}
 
 interactive_transcript=$tmpdir/transcript
 rm -f -- "$interactive_capture_args" "$interactive_capture_stdin" "$interactive_capture_calls"
 interactive_status=0
 {
-  print -r -- "$interactive_setup"
-  sleep 1
+  send_interactive_setup "$interactive_setup"
   print -rn -- $'\t\r'
   sleep 0.2
   print -rn -- '   '$'\r'
@@ -613,7 +624,7 @@ interactive_status=0
   print -rn -- 'hello'$'\r'
   sleep 0.4
   print -rn -- $'\x04'
-} | timeout 5 script -qfec 'TERM=xterm-256color zsh -df' "$interactive_transcript" >/dev/null || interactive_status=$?
+} | timeout 10 script -qfec 'TERM=xterm-256color zsh -df' "$interactive_transcript" >/dev/null || interactive_status=$?
 # The real Ctrl-C above is delivered as SIGINT by the tty, so the interactive
 # shell's final status is 130 (128 + SIGINT); the draft cancel is verified from
 # the transcript below rather than from a bespoke interrupt widget.
@@ -656,12 +667,11 @@ no_prompt_sp_transcript=$tmpdir/no-prompt-sp-transcript
 rm -f -- "$interactive_capture_args" "$interactive_capture_stdin" "$interactive_capture_calls"
 interactive_status=0
 {
-  print -r -- "$interactive_setup; unsetopt PROMPT_SP"
-  sleep 0.2
+  send_interactive_setup "$interactive_setup; unsetopt PROMPT_SP"
   print -rn -- $'\t'"spacing probe"$'\r'
   sleep 0.4
   print -rn -- $'\x04'
-} | timeout 5 script -qfec 'TERM=xterm-256color zsh -df' "$no_prompt_sp_transcript" >/dev/null || interactive_status=$?
+} | timeout 10 script -qfec 'TERM=xterm-256color zsh -df' "$no_prompt_sp_transcript" >/dev/null || interactive_status=$?
 (( interactive_status == 0 )) || fail "PROMPT_SP-disabled transcript exited with status $interactive_status"
 raw_newline_count_between "$no_prompt_sp_transcript" 'spacing probe' '[thought '
 [[ "$REPLY" == 1 ]] || fail "PROMPT_SP-disabled handoff should advance one raw line before thinking, saw $REPLY"
@@ -670,12 +680,11 @@ shift_enter_transcript=$tmpdir/shift-enter-transcript
 rm -f -- "$interactive_capture_args" "$interactive_capture_stdin" "$interactive_capture_calls"
 interactive_status=0
 {
-  print -r -- "$interactive_setup"
-  sleep 1
+  send_interactive_setup "$interactive_setup"
   print -rn -- $'\t'"first line"$'\e[13;2u'"second line"$'\r'
   sleep 0.4
   print -rn -- $'\x04'
-} | timeout 5 script -qfec 'TERM=xterm-256color zsh -df' "$shift_enter_transcript" >/dev/null || interactive_status=$?
+} | timeout 10 script -qfec 'TERM=xterm-256color zsh -df' "$shift_enter_transcript" >/dev/null || interactive_status=$?
 (( interactive_status == 0 )) || fail "Shift+Enter transcript exited with status $interactive_status"
 [[ $(<"$interactive_capture_calls") == x ]] || fail "Shift+Enter should not submit before Enter"
 submitted_display_before_response "$shift_enter_transcript"
@@ -691,12 +700,11 @@ wrapped_prompt=${(l:120::x:)wrapped_prompt}
 rm -f -- "$interactive_capture_args" "$interactive_capture_stdin" "$interactive_capture_calls"
 interactive_status=0
 {
-  print -r -- "$interactive_setup"
-  sleep 1
+  send_interactive_setup "$interactive_setup"
   print -rn -- $'\t'"$wrapped_prompt"$'\r'
   sleep 0.4
   print -rn -- $'\x04'
-} | timeout 5 script -qfec 'TERM=xterm-256color zsh -df' "$wrapped_transcript" >/dev/null || interactive_status=$?
+} | timeout 10 script -qfec 'TERM=xterm-256color zsh -df' "$wrapped_transcript" >/dev/null || interactive_status=$?
 (( interactive_status == 0 )) || fail "wrapped prompt transcript exited with status $interactive_status"
 submitted_display_before_response "$wrapped_transcript"
 wrapped_expected_stdin=$tmpdir/wrapped-expected-stdin
@@ -708,12 +716,11 @@ custom_slash_setup="$interactive_setup; export TEST_EXTRA_COMMAND=review.md"
 rm -f -- "$interactive_capture_args" "$interactive_capture_stdin" "$interactive_capture_calls"
 interactive_status=0
 {
-  print -r -- "$custom_slash_setup"
-  sleep 1
+  send_interactive_setup "$custom_slash_setup"
   print -rn -- $'\t'"/review.md First line"$'\e[13;2u'"Second line"$'\r'
   sleep 0.4
   print -rn -- $'\x04'
-} | timeout 5 script -qfec 'TERM=xterm-256color zsh -df' "$custom_slash_transcript" >/dev/null || interactive_status=$?
+} | timeout 10 script -qfec 'TERM=xterm-256color zsh -df' "$custom_slash_transcript" >/dev/null || interactive_status=$?
 (( interactive_status == 0 )) || fail "custom slash transcript exited with status $interactive_status"
 [[ $(<"$interactive_capture_calls") == x ]] || fail "custom slash command should run once"
 custom_slash_expected_stdin=$tmpdir/custom-slash-expected-stdin
@@ -728,12 +735,11 @@ plain_setup="$interactive_setup; MU_ZSH_OUTPUT=plain"
 rm -f -- "$interactive_capture_args" "$interactive_capture_stdin" "$interactive_capture_calls"
 interactive_status=0
 {
-  print -r -- "$plain_setup"
-  sleep 1
+  send_interactive_setup "$plain_setup"
   print -rn -- $'\t'"plain prompt"$'\r'
   sleep 0.4
   print -rn -- $'\x04'
-} | timeout 5 script -qfec 'TERM=xterm-256color zsh -df' "$plain_transcript" >/dev/null || interactive_status=$?
+} | timeout 10 script -qfec 'TERM=xterm-256color zsh -df' "$plain_transcript" >/dev/null || interactive_status=$?
 (( interactive_status == 0 )) || fail "plain transcript exited with status $interactive_status"
 
 normalized=$(perl -pe 's/\e\[[0-?]*[ -\/]*[@-~]//g' "$plain_transcript" | col -b)
@@ -752,12 +758,11 @@ model_switch_transcript=$tmpdir/model-switch-transcript
 rm -f -- "$interactive_capture_args" "$interactive_capture_stdin" "$interactive_capture_calls"
 interactive_status=0
 {
-  print -r -- "$interactive_setup"
-  sleep 1
+  send_interactive_setup "$interactive_setup"
   print -rn -- $'\t'"/model gpt"$'\r'
   sleep 0.4
   print -rn -- $'\x04'
-} | timeout 5 script -qfec 'TERM=xterm-256color zsh -df' "$model_switch_transcript" >/dev/null || interactive_status=$?
+} | timeout 10 script -qfec 'TERM=xterm-256color zsh -df' "$model_switch_transcript" >/dev/null || interactive_status=$?
 (( interactive_status == 0 )) || fail "model switch transcript exited with status $interactive_status"
 
 normalized=$(perl -pe 's/\e\[[0-?]*[ -\/]*[@-~]//g' "$model_switch_transcript" | col -b)
@@ -773,12 +778,11 @@ rm -f -- "$interactive_capture_args" "$interactive_capture_stdin" "$interactive_
 interactive_status=0
 new_session_setup="$interactive_setup; MU_ZSH_SESSION_ID=tracked-session; MU_ZSH_SESSION_SCOPE=\$(_mu_zsh_current_scope_key); _mu_zsh_sync_state"
 {
-  print -r -- "$new_session_setup"
-  sleep 1
+  send_interactive_setup "$new_session_setup"
   print -rn -- $'\t'"/new"$'\r'
   sleep 0.4
   print -rn -- $'\x04'
-} | timeout 5 script -qfec 'TERM=xterm-256color zsh -df' "$new_session_transcript" >/dev/null || interactive_status=$?
+} | timeout 10 script -qfec 'TERM=xterm-256color zsh -df' "$new_session_transcript" >/dev/null || interactive_status=$?
 (( interactive_status == 0 )) || fail "new session transcript exited with status $interactive_status"
 
 normalized=$(perl -pe 's/\e\[[0-?]*[ -\/]*[@-~]//g' "$new_session_transcript" | col -b)
@@ -795,8 +799,7 @@ slash_listing_transcript=$tmpdir/slash-listing-transcript
 rm -f -- "$interactive_capture_args" "$interactive_capture_stdin" "$interactive_capture_calls"
 interactive_status=0
 {
-  print -r -- "$interactive_setup"
-  sleep 1
+  send_interactive_setup "$interactive_setup"
   print -rn -- $'\t/'
   sleep 0.4
   # Real Ctrl-C (SIGINT) cancels the draft and returns to an empty mu> prompt,
@@ -804,7 +807,7 @@ interactive_status=0
   print -rn -- $'\x03'
   sleep 0.3
   print -rn -- $'\x04'
-} | timeout 5 script -qfec 'TERM=xterm-256color zsh -df' "$slash_listing_transcript" >/dev/null || interactive_status=$?
+} | timeout 10 script -qfec 'TERM=xterm-256color zsh -df' "$slash_listing_transcript" >/dev/null || interactive_status=$?
 (( interactive_status == 0 || interactive_status == 130 )) || fail "slash listing transcript exited with status $interactive_status"
 
 normalized=$(perl -pe 's/\e\[[0-?]*[ -\/]*[@-~]//g' "$slash_listing_transcript" | col -b)
@@ -814,12 +817,11 @@ slash_completion_transcript=$tmpdir/slash-completion-transcript
 rm -f -- "$interactive_capture_args" "$interactive_capture_stdin" "$interactive_capture_calls"
 interactive_status=0
 {
-  print -r -- "$interactive_setup; zstyle ':completion:*' matcher-list 'm:{a-zA-Z}={A-Za-z}'"
-  sleep 0.2
+  send_interactive_setup "$interactive_setup; zstyle ':completion:*' matcher-list 'm:{a-zA-Z}={A-Za-z}'"
   print -rn -- $'\t'"/MO"$'\t\t'"gpt"$'\r'
   sleep 0.4
   print -rn -- $'\x04'
-} | timeout 5 script -qfec 'TERM=xterm-256color zsh -df' "$slash_completion_transcript" >/dev/null || interactive_status=$?
+} | timeout 10 script -qfec 'TERM=xterm-256color zsh -df' "$slash_completion_transcript" >/dev/null || interactive_status=$?
 (( interactive_status == 0 )) || fail "slash completion transcript exited with status $interactive_status"
 
 normalized=$(perl -pe 's/\e\[[0-?]*[ -\/]*[@-~]//g' "$slash_completion_transcript" | col -b)
@@ -831,12 +833,11 @@ common_prefix_setup="$interactive_setup; export TEST_EXTRA_COMMAND=model-helper.
 rm -f -- "$interactive_capture_args" "$interactive_capture_stdin" "$interactive_capture_calls"
 interactive_status=0
 {
-  print -r -- "$common_prefix_setup"
-  sleep 1
+  send_interactive_setup "$common_prefix_setup"
   print -rn -- $'\t\x14'
   sleep 0.4
   print -rn -- $'\x04'
-} | timeout 5 script -qfec 'TERM=xterm-256color zsh -df' "$common_prefix_transcript" >/dev/null || interactive_status=$?
+} | timeout 10 script -qfec 'TERM=xterm-256color zsh -df' "$common_prefix_transcript" >/dev/null || interactive_status=$?
 (( interactive_status == 0 )) || fail "common-prefix completion transcript exited with status $interactive_status"
 
 normalized=$(perl -pe 's/\e\[[0-?]*[ -\/]*[@-~]//g' "$common_prefix_transcript" | col -b)
@@ -848,12 +849,11 @@ model_effort_setup="$interactive_setup; _mu_test_model_effort_completion() { BUF
 rm -f -- "$interactive_capture_args" "$interactive_capture_stdin" "$interactive_capture_calls"
 interactive_status=0
 {
-  print -r -- "$model_effort_setup"
-  sleep 1
+  send_interactive_setup "$model_effort_setup"
   print -rn -- $'\t\x14'
   sleep 0.4
   print -rn -- $'\x04'
-} | timeout 5 script -qfec 'TERM=xterm-256color zsh -df' "$model_effort_transcript" >/dev/null || interactive_status=$?
+} | timeout 10 script -qfec 'TERM=xterm-256color zsh -df' "$model_effort_transcript" >/dev/null || interactive_status=$?
 (( interactive_status == 0 )) || fail "model effort completion transcript exited with status $interactive_status"
 
 normalized=$(perl -pe 's/\e\[[0-?]*[ -\/]*[@-~]//g' "$model_effort_transcript" | col -b)
@@ -866,12 +866,11 @@ delete_slash_setup="$interactive_setup; _mu_test_delete_slash_completion() { BUF
 rm -f -- "$interactive_capture_args" "$interactive_capture_stdin" "$interactive_capture_calls"
 interactive_status=0
 {
-  print -r -- "$delete_slash_setup"
-  sleep 1
+  send_interactive_setup "$delete_slash_setup"
   print -rn -- $'\t\x19'
   sleep 0.4
   print -rn -- $'\x04'
-} | timeout 5 script -qfec 'TERM=xterm-256color zsh -df' "$delete_slash_transcript" >/dev/null || interactive_status=$?
+} | timeout 10 script -qfec 'TERM=xterm-256color zsh -df' "$delete_slash_transcript" >/dev/null || interactive_status=$?
 (( interactive_status == 0 )) || fail "delete slash completion transcript exited with status $interactive_status"
 
 normalized=$(perl -pe 's/\e\[[0-?]*[ -\/]*[@-~]//g' "$delete_slash_transcript" | col -b)
@@ -882,12 +881,11 @@ unknown_slash_transcript=$tmpdir/unknown-slash-transcript
 rm -f -- "$interactive_capture_args" "$interactive_capture_stdin" "$interactive_capture_calls"
 interactive_status=0
 {
-  print -r -- "$interactive_setup"
-  sleep 1
+  send_interactive_setup "$interactive_setup"
   print -rn -- $'\t'"/not-a-command custom"$'\r'
   sleep 0.4
   print -rn -- $'\x04'
-} | timeout 5 script -qfec 'TERM=xterm-256color zsh -df' "$unknown_slash_transcript" >/dev/null || interactive_status=$?
+} | timeout 10 script -qfec 'TERM=xterm-256color zsh -df' "$unknown_slash_transcript" >/dev/null || interactive_status=$?
 (( interactive_status == 0 )) || fail "unknown slash transcript exited with status $interactive_status"
 
 [[ ! -e "$interactive_capture_calls" || ! -s "$interactive_capture_calls" ]] || fail "unknown slash input should not submit a prompt"
@@ -899,14 +897,13 @@ toggle_setup="$interactive_setup; _mu_test_tab_roundtrip() { BUFFER='echo toggle
 rm -f -- "$interactive_capture_args" "$interactive_capture_stdin" "$interactive_capture_calls"
 interactive_status=0
 {
-  print -r -- "$toggle_setup"
-  sleep 1
+  send_interactive_setup "$toggle_setup"
   print -rn -- $'\x14\r'
   sleep 0.2
   print -rn -- 'exit'
   sleep 0.2
   print -rn -- $'\r'
-} | timeout 5 script -qfec 'TERM=xterm-256color zsh -df' "$toggle_transcript" >/dev/null || interactive_status=$?
+} | timeout 10 script -qfec 'TERM=xterm-256color zsh -df' "$toggle_transcript" >/dev/null || interactive_status=$?
 (( interactive_status == 0 )) || fail "toggle transcript exited with status $interactive_status"
 
 normalized=$(perl -pe 's/\e\[[0-?]*[ -\/]*[@-~]//g' "$toggle_transcript" | col -b)
@@ -923,12 +920,11 @@ rm -f -- "$history_disabled_replay" "$interactive_capture_args" "$interactive_ca
 history_disabled_setup=" setopt HIST_IGNORE_SPACE; PS1='> '; PATH=${(q)interactive_fake_bin}:\$PATH; export TEST_CAPTURE_ARGS=${(q)interactive_capture_args} TEST_CAPTURE_STDIN=${(q)interactive_capture_stdin} TEST_CAPTURE_CALLS=${(q)interactive_capture_calls}; HISTFILE=${(q)history_disabled_file}; HISTSIZE=100; SAVEHIST=100; fc -R ${(q)history_disabled_file}; source ${(q)root}/mu.zsh"
 interactive_status=0
 {
-  print -r -- "$history_disabled_setup"
-  sleep 1
+  send_interactive_setup "$history_disabled_setup"
   print -rn -- $'\t'"$history_disabled_prompt"$'\e[A\e[B\r'
   sleep 0.4
   print -rn -- $'\x04'
-} | timeout 5 script -qfec 'TERM=xterm-256color zsh -df' "$history_disabled_transcript" >/dev/null || interactive_status=$?
+} | timeout 10 script -qfec 'TERM=xterm-256color zsh -df' "$history_disabled_transcript" >/dev/null || interactive_status=$?
 (( interactive_status == 0 )) || fail "history-disabled transcript exited with status $interactive_status"
 [[ ! -e "$history_disabled_replay" ]] || fail "mu-mode arrows should not execute the recalled shell history entry"
 [[ $(<"$interactive_capture_calls") == x ]] || fail "mu-mode arrows should still submit exactly one mu prompt"
