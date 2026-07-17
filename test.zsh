@@ -601,7 +601,7 @@ rm -f -- "$interactive_capture_args" "$interactive_capture_stdin" "$interactive_
 interactive_status=0
 {
   print -r -- "$interactive_setup"
-  sleep 0.2
+  sleep 1
   print -rn -- $'\t\r'
   sleep 0.2
   print -rn -- '   '$'\r'
@@ -671,7 +671,7 @@ rm -f -- "$interactive_capture_args" "$interactive_capture_stdin" "$interactive_
 interactive_status=0
 {
   print -r -- "$interactive_setup"
-  sleep 0.2
+  sleep 1
   print -rn -- $'\t'"first line"$'\e[13;2u'"second line"$'\r'
   sleep 0.4
   print -rn -- $'\x04'
@@ -692,7 +692,7 @@ rm -f -- "$interactive_capture_args" "$interactive_capture_stdin" "$interactive_
 interactive_status=0
 {
   print -r -- "$interactive_setup"
-  sleep 0.2
+  sleep 1
   print -rn -- $'\t'"$wrapped_prompt"$'\r'
   sleep 0.4
   print -rn -- $'\x04'
@@ -709,7 +709,7 @@ rm -f -- "$interactive_capture_args" "$interactive_capture_stdin" "$interactive_
 interactive_status=0
 {
   print -r -- "$custom_slash_setup"
-  sleep 0.2
+  sleep 1
   print -rn -- $'\t'"/review.md First line"$'\e[13;2u'"Second line"$'\r'
   sleep 0.4
   print -rn -- $'\x04'
@@ -729,7 +729,7 @@ rm -f -- "$interactive_capture_args" "$interactive_capture_stdin" "$interactive_
 interactive_status=0
 {
   print -r -- "$plain_setup"
-  sleep 0.2
+  sleep 1
   print -rn -- $'\t'"plain prompt"$'\r'
   sleep 0.4
   print -rn -- $'\x04'
@@ -753,7 +753,7 @@ rm -f -- "$interactive_capture_args" "$interactive_capture_stdin" "$interactive_
 interactive_status=0
 {
   print -r -- "$interactive_setup"
-  sleep 0.2
+  sleep 1
   print -rn -- $'\t'"/model gpt"$'\r'
   sleep 0.4
   print -rn -- $'\x04'
@@ -774,7 +774,7 @@ interactive_status=0
 new_session_setup="$interactive_setup; MU_ZSH_SESSION_ID=tracked-session; MU_ZSH_SESSION_SCOPE=\$(_mu_zsh_current_scope_key); _mu_zsh_sync_state"
 {
   print -r -- "$new_session_setup"
-  sleep 0.2
+  sleep 1
   print -rn -- $'\t'"/new"$'\r'
   sleep 0.4
   print -rn -- $'\x04'
@@ -796,7 +796,7 @@ rm -f -- "$interactive_capture_args" "$interactive_capture_stdin" "$interactive_
 interactive_status=0
 {
   print -r -- "$interactive_setup"
-  sleep 0.2
+  sleep 1
   print -rn -- $'\t/'
   sleep 0.4
   # Real Ctrl-C (SIGINT) cancels the draft and returns to an empty mu> prompt,
@@ -832,7 +832,7 @@ rm -f -- "$interactive_capture_args" "$interactive_capture_stdin" "$interactive_
 interactive_status=0
 {
   print -r -- "$common_prefix_setup"
-  sleep 0.2
+  sleep 1
   print -rn -- $'\t\x14'
   sleep 0.4
   print -rn -- $'\x04'
@@ -849,7 +849,7 @@ rm -f -- "$interactive_capture_args" "$interactive_capture_stdin" "$interactive_
 interactive_status=0
 {
   print -r -- "$model_effort_setup"
-  sleep 0.2
+  sleep 1
   print -rn -- $'\t\x14'
   sleep 0.4
   print -rn -- $'\x04'
@@ -867,7 +867,7 @@ rm -f -- "$interactive_capture_args" "$interactive_capture_stdin" "$interactive_
 interactive_status=0
 {
   print -r -- "$delete_slash_setup"
-  sleep 0.2
+  sleep 1
   print -rn -- $'\t\x19'
   sleep 0.4
   print -rn -- $'\x04'
@@ -883,7 +883,7 @@ rm -f -- "$interactive_capture_args" "$interactive_capture_stdin" "$interactive_
 interactive_status=0
 {
   print -r -- "$interactive_setup"
-  sleep 0.2
+  sleep 1
   print -rn -- $'\t'"/not-a-command custom"$'\r'
   sleep 0.4
   print -rn -- $'\x04'
@@ -900,7 +900,7 @@ rm -f -- "$interactive_capture_args" "$interactive_capture_stdin" "$interactive_
 interactive_status=0
 {
   print -r -- "$toggle_setup"
-  sleep 0.2
+  sleep 1
   print -rn -- $'\x14\r'
   sleep 0.2
   print -rn -- 'exit'
@@ -924,7 +924,7 @@ history_disabled_setup=" setopt HIST_IGNORE_SPACE; PS1='> '; PATH=${(q)interacti
 interactive_status=0
 {
   print -r -- "$history_disabled_setup"
-  sleep 0.2
+  sleep 1
   print -rn -- $'\t'"$history_disabled_prompt"$'\e[A\e[B\r'
   sleep 0.4
   print -rn -- $'\x04'

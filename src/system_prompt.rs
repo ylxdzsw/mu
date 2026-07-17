@@ -93,7 +93,7 @@ mod tests {
     fn role_preamble_explicitly_limits_tools() {
         let prompt = assemble_prompt(&[], Path::new("/tmp/mu-test-global"), None);
         assert!(prompt.starts_with(role_preamble()));
-        assert!(prompt.contains("Exactly one function tool is available: `bash`"));
+        assert!(prompt.contains("Exactly one tool is available: `bash`"));
         assert!(prompt.contains("\nuser: "));
         assert!(prompt.contains(" (uid "));
     }

@@ -1,0 +1,43 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes bsdextrautils zsh jq sqlite3
+
+      - name: Check formatting
+        run: cargo fmt --check
+
+      - name: Lint
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: Test
+        run: cargo test --all-features -- --test-threads=1
+
+      - name: Build binaries
+        run: cargo build --bins
+
+      - name: Test zsh integration
+        run: |
+          zsh -n mu.zsh test.zsh
+          zsh test.zsh
+
+      - name: Check package recipe
+        run: bash -n PKGBUILD

@@ -4,7 +4,7 @@ pkgrel=1
 pkgdesc='Small composable agent runtime for the terminal'
 arch=('x86_64')
 url='https://github.com/ylxdzsw/mu'
-license=('custom')
+license=('MIT')
 depends=('bash' 'jq' 'sqlite')
 makedepends=('cargo' 'git')
 source=("$pkgname::git+$url.git")
@@ -39,4 +39,5 @@ package() {
   cp -a "$srcdir/$pkgname/builtins/." "$pkgdir/usr/share/mu/"
   install -Dm644 "$srcdir/$pkgname/README.md" "$pkgdir/usr/share/doc/$pkgname/README.md"
   install -Dm644 "$srcdir/$pkgname/SPEC.md" "$pkgdir/usr/share/doc/$pkgname/SPEC.md"
+  install -Dm644 "$srcdir/$pkgname/LICENSE" "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
 }

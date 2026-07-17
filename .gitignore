@@ -1,6 +1,3 @@
 /target/
 /.mu/
 Cargo.lock
-**/*.db
-**/*.db-*
-node_modules

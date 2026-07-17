@@ -161,3 +161,7 @@ local configuration scaffold, and keep project-specific guidance in
 See [SPEC.md](SPEC.md) for the complete product contract, including exact CLI,
 configuration, discovery, rendering, persistence, provider, and zsh behavior.
 Arch Linux packaging for this checkout is in [PKGBUILD](PKGBUILD).
+
+## License
+
+`mu` is available under the [MIT License](LICENSE).

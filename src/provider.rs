@@ -1,4 +1,4 @@
-use std::time::Duration;
+use std::{fmt, time::Duration};
 
 use async_trait::async_trait;
 use clap::ValueEnum;
@@ -353,21 +353,30 @@ pub enum FinishReason {
     Other(String),
 }
 
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug)]
 pub enum ProviderError {
-    #[error("context length exceeded")]
     ContextLength,
-    #[error("HTTP 429: {message}")]
     RateLimit { message: String },
-    #[error("HTTP {status}: {body}")]
     HttpStatus { status: u16, body: String },
-    #[error("transport error: {0}")]
     Transport(String),
-    #[error("SSE parse: {0}")]
     SseParse(String),
-    #[error("{0}")]
     Other(String),
 }
+
+impl fmt::Display for ProviderError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ContextLength => formatter.write_str("context length exceeded"),
+            Self::RateLimit { message } => write!(formatter, "HTTP 429: {message}"),
+            Self::HttpStatus { status, body } => write!(formatter, "HTTP {status}: {body}"),
+            Self::Transport(message) => write!(formatter, "transport error: {message}"),
+            Self::SseParse(message) => write!(formatter, "SSE parse: {message}"),
+            Self::Other(message) => formatter.write_str(message),
+        }
+    }
+}
+
+impl std::error::Error for ProviderError {}
 
 impl ProviderError {
     pub fn retryable_for_live_turn(&self) -> bool {
