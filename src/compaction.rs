@@ -279,6 +279,7 @@ mod tests {
                     )]),
                 },
             )]),
+            output: Default::default(),
             compaction: crate::config::CompactionConfig {
                 fraction: 0.75,
                 keep_recent_turns: 2,

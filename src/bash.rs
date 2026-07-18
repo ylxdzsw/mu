@@ -682,6 +682,7 @@ mod tests {
                     models: crate::config::OrderedMap::default(),
                 },
             )]),
+            output: Default::default(),
             compaction: CompactionConfig::default(),
             limits: LimitsConfig::default(),
             guardrail: GuardrailConfig::default(),

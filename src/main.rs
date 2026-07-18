@@ -2,6 +2,7 @@ use std::fmt;
 use std::io::{self, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
@@ -44,6 +45,11 @@ use renderer::Renderer;
 use runtime::{InvocationOverrides, StatusReport, build_status_report, resolve_invocation};
 
 const MAX_SUBAGENT_TURN_DEPTH: u32 = 1;
+const OUTPUT_FINAL: u8 = 0;
+const OUTPUT_CONCISE: u8 = 1;
+const OUTPUT_DETAIL: u8 = 2;
+const OUTPUT_FULL: u8 = 3;
+static RESOLVED_OUTPUT: AtomicU8 = AtomicU8::new(OUTPUT_DETAIL);
 
 /// An error that carries a specific process exit code.
 ///
@@ -159,7 +165,29 @@ fn error_output_format() -> cli::OutputFormat {
             };
         }
     }
-    cli::OutputFormat::Detail
+    match RESOLVED_OUTPUT.load(Ordering::Relaxed) {
+        OUTPUT_FINAL => cli::OutputFormat::Final,
+        OUTPUT_CONCISE => cli::OutputFormat::Concise,
+        OUTPUT_FULL => cli::OutputFormat::Full,
+        _ => cli::OutputFormat::Detail,
+    }
+}
+
+fn set_resolved_output(format: cli::OutputFormat) {
+    let value = match format {
+        cli::OutputFormat::Final => OUTPUT_FINAL,
+        cli::OutputFormat::Concise => OUTPUT_CONCISE,
+        cli::OutputFormat::Detail => OUTPUT_DETAIL,
+        cli::OutputFormat::Full => OUTPUT_FULL,
+    };
+    RESOLVED_OUTPUT.store(value, Ordering::Relaxed);
+}
+
+fn resolve_output(
+    explicit: Option<cli::OutputFormat>,
+    config_default: cli::OutputFormat,
+) -> cli::OutputFormat {
+    explicit.unwrap_or(config_default)
 }
 
 fn write_final_stdout(text: Option<&str>) -> io::Result<()> {
@@ -455,6 +483,8 @@ async fn run() -> Result<()> {
         Some(Command::Retry(retry_args)) => {
             ensure_subagent_turn_allowed(bash::subagent_depth_from_env())?;
             let config = Config::load_for_scope(project_config_dir.as_deref())?;
+            let output = resolve_output(retry_args.output, config.output);
+            set_resolved_output(output);
 
             paths::ensure_project_layout(&scope)?;
             let state_dir = scope.state_dir();
@@ -465,11 +495,11 @@ async fn run() -> Result<()> {
             let store = store::Store::open(&db_path)?;
             let session = resolve_retry_session(&store, &retry_args)?
                 .ok_or_else(|| anyhow::anyhow!("no sessions found in active scope"))?;
-            let _lock = acquire_session_lock_or_exit(&store, &session.id, retry_args.output)?;
+            let _lock = acquire_session_lock_or_exit(&store, &session.id, output)?;
 
             // Nothing to resume on a session whose last turn already finished.
             if store.is_session_clean(&session.id)? {
-                if retry_args.output != cli::OutputFormat::Final {
+                if output != cli::OutputFormat::Final {
                     println!("session is already complete; nothing to retry");
                 }
                 return Ok(());
@@ -499,7 +529,7 @@ async fn run() -> Result<()> {
                 request: &request,
                 model_context_window: model_info.context_window,
                 title: None,
-                output: retry_args.output,
+                output,
                 state_dir: &state_dir,
                 preamble_notice: Some("[mu] resuming interrupted turn"),
             })
@@ -539,12 +569,17 @@ async fn run() -> Result<()> {
     }
 
     ensure_subagent_turn_allowed(bash::subagent_depth_from_env())?;
+    let config = Config::load_for_scope(project_config_dir.as_deref())?;
+    let output = resolve_output(default_turn.output, config.output);
+    set_resolved_output(output);
     let prompt_source = resolve_prompt_source(prompt_file, &scope)?;
     run_turn_from_source(
         &cwd,
         &scope,
         project_config_dir.as_deref(),
+        &config,
         default_turn,
+        output,
         prompt_source,
     )
     .await
@@ -554,14 +589,14 @@ async fn run_turn_from_source(
     cwd: &Path,
     scope: &paths::Scope,
     project_config_dir: Option<&Path>,
+    config: &Config,
     turn: cli::TurnArgs,
+    output: cli::OutputFormat,
     prompt_source: PromptSource,
 ) -> Result<()> {
     let loaded_prompt = load_prompt(prompt_source)?;
     let prompt = loaded_prompt.text;
     let attachments = load_attachments(&turn.attachments)?;
-
-    let config = Config::load_for_scope(project_config_dir)?;
 
     paths::ensure_project_layout(scope)?;
     let state_dir = scope.state_dir();
@@ -572,15 +607,15 @@ async fn run_turn_from_source(
     let store = store::Store::open(&db_path)?;
     let resolved = resolve_invocation(
         &store,
-        &config,
+        config,
         &InvocationOverrides {
             session: turn.selection.session.clone(),
             continue_latest: turn.selection.continue_latest,
             model: model_override(turn.selection.model.clone(), loaded_prompt.model),
         },
     )?;
-    let model_info = models::resolve_model_info(&config, &resolved.request.model);
-    let provider = build_provider(&config, &resolved.request.model.provider_id)?;
+    let model_info = models::resolve_model_info(config, &resolved.request.model);
+    let provider = build_provider(config, &resolved.request.model.provider_id)?;
 
     let (session, created) = if let Some(session) = resolved.attached_session.clone() {
         (session, false)
@@ -595,7 +630,7 @@ async fn run_turn_from_source(
     };
     let session_id = session.id.clone();
 
-    let _lock = acquire_session_lock_or_exit(&store, &session_id, turn.output)?;
+    let _lock = acquire_session_lock_or_exit(&store, &session_id, output)?;
 
     // If the previous turn was interrupted, normalize its tail (synthesize
     // interrupted results for any dangling tool calls) so history is valid.
@@ -627,14 +662,14 @@ async fn run_turn_from_source(
 
     let title: String = prompt.chars().take(60).collect();
     run_turn(RunTurnArgs {
-        config: &config,
+        config,
         provider,
         store: &store,
         session_id: &session_id,
         request: &resolved.request,
         model_context_window: model_info.context_window,
         title: Some(&title),
-        output: turn.output,
+        output,
         state_dir: &state_dir,
         preamble_notice: None,
     })
@@ -1037,6 +1072,18 @@ mod tests {
         assert_eq!(
             effective_retry_model_ref("opencode/deepseek-v4-flash-free", None),
             "opencode/deepseek-v4-flash-free"
+        );
+    }
+
+    #[test]
+    fn explicit_output_overrides_config_default() {
+        assert_eq!(
+            resolve_output(None, cli::OutputFormat::Concise),
+            cli::OutputFormat::Concise
+        );
+        assert_eq!(
+            resolve_output(Some(cli::OutputFormat::Full), cli::OutputFormat::Concise),
+            cli::OutputFormat::Full
         );
     }
 

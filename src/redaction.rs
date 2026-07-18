@@ -136,6 +136,7 @@ mod tests {
                     models: OrderedMap::default(),
                 },
             )]),
+            output: Default::default(),
             compaction: CompactionConfig::default(),
             limits: LimitsConfig::default(),
             guardrail: GuardrailConfig::default(),

@@ -107,13 +107,15 @@ Choose output for the caller:
 ```sh
 mu --output final prompt.md       # final assistant message only
 mu --output concise prompt.md     # assistant text plus one-line tool calls
-mu --output detail prompt.md      # normal human transcript (default)
+mu --output detail prompt.md      # normal human transcript (built-in default)
 mu --output full prompt.md        # complete reasoning and tool details
 ```
 
-`--output` controls brevity, not terminal behavior. Mu automatically enables
-live lines, color, and rich Markdown when stdout is a terminal; redirected
-output is sequential and ANSI-free.
+Set `"output": "concise"` in global or project `config.jsonc` to change the
+default. An explicit `--output` wins. Output density controls brevity, not
+terminal behavior: Mu automatically enables live lines, color, and rich
+Markdown when stdout is a terminal; redirected output is sequential and
+ANSI-free.
 
 Inspect sessions and resolved state with `mu session list`, `mu session
 transcript --session <id>`, and `mu status --json`. Run `mu --help` for the full

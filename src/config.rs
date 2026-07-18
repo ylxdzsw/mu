@@ -6,6 +6,7 @@ use anyhow::{Context, Result, bail};
 use serde::de::{MapAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize};
 
+use crate::cli::OutputFormat;
 use crate::paths;
 
 pub type EnvMap = HashMap<String, String>;
@@ -37,6 +38,8 @@ fn load_dotenv_into(path: &Path, env: &mut EnvMap) -> Result<()> {
 pub struct Config {
     #[serde(default)]
     pub providers: OrderedMap<ProviderConfig>,
+    #[serde(default)]
+    pub output: OutputFormat,
     #[serde(default)]
     pub compaction: CompactionConfig,
     #[serde(default)]
@@ -551,6 +554,7 @@ fn merge_json(base: &mut serde_json::Value, overlay: serde_json::Value) {
 }
 
 const STARTER_CONFIG: &str = r#"{
+  "output": "detail",
   "providers": {
     "openai": {
       "endpoint": "https://api.openai.com/v1/chat/completions",
@@ -645,6 +649,7 @@ mod tests {
                     models: OrderedMap::default(),
                 },
             )]),
+            output: OutputFormat::Detail,
             compaction: CompactionConfig::default(),
             limits: LimitsConfig::default(),
             guardrail: GuardrailConfig::default(),
@@ -670,7 +675,24 @@ mod tests {
             }
         });
 
-        config_from_value(value).unwrap();
+        let config = config_from_value(value).unwrap();
+        assert_eq!(config.output, OutputFormat::Detail);
+    }
+
+    #[test]
+    fn parse_accepts_configured_output() {
+        let value = serde_json::json!({
+            "output": "concise",
+            "providers": {
+                "openai": {
+                    "endpoint": "http://localhost/chat/completions",
+                    "models": {"gpt-4o": {"context_window": 128000}}
+                }
+            }
+        });
+
+        let config = config_from_value(value).unwrap();
+        assert_eq!(config.output, OutputFormat::Concise);
     }
 
     #[test]

@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 
 use clap::{Args as ClapArgs, Parser, Subcommand, ValueEnum};
+use serde::Deserialize;
 
 #[derive(Parser, Debug)]
 #[command(name = "mu", about = "Fast terminal agent harness")]
@@ -36,8 +37,9 @@ pub struct TurnArgs {
     #[arg(short = 'a', long = "attach", value_name = "FILE")]
     pub attachments: Vec<PathBuf>,
 
-    #[arg(long, value_enum, default_value_t = OutputFormat::Detail)]
-    pub output: OutputFormat,
+    /// Output density (overrides config)
+    #[arg(long, value_enum)]
+    pub output: Option<OutputFormat>,
 }
 
 #[derive(ClapArgs, Debug, Clone)]
@@ -45,14 +47,17 @@ pub struct RetryArgs {
     #[command(flatten)]
     pub selection: SelectionArgs,
 
-    #[arg(long, value_enum, default_value_t = OutputFormat::Detail)]
-    pub output: OutputFormat,
+    /// Output density (overrides config)
+    #[arg(long, value_enum)]
+    pub output: Option<OutputFormat>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, ValueEnum, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum OutputFormat {
     Final,
     Concise,
+    #[default]
     Detail,
     Full,
 }
@@ -156,7 +161,7 @@ mod tests {
         .unwrap();
         assert_eq!(args.prompt_file, Some(PathBuf::from("prompt.md")));
         assert!(args.command.is_none());
-        assert_eq!(args.turn.output, OutputFormat::Detail);
+        assert_eq!(args.turn.output, Some(OutputFormat::Detail));
         assert_eq!(args.turn.selection.model.as_deref(), Some("gpt-test"));
         assert_eq!(
             args.turn.attachments,
@@ -167,13 +172,13 @@ mod tests {
     #[test]
     fn parses_final_output_mode() {
         let args = Args::try_parse_from(["mu", "--output", "final"]).unwrap();
-        assert_eq!(args.turn.output, OutputFormat::Final);
+        assert_eq!(args.turn.output, Some(OutputFormat::Final));
     }
 
     #[test]
-    fn defaults_to_detail_output_mode() {
+    fn leaves_output_unspecified_for_config_resolution() {
         let args = Args::try_parse_from(["mu"]).unwrap();
-        assert_eq!(args.turn.output, OutputFormat::Detail);
+        assert_eq!(args.turn.output, None);
     }
 
     #[test]
@@ -185,7 +190,7 @@ mod tests {
             ("full", OutputFormat::Full),
         ] {
             let args = Args::try_parse_from(["mu", "--output", value]).unwrap();
-            assert_eq!(args.turn.output, expected);
+            assert_eq!(args.turn.output, Some(expected));
         }
         for removed in ["plain", "terminal"] {
             assert!(Args::try_parse_from(["mu", "--output", removed]).is_err());
@@ -215,7 +220,7 @@ mod tests {
     }
 
     #[test]
-    fn parses_retry_model_override() {
+    fn parses_retry_model_and_output_overrides() {
         let args = Args::try_parse_from([
             "mu",
             "retry",
@@ -234,7 +239,7 @@ mod tests {
                     retry.selection.model.as_deref(),
                     Some("opencode/mimo-v2.5-free")
                 );
-                assert_eq!(retry.output, OutputFormat::Detail);
+                assert_eq!(retry.output, Some(OutputFormat::Detail));
             }
             other => panic!("expected retry command, got {other:?}"),
         }

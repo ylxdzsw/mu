@@ -317,6 +317,7 @@ mod tests {
                     )]),
                 },
             )]),
+            output: Default::default(),
             compaction: CompactionConfig::default(),
             limits: LimitsConfig::default(),
             guardrail: GuardrailConfig::default(),

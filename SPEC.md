@@ -231,9 +231,11 @@ accepts optional non-terminal stdin as a custom focus). The surface is small:
   transcript.
 - `mu compact --session <id>` — force compaction. Terminal stdin is not read;
   non-terminal stdin is an optional verbatim custom focus instruction.
-- `mu retry [-s <id>] [-c] [--model <id>]` — resume an interrupted (unclean)
-  turn: normalize the tail and continue the agent loop with no new prompt.
-  `--model` overrides the session model for the retry. No-op on a clean session.
+- `mu retry [-s <id>] [-c] [--model <id>] [--output final|concise|detail|full]`
+  — resume an interrupted (unclean) turn: normalize the tail and continue the
+  agent loop with no new prompt. `--model` overrides the session model and
+  `--output` overrides the merged config default for the retry. No-op on a clean
+  session.
 
 The turn runner remains one completed turn per invocation. Bare `mu` reads the
 prompt from stdin; a positional name first resolves to a discovered custom
@@ -461,7 +463,8 @@ fall back to temp scripts.
 
 `mu` supports four output densities: `final`, `concise`, `detail`, and `full`.
 They are different renderings of the same agent turn and must not imply
-different agent behavior. `detail` is the default.
+different agent behavior. The effective density is an explicit `--output`, then
+the merged `config.jsonc` `output` value, then `detail`.
 The removed `plain` and `terminal` values are rejected rather than retained as
 aliases.
 
@@ -663,11 +666,12 @@ the plugin.
 ### 6.1 Invocation pattern
 
 Submitting a non-empty prompt runs `mu` as an ordinary foreground child process.
-The plugin passes `--session` after the first turn, forwards configured output
-mode, writes the prompt to the child process's stdin, waits for the turn to
-finish, and then redraws `mu>` with the same session id.
-`MU_ZSH_OUTPUT` selects the density and defaults to `detail`; it does not control
-whether the child is interactive.
+The plugin passes `--session` after the first turn, forwards an explicit shell
+output override when configured, writes the prompt to the child process's stdin,
+waits for the turn to finish, and then redraws `mu>` with the same session id.
+`MU_ZSH_OUTPUT` optionally overrides the density; when unset, the child inherits
+the active `config.jsonc` default. It does not control whether the child is
+interactive.
 After ZLE commits the submitted prompt line to scrollback, the plugin prints one
 empty line before child-process output starts, independent of whether the child
 uses `concise`, `detail`, or `full` output.
@@ -948,6 +952,7 @@ one scope are not visible in another.
 
   ```jsonc
   {
+    "output": "detail",                         // optional default density
     "providers": {
       "openai": {
         "endpoint": "https://api.openai.com/v1/responses", // required complete POST URL
@@ -974,13 +979,15 @@ one scope are not visible in another.
   ```
 
   At least one provider and one model are required; everything else has the
-  defaults shown. Provider and model order is meaningful: project config entries
-  are listed before inherited global entries, and model suggestions follow that
-  order. `supported_efforts` contains arbitrary provider-defined strings and is
-  advisory: it drives status output and shell completion but does not restrict
-  manually entered effort suffixes. If global `config.jsonc` is missing, `mu`
-  creates a starter file automatically. `mu` hard-fails on a turn if the required
-  fields are missing or the API-key env var is unset (§7).
+  defaults shown. `output` accepts `final`, `concise`, `detail`, or `full`; an
+  explicit CLI `--output` overrides it. Provider and model order is meaningful:
+  project config entries are listed before inherited global entries, and model
+  suggestions follow that order. `supported_efforts` contains arbitrary
+  provider-defined strings and is advisory: it drives status output and shell
+  completion but does not restrict manually entered effort suffixes. If global
+  `config.jsonc` is missing, `mu` creates a starter file automatically. `mu`
+  hard-fails on a turn if the required fields are missing or the API-key env var
+  is unset (§7).
 - **.env** — optional dotenv data. Values are visible to `bash`; this is
   convenience, not sandboxing. Values from provider `api_key_env` and
   `redaction.env` are exact-value redacted from bash output before the output is
@@ -1188,8 +1195,9 @@ per-call "running" marker in the database.
   new prompt and continues or redirects. No forced retry, no stuck session.
 - **`mu retry`** normalizes the tail and re-runs the loop with *no* new prompt,
   so the model continues the interrupted turn. `--model` overrides the stored
-  session model for that retry; the zsh `/retry` command forwards an active
-  `/model` selection. It refuses on a clean session ("nothing to retry").
+  session model and `--output` overrides the merged config default for that
+  retry; the zsh `/retry` command forwards active shell overrides. It refuses on
+  a clean session ("nothing to retry").
 
 ### Session concurrency lock
 

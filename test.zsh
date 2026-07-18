@@ -275,6 +275,12 @@ builtin cd "$saved_pwd"
 HOME=$saved_home
 
 MU_ZSH_BIN=mu
+MU_ZSH_OUTPUT=
+MU_ZSH_SESSION_ID=
+MU_ZSH_SESSION_SCOPE=
+_mu_zsh_base_command_reply
+assert_command_reply "inherits configured output by default" mu
+
 MU_ZSH_OUTPUT=detail
 MU_ZSH_SESSION_ID=abc123
 MU_ZSH_SESSION_SCOPE=$(_mu_zsh_current_scope_key)
@@ -599,7 +605,7 @@ printf '%s\n\n' "[mu] tokens: 12 in / 5 out  context: 25%" >&2
 EOF
 chmod +x "$interactive_fake_bin/mu"
 
-interactive_setup="PS1='> '; PATH=${(q)interactive_fake_bin}:\$PATH; export TEST_CAPTURE_ARGS=${(q)interactive_capture_args} TEST_CAPTURE_STDIN=${(q)interactive_capture_stdin} TEST_CAPTURE_CALLS=${(q)interactive_capture_calls}; autoload -Uz compinit; compinit -D; source ${(q)root}/mu.zsh"
+interactive_setup="PS1='> '; PATH=${(q)interactive_fake_bin}:\$PATH; export TEST_CAPTURE_ARGS=${(q)interactive_capture_args} TEST_CAPTURE_STDIN=${(q)interactive_capture_stdin} TEST_CAPTURE_CALLS=${(q)interactive_capture_calls}; autoload -Uz compinit; compinit -D; source ${(q)root}/mu.zsh; MU_ZSH_OUTPUT=detail"
 interactive_ready=$tmpdir/interactive-ready
 
 send_interactive_setup() {
@@ -934,8 +940,7 @@ interactive_status=0
 [[ ! -e "$history_disabled_replay" ]] || fail "mu-mode arrows should not execute the recalled shell history entry"
 [[ $(<"$interactive_capture_calls") == x ]] || fail "mu-mode arrows should still submit exactly one mu prompt"
 
-interactive_args=("${(@f)$(<"$interactive_capture_args")}")
-[[ "${(j:\0:)interactive_args}" == "${(j:\0:)expected_interactive_args}" ]] || fail "unexpected history-disabled args: ${interactive_args[*]}"
+[[ "$(<"$interactive_capture_args")" == "" ]] || fail "default zsh invocation should inherit config output: $(<"$interactive_capture_args")"
 print -rn -- "$history_disabled_prompt"$'\n' > "$interactive_expected_stdin"
 cmp -- "$interactive_expected_stdin" "$interactive_capture_stdin" || fail "mu-mode arrows should leave the draft unchanged before submit"
 

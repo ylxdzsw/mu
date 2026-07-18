@@ -16,7 +16,7 @@ typeset -g MU_ZSH_MODEL=${MU_ZSH_MODEL:-}
 typeset -g MU_ZSH_MODEL_SCOPE=${MU_ZSH_MODEL_SCOPE:-}
 typeset -g MU_ZSH_EFFECTIVE_MODEL=${MU_ZSH_EFFECTIVE_MODEL:-}
 typeset -g MU_ZSH_BIN=${MU_ZSH_BIN:-mu}
-typeset -g MU_ZSH_OUTPUT=${MU_ZSH_OUTPUT:-detail}
+typeset -g MU_ZSH_OUTPUT=${MU_ZSH_OUTPUT:-}
 typeset -g MU_ZSH_PROMPT_INPUT=${MU_ZSH_PROMPT_INPUT:-${MU_ZSH_PROMPT:-'mu> '}}
 typeset -g MU_ZSH_PROMPT=${MU_ZSH_PROMPT:-$MU_ZSH_PROMPT_INPUT}
 typeset -g MU_ZSH_PENDING_INPUT=
@@ -212,21 +212,23 @@ _mu_zsh_record_history() {
   model=$MU_ZSH_EFFECTIVE_MODEL
 
   local attachments=
+  local output=
   local attachment
   for attachment in "${MU_ZSH_PENDING_ATTACHMENTS[@]}"; do
     attachments+=" -a ${(q)attachment}"
   done
+  [[ -n "$MU_ZSH_OUTPUT" ]] && output=" --output ${(q)MU_ZSH_OUTPUT}"
 
   if [[ -n "$session_id" ]]; then
     if [[ -n "$model" ]]; then
-      print -sr -- "$MU_ZSH_BIN -s ${(q)session_id} --model ${(q)model}${attachments} --output ${(q)MU_ZSH_OUTPUT} <<< $quoted"
+      print -sr -- "$MU_ZSH_BIN -s ${(q)session_id} --model ${(q)model}${attachments}${output} <<< $quoted"
     else
-      print -sr -- "$MU_ZSH_BIN -s ${(q)session_id}${attachments} --output ${(q)MU_ZSH_OUTPUT} <<< $quoted"
+      print -sr -- "$MU_ZSH_BIN -s ${(q)session_id}${attachments}${output} <<< $quoted"
     fi
   elif [[ -n "$model" ]]; then
-    print -sr -- "$MU_ZSH_BIN --model ${(q)model}${attachments} --output ${(q)MU_ZSH_OUTPUT} <<< $quoted"
+    print -sr -- "$MU_ZSH_BIN --model ${(q)model}${attachments}${output} <<< $quoted"
   else
-    print -sr -- "$MU_ZSH_BIN${attachments} --output ${(q)MU_ZSH_OUTPUT} <<< $quoted"
+    print -sr -- "$MU_ZSH_BIN${attachments}${output} <<< $quoted"
   fi
 }
 
@@ -253,7 +255,8 @@ _mu_zsh_base_command_reply() {
   }
 
   _mu_zsh_sync_state "$scope"
-  MU_ZSH_COMMAND_REPLY=("$MU_ZSH_BIN" --output "$MU_ZSH_OUTPUT")
+  MU_ZSH_COMMAND_REPLY=("$MU_ZSH_BIN")
+  [[ -n "$MU_ZSH_OUTPUT" ]] && MU_ZSH_COMMAND_REPLY+=(--output "$MU_ZSH_OUTPUT")
   [[ -n "$MU_ZSH_EFFECTIVE_SESSION_ID" ]] && MU_ZSH_COMMAND_REPLY+=(-s "$MU_ZSH_EFFECTIVE_SESSION_ID")
   [[ -n "$MU_ZSH_EFFECTIVE_MODEL" ]] && MU_ZSH_COMMAND_REPLY+=(--model "$MU_ZSH_EFFECTIVE_MODEL")
   return 0
@@ -870,7 +873,7 @@ _mu_zsh_run_slash_command() {
       local -a retry_command
       retry_command=("$MU_ZSH_BIN" retry -s "$session_id")
       [[ -n "$MU_ZSH_EFFECTIVE_MODEL" ]] && retry_command+=(--model "$MU_ZSH_EFFECTIVE_MODEL")
-      retry_command+=(--output "$MU_ZSH_OUTPUT")
+      [[ -n "$MU_ZSH_OUTPUT" ]] && retry_command+=(--output "$MU_ZSH_OUTPUT")
       if "${retry_command[@]}"; then
         exit_status=0
       else
