@@ -61,6 +61,7 @@ struct CommandHeaderDisplay {
     command_line_done: bool,
     cwd_line_done: bool,
     stdin_started: bool,
+    stdin_displayed_bytes: usize,
     stdin_line_done: bool,
 }
 
@@ -152,8 +153,8 @@ impl<'a> AgentLoop<'a> {
                             self.renderer.reasoning_start(visibility)
                         }
                         StreamEvent::ReasoningDelta(text) => self.renderer.reasoning_delta(&text),
-                        StreamEvent::ReasoningSummaryDelta(text) => {
-                            self.renderer.reasoning_summary_delta(&text)
+                        StreamEvent::ReasoningSummaryDelta { part_index, text } => {
+                            self.renderer.reasoning_summary_delta(part_index, &text)
                         }
                         StreamEvent::ReasoningEnd => self.renderer.reasoning_end(None),
                         StreamEvent::ToolCallDelta(delta) => {
@@ -346,6 +347,7 @@ impl<'a> AgentLoop<'a> {
                                                 outcome: a.outcome(),
                                                 reason: Some(&a.reason),
                                             })?;
+                                            self.renderer.tool_rejected()?;
                                             if let Some((consec, recent)) =
                                                 g.circuit_breaker_tripped()
                                             {
@@ -790,6 +792,32 @@ impl CommandHeaderDisplay {
             self.started = renderer.bash_header_start(tool_call_id)?;
         }
 
+        if renderer.output_format() == crate::cli::OutputFormat::Concise {
+            let ready = title.complete_value().is_some() && risk.complete_value().is_some();
+            if ready || arguments_complete {
+                renderer.concise_tool_ready(title.complete_value(), risk.complete_value())?;
+                self.title_line_done = true;
+                self.command_line_done = true;
+                self.cwd_line_done = true;
+                self.stdin_line_done = true;
+            }
+            return Ok(());
+        }
+
+        if renderer.output_format() == crate::cli::OutputFormat::Full {
+            return self.update_full(
+                renderer,
+                FullCommandHeaderUpdate {
+                    title,
+                    risk,
+                    command,
+                    cwd,
+                    stdin,
+                    arguments_complete,
+                },
+            );
+        }
+
         if !self.title_line_done {
             if let Some(value) = title.value() {
                 if !self.title_started {
@@ -865,10 +893,115 @@ impl CommandHeaderDisplay {
         }
         Ok(())
     }
+
+    fn update_full(
+        &mut self,
+        renderer: &mut Renderer,
+        update: FullCommandHeaderUpdate,
+    ) -> std::io::Result<()> {
+        let FullCommandHeaderUpdate {
+            title,
+            risk,
+            command,
+            cwd,
+            stdin,
+            arguments_complete,
+        } = update;
+        if !self.title_line_done {
+            if let Some(value) = title.value() {
+                if !self.title_started {
+                    renderer.bash_header_title_start()?;
+                    self.title_started = true;
+                }
+                let done = stream_first_line(
+                    value,
+                    title.is_complete(),
+                    crate::renderer::BASH_TITLE_PREVIEW_BYTES,
+                    &mut self.title_displayed_bytes,
+                    |text| renderer.bash_header_title_delta(text),
+                )?;
+                if done {
+                    renderer.bash_header_title_end()?;
+                    self.title_line_done = true;
+                }
+            } else if arguments_complete {
+                renderer.bash_header_title_start()?;
+                renderer.bash_header_title_end()?;
+                self.title_started = true;
+                self.title_line_done = true;
+            }
+        }
+
+        let complete_risk = risk.complete_value();
+        if self.title_line_done
+            && !self.command_started
+            && (complete_risk.is_some() || arguments_complete)
+        {
+            renderer.bash_header_command_start(complete_risk)?;
+            self.command_started = true;
+        }
+        if self.command_started && !self.command_line_done {
+            if let Some(value) = command.value() {
+                let done = stream_all(
+                    value,
+                    command.is_complete(),
+                    &mut self.command_displayed_bytes,
+                    |text| renderer.bash_header_command_delta(text),
+                )?;
+                if done {
+                    renderer.bash_header_command_end()?;
+                    self.command_line_done = true;
+                }
+            } else if arguments_complete {
+                renderer.bash_header_command_end()?;
+                self.command_line_done = true;
+            }
+        }
+        if self.command_line_done && !self.cwd_line_done {
+            match cwd {
+                StringFieldState::Complete(value) => {
+                    renderer.bash_header_cwd_line(&value)?;
+                    self.cwd_line_done = true;
+                }
+                StringFieldState::Missing if arguments_complete => self.cwd_line_done = true,
+                StringFieldState::Missing | StringFieldState::Partial(_) => {}
+            }
+        }
+        if self.command_line_done && self.cwd_line_done && !self.stdin_line_done {
+            if let Some(value) = stdin.value() {
+                if !self.stdin_started {
+                    renderer.bash_header_stdin_full_start()?;
+                    self.stdin_started = true;
+                }
+                let done = stream_all(
+                    value,
+                    stdin.is_complete(),
+                    &mut self.stdin_displayed_bytes,
+                    |text| renderer.bash_header_stdin_full_delta(text),
+                )?;
+                if done {
+                    renderer.bash_header_stdin_full_end()?;
+                    self.stdin_line_done = true;
+                }
+            } else if arguments_complete {
+                self.stdin_line_done = true;
+            }
+        }
+        Ok(())
+    }
 }
 
 struct CommandHeaderUpdate<'a> {
     tool_call_id: Option<&'a str>,
+    title: StringFieldState,
+    risk: StringFieldState,
+    command: StringFieldState,
+    cwd: StringFieldState,
+    stdin: StringFieldState,
+    arguments_complete: bool,
+}
+
+struct FullCommandHeaderUpdate {
     title: StringFieldState,
     risk: StringFieldState,
     command: StringFieldState,
@@ -1118,6 +1251,18 @@ fn stream_first_line(
     Ok(false)
 }
 
+fn stream_all(
+    value: &str,
+    complete: bool,
+    displayed_bytes: &mut usize,
+    mut write: impl FnMut(&str) -> std::io::Result<()>,
+) -> std::io::Result<bool> {
+    let start = (*displayed_bytes).min(value.len());
+    write(&value[start..])?;
+    *displayed_bytes = value.len();
+    Ok(complete)
+}
+
 fn guardrail_review_required(guardrail: Option<&Guardrail>, call: &ToolCall, args: &Value) -> bool {
     if call.function.name != "bash" {
         return false;
@@ -1338,7 +1483,7 @@ mod tests {
 
     #[test]
     fn streamed_command_headers_defer_later_commands_until_active() {
-        let mut renderer = Renderer::with_format(OutputFormat::Plain);
+        let mut renderer = Renderer::with_format(OutputFormat::Detail);
         let mut headers = StreamingCommandHeaders::default();
 
         handle_tool_call_delta(
@@ -1414,7 +1559,7 @@ mod tests {
 
     #[test]
     fn plain_command_header_starts_before_title_arrives() {
-        let mut renderer = Renderer::with_format(OutputFormat::Plain);
+        let mut renderer = Renderer::with_format(OutputFormat::Detail);
         let mut headers = StreamingCommandHeaders::default();
 
         handle_tool_call_delta(
@@ -1452,8 +1597,78 @@ mod tests {
     }
 
     #[test]
+    fn concise_header_waits_for_both_title_and_risk() {
+        let mut renderer = Renderer::with_format(OutputFormat::Concise);
+        let mut headers = StreamingCommandHeaders::default();
+
+        handle_tool_call_delta(
+            &mut renderer,
+            &mut headers,
+            ToolCallDelta {
+                index: 0,
+                id: Some("call_1".into()),
+                name: Some("bash".into()),
+                arguments_delta: r#"{"title":"Inspect""#.into(),
+            },
+        )
+        .unwrap();
+        assert!(headers.entries[0].display.started);
+        assert!(!headers.entries[0].display.is_done());
+
+        handle_tool_call_delta(
+            &mut renderer,
+            &mut headers,
+            ToolCallDelta {
+                index: 0,
+                id: None,
+                name: None,
+                arguments_delta: r#", "risk":"readonly""#.into(),
+            },
+        )
+        .unwrap();
+        assert!(headers.entries[0].display.is_done());
+    }
+
+    #[test]
+    fn full_header_streams_complete_command_and_stdin_fields() {
+        let mut renderer = Renderer::with_format(OutputFormat::Full);
+        let mut headers = StreamingCommandHeaders::default();
+
+        handle_tool_call_delta(
+            &mut renderer,
+            &mut headers,
+            ToolCallDelta {
+                index: 0,
+                id: Some("call_1".into()),
+                name: Some("bash".into()),
+                arguments_delta: r#"{"title":"Run","risk":"readonly","command":"one\ntwo","stdin":"alpha"#.into(),
+            },
+        )
+        .unwrap();
+        let display = &headers.entries[0].display;
+        assert_eq!(display.command_displayed_bytes, "one\ntwo".len());
+        assert_eq!(display.stdin_displayed_bytes, 0);
+        assert!(!display.stdin_line_done);
+
+        handle_tool_call_delta(
+            &mut renderer,
+            &mut headers,
+            ToolCallDelta {
+                index: 0,
+                id: None,
+                name: None,
+                arguments_delta: r#"\nbeta"}"#.into(),
+            },
+        )
+        .unwrap();
+        let display = &headers.entries[0].display;
+        assert_eq!(display.stdin_displayed_bytes, "alpha\nbeta".len());
+        assert!(display.is_done());
+    }
+
+    #[test]
     fn streamed_command_header_waits_for_command_completion() {
-        let mut renderer = Renderer::with_format(OutputFormat::Terminal);
+        let mut renderer = Renderer::with_format(OutputFormat::Detail);
         renderer.force_styled_for_test();
         let mut headers = StreamingCommandHeaders::default();
 
@@ -1490,7 +1705,7 @@ mod tests {
 
     #[test]
     fn streamed_stdin_summary_waits_for_command_completion() {
-        let mut renderer = Renderer::with_format(OutputFormat::Terminal);
+        let mut renderer = Renderer::with_format(OutputFormat::Detail);
         renderer.force_styled_for_test();
         let mut headers = StreamingCommandHeaders::default();
 
@@ -1533,7 +1748,7 @@ mod tests {
 
     #[test]
     fn streamed_command_header_waits_for_argument_completion_before_missing_cwd_is_decided() {
-        let mut renderer = Renderer::with_format(OutputFormat::Plain);
+        let mut renderer = Renderer::with_format(OutputFormat::Detail);
         let mut headers = StreamingCommandHeaders::default();
 
         handle_tool_call_delta(
@@ -1573,7 +1788,7 @@ mod tests {
 
     #[test]
     fn streamed_stdin_summary_waits_for_cwd_decision() {
-        let mut renderer = Renderer::with_format(OutputFormat::Terminal);
+        let mut renderer = Renderer::with_format(OutputFormat::Detail);
         renderer.force_styled_for_test();
         let mut headers = StreamingCommandHeaders::default();
 
@@ -1618,7 +1833,7 @@ mod tests {
 
     #[test]
     fn streamed_stdin_summary_keeps_updating_until_stdin_completes() {
-        let mut renderer = Renderer::with_format(OutputFormat::Terminal);
+        let mut renderer = Renderer::with_format(OutputFormat::Detail);
         renderer.force_styled_for_test();
         let mut headers = StreamingCommandHeaders::default();
 
@@ -1661,7 +1876,7 @@ mod tests {
 
     #[test]
     fn final_header_shows_empty_stdin_summary() {
-        let mut renderer = Renderer::with_format(OutputFormat::Plain);
+        let mut renderer = Renderer::with_format(OutputFormat::Detail);
         let mut headers = StreamingCommandHeaders::default();
         let args = serde_json::json!({
             "title": "Empty stdin",
@@ -1711,7 +1926,7 @@ mod tests {
         let provider = Box::new(RetryThenStopProvider {
             step: Mutex::new(0),
         });
-        let mut renderer = Renderer::with_format(OutputFormat::Plain);
+        let mut renderer = Renderer::with_format(OutputFormat::Detail);
         let mut agent = AgentLoop {
             config: &config,
             provider,
@@ -1781,7 +1996,7 @@ mod tests {
             step: Mutex::new(0),
             barrier_path: tmp.join("second-started").display().to_string(),
         });
-        let mut renderer = Renderer::with_format(OutputFormat::Plain);
+        let mut renderer = Renderer::with_format(OutputFormat::Detail);
         let mut agent = AgentLoop {
             config: &config,
             provider,
@@ -1970,7 +2185,7 @@ mod tests {
         let provider = Box::new(GrowThenStopProvider {
             turn_step: Mutex::new(0),
         });
-        let mut renderer = Renderer::with_format(OutputFormat::Plain);
+        let mut renderer = Renderer::with_format(OutputFormat::Detail);
         let mut agent = AgentLoop {
             config: &config,
             provider,
@@ -2101,7 +2316,7 @@ mod tests {
         let provider = Box::new(TwoCallUsageProvider {
             step: Mutex::new(0),
         });
-        let mut renderer = Renderer::with_format(OutputFormat::Plain);
+        let mut renderer = Renderer::with_format(OutputFormat::Detail);
         let mut agent = AgentLoop {
             config: &config,
             provider,
@@ -2185,7 +2400,7 @@ mod tests {
             )
             .unwrap();
         let provider = Box::new(LengthFinishProvider);
-        let mut renderer = Renderer::with_format(OutputFormat::Plain);
+        let mut renderer = Renderer::with_format(OutputFormat::Detail);
         let mut agent = AgentLoop {
             config: &config,
             provider,

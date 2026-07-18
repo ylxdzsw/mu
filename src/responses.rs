@@ -283,10 +283,12 @@ pub(crate) fn consume_responses_sse_buffer(
                 let summary_index = value["summary_index"].as_u64().unwrap_or(u64::MAX) as usize;
                 if state.reasoning_active
                     && state.reasoning_output_index == Some(output_index)
-                    && summary_index == 0
                     && let Some(delta) = value["delta"].as_str()
                 {
-                    on_event(StreamEvent::ReasoningSummaryDelta(delta.to_string()))?;
+                    on_event(StreamEvent::ReasoningSummaryDelta {
+                        part_index: summary_index,
+                        text: delta.to_string(),
+                    })?;
                 }
             }
             "response.output_text.delta" | "response.refusal.delta" => {

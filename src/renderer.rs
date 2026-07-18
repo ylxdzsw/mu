@@ -52,7 +52,10 @@ pub struct Renderer {
     live_line_rendered: bool,
     reasoning: Option<ReasoningState>,
     bash_preview: Option<BashPreviewState>,
+    concise_tool: Option<ConciseToolState>,
+    last_committed_block: Option<CommittedBlock>,
     turn_done_bell_min_duration: Option<Duration>,
+    format: OutputFormat,
     final_only: bool,
 }
 
@@ -85,7 +88,7 @@ impl Write for SharedOutput {
 
 impl Renderer {
     pub fn new() -> Self {
-        Self::with_format(OutputFormat::Terminal)
+        Self::with_format(OutputFormat::Detail)
     }
 
     pub fn with_format(format: OutputFormat) -> Self {
@@ -97,7 +100,7 @@ impl Renderer {
         turn_done_bell_min_duration: Option<Duration>,
     ) -> Self {
         let stdout = io::stdout();
-        let styled = format == OutputFormat::Terminal && stdout.is_terminal();
+        let styled = format != OutputFormat::Final && stdout.is_terminal();
         let stderr = io::stderr();
         let stderr_is_terminal = stderr.is_terminal();
         Self {
@@ -114,7 +117,10 @@ impl Renderer {
             live_line_rendered: false,
             reasoning: None,
             bash_preview: None,
+            concise_tool: None,
+            last_committed_block: None,
             turn_done_bell_min_duration,
+            format,
             final_only: format == OutputFormat::Final,
         }
     }
@@ -141,14 +147,17 @@ impl Renderer {
                 stdout_at_line_start: true,
                 trailing_newlines: 0,
                 has_committed_stdout: false,
-                styled: format == OutputFormat::Terminal && stdout_is_terminal,
+                styled: format != OutputFormat::Final && stdout_is_terminal,
                 markdown: MarkdownStream::default(),
                 assistant_block_open: false,
                 live_line: None,
                 live_line_rendered: false,
                 reasoning: None,
                 bash_preview: None,
+                concise_tool: None,
+                last_committed_block: None,
                 turn_done_bell_min_duration,
+                format,
                 final_only: format == OutputFormat::Final,
             },
             stdout,
@@ -171,14 +180,17 @@ impl Renderer {
                 stdout_at_line_start: true,
                 trailing_newlines: 0,
                 has_committed_stdout: false,
-                styled: format == OutputFormat::Terminal && output_is_terminal,
+                styled: format != OutputFormat::Final && output_is_terminal,
                 markdown: MarkdownStream::default(),
                 assistant_block_open: false,
                 live_line: None,
                 live_line_rendered: false,
                 reasoning: None,
                 bash_preview: None,
+                concise_tool: None,
+                last_committed_block: None,
                 turn_done_bell_min_duration,
+                format,
                 final_only: format == OutputFormat::Final,
             },
             output,
@@ -196,6 +208,7 @@ impl Renderer {
             if !self.assistant_block_open {
                 self.ensure_block_separator_if_needed()?;
                 self.assistant_block_open = true;
+                self.last_committed_block = Some(CommittedBlock::Other);
             }
             return self.write_stdout_committed(text);
         }
@@ -214,6 +227,7 @@ impl Renderer {
             if !self.assistant_block_open {
                 self.ensure_block_separator_if_needed()?;
                 self.assistant_block_open = true;
+                self.last_committed_block = Some(CommittedBlock::Other);
             }
             self.write_committed(&block)?;
         }
@@ -242,6 +256,7 @@ impl Renderer {
             if !self.assistant_block_open {
                 self.ensure_block_separator_if_needed()?;
                 self.assistant_block_open = true;
+                self.last_committed_block = Some(CommittedBlock::Other);
             }
             self.write_committed(&rendered)?;
         }
@@ -261,8 +276,10 @@ impl Renderer {
             summary: String::new(),
             title: None,
             committed: false,
+            full_output_started: false,
+            full_summary_part: None,
         });
-        if self.styled {
+        if self.styled && self.format != OutputFormat::Full {
             self.live_line = Some(LiveLine::Thinking);
             self.render_live_line()?;
         }
@@ -285,6 +302,9 @@ impl Renderer {
         if reasoning.committed {
             return Ok(());
         }
+        if self.format == OutputFormat::Full {
+            return self.full_reasoning_text(text, None);
+        }
         if !self.styled {
             return Ok(());
         }
@@ -292,8 +312,14 @@ impl Renderer {
         self.render_live_line()
     }
 
-    pub fn reasoning_summary_delta(&mut self, text: &str) -> io::Result<()> {
+    pub fn reasoning_summary_delta(&mut self, part_index: usize, text: &str) -> io::Result<()> {
         if self.final_only || text.is_empty() {
+            return Ok(());
+        }
+        if self.format == OutputFormat::Full {
+            return self.full_reasoning_text(text, Some(part_index));
+        }
+        if part_index != 0 {
             return Ok(());
         }
         let Some(reasoning) = self.reasoning.as_mut() else {
@@ -333,6 +359,21 @@ impl Renderer {
         if reasoning.committed {
             return Ok(());
         }
+        if self.format == OutputFormat::Concise {
+            reasoning.committed = true;
+            self.clear_live_line()?;
+            self.live_line = None;
+            return Ok(());
+        }
+        if self.format == OutputFormat::Full {
+            let output_started = reasoning.full_output_started;
+            reasoning.committed = true;
+            if output_started {
+                self.ensure_line_start()?;
+                self.last_committed_block = Some(CommittedBlock::Other);
+            }
+            return Ok(());
+        }
         if reasoning.title.is_none() {
             reasoning.title = extract_reasoning_summary_title(&reasoning.summary, true);
         }
@@ -355,6 +396,7 @@ impl Renderer {
         reasoning.committed = true;
         self.live_line = None;
         self.ensure_block_separator_if_needed()?;
+        self.last_committed_block = Some(CommittedBlock::Other);
         self.write_committed(&line)
     }
 
@@ -364,6 +406,7 @@ impl Renderer {
         }
         self.assistant_block_open = false;
         self.reasoning_end(None)?;
+        self.concise_tool = None;
         if self.styled {
             self.live_line = Some(LiveLine::ToolComposition);
             self.render_live_line()?;
@@ -437,10 +480,64 @@ impl Renderer {
             return Ok(());
         }
         if self.styled {
-            self.write_committed(&format!("{RESET}\n"))
+            if self.format == OutputFormat::Full {
+                self.write_committed(RESET)?;
+                self.ensure_line_start()
+            } else {
+                self.write_committed(&format!("{RESET}\n"))
+            }
+        } else if self.format == OutputFormat::Full && self.stdout_at_line_start {
+            Ok(())
         } else {
             self.write_committed("\n")
         }
+    }
+
+    pub fn bash_header_stdin_full_start(&mut self) -> io::Result<()> {
+        if self.final_only {
+            return Ok(());
+        }
+        if self.styled {
+            self.write_committed(&format!("{BLUE}< {RESET}"))
+        } else {
+            self.write_committed("< ")
+        }
+    }
+
+    pub fn bash_header_stdin_full_delta(&mut self, text: &str) -> io::Result<()> {
+        if self.final_only || text.is_empty() {
+            return Ok(());
+        }
+        self.write_committed(text)
+    }
+
+    pub fn bash_header_stdin_full_end(&mut self) -> io::Result<()> {
+        if self.final_only || self.stdout_at_line_start {
+            return Ok(());
+        }
+        self.write_committed("\n")
+    }
+
+    pub fn concise_tool_ready(
+        &mut self,
+        title: Option<&str>,
+        risk: Option<&str>,
+    ) -> io::Result<()> {
+        if self.final_only || self.format != OutputFormat::Concise {
+            return Ok(());
+        }
+        self.concise_tool = Some(ConciseToolState {
+            title: title
+                .filter(|title| !title.is_empty())
+                .unwrap_or("bash")
+                .to_string(),
+            risk: risk.map(str::to_string),
+        });
+        if self.styled {
+            self.live_line = Some(LiveLine::ConciseTool);
+            self.render_live_line()?;
+        }
+        Ok(())
     }
 
     pub fn bash_header_stdin_summary(&mut self, bytes: usize, complete: bool) -> io::Result<()> {
@@ -479,17 +576,34 @@ impl Renderer {
             .unwrap_or_default();
         let risk = args.get("risk").and_then(|value| value.as_str());
         self.bash_header_start(tool_call_id)?;
+        if self.format == OutputFormat::Concise {
+            self.concise_tool_ready(Some(title), risk)?;
+            return Ok(true);
+        }
         self.bash_header_title_start()?;
         self.bash_header_title_delta(&preview_first_line(title, BASH_TITLE_PREVIEW_BYTES))?;
         self.bash_header_title_end()?;
         self.bash_header_command_start(risk)?;
-        self.bash_header_command_delta(&preview_first_line(command, BASH_COMMAND_PREVIEW_BYTES))?;
+        if self.format == OutputFormat::Full {
+            self.bash_header_command_delta(command)?;
+        } else {
+            self.bash_header_command_delta(&preview_first_line(
+                command,
+                BASH_COMMAND_PREVIEW_BYTES,
+            ))?;
+        }
         self.bash_header_command_end()?;
         if let Some(cwd) = args.get("cwd").and_then(|value| value.as_str()) {
             self.bash_header_cwd_line(cwd)?;
         }
         if let Some(stdin) = args.get("stdin").and_then(|value| value.as_str()) {
-            self.bash_header_stdin_summary(stdin.len(), true)?;
+            if self.format == OutputFormat::Full {
+                self.bash_header_stdin_full_start()?;
+                self.bash_header_stdin_full_delta(stdin)?;
+                self.bash_header_stdin_full_end()?;
+            } else {
+                self.bash_header_stdin_summary(stdin.len(), true)?;
+            }
         }
         Ok(true)
     }
@@ -509,6 +623,7 @@ impl Renderer {
         self.live_line = None;
         self.reasoning = None;
         self.bash_preview = None;
+        self.concise_tool = None;
         Ok(())
     }
 
@@ -530,7 +645,7 @@ impl Renderer {
         self.assistant_block_open = false;
         self.reasoning_end(None)?;
         self.live_line = None;
-        self.bash_preview = Some(BashPreviewState::default());
+        self.bash_preview = (self.format == OutputFormat::Detail).then(BashPreviewState::default);
         if header_already_rendered {
             return Ok(());
         }
@@ -544,6 +659,9 @@ impl Renderer {
         text: &str,
     ) -> io::Result<()> {
         if self.final_only {
+            return Ok(());
+        }
+        if self.format == OutputFormat::Concise {
             return Ok(());
         }
         if text.is_empty() {
@@ -579,6 +697,9 @@ impl Renderer {
         if self.final_only {
             return Ok(());
         }
+        if self.format == OutputFormat::Concise {
+            return self.commit_concise_tool(Some(exit_code));
+        }
         self.finalize_bash_preview()?;
         let text = format_tool(exit_code, elapsed, self.styled);
         self.ensure_line_start()?;
@@ -595,6 +716,15 @@ impl Renderer {
         if self.final_only {
             return Ok(());
         }
+        if self.format == OutputFormat::Concise {
+            if self.concise_tool.is_none() {
+                self.concise_tool = Some(ConciseToolState {
+                    title: name.to_string(),
+                    risk: None,
+                });
+            }
+            return self.commit_concise_tool(None);
+        }
         self.finalize_bash_preview()?;
         self.ensure_line_start()?;
         let elapsed = format_duration(elapsed);
@@ -608,6 +738,13 @@ impl Renderer {
         self.write_stdout_committed(&terminal_trim_committed_text(&line))
     }
 
+    pub fn tool_rejected(&mut self) -> io::Result<()> {
+        if self.format == OutputFormat::Concise {
+            return self.commit_concise_tool(None);
+        }
+        Ok(())
+    }
+
     pub fn guardrail_verdict(
         &mut self,
         allowed: bool,
@@ -617,6 +754,9 @@ impl Renderer {
         _command: &str,
     ) -> io::Result<()> {
         if self.final_only {
+            return Ok(());
+        }
+        if self.format == OutputFormat::Concise {
             return Ok(());
         }
         self.assistant_block_open = false;
@@ -651,7 +791,9 @@ impl Renderer {
         }
         self.assistant_block_open = false;
         self.ensure_block_separator_if_needed()?;
-        self.write_stdout_committed(&terminal_trim_committed_text(&format!("{msg}\n")))
+        self.write_stdout_committed(&terminal_trim_committed_text(&format!("{msg}\n")))?;
+        self.last_committed_block = Some(CommittedBlock::Other);
+        Ok(())
     }
 
     pub fn turn_retry(
@@ -671,6 +813,15 @@ impl Renderer {
     /// is now "unclean"; the next prompt continues on top of it, or `mu retry`
     /// resumes it.
     pub fn turn_interrupted(&mut self, reason: &str) -> io::Result<()> {
+        if self.format == OutputFormat::Concise
+            && (self.concise_tool.is_some()
+                || matches!(
+                    self.live_line,
+                    Some(LiveLine::ToolComposition | LiveLine::ConciseTool)
+                ))
+        {
+            self.commit_concise_tool(None)?;
+        }
         self.notice(&format!("[mu] interrupted: {reason}"))?;
         self.notice(
             "[mu] partial output above is not saved to session history; \
@@ -736,6 +887,59 @@ impl Renderer {
         self.stderr.flush()
     }
 
+    pub(crate) fn output_format(&self) -> OutputFormat {
+        self.format
+    }
+
+    fn full_reasoning_text(&mut self, text: &str, summary_part: Option<usize>) -> io::Result<()> {
+        let Some(reasoning) = self.reasoning.as_ref() else {
+            return Ok(());
+        };
+        if reasoning.committed {
+            return Ok(());
+        }
+        let starts_new_part = reasoning.full_output_started
+            && summary_part.is_some()
+            && reasoning.full_summary_part != summary_part;
+        if starts_new_part {
+            self.ensure_line_start()?;
+            self.ensure_blank_line_before_next_block()?;
+        } else if !reasoning.full_output_started {
+            self.ensure_block_separator_if_needed()?;
+        }
+        if let Some(reasoning) = self.reasoning.as_mut() {
+            reasoning.full_output_started = true;
+            if summary_part.is_some() {
+                reasoning.full_summary_part = summary_part;
+            }
+        }
+        self.last_committed_block = Some(CommittedBlock::Other);
+        let text = strip_ansi(text);
+        if self.styled {
+            self.write_stdout_committed(&format!("{GRAY}{text}{RESET}"))
+        } else {
+            self.write_stdout_committed(&text)
+        }
+    }
+
+    fn commit_concise_tool(&mut self, exit_code: Option<i32>) -> io::Result<()> {
+        self.clear_live_line()?;
+        self.live_line = None;
+        let tool = self.concise_tool.take().unwrap_or(ConciseToolState {
+            title: "bash".to_string(),
+            risk: None,
+        });
+        if self.last_committed_block != Some(CommittedBlock::Tool) {
+            self.ensure_block_separator_if_needed()?;
+        } else {
+            self.ensure_line_start()?;
+        }
+        let line = format_concise_tool(&tool.title, tool.risk.as_deref(), exit_code, self.styled);
+        self.write_stdout_committed(&line)?;
+        self.last_committed_block = Some(CommittedBlock::Tool);
+        Ok(())
+    }
+
     fn ensure_line_start(&mut self) -> io::Result<()> {
         self.clear_live_line()?;
         if self.stdout_at_line_start {
@@ -776,9 +980,13 @@ impl Renderer {
             self.stdout.write_all(b"\r\x1b[2K")?;
         } else if matches!(
             self.live_line,
-            Some(LiveLine::Thinking | LiveLine::ToolComposition)
+            Some(LiveLine::Thinking | LiveLine::ToolComposition | LiveLine::ConciseTool)
         ) {
-            self.ensure_block_separator_if_needed()?;
+            let continues_concise_tools = self.format == OutputFormat::Concise
+                && self.last_committed_block == Some(CommittedBlock::Tool);
+            if !continues_concise_tools {
+                self.ensure_block_separator_if_needed()?;
+            }
         } else if !self.stdout_at_line_start {
             self.write_stdout("\n")?;
         }
@@ -810,6 +1018,14 @@ impl Renderer {
                 ))
             }
             Some(LiveLine::ToolComposition) => Some(format!("{GRAY}[preparing toolcall]{RESET}")),
+            Some(LiveLine::ConciseTool) => {
+                let tool = self.concise_tool.as_ref()?;
+                Some(format_concise_tool_live(
+                    &tool.title,
+                    tool.risk.as_deref(),
+                    self.styled,
+                ))
+            }
             Some(LiveLine::TableBuffering { chars }) => Some(format_table_live(
                 approx_tokens_from_chars(chars),
                 self.styled,
@@ -991,6 +1207,7 @@ struct TableBufferLive {
 enum LiveLine {
     Thinking,
     ToolComposition,
+    ConciseTool,
     TableBuffering {
         chars: usize,
     },
@@ -1010,6 +1227,19 @@ struct ReasoningState {
     summary: String,
     title: Option<String>,
     committed: bool,
+    full_output_started: bool,
+    full_summary_part: Option<usize>,
+}
+
+struct ConciseToolState {
+    title: String,
+    risk: Option<String>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CommittedBlock {
+    Tool,
+    Other,
 }
 
 #[derive(Default)]
@@ -2603,6 +2833,32 @@ fn format_tool(exit_code: i32, elapsed: Duration, styled: bool) -> String {
     }
 }
 
+fn format_concise_tool_live(title: &str, risk: Option<&str>, styled: bool) -> String {
+    let body = format!("=> {title}");
+    if styled {
+        format!("{}{body}{RESET}", bash_risk_color(risk))
+    } else {
+        body
+    }
+}
+
+fn format_concise_tool(
+    title: &str,
+    risk: Option<&str>,
+    exit_code: Option<i32>,
+    styled: bool,
+) -> String {
+    let outcome = exit_code
+        .map(|code| format!("exit {code}"))
+        .unwrap_or_else(|| "error".to_string());
+    let body = format!("=> {title} · {outcome}");
+    if styled {
+        format!("{}{body}{RESET}\n", bash_risk_color(risk))
+    } else {
+        format!("{body}\n")
+    }
+}
+
 #[cfg(test)]
 fn format_bash_header(title: &str, command: &str, risk: Option<&str>, styled: bool) -> String {
     let command = preview_first_line(command, BASH_COMMAND_PREVIEW_BYTES);
@@ -3594,7 +3850,7 @@ mod tests {
     #[test]
     fn table_buffer_indicator_is_live_only_until_table_finishes() {
         let mut stream = MarkdownStream::default();
-        let mut renderer = Renderer::with_format(OutputFormat::Terminal);
+        let mut renderer = Renderer::with_format(OutputFormat::Detail);
         renderer.force_styled_for_test();
 
         assert_eq!(stream.push("| Name | Value |\n").concat(), "");
@@ -3632,7 +3888,7 @@ mod tests {
 
     fn capture_markdown_stream_transcript() -> String {
         let (mut renderer, output) =
-            Renderer::with_test_shared_output(OutputFormat::Terminal, true, None);
+            Renderer::with_test_shared_output(OutputFormat::Detail, true, None);
 
         renderer.assistant_text("- one\n").unwrap();
         output.write_raw("<after-list>\n");
@@ -3674,7 +3930,7 @@ mod tests {
     #[test]
     fn tool_composition_indicator_is_replaced_before_title_commits() {
         let (mut renderer, output) =
-            Renderer::with_test_shared_output(OutputFormat::Terminal, true, None);
+            Renderer::with_test_shared_output(OutputFormat::Detail, true, None);
 
         renderer.bash_header_start(Some("call_1")).unwrap();
         assert_eq!(
@@ -3700,7 +3956,7 @@ mod tests {
     #[test]
     fn plain_tool_header_omits_composition_indicator() {
         let (mut renderer, output) =
-            Renderer::with_test_shared_output(OutputFormat::Plain, false, None);
+            Renderer::with_test_shared_output(OutputFormat::Detail, false, None);
 
         renderer.bash_header_start(Some("call_1")).unwrap();
         assert_eq!(output.transcript(), "");
@@ -3746,7 +4002,7 @@ mod tests {
 
     #[test]
     fn bash_start_can_reuse_streamed_header_without_duplication() {
-        let mut renderer = Renderer::with_format(OutputFormat::Plain);
+        let mut renderer = Renderer::with_format(OutputFormat::Detail);
         let args = json!({
             "title": "List files",
             "risk": "readonly",
@@ -3846,7 +4102,7 @@ mod tests {
     #[test]
     fn streamed_trace_commits_even_without_reasoning_text_and_keeps_tokens() {
         let (mut renderer, output, _stderr) =
-            Renderer::with_test_output(OutputFormat::Plain, false, false, None);
+            Renderer::with_test_output(OutputFormat::Detail, false, false, None);
 
         renderer
             .reasoning_start(ReasoningVisibility::StreamedTrace)
@@ -3861,14 +4117,14 @@ mod tests {
     #[test]
     fn opaque_reasoning_commits_duration_and_conservative_summary_title_without_tokens() {
         let (mut renderer, output, _stderr) =
-            Renderer::with_test_output(OutputFormat::Plain, false, false, None);
+            Renderer::with_test_output(OutputFormat::Detail, false, false, None);
 
         renderer
             .reasoning_start(ReasoningVisibility::Opaque)
             .unwrap();
-        renderer.reasoning_summary_delta("**Inspecting").unwrap();
+        renderer.reasoning_summary_delta(0, "**Inspecting").unwrap();
         renderer
-            .reasoning_summary_delta(" renderer state**\n\nDetails")
+            .reasoning_summary_delta(0, " renderer state**\n\nDetails")
             .unwrap();
         renderer.reasoning_end(Some((20, 7))).unwrap();
 
@@ -3883,7 +4139,7 @@ mod tests {
     #[test]
     fn opaque_reasoning_without_summary_commits_timer_only() {
         let (mut renderer, output, _stderr) =
-            Renderer::with_test_output(OutputFormat::Plain, false, false, None);
+            Renderer::with_test_output(OutputFormat::Detail, false, false, None);
 
         renderer
             .reasoning_start(ReasoningVisibility::Opaque)
@@ -3899,14 +4155,14 @@ mod tests {
     #[test]
     fn multiple_opaque_reasoning_items_commit_separate_titles() {
         let (mut renderer, output, _stderr) =
-            Renderer::with_test_output(OutputFormat::Plain, false, false, None);
+            Renderer::with_test_output(OutputFormat::Detail, false, false, None);
 
         for title in ["First pass", "Second pass"] {
             renderer
                 .reasoning_start(ReasoningVisibility::Opaque)
                 .unwrap();
             renderer
-                .reasoning_summary_delta(&format!("**{title}**\n"))
+                .reasoning_summary_delta(0, &format!("**{title}**\n"))
                 .unwrap();
             renderer.reasoning_end(None).unwrap();
         }
@@ -3926,7 +4182,7 @@ mod tests {
             .reasoning_start(ReasoningVisibility::Opaque)
             .unwrap();
         renderer
-            .reasoning_summary_delta("**Hidden title**\n")
+            .reasoning_summary_delta(0, "**Hidden title**\n")
             .unwrap();
         renderer.reasoning_end(None).unwrap();
 
@@ -3936,13 +4192,13 @@ mod tests {
     #[test]
     fn terminal_reasoning_title_updates_the_live_line() {
         let (mut renderer, _output) =
-            Renderer::with_test_shared_output(OutputFormat::Terminal, true, None);
+            Renderer::with_test_shared_output(OutputFormat::Detail, true, None);
 
         renderer
             .reasoning_start(ReasoningVisibility::Opaque)
             .unwrap();
         renderer
-            .reasoning_summary_delta("## Inspecting renderer state\n")
+            .reasoning_summary_delta(0, "## Inspecting renderer state\n")
             .unwrap();
 
         let live = strip_ansi(&renderer.format_live_line().unwrap());
@@ -3986,7 +4242,7 @@ mod tests {
     #[test]
     fn terminal_ignores_empty_assistant_blocks_before_first_visible_block() {
         let (mut renderer, output) =
-            Renderer::with_test_shared_output(OutputFormat::Terminal, true, None);
+            Renderer::with_test_shared_output(OutputFormat::Detail, true, None);
 
         renderer.assistant_text("\n\n").unwrap();
         renderer.assistant_end().unwrap();
@@ -4003,7 +4259,7 @@ mod tests {
     #[test]
     fn first_visible_renderer_blocks_have_no_leading_separator() {
         let (mut assistant, assistant_output) =
-            Renderer::with_test_shared_output(OutputFormat::Terminal, true, None);
+            Renderer::with_test_shared_output(OutputFormat::Detail, true, None);
         assistant.assistant_text("Hello.\n").unwrap();
         assistant.assistant_end().unwrap();
         assert!(
@@ -4013,7 +4269,7 @@ mod tests {
         );
 
         let (mut tool, tool_output) =
-            Renderer::with_test_shared_output(OutputFormat::Terminal, true, None);
+            Renderer::with_test_shared_output(OutputFormat::Detail, true, None);
         tool.bash_header_start(None).unwrap();
         tool.bash_header_title_start().unwrap();
         tool.bash_header_title_delta("Inspect").unwrap();
@@ -4034,7 +4290,7 @@ mod tests {
         );
 
         let (mut plain, plain_output) =
-            Renderer::with_test_shared_output(OutputFormat::Plain, false, None);
+            Renderer::with_test_shared_output(OutputFormat::Detail, false, None);
         plain.assistant_text("Hello.\n").unwrap();
         plain.assistant_end().unwrap();
         assert_eq!(plain_output.transcript(), "Hello.\n");
@@ -4094,12 +4350,201 @@ mod tests {
         );
     }
 
+    #[test]
+    fn concise_noninteractive_tool_is_exactly_one_line() {
+        let (mut renderer, output) =
+            Renderer::with_test_shared_output(OutputFormat::Concise, false, None);
+        let args = json!({
+            "title": "Inspect files",
+            "risk": "readonly",
+            "command": "printf 'hidden command'",
+            "stdin": "hidden stdin",
+        });
+
+        renderer.bash_header_full(Some("call_1"), &args).unwrap();
+        renderer
+            .tool_start(Some("call_1"), "bash", &args, true)
+            .unwrap();
+        renderer
+            .bash_output(Some("call_1"), "bash", "hidden output\n")
+            .unwrap();
+        renderer
+            .tool_finished(7, Duration::from_millis(250))
+            .unwrap();
+
+        assert_eq!(output.transcript(), "=> Inspect files · exit 7\n");
+    }
+
+    #[test]
+    fn concise_interactive_tool_replaces_preparing_line_and_uses_risk_color() {
+        let (mut renderer, output) =
+            Renderer::with_test_shared_output(OutputFormat::Concise, true, None);
+
+        renderer.bash_header_start(Some("call_1")).unwrap();
+        renderer
+            .concise_tool_ready(Some("Apply patch"), Some("reversible"))
+            .unwrap();
+        renderer.tool_finished(0, Duration::from_secs(9)).unwrap();
+
+        assert_eq!(
+            output.transcript(),
+            format!(
+                "{GRAY}[preparing toolcall]{RESET}\r\x1b[2K{YELLOW}=> Apply patch{RESET}\r\x1b[2K{YELLOW}=> Apply patch · exit 0{RESET}\n"
+            )
+        );
+    }
+
+    #[test]
+    fn concise_consecutive_tools_and_following_thought_have_no_empty_lines() {
+        let (mut renderer, output) =
+            Renderer::with_test_shared_output(OutputFormat::Concise, true, None);
+
+        for title in ["First", "Second"] {
+            renderer.bash_header_start(None).unwrap();
+            renderer
+                .concise_tool_ready(Some(title), Some("readonly"))
+                .unwrap();
+            renderer.tool_finished(0, Duration::from_millis(1)).unwrap();
+            renderer
+                .reasoning_start(ReasoningVisibility::StreamedTrace)
+                .unwrap();
+            renderer.reasoning_delta("plan").unwrap();
+            renderer.reasoning_end(None).unwrap();
+        }
+
+        let transcript = output.transcript();
+        assert!(!strip_ansi(&transcript).contains("\n\n"), "{transcript:?}");
+        assert!(transcript.contains(&format!("{CYAN}=> First · exit 0{RESET}\n{GRAY}[thought ")));
+        assert!(transcript.contains(&format!("{CYAN}=> Second · exit 0{RESET}\n{GRAY}[thought ")));
+    }
+
+    #[test]
+    fn concise_reasoning_is_ephemeral_and_noninteractive_reasoning_is_silent() {
+        let (mut interactive, interactive_output) =
+            Renderer::with_test_shared_output(OutputFormat::Concise, true, None);
+        interactive
+            .reasoning_start(ReasoningVisibility::Opaque)
+            .unwrap();
+        interactive
+            .reasoning_summary_delta(0, "**Inspecting**\n")
+            .unwrap();
+        interactive.reasoning_end(None).unwrap();
+        assert!(interactive_output.transcript().ends_with("\r\x1b[2K"));
+
+        let (mut redirected, redirected_output) =
+            Renderer::with_test_shared_output(OutputFormat::Concise, false, None);
+        redirected
+            .reasoning_start(ReasoningVisibility::StreamedTrace)
+            .unwrap();
+        redirected.reasoning_delta("private trace").unwrap();
+        redirected.reasoning_end(None).unwrap();
+        assert!(redirected_output.transcript().is_empty());
+    }
+
+    #[test]
+    fn concise_interruption_closes_a_pending_tool_line_as_error() {
+        let (mut renderer, output) =
+            Renderer::with_test_shared_output(OutputFormat::Concise, false, None);
+        renderer.bash_header_start(Some("call_1")).unwrap();
+        renderer
+            .concise_tool_ready(Some("Review action"), Some("destructive"))
+            .unwrap();
+
+        renderer.turn_interrupted("review failed").unwrap();
+
+        let transcript = output.transcript();
+        assert!(transcript.starts_with("=> Review action · error\n\n"));
+        assert!(transcript.contains("[mu] interrupted: review failed\n"));
+    }
+
+    #[test]
+    fn concise_guardrail_rejection_closes_the_tool_line_as_error() {
+        let (mut renderer, output) =
+            Renderer::with_test_shared_output(OutputFormat::Concise, false, None);
+        let args = json!({
+            "title": "Review action",
+            "risk": "destructive",
+            "command": "do something",
+        });
+
+        renderer.bash_header_full(Some("call_1"), &args).unwrap();
+        renderer
+            .guardrail_verdict(false, "high", "low", "not authorized", "do something")
+            .unwrap();
+        renderer.tool_rejected().unwrap();
+
+        assert_eq!(output.transcript(), "=> Review action · error\n");
+    }
+
+    #[test]
+    fn full_streams_reasoning_without_an_indicator() {
+        let (mut renderer, output) =
+            Renderer::with_test_shared_output(OutputFormat::Full, false, None);
+
+        renderer
+            .reasoning_start(ReasoningVisibility::StreamedTrace)
+            .unwrap();
+        renderer.reasoning_delta("step one\n").unwrap();
+        renderer.reasoning_delta("step two").unwrap();
+        renderer.reasoning_end(Some((10, 4))).unwrap();
+
+        assert_eq!(output.transcript(), "step one\nstep two\n");
+        assert!(!output.transcript().contains("[thought"));
+    }
+
+    #[test]
+    fn full_streams_all_reasoning_summary_parts_in_order() {
+        let (mut renderer, output) =
+            Renderer::with_test_shared_output(OutputFormat::Full, false, None);
+
+        renderer
+            .reasoning_start(ReasoningVisibility::Opaque)
+            .unwrap();
+        renderer.reasoning_summary_delta(0, "first ").unwrap();
+        renderer.reasoning_summary_delta(0, "part").unwrap();
+        renderer.reasoning_summary_delta(1, "second part").unwrap();
+        renderer.reasoning_end(None).unwrap();
+
+        assert_eq!(output.transcript(), "first part\n\nsecond part\n");
+    }
+
+    #[test]
+    fn full_tool_keeps_complete_command_stdin_and_output() {
+        let (mut renderer, output) =
+            Renderer::with_test_shared_output(OutputFormat::Full, false, None);
+        let args = json!({
+            "title": "Run script",
+            "risk": "readonly",
+            "command": "printf one\nprintf two",
+            "stdin": "alpha\nbeta",
+        });
+        let command_output = (1..=8)
+            .map(|line| format!("line{line}\n"))
+            .collect::<String>();
+
+        renderer.bash_header_full(Some("call_1"), &args).unwrap();
+        renderer
+            .tool_start(Some("call_1"), "bash", &args, true)
+            .unwrap();
+        renderer
+            .bash_output(Some("call_1"), "bash", &command_output)
+            .unwrap();
+        renderer.tool_finished(0, Duration::from_millis(5)).unwrap();
+
+        let transcript = output.transcript();
+        assert!(transcript.contains("# Run script\n$ [readonly] printf one\nprintf two\n"));
+        assert!(transcript.contains("< alpha\nbeta\n"));
+        assert!(transcript.contains("line1\nline2\nline3\nline4\nline5\nline6\nline7\nline8\n"));
+        assert!(!transcript.contains("omitted"));
+        assert!(transcript.ends_with("✓ exit 0 · 5ms\n"));
+    }
+
     fn capture_renderer_transcript(
         turn_elapsed: Duration,
         trailing_prompt: Option<&str>,
     ) -> String {
         let (mut renderer, output) =
-            Renderer::with_test_shared_output(OutputFormat::Terminal, true, None);
+            Renderer::with_test_shared_output(OutputFormat::Detail, true, None);
 
         renderer
             .reasoning_start(ReasoningVisibility::StreamedTrace)
@@ -4149,7 +4594,7 @@ mod tests {
 
     fn capture_plain_reasoning_transcript() -> String {
         let (mut renderer, output, _stderr) =
-            Renderer::with_test_output(OutputFormat::Plain, false, false, None);
+            Renderer::with_test_output(OutputFormat::Detail, false, false, None);
 
         renderer
             .reasoning_start(ReasoningVisibility::StreamedTrace)

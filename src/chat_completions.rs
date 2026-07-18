@@ -682,8 +682,8 @@ mod tests {
                 StreamEvent::ReasoningDelta(text) => {
                     seen_events.push(format!("reasoning_delta:{text}"))
                 }
-                StreamEvent::ReasoningSummaryDelta(text) => {
-                    seen_events.push(format!("reasoning_summary_delta:{text}"))
+                StreamEvent::ReasoningSummaryDelta { part_index, text } => {
+                    seen_events.push(format!("reasoning_summary_delta:{part_index}:{text}"))
                 }
                 StreamEvent::ReasoningEnd => seen_events.push("reasoning_end".to_string()),
                 StreamEvent::TextDelta(text) => seen_events.push(format!("text:{text}")),
@@ -1122,7 +1122,7 @@ mod tests {
     }
 
     #[test]
-    fn streams_summary_text_only_for_the_active_first_summary_part() {
+    fn streams_every_summary_part_for_the_active_reasoning_item() {
         let mut state = ResponsesStreamState::default();
         let mut events = Vec::new();
         let mut on_event = |event| {
@@ -1147,14 +1147,21 @@ mod tests {
         ));
         assert!(matches!(
             events.get(1),
-            Some(StreamEvent::ReasoningSummaryDelta(text)) if text == "**Inspecting"
+            Some(StreamEvent::ReasoningSummaryDelta { part_index: 1, text })
+                if text == "ignored part"
         ));
         assert!(matches!(
             events.get(2),
-            Some(StreamEvent::ReasoningSummaryDelta(text)) if text == " renderer**\n"
+            Some(StreamEvent::ReasoningSummaryDelta { part_index: 0, text })
+                if text == "**Inspecting"
         ));
-        assert!(matches!(events.get(3), Some(StreamEvent::ReasoningEnd)));
-        assert_eq!(events.len(), 4);
+        assert!(matches!(
+            events.get(3),
+            Some(StreamEvent::ReasoningSummaryDelta { part_index: 0, text })
+                if text == " renderer**\n"
+        ));
+        assert!(matches!(events.get(4), Some(StreamEvent::ReasoningEnd)));
+        assert_eq!(events.len(), 5);
     }
 
     #[test]

@@ -275,28 +275,28 @@ builtin cd "$saved_pwd"
 HOME=$saved_home
 
 MU_ZSH_BIN=mu
-MU_ZSH_OUTPUT=terminal
+MU_ZSH_OUTPUT=detail
 MU_ZSH_SESSION_ID=abc123
 MU_ZSH_SESSION_SCOPE=$(_mu_zsh_current_scope_key)
 _mu_zsh_base_command_reply
-assert_command_reply "builds attached command" mu --output terminal -s abc123
+assert_command_reply "builds attached command" mu --output detail -s abc123
 
 MU_ZSH_SESSION_ID=
 MU_ZSH_SESSION_SCOPE=
 _mu_zsh_base_command_reply
-assert_command_reply "builds new-session command" mu --output terminal
+assert_command_reply "builds new-session command" mu --output detail
 MU_ZSH_BIN=$prompt_fake_bin/mu
 
 MU_ZSH_MODEL=openai/gpt
 MU_ZSH_MODEL_SCOPE=$(_mu_zsh_current_scope_key)
 _mu_zsh_base_command_reply
-assert_command_reply "builds pending-model command" "$prompt_fake_bin/mu" --output terminal --model openai/gpt
+assert_command_reply "builds pending-model command" "$prompt_fake_bin/mu" --output detail --model openai/gpt
 status_json=$(_mu_zsh_status_json)
 [[ "$status_json" == *"\"canonical\":\"openai/gpt\""* ]] || fail "status uses pending model"
 MU_ZSH_SESSION_ID=abc123
 MU_ZSH_SESSION_SCOPE=$(_mu_zsh_current_scope_key)
 _mu_zsh_base_command_reply
-assert_command_reply "builds attached pending-model command" "$prompt_fake_bin/mu" --output terminal -s abc123 --model openai/gpt
+assert_command_reply "builds attached pending-model command" "$prompt_fake_bin/mu" --output detail -s abc123 --model openai/gpt
 _mu_zsh_clear_model_state
 _mu_zsh_clear_session_state
 
@@ -314,14 +314,14 @@ rm -f "$tmp"
 
 export MU_ZSH_FAKE_LOG=${TMPDIR:-/tmp}/mu-zsh-test-${$}.log
 rm -f "$MU_ZSH_FAKE_LOG"
-MU_ZSH_OUTPUT=plain
+MU_ZSH_OUTPUT=detail
 MU_ZSH_SESSION_FILE=${TMPDIR:-/tmp}/mu-zsh-test-submit-${$}.session
 MU_ZSH_SESSION_ID=
 _mu_zsh_submit_prompt "first prompt"
 [[ "$MU_ZSH_SESSION_ID" == "created-session" ]] || fail "captures session id after first submit"
 
 _mu_zsh_submit_prompt "second prompt"
-grep -q -- "--output plain" "$MU_ZSH_FAKE_LOG" || fail "passes output mode"
+grep -q -- "--output detail" "$MU_ZSH_FAKE_LOG" || fail "passes output mode"
 grep -q -- "-s created-session" "$MU_ZSH_FAKE_LOG" || fail "passes session id on later submit"
 grep -q -- "prompt=first prompt" "$MU_ZSH_FAKE_LOG" || fail "sends first prompt on stdin"
 grep -q -- "prompt=second prompt" "$MU_ZSH_FAKE_LOG" || fail "sends second prompt on stdin"
@@ -329,7 +329,7 @@ grep -q -- "prompt=second prompt" "$MU_ZSH_FAKE_LOG" || fail "sends second promp
 rm -f "$MU_ZSH_FAKE_LOG" "$MU_ZSH_SESSION_FILE"
 
 MU_ZSH_BIN=$prompt_fake_bin/mu
-MU_ZSH_OUTPUT=plain
+MU_ZSH_OUTPUT=detail
 MU_ZSH_SESSION_ID=
 MU_ZSH_SESSION_SCOPE=
 command_candidates=("${(@f)$(_mu_zsh_slash_command_candidates)}")
@@ -411,11 +411,11 @@ fi
 
 rm -f "$MU_ZSH_FAKE_LOG"
 _mu_zsh_run_slash_command "/retry"
-grep -q -- "retry -s tracked-session --output plain" "$MU_ZSH_FAKE_LOG" || fail "retry slash command targets tracked session"
+grep -q -- "retry -s tracked-session --output detail" "$MU_ZSH_FAKE_LOG" || fail "retry slash command targets tracked session"
 _mu_zsh_run_slash_command "/model gpt"
 rm -f "$MU_ZSH_FAKE_LOG"
 _mu_zsh_run_slash_command "/retry"
-grep -q -- "retry -s tracked-session --model openai/gpt --output plain" "$MU_ZSH_FAKE_LOG" || fail "retry slash command forwards pending model"
+grep -q -- "retry -s tracked-session --model openai/gpt --output detail" "$MU_ZSH_FAKE_LOG" || fail "retry slash command forwards pending model"
 _mu_zsh_clear_model_state
 rm -f "$MU_ZSH_FAKE_LOG"
 _mu_zsh_run_slash_command "/compact"
@@ -427,10 +427,10 @@ compact_prompt=$(cat "$MU_ZSH_FAKE_LOG")
 [[ "$compact_prompt" == *$'prompt=Focus on authentication\nKeep concrete API shapes'* ]] || fail "focused compact pipes multiline instruction"
 rm -f "$MU_ZSH_FAKE_LOG"
 _mu_zsh_run_slash_command "/review.md"
-grep -q -- "--output plain -s tracked-session review.md" "$MU_ZSH_FAKE_LOG" || fail "custom slash command targets tracked session"
+grep -q -- "--output detail -s tracked-session review.md" "$MU_ZSH_FAKE_LOG" || fail "custom slash command targets tracked session"
 rm -f "$MU_ZSH_FAKE_LOG"
 _mu_zsh_run_slash_command "/review.md Focus on authentication"
-grep -q -- "--output plain -s tracked-session review.md" "$MU_ZSH_FAKE_LOG" || fail "custom slash command keeps tracked session with instruction"
+grep -q -- "--output detail -s tracked-session review.md" "$MU_ZSH_FAKE_LOG" || fail "custom slash command keeps tracked session with instruction"
 grep -Fxq -- "prompt=Focus on authentication" "$MU_ZSH_FAKE_LOG" || fail "custom slash command pipes instruction"
 rm -f "$MU_ZSH_FAKE_LOG"
 _mu_zsh_run_slash_command $'/review.md First line\nSecond line'
@@ -493,7 +493,7 @@ fi
 EOF
 chmod +x "$scope_fake_bin/mu"
 MU_ZSH_BIN=$scope_fake_bin/mu
-MU_ZSH_OUTPUT=plain
+MU_ZSH_OUTPUT=detail
 MU_ZSH_SESSION_FILE=${TMPDIR:-/tmp}/mu-zsh-scope-submit-${$}.session
 export MU_ZSH_SCOPE_LOG=${TMPDIR:-/tmp}/mu-zsh-scope-${$}.log
 rm -f "$MU_ZSH_SCOPE_LOG" "$MU_ZSH_SESSION_FILE"
@@ -511,7 +511,7 @@ MU_ZSH_MODEL_SCOPE=$(_mu_zsh_current_scope_key)
 
 builtin cd "$project_b/subdir"
 _mu_zsh_base_command_reply
-assert_command_reply "does not reuse another project's session before submitting there" "$scope_fake_bin/mu" --output plain
+assert_command_reply "does not reuse another project's session before submitting there" "$scope_fake_bin/mu" --output detail
 : > "$MU_ZSH_SCOPE_LOG"
 status_json=$(_mu_zsh_status_json)
 [[ "$status_json" == *"\"project_root\":\"$project_b\""* ]] || fail "status follows the current project"
@@ -519,7 +519,7 @@ status_json=$(_mu_zsh_status_json)
 
 builtin cd "$project_a/subdir"
 _mu_zsh_base_command_reply
-assert_command_reply "returns to the original scoped session and model after cd-ing back" "$scope_fake_bin/mu" --output plain -s session-project-a --model model-for-a
+assert_command_reply "returns to the original scoped session and model after cd-ing back" "$scope_fake_bin/mu" --output detail -s session-project-a --model model-for-a
 
 builtin cd "$project_b/subdir"
 _mu_zsh_submit_prompt "project b prompt"
@@ -529,7 +529,7 @@ _mu_zsh_submit_prompt "project b prompt"
 
 builtin cd "$project_a/subdir"
 _mu_zsh_base_command_reply
-assert_command_reply "forgets the first project's session once a new one starts elsewhere" "$scope_fake_bin/mu" --output plain
+assert_command_reply "forgets the first project's session once a new one starts elsewhere" "$scope_fake_bin/mu" --output detail
 
 builtin cd "$saved_pwd"
 MU_ZSH_BIN=$prompt_fake_bin/mu
@@ -591,7 +591,7 @@ cat > "$TEST_CAPTURE_STDIN"
 if [ -n "$MU_SESSION_FILE" ]; then
   printf '%s\n' "created-session" > "$MU_SESSION_FILE"
 fi
-if [ "$2" = terminal ]; then
+if [ "$2" = detail ]; then
   printf '%s\n\n' "[thought 100ms, 2 tokens]"
 fi
 printf '%s\n\n' "Hello! I'm your terminal agent."
@@ -665,7 +665,7 @@ print -rn -- 'hello'$'\n' > "$interactive_expected_stdin"
 cmp -- "$interactive_expected_stdin" "$interactive_capture_stdin" || fail "interactive prompt should be passed on stdin"
 
 interactive_args=("${(@f)$(<"$interactive_capture_args")}")
-expected_interactive_args=(--output terminal)
+expected_interactive_args=(--output detail)
 [[ "${(j:\0:)interactive_args}" == "${(j:\0:)expected_interactive_args}" ]] || fail "unexpected interactive args: ${interactive_args[*]}"
 
 no_prompt_sp_transcript=$tmpdir/no-prompt-sp-transcript
@@ -732,32 +732,32 @@ custom_slash_expected_stdin=$tmpdir/custom-slash-expected-stdin
 print -rn -- 'First line'$'\n''Second line' > "$custom_slash_expected_stdin"
 cmp -- "$custom_slash_expected_stdin" "$interactive_capture_stdin" || fail "custom slash instruction should preserve multiline text"
 interactive_args=("${(@f)$(<"$interactive_capture_args")}")
-expected_custom_slash_args=(--output terminal review.md)
+expected_custom_slash_args=(--output detail review.md)
 [[ "${(j:\0:)interactive_args}" == "${(j:\0:)expected_custom_slash_args}" ]] || fail "custom slash command should use the command path"
 
-plain_transcript=$tmpdir/plain-transcript
-plain_setup="$interactive_setup; MU_ZSH_OUTPUT=plain"
+concise_transcript=$tmpdir/concise-transcript
+concise_setup="$interactive_setup; MU_ZSH_OUTPUT=concise"
 rm -f -- "$interactive_capture_args" "$interactive_capture_stdin" "$interactive_capture_calls"
 interactive_status=0
 {
-  send_interactive_setup "$plain_setup"
-  print -rn -- $'\t'"plain prompt"$'\r'
+  send_interactive_setup "$concise_setup"
+  print -rn -- $'\t'"concise prompt"$'\r'
   sleep 0.4
   print -rn -- $'\x04'
-} | timeout 10 script -qfec 'TERM=xterm-256color zsh -df' "$plain_transcript" >/dev/null || interactive_status=$?
-(( interactive_status == 0 )) || fail "plain transcript exited with status $interactive_status"
+} | timeout 10 script -qfec 'TERM=xterm-256color zsh -df' "$concise_transcript" >/dev/null || interactive_status=$?
+(( interactive_status == 0 )) || fail "concise transcript exited with status $interactive_status"
 
-normalized=$(perl -pe 's/\e\[[0-?]*[ -\/]*[@-~]//g' "$plain_transcript" | col -b)
-after_submitted_prompt=${normalized##*$'mu> plain prompt\n'}
-[[ "$after_submitted_prompt" == *"Hello! I'm your terminal agent."* ]] || fail "plain output should follow the submitted prompt"
-raw_newline_count_between "$plain_transcript" 'plain prompt' "Hello! I'm your terminal agent."
-[[ "$REPLY" == 1 ]] || fail "plain prompt handoff should advance one raw line before output, saw $REPLY"
+normalized=$(perl -pe 's/\e\[[0-?]*[ -\/]*[@-~]//g' "$concise_transcript" | col -b)
+after_submitted_prompt=${normalized##*$'mu> concise prompt\n'}
+[[ "$after_submitted_prompt" == *"Hello! I'm your terminal agent."* ]] || fail "concise output should follow the submitted prompt"
+raw_newline_count_between "$concise_transcript" 'concise prompt' "Hello! I'm your terminal agent."
+[[ "$REPLY" == 1 ]] || fail "concise prompt handoff should advance one raw line before output, saw $REPLY"
 after_response=${normalized#*"Hello! I'm your terminal agent."}
-[[ "$after_response" == $'\n\n[mu] tokens: 12 in / 5 out  context: 25%\n\n'* ]] || fail "plain token summary should be a separate block after assistant output"
-[[ "$after_response" != *$'[mu] tokens: 12 in / 5 out  context: 25%\n\n\n'* ]] || fail "plain token summary should not leave two trailing empty lines"
+[[ "$after_response" == $'\n\n[mu] tokens: 12 in / 5 out  context: 25%\n\n'* ]] || fail "concise token summary should be a separate block after assistant output"
+[[ "$after_response" != *$'[mu] tokens: 12 in / 5 out  context: 25%\n\n\n'* ]] || fail "concise token summary should not leave two trailing empty lines"
 interactive_args=("${(@f)$(<"$interactive_capture_args")}")
-expected_plain_args=(--output plain)
-[[ "${(j:\0:)interactive_args}" == "${(j:\0:)expected_plain_args}" ]] || fail "unexpected plain interactive args: ${interactive_args[*]}"
+expected_concise_args=(--output concise)
+[[ "${(j:\0:)interactive_args}" == "${(j:\0:)expected_concise_args}" ]] || fail "unexpected concise interactive args: ${interactive_args[*]}"
 
 model_switch_transcript=$tmpdir/model-switch-transcript
 rm -f -- "$interactive_capture_args" "$interactive_capture_stdin" "$interactive_capture_calls"

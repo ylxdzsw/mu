@@ -63,7 +63,7 @@ The parent should check the child exit status before trusting the answer.
 
 ## Asynchronous Delegation
 
-Use `--output plain` for async delegation so the child writes a readable
+Use `--output detail` for async delegation so the child writes a readable
 transcript while working. Do not use `cmd &` inside a normal bash tool call;
 ordinary bash children are cleaned up with the tool process group. Use
 background-task skill instead.

@@ -189,8 +189,8 @@ repeated turn invocations, not a replacement runtime.
   definition and an execute function.
 - **Provider client.** Streaming HTTP to the model API behind one internal
   interface.
-- **Renderer.** Sole writer to output; render the same turn as plain text or
-  terminal UI (§5).
+- **Renderer.** Sole writer to output; apply the selected output density and
+  automatically detected interactivity (§5).
 - **Store.** SQLite load/append in either project-local or global scope (§11).
 
 The binary runs on a single `tokio` runtime. There is no input thread or line
@@ -203,15 +203,15 @@ The core binary is invoked one of two ways: as a **turn** (default, reads a
 prompt on stdin) or as a **subcommand** (management; manual compaction alone
 accepts optional non-terminal stdin as a custom focus). The surface is small:
 
-- `mu [-s <id>] [-c] [--model <id>] [-a <file>] [--output final|plain|terminal]`
+- `mu [-s <id>] [-c] [--model <id>] [-a <file>] [--output final|concise|detail|full]`
   — run one turn; prompt read from stdin. `-a/--attach` is repeatable and accepts
   supported image or audio files.
-- `mu [-s <id>] [-c] [--model <id>] [-a <file>] [--output final|plain|terminal] <prompt-file>`
+- `mu [-s <id>] [-c] [--model <id>] [-a <file>] [--output final|concise|detail|full] <prompt-file>`
   — run one turn from a prompt file; if the first line starts with `#!`, drop
   it before sending the prompt. A `mu` shebang may contain exactly
   `--model <id>` as a turn-local default. Non-terminal stdin is appended as a
   custom instruction. `-a/--attach` is repeatable.
-- `mu [-s <id>] [-c] [--model <id>] [--output final|plain|terminal] <custom-command>`
+- `mu [-s <id>] [-c] [--model <id>] [--output final|concise|detail|full] <custom-command>`
   — run a discovered shebang command from the active project/global `.mu`
   instruction index. Command names are relative `.mu` paths including
   extensions; built-in subcommands and explicit prompt paths win.
@@ -308,7 +308,7 @@ This is the exact sequence the binary follows for one turn invocation:
    d. **Persist the completed assistant message** (including any `tool_calls`)
       to the DB and append it to the context list.
    e. If `finish_reason` is `tool_calls`: split the calls into maximal
-      contiguous batches of eligible readonly work. `plain` and `terminal` may
+      contiguous batches of eligible readonly work. All output densities may
       execute contiguous `risk:"readonly"` `bash` calls concurrently, but
       **persist tool result
       messages** (`role: "tool"`, with their `tool_call_id`) in the model's
@@ -403,12 +403,12 @@ and stdin. This is an execution optimization only: stored tool-call records,
 stored tool messages, and the next model request still see the original
 assistant tool-call order.
 
-**Terminal visibility.** While a tool call has started but its title has not
-begun streaming, styled terminal output shows a mutable
+**Detailed visibility.** In `detail` output, while a tool call has started but
+its title has not begun streaming, interactive output shows a mutable
 `[preparing toolcall]` indicator. The indicator is cleared when `bash` begins
-committing its `# <title>` line, followed by a `$ <command>` line. In styled
-terminal output, `#` shares the title styling and `$` shares the command's risk
-color; plain output instead includes an explicit `[risk]` label. If the call
+committing its `# <title>` line, followed by a `$ <command>` line. In interactive
+output, `#` shares the title styling and `$` shares the command's risk color;
+redirected output instead includes an explicit `[risk]` label. If the call
 includes a `cwd` field whose
 resolved path differs from `mu`'s process working directory, it then prints an
 `@ <raw cwd>` line using the exact `cwd` string supplied by the agent. If the
@@ -459,9 +459,11 @@ fall back to temp scripts.
 
 ## 5. Output and rendering
 
-`mu` supports three output formats: `final`, `plain`, and `terminal`. They are
-different renderings of the same agent turn and must not imply different agent
-behavior.
+`mu` supports four output densities: `final`, `concise`, `detail`, and `full`.
+They are different renderings of the same agent turn and must not imply
+different agent behavior. `detail` is the default.
+The removed `plain` and `terminal` values are rejected rather than retained as
+aliases.
 
 - **Final output** is for supervisor agents invoking `mu` as a subagent. It
   does not stream. On success, stdout is exactly the final raw assistant message
@@ -472,24 +474,34 @@ behavior.
   behave the same as in human-facing modes. On fatal failure after retry
   exhaustion or any other unrecovered error, stdout is `error: <message>`
   followed by one newline and the process exits non-zero.
-- **Plain text** is for simple scripting and low-friction terminal use. It
-  prioritizes assistant/tool text and avoids terminal-specific control.
-- **Terminal output** is for humans in an interactive terminal. It may use color
-  and may update recent status lines for in-progress activity, but it must keep
-  normal scrollback. It must not use an alternate screen, clear the screen, or
-  require mouse interaction.
-**Concurrency contract.** All output modes may run contiguous readonly
-`bash` calls concurrently. `terminal` keeps append-only scrollback and the
-one-live-line rule: at most one bash call owns live terminal streaming at a
-time, even while later readonly calls are already running in the background.
-`plain` follows the same ordered human-facing display without live-line redraws.
-`final` suppresses the live transcript display while preserving the same
-execution, ordering, and persistence semantics.
+- **Concise output** keeps assistant text and ordinary notices but reduces every
+  bash call to one `=> <title> · exit <code>` line. Calls that fail without a
+  numeric exit code end in `· error`. Command, cwd, stdin, output, duration, and
+  successful guardrail detail are suppressed. Reasoning progress is ephemeral
+  and never becomes committed transcript output.
+- **Detail output** is the normal human transcript. It preserves the existing
+  thought line, streamed/capped tool header, output preview, and exit line.
+- **Full output** streams all provider-visible reasoning trace or reasoning
+  summary without a thought indicator, and shows the complete command, stdin,
+  and redacted tool output. Model-facing tool-result truncation remains in force.
 
-The renderer is the sole writer to stdout/stderr and enforces the selected
-format. It may style output only when stdout is a TTY and `--output terminal` is
-selected. It never clears the screen, uses an alternate screen, or requires
-mouse interaction. Plain output is always ANSI-free.
+Interactivity is independent from density and is not configurable. Stdout TTY
+detection enables ANSI styling, parsed terminal Markdown, and the single mutable
+live line in every non-final density. Redirected stdout is sequential and
+ANSI-free. `final` ignores interactivity. Interactive rendering keeps normal
+scrollback and never uses an alternate screen, clears the screen, or requires
+mouse interaction.
+
+**Concurrency contract.** All output modes may run contiguous readonly
+`bash` calls concurrently. Interactive output keeps append-only scrollback and
+the one-live-line rule: at most one bash call owns live terminal presentation at
+a time, even while later readonly calls are already running in the background.
+Redirected output follows the same ordered display without live-line redraws.
+`final` suppresses the transcript while preserving execution, ordering, and
+persistence semantics.
+
+The renderer is the sole writer to stdout/stderr and independently enforces the
+selected density and detected interactivity.
 
 Assistant Markdown is parsed on TTYs. The renderer commits only output whose
 terminal representation is stable: ordinary prose streams as soon as it is not
@@ -505,7 +517,7 @@ tables are buffered until the table is complete enough to align and commit once,
 so columns never require rewriting prior output. Each column is at most 80
 visible terminal cells wide; longer header or body cells wrap into aligned
 continuation rows without truncating their content. While a confirmed table is
-buffered, TTY terminal output shows a mutable `[table ~N tokens]` live indicator;
+buffered, interactive output shows a mutable `[table ~N tokens]` live indicator;
 the completed table clears and overwrites that indicator instead of committing a
 final table-status line. Markdown features outside this supported terminal
 subset are emitted as raw Markdown rather than partially rendered. When stdout
@@ -514,7 +526,7 @@ produced them, preserving raw Markdown for downstream consumers.
 
 ### 5.1 TTY block-spacing contract
 
-Terminal output is structured as a sequence of top-level transcript blocks:
+Interactive output is structured as a sequence of top-level transcript blocks:
 the zsh `mu>` prompt, assistant text, committed thought lines, bash tool blocks,
 notices, and similar human-facing sections. Spacing has exactly one owner at
 each boundary: zsh owns the transition from a submitted `mu>` prompt to the
@@ -530,8 +542,8 @@ renderer-to-renderer block transitions.
   block may be a live thought indicator, assistant text, a tool call, or a
   notice. In styled TTY output, provider-emitted whitespace before it is
   boundary noise: it does not render and does not mark a block as committed.
-  Blank lines inside visible assistant content remain intact, and plain output
-  continues to preserve raw assistant deltas.
+  Blank lines inside visible assistant content remain intact, and redirected
+  output continues to preserve raw assistant deltas.
 - The *next* top-level block owns that separator. Committed block formatters
   should end with exactly one newline; they must not rely on trailing blank
   lines baked into their own text.
@@ -547,7 +559,7 @@ renderer-to-renderer block transitions.
   transcript output, it has exactly one empty line before the summary and one
   empty line between the summary and the next shell prompt.
 
-This contract applies to human-facing `terminal` and `plain` output.
+This contract applies to `concise`, `detail`, and `full` output.
 
 **Stream routing (explicit).** The conversation transcript goes to **stdout**:
 tool presentation, tool failures, Bash output, and assistant text. Fatal process
@@ -556,47 +568,50 @@ captures the complete portable transcript while fatal diagnostics/summary
 remain visible. Stdout TTY detection selects rich versus portable rendering;
 stderr TTY detection suppresses the summary when redirected.
 
-- **Tool presentation.** Styled terminal output shows `[preparing toolcall]` as
-  its one mutable live line after a tool call starts and before title bytes are
-  available; plain output omits this transient status. Bash then streams the
-  active command header as the model composes the tool-call arguments:
-  `# <title>` first, then `$ <command>` once the `risk` value is available so
-  terminal output can color the whole command line consistently. The title and
-  command are append-only and capped in place; the command display is the first
-  decoded line with a byte cap. If fields arrive out of order, display buffers
-  until the ordered header can be committed.
-  If a `stdin` field is provided, the optional `< [stdin N bytes]` summary starts
-  only after the command line has committed; styled terminal output may update
-  that summary as the only live line, while plain output commits it once the
-  final byte count is known.
-  Later tool-call headers are buffered until their original-order display slot
-  becomes active. Once execution begins, a header that was already streamed is
-  not printed a second time. `plain` shows explicit risk labels such as
-  `[readonly]` where `terminal` uses color. Both human-facing outputs stream the
-  same output head preview, then print the omission marker only once at tool
-  completion if a middle section was actually omitted, followed by any reserved
-  tail and a matching exit line. Full tool results still follow the shared
-  model-context truncation policy (§4). Multiple tool calls in one assistant
-  message are displayed in provider order. In `plain` and `terminal`,
-  concurrent readonly batches still present exactly one active bash stream at a
-  time in original tool order; later calls may already be running, but their
-  headers and execution output are buffered until they become the active slot.
-- **Assistant text.** `plain` and redirected output stream raw Markdown deltas
-  unchanged. TTY `terminal` display commits parsed Markdown as soon as the
-  relevant unit is stable: prose streams token-by-token unless an inline span is
-  open, list/heading/quote content streams after the prefix is stable, tables
-  wait for the complete table, and unsupported Markdown stays raw.
-- **Reasoning progress.** A definite reasoning-block start immediately creates
-  the terminal's mutable thought line. Chat Completions reasoning keeps the
-  existing `[thought <duration>, <tokens> tokens]` form, using its streamed
-  reasoning text for the live estimate. Responses reasoning is opaque and uses
-  `[thought <duration>]` without a per-thought token count. When an opted-in
-  Responses summary begins with a complete bold-only line or ATX heading, Mu
-  conservatively extracts that first line and updates the live display to
-  `[thought <duration>] <title>`; prose, missing summaries, and unrecognized
-  formats remain timer-only. Titles are normalized to one line and capped at 80
-  visible terminal cells. Reasoning completion commits the current thought line
-  in both human-facing modes even when no reasoning or summary text was exposed.
+- **Detail tool presentation.** Interactive output shows `[preparing toolcall]`
+  as its one mutable live line before title bytes arrive; redirected output
+  omits it. Bash then streams `# <title>` and `$ <command>` in order. Interactive
+  output colors the command by risk, while redirected output includes an
+  explicit label such as `[readonly]`. The command is capped to its first
+  decoded line, optional stdin is summarized as `< [stdin N bytes]`, command
+  output uses the ordered head/omission/tail preview, and completion prints the
+  matching exit line. Headers already streamed are not duplicated at execution.
+- **Concise tool presentation.** Interactive output replaces
+  `[preparing toolcall]` once both title and risk are complete with a risk-colored
+  live `=> <title>`. Completion clears it and commits exactly
+  `=> <title> · exit <code>` or `=> <title> · error`, without duration.
+  Redirected output emits only the completed ANSI-free line and does not add a
+  risk label. Risk colors are cyan for readonly, yellow for reversible, red for
+  destructive, and dim for missing/unknown risk. Command, cwd, stdin, output,
+  duration, and successful guardrail detail are suppressed. Consecutive calls
+  form one block with no empty lines between them.
+- **Full tool presentation.** Full retains the detailed title, risk, cwd, and
+  exit/error presentation, but `$ ` contains the complete decoded multiline
+  command, `< ` contains complete stdin instead of a byte summary, and every
+  redacted/sanitized output byte is displayed without a screen preview or
+  omission marker. Model-context truncation and spill files from §4 are
+  unchanged.
+- **Tool ordering.** Multiple calls are displayed in provider order. In
+  `detail` and `full`, concurrent readonly batches still present one active bash
+  stream at a time; later calls may already run in the background. Concise
+  buffers each outcome and commits its one-line record in the same order.
+- **Assistant text.** Redirected output streams raw Markdown deltas unchanged.
+  Interactive output commits parsed Markdown as soon as the relevant unit is
+  stable: prose streams token-by-token unless an inline span is open,
+  list/heading/quote content streams after the prefix is stable, tables wait for
+  completion, and unsupported Markdown stays raw.
+- **Reasoning progress.** Detail creates the interactive mutable thought line.
+  Chat reasoning uses `[thought <duration>, <tokens> tokens]`; opaque Responses
+  reasoning uses `[thought <duration>]` with an optional conservative title from
+  the first bold-only or ATX-heading summary line. Detail commits that line when
+  reasoning finishes, including when no exposed reasoning text exists. Concise
+  uses the same interactive indicator but erases it at completion and is silent
+  when redirected. Immediately after a concise tool it occupies the next line
+  without an empty separator, and ephemeral reasoning does not break a
+  consecutive tool block. Full streams Chat reasoning deltas and every exposed
+  Responses summary part directly in provider order, without a live or
+  committed thought indicator; providers exposing neither produce no reasoning
+  output.
 - **Errors.** Always printed and clearly prefixed, with TTY styling when
   available. Fatal turn failure produces a non-zero process exit code so the
   shell's `$?` is meaningful.
@@ -615,14 +630,14 @@ when the provider does not report it; `context` is the new
 `total_tokens` ÷ model context window. This is the *only* stderr output in the normal case. It appears after all
 stdout, and goes to stderr so it stays out of a captured stdout transcript. It
 is suppressed if stderr is not a TTY (piped/redirected), since it would pollute
-log files. In both human-facing modes it is followed by one blank line so the
+log files. In every non-final density it is followed by one blank line so the
 next shell prompt is visually separated from the completed turn.
 
-Plain mode avoids terminal-only control sequences so it remains suitable for
-scripts. Human terminal mode may show progress for in-flight work, but committed
-transcript content is never erased from scrollback. When
-`terminal_bell.enabled` is true, terminal mode also emits a BEL (`\a`) after a
-successful turn's summary once total turn duration meets
+Redirected stdout avoids terminal-only control sequences so every density
+remains suitable for scripts. Interactive output may show progress for
+in-flight work, but committed transcript content is never erased from
+scrollback. When `terminal_bell.enabled` is true, interactive non-final output
+also emits a BEL (`\a`) after a successful turn's summary once total turn duration meets
 `terminal_bell.min_duration_ms` (default 10s).
 
 ---
@@ -651,9 +666,11 @@ Submitting a non-empty prompt runs `mu` as an ordinary foreground child process.
 The plugin passes `--session` after the first turn, forwards configured output
 mode, writes the prompt to the child process's stdin, waits for the turn to
 finish, and then redraws `mu>` with the same session id.
+`MU_ZSH_OUTPUT` selects the density and defaults to `detail`; it does not control
+whether the child is interactive.
 After ZLE commits the submitted prompt line to scrollback, the plugin prints one
 empty line before child-process output starts, independent of whether the child
-uses `terminal` or `plain` human-facing output.
+uses `concise`, `detail`, or `full` output.
 
 Consequences:
 

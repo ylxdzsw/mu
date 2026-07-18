@@ -144,20 +144,22 @@ fn error_output_format() -> cli::OutputFormat {
     while let Some(arg) = args.next() {
         if arg == "--output" {
             return match args.next().as_deref() {
-                Some("plain") => cli::OutputFormat::Plain,
                 Some("final") => cli::OutputFormat::Final,
-                _ => cli::OutputFormat::Terminal,
+                Some("concise") => cli::OutputFormat::Concise,
+                Some("full") => cli::OutputFormat::Full,
+                _ => cli::OutputFormat::Detail,
             };
         }
         if let Some(value) = arg.strip_prefix("--output=") {
             return match value {
-                "plain" => cli::OutputFormat::Plain,
                 "final" => cli::OutputFormat::Final,
-                _ => cli::OutputFormat::Terminal,
+                "concise" => cli::OutputFormat::Concise,
+                "full" => cli::OutputFormat::Full,
+                _ => cli::OutputFormat::Detail,
             };
         }
     }
-    cli::OutputFormat::Terminal
+    cli::OutputFormat::Detail
 }
 
 fn write_final_stdout(text: Option<&str>) -> io::Result<()> {
@@ -520,8 +522,7 @@ async fn run() -> Result<()> {
                 model: models::resolve_model_ref(&config, &session_state.model)?,
             };
             let provider = build_provider(&config, &request.model.provider_id)?;
-            let _lock =
-                acquire_session_lock_or_exit(&store, &session, cli::OutputFormat::Terminal)?;
+            let _lock = acquire_session_lock_or_exit(&store, &session, cli::OutputFormat::Detail)?;
             compaction::run_compaction(
                 &store,
                 &config,
@@ -1003,7 +1004,7 @@ mod tests {
     #[test]
     fn prompt_file_rejects_other_mu_shebang_arguments() {
         let path = temp_file_path("invalid-shebang");
-        std::fs::write(&path, "#!/usr/bin/env -S mu --output plain\nhello\n").unwrap();
+        std::fs::write(&path, "#!/usr/bin/env -S mu --output detail\nhello\n").unwrap();
         let mut stdin = Cursor::new("");
         let error =
             load_prompt_with_stdin(PromptSource::File(path.clone()), true, &mut stdin).unwrap_err();

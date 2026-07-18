@@ -106,9 +106,14 @@ Choose output for the caller:
 
 ```sh
 mu --output final prompt.md       # final assistant message only
-mu --output plain prompt.md       # sequential text, suitable for logs
-mu --output terminal prompt.md    # interactive terminal rendering (default)
+mu --output concise prompt.md     # assistant text plus one-line tool calls
+mu --output detail prompt.md      # normal human transcript (default)
+mu --output full prompt.md        # complete reasoning and tool details
 ```
+
+`--output` controls brevity, not terminal behavior. Mu automatically enables
+live lines, color, and rich Markdown when stdout is a terminal; redirected
+output is sequential and ANSI-free.
 
 Inspect sessions and resolved state with `mu session list`, `mu session
 transcript --session <id>`, and `mu status --json`. Run `mu --help` for the full
@@ -137,7 +142,7 @@ CLI surface.
   per-turn model and reasoning-effort overrides.
 - Persistent global or project-scoped sessions, continuation, transcripts,
   automatic context compaction, and interrupted-turn recovery.
-- Streaming terminal and plain-text renderers plus a final-message-only mode.
+- Four output densities with automatic interactive-terminal rendering.
 - Image and audio attachments from both the CLI and zsh prompt mode.
 - Reusable prompt files, executable prompts, slash commands, project/user
   instructions, and conditionally available skills.

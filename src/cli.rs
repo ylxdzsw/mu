@@ -36,7 +36,7 @@ pub struct TurnArgs {
     #[arg(short = 'a', long = "attach", value_name = "FILE")]
     pub attachments: Vec<PathBuf>,
 
-    #[arg(long, value_enum, default_value_t = OutputFormat::Terminal)]
+    #[arg(long, value_enum, default_value_t = OutputFormat::Detail)]
     pub output: OutputFormat,
 }
 
@@ -45,15 +45,16 @@ pub struct RetryArgs {
     #[command(flatten)]
     pub selection: SelectionArgs,
 
-    #[arg(long, value_enum, default_value_t = OutputFormat::Terminal)]
+    #[arg(long, value_enum, default_value_t = OutputFormat::Detail)]
     pub output: OutputFormat,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum OutputFormat {
     Final,
-    Plain,
-    Terminal,
+    Concise,
+    Detail,
+    Full,
 }
 
 #[derive(Subcommand, Debug)]
@@ -143,7 +144,7 @@ mod tests {
         let args = Args::try_parse_from([
             "mu",
             "--output",
-            "plain",
+            "detail",
             "--model",
             "gpt-test",
             "-a",
@@ -155,7 +156,7 @@ mod tests {
         .unwrap();
         assert_eq!(args.prompt_file, Some(PathBuf::from("prompt.md")));
         assert!(args.command.is_none());
-        assert_eq!(args.turn.output, OutputFormat::Plain);
+        assert_eq!(args.turn.output, OutputFormat::Detail);
         assert_eq!(args.turn.selection.model.as_deref(), Some("gpt-test"));
         assert_eq!(
             args.turn.attachments,
@@ -167,6 +168,28 @@ mod tests {
     fn parses_final_output_mode() {
         let args = Args::try_parse_from(["mu", "--output", "final"]).unwrap();
         assert_eq!(args.turn.output, OutputFormat::Final);
+    }
+
+    #[test]
+    fn defaults_to_detail_output_mode() {
+        let args = Args::try_parse_from(["mu"]).unwrap();
+        assert_eq!(args.turn.output, OutputFormat::Detail);
+    }
+
+    #[test]
+    fn parses_all_output_modes_and_rejects_removed_values() {
+        for (value, expected) in [
+            ("final", OutputFormat::Final),
+            ("concise", OutputFormat::Concise),
+            ("detail", OutputFormat::Detail),
+            ("full", OutputFormat::Full),
+        ] {
+            let args = Args::try_parse_from(["mu", "--output", value]).unwrap();
+            assert_eq!(args.turn.output, expected);
+        }
+        for removed in ["plain", "terminal"] {
+            assert!(Args::try_parse_from(["mu", "--output", removed]).is_err());
+        }
     }
 
     #[test]
@@ -201,7 +224,7 @@ mod tests {
             "--model",
             "opencode/mimo-v2.5-free",
             "--output",
-            "plain",
+            "detail",
         ])
         .unwrap();
         match args.command {
@@ -211,7 +234,7 @@ mod tests {
                     retry.selection.model.as_deref(),
                     Some("opencode/mimo-v2.5-free")
                 );
-                assert_eq!(retry.output, OutputFormat::Plain);
+                assert_eq!(retry.output, OutputFormat::Detail);
             }
             other => panic!("expected retry command, got {other:?}"),
         }

@@ -674,7 +674,7 @@ mod tests {
     #[test]
     fn detects_permissive_mu_shebangs() {
         assert!(is_mu_shebang("#!/usr/bin/env mu"));
-        assert!(is_mu_shebang("#!/usr/bin/env -S mu --output plain"));
+        assert!(is_mu_shebang("#!/usr/bin/env -S mu --output detail"));
         assert!(is_mu_shebang("#!/usr/bin/mu"));
         assert!(!is_mu_shebang("#!/usr/bin/env bash"));
         assert!(!is_mu_shebang("not a shebang"));
@@ -699,7 +699,7 @@ mod tests {
     fn rejects_other_mu_shebang_arguments() {
         for line in [
             "#!/usr/bin/env -S mu --model",
-            "#!/usr/bin/env -S mu --output plain",
+            "#!/usr/bin/env -S mu --output detail",
             "#!/usr/bin/env -S mu --model=openai/gpt-5",
             "#!/usr/bin/env -S mu --model openai/gpt-5 extra",
             "#!/usr/bin/env -S mu --model one --model two",
@@ -715,7 +715,7 @@ mod tests {
         let path = root.join("review.md");
         fs::write(
             &path,
-            "#!/usr/bin/env -S mu --output plain\nReview the tree.\n",
+            "#!/usr/bin/env -S mu --output detail\nReview the tree.\n",
         )
         .unwrap();
 

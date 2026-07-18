@@ -326,7 +326,7 @@ pub enum StreamEvent {
     TextDelta(String),
     ReasoningStart(ReasoningVisibility),
     ReasoningDelta(String),
-    ReasoningSummaryDelta(String),
+    ReasoningSummaryDelta { part_index: usize, text: String },
     ReasoningEnd,
     ToolCallDelta(ToolCallDelta),
     Tick,
