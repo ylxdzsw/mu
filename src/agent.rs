@@ -14,7 +14,7 @@ use crate::provider::{
     approx_tokens,
 };
 use crate::renderer::Renderer;
-use crate::store::{ReviewRecord, Store, ToolCallRecord};
+use crate::store::{ReviewRecord, Store, ToolCallRecord, TurnAttemptCompletion};
 use crate::tools::{BashRisk, ExecutionMode, ToolContext, ToolResult};
 use crate::{bash, tools};
 use bash::RunningBash;
@@ -27,6 +27,42 @@ pub struct TurnResult {
     /// gauge and `session.last_total_tokens`.
     pub context_tokens: u64,
     pub final_assistant: Option<String>,
+}
+
+#[derive(Default)]
+struct TurnAudit {
+    current_partial_output: String,
+    abandoned_partial_output: String,
+    provider_request_count: u32,
+    iteration_count: u32,
+    retry_count: u32,
+    context_tokens: u64,
+}
+
+impl TurnAudit {
+    fn begin_provider_request(&mut self) {
+        self.provider_request_count = self.provider_request_count.saturating_add(1);
+        self.current_partial_output.clear();
+    }
+
+    fn abandon_provider_request(&mut self) {
+        self.abandoned_partial_output
+            .push_str(&self.current_partial_output);
+        self.current_partial_output.clear();
+    }
+
+    fn commit_provider_response(&mut self) {
+        self.current_partial_output.clear();
+    }
+
+    fn partial_output(&self) -> Option<String> {
+        if self.abandoned_partial_output.is_empty() && self.current_partial_output.is_empty() {
+            return None;
+        }
+        let mut output = self.abandoned_partial_output.clone();
+        output.push_str(&self.current_partial_output);
+        Some(output)
+    }
 }
 
 struct ConcurrentBashExecution<'a> {
@@ -71,6 +107,7 @@ pub struct AgentLoop<'a> {
     pub store: &'a Store,
     pub session_id: &'a str,
     pub request: RequestOptions,
+    pub attempt_kind: &'a str,
     pub model_context_window: Option<u64>,
     pub renderer: &'a mut Renderer,
     pub state_dir: &'a Path,
@@ -78,6 +115,39 @@ pub struct AgentLoop<'a> {
 
 impl<'a> AgentLoop<'a> {
     pub async fn run_turn(&mut self) -> Result<TurnResult> {
+        let attempt_id = self.store.start_turn_attempt(
+            self.session_id,
+            self.attempt_kind,
+            &self.request.model.canonical,
+        )?;
+        let started = Instant::now();
+        let mut audit = TurnAudit::default();
+        let result = self.run_turn_inner(&mut audit).await;
+        let partial_output = audit.partial_output();
+        let error_text = result.as_ref().err().map(|error| error.to_string());
+        let (outcome, error_class) = result
+            .as_ref()
+            .err()
+            .map(classify_turn_error)
+            .unwrap_or(("completed", None));
+        self.store.finish_turn_attempt(
+            attempt_id,
+            TurnAttemptCompletion {
+                outcome,
+                error_class,
+                error: error_text.as_deref(),
+                partial_output: partial_output.as_deref(),
+                provider_request_count: audit.provider_request_count,
+                iteration_count: audit.iteration_count,
+                retry_count: audit.retry_count,
+                duration_ms: started.elapsed().as_millis().min(u64::MAX as u128) as u64,
+                context_tokens: audit.context_tokens,
+            },
+        )?;
+        result
+    }
+
+    async fn run_turn_inner(&mut self, audit: &mut TurnAudit) -> Result<TurnResult> {
         bash::reset_cancellation_state();
         bash::install_signal_forwarder();
         compaction::maybe_compact(
@@ -111,6 +181,7 @@ impl<'a> AgentLoop<'a> {
         const MAX_LIVE_PROVIDER_RETRIES: u32 = 3;
 
         for iteration in 0..max_iter {
+            audit.iteration_count = (iteration + 1).min(u32::MAX as usize) as u32;
             // Proactive compaction (SPEC §11 Tier 2): `maybe_compact` only runs
             // once before the turn, but a single turn can add many large tool
             // results. Re-check the growing context before each subsequent model
@@ -146,9 +217,13 @@ impl<'a> AgentLoop<'a> {
 
             let mut command_headers = StreamingCommandHeaders::default();
             let stream_result = loop {
+                audit.begin_provider_request();
                 let mut on_stream_event = |event: StreamEvent| -> Result<(), ProviderError> {
                     let result = match event {
-                        StreamEvent::TextDelta(text) => self.renderer.assistant_text(&text),
+                        StreamEvent::TextDelta(text) => {
+                            audit.current_partial_output.push_str(&text);
+                            self.renderer.assistant_text(&text)
+                        }
                         StreamEvent::ReasoningStart(visibility) => {
                             self.renderer.reasoning_start(visibility)
                         }
@@ -189,6 +264,8 @@ impl<'a> AgentLoop<'a> {
                     Err(ProviderError::ContextLength)
                         if overflow_retries < MAX_OVERFLOW_RETRIES =>
                     {
+                        audit.abandon_provider_request();
+                        audit.retry_count = audit.retry_count.saturating_add(1);
                         overflow_retries += 1;
                         compaction::run_compaction(
                             self.store,
@@ -208,6 +285,8 @@ impl<'a> AgentLoop<'a> {
                         if error.retryable_for_live_turn()
                             && live_provider_retries < MAX_LIVE_PROVIDER_RETRIES =>
                     {
+                        audit.abandon_provider_request();
+                        audit.retry_count = audit.retry_count.saturating_add(1);
                         live_provider_retries += 1;
                         self.renderer.turn_retry(
                             live_provider_retries as u64,
@@ -230,11 +309,13 @@ impl<'a> AgentLoop<'a> {
                 total_usage.reasoning_output_tokens += u.reasoning_output_tokens;
                 total_usage.total_tokens += u.total_tokens;
                 context_tokens = u.total_tokens;
+                audit.context_tokens = context_tokens;
             }
 
             let msg_id = self
                 .store
                 .append_message(self.session_id, &stream_result.message)?;
+            audit.commit_provider_response();
             context.push(stream_result.message.clone());
 
             match stream_result.finish_reason {
@@ -381,6 +462,8 @@ impl<'a> AgentLoop<'a> {
                                                 risk: risk.as_ref().map(|risk| risk.as_str()),
                                                 output: &output,
                                                 status: "error",
+                                                exit_code: None,
+                                                duration_ms: None,
                                             })?;
                                             cursor += 1;
                                             continue;
@@ -497,12 +580,17 @@ impl<'a> AgentLoop<'a> {
         context: &mut Vec<Message>,
         emit_renderer: bool,
     ) -> Result<()> {
-        let (output, artifacts, status) = match result {
+        let (output, artifacts, status, exit_code) = match result {
             Ok(result) => {
                 if emit_renderer {
                     self.renderer.tool_finished(result.exit_code, elapsed)?;
                 }
-                (result.output, result.artifacts, "ok")
+                (
+                    result.output,
+                    result.artifacts,
+                    "ok",
+                    Some(result.exit_code),
+                )
             }
             Err(error) => {
                 let message = format!("error: {error}");
@@ -514,7 +602,7 @@ impl<'a> AgentLoop<'a> {
                         elapsed,
                     )?;
                 }
-                (message, Vec::new(), "error")
+                (message, Vec::new(), "error", None)
             }
         };
 
@@ -529,6 +617,8 @@ impl<'a> AgentLoop<'a> {
                 risk: risk.as_ref().map(|risk| risk.as_str()),
                 output: &output,
                 status,
+                exit_code,
+                duration_ms: Some(elapsed.as_millis().min(u64::MAX as u128) as u64),
             },
             &output,
             &artifacts,
@@ -642,6 +732,23 @@ impl<'a> AgentLoop<'a> {
         self.renderer
             .bash_output(Some(&exec.call.id), &exec.call.function.name, &next)?;
         Ok(true)
+    }
+}
+
+fn classify_turn_error(error: &anyhow::Error) -> (&'static str, Option<&'static str>) {
+    let message = format!("{error:#}").to_ascii_lowercase();
+    if bash::cancellation_requested() || message.contains("turn interrupted") {
+        ("interrupted", Some("interrupted"))
+    } else if message.contains("provider error") || message.contains("transport error") {
+        ("error", Some("provider"))
+    } else if message.contains("context length") {
+        ("error", Some("context_length"))
+    } else if message.contains("max iterations") {
+        ("error", Some("max_iterations"))
+    } else if message.contains("guardrail") {
+        ("error", Some("guardrail"))
+    } else {
+        ("error", Some("internal"))
     }
 }
 
@@ -1296,6 +1403,22 @@ mod tests {
         step: Mutex<usize>,
     }
 
+    struct PartialFailureProvider;
+
+    #[async_trait(?Send)]
+    impl Provider for PartialFailureProvider {
+        async fn stream_chat(
+            &self,
+            _request: &RequestOptions,
+            _messages: &[Message],
+            _tools: &[Value],
+            on_event: &mut dyn FnMut(crate::provider::StreamEvent) -> Result<(), ProviderError>,
+        ) -> Result<StreamResult, ProviderError> {
+            on_event(StreamEvent::TextDelta("unfinished answer".into()))?;
+            Err(ProviderError::Other("fatal stream failure".into()))
+        }
+    }
+
     #[async_trait(?Send)]
     impl Provider for RetryThenStopProvider {
         async fn stream_chat(
@@ -1303,15 +1426,18 @@ mod tests {
             _request: &RequestOptions,
             _messages: &[Message],
             _tools: &[Value],
-            _on_event: &mut dyn FnMut(crate::provider::StreamEvent) -> Result<(), ProviderError>,
+            on_event: &mut dyn FnMut(crate::provider::StreamEvent) -> Result<(), ProviderError>,
         ) -> Result<StreamResult, ProviderError> {
             let mut step = self.step.lock().unwrap();
             let current = *step;
             *step += 1;
             match current {
-                0 => Err(ProviderError::RateLimit {
-                    message: "slow down".into(),
-                }),
+                0 => {
+                    on_event(StreamEvent::TextDelta("discarded partial".into()))?;
+                    Err(ProviderError::RateLimit {
+                        message: "slow down".into(),
+                    })
+                }
                 1 => Ok(StreamResult {
                     message: Message::Assistant {
                         content: Some("done".into()),
@@ -1936,6 +2062,7 @@ mod tests {
             request: RequestOptions {
                 model: request_model,
             },
+            attempt_kind: "turn",
             model_context_window: None,
             renderer: &mut renderer,
             state_dir: &tmp,
@@ -1963,6 +2090,120 @@ mod tests {
                 ..
             }) if content == "done"
         ));
+        assert!(!messages.iter().any(|message| {
+            match message {
+                Message::Assistant { content, .. } => content
+                    .as_deref()
+                    .is_some_and(|content| content.contains("discarded partial")),
+                _ => false,
+            }
+        }));
+        let audit = rusqlite::Connection::open(tmp.join("mu.db"))
+            .unwrap()
+            .query_row(
+                "SELECT kind, outcome, partial_output, provider_request_count,
+                        iteration_count, retry_count
+                 FROM turn_attempt WHERE session_id = ?1 ORDER BY id DESC LIMIT 1",
+                rusqlite::params![session.id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, i64>(4)?,
+                        row.get::<_, i64>(5)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(audit.0, "turn");
+        assert_eq!(audit.1, "completed");
+        assert_eq!(audit.2.as_deref(), Some("discarded partial"));
+        assert_eq!((audit.3, audit.4, audit.5), (2, 1, 1));
+        let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    #[tokio::test]
+    async fn failed_partial_output_is_audited_but_excluded_from_history() {
+        let tmp = std::env::temp_dir().join(format!("mu-agent-partial-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let store = Store::open(&tmp.join("mu.db")).unwrap();
+        let session = store.create_session("/tmp", "test/fake-model").unwrap();
+        let config = test_config();
+        let request_model = crate::models::resolve_model_ref(&config, "test/fake-model").unwrap();
+        store
+            .append_message(
+                &session.id,
+                &Message::System {
+                    content: "system".into(),
+                },
+            )
+            .unwrap();
+        store
+            .append_message(
+                &session.id,
+                &Message::User {
+                    content: UserContent::Text("fail after streaming".into()),
+                },
+            )
+            .unwrap();
+        let mut renderer = Renderer::with_format(OutputFormat::Detail);
+        let mut agent = AgentLoop {
+            config: &config,
+            provider: Box::new(PartialFailureProvider),
+            store: &store,
+            session_id: &session.id,
+            request: RequestOptions {
+                model: request_model,
+            },
+            attempt_kind: "retry",
+            model_context_window: None,
+            renderer: &mut renderer,
+            state_dir: &tmp,
+        };
+
+        let error = match agent.run_turn().await {
+            Ok(_) => panic!("expected provider failure"),
+            Err(error) => error,
+        };
+
+        assert!(error.to_string().contains("provider error"));
+        let messages = store.load_context_messages(&session.id).unwrap();
+        assert!(matches!(messages.last(), Some(Message::User { .. })));
+        assert!(!messages.iter().any(|message| {
+            match message {
+                Message::Assistant { content, .. } => content
+                    .as_deref()
+                    .is_some_and(|content| content.contains("unfinished answer")),
+                _ => false,
+            }
+        }));
+        let audit = rusqlite::Connection::open(tmp.join("mu.db"))
+            .unwrap()
+            .query_row(
+                "SELECT kind, outcome, error_class, partial_output,
+                        provider_request_count, iteration_count, retry_count
+                 FROM turn_attempt WHERE session_id = ?1 ORDER BY id DESC LIMIT 1",
+                rusqlite::params![session.id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                        row.get::<_, i64>(4)?,
+                        row.get::<_, i64>(5)?,
+                        row.get::<_, i64>(6)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(audit.0, "retry");
+        assert_eq!(audit.1, "error");
+        assert_eq!(audit.2.as_deref(), Some("provider"));
+        assert_eq!(audit.3.as_deref(), Some("unfinished answer"));
+        assert_eq!((audit.4, audit.5, audit.6), (1, 1, 0));
         let _ = std::fs::remove_dir_all(tmp);
     }
 
@@ -2006,6 +2247,7 @@ mod tests {
             request: RequestOptions {
                 model: request_model,
             },
+            attempt_kind: "turn",
             model_context_window: None,
             renderer: &mut renderer,
             state_dir: &tmp,
@@ -2195,6 +2437,7 @@ mod tests {
             request: RequestOptions {
                 model: request_model,
             },
+            attempt_kind: "turn",
             // Tiny window: threshold = 200 * 0.75 = 150 tokens (~600 bytes).
             // The ~3KB tool result blows past it, forcing an in-loop compaction.
             model_context_window: Some(200),
@@ -2326,6 +2569,7 @@ mod tests {
             request: RequestOptions {
                 model: request_model,
             },
+            attempt_kind: "turn",
             model_context_window: None,
             renderer: &mut renderer,
             state_dir: &tmp,
@@ -2410,6 +2654,7 @@ mod tests {
             request: RequestOptions {
                 model: request_model,
             },
+            attempt_kind: "turn",
             model_context_window: None,
             renderer: &mut renderer,
             state_dir: &tmp,

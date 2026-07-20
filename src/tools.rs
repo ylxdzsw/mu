@@ -137,18 +137,20 @@ fn build_tail_preview(
     max_line_bytes: usize,
 ) -> String {
     let start = lines.len().saturating_sub(max_lines);
-    let mut out = String::new();
-    for line in &lines[start..] {
-        let truncated_line = truncate_line(line, max_line_bytes);
-        if out.len() + truncated_line.len() + 1 > max_bytes {
+    let line_cap = max_line_bytes.min(max_bytes);
+    let mut selected = Vec::new();
+    let mut used_bytes = 0;
+    for line in lines[start..].iter().rev() {
+        let truncated_line = truncate_line(line, line_cap);
+        let separator_bytes = usize::from(!selected.is_empty());
+        if used_bytes + separator_bytes + truncated_line.len() > max_bytes {
             break;
         }
-        if !out.is_empty() {
-            out.push('\n');
-        }
-        out.push_str(&truncated_line);
+        used_bytes += separator_bytes + truncated_line.len();
+        selected.push(truncated_line);
     }
-    out
+    selected.reverse();
+    selected.join("\n")
 }
 
 fn truncate_line(line: &str, max_bytes: usize) -> String {
@@ -247,7 +249,7 @@ pub fn parse_args<T: for<'de> Deserialize<'de>>(args: &Value) -> Result<T> {
 mod tests {
     use serde_json::json;
 
-    use super::{tool_definitions, truncate_line};
+    use super::{build_tail_preview, tool_definitions, truncate_line};
 
     #[test]
     fn tool_definitions_expose_only_bash() {
@@ -283,5 +285,30 @@ mod tests {
         let out = truncate_line(&line, 25);
         assert!(out.ends_with('…'));
         assert!(out.len() <= 25 + '…'.len_utf8());
+    }
+
+    #[test]
+    fn tail_preview_preserves_actual_tail_when_byte_limited() {
+        let lines = vec![
+            "first output line",
+            "second output line",
+            "third output line",
+            "[exit code: 7]",
+        ];
+
+        let preview = build_tail_preview(&lines, 10, 32, 1024);
+
+        assert!(preview.ends_with("[exit code: 7]"));
+        assert!(!preview.contains("first output line"));
+        assert!(preview.len() <= 32);
+    }
+
+    #[test]
+    fn tail_preview_preserves_actual_tail_when_line_limited() {
+        let lines = vec!["one", "two", "three", "[exit code: 0]"];
+
+        let preview = build_tail_preview(&lines, 2, 1024, 1024);
+
+        assert_eq!(preview, "three\n[exit code: 0]");
     }
 }

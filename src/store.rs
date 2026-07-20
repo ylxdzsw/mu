@@ -60,6 +60,20 @@ pub struct ToolCallRecord<'a> {
     pub risk: Option<&'a str>,
     pub output: &'a str,
     pub status: &'a str,
+    pub exit_code: Option<i32>,
+    pub duration_ms: Option<u64>,
+}
+
+pub struct TurnAttemptCompletion<'a> {
+    pub outcome: &'a str,
+    pub error_class: Option<&'a str>,
+    pub error: Option<&'a str>,
+    pub partial_output: Option<&'a str>,
+    pub provider_request_count: u32,
+    pub iteration_count: u32,
+    pub retry_count: u32,
+    pub duration_ms: u64,
+    pub context_tokens: u64,
 }
 
 pub struct ReviewRecord<'a> {
@@ -88,7 +102,8 @@ impl std::fmt::Display for SessionBusy {
 
 impl std::error::Error for SessionBusy {}
 
-const CURRENT_SCHEMA_VERSION: i32 = 6;
+const CURRENT_SCHEMA_VERSION: i32 = 7;
+const COMPATIBLE_SCHEMA_BASELINE: i32 = 6;
 
 fn session_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Session> {
     Ok(Session {
@@ -143,9 +158,13 @@ impl Store {
             0 => anyhow::bail!(
                 "unsupported pre-release session database schema; remove sessions.db to create a fresh release database"
             ),
+            COMPATIBLE_SCHEMA_BASELINE => self.migrate_schema_v6_to_v7(),
             CURRENT_SCHEMA_VERSION => Ok(()),
+            version if version > CURRENT_SCHEMA_VERSION => anyhow::bail!(
+                "session database schema version {version} is newer than this mu supports (maximum {CURRENT_SCHEMA_VERSION}); upgrade mu"
+            ),
             version => anyhow::bail!(
-                "unsupported session database schema version {version}; remove sessions.db to create version {CURRENT_SCHEMA_VERSION}"
+                "session database schema version {version} predates the compatibility baseline {COMPATIBLE_SCHEMA_BASELINE}; upgrade through a compatible mu release"
             ),
         }
     }
@@ -196,8 +215,29 @@ impl Store {
                 risk TEXT,
                 output TEXT,
                 status TEXT NOT NULL,
+                exit_code INTEGER,
+                duration_ms INTEGER,
                 FOREIGN KEY(message_id) REFERENCES message(id)
             );
+            CREATE TABLE IF NOT EXISTS turn_attempt (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                model TEXT NOT NULL,
+                started_at TEXT NOT NULL,
+                completed_at TEXT,
+                outcome TEXT NOT NULL,
+                error_class TEXT,
+                error TEXT,
+                partial_output TEXT,
+                provider_request_count INTEGER NOT NULL DEFAULT 0,
+                iteration_count INTEGER NOT NULL DEFAULT 0,
+                retry_count INTEGER NOT NULL DEFAULT 0,
+                duration_ms INTEGER,
+                context_tokens INTEGER NOT NULL DEFAULT 0,
+                FOREIGN KEY(session_id) REFERENCES session(id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_turn_attempt_session_id ON turn_attempt(session_id);
             CREATE TABLE IF NOT EXISTS turn_usage (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 session_id TEXT NOT NULL,
@@ -229,8 +269,38 @@ impl Store {
                 reason TEXT,
                 created_at TEXT NOT NULL
             );
-            PRAGMA user_version = 6;",
+            PRAGMA user_version = 7;",
         )?;
+        Ok(())
+    }
+
+    fn migrate_schema_v6_to_v7(&self) -> Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute_batch(
+            "ALTER TABLE tool_call ADD COLUMN exit_code INTEGER;
+             ALTER TABLE tool_call ADD COLUMN duration_ms INTEGER;
+             CREATE TABLE turn_attempt (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                model TEXT NOT NULL,
+                started_at TEXT NOT NULL,
+                completed_at TEXT,
+                outcome TEXT NOT NULL,
+                error_class TEXT,
+                error TEXT,
+                partial_output TEXT,
+                provider_request_count INTEGER NOT NULL DEFAULT 0,
+                iteration_count INTEGER NOT NULL DEFAULT 0,
+                retry_count INTEGER NOT NULL DEFAULT 0,
+                duration_ms INTEGER,
+                context_tokens INTEGER NOT NULL DEFAULT 0,
+                FOREIGN KEY(session_id) REFERENCES session(id)
+             );
+             CREATE INDEX idx_turn_attempt_session_id ON turn_attempt(session_id);
+             PRAGMA user_version = 7;",
+        )?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -365,6 +435,52 @@ impl Store {
         Ok(())
     }
 
+    pub fn start_turn_attempt(&self, session_id: &str, kind: &str, model: &str) -> Result<i64> {
+        let now = chrono::Utc::now().to_rfc3339();
+        self.conn.execute(
+            "INSERT INTO turn_attempt (session_id, kind, model, started_at, outcome)
+             VALUES (?1, ?2, ?3, ?4, 'running')",
+            params![session_id, kind, model, now],
+        )?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    pub fn finish_turn_attempt(
+        &self,
+        attempt_id: i64,
+        completion: TurnAttemptCompletion<'_>,
+    ) -> Result<()> {
+        let now = chrono::Utc::now().to_rfc3339();
+        self.conn.execute(
+            "UPDATE turn_attempt SET
+                completed_at = ?1,
+                outcome = ?2,
+                error_class = ?3,
+                error = ?4,
+                partial_output = ?5,
+                provider_request_count = ?6,
+                iteration_count = ?7,
+                retry_count = ?8,
+                duration_ms = ?9,
+                context_tokens = ?10
+             WHERE id = ?11",
+            params![
+                now,
+                completion.outcome,
+                completion.error_class,
+                completion.error,
+                completion.partial_output,
+                completion.provider_request_count as i64,
+                completion.iteration_count as i64,
+                completion.retry_count as i64,
+                u64_to_i64(completion.duration_ms),
+                u64_to_i64(completion.context_tokens),
+                attempt_id,
+            ],
+        )?;
+        Ok(())
+    }
+
     /// A session is "clean" when its last turn finished — the last message is a
     /// completed assistant reply with no `tool_calls`. A trailing user prompt,
     /// tool result, or assistant message still carrying `tool_calls` means the
@@ -438,6 +554,8 @@ impl Store {
                     risk: risk.as_ref().map(|risk| risk.as_str()),
                     output: INTERRUPTED_TOOL_RESULT,
                     status: "interrupted",
+                    exit_code: None,
+                    duration_ms: None,
                 },
                 INTERRUPTED_TOOL_RESULT,
                 &[],
@@ -606,8 +724,9 @@ impl Store {
 
     pub fn record_tool_call(&self, record: ToolCallRecord<'_>) -> Result<()> {
         self.conn.execute(
-            "INSERT OR REPLACE INTO tool_call (id, message_id, tool, args, risk, output, status)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            "INSERT OR REPLACE INTO tool_call (
+                id, message_id, tool, args, risk, output, status, exit_code, duration_ms
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             params![
                 record.id,
                 record.message_id,
@@ -615,7 +734,9 @@ impl Store {
                 record.args,
                 record.risk,
                 record.output,
-                record.status
+                record.status,
+                record.exit_code,
+                record.duration_ms.map(u64_to_i64),
             ],
         )?;
         Ok(())
@@ -631,8 +752,9 @@ impl Store {
         let now = chrono::Utc::now().to_rfc3339();
         let tx = self.conn.unchecked_transaction()?;
         tx.execute(
-            "INSERT OR REPLACE INTO tool_call (id, message_id, tool, args, risk, output, status)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            "INSERT OR REPLACE INTO tool_call (
+                id, message_id, tool, args, risk, output, status, exit_code, duration_ms
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             params![
                 record.id,
                 record.message_id,
@@ -640,7 +762,9 @@ impl Store {
                 record.args,
                 record.risk,
                 record.output,
-                record.status
+                record.status,
+                record.exit_code,
+                record.duration_ms.map(u64_to_i64),
             ],
         )?;
         let message = Message::Tool {
@@ -952,6 +1076,10 @@ fn attachment_blob_id(data: &[u8]) -> String {
     digest.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
+fn u64_to_i64(value: u64) -> i64 {
+    value.min(i64::MAX as u64) as i64
+}
+
 fn load_context_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ContextRow> {
     Ok((
         row.get(0)?,
@@ -1180,6 +1308,7 @@ mod tests {
                 "review",
                 "session",
                 "tool_call",
+                "turn_attempt",
                 "turn_usage"
             ]
         );
@@ -1194,6 +1323,16 @@ mod tests {
         assert!(message_columns.contains(&"reasoning_content".to_string()));
         assert!(message_columns.contains(&"native_replay_json".to_string()));
         assert!(message_columns.contains(&"tool_content_json".to_string()));
+        let tool_call_columns = store
+            .conn
+            .prepare("PRAGMA table_info(tool_call)")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert!(tool_call_columns.contains(&"exit_code".to_string()));
+        assert!(tool_call_columns.contains(&"duration_ms".to_string()));
         let session_columns = store
             .conn
             .prepare("PRAGMA table_info(session)")
@@ -1234,7 +1373,89 @@ mod tests {
     }
 
     #[test]
-    fn non_current_schema_version_is_rejected() {
+    fn schema_v6_is_migrated_without_losing_tool_calls() {
+        let tmp = std::env::temp_dir().join(format!("mu-store-v6-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let db = tmp.join("mu.db");
+        let conn = Connection::open(&db).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE session (
+                id TEXT PRIMARY KEY,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                cwd TEXT NOT NULL,
+                model TEXT NOT NULL,
+                title TEXT,
+                last_total_tokens INTEGER NOT NULL DEFAULT 0
+             );
+             CREATE TABLE message (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT NOT NULL,
+                role TEXT NOT NULL,
+                content TEXT NOT NULL,
+                reasoning_content TEXT,
+                native_replay_json TEXT,
+                user_content_json TEXT,
+                tool_content_json TEXT,
+                tool_call_id TEXT,
+                tool_calls_json TEXT,
+                seq INTEGER NOT NULL,
+                created_at TEXT NOT NULL
+             );
+             CREATE TABLE tool_call (
+                id TEXT PRIMARY KEY,
+                message_id INTEGER NOT NULL,
+                tool TEXT NOT NULL,
+                args TEXT NOT NULL,
+                risk TEXT,
+                output TEXT,
+                status TEXT NOT NULL
+             );
+             INSERT INTO session VALUES (
+                'session-1', 'now', 'now', '/tmp', 'test/model', NULL, 0
+             );
+             INSERT INTO message (
+                id, session_id, role, content, seq, created_at
+             ) VALUES (1, 'session-1', 'assistant', '', 0, 'now');
+             INSERT INTO tool_call VALUES (
+                'call-1', 1, 'bash', '{}', 'readonly', 'old output', 'ok'
+             );
+             PRAGMA user_version = 6;",
+        )
+        .unwrap();
+        drop(conn);
+
+        let store = Store::open(&db).unwrap();
+
+        let version: i32 = store
+            .conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, CURRENT_SCHEMA_VERSION);
+        let migrated: (String, Option<i32>, Option<i64>) = store
+            .conn
+            .query_row(
+                "SELECT output, exit_code, duration_ms FROM tool_call WHERE id = 'call-1'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(migrated, ("old output".into(), None, None));
+        assert!(
+            store
+                .conn
+                .query_row(
+                    "SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = 'turn_attempt'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .is_ok()
+        );
+        let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    #[test]
+    fn schema_older_than_compatibility_baseline_is_rejected() {
         let tmp = std::env::temp_dir().join(format!("mu-store-old-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&tmp).unwrap();
         let db = tmp.join("mu.db");
@@ -1244,8 +1465,25 @@ mod tests {
 
         let error = Store::open(&db).err().unwrap().to_string();
 
-        assert!(error.contains("unsupported session database schema version 5"));
-        assert!(error.contains("remove sessions.db"));
+        assert!(error.contains("schema version 5"));
+        assert!(error.contains("compatibility baseline 6"));
+        assert!(error.contains("upgrade through a compatible mu release"));
+        let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    #[test]
+    fn newer_schema_version_requests_a_mu_upgrade() {
+        let tmp = std::env::temp_dir().join(format!("mu-store-new-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let db = tmp.join("mu.db");
+        let conn = Connection::open(&db).unwrap();
+        conn.execute_batch("PRAGMA user_version = 8;").unwrap();
+        drop(conn);
+
+        let error = Store::open(&db).err().unwrap().to_string();
+
+        assert!(error.contains("schema version 8 is newer"));
+        assert!(error.contains("upgrade mu"));
         let _ = std::fs::remove_dir_all(tmp);
     }
 
@@ -1498,11 +1736,22 @@ mod tests {
                     risk: Some("readonly"),
                     output: "a",
                     status: "ok",
+                    exit_code: Some(0),
+                    duration_ms: Some(12),
                 },
                 "a",
                 &[],
             )
             .unwrap();
+        let execution: (Option<i32>, Option<i64>) = store
+            .conn
+            .query_row(
+                "SELECT exit_code, duration_ms FROM tool_call WHERE id = 'call-a'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(execution, (Some(0), Some(12)));
 
         // Session is unclean (last message is a tool result, turn not finished).
         assert!(!store.is_session_clean(&session.id).unwrap());

@@ -465,8 +465,9 @@ the budget:
   stating how much was elided, and the
   **full output is spilled to a temp file** under a truncation directory in the
   state dir. The marker points the model at that file so it can inspect the
-  result with another `bash` call; nothing is lost, it just is not forced into
-  context.
+  result with another `bash` call. Byte limiting is applied backward from the
+  actual tail so the final exit-status line is retained; nothing is lost, it
+  just is not forced into context.
 - Spilled temp files are garbage-collected after a retention window (default 7
   days), pruned opportunistically on startup.
 
@@ -1123,12 +1124,26 @@ Conceptual schema (flat and small):
   with byte size and creation time. Message content stores filename, MIME type,
   and blob reference metadata; identical bytes are stored once per scope DB.
 - **tool_call** — `id`, `message_id`, `tool`, `args` (JSON), `risk`, `output`,
-  `status` (`ok` / `error` / `interrupted`), timings. Records the agent's tool
+  `status` (`ok` / `error` / `interrupted`), optional structured `exit_code`,
+  and optional `duration_ms`. Records the agent's tool
   invocations for inspection and the renderer's truncation pointers. (Tool
   *results* fed back to the model are stored as `tool` messages; this table is
-  the structured audit copy.) There is intentionally **no** turn-status or
-  checkpoint column on `session`: whether the last turn finished is derived from
-  the message tail (§"Interrupted turns and retry").
+  the structured audit copy.)
+- **turn_attempt** — audit-only invocation records: session, invocation kind
+  (`turn` / `retry`), model, start/end time, outcome, error class/text, partial
+  assistant text that never became a completed message, provider-request count,
+  iteration/retry counts, duration, and last reported context size. Attempt rows
+  are never loaded into model context and never participate in retry or
+  compaction. There is intentionally **no** turn-status or checkpoint column on
+  `session`: whether the last turn finished is derived from the message tail
+  (§"Interrupted turns and retry").
+
+**Compatibility baseline.** Schema version 6 is the durable compatibility
+baseline. Later schema versions retain ordered, transactional migrations from
+that baseline instead of asking the user to delete `sessions.db`; unknown newer
+versions fail with an instruction to upgrade `mu`. Config evolution follows the
+same rule: new fields are optional with defaults, and renamed or removed fields
+must retain an accepted legacy spelling or provide an explicit migration path.
 
 ### Session mapping
 
@@ -1193,9 +1208,11 @@ written:
   killed mid-run gets a result recorded — so a side-effecting command is never
   lost from history.
 - A partial/in-flight assistant message (streamed text, reasoning) is **never**
-  persisted. On interruption — Ctrl-C, a dropped connection, a provider error —
-  the process simply exits and the partial stream dies with it. Nothing is
-  written on the interruption path.
+  persisted as a `message`. Partial assistant text may be retained on the
+  audit-only `turn_attempt` row, including text discarded by an automatic
+  provider retry, but it is never loaded into model context. On interruption —
+  Ctrl-C, a dropped connection, or a provider error — retry/history assembly
+  therefore remains based only on completed messages.
 
 ### Interrupted turns and retry
 
