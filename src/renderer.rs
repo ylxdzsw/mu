@@ -29,7 +29,7 @@ pub(crate) const BASH_COMMAND_PREVIEW_BYTES: usize = 160;
 pub(crate) const BASH_TITLE_PREVIEW_BYTES: usize = 120;
 const GUARDRAIL_REASON_PREVIEW_BYTES: usize = 180;
 const REASONING_TITLE_MAX_WIDTH: usize = 80;
-const MAX_TABLE_COLUMN_WIDTH: usize = 40;
+const DEFAULT_MAX_TABLE_COLUMN_WIDTH: usize = 40;
 const BASH_HEAD_LINE_BUDGET: usize = 3;
 const BASH_HEAD_BYTE_BUDGET: usize = 1024;
 const BASH_HEAD_LINE_CAP_BYTES: usize = 120;
@@ -2497,8 +2497,9 @@ fn render_table(table: &TableState) -> String {
             widths[idx] = widths[idx].max(visible_text_width(cell));
         }
     }
+    let max_column_width = max_table_column_width(cols);
     for width in &mut widths {
-        *width = (*width).min(MAX_TABLE_COLUMN_WIDTH);
+        *width = (*width).min(max_column_width);
     }
 
     let mut out = String::new();
@@ -2509,6 +2510,15 @@ fn render_table(table: &TableState) -> String {
     }
     out.push('\n');
     out
+}
+
+fn max_table_column_width(column_count: usize) -> usize {
+    match column_count {
+        1 | 2 => 80,
+        3 => 60,
+        4 => 45,
+        _ => DEFAULT_MAX_TABLE_COLUMN_WIDTH,
+    }
 }
 
 fn render_table_row(row: &[String], widths: &[usize], alignments: &[Alignment]) -> String {
@@ -3488,27 +3498,49 @@ mod tests {
     }
 
     #[test]
-    fn markdown_renderer_caps_table_columns_at_forty_cells() {
-        let at_limit = "a".repeat(MAX_TABLE_COLUMN_WIDTH);
-        let over_limit = "b".repeat(MAX_TABLE_COLUMN_WIDTH + 1);
-        let rendered = render_markdown(&format!(
-            "| Text | Side |\n| --- | --- |\n| {at_limit} | x |\n| {over_limit} | y |\n"
-        ));
-        let plain = strip_ansi(&rendered);
-        let table_lines = plain
-            .lines()
-            .filter(|line| line.starts_with('|') && line.ends_with('|'))
-            .collect::<Vec<_>>();
+    fn markdown_renderer_caps_table_columns_by_column_count() {
+        for (column_count, expected_limit) in [(1, 80), (2, 80), (3, 60), (4, 45), (5, 40)] {
+            let at_limit = "a".repeat(expected_limit);
+            let over_limit = "b".repeat(expected_limit + 1);
+            let mut header = vec!["Text"; column_count];
+            let separator = vec!["---"; column_count];
+            let mut first_row = vec!["x".to_string(); column_count];
+            let mut second_row = vec!["y".to_string(); column_count];
+            header[0] = "Long";
+            first_row[0] = at_limit.clone();
+            second_row[0] = over_limit.clone();
+            let markdown = format!(
+                "| {} |\n| {} |\n| {} |\n| {} |\n",
+                header.join(" | "),
+                separator.join(" | "),
+                first_row.join(" | "),
+                second_row.join(" | ")
+            );
 
-        assert_eq!(bar_columns(table_lines[0])[1], MAX_TABLE_COLUMN_WIDTH + 3);
-        assert_eq!(table_lines.len(), 5, "{plain:?}");
-        assert!(table_lines[2].contains(&at_limit), "{plain:?}");
-        assert!(
-            table_lines[3].contains(&"b".repeat(MAX_TABLE_COLUMN_WIDTH)),
-            "{plain:?}"
-        );
-        assert!(table_lines[4].contains("b"), "{plain:?}");
-        assert_table_grid_aligned(&plain);
+            let plain = strip_ansi(&render_markdown(&markdown));
+            let table_lines = plain
+                .lines()
+                .filter(|line| line.starts_with('|') && line.ends_with('|'))
+                .collect::<Vec<_>>();
+
+            assert_eq!(
+                bar_columns(table_lines[0])[1],
+                expected_limit + 3,
+                "column_count={column_count}: {plain:?}"
+            );
+            assert_eq!(
+                table_lines.len(),
+                5,
+                "column_count={column_count}: {plain:?}"
+            );
+            assert!(table_lines[2].contains(&at_limit), "{plain:?}");
+            assert!(
+                table_lines[3].contains(&"b".repeat(expected_limit)),
+                "{plain:?}"
+            );
+            assert!(table_lines[4].contains("b"), "{plain:?}");
+            assert_table_grid_aligned(&plain);
+        }
     }
 
     #[test]
@@ -3721,7 +3753,7 @@ mod tests {
     fn markdown_stream_wraps_long_table_headers_and_cells_on_commit() {
         let mut stream = MarkdownStream::default();
         let header = "heading ".repeat(12);
-        let body = "x".repeat(MAX_TABLE_COLUMN_WIDTH + 1);
+        let body = "x".repeat(max_table_column_width(2) + 1);
 
         assert!(stream.push(&format!("| {header} | Side |\n")).is_empty());
         assert!(stream.push("| --- | --- |\n").is_empty());
@@ -3739,8 +3771,8 @@ mod tests {
             .iter()
             .position(|line| line.contains("---"))
             .expect("table separator missing");
-        assert_eq!(separator, 3, "{plain:?}");
-        assert_eq!(table_lines.len(), 6, "{plain:?}");
+        assert_eq!(separator, 2, "{plain:?}");
+        assert_eq!(table_lines.len(), 5, "{plain:?}");
         assert_table_grid_aligned(&plain);
     }
 
