@@ -866,9 +866,12 @@ guard.
 Model and provider selection come from `config.jsonc`: a complete `endpoint`, optional
 env var holding the API key, and ordered provider/model definitions. If the
 global config file is missing, `mu` creates a starter `~/.mu/config.jsonc`
-automatically before loading configuration. In a scope with no sessions, the
-first configured model is used. API keys are read from environment variables;
-`mu` does not store secrets in its database.
+automatically before loading configuration. The starter's first provider is a
+keyless OpenCode Zen free model (`api_key_env: ""`), so a freshly built `mu`
+runs a turn with no additional setup; it also ships a commented keyed provider
+example. In a scope with no sessions, the first configured model is used. API
+keys are read from environment variables; `mu` does not store secrets in its
+database.
 
 **No provider, hard fail.** If no provider is configured, a provider has no
 valid supported endpoint, or a non-empty configured key env var is unset, a *turn* invocation

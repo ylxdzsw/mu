@@ -1,13 +1,8 @@
 # mu
 
-`mu` is a small, composable agent runtime for the terminal: one prompt in, one
+`mu` is a small, composable agent for the terminal: one prompt in, one
 completed agent turn out. It works equally well as a Unix command in scripts or
 as an interactive assistant inside zsh.
-
-The core stays deliberately small. Each turn starts a fresh native process,
-loads its session, streams the agent and its tool activity, saves completed
-messages, and exits. The shell continues to own line editing, history, job
-control, and the terminal.
 
 ## Quick start
 
@@ -18,36 +13,16 @@ cargo build --release
 export PATH="$PWD/target/release:$PATH"
 ```
 
-`mu` targets Unix-like systems and expects `bash` on `PATH`.
-
-Packaged installations also expose three Mu-owned commands inside agent `bash`
-calls: `apply_patch` for structured text edits, `edit` for exact text
-replacement, and `view_image` for loading a local image into the model's tool
-result. They are private symlinks under `/usr/libexec/mu`, all backed by the
-same `mu` executable. For a source-tree build, create equivalent sibling
-symlinks if you want to exercise the applets directly:
-
-```sh
-ln -sf mu target/release/apply_patch
-ln -sf mu target/release/edit
-ln -sf mu target/release/view_image
-```
-
-Add an API key to `~/.mu/.env` (create the file if needed):
-
-```dotenv
-OPENAI_API_KEY=...
-```
-
-On first use, `mu` creates `~/.mu/config.jsonc` with a starter
-OpenAI-compatible provider. Edit that file to select another endpoint, API-key
-environment variable, or model.
-
-Run a turn with a prompt:
+Now ask it something:
 
 ```sh
 mu <<< 'Summarize the changes in this repository.'
 ```
+
+That works with no setup and no API key. Out of the box `mu` uses a free model
+from [OpenCode Zen](https://opencode.ai/zen/), so you can try it immediately
+after building. Bring your own provider whenever you want (see
+[Using your own provider](#using-your-own-provider)).
 
 Continue the latest session for another turn:
 
@@ -55,32 +30,41 @@ Continue the latest session for another turn:
 mu -c <<< 'Now identify the riskiest change.'
 ```
 
+`mu` targets Unix-like systems and expects `bash` on `PATH`.
+
 ## Interactive zsh usage
 
-Source the included plugin from `.zshrc`:
+The most comfortable way to use `mu` is right inside your shell. Source the
+included plugin from `.zshrc`:
 
 ```zsh
 source /path/to/mu/mu.zsh
 # Arch package: source /usr/share/zsh/plugins/mu/mu.zsh
 ```
 
-The plugin requires `zsh`, `jq`, and `mu` on `PATH`. At an empty shell prompt,
-press Tab to enter `mu>` mode, type a request, and press Enter. Each submission
-runs one foreground `mu` turn while the plugin keeps the session connected.
-Press Tab again to return to the normal shell without losing the current input.
+At an empty shell prompt, press **Tab** to enter `mu>` mode, type a request, and
+press **Enter**:
 
-Common prompt-mode commands include:
+```
+mu> what changed in the last three commits?
+```
+
+Each submission runs one foreground `mu` turn while the plugin keeps the session
+connected. Press Tab again to return to the normal shell without losing your
+input, so `mu` and your usual commands share one prompt. The shell keeps owning
+line editing, history, and job control.
+
+Type `/` to list prompt-mode commands. The common ones:
 
 - `/new` starts a new session.
 - `/model` selects a configured model.
 - `/attach <file>` adds an image or audio file to the next turn.
-- `/retry` resumes a turn interrupted by Ctrl-C, a crash, or a lost connection,
-  using the model selected by `/model` when one is active.
+- `/retry` resumes a turn interrupted by Ctrl-C, a crash, or a lost connection.
 - `/compact` compacts a long session, optionally with a focus instruction.
 
-Typing `/` lists available commands.
+The plugin requires `zsh`, `jq`, and `mu` on `PATH`.
 
-## Examples
+## More ways to run a turn
 
 Use a specific model or attach files to a one-shot turn:
 
@@ -100,10 +84,14 @@ Emphasize compatibility and migration risks.
 EOF
 ```
 
-`mu` is designed to be compatible with shebang; executable prompts may select
-a turn-local model with `#!/usr/bin/env -S mu --model <model>`.
+`mu` is compatible with shebang lines, so an executable prompt can select its own
+model:
 
-Choose output for the caller:
+```sh
+#!/usr/bin/env -S mu --model openai/gpt-5:high
+```
+
+Choose how much the caller sees:
 
 ```sh
 mu --output final prompt.md       # final assistant message only
@@ -112,17 +100,15 @@ mu --output detail prompt.md      # normal human transcript (built-in default)
 mu --output full prompt.md        # complete reasoning and tool details
 ```
 
-Set `"output": "concise"` in global or project `config.jsonc` to change the
-default. An explicit `--output` wins. Output density controls brevity, not
-terminal behavior: Mu automatically enables live lines, color, and rich
-Markdown when stdout is a terminal; redirected output is sequential and
-ANSI-free.
-
 Inspect sessions and resolved state with `mu session list`, `mu session
 transcript --session <id>`, and `mu status --json`. Run `mu --help` for the full
 CLI surface.
 
-## Design highlights
+## How it works
+
+The core stays deliberately small. Each turn starts a fresh native process,
+loads its session, streams the agent and its tool activity, saves completed
+messages, and exits. A few ideas follow from that:
 
 - **A turn is the primitive.** `mu` is a fast native binary, not a daemon, TUI,
   or in-process REPL. Shell pipelines and prompt files compose it naturally.
@@ -135,14 +121,14 @@ CLI surface.
 - **Progressive customization.** Markdown instructions, commands, and skills
   extend behavior without a plugin SDK or additional model-visible tools.
 - **Project-aware, working-directory faithful.** Configuration and sessions can
-  be global or project-local, while commands continue to run from the directory
-  where `mu` was invoked.
+  be global or project-local, while commands run from the directory where `mu`
+  was invoked.
 
 ## Key features
 
 - OpenAI-compatible Chat Completions and OpenAI Responses providers, with
-  strict full-endpoint selection, ordered model selection, and
-  per-turn model and reasoning-effort overrides.
+  strict full-endpoint selection, ordered model selection, and per-turn model
+  and reasoning-effort overrides.
 - Persistent global or project-scoped sessions, continuation, transcripts,
   automatic context compaction, and interrupted-turn recovery.
 - Four output densities with automatic interactive-terminal rendering.
@@ -152,6 +138,22 @@ CLI surface.
 - A built-in safety guardrail and exact-value redaction for configured secrets,
   with exact or suffix-based environment-variable selectors, in `bash` output.
 
+## Using your own provider
+
+On first use, `mu` creates `~/.mu/config.jsonc`. It ships with two providers:
+the keyless OpenCode Zen free model used by default, and a commented OpenAI
+example. To use a keyed provider, add its API key to `~/.mu/.env` (create the
+file if needed):
+
+```dotenv
+OPENAI_API_KEY=...
+```
+
+Then select it per turn with `mu --model openai/gpt-4o`, or reorder the
+providers in `config.jsonc` so yours comes first and becomes the default. Any
+OpenAI-compatible endpoint works; edit the endpoint, API-key environment
+variable, and model list to match your provider.
+
 ## Configuration and project scope
 
 Global configuration and state live in `~/.mu`. Inside a project—the nearest
@@ -159,10 +161,31 @@ ancestor with `.git` or `.mu`—project state lives in `<project>/.mu` and proje
 configuration can override global defaults. The invoking working directory is
 preserved for the agent and its `bash` tool.
 
-Most repositories need no setup: `mu` discovers the project and creates only
-the runtime state it needs. Use `mu project init` when you explicitly want a
-local configuration scaffold, and keep project-specific guidance in
-`AGENTS.md` or `.mu` instruction files.
+Most repositories need no setup: `mu` discovers the project and creates only the
+runtime state it needs. Use `mu project init` when you explicitly want a local
+configuration scaffold, and keep project-specific guidance in `AGENTS.md` or
+`.mu` instruction files.
+
+Setting `"output": "concise"` in global or project `config.jsonc` changes the
+default output density; an explicit `--output` always wins. Output density
+controls brevity, not terminal behavior: `mu` automatically enables live lines,
+color, and rich Markdown when stdout is a terminal, and redirected output is
+sequential and ANSI-free.
+
+## Packaged installations
+
+Packaged installations also expose three Mu-owned commands inside agent `bash`
+calls: `apply_patch` for structured text edits, `edit` for exact text
+replacement, and `view_image` for loading a local image into the model's tool
+result. They are private symlinks under `/usr/libexec/mu`, all backed by the
+same `mu` executable. For a source-tree build, create equivalent sibling
+symlinks if you want to exercise the applets directly:
+
+```sh
+ln -sf mu target/release/apply_patch
+ln -sf mu target/release/edit
+ln -sf mu target/release/view_image
+```
 
 ## Reference
 

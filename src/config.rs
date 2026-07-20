@@ -579,6 +579,20 @@ fn merge_json(base: &mut serde_json::Value, overlay: serde_json::Value) {
 const STARTER_CONFIG: &str = r#"{
   "output": "detail",
   "providers": {
+    // Default provider: OpenCode Zen's free DeepSeek model. It needs no API
+    // key, so mu works out of the box. Other free models include
+    // "big-pickle", "mimo-v2.5-free", and "north-mini-code-free".
+    "opencode": {
+      "endpoint": "https://opencode.ai/zen/v1/chat/completions",
+      "api_key_env": "",
+      "models": {
+        "deepseek-v4-flash-free": {
+          "context_window": 128000
+        }
+      }
+    },
+    // Example keyed provider. Add OPENAI_API_KEY to ~/.mu/.env, then select it
+    // with `mu --model openai/gpt-4o` or reorder providers to make it default.
     "openai": {
       "endpoint": "https://api.openai.com/v1/chat/completions",
       "api_key_env": "OPENAI_API_KEY",
