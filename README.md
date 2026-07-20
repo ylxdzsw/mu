@@ -20,15 +20,16 @@ export PATH="$PWD/target/release:$PATH"
 
 `mu` targets Unix-like systems and expects `bash` on `PATH`.
 
-Packaged installations also expose two Mu-owned commands inside agent `bash`
-calls: `apply_patch` for structured text edits and `view_image` for loading a
-local image into the model's tool result. They are private symlinks under
-`/usr/libexec/mu`, both backed by the same `mu` executable. For a source-tree
-build, create equivalent sibling symlinks if you want to exercise the applets
-directly:
+Packaged installations also expose three Mu-owned commands inside agent `bash`
+calls: `apply_patch` for structured text edits, `edit` for exact text
+replacement, and `view_image` for loading a local image into the model's tool
+result. They are private symlinks under `/usr/libexec/mu`, all backed by the
+same `mu` executable. For a source-tree build, create equivalent sibling
+symlinks if you want to exercise the applets directly:
 
 ```sh
 ln -sf mu target/release/apply_patch
+ln -sf mu target/release/edit
 ln -sf mu target/release/view_image
 ```
 

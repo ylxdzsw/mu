@@ -4,12 +4,14 @@ use std::path::Path;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Applet {
     ApplyPatch,
+    Edit,
     ViewImage,
 }
 
 pub fn from_argv0(argv0: &OsStr) -> Option<Applet> {
     match Path::new(argv0).file_name().and_then(OsStr::to_str) {
         Some("apply_patch") => Some(Applet::ApplyPatch),
+        Some("edit") => Some(Applet::Edit),
         Some("view_image") => Some(Applet::ViewImage),
         _ => None,
     }
@@ -18,6 +20,7 @@ pub fn from_argv0(argv0: &OsStr) -> Option<Applet> {
 pub fn dispatch(applet: Applet) -> i32 {
     match applet {
         Applet::ApplyPatch => apply_patch::main(),
+        Applet::Edit => edit::main(),
         Applet::ViewImage => view_image::main(),
     }
 }
@@ -629,7 +632,7 @@ mod apply_patch {
         Ok(())
     }
 
-    fn atomic_write(
+    pub(super) fn atomic_write(
         path: &Path,
         content: &str,
         permissions: Option<fs::Permissions>,
@@ -950,6 +953,578 @@ mod apply_patch {
     }
 }
 
+mod edit {
+    use std::fs;
+    use std::io::{Read, Write};
+    use std::path::{Path, PathBuf};
+
+    use anyhow::{Context, Result, bail};
+    use clap::Parser;
+
+    #[derive(Debug, Parser)]
+    #[command(
+        name = "edit",
+        about = "Replace exact text in an existing file",
+        after_help = "Pass one or more SEARCH/REPLACE blocks on stdin:\n\n<<<<<<< SEARCH\nexact existing text\n=======\nreplacement text\n>>>>>>> REPLACE"
+    )]
+    struct Args {
+        /// Replace every occurrence of each SEARCH block
+        #[arg(long)]
+        all: bool,
+        /// Existing file to edit
+        file: PathBuf,
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct Block {
+        search: String,
+        replacement: String,
+    }
+
+    #[derive(Debug)]
+    struct Line {
+        number: usize,
+        start: usize,
+        content_end: usize,
+    }
+
+    #[derive(Debug)]
+    struct Match {
+        start: usize,
+        end: usize,
+        block: usize,
+    }
+
+    #[derive(Debug)]
+    struct PlannedEdit {
+        target: PathBuf,
+        reported_path: PathBuf,
+        content: String,
+        permissions: fs::Permissions,
+        blocks: usize,
+        replacements: usize,
+    }
+
+    pub fn main() -> i32 {
+        let args = match Args::try_parse() {
+            Ok(args) => args,
+            Err(error) => {
+                let _ = error.print();
+                return error.exit_code();
+            }
+        };
+        match read_document().and_then(|document| run(args, &document)) {
+            Ok(summary) => {
+                print!("{summary}");
+                let _ = std::io::stdout().flush();
+                0
+            }
+            Err(error) => {
+                eprintln!("edit: {error:#}");
+                1
+            }
+        }
+    }
+
+    fn read_document() -> Result<String> {
+        let mut document = String::new();
+        std::io::stdin()
+            .read_to_string(&mut document)
+            .context("reading edit document from stdin")?;
+        if document.is_empty() {
+            bail!("expected one or more SEARCH/REPLACE blocks on stdin");
+        }
+        Ok(document)
+    }
+
+    fn run(args: Args, document: &str) -> Result<String> {
+        let blocks = parse_document(document)?;
+        let cwd = std::env::current_dir().context("determining current directory")?;
+        let planned = preflight(&cwd, args.file, blocks, args.all)?;
+        super::apply_patch::atomic_write(
+            &planned.target,
+            &planned.content,
+            Some(planned.permissions.clone()),
+            true,
+        )?;
+        Ok(format_summary(&planned, &cwd))
+    }
+
+    fn parse_document(document: &str) -> Result<Vec<Block>> {
+        let lines = scan_lines(document);
+        let mut blocks = Vec::new();
+        let mut index = 0;
+
+        while index < lines.len() {
+            if index + 1 == lines.len() && line_text(document, &lines[index]).is_empty() {
+                break;
+            }
+            let block_number = blocks.len() + 1;
+            expect_marker(document, &lines[index], "<<<<<<< SEARCH", block_number)?;
+            index += 1;
+
+            let search_start = index;
+            while index < lines.len() && line_text(document, &lines[index]) != "=======" {
+                if is_marker(line_text(document, &lines[index])) {
+                    bail!(
+                        "block {block_number} expected `=======` at line {}, found `{}`",
+                        lines[index].number,
+                        line_text(document, &lines[index])
+                    );
+                }
+                index += 1;
+            }
+            if index == lines.len() {
+                bail!("block {block_number} is missing `=======`");
+            }
+            let search = body_text(document, &lines[search_start..index]).to_string();
+            if search.is_empty() {
+                bail!("block {block_number} has an empty SEARCH section");
+            }
+            index += 1;
+
+            let replacement_start = index;
+            while index < lines.len() && line_text(document, &lines[index]) != ">>>>>>> REPLACE" {
+                if is_marker(line_text(document, &lines[index])) {
+                    bail!(
+                        "block {block_number} expected `>>>>>>> REPLACE` at line {}, found `{}`",
+                        lines[index].number,
+                        line_text(document, &lines[index])
+                    );
+                }
+                index += 1;
+            }
+            if index == lines.len() {
+                bail!("block {block_number} is missing `>>>>>>> REPLACE`");
+            }
+            let replacement = body_text(document, &lines[replacement_start..index]).to_string();
+            blocks.push(Block {
+                search,
+                replacement,
+            });
+            index += 1;
+        }
+
+        if blocks.is_empty() {
+            bail!("edit document contains no SEARCH/REPLACE blocks");
+        }
+        Ok(blocks)
+    }
+
+    fn scan_lines(text: &str) -> Vec<Line> {
+        let mut lines = Vec::new();
+        let mut start = 0;
+        for (number, newline) in text.match_indices('\n').enumerate() {
+            let raw_content_end = newline.0;
+            let content_end =
+                if text.as_bytes().get(raw_content_end.wrapping_sub(1)) == Some(&b'\r') {
+                    raw_content_end - 1
+                } else {
+                    raw_content_end
+                };
+            lines.push(Line {
+                number: number + 1,
+                start,
+                content_end,
+            });
+            start = raw_content_end + 1;
+        }
+        lines.push(Line {
+            number: lines.len() + 1,
+            start,
+            content_end: text.len(),
+        });
+        lines
+    }
+
+    fn line_text<'a>(document: &'a str, line: &Line) -> &'a str {
+        &document[line.start..line.content_end]
+    }
+
+    fn body_text<'a>(document: &'a str, lines: &[Line]) -> &'a str {
+        match (lines.first(), lines.last()) {
+            (Some(first), Some(last)) => &document[first.start..last.content_end],
+            _ => "",
+        }
+    }
+
+    fn expect_marker(document: &str, line: &Line, marker: &str, block: usize) -> Result<()> {
+        let actual = line_text(document, line);
+        if actual != marker {
+            bail!(
+                "expected `<<<<<<< SEARCH` for block {block} at line {}, found `{actual}`",
+                line.number
+            );
+        }
+        Ok(())
+    }
+
+    fn is_marker(line: &str) -> bool {
+        matches!(line, "<<<<<<< SEARCH" | "=======" | ">>>>>>> REPLACE")
+    }
+
+    fn resolve_path(cwd: &Path, path: &Path) -> PathBuf {
+        if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            cwd.join(path)
+        }
+    }
+
+    fn preflight(
+        cwd: &Path,
+        reported_path: PathBuf,
+        blocks: Vec<Block>,
+        replace_all: bool,
+    ) -> Result<PlannedEdit> {
+        let path = resolve_path(cwd, &reported_path);
+        let entry_metadata = fs::symlink_metadata(&path)
+            .with_context(|| format!("cannot edit missing file {}", reported_path.display()))?;
+        let target = if entry_metadata.file_type().is_symlink() {
+            fs::canonicalize(&path)
+                .with_context(|| format!("resolving symlink to edit {}", reported_path.display()))?
+        } else {
+            path
+        };
+        let metadata = fs::metadata(&target)
+            .with_context(|| format!("cannot edit missing file {}", reported_path.display()))?;
+        if !metadata.is_file() {
+            bail!("cannot edit non-regular file {}", reported_path.display());
+        }
+        let original = fs::read_to_string(&target)
+            .with_context(|| format!("reading file to edit {}", reported_path.display()))?;
+
+        let mut matches = Vec::new();
+        for (block_index, block) in blocks.iter().enumerate() {
+            let locations = find_all(&original, &block.search);
+            let block_number = block_index + 1;
+            if locations.is_empty() {
+                bail!(
+                    "block {block_number} did not match {}; re-read the file and copy the exact current text",
+                    reported_path.display()
+                );
+            }
+            if !replace_all && locations.len() != 1 {
+                bail!(
+                    "block {block_number} matched {} locations in {}; add surrounding context or retry with --all",
+                    locations.len(),
+                    reported_path.display()
+                );
+            }
+            for start in locations {
+                matches.push(Match {
+                    start,
+                    end: start + block.search.len(),
+                    block: block_index,
+                });
+                if !replace_all {
+                    break;
+                }
+            }
+        }
+
+        matches.sort_by_key(|found| (found.start, found.end, found.block));
+        for pair in matches.windows(2) {
+            if pair[1].start < pair[0].end {
+                let first = pair[0].block + 1;
+                let second = pair[1].block + 1;
+                if first == second {
+                    bail!(
+                        "block {first} has overlapping matches in {}; add surrounding context or edit in separate steps",
+                        reported_path.display()
+                    );
+                }
+                bail!(
+                    "blocks {first} and {second} overlap in {}; combine them into one block",
+                    reported_path.display()
+                );
+            }
+        }
+
+        let replacements = matches.len();
+        let mut content = original;
+        for found in matches.iter().rev() {
+            content.replace_range(found.start..found.end, &blocks[found.block].replacement);
+        }
+        Ok(PlannedEdit {
+            target,
+            reported_path,
+            content,
+            permissions: metadata.permissions(),
+            blocks: blocks.len(),
+            replacements,
+        })
+    }
+
+    fn find_all(text: &str, needle: &str) -> Vec<usize> {
+        text.as_bytes()
+            .windows(needle.len())
+            .enumerate()
+            .filter_map(|(index, candidate)| (candidate == needle.as_bytes()).then_some(index))
+            .collect()
+    }
+
+    fn format_summary(edit: &PlannedEdit, cwd: &Path) -> String {
+        let path = edit
+            .reported_path
+            .strip_prefix(cwd)
+            .unwrap_or(&edit.reported_path);
+        let block_label = if edit.blocks == 1 { "block" } else { "blocks" };
+        let replacement_label = if edit.replacements == 1 {
+            "replacement"
+        } else {
+            "replacements"
+        };
+        format!(
+            "Done!\nM {}\nApplied {} {block_label}, {} {replacement_label}.\n",
+            path.display(),
+            edit.blocks,
+            edit.replacements
+        )
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn temp_dir() -> PathBuf {
+            let path = std::env::temp_dir().join(format!("mu-edit-{}", uuid::Uuid::new_v4()));
+            fs::create_dir_all(&path).unwrap();
+            path
+        }
+
+        fn block(search: &str, replacement: &str) -> String {
+            format!("<<<<<<< SEARCH\n{search}\n=======\n{replacement}\n>>>>>>> REPLACE\n")
+        }
+
+        #[test]
+        fn parses_file_and_replace_all_flag() {
+            let args = Args::try_parse_from(["edit", "--all", "src/main.rs"]).unwrap();
+            assert!(args.all);
+            assert_eq!(args.file, PathBuf::from("src/main.rs"));
+        }
+
+        #[test]
+        fn parses_multiple_blocks_and_empty_replacement() {
+            let document = concat!(
+                "<<<<<<< SEARCH\none\n=======\ntwo\n>>>>>>> REPLACE\n",
+                "<<<<<<< SEARCH\nremove me\n=======\n>>>>>>> REPLACE\n"
+            );
+            assert_eq!(
+                parse_document(document).unwrap(),
+                vec![
+                    Block {
+                        search: "one".into(),
+                        replacement: "two".into()
+                    },
+                    Block {
+                        search: "remove me".into(),
+                        replacement: String::new()
+                    }
+                ]
+            );
+        }
+
+        #[test]
+        fn framing_newlines_are_not_part_of_the_bodies() {
+            let blocks = parse_document(
+                "<<<<<<< SEARCH\nfirst\nsecond\n\n=======\nreplacement\n>>>>>>> REPLACE\n",
+            )
+            .unwrap();
+            assert_eq!(blocks[0].search, "first\nsecond\n");
+            assert_eq!(blocks[0].replacement, "replacement");
+        }
+
+        #[test]
+        fn preserves_internal_crlf_line_endings() {
+            let blocks = parse_document(
+                "<<<<<<< SEARCH\r\nfirst\r\nsecond\r\n=======\r\nnew\r\n>>>>>>> REPLACE\r\n",
+            )
+            .unwrap();
+            assert_eq!(blocks[0].search, "first\r\nsecond");
+            assert_eq!(blocks[0].replacement, "new");
+        }
+
+        #[test]
+        fn rejects_empty_search_and_malformed_documents() {
+            let error =
+                parse_document("<<<<<<< SEARCH\n=======\nx\n>>>>>>> REPLACE\n").unwrap_err();
+            assert!(error.to_string().contains("empty SEARCH"));
+
+            let error = parse_document("<<<<<<< SEARCH\nx\n>>>>>>> REPLACE\n").unwrap_err();
+            assert!(error.to_string().contains("expected `=======`"));
+
+            let error = parse_document("not a block\n").unwrap_err();
+            assert!(error.to_string().contains("expected `<<<<<<< SEARCH`"));
+        }
+
+        #[test]
+        fn applies_multiple_blocks_against_the_original_snapshot() {
+            let dir = temp_dir();
+            fs::write(dir.join("file.txt"), "alpha beta gamma\n").unwrap();
+            let blocks = vec![
+                Block {
+                    search: "alpha".into(),
+                    replacement: "A".into(),
+                },
+                Block {
+                    search: "gamma".into(),
+                    replacement: "G".into(),
+                },
+            ];
+            let planned = preflight(&dir, PathBuf::from("file.txt"), blocks, false).unwrap();
+            assert_eq!(planned.content, "A beta G\n");
+            assert_eq!(planned.replacements, 2);
+            super::super::apply_patch::atomic_write(
+                &planned.target,
+                &planned.content,
+                Some(planned.permissions.clone()),
+                true,
+            )
+            .unwrap();
+            assert_eq!(
+                fs::read_to_string(dir.join("file.txt")).unwrap(),
+                "A beta G\n"
+            );
+            fs::remove_dir_all(dir).unwrap();
+        }
+
+        #[test]
+        fn all_replaces_every_non_overlapping_occurrence() {
+            let dir = temp_dir();
+            fs::write(dir.join("file.txt"), "x x x").unwrap();
+            let blocks = parse_document(&block("x", "y")).unwrap();
+            let planned = preflight(&dir, PathBuf::from("file.txt"), blocks, true).unwrap();
+            assert_eq!(planned.content, "y y y");
+            assert_eq!(planned.replacements, 3);
+            fs::remove_dir_all(dir).unwrap();
+        }
+
+        #[test]
+        fn empty_replacement_deletes_the_match() {
+            let dir = temp_dir();
+            fs::write(dir.join("file.txt"), "keep remove keep").unwrap();
+            let blocks = parse_document(&block(" remove", "")).unwrap();
+            let planned = preflight(&dir, PathBuf::from("file.txt"), blocks, false).unwrap();
+            assert_eq!(planned.content, "keep keep");
+            fs::remove_dir_all(dir).unwrap();
+        }
+
+        #[test]
+        fn reports_no_match_and_ambiguity_without_writing() {
+            let dir = temp_dir();
+            let path = dir.join("file.txt");
+            fs::write(&path, "same same").unwrap();
+
+            let error = preflight(
+                &dir,
+                PathBuf::from("file.txt"),
+                parse_document(&block("missing", "new")).unwrap(),
+                false,
+            )
+            .unwrap_err();
+            assert!(error.to_string().contains("did not match"));
+
+            let error = preflight(
+                &dir,
+                PathBuf::from("file.txt"),
+                parse_document(&block("same", "new")).unwrap(),
+                false,
+            )
+            .unwrap_err();
+            assert!(error.to_string().contains("matched 2 locations"));
+            assert_eq!(fs::read_to_string(&path).unwrap(), "same same");
+            fs::remove_dir_all(dir).unwrap();
+        }
+
+        #[test]
+        fn accepts_absolute_paths_and_rejects_missing_files() {
+            let dir = temp_dir();
+            let path = dir.join("file.txt");
+            fs::write(&path, "old").unwrap();
+            let planned = preflight(
+                &dir,
+                path.clone(),
+                parse_document(&block("old", "new")).unwrap(),
+                false,
+            )
+            .unwrap();
+            assert_eq!(planned.target, path);
+            assert_eq!(planned.content, "new");
+
+            let missing = dir.join("missing.txt");
+            let error = preflight(
+                &dir,
+                missing.clone(),
+                parse_document(&block("old", "new")).unwrap(),
+                false,
+            )
+            .unwrap_err();
+            assert!(error.to_string().contains("cannot edit missing file"));
+            assert!(!missing.exists());
+            fs::remove_dir_all(dir).unwrap();
+        }
+
+        #[test]
+        fn rejects_overlapping_blocks_and_overlapping_all_matches() {
+            let dir = temp_dir();
+            fs::write(dir.join("file.txt"), "abc").unwrap();
+            let blocks = vec![
+                Block {
+                    search: "ab".into(),
+                    replacement: "x".into(),
+                },
+                Block {
+                    search: "bc".into(),
+                    replacement: "y".into(),
+                },
+            ];
+            let error = preflight(&dir, PathBuf::from("file.txt"), blocks, false).unwrap_err();
+            assert!(error.to_string().contains("blocks 1 and 2 overlap"));
+
+            fs::write(dir.join("file.txt"), "aaa").unwrap();
+            let blocks = parse_document(&block("aa", "x")).unwrap();
+            let error = preflight(&dir, PathBuf::from("file.txt"), blocks, true).unwrap_err();
+            assert!(error.to_string().contains("overlapping matches"));
+            fs::remove_dir_all(dir).unwrap();
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn preserves_permissions_and_updates_through_symlink() {
+            use std::os::unix::fs::{PermissionsExt, symlink};
+
+            let dir = temp_dir();
+            let target = dir.join("target.txt");
+            fs::write(&target, "old").unwrap();
+            fs::set_permissions(&target, fs::Permissions::from_mode(0o640)).unwrap();
+            symlink("target.txt", dir.join("link.txt")).unwrap();
+            let blocks = parse_document(&block("old", "new")).unwrap();
+            let planned = preflight(&dir, PathBuf::from("link.txt"), blocks, false).unwrap();
+            super::super::apply_patch::atomic_write(
+                &planned.target,
+                &planned.content,
+                Some(planned.permissions.clone()),
+                true,
+            )
+            .unwrap();
+
+            assert!(
+                fs::symlink_metadata(dir.join("link.txt"))
+                    .unwrap()
+                    .file_type()
+                    .is_symlink()
+            );
+            assert_eq!(fs::read_to_string(&target).unwrap(), "new");
+            assert_eq!(
+                fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+                0o640
+            );
+            fs::remove_dir_all(dir).unwrap();
+        }
+    }
+}
+
 mod view_image {
     use std::path::PathBuf;
 
@@ -1040,6 +1615,7 @@ mod tests {
             from_argv0(OsStr::new("/x/apply_patch")),
             Some(Applet::ApplyPatch)
         );
+        assert_eq!(from_argv0(OsStr::new("edit")), Some(Applet::Edit));
         assert_eq!(
             from_argv0(OsStr::new("view_image")),
             Some(Applet::ViewImage)

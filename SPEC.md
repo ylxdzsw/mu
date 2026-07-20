@@ -74,7 +74,7 @@ is unacceptable here.
 Rationale:
 
 - Cold start in single-digit milliseconds. No runtime bootstrap, no JIT warmup.
-- One physical binary to install and update. Private `apply_patch` and
+- One physical binary to install and update. Private `apply_patch`, `edit`, and
   `view_image` symlinks dispatch back into it by `argv[0]`.
 - Mature ecosystem for everything needed: async runtime (`tokio`), HTTP/SSE
   (`reqwest`), SQLite (`rusqlite`), JSONC/serde.
@@ -362,7 +362,7 @@ bash({
 ```
 
 `bash` prepends `/usr/libexec/mu` to its post-login `PATH`. That directory owns
-two private symlinks to the physical `/usr/bin/mu` binary. Before normal CLI
+three private symlinks to the physical `/usr/bin/mu` binary. Before normal CLI
 parsing or async-runtime startup, `mu` checks the basename of `argv[0]` and
 dispatches these applets:
 
@@ -375,6 +375,31 @@ dispatches these applets:
   symlink edits its regular-file target while preserving the link; deleting a
   symlink removes only the link; moving a symlink renames the link. Dangling
   links can therefore be deleted or moved but cannot be updated.
+- **`edit [--all] FILE`** reads one or more exact replacement blocks from
+  stdin. Each block has marker-only framing lines and this shape:
+  ```text
+  <<<<<<< SEARCH
+  exact existing text
+  =======
+  replacement text
+  >>>>>>> REPLACE
+  ```
+  The line endings adjacent to the three marker lines are framing, not body
+  content; an additional empty body line represents a leading or trailing line
+  ending. Internal body line endings are preserved literally.
+  An empty SEARCH section is invalid; an empty REPLACE section deletes the
+  matched text. Without `--all`, every SEARCH must occur exactly once. With
+  `--all`, every SEARCH must occur at least once and every occurrence is
+  replaced. All matches are calculated against the original UTF-8 file
+  snapshot, and overlapping matches are rejected. Relative paths resolve from
+  the shell call's working directory; absolute paths are used as written.
+  Updating through a symlink edits its regular-file target while preserving
+  the link and its target's permissions. The entire document is preflighted
+  before one atomic file replacement, so a parse, match, overlap, read, or
+  write failure leaves the existing file unchanged. Success is reported
+  compactly as `Done!`, an `M PATH` line, and an applied block/replacement
+  count; failures identify the responsible block and corrective action. The
+  updated file or a full diff is not returned.
 - **`view_image [--detail auto|low|high|original] PATH`** loads a validated PNG,
   JPEG, WebP, or GIF through the same attachment loader and 20 MiB limit used by
   `mu -a`. `--detail` is optional and defaults to `auto`. The command writes a
@@ -1006,8 +1031,9 @@ The assembled prompt has this fixed order:
 1. A short role/behavior preamble (a few sentences). Illustrative:
    > You are mu, a terminal agent. Exactly one function tool is available:
    > `bash`; do not call any other function tool. Inside `bash`, Mu provides
-   > `apply_patch` for structured file edits and `view_image` for loading an
-   > image into the tool result. These are shell commands, not function tools.
+   > `apply_patch` for structured file edits, `edit` for exact replacements,
+   > and `view_image` for loading an image into the tool result. These are shell
+   > commands, not function tools.
    > Each bash call is isolated; pass `cwd` explicitly when needed. Keep
    > responses concise.
    The exact wording lives in `src/system_preamble.md`; keep it short.
