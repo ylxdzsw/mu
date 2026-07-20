@@ -298,7 +298,7 @@ _mu_zsh_json_value_reply() {
 }
 
 _mu_zsh_build_mode_prompt() {
-  local status_json model context_raw context cwd project_root project_segment attachment_segment
+  local status_json model context_raw context context_segment cwd project_root project_segment attachment_segment
   local clean unclean_segment
   local escaped_model escaped_context escaped_project_root escaped_unclean_text
 
@@ -317,19 +317,22 @@ _mu_zsh_build_mode_prompt() {
   context_raw=${fields[2]:-}
   project_root=${fields[3]:-}
   clean=${fields[4]:-}
-  if [[ -z "$MU_ZSH_EFFECTIVE_SESSION_ID" ]]; then
-    context=new
-  elif [[ -z "$context_raw" || "$context_raw" == null ]]; then
-    context=0%
-  elif ! printf -v context '%.0f%%' "$context_raw" 2>/dev/null; then
-    context=0%
+  if [[ -n "$MU_ZSH_EFFECTIVE_SESSION_ID" ]]; then
+    if [[ -z "$context_raw" || "$context_raw" == null ]]; then
+      context=0%
+    elif ! printf -v context '%.0f%%' "$context_raw" 2>/dev/null; then
+      context=0%
+    fi
+    escaped_context=$context
+    escaped_context=${escaped_context//\%/%%}
+    context_segment=" %F{$MU_ZSH_PROMPT_CONTEXT_COLOR}${escaped_context}%f"
+  else
+    context_segment=
   fi
   cwd=$PWD
   cwd=${cwd//\%/%%}
   escaped_model=$model
   escaped_model=${escaped_model//\%/%%}
-  escaped_context=$context
-  escaped_context=${escaped_context//\%/%%}
   if [[ -z "$project_root" ]]; then
     project_segment=" %F{$MU_ZSH_PROMPT_PROJECT_COLOR}(global)%f"
   elif [[ "$project_root" != "$PWD" ]]; then
@@ -356,7 +359,7 @@ _mu_zsh_build_mode_prompt() {
     unclean_segment=
   fi
 
-  print -r -- "%F{$MU_ZSH_PROMPT_MODEL_COLOR}${escaped_model}%f %F{$MU_ZSH_PROMPT_CONTEXT_COLOR}${escaped_context}%f %F{$MU_ZSH_PROMPT_PWD_COLOR}${cwd}%f${project_segment}${unclean_segment}${attachment_segment}
+  print -r -- "%F{$MU_ZSH_PROMPT_MODEL_COLOR}${escaped_model}%f${context_segment} %F{$MU_ZSH_PROMPT_PWD_COLOR}${cwd}%f${project_segment}${unclean_segment}${attachment_segment}
 ${MU_ZSH_PROMPT_INPUT}"
 }
 
