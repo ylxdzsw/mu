@@ -28,6 +28,7 @@ systemd-run \
   --property=StandardError=append:"$log" \
   --property=WorkingDirectory="$(pwd)" \
   --expand-environment=no \
+  -E MU_SUBAGENT_DEPTH="${MU_SUBAGENT_DEPTH:-0}" \
   bash -lc 'exec your-server-command-here'
 
 invocation_id=$(systemctl show "$unit" -P InvocationID 2>/dev/null || true)
@@ -35,6 +36,10 @@ printf 'unit=%s\ninvocation_id=%s\nlog=%s\n' "$unit" "$invocation_id" "$log"
 ```
 
 Run the service command in the foreground inside the unit. Do not append `&`.
+The `MU_SUBAGENT_DEPTH` variable prevents infinite recursion of delegation when
+running `mu` subagents. It is auto managed by `mu` in direct invocation but will
+be cleared by systemd unless we pass it explicitly as in the example.
+
 If the runtime user is not `root`, add `--user`.
 
 Read logs through a normal foreground `bash` command such as:
