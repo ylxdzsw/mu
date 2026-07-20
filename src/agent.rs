@@ -665,7 +665,7 @@ impl<'a> AgentLoop<'a> {
                     bash_args,
                     self.config,
                     self.state_dir,
-                )),
+                )?),
                 streamed_len: 0,
             });
         }

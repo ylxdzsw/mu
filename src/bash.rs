@@ -94,7 +94,7 @@ pub async fn execute(args: Value, ctx: &mut ToolContext<'_>) -> Result<ToolResul
         bail!("timeout must be greater than 0");
     }
 
-    let redactor = SecretRedactor::from_config(ctx.config);
+    let redactor = SecretRedactor::from_config(ctx.config)?;
     for warning in redactor.warnings() {
         ctx.renderer.notice(&format!("[redaction] {warning}"))?;
     }
@@ -220,23 +220,30 @@ impl BashOutputTarget for BufferedBashTarget {
     }
 }
 
-pub fn start_bash_task(args: BashArgs, config: &Config, state_dir: &Path) -> RunningBash {
-    let warnings = SecretRedactor::from_config(config).warnings().to_vec();
+pub fn start_bash_task(args: BashArgs, config: &Config, state_dir: &Path) -> Result<RunningBash> {
+    let redactor = SecretRedactor::from_config(config)?;
+    let warnings = redactor.warnings().to_vec();
     let config = config.clone();
     let state_dir = state_dir.to_path_buf();
     let shared = Arc::new(SharedBashState::default());
     let shared_for_task = Arc::clone(&shared);
     let task = tokio::task::spawn_blocking(move || {
         let started = Instant::now();
-        let result = execute_bash_task(args, &config, &state_dir, Arc::clone(&shared_for_task));
+        let result = execute_bash_task(
+            args,
+            &config,
+            &state_dir,
+            Arc::clone(&shared_for_task),
+            redactor,
+        );
         shared_for_task.mark_finished();
         (result, started.elapsed())
     });
-    RunningBash {
+    Ok(RunningBash {
         warnings,
         shared,
         task,
-    }
+    })
 }
 
 fn run_bash(
@@ -254,13 +261,13 @@ fn execute_bash_task(
     config: &Config,
     state_dir: &Path,
     shared: Arc<SharedBashState>,
+    mut redactor: SecretRedactor,
 ) -> Result<ToolResult> {
     let timeout = args.timeout.unwrap_or(DEFAULT_TIMEOUT_SECS);
     if timeout == 0 {
         bail!("timeout must be greater than 0");
     }
 
-    let mut redactor = SecretRedactor::from_config(config);
     let mut target = BufferedBashTarget::new(shared);
     let result = run_bash_inner(args, timeout, &mut target, &config.env, &mut redactor)?;
     let exit_code = result.exit_code;
@@ -407,8 +414,7 @@ fn run_bash_inner(
 
         match rx.recv_timeout(Duration::from_millis(25)) {
             Ok(bytes) => {
-                let text = String::from_utf8_lossy(&bytes);
-                let redacted = redactor.redact_chunk(&text);
+                let redacted = redactor.redact_chunk(&bytes);
                 output.push_str(&redacted);
                 target.push_output(&redacted)?;
             }
@@ -459,8 +465,7 @@ fn drain_available(
     redactor: &mut SecretRedactor,
 ) -> Result<()> {
     while let Ok(bytes) = rx.try_recv() {
-        let text = String::from_utf8_lossy(&bytes);
-        let redacted = redactor.redact_chunk(&text);
+        let redacted = redactor.redact_chunk(&bytes);
         output.push_str(&redacted);
         target.push_output(&redacted)?;
     }
@@ -826,7 +831,7 @@ PY"#;
                 ("OPENAI_API_KEY", "provider-secret"),
                 ("CUSTOM_SECRET", "tiny"),
             ],
-            &["CUSTOM_SECRET"],
+            &["*SECRET"],
         );
         let mut ctx = ToolContext {
             config: &config,

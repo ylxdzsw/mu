@@ -409,6 +409,9 @@ impl Config {
         if self.providers.is_empty() {
             bail!("no providers configured in config.jsonc: set `providers`");
         }
+        for selector in &self.redaction.env {
+            redaction_suffix(selector)?;
+        }
         for (provider_id, provider) in &self.providers {
             if provider.endpoint.trim().is_empty() {
                 bail!(
@@ -426,6 +429,26 @@ impl Config {
         self.validate_structure()?;
         crate::models::validate_config(self)
     }
+}
+
+pub(crate) fn redaction_suffix(selector: &str) -> Result<Option<&str>> {
+    let Some(suffix) = selector.strip_prefix('*') else {
+        if selector.contains('*') {
+            bail!(
+                "invalid redaction env selector `{selector}`: `*` is only allowed as the first character"
+            );
+        }
+        return Ok(None);
+    };
+    if suffix.is_empty() {
+        bail!(
+            "invalid redaction env selector `{selector}`: `*` must be followed by a literal suffix"
+        );
+    }
+    if suffix.contains('*') {
+        bail!("invalid redaction env selector `{selector}`: exactly one `*` is allowed");
+    }
+    Ok(Some(suffix))
 }
 
 fn ensure_starter_config(path: &Path) -> Result<()> {
@@ -719,6 +742,47 @@ mod tests {
             .as_ref()
             .unwrap();
         assert_eq!(efforts, &["none", "minimal", "provider-custom"]);
+    }
+
+    #[test]
+    fn redaction_env_accepts_exact_names_and_leading_wildcard_suffixes() {
+        let config = config_from_value(serde_json::json!({
+            "providers": {
+                "openai": {
+                    "endpoint": "http://localhost/chat/completions",
+                    "models": {"gpt": {}}
+                }
+            },
+            "redaction": {"env": ["GITHUB_TOKEN", "*_TOKEN"]}
+        }))
+        .unwrap();
+
+        assert_eq!(config.redaction.env, ["GITHUB_TOKEN", "*_TOKEN"]);
+    }
+
+    #[test]
+    fn redaction_env_rejects_unsupported_wildcards() {
+        for (selector, expected) in [
+            ("*", "must be followed by a literal suffix"),
+            ("**_TOKEN", "exactly one `*` is allowed"),
+            ("AWS_*", "only allowed as the first character"),
+            ("*TOKEN*", "exactly one `*` is allowed"),
+        ] {
+            let error = config_from_value(serde_json::json!({
+                "providers": {
+                    "openai": {
+                        "endpoint": "http://localhost/chat/completions",
+                        "models": {"gpt": {}}
+                    }
+                },
+                "redaction": {"env": [selector]}
+            }))
+            .unwrap_err();
+
+            let message = error.to_string();
+            assert!(message.contains(selector), "{message}");
+            assert!(message.contains(expected), "{message}");
+        }
     }
 
     #[test]

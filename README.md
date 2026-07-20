@@ -149,8 +149,8 @@ CLI surface.
 - Image and audio attachments from both the CLI and zsh prompt mode.
 - Reusable prompt files, executable prompts, slash commands, project/user
   instructions, and conditionally available skills.
-- A built-in safety guardrail and exact-value redaction for configured secrets
-  in `bash` output.
+- A built-in safety guardrail and exact-value redaction for configured secrets,
+  with exact or suffix-based environment-variable selectors, in `bash` output.
 
 ## Configuration and project scope
 

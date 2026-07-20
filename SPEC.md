@@ -1020,7 +1020,7 @@ one scope are not visible in another.
     "compaction": { "fraction": 0.75, "keep_recent_turns": 2 },  // optional
     "limits": { "max_iterations": 50, "max_lines": 2000, "max_bytes": 51200, "max_line_bytes": 10240 },
     "redaction": {
-      "env": ["GITHUB_TOKEN"]                    // optional; provider api_key_env is implicit
+      "env": ["GITHUB_TOKEN", "*_TOKEN"]         // optional; provider api_key_env is implicit
     }
   }
   ```
@@ -1038,8 +1038,13 @@ one scope are not visible in another.
 - **.env** — optional dotenv data. Values are visible to `bash`; this is
   convenience, not sandboxing. Values from provider `api_key_env` and
   `redaction.env` are exact-value redacted from bash output before the output is
-  stored or shown to the model. Empty redaction values are ignored with a
-  warning. Short redaction values are still redacted with a warning.
+  stored or shown to the model. Each `redaction.env` selector is either an exact
+  environment-variable name or a leading `*` followed by a non-empty literal
+  suffix, such as `*_TOKEN`. The suffix form matches all effective environment
+  variable names ending in that suffix. Other wildcard placements, multiple or
+  consecutive wildcards, and wildcard-only selectors are invalid. Matching is
+  case-sensitive. Empty redaction values are ignored with a warning. Short
+  redaction values are still redacted with a warning.
 - **AGENTS.md** — system-prompt addendum. Global instructions are loaded first;
   active-project instructions are appended after them when a project is active.
   Both are included; "project overrides global" means later text wins by
