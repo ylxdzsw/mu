@@ -306,6 +306,7 @@ _mu_zsh_build_mode_prompt() {
   # dominates prompt-draw latency, so keep this to a single invocation.
   local tsv
   local -a fields
+  _mu_zsh_sync_state
   status_json=$(_mu_zsh_status_json) || status_json=
   if [[ -n "$status_json" ]] && command -v jq >/dev/null 2>&1; then
     tsv=$(jq -r '[(.model.canonical // ""), (.context_percent // ""), (.project_root // ""), (if has("clean") then (.clean|tostring) else "" end)] | @tsv' <<< "$status_json" 2>/dev/null) || tsv=
@@ -316,7 +317,9 @@ _mu_zsh_build_mode_prompt() {
   context_raw=${fields[2]:-}
   project_root=${fields[3]:-}
   clean=${fields[4]:-}
-  if [[ -z "$context_raw" || "$context_raw" == null ]]; then
+  if [[ -z "$MU_ZSH_EFFECTIVE_SESSION_ID" ]]; then
+    context=new
+  elif [[ -z "$context_raw" || "$context_raw" == null ]]; then
     context=0%
   elif ! printf -v context '%.0f%%' "$context_raw" 2>/dev/null; then
     context=0%

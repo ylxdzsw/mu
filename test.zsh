@@ -131,10 +131,29 @@ _mu_zsh_enter_mode
 [[ "$BUFFER" == "echo hello" ]] || fail "preserves buffer in mu mode"
 [[ "$CURSOR" -eq 0 ]] || fail "preserves cursor in mu mode"
 escaped_pwd=${PWD//\%/%%}
-expected_prompt="%F{45}prompt-test-model%f %F{244}25%%%f %F{39}${escaped_pwd}%f
+expected_prompt="%F{45}prompt-test-model%f %F{244}new%f %F{39}${escaped_pwd}%f
 mu> "
 [[ "$PROMPT" == "$MU_ZSH_PROMPT" ]] || fail "sets mu prompt"
 [[ "$PROMPT" == "$expected_prompt" ]] || fail "renders two-line mu prompt"
+
+short_fake_bin=$tmpdir/short-bin
+mkdir -p -- "$short_fake_bin"
+cat > "$short_fake_bin/mu" <<'EOF'
+#!/usr/bin/env zsh
+if [[ "$1" == "status" ]]; then
+  print -r -- '{"model":{"provider_id":"test","model_id":"m","effort":null,"canonical":"m"},"context_percent":0.0,"project_root":null}'
+  exit 0
+fi
+exit 1
+EOF
+chmod +x "$short_fake_bin/mu"
+MU_ZSH_SESSION_ID=short-session
+MU_ZSH_SESSION_SCOPE=$(_mu_zsh_current_scope_key)
+MU_ZSH_BIN=$short_fake_bin/mu
+short_prompt=$(_mu_zsh_build_mode_prompt)
+MU_ZSH_BIN=$prompt_fake_bin/mu
+_mu_zsh_clear_session_state
+[[ "$short_prompt" == *"%F{$MU_ZSH_PROMPT_CONTEXT_COLOR}0%%%f"* ]] || fail "shows 0% for an attached short session"
 
 BUFFER="edited in mu"
 CURSOR=3
@@ -643,7 +662,7 @@ interactive_status=0
 
 normalized=$(perl -pe 's/\e\[[0-?]*[ -\/]*[@-~]//g' "$interactive_transcript" | col -b)
 submitted_display_before_response "$interactive_transcript"
-expected_submitted_display="prompt-test-model 25% $root"$'\nmu> hello\n'
+expected_submitted_display="prompt-test-model new $root"$'\nmu> hello\n'
 [[ "$REPLY" == *"$expected_submitted_display"* ]] || fail "submitted prompt should remain complete in terminal scrollback"
 after_submitted_display=${REPLY#*"$expected_submitted_display"}
 [[ "$after_submitted_display" != *"$expected_submitted_display"* ]] || fail "submitted prompt should be committed exactly once"
@@ -699,7 +718,7 @@ interactive_status=0
 (( interactive_status == 0 )) || fail "Shift+Enter transcript exited with status $interactive_status"
 [[ $(<"$interactive_capture_calls") == x ]] || fail "Shift+Enter should not submit before Enter"
 submitted_display_before_response "$shift_enter_transcript"
-expected_submitted_display="prompt-test-model 25% $root"$'\nmu> first line\nsecond line\n'
+expected_submitted_display="prompt-test-model new $root"$'\nmu> first line\nsecond line\n'
 [[ "$REPLY" == *"$expected_submitted_display"* ]] || fail "multiline submitted prompt should remain complete in terminal scrollback"
 shift_enter_expected_stdin=$tmpdir/shift-enter-expected-stdin
 print -rn -- 'first line'$'\n''second line'$'\n' > "$shift_enter_expected_stdin"
@@ -781,7 +800,7 @@ normalized=$(perl -pe 's/\e\[[0-?]*[ -\/]*[@-~]//g' "$model_switch_transcript" |
 after_model_switch=${normalized#*$'[mu] next turns in this scope will use openai/gpt\n'}
 [[ "$after_model_switch" == $'\n'* ]] || fail "model slash command should leave an empty line before the next prompt"
 [[ "$after_model_switch" != $'\n\n'* ]] || fail "model slash command should not leave two empty lines before the next prompt"
-[[ "$after_model_switch" == *$'openai/gpt 25%'* ]] || fail "model slash command should redraw prompt with selected model"
+[[ "$after_model_switch" == *$'openai/gpt new'* ]] || fail "model slash command should redraw a new-session prompt with the selected model"
 [[ ! -e "$interactive_capture_calls" || ! -s "$interactive_capture_calls" ]] || fail "model slash command should not submit a prompt"
 
 new_session_transcript=$tmpdir/new-session-transcript
@@ -803,7 +822,7 @@ raw_newline_count_between "$new_session_transcript" /new '[mu] next turn will st
 after_new_session=${normalized#*$'[mu] next turn will start a new session\n'}
 [[ "$after_new_session" == $'\n'* ]] || fail "new slash command should leave an empty line before the next prompt"
 [[ "$after_new_session" != $'\n\n'* ]] || fail "new slash command should not leave two empty lines before the next prompt"
-[[ "$after_new_session" == *$'prompt-test-model 25%'* ]] || fail "new slash command should redraw prompt"
+[[ "$after_new_session" == *$'prompt-test-model new'* ]] || fail "new slash command should redraw a new-session prompt"
 [[ ! -e "$interactive_capture_calls" || ! -s "$interactive_capture_calls" ]] || fail "new slash command should not submit a prompt"
 
 slash_listing_transcript=$tmpdir/slash-listing-transcript

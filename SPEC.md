@@ -709,6 +709,9 @@ waits for the turn to finish, and then redraws `mu>` with the same session id.
 `MU_ZSH_OUTPUT` optionally overrides the density; when unset, the child inherits
 the active `config.jsonc` default. It does not control whether the child is
 interactive.
+The prompt's context field reads `new` while no session is attached; once a
+session exists, it shows the rounded context percentage, including `0%` for a
+short session.
 After ZLE commits the submitted prompt line to scrollback, the plugin prints one
 empty line before child-process output starts, independent of whether the child
 uses `concise`, `detail`, or `full` output.
