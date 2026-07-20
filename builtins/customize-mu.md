@@ -123,13 +123,20 @@ example `mu review.md` or `/review.md` in the zsh prompt mode. Built-in
 subcommands and explicit prompt paths such as `./status` win over command names.
 
 Every prompt file can take an optional custom instruction from non-terminal
-stdin. Prefer a quoted heredoc for multiline text:
+stdin. When calling it through the Bash tool, prefer the tool's `stdin` argument
+over shell redirection:
 
-```sh
-mu review.md <<'EOF'
-Focus on authentication and authorization.
-EOF
+```ts
+bash({
+  title: "Run custom review command",
+  risk: "readonly",
+  command: "mu review.md",
+  stdin: "Focus on authentication and authorization."
+})
 ```
+
+For a human invoking `mu` directly from a terminal, a quoted heredoc remains
+appropriate for multiline input.
 
 For file-backed turns, terminal stdin is not read, and an empty pipe leaves the
 file prompt unchanged. Non-empty stdin is appended after `---`. In zsh prompt
@@ -148,7 +155,11 @@ A skill is an instruction file with YAML frontmatter containing `name` and
 no skill tool; the agent reads the skill file on demand with normal `bash`
 commands such as `sed`, `cat`, or `rg`.
 
-Flat file form:
+Prefer a flat file when the skill consists only of instructions:
+
+```text
+.mu/my-skill.md
+```
 
 ```markdown
 ---
@@ -167,7 +178,9 @@ comma-separated; every listed env var must be non-empty and every listed command
 must resolve before `mu` lists the skill. Do not use requirements to replace a
 clear trigger description.
 
-Folder form:
+Use the folder form when the skill bundles supporting scripts, references,
+examples, or assets, or when external Open Skills compatibility is an explicit
+goal. Do not create a directory merely to hold one `SKILL.md`:
 
 ```text
 .mu/my-skill/SKILL.md
@@ -176,6 +189,10 @@ Folder form:
 The skill name must match the flat file stem or the parent directory of
 `SKILL.md`. Names are lowercase ASCII letters or digits plus `_` and `-`.
 Descriptions should say both what the skill does and when it should trigger.
+
+In skill examples, pass multiline or escaping-sensitive command input through
+the Bash tool's `stdin` argument. Keep it out of the command string and omit
+`stdin` when the command needs no input.
 
 ## Project initialization
 
