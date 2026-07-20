@@ -321,7 +321,8 @@ This is the exact sequence the binary follows for one turn invocation:
 10. **Update the session row:** `last_total_tokens` = the `total_tokens` from the
     *final* provider response of the turn (this already reflects the full context
     incl. prior turns); bump `updated_at`.
-11. **Print the turn summary line** to stderr (§5), release the `flock`, exit 0.
+11. **For `detail` and `full`, print the turn summary line** to stderr (§5),
+    release the `flock`, exit 0. `concise` and `final` omit it.
 
 **Usage accounting.** Each provider response in the loop carries its own `usage`.
 For the **context fullness** figure (`last_total_tokens`, the summary's
@@ -596,15 +597,18 @@ renderer-to-renderer block transitions.
 - A bash tool block includes its header, streamed preview/output, omission
   marker, and final exit line; those pieces are not separated from each other by
   extra blank lines.
-- The turn summary is its own final transcript block. When a turn produced
-  transcript output, it has exactly one empty line before the summary and one
-  empty line between the summary and the next shell prompt.
+- In `detail` and `full`, the turn summary is its own final transcript block.
+  When a turn produced transcript output, it has exactly one empty line before
+  the summary and one empty line between the summary and the next shell prompt.
+  Concise omits the summary but keeps one empty line before the next shell
+  prompt.
 
 This contract applies to `concise`, `detail`, and `full` output.
 
 **Stream routing (explicit).** The conversation transcript goes to **stdout**:
 tool presentation, tool failures, Bash output, and assistant text. Fatal process
-errors and the turn summary go to **stderr**. Thus `mu <<< prompt > out.txt`
+errors and the `detail`/`full` turn summary go to **stderr**. Thus
+`mu <<< prompt > out.txt`
 captures the complete portable transcript while fatal diagnostics/summary
 remain visible. Stdout TTY detection selects rich versus portable rendering;
 stderr TTY detection suppresses the summary when redirected.
@@ -657,8 +661,8 @@ stderr TTY detection suppresses the summary when redirected.
   available. Fatal turn failure produces a non-zero process exit code so the
   shell's `$?` is meaningful.
 
-**Turn summary line.** When `mu` exits normally (turn complete), it prints a
-single structured summary line to stderr:
+**Turn summary line.** When `mu` exits normally (turn complete) in `detail` or
+`full`, it prints a single structured summary line to stderr:
 
 ```
 [mu] tokens: 1234 in (567 cache read, 89 cache write) / 456 out  context: 12%
@@ -670,16 +674,18 @@ and cache usage is shown parenthetically when reported. Cache write is omitted
 when the provider does not report it; `context` is the new
 `total_tokens` ÷ model context window. This is the *only* stderr output in the normal case. It appears after all
 stdout, and goes to stderr so it stays out of a captured stdout transcript. It
-is suppressed if stderr is not a TTY (piped/redirected), since it would pollute
-log files. In every non-final density it is followed by one blank line so the
-next shell prompt is visually separated from the completed turn.
+is suppressed in `concise` and `final`, and when stderr is not a TTY
+(piped/redirected), since it would pollute log files. In `detail` and `full` it
+is followed by one blank line so the next shell prompt is visually separated
+from the completed turn.
 
 Redirected stdout avoids terminal-only control sequences so every density
 remains suitable for scripts. Interactive output may show progress for
 in-flight work, but committed transcript content is never erased from
 scrollback. When `terminal_bell.enabled` is true, interactive non-final output
-also emits a BEL (`\a`) after a successful turn's summary once total turn duration meets
-`terminal_bell.min_duration_ms` (default 10s).
+also emits a BEL (`\a`) after successful turn completion once total turn
+duration meets `terminal_bell.min_duration_ms` (default 10s). In `detail` and
+`full`, the summary is written before the bell.
 
 ---
 
@@ -1362,7 +1368,8 @@ and re-prompt.
 terminating signal ends the turn — most commonly `130` for SIGINT (the shell's
 default for Ctrl-C), and `143` for SIGTERM. A signalled exit takes precedence
 over the generic error code even when the interruption first surfaces as a turn
-error. The summary line is printed only on exit `0`.
+error. When enabled by the output density, the summary line is printed only on
+exit `0`.
 
 ### Abort, pause, and resume
 

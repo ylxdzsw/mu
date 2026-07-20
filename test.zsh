@@ -620,7 +620,9 @@ if [ "$2" = detail ]; then
   printf '%s\n\n' "[thought 100ms, 2 tokens]"
 fi
 printf '%s\n\n' "Hello! I'm your terminal agent."
-printf '%s\n\n' "[mu] tokens: 12 in / 5 out  context: 25%" >&2
+if [ "$2" = detail ] || [ "$2" = full ]; then
+  printf '%s\n\n' "[mu] tokens: 12 in / 5 out  context: 25%" >&2
+fi
 EOF
 chmod +x "$interactive_fake_bin/mu"
 
@@ -778,8 +780,7 @@ after_submitted_prompt=${normalized##*$'mu> concise prompt\n'}
 raw_newline_count_between "$concise_transcript" 'concise prompt' "Hello! I'm your terminal agent."
 [[ "$REPLY" == 1 ]] || fail "concise prompt handoff should advance one raw line before output, saw $REPLY"
 after_response=${normalized#*"Hello! I'm your terminal agent."}
-[[ "$after_response" == $'\n\n[mu] tokens: 12 in / 5 out  context: 25%\n\n'* ]] || fail "concise token summary should be a separate block after assistant output"
-[[ "$after_response" != *$'[mu] tokens: 12 in / 5 out  context: 25%\n\n\n'* ]] || fail "concise token summary should not leave two trailing empty lines"
+[[ "$after_response" != *'[mu] tokens:'* ]] || fail "concise output should omit the token summary"
 interactive_args=("${(@f)$(<"$interactive_capture_args")}")
 expected_concise_args=(--output concise)
 [[ "${(j:\0:)interactive_args}" == "${(j:\0:)expected_concise_args}" ]] || fail "unexpected concise interactive args: ${interactive_args[*]}"

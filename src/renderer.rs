@@ -830,13 +830,20 @@ impl Renderer {
     }
 
     /// Ensure stdout ends on a fresh line so the next shell prompt does not
-    /// glue onto the final line of assistant output.
+    /// glue onto the final line of assistant output. Interactive concise output
+    /// also keeps the usual blank line before that prompt without a summary.
     pub fn finish_turn(&mut self) -> io::Result<()> {
         if self.final_only {
             return Ok(());
         }
         self.assistant_end()?;
-        self.ensure_line_start()
+        self.ensure_line_start()?;
+        if self.format == OutputFormat::Concise && self.styled && self.has_committed_stdout {
+            self.stdout.write_all(b"\n")?;
+            self.trailing_newlines = self.trailing_newlines.saturating_add(1);
+            self.stdout.flush()?;
+        }
+        Ok(())
     }
 
     pub fn turn_summary(
@@ -848,7 +855,7 @@ impl Renderer {
         context_pct: Option<f64>,
         elapsed: Duration,
     ) -> io::Result<()> {
-        if self.final_only {
+        if matches!(self.format, OutputFormat::Final | OutputFormat::Concise) {
             return Ok(());
         }
         if !self.stderr_is_terminal {
@@ -4383,6 +4390,35 @@ mod tests {
             format_turn_summary(600, 0, None, 456, Some(12.0), Duration::from_millis(1100),),
             "[mu] tokens: 600 in / 456 out  context: 12%  time: 1.1s"
         );
+    }
+
+    #[test]
+    fn concise_and_final_output_omit_turn_summary() {
+        for format in [OutputFormat::Concise, OutputFormat::Final] {
+            let (mut renderer, _stdout, stderr) =
+                Renderer::with_test_output(format, true, true, None);
+
+            renderer
+                .turn_summary(12, 0, None, 5, Some(25.0), Duration::from_secs(1))
+                .unwrap();
+
+            assert!(stderr.transcript().is_empty(), "{format:?}");
+        }
+    }
+
+    #[test]
+    fn concise_terminal_keeps_blank_line_before_next_prompt_without_summary() {
+        let (mut renderer, output) =
+            Renderer::with_test_shared_output(OutputFormat::Concise, true, None);
+
+        renderer.assistant_text("Done.").unwrap();
+        renderer.finish_turn().unwrap();
+        renderer
+            .turn_summary(12, 0, None, 5, Some(25.0), Duration::from_secs(1))
+            .unwrap();
+        output.write_raw("mu> ");
+
+        assert_eq!(output.transcript(), "Done.\n\nmu> ");
     }
 
     #[test]
