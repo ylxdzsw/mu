@@ -18,13 +18,15 @@ const STRIKE: &str = "\x1b[9m";
 const OSC8_OPEN: &str = "\x1b]8;;";
 const OSC8_CLOSE: &str = "\x1b]8;;\x1b\\";
 const OSC8_ST: &str = "\x1b\\";
-const RED: &str = "\x1b[91m";
-const GREEN: &str = "\x1b[92m";
-const YELLOW: &str = "\x1b[93m";
-const BLUE: &str = "\x1b[94m";
-const CYAN: &str = "\x1b[96m";
-const GRAY: &str = "\x1b[90m";
-const CODE: &str = "\x1b[38;5;215m";
+// Palette: regular slots for long text; bright only for short emphasis where
+// chosen (reversible risk). OK is always regular green. Code is 256:215.
+const RED: &str = "\x1b[31m"; // destructive / error (regular)
+const GREEN: &str = "\x1b[32m"; // ok icon + text (regular, non-bright)
+const BRIGHT_YELLOW: &str = "\x1b[93m"; // reversible risk (bright)
+const BLUE: &str = "\x1b[34m"; // H2, links, stdin (regular)
+const CYAN: &str = "\x1b[36m"; // H1, readonly, info (regular)
+const GRAY: &str = "\x1b[90m"; // meta / quote (bright-black)
+const CODE: &str = "\x1b[38;5;215m"; // peach exception
 pub(crate) const BASH_COMMAND_PREVIEW_BYTES: usize = 160;
 pub(crate) const BASH_TITLE_PREVIEW_BYTES: usize = 120;
 const GUARDRAIL_REASON_PREVIEW_BYTES: usize = 180;
@@ -2150,6 +2152,7 @@ enum MdStyle {
     Underline,
     Strike,
     Blue,
+    Cyan,
     Code,
 }
 
@@ -2162,6 +2165,7 @@ impl MdStyle {
             Self::Underline => UNDERLINE,
             Self::Strike => STRIKE,
             Self::Blue => BLUE,
+            Self::Cyan => CYAN,
             Self::Code => CODE,
         }
     }
@@ -2798,8 +2802,8 @@ fn visible_text_width(text: &str) -> usize {
 
 fn heading_styles(level: HeadingLevel) -> &'static [MdStyle] {
     match level {
-        HeadingLevel::H1 => &[MdStyle::Bold, MdStyle::Underline],
-        HeadingLevel::H2 => &[MdStyle::Bold],
+        HeadingLevel::H1 => &[MdStyle::Bold, MdStyle::Underline, MdStyle::Cyan],
+        HeadingLevel::H2 => &[MdStyle::Bold, MdStyle::Blue],
         HeadingLevel::H3 => &[MdStyle::Bold],
         HeadingLevel::H4 => &[MdStyle::Underline],
         HeadingLevel::H5 => &[MdStyle::Bold, MdStyle::Dim],
@@ -2921,7 +2925,7 @@ fn format_risk_label(risk: &str, styled: bool) -> String {
     }
     match risk {
         "readonly" => format!("{CYAN}[{risk}]{RESET}"),
-        "reversible" => format!("{YELLOW}[{risk}]{RESET}"),
+        "reversible" => format!("{BRIGHT_YELLOW}[{risk}]{RESET}"),
         "destructive" => format!("{RED}[{risk}]{RESET}"),
         _ => format!("{DIM}[{risk}]{RESET}"),
     }
@@ -2930,7 +2934,7 @@ fn format_risk_label(risk: &str, styled: bool) -> String {
 fn bash_risk_color(risk: Option<&str>) -> &'static str {
     match risk {
         Some("readonly") => CYAN,
-        Some("reversible") => YELLOW,
+        Some("reversible") => BRIGHT_YELLOW,
         Some("destructive") => RED,
         _ => DIM,
     }
@@ -4460,7 +4464,7 @@ mod tests {
         assert_eq!(
             output.transcript(),
             format!(
-                "{GRAY}[preparing toolcall]{RESET}\r\x1b[2K{YELLOW}=> Apply patch{RESET}\r\x1b[2K{YELLOW}=> Apply patch · exit 0{RESET}\n"
+                "{GRAY}[preparing toolcall]{RESET}\r\x1b[2K{BRIGHT_YELLOW}=> Apply patch{RESET}\r\x1b[2K{BRIGHT_YELLOW}=> Apply patch · exit 0{RESET}\n"
             )
         );
     }
