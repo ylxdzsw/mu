@@ -964,10 +964,13 @@ mod edit {
     #[derive(Debug, Parser)]
     #[command(
         name = "edit",
-        about = "Replace exact text in an existing file",
-        after_help = "Pass one or more SEARCH/REPLACE blocks on stdin:\n\n<<<<<<< SEARCH\nexact existing text\n=======\nreplacement text\n>>>>>>> REPLACE"
+        about = "Replace text in an existing file",
+        after_help = "Pass one or more SEARCH/REPLACE blocks on stdin:\n\n<<<<<<< SEARCH\nexact existing text\n=======\nreplacement text\n>>>>>>> REPLACE\n\nStrict matching is the default. --relaxed additionally tolerates line-ending and line-edge whitespace differences."
     )]
     struct Args {
+        /// Tolerate line-ending and line-edge whitespace differences
+        #[arg(long)]
+        relaxed: bool,
         /// Replace every occurrence of each SEARCH block
         #[arg(long)]
         all: bool,
@@ -993,6 +996,34 @@ mod edit {
         start: usize,
         end: usize,
         block: usize,
+        replacement: String,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    struct MatchRange {
+        start: usize,
+        end: usize,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum MatchTier {
+        Exact,
+        LineEndings,
+        TrailingWhitespace,
+        SurroundingWhitespace,
+    }
+
+    #[derive(Debug)]
+    struct TextLine {
+        start: usize,
+        content_end: usize,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum LineEnding {
+        Lf,
+        CrLf,
+        Cr,
     }
 
     #[derive(Debug)]
@@ -1040,7 +1071,7 @@ mod edit {
     fn run(args: Args, document: &str) -> Result<String> {
         let blocks = parse_document(document)?;
         let cwd = std::env::current_dir().context("determining current directory")?;
-        let planned = preflight(&cwd, args.file, blocks, args.all)?;
+        let planned = preflight(&cwd, args.file, blocks, args.all, args.relaxed)?;
         super::apply_patch::atomic_write(
             &planned.target,
             &planned.content,
@@ -1176,6 +1207,7 @@ mod edit {
         reported_path: PathBuf,
         blocks: Vec<Block>,
         replace_all: bool,
+        relaxed: bool,
     ) -> Result<PlannedEdit> {
         let path = resolve_path(cwd, &reported_path);
         let entry_metadata = fs::symlink_metadata(&path)
@@ -1196,26 +1228,60 @@ mod edit {
 
         let mut matches = Vec::new();
         for (block_index, block) in blocks.iter().enumerate() {
-            let locations = find_all(&original, &block.search);
             let block_number = block_index + 1;
-            if locations.is_empty() {
-                bail!(
-                    "block {block_number} did not match {}; re-read the file and copy the exact current text",
-                    reported_path.display()
-                );
-            }
+            let locations = if relaxed {
+                find_at_first_tier(&original, &block.search, true).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "block {block_number} did not match {} even with --relaxed; re-read the file and copy more exact current text",
+                        reported_path.display()
+                    )
+                })?.1
+            } else {
+                let exact = find_exact(&original, &block.search);
+                if exact.is_empty() {
+                    if let Some((tier, relaxed_locations)) =
+                        find_at_first_tier(&original, &block.search, false)
+                    {
+                        if relaxed_locations.len() == 1 {
+                            bail!(
+                                "block {block_number} did not match exactly in {}, but matched once {}; re-read and copy the exact current text, or retry with --relaxed",
+                                reported_path.display(),
+                                tier.description()
+                            );
+                        }
+                        bail!(
+                            "block {block_number} did not match exactly in {}; relaxed matching found {} locations {}; add surrounding context and retry",
+                            reported_path.display(),
+                            relaxed_locations.len(),
+                            tier.description()
+                        );
+                    }
+                    bail!(
+                        "block {block_number} did not match {}; re-read the file and copy the exact current text",
+                        reported_path.display()
+                    );
+                }
+                exact
+            };
             if !replace_all && locations.len() != 1 {
+                let mode = if relaxed { " with --relaxed" } else { "" };
                 bail!(
-                    "block {block_number} matched {} locations in {}; add surrounding context or retry with --all",
+                    "block {block_number} matched {} locations in {}{mode}; add surrounding context or retry with --all",
                     locations.len(),
                     reported_path.display()
                 );
             }
-            for start in locations {
+            for location in locations {
+                let replacement = if relaxed {
+                    adapt_replacement_line_endings(&original, location, &block.replacement)
+                } else {
+                    block.replacement.clone()
+                };
                 matches.push(Match {
-                    start,
-                    end: start + block.search.len(),
+                    start: location.start,
+                    end: location.end,
                     block: block_index,
+                    replacement,
                 });
                 if !replace_all {
                     break;
@@ -1244,7 +1310,7 @@ mod edit {
         let replacements = matches.len();
         let mut content = original;
         for found in matches.iter().rev() {
-            content.replace_range(found.start..found.end, &blocks[found.block].replacement);
+            content.replace_range(found.start..found.end, &found.replacement);
         }
         Ok(PlannedEdit {
             target,
@@ -1256,12 +1322,251 @@ mod edit {
         })
     }
 
-    fn find_all(text: &str, needle: &str) -> Vec<usize> {
+    fn find_exact(text: &str, needle: &str) -> Vec<MatchRange> {
         text.as_bytes()
             .windows(needle.len())
             .enumerate()
-            .filter_map(|(index, candidate)| (candidate == needle.as_bytes()).then_some(index))
+            .filter_map(|(start, candidate)| {
+                (candidate == needle.as_bytes()).then_some(MatchRange {
+                    start,
+                    end: start + needle.len(),
+                })
+            })
             .collect()
+    }
+
+    fn find_at_first_tier(
+        text: &str,
+        needle: &str,
+        include_exact: bool,
+    ) -> Option<(MatchTier, Vec<MatchRange>)> {
+        let tiers = [
+            MatchTier::Exact,
+            MatchTier::LineEndings,
+            MatchTier::TrailingWhitespace,
+            MatchTier::SurroundingWhitespace,
+        ];
+        for tier in tiers {
+            if tier == MatchTier::Exact && !include_exact {
+                continue;
+            }
+            let matches = match tier {
+                MatchTier::Exact => find_exact(text, needle),
+                MatchTier::LineEndings => find_with_normalized_line_endings(text, needle),
+                MatchTier::TrailingWhitespace | MatchTier::SurroundingWhitespace => {
+                    find_by_lines(text, needle, tier)
+                }
+            };
+            if !matches.is_empty() {
+                return Some((tier, matches));
+            }
+        }
+        None
+    }
+
+    impl MatchTier {
+        fn description(self) -> &'static str {
+            match self {
+                Self::Exact => "exactly",
+                Self::LineEndings => "after normalizing line endings",
+                Self::TrailingWhitespace => "after ignoring trailing line whitespace",
+                Self::SurroundingWhitespace => {
+                    "after ignoring leading and trailing line whitespace"
+                }
+            }
+        }
+    }
+
+    fn find_with_normalized_line_endings(text: &str, needle: &str) -> Vec<MatchRange> {
+        let (normalized_text, offsets) = normalize_line_endings_with_offsets(text);
+        let (normalized_needle, _) = normalize_line_endings_with_offsets(needle);
+        normalized_text
+            .windows(normalized_needle.len())
+            .enumerate()
+            .filter_map(|(start, candidate)| {
+                if candidate != normalized_needle.as_slice() {
+                    return None;
+                }
+                let first = offsets[start];
+                let last = offsets[start + normalized_needle.len() - 1];
+                Some(MatchRange {
+                    start: first.0,
+                    end: last.1,
+                })
+            })
+            .collect()
+    }
+
+    fn normalize_line_endings_with_offsets(text: &str) -> (Vec<u8>, Vec<(usize, usize)>) {
+        let bytes = text.as_bytes();
+        let mut normalized = Vec::with_capacity(bytes.len());
+        let mut offsets = Vec::with_capacity(bytes.len());
+        let mut index = 0;
+        while index < bytes.len() {
+            if bytes[index] == b'\r' {
+                let end = if bytes.get(index + 1) == Some(&b'\n') {
+                    index + 2
+                } else {
+                    index + 1
+                };
+                normalized.push(b'\n');
+                offsets.push((index, end));
+                index = end;
+            } else {
+                normalized.push(bytes[index]);
+                offsets.push((index, index + 1));
+                index += 1;
+            }
+        }
+        (normalized, offsets)
+    }
+
+    fn find_by_lines(text: &str, needle: &str, tier: MatchTier) -> Vec<MatchRange> {
+        let text_lines = scan_text_lines(text);
+        let needle_lines = scan_text_lines(needle);
+        if needle_lines.len() > text_lines.len() {
+            return Vec::new();
+        }
+        let matches_line = |actual: &str, expected: &str| match tier {
+            MatchTier::TrailingWhitespace => actual.trim_end() == expected.trim_end(),
+            MatchTier::SurroundingWhitespace => actual.trim() == expected.trim(),
+            _ => unreachable!("line matching is only used for whitespace tiers"),
+        };
+        if needle_lines.iter().all(|line| {
+            let content = &needle[line.start..line.content_end];
+            match tier {
+                MatchTier::TrailingWhitespace => content.trim_end().is_empty(),
+                MatchTier::SurroundingWhitespace => content.trim().is_empty(),
+                _ => unreachable!("line matching is only used for whitespace tiers"),
+            }
+        }) {
+            return Vec::new();
+        }
+        (0..=text_lines.len() - needle_lines.len())
+            .filter_map(|start| {
+                let matches = text_lines[start..start + needle_lines.len()]
+                    .iter()
+                    .zip(&needle_lines)
+                    .all(|(actual, expected)| {
+                        matches_line(
+                            &text[actual.start..actual.content_end],
+                            &needle[expected.start..expected.content_end],
+                        )
+                    });
+                matches.then(|| MatchRange {
+                    start: text_lines[start].start,
+                    end: text_lines[start + needle_lines.len() - 1].content_end,
+                })
+            })
+            .collect()
+    }
+
+    fn scan_text_lines(text: &str) -> Vec<TextLine> {
+        let bytes = text.as_bytes();
+        let mut lines = Vec::new();
+        let mut start = 0;
+        let mut index = 0;
+        while index < bytes.len() {
+            let ending_len = match bytes[index] {
+                b'\r' if bytes.get(index + 1) == Some(&b'\n') => 2,
+                b'\r' | b'\n' => 1,
+                _ => {
+                    index += 1;
+                    continue;
+                }
+            };
+            lines.push(TextLine {
+                start,
+                content_end: index,
+            });
+            index += ending_len;
+            start = index;
+        }
+        lines.push(TextLine {
+            start,
+            content_end: text.len(),
+        });
+        lines
+    }
+
+    fn adapt_replacement_line_endings(
+        original: &str,
+        location: MatchRange,
+        replacement: &str,
+    ) -> String {
+        let ending = dominant_line_ending(&original[location.start..location.end])
+            .or_else(|| line_ending_at(original, location.end))
+            .or_else(|| dominant_line_ending(original));
+        match ending {
+            Some(ending) => convert_line_endings(replacement, ending),
+            None => replacement.to_string(),
+        }
+    }
+
+    fn dominant_line_ending(text: &str) -> Option<LineEnding> {
+        let mut counts = [0usize; 3];
+        let bytes = text.as_bytes();
+        let mut index = 0;
+        while index < bytes.len() {
+            match bytes[index] {
+                b'\r' if bytes.get(index + 1) == Some(&b'\n') => {
+                    counts[1] += 1;
+                    index += 2;
+                }
+                b'\r' => {
+                    counts[2] += 1;
+                    index += 1;
+                }
+                b'\n' => {
+                    counts[0] += 1;
+                    index += 1;
+                }
+                _ => index += 1,
+            }
+        }
+        counts
+            .iter()
+            .enumerate()
+            .max_by_key(|(_, count)| *count)
+            .and_then(|(index, count)| {
+                (*count > 0).then_some(match index {
+                    0 => LineEnding::Lf,
+                    1 => LineEnding::CrLf,
+                    _ => LineEnding::Cr,
+                })
+            })
+    }
+
+    fn line_ending_at(text: &str, index: usize) -> Option<LineEnding> {
+        match text.as_bytes().get(index..) {
+            Some([b'\r', b'\n', ..]) => Some(LineEnding::CrLf),
+            Some([b'\r', ..]) => Some(LineEnding::Cr),
+            Some([b'\n', ..]) => Some(LineEnding::Lf),
+            _ => None,
+        }
+    }
+
+    fn convert_line_endings(text: &str, ending: LineEnding) -> String {
+        let replacement = match ending {
+            LineEnding::Lf => "\n",
+            LineEnding::CrLf => "\r\n",
+            LineEnding::Cr => "\r",
+        };
+        let mut converted = String::with_capacity(text.len());
+        let mut characters = text.chars().peekable();
+        while let Some(character) = characters.next() {
+            match character {
+                '\r' => {
+                    if characters.peek() == Some(&'\n') {
+                        characters.next();
+                    }
+                    converted.push_str(replacement);
+                }
+                '\n' => converted.push_str(replacement),
+                other => converted.push(other),
+            }
+        }
+        converted
     }
 
     fn format_summary(edit: &PlannedEdit, cwd: &Path) -> String {
@@ -1298,8 +1603,9 @@ mod edit {
         }
 
         #[test]
-        fn parses_file_and_replace_all_flag() {
-            let args = Args::try_parse_from(["edit", "--all", "src/main.rs"]).unwrap();
+        fn parses_file_and_matching_flags() {
+            let args = Args::try_parse_from(["edit", "--relaxed", "--all", "src/main.rs"]).unwrap();
+            assert!(args.relaxed);
             assert!(args.all);
             assert_eq!(args.file, PathBuf::from("src/main.rs"));
         }
@@ -1372,7 +1678,7 @@ mod edit {
                     replacement: "G".into(),
                 },
             ];
-            let planned = preflight(&dir, PathBuf::from("file.txt"), blocks, false).unwrap();
+            let planned = preflight(&dir, PathBuf::from("file.txt"), blocks, false, false).unwrap();
             assert_eq!(planned.content, "A beta G\n");
             assert_eq!(planned.replacements, 2);
             super::super::apply_patch::atomic_write(
@@ -1394,7 +1700,7 @@ mod edit {
             let dir = temp_dir();
             fs::write(dir.join("file.txt"), "x x x").unwrap();
             let blocks = parse_document(&block("x", "y")).unwrap();
-            let planned = preflight(&dir, PathBuf::from("file.txt"), blocks, true).unwrap();
+            let planned = preflight(&dir, PathBuf::from("file.txt"), blocks, true, false).unwrap();
             assert_eq!(planned.content, "y y y");
             assert_eq!(planned.replacements, 3);
             fs::remove_dir_all(dir).unwrap();
@@ -1405,7 +1711,7 @@ mod edit {
             let dir = temp_dir();
             fs::write(dir.join("file.txt"), "keep remove keep").unwrap();
             let blocks = parse_document(&block(" remove", "")).unwrap();
-            let planned = preflight(&dir, PathBuf::from("file.txt"), blocks, false).unwrap();
+            let planned = preflight(&dir, PathBuf::from("file.txt"), blocks, false, false).unwrap();
             assert_eq!(planned.content, "keep keep");
             fs::remove_dir_all(dir).unwrap();
         }
@@ -1421,6 +1727,7 @@ mod edit {
                 PathBuf::from("file.txt"),
                 parse_document(&block("missing", "new")).unwrap(),
                 false,
+                false,
             )
             .unwrap_err();
             assert!(error.to_string().contains("did not match"));
@@ -1430,10 +1737,87 @@ mod edit {
                 PathBuf::from("file.txt"),
                 parse_document(&block("same", "new")).unwrap(),
                 false,
+                false,
             )
             .unwrap_err();
             assert!(error.to_string().contains("matched 2 locations"));
             assert_eq!(fs::read_to_string(&path).unwrap(), "same same");
+            fs::remove_dir_all(dir).unwrap();
+        }
+
+        #[test]
+        fn strict_mode_suggests_unique_relaxed_line_ending_match() {
+            let dir = temp_dir();
+            let path = dir.join("file.txt");
+            fs::write(&path, "first\r\nold\r\nlast\r\n").unwrap();
+            let blocks = parse_document(&block("first\nold\nlast", "first\nnew\nlast")).unwrap();
+            let error = preflight(&dir, PathBuf::from("file.txt"), blocks, false, false)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("matched once after normalizing line endings"));
+            assert!(error.contains("retry with --relaxed"));
+            assert_eq!(
+                fs::read_to_string(&path).unwrap(),
+                "first\r\nold\r\nlast\r\n"
+            );
+            fs::remove_dir_all(dir).unwrap();
+        }
+
+        #[test]
+        fn relaxed_mode_preserves_target_line_endings() {
+            let dir = temp_dir();
+            fs::write(dir.join("file.txt"), "first\r\nold\r\nlast\r\n").unwrap();
+            let blocks = parse_document(&block("first\nold\nlast", "first\nnew\nlast")).unwrap();
+            let planned = preflight(&dir, PathBuf::from("file.txt"), blocks, false, true).unwrap();
+            assert_eq!(planned.content, "first\r\nnew\r\nlast\r\n");
+            fs::remove_dir_all(dir).unwrap();
+        }
+
+        #[test]
+        fn relaxed_mode_ignores_only_line_edge_whitespace() {
+            let dir = temp_dir();
+            fs::write(dir.join("file.txt"), "    old value  \nkeep\n").unwrap();
+            let blocks = parse_document(&block("  old value\nkeep", "  new value\nkeep")).unwrap();
+            let planned = preflight(&dir, PathBuf::from("file.txt"), blocks, false, true).unwrap();
+            assert_eq!(planned.content, "  new value\nkeep\n");
+
+            fs::write(dir.join("file.txt"), "a  b\n").unwrap();
+            let blocks = parse_document(&block("a b", "changed")).unwrap();
+            let error = preflight(&dir, PathBuf::from("file.txt"), blocks, false, true)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("even with --relaxed"));
+
+            fs::write(dir.join("file.txt"), "\n").unwrap();
+            let blocks = parse_document(&block(" ", "changed")).unwrap();
+            let error = preflight(&dir, PathBuf::from("file.txt"), blocks, false, true)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("even with --relaxed"));
+            fs::remove_dir_all(dir).unwrap();
+        }
+
+        #[test]
+        fn relaxed_ambiguity_is_reported_and_all_replaces_every_candidate() {
+            let dir = temp_dir();
+            fs::write(dir.join("file.txt"), "  old\n    old\n").unwrap();
+            let blocks = parse_document(&block("\told", "\tnew")).unwrap();
+            let error = preflight(&dir, PathBuf::from("file.txt"), blocks, false, false)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("relaxed matching found 2 locations"));
+
+            let blocks = parse_document(&block("\told", "\tnew")).unwrap();
+            let error = preflight(&dir, PathBuf::from("file.txt"), blocks, false, true)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("matched 2 locations"));
+            assert!(error.contains("with --relaxed"));
+
+            let blocks = parse_document(&block("\told", "\tnew")).unwrap();
+            let planned = preflight(&dir, PathBuf::from("file.txt"), blocks, true, true).unwrap();
+            assert_eq!(planned.content, "\tnew\n\tnew\n");
+            assert_eq!(planned.replacements, 2);
             fs::remove_dir_all(dir).unwrap();
         }
 
@@ -1447,6 +1831,7 @@ mod edit {
                 path.clone(),
                 parse_document(&block("old", "new")).unwrap(),
                 false,
+                false,
             )
             .unwrap();
             assert_eq!(planned.target, path);
@@ -1457,6 +1842,7 @@ mod edit {
                 &dir,
                 missing.clone(),
                 parse_document(&block("old", "new")).unwrap(),
+                false,
                 false,
             )
             .unwrap_err();
@@ -1479,12 +1865,14 @@ mod edit {
                     replacement: "y".into(),
                 },
             ];
-            let error = preflight(&dir, PathBuf::from("file.txt"), blocks, false).unwrap_err();
+            let error =
+                preflight(&dir, PathBuf::from("file.txt"), blocks, false, false).unwrap_err();
             assert!(error.to_string().contains("blocks 1 and 2 overlap"));
 
             fs::write(dir.join("file.txt"), "aaa").unwrap();
             let blocks = parse_document(&block("aa", "x")).unwrap();
-            let error = preflight(&dir, PathBuf::from("file.txt"), blocks, true).unwrap_err();
+            let error =
+                preflight(&dir, PathBuf::from("file.txt"), blocks, true, false).unwrap_err();
             assert!(error.to_string().contains("overlapping matches"));
             fs::remove_dir_all(dir).unwrap();
         }
@@ -1500,7 +1888,7 @@ mod edit {
             fs::set_permissions(&target, fs::Permissions::from_mode(0o640)).unwrap();
             symlink("target.txt", dir.join("link.txt")).unwrap();
             let blocks = parse_document(&block("old", "new")).unwrap();
-            let planned = preflight(&dir, PathBuf::from("link.txt"), blocks, false).unwrap();
+            let planned = preflight(&dir, PathBuf::from("link.txt"), blocks, false, false).unwrap();
             super::super::apply_patch::atomic_write(
                 &planned.target,
                 &planned.content,

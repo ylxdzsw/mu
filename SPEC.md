@@ -375,7 +375,7 @@ dispatches these applets:
   symlink edits its regular-file target while preserving the link; deleting a
   symlink removes only the link; moving a symlink renames the link. Dangling
   links can therefore be deleted or moved but cannot be updated.
-- **`edit [--all] FILE`** reads one or more exact replacement blocks from
+- **`edit [--relaxed] [--all] FILE`** reads one or more replacement blocks from
   stdin. Each block has marker-only framing lines and this shape:
   ```text
   <<<<<<< SEARCH
@@ -388,11 +388,21 @@ dispatches these applets:
   content; an additional empty body line represents a leading or trailing line
   ending. Internal body line endings are preserved literally.
   An empty SEARCH section is invalid; an empty REPLACE section deletes the
-  matched text. Without `--all`, every SEARCH must occur exactly once. With
-  `--all`, every SEARCH must occur at least once and every occurrence is
-  replaced. All matches are calculated against the original UTF-8 file
-  snapshot, and overlapping matches are rejected. Relative paths resolve from
-  the shell call's working directory; absolute paths are used as written.
+  matched text. Matching is byte-exact by default. When an exact SEARCH has no
+  matches, strict mode probes the relaxed tiers without writing: line-ending
+  equivalence, ignored trailing line whitespace, then ignored leading and
+  trailing line whitespace. A unique relaxed candidate produces an actionable
+  error suggesting either exact text or `--relaxed`; ambiguous candidates ask
+  for more context. `--relaxed` applies the first tier that finds candidates.
+  It does not collapse or ignore internal whitespace, and it converts REPLACE
+  line endings to the dominant style around each matched range so an LF edit
+  does not introduce mixed endings into a CRLF file.
+
+  Without `--all`, every SEARCH must occur exactly once at the selected tier.
+  With `--all`, every occurrence at that tier is replaced. All matches are
+  calculated against the original UTF-8 file snapshot, and overlapping matches
+  are rejected. Relative paths resolve from the shell call's working directory;
+  absolute paths are used as written.
   Updating through a symlink edits its regular-file target while preserving
   the link and its target's permissions. The entire document is preflighted
   before one atomic file replacement, so a parse, match, overlap, read, or
