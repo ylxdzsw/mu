@@ -640,6 +640,23 @@ send_interactive_setup() {
   fail "interactive shell did not finish setup"
 }
 
+empty_enter_transcript=$tmpdir/empty-enter-transcript
+rm -f -- "$interactive_capture_args" "$interactive_capture_stdin" "$interactive_capture_calls"
+interactive_status=0
+{
+  send_interactive_setup "$interactive_setup"
+  print -rn -- $'\t\r'
+  sleep 0.4
+  print -rn -- $'\x04'
+} | timeout 10 script -qfec 'TERM=xterm-256color zsh -df' "$empty_enter_transcript" >/dev/null || interactive_status=$?
+(( interactive_status == 0 )) || fail "empty Enter transcript exited with status $interactive_status"
+normalized=$(perl -pe 's/\e\[[0-?]*[ -\/]*[@-~]//g' "$empty_enter_transcript" | col -b)
+empty_prompt_pair="prompt-test-model new $root"$'\nmu>\nprompt-test-model new '"$root"$'\nmu>'
+[[ "$normalized" == *"$empty_prompt_pair"* ]] || fail "empty Enter should commit one complete mu prompt before drawing the next"
+empty_enter_raw=$(<"$empty_enter_transcript")
+[[ "$empty_enter_raw" != *$'\e[A'* ]] || fail "empty Enter should not move up and overwrite the previous prompt"
+[[ ! -e "$interactive_capture_calls" || ! -s "$interactive_capture_calls" ]] || fail "empty Enter should not call fake mu"
+
 interactive_transcript=$tmpdir/transcript
 rm -f -- "$interactive_capture_args" "$interactive_capture_stdin" "$interactive_capture_calls"
 interactive_status=0

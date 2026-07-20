@@ -419,13 +419,6 @@ _mu_zsh_reset_mode_prompt() {
   zle -K mumode 2>/dev/null || true
 }
 
-_mu_zsh_redraw_mode_prompt() {
-  zle -I
-  print
-  _mu_zsh_clear_prompt
-  _mu_zsh_reset_mode_prompt
-}
-
 _mu_zsh_has_effective_session() {
   _mu_zsh_sync_session_state
   [[ -n "$MU_ZSH_EFFECTIVE_SESSION_ID" ]]
@@ -1040,7 +1033,7 @@ _mu_zsh_accept() {
 
   local input=$BUFFER
   if [[ -z "${input//[[:space:]]/}" ]]; then
-    _mu_zsh_redraw_mode_prompt
+    zle .accept-line
     return
   fi
 
