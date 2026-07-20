@@ -29,7 +29,7 @@ pub(crate) const BASH_COMMAND_PREVIEW_BYTES: usize = 160;
 pub(crate) const BASH_TITLE_PREVIEW_BYTES: usize = 120;
 const GUARDRAIL_REASON_PREVIEW_BYTES: usize = 180;
 const REASONING_TITLE_MAX_WIDTH: usize = 80;
-const MAX_TABLE_COLUMN_WIDTH: usize = 80;
+const MAX_TABLE_COLUMN_WIDTH: usize = 40;
 const BASH_HEAD_LINE_BUDGET: usize = 3;
 const BASH_HEAD_BYTE_BUDGET: usize = 1024;
 const BASH_HEAD_LINE_CAP_BYTES: usize = 120;
@@ -3488,11 +3488,11 @@ mod tests {
     }
 
     #[test]
-    fn markdown_renderer_caps_table_columns_at_eighty_cells() {
-        let eighty = "a".repeat(MAX_TABLE_COLUMN_WIDTH);
-        let eighty_one = "b".repeat(MAX_TABLE_COLUMN_WIDTH + 1);
+    fn markdown_renderer_caps_table_columns_at_forty_cells() {
+        let at_limit = "a".repeat(MAX_TABLE_COLUMN_WIDTH);
+        let over_limit = "b".repeat(MAX_TABLE_COLUMN_WIDTH + 1);
         let rendered = render_markdown(&format!(
-            "| Text | Side |\n| --- | --- |\n| {eighty} | x |\n| {eighty_one} | y |\n"
+            "| Text | Side |\n| --- | --- |\n| {at_limit} | x |\n| {over_limit} | y |\n"
         ));
         let plain = strip_ansi(&rendered);
         let table_lines = plain
@@ -3502,8 +3502,11 @@ mod tests {
 
         assert_eq!(bar_columns(table_lines[0])[1], MAX_TABLE_COLUMN_WIDTH + 3);
         assert_eq!(table_lines.len(), 5, "{plain:?}");
-        assert!(table_lines[2].contains(&eighty), "{plain:?}");
-        assert!(table_lines[3].contains(&"b".repeat(80)), "{plain:?}");
+        assert!(table_lines[2].contains(&at_limit), "{plain:?}");
+        assert!(
+            table_lines[3].contains(&"b".repeat(MAX_TABLE_COLUMN_WIDTH)),
+            "{plain:?}"
+        );
         assert!(table_lines[4].contains("b"), "{plain:?}");
         assert_table_grid_aligned(&plain);
     }
@@ -3736,8 +3739,8 @@ mod tests {
             .iter()
             .position(|line| line.contains("---"))
             .expect("table separator missing");
-        assert_eq!(separator, 2, "{plain:?}");
-        assert_eq!(table_lines.len(), 5, "{plain:?}");
+        assert_eq!(separator, 3, "{plain:?}");
+        assert_eq!(table_lines.len(), 6, "{plain:?}");
         assert_table_grid_aligned(&plain);
     }
 

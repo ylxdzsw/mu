@@ -552,7 +552,7 @@ strikethrough wait for the current span to complete; fenced code starts terminal
 code styling at the opening fence, streams code lines without printing fence
 markers, and resets styling at the closing fence or response boundary. Markdown
 tables are buffered until the table is complete enough to align and commit once,
-so columns never require rewriting prior output. Each column is at most 80
+so columns never require rewriting prior output. Each column is at most 40
 visible terminal cells wide; longer header or body cells wrap into aligned
 continuation rows without truncating their content. While a confirmed table is
 buffered, interactive output shows a mutable `[table ~N tokens]` live indicator;
