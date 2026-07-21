@@ -672,10 +672,13 @@ stderr TTY detection suppresses the summary when redirected.
   the first bold-only or ATX-heading summary line. Detail commits that line when
   reasoning finishes, including when no exposed reasoning text exists. Concise
   uses the same interactive indicator but erases it at completion and is silent
-  when redirected. Immediately after a concise tool it occupies the next line
-  without an empty separator, and ephemeral reasoning does not break a
-  consecutive tool block. Full streams Chat reasoning deltas and every exposed
-  Responses summary part directly in provider order, without a live or
+  when redirected. A Responses title received while reasoning continues appears
+  on the next periodic refresh, remains for that reasoning item, and does not
+  reset its timer. A title received only as reasoning completes is not briefly
+  flashed or committed. Immediately after a concise tool the indicator occupies
+  the next line without an empty separator, and ephemeral reasoning does not
+  break a consecutive tool block. Full streams Chat reasoning deltas and every
+  exposed Responses summary part directly in provider order, without a live or
   committed thought indicator; providers exposing neither produce no reasoning
   output.
 - **Errors.** Always printed and clearly prefixed, with TTY styling when

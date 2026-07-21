@@ -334,7 +334,7 @@ impl Renderer {
         if reasoning.title.is_none() {
             reasoning.title = extract_reasoning_summary_title(&reasoning.summary, false);
         }
-        if self.styled {
+        if self.styled && self.format != OutputFormat::Concise {
             self.live_line = Some(LiveLine::Thinking);
             self.render_live_line()?;
         }
@@ -4500,10 +4500,13 @@ mod tests {
         interactive
             .reasoning_start(ReasoningVisibility::Opaque)
             .unwrap();
+        let before_summary = interactive_output.transcript();
         interactive
             .reasoning_summary_delta(0, "**Inspecting**\n")
             .unwrap();
+        assert_eq!(interactive_output.transcript(), before_summary);
         interactive.reasoning_end(None).unwrap();
+        assert!(!interactive_output.transcript().contains("Inspecting"));
         assert!(interactive_output.transcript().ends_with("\r\x1b[2K"));
 
         let (mut redirected, redirected_output) =
@@ -4514,6 +4517,39 @@ mod tests {
         redirected.reasoning_delta("private trace").unwrap();
         redirected.reasoning_end(None).unwrap();
         assert!(redirected_output.transcript().is_empty());
+    }
+
+    #[test]
+    fn concise_reasoning_title_appears_on_ticks_without_resetting_timer() {
+        let (mut renderer, output) =
+            Renderer::with_test_shared_output(OutputFormat::Concise, true, None);
+        renderer
+            .reasoning_start(ReasoningVisibility::Opaque)
+            .unwrap();
+        let started = renderer.reasoning.as_ref().unwrap().started;
+
+        renderer
+            .reasoning_summary_delta(0, "**Inspecting**\n")
+            .unwrap();
+        assert_eq!(renderer.reasoning.as_ref().unwrap().started, started);
+        assert!(!output.transcript().contains("Inspecting"));
+
+        renderer.thinking_tick().unwrap();
+        renderer.thinking_tick().unwrap();
+        assert_eq!(
+            strip_ansi(&output.transcript())
+                .matches("] Inspecting")
+                .count(),
+            2
+        );
+        assert_eq!(renderer.reasoning.as_ref().unwrap().started, started);
+
+        renderer.reasoning_end(None).unwrap();
+        renderer
+            .reasoning_start(ReasoningVisibility::Opaque)
+            .unwrap();
+        let live = strip_ansi(&renderer.format_live_line().unwrap());
+        assert!(!live.contains("Inspecting"), "{live:?}");
     }
 
     #[test]
