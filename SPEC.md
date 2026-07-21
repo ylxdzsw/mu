@@ -225,6 +225,20 @@ accepts optional non-terminal stdin as a custom focus). The surface is small:
   directory.
 - `mu status --json [--include-models] [--include-commands] [--include-skills]`
   — machine-readable shell state for prompt rendering and completion.
+- `mu context [--export]` — introspect the agent context. By default it prints
+  the assembled system prompt mu itself would use: the role preamble, the
+  `<runtime>` block, the full skills index (built-in, global, and project), and
+  the merged `AGENTS.md` — a faithful mirror of the persisted system message, so
+  it never contacts a provider. `--export` instead prints a portable projection
+  for a *foreign* agent to ingest: an explanatory preamble (noting the content
+  was authored for mu, and pointing at the `customize-mu` reference when that
+  built-in is present) followed by the user's own merged `AGENTS.md` (verbatim)
+  and non-built-in skills; the role preamble, `<runtime>` block, and built-in
+  skills are omitted. In `--export` mode, when the user has no `AGENTS.md` and no
+  non-built-in skills the output is empty (exit 0), so a `SessionStart`-style
+  hook injects nothing in a project with no mu configuration. Neither mode loads
+  a provider; scope resolves from the working directory like other introspection
+  commands. See the README for a Claude Code hook example.
 - `mu session new` — create a session and print its id.
 - `mu session list` — list recent sessions.
 - `mu session transcript --session <id>` — print a persisted session

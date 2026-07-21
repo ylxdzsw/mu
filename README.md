@@ -138,6 +138,46 @@ messages, and exits. A few ideas follow from that:
 - A built-in safety guardrail and exact-value redaction for configured secrets,
   with exact or suffix-based environment-variable selectors, in `bash` output.
 
+## Sharing mu's context with other agents
+
+`mu context` introspects the agent context and has two modes. On its own it
+prints the assembled system prompt mu itself would use — role preamble, runtime
+block, the full skills index, and your merged `AGENTS.md` — so you can see
+exactly what a new session receives:
+
+```sh
+mu context             # the system prompt mu itself would use (inspection)
+mu context --export    # a portable projection for another agent to ingest
+```
+
+`--export` instead emits a projection tailored for a *foreign* agent: a short
+preamble explaining the content was authored for mu, followed by your own merged
+`AGENTS.md` and your non-built-in skills. The role preamble, runtime block, and
+built-in skills are left out. Neither mode contacts a provider, and scope
+resolves from the working directory like `mu status`.
+
+Because `--export` re-reads your instructions and skills on every call, it stays
+current with no separate sync step. In a project with no user `AGENTS.md` and no
+user skills it prints nothing, so it is safe to wire up unconditionally.
+
+For Claude Code, run it from a `SessionStart` hook so each new session ingests
+your mu context. Add to `~/.claude/settings.json`:
+
+```json
+{
+  "hooks": {
+    "SessionStart": [
+      { "hooks": [{ "type": "command", "command": "mu context --export" }] }
+    ]
+  }
+}
+```
+
+The export preamble tells the agent the guidance was written for mu (whose only
+tool is `bash`) so it adapts the intent to its own richer toolset — for example,
+reading a skill file with its file tools rather than a shell — and points it at
+mu's `customize-mu` reference if it wants the full configuration contract.
+
 ## Using your own provider
 
 On first use, `mu` creates `~/.mu/config.jsonc`. It ships with two providers:

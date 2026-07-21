@@ -76,6 +76,8 @@ pub enum Command {
     },
     /// Inspect the resolved model and context state
     Status(StatusArgs),
+    /// Print the user's mu instructions and skills for a foreign agent
+    Context(ContextArgs),
     /// Resume an interrupted (unclean) turn in a session
     Retry(RetryArgs),
     /// Force compaction for a session
@@ -83,6 +85,15 @@ pub enum Command {
         #[arg(long)]
         session: String,
     },
+}
+
+#[derive(ClapArgs, Debug, Clone)]
+pub struct ContextArgs {
+    /// Emit the curated projection for another agent to ingest (user AGENTS.md
+    /// and non-built-in skills, with an explanatory preamble) instead of the raw
+    /// system prompt mu itself would use.
+    #[arg(long)]
+    pub export: bool,
 }
 
 #[derive(ClapArgs, Debug, Clone)]
@@ -216,6 +227,21 @@ mod tests {
                 assert!(status.include_skills);
             }
             other => panic!("expected status command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_context_command_with_and_without_export() {
+        let args = Args::try_parse_from(["mu", "context"]).unwrap();
+        match args.command {
+            Some(Command::Context(context)) => assert!(!context.export),
+            other => panic!("expected context command, got {other:?}"),
+        }
+
+        let args = Args::try_parse_from(["mu", "context", "--export"]).unwrap();
+        match args.command {
+            Some(Command::Context(context)) => assert!(context.export),
+            other => panic!("expected context command, got {other:?}"),
         }
     }
 

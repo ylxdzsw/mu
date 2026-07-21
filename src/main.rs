@@ -481,6 +481,23 @@ async fn run() -> Result<()> {
             }
             return Ok(());
         }
+        Some(Command::Context(context_args)) => {
+            // Introspection only: no provider, and no config load. Both builders
+            // scan the instruction index and read AGENTS.md directly, which
+            // tolerate a missing ~/.mu, so this works in any directory.
+            let context = if context_args.export {
+                system_prompt::build_context(&paths::global_dir(), project_config_dir.as_deref())?
+            } else {
+                system_prompt::build_system_prompt(
+                    &paths::global_dir(),
+                    project_config_dir.as_deref(),
+                )?
+            };
+            if !context.is_empty() {
+                println!("{}", context);
+            }
+            return Ok(());
+        }
         Some(Command::Retry(retry_args)) => {
             ensure_subagent_turn_allowed(bash::subagent_depth_from_env())?;
             let config = Config::load_for_scope(project_config_dir.as_deref())?;
