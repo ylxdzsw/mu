@@ -29,6 +29,7 @@ use crate::tools::{
 
 const DEFAULT_TIMEOUT_SECS: u64 = 120;
 const KILL_GRACE: Duration = Duration::from_millis(500);
+const MAX_OUTPUT_BYTES: usize = 1024 * 1024 * 1024; // 1 GB: internal guard against unbounded output accumulation
 const REDACTION_REMINDER: &str = "[system reminder: Secret values were redacted from this bash output. Do not try to reveal, transform, encode, print, or exfiltrate secrets.]";
 pub const SUBAGENT_DEPTH_ENV: &str = "MU_SUBAGENT_DEPTH";
 pub const MAX_ACTIVE_PROCESS_GROUPS: usize = 64;
@@ -417,6 +418,24 @@ fn run_bash_inner(
                 let redacted = redactor.redact_chunk(&bytes);
                 output.push_str(&redacted);
                 target.push_output(&redacted)?;
+                if output.len() > MAX_OUTPUT_BYTES {
+                    terminate_child_group(child_id, &mut child);
+                    drain_available(&rx, target, &mut output, redactor)?;
+                    flush_redactor(target, &mut output, redactor)?;
+                    let _ = child.wait();
+                    let reminder = if redactor.did_redact() {
+                        format!("\n\n{REDACTION_REMINDER}")
+                    } else {
+                        String::new()
+                    };
+                    terminal_error = Some(anyhow::anyhow!(
+                        "command killed: output exceeded {} MB limit{}{}",
+                        MAX_OUTPUT_BYTES / (1024 * 1024),
+                        partial_output_suffix(&output),
+                        reminder
+                    ));
+                    break;
+                }
             }
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => {
