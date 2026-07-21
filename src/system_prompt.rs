@@ -19,7 +19,8 @@ const EXPORT_PREAMBLE: &str = "\
 user's own mu configuration (global + project); mu's built-in skills are omitted.
 They were authored for `mu`, a terminal agent whose only tool is `bash`. Adapt
 their intent to your own tools — for example, read a skill file with your
-file-reading tool instead of mu's shell.";
+file-reading tool instead of mu's shell. Mu `.env` files may contain API keys or
+other secrets.";
 
 const EXPORT_PREAMBLE_CLOSE: &str = " -->";
 
@@ -60,11 +61,11 @@ pub fn assemble_prompt(
         parts.push(skills_block);
     }
 
-    if let Some(global) = read_agents_md(&global_config_dir.join("AGENTS.md")) {
+    if let Some(global) = agents_md_block(&global_config_dir.join("AGENTS.md"), "global") {
         parts.push(global);
     }
     if let Some(project_config_dir) = project_config_dir
-        && let Some(local) = read_agents_md(&project_config_dir.join("AGENTS.md"))
+        && let Some(local) = agents_md_block(&project_config_dir.join("AGENTS.md"), "project")
     {
         parts.push(local);
     }
@@ -79,8 +80,8 @@ pub fn assemble_prompt(
 /// followed by the user's own instructions (global then project `AGENTS.md`) and
 /// non-built-in skills, so a foreign agent can ingest the user's mu setup without
 /// inheriting mu's `bash`-only framing. Returns an empty string when the user has
-/// no `AGENTS.md` and no non-built-in skills, so a `SessionStart` hook injects
-/// nothing in a project with no mu configuration.
+/// no `AGENTS.md`, non-built-in skills, or `.env` files, so a `SessionStart` hook
+/// injects nothing in a project with no mu configuration.
 pub fn build_context(
     global_config_dir: &Path,
     project_config_dir: Option<&Path>,
@@ -91,24 +92,52 @@ pub fn build_context(
         .into_iter()
         .filter(|skill| skill.scope != InstructionScope::Builtin)
         .collect::<Vec<_>>();
-    Ok(assemble_context(
+    let env_paths = existing_env_paths(global_config_dir, project_config_dir);
+    let preamble = export_preamble(&env_paths);
+    let context = assemble_context(
         &user_skills,
         global_config_dir,
         project_config_dir,
-        &export_preamble(),
-    ))
+        &preamble,
+    );
+    Ok(if context.is_empty() && !env_paths.is_empty() {
+        preamble
+    } else {
+        context
+    })
 }
 
 /// Assemble the `--export` preamble, appending a pointer to the `customize-mu`
 /// reference when that built-in file is present so a foreign agent can read
 /// mu's full configuration/skill/command contract on demand.
-fn export_preamble() -> String {
+fn existing_env_paths(
+    global_config_dir: &Path,
+    project_config_dir: Option<&Path>,
+) -> Vec<std::path::PathBuf> {
+    std::iter::once(global_config_dir.join(".env"))
+        .chain(project_config_dir.map(|dir| dir.join(".env")))
+        .filter(|path| path.is_file())
+        .filter_map(|path| path.canonicalize().ok())
+        .collect()
+}
+
+fn export_preamble(env_paths: &[std::path::PathBuf]) -> String {
     let mut preamble = EXPORT_PREAMBLE.to_string();
     let customize = crate::paths::builtins_dir().join("customize-mu.md");
     if customize.is_file() {
         preamble.push_str(&format!(
             "\nTo understand mu's configuration, skills, and command contract, read {}.",
             customize.display()
+        ));
+    }
+    if !env_paths.is_empty() {
+        preamble.push_str(&format!(
+            "\nSkills may need environment values from these files (JSON strings), in global-to-project precedence: [{}]. Mu parses them as restricted shell-compatible assignments: blank lines and full-line `#` comments are ignored; assignments are `NAME=VALUE` with optional `export`; values are bare `[A-Za-z0-9_./:@%+,=-]*`, single-quoted, or double-quoted with only `\\\"`, `\\\\`, `\\$`, and `\\`` escapes. Expansion and other shell syntax are errors. Parse and load them when needed, but never display the files or expose secret values in output.",
+            env_paths
+                .iter()
+                .map(|path| json_string_for_html_comment(&path.display().to_string()))
+                .collect::<Vec<_>>()
+                .join(", ")
         ));
     }
     preamble.push_str(EXPORT_PREAMBLE_CLOSE);
@@ -123,11 +152,11 @@ fn assemble_context(
 ) -> String {
     let mut parts = Vec::new();
 
-    if let Some(global) = read_agents_md(&global_config_dir.join("AGENTS.md")) {
+    if let Some(global) = agents_md_block(&global_config_dir.join("AGENTS.md"), "global") {
         parts.push(global);
     }
     if let Some(project_config_dir) = project_config_dir
-        && let Some(local) = read_agents_md(&project_config_dir.join("AGENTS.md"))
+        && let Some(local) = agents_md_block(&project_config_dir.join("AGENTS.md"), "project")
     {
         parts.push(local);
     }
@@ -145,6 +174,36 @@ fn assemble_context(
 
     parts.insert(0, preamble.to_string());
     parts.join("\n\n")
+}
+
+fn agents_md_block(path: &Path, scope: &str) -> Option<String> {
+    let contents = read_agents_md(path)?;
+    let absolute_path = path.canonicalize().ok()?;
+    let escaped_path = xml_escape_attribute(&absolute_path.display().to_string());
+    let mut block = format!("<agents_md scope=\"{scope}\" path=\"{escaped_path}\">\n");
+    block.push_str(&contents);
+    if !contents.ends_with('\n') {
+        block.push('\n');
+    }
+    block.push_str("</agents_md>");
+    Some(block)
+}
+
+fn xml_escape_attribute(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('"', "&quot;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('\n', "&#10;")
+        .replace('\r', "&#13;")
+        .replace('\t', "&#9;")
+}
+
+fn json_string_for_html_comment(value: &str) -> String {
+    serde_json::to_string(value)
+        .expect("serializing a path string cannot fail")
+        .replace("--", "\\u002d\\u002d")
 }
 
 fn os_description() -> String {
@@ -228,7 +287,8 @@ mod tests {
 
     use super::{
         EXPORT_PREAMBLE, assemble_context, assemble_prompt, build_context, cwd_changed_context,
-        export_preamble, initial_environment_context, linux_distribution, role_preamble,
+        export_preamble, initial_environment_context, json_string_for_html_comment,
+        linux_distribution, role_preamble, xml_escape_attribute,
     };
     use crate::paths::{Project, ProjectMarker};
     use crate::skills::{InstructionScope, SkillMeta, SkillRequirements};
@@ -238,10 +298,8 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let dir = std::env::temp_dir().join(format!(
-            "mu-context-{name}-{}-{nanos}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("mu-context-{name}-{}-{nanos}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
         dir
     }
@@ -304,14 +362,53 @@ mod tests {
         let skills = [skill("brave-search", InstructionScope::Global)];
 
         let context = assemble_context(&skills, &global, None, EXPORT_PREAMBLE);
+        let agents_path = global.join("AGENTS.md").canonicalize().unwrap();
         fs::remove_dir_all(&global).unwrap();
 
         assert!(context.starts_with(EXPORT_PREAMBLE));
-        assert!(context.contains("Global mu instructions."));
+        assert!(context.contains("Mu `.env` files may contain API keys"));
+        assert!(context.contains(&format!(
+            "<agents_md scope=\"global\" path=\"{}\">\nGlobal mu instructions.\n</agents_md>",
+            agents_path.display()
+        )));
         assert!(context.contains("<available_skills>"));
         assert!(context.contains("brave-search"));
+        assert!(!context.contains("Relative paths inside a skill file"));
         assert!(!context.contains(role_preamble()));
         assert!(!context.contains("<runtime>"));
+    }
+
+    #[test]
+    fn assemble_prompt_wraps_agents_files_with_scope_and_absolute_path() {
+        let root = temp_dir("agents-wrappers");
+        let global = root.join("global & user");
+        let project = root.join("project");
+        fs::create_dir_all(&global).unwrap();
+        fs::create_dir_all(&project).unwrap();
+        fs::write(global.join("AGENTS.md"), "Global instructions.\n").unwrap();
+        fs::write(project.join("AGENTS.md"), "Project instructions.").unwrap();
+
+        let prompt = assemble_prompt(&[], &global, Some(&project));
+        let global_path = global
+            .join("AGENTS.md")
+            .canonicalize()
+            .unwrap()
+            .display()
+            .to_string()
+            .replace('&', "&amp;");
+        let project_path = project.join("AGENTS.md").canonicalize().unwrap();
+        fs::remove_dir_all(&root).unwrap();
+
+        let global_block = format!(
+            "<agents_md scope=\"global\" path=\"{global_path}\">\nGlobal instructions.\n</agents_md>"
+        );
+        let project_block = format!(
+            "<agents_md scope=\"project\" path=\"{}\">\nProject instructions.\n</agents_md>",
+            project_path.display()
+        );
+        assert!(prompt.contains(&global_block));
+        assert!(prompt.contains(&project_block));
+        assert!(prompt.find(&global_block) < prompt.find(&project_block));
     }
 
     #[test]
@@ -325,16 +422,76 @@ mod tests {
     }
 
     #[test]
-    fn export_preamble_points_at_customize_mu_when_present() {
-        let preamble = export_preamble();
+    fn export_preamble_points_at_customize_mu_and_existing_env_files() {
+        let global = temp_dir("export-env-global");
+        let project = temp_dir("export-env-project");
+        fs::write(global.join(".env"), "GLOBAL_KEY=secret\n").unwrap();
+        fs::write(project.join(".env"), "PROJECT_KEY=secret\n").unwrap();
+        let global_env = global.join(".env").canonicalize().unwrap();
+        let project_env = project.join(".env").canonicalize().unwrap();
+
+        let preamble = export_preamble(&[global_env.clone(), project_env.clone()]);
+        fs::remove_dir_all(&global).unwrap();
+        fs::remove_dir_all(&project).unwrap();
+
         assert!(preamble.starts_with(EXPORT_PREAMBLE));
         assert!(preamble.trim_end().ends_with("-->"));
+        assert!(preamble.contains(&global_env.display().to_string()));
+        assert!(preamble.contains(&project_env.display().to_string()));
+        assert!(preamble.contains("JSON strings"));
+        assert!(preamble.contains("in global-to-project precedence"));
+        assert!(preamble.contains("assignments are `NAME=VALUE` with optional `export`"));
+        assert!(preamble.contains("bare `[A-Za-z0-9_./:@%+,=-]*`"));
+        assert!(preamble.contains("single-quoted, or double-quoted"));
+        assert!(preamble.contains("never display the files or expose secret values"));
         // On a packaged or source checkout the built-in reference exists, so the
         // pointer is appended; otherwise the preamble is just opened and closed.
-        if crate::paths::builtins_dir().join("customize-mu.md").is_file() {
+        if crate::paths::builtins_dir()
+            .join("customize-mu.md")
+            .is_file()
+        {
             assert!(preamble.contains("customize-mu.md"));
             assert!(preamble.contains("mu's configuration, skills, and command contract"));
         }
+    }
+
+    #[test]
+    fn export_preamble_encodes_paths_without_closing_its_html_comment() {
+        let path = std::path::PathBuf::from("/tmp/project-->injected\nname/.env");
+        let encoded = json_string_for_html_comment(&path.display().to_string());
+
+        assert_eq!(
+            serde_json::from_str::<String>(&encoded).unwrap(),
+            path.display().to_string()
+        );
+        assert!(!encoded.contains("--"));
+
+        let preamble = export_preamble(&[path]);
+        assert_eq!(preamble.matches("-->").count(), 1);
+        assert!(!preamble.contains("injected\nname"));
+    }
+
+    #[test]
+    fn agents_path_attribute_escapes_xml_markup_and_control_whitespace() {
+        assert_eq!(
+            xml_escape_attribute("a&\"<>\n\r\tb"),
+            "a&amp;&quot;&lt;&gt;&#10;&#13;&#9;b"
+        );
+    }
+
+    #[test]
+    fn build_context_reports_env_files_without_agents_or_skills() {
+        let global = temp_dir("export-env-only");
+        fs::write(global.join(".env"), "API_KEY=secret\n").unwrap();
+        let env_path = global.join(".env").canonicalize().unwrap();
+
+        let context = build_context(&global, None).unwrap();
+        fs::remove_dir_all(&global).unwrap();
+
+        assert!(context.starts_with(EXPORT_PREAMBLE));
+        assert!(context.contains(&env_path.display().to_string()));
+        assert!(!context.contains("<available_skills>"));
+        assert!(!context.contains("<agents_md"));
     }
 
     #[test]
@@ -350,6 +507,9 @@ mod tests {
             "---\nname: brave-search\ndescription: Web search.\n---\nSearch it.\n",
         )
         .unwrap();
+        fs::write(global.join(".env"), "BRAVE_API_KEY=secret\n").unwrap();
+
+        let env_path = global.join(".env").canonicalize().unwrap();
 
         // build_context scans real builtins; the user's global skill must appear
         // and no built-in skill (e.g. subagent) may leak into the skills index.
@@ -358,6 +518,7 @@ mod tests {
 
         assert!(context.contains("(path: "));
         assert!(context.contains("brave-search"));
+        assert!(context.contains(&env_path.display().to_string()));
         // `subagent` is a built-in skill; only the preamble's customize-mu
         // pointer may mention a built-in path, never the skills index.
         assert!(!context.contains("subagent"));

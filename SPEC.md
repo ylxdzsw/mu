@@ -232,11 +232,18 @@ accepts optional non-terminal stdin as a custom focus). The surface is small:
   it never contacts a provider. `--export` instead prints a portable projection
   for a *foreign* agent to ingest: an explanatory preamble (noting the content
   was authored for mu, and pointing at the `customize-mu` reference when that
-  built-in is present) followed by the user's own merged `AGENTS.md` (verbatim)
-  and non-built-in skills; the role preamble, `<runtime>` block, and built-in
-  skills are omitted. In `--export` mode, when the user has no `AGENTS.md` and no
-  non-built-in skills the output is empty (exit 0), so a `SessionStart`-style
-  hook injects nothing in a project with no mu configuration. Neither mode loads
+  built-in is present, while listing the absolute paths of existing global and
+  active-project `.env` files and warning that they may contain API keys or
+  other secrets; the preamble lists paths as comment-safe JSON strings and
+  explains Mu's restricted shell-compatible `.env` syntax and global-to-project
+  precedence so a foreign agent can parse and load them when a skill needs their
+  values, without displaying the files or exposing secret values in output)
+  followed by the user's own merged `AGENTS.md` (each wrapped with its scope and
+  absolute source path) and non-built-in skills; the role preamble, `<runtime>`
+  block, and built-in skills are omitted. In `--export` mode, when the user has no
+  `AGENTS.md`, non-built-in skills, or `.env` files, the output is empty (exit
+  0), so a `SessionStart`-style hook injects nothing in a project with no mu
+  configuration. Neither mode loads
   a provider; scope resolves from the working directory like other introspection
   commands. See the README for a Claude Code hook example.
 - `mu session new` — create a session and print its id.
@@ -1003,8 +1010,37 @@ configuration is used.
 Optional `.env` files are loaded with the same scope precedence:
 process environment first, then global `.env`, then active-project `.env`.
 The resulting effective environment is used for provider API-key lookup and is
-passed to every `bash` tool process. `.env` files are parsed as dotenv data, not
-sourced as shell scripts.
+passed to every `bash` tool process. Each file is parsed completely before any
+of its assignments are applied; duplicate assignments use the last value.
+
+The `.env` format is a restricted, source-compatible subset of shell assignment
+syntax. It is parsed as data and never executed:
+
+```text
+LINE       := BLANK | COMMENT | ASSIGNMENT
+ASSIGNMENT := ("export" [ \t]+)? NAME "=" VALUE
+NAME       := [A-Za-z_][A-Za-z0-9_]*
+VALUE      := BARE | SINGLE_QUOTED | DOUBLE_QUOTED
+BARE       := [A-Za-z0-9_./:@%+,=-]*
+```
+
+Blank lines may contain spaces or tabs. Comments are full lines whose first
+non-whitespace character is `#`. Assignments cannot be indented and cannot have
+whitespace around `=`, trailing whitespace, inline comments, or trailing
+tokens. Bare values cover common tokens and paths; other values must be quoted.
+Single quotes preserve their contents literally and have no escape syntax.
+Double quotes support only `\"`, `\\`, `\$`, and ``\` ``; unescaped `$` and
+backticks are rejected. Quoting forms cannot be concatenated. Expansion,
+multiline values, line continuation, tilde expansion, globbing, shell operators,
+and ANSI-C quoting are unsupported. Invalid UTF-8, NUL, lone carriage returns,
+and all unsupported syntax are errors. LF and CRLF line endings are accepted,
+and the final line need not end in a newline.
+
+Every accepted assignment produces the same string value when the file is
+sourced by Bash or Zsh. Mu treats `export` as an accepted, source-friendly prefix
+but otherwise ignores it because every loaded value is passed to child
+processes. A shell reader can use `set -a` while sourcing to export assignments
+that omit the prefix.
 
 Configuration and session storage are related but separate concepts. Config is
 merged across scopes; sessions live in exactly one scope: the discovered
@@ -1052,7 +1088,8 @@ one scope are not visible in another.
   `config.jsonc` is missing, `mu` creates a starter file automatically. `mu`
   hard-fails on a turn if the required fields are missing or the API-key env var
   is unset (§7).
-- **.env** — optional dotenv data. Values are visible to `bash`; this is
+- **.env** — optional restricted shell-compatible assignment data. Values are
+  visible to `bash`; this is
   convenience, not sandboxing. Values from provider `api_key_env` and
   `redaction.env` are exact-value redacted from bash output before the output is
   stored or shown to the model. Each `redaction.env` selector is either an exact
@@ -1064,8 +1101,10 @@ one scope are not visible in another.
   redaction values are still redacted with a warning.
 - **AGENTS.md** — system-prompt addendum. Global instructions are loaded first;
   active-project instructions are appended after them when a project is active.
-  Both are included; "project overrides global" means later text wins by
-  convention, not that global instructions are dropped.
+  Each file is wrapped in an `<agents_md>` element whose `scope` is `global` or
+  `project` and whose `path` is the absolute source path. Both are included;
+  "project overrides global" means later text wins by convention, not that
+  global instructions are dropped.
 
 The system prompt is intentionally minimal. It is assembled once when a session
 is created, persisted as the first message, and then loaded from session history
@@ -1102,8 +1141,10 @@ The assembled prompt has this fixed order:
    metadata is merged from built-in, global, and active-project instruction
    indexes. Priority is project > global/user > built-in for same-name skills
    and commands.
-4. The global `AGENTS.md` contents, if the file exists.
-5. The project-local `AGENTS.md` contents, if a project is active and the file
+4. The global `AGENTS.md`, wrapped in `<agents_md scope="global"
+   path="/absolute/path/to/AGENTS.md">`, if the file exists.
+5. The project-local `AGENTS.md`, wrapped in `<agents_md scope="project"
+   path="/absolute/path/to/AGENTS.md">`, if a project is active and the file
    exists.
 
 Tool definitions are **not** part of this prompt; they go in the API `tools`

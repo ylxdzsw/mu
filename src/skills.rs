@@ -180,10 +180,6 @@ pub fn format_skills_block(skills: &[SkillMeta]) -> String {
             s.name, s.description, s.path
         ));
     }
-    lines.push(
-        "Relative paths inside a skill file resolve against that file's containing directory."
-            .into(),
-    );
     lines.push("</available_skills>".into());
     lines.join("\n")
 }
