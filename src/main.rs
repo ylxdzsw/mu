@@ -378,25 +378,14 @@ async fn run() -> Result<()> {
                             models::first_model_ref(&config)?.canonical
                         }
                     };
-                    let session = store.create_session(&cwd.display().to_string(), &model)?;
-                    store.append_message(
-                        &session.id,
-                        &provider::Message::System {
-                            content: system_prompt::build_system_prompt(
-                                &paths::global_dir(),
-                                project_config_dir.as_deref(),
-                            )?,
-                        },
-                    )?;
-                    store.append_message(
-                        &session.id,
-                        &provider::Message::User {
-                            content: system_prompt::initial_environment_context(
-                                &cwd,
-                                scope.project(),
-                            )
-                            .into(),
-                        },
+                    let session = store.create_session_seeded(
+                        &cwd.display().to_string(),
+                        &model,
+                        &system_prompt::build_system_prompt(
+                            &paths::global_dir(),
+                            project_config_dir.as_deref(),
+                        )?,
+                        &system_prompt::initial_environment_context(&cwd, scope.project()),
                     )?;
                     println!("{}", session.id);
                 }
@@ -913,18 +902,11 @@ fn create_seeded_session(
     project_config_dir: Option<&std::path::Path>,
     seed: &RequestOptions,
 ) -> Result<(store::Session, bool)> {
-    let session = store.create_session(&cwd.display().to_string(), &seed.model.canonical)?;
-    store.append_message(
-        &session.id,
-        &provider::Message::System {
-            content: system_prompt::build_system_prompt(&paths::global_dir(), project_config_dir)?,
-        },
-    )?;
-    store.append_message(
-        &session.id,
-        &provider::Message::User {
-            content: system_prompt::initial_environment_context(cwd, project).into(),
-        },
+    let session = store.create_session_seeded(
+        &cwd.display().to_string(),
+        &seed.model.canonical,
+        &system_prompt::build_system_prompt(&paths::global_dir(), project_config_dir)?,
+        &system_prompt::initial_environment_context(cwd, project),
     )?;
     Ok((session, true))
 }

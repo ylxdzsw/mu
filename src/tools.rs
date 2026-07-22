@@ -28,6 +28,11 @@ pub enum ExecutionMode {
     Concurrent,
 }
 
+/// How long truncation spill files are kept before `prune_truncation_spills`
+/// removes them. Surfaced in the truncation marker so the agent knows a spill
+/// path from an old, resumed session may no longer exist.
+pub const SPILL_RETENTION_DAYS: u64 = 7;
+
 pub fn tool_definitions() -> Vec<Value> {
     vec![serde_json::json!({
         "type": "function",
@@ -55,7 +60,7 @@ pub fn apply_truncation(
     prefix: &str,
     state_dir: &Path,
     use_tail: bool,
-) -> Result<String> {
+) -> String {
     truncate_output(&output, limits, prefix, state_dir, use_tail)
 }
 
@@ -65,7 +70,7 @@ fn truncate_output(
     spill_prefix: &str,
     state_dir: &Path,
     use_tail: bool,
-) -> Result<String> {
+) -> String {
     let lines: Vec<&str> = output.lines().collect();
     let total_lines = lines.len();
 
@@ -73,15 +78,8 @@ fn truncate_output(
         && output.len() <= limits.max_bytes
         && lines.iter().all(|line| line.len() <= limits.max_line_bytes)
     {
-        return Ok(output.to_string());
+        return output.to_string();
     }
-
-    crate::paths::ensure_dir(&state_dir.join("truncation"))?;
-    let spill_path =
-        state_dir
-            .join("truncation")
-            .join(format!("{}-{}.txt", spill_prefix, uuid::Uuid::new_v4()));
-    std::fs::write(&spill_path, output)?;
 
     let preview = if use_tail {
         build_tail_preview(
@@ -99,12 +97,27 @@ fn truncate_output(
         )
     };
 
+    // The spill is best-effort: by this point the command has already run, so
+    // a failure to save the full output (read-only state dir, disk full) must
+    // degrade to a preview-only note, never fail the tool result.
+    let spill_note = match write_spill(output, spill_prefix, state_dir) {
+        Ok(spill_path) => format!(
+            "full output saved for {SPILL_RETENTION_DAYS} days to {}; inspect it with `bash` if it still exists",
+            spill_path.display()
+        ),
+        Err(error) => format!("full output could not be saved ({error}); only this preview is available"),
+    };
+
     let elided_lines = total_lines.saturating_sub(preview.lines().count());
-    let marker = format!(
-        "\n[… {elided_lines} lines elided; full output saved to {}; inspect it with `bash` if needed]",
-        spill_path.display()
-    );
-    Ok(format!("{preview}{marker}"))
+    format!("{preview}\n[… {elided_lines} lines elided; {spill_note}]")
+}
+
+fn write_spill(output: &str, spill_prefix: &str, state_dir: &Path) -> Result<PathBuf> {
+    let dir = state_dir.join("truncation");
+    crate::paths::ensure_dir(&dir)?;
+    let spill_path = dir.join(format!("{}-{}.txt", spill_prefix, uuid::Uuid::new_v4()));
+    std::fs::write(&spill_path, output)?;
+    Ok(spill_path)
 }
 
 fn build_head_preview(
@@ -310,5 +323,61 @@ mod tests {
         let preview = build_tail_preview(&lines, 2, 1024, 1024);
 
         assert_eq!(preview, "three\n[exit code: 0]");
+    }
+
+    fn tight_limits() -> crate::config::LimitsConfig {
+        crate::config::LimitsConfig {
+            max_iterations: 50,
+            max_lines: 2,
+            max_bytes: 10_000,
+            max_line_bytes: 10_000,
+        }
+    }
+
+    #[test]
+    fn truncation_spills_full_output_and_names_the_retention_window() {
+        let tmp = std::env::temp_dir().join(format!("mu-trunc-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        let clamped = super::apply_truncation(
+            "one\ntwo\nthree\nfour".into(),
+            &tight_limits(),
+            "bash",
+            &tmp,
+            true,
+        );
+
+        assert!(clamped.contains("lines elided"));
+        assert!(clamped.contains(&format!(
+            "full output saved for {} days",
+            super::SPILL_RETENTION_DAYS
+        )));
+        let spilled: Vec<_> = std::fs::read_dir(tmp.join("truncation"))
+            .unwrap()
+            .collect();
+        assert_eq!(spilled.len(), 1);
+        let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    #[test]
+    fn truncation_survives_an_unwritable_spill_directory() {
+        let tmp = std::env::temp_dir().join(format!("mu-trunc-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        // Occupy the spill directory's path with a regular file so it cannot
+        // be created: the command already ran, so the clamped preview must
+        // come back anyway instead of an error.
+        std::fs::write(tmp.join("truncation"), b"not a directory").unwrap();
+
+        let clamped = super::apply_truncation(
+            "one\ntwo\nthree\nfour".into(),
+            &tight_limits(),
+            "bash",
+            &tmp,
+            true,
+        );
+
+        assert!(clamped.contains("three\nfour"));
+        assert!(clamped.contains("full output could not be saved"));
+        let _ = std::fs::remove_dir_all(tmp);
     }
 }

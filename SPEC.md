@@ -299,7 +299,9 @@ This is the exact sequence the binary follows for one turn invocation:
    - If `-c/--continue-latest` is given → use the latest session in the active
      scope, or create one if no session exists.
    - If neither `--session` nor `--continue-latest` is given → create a new
-     session row, persist the assembled system prompt as the first message, and
+     session row, its persisted system prompt, and the environment seed in one
+     transaction (so a crash can never leave a session without its system
+     message), and
      write its id to the runtime file named by `$MU_SESSION_FILE` when that env var
      is set (§11).
 5. **Acquire the session `flock`** (§11). If held, print "session busy", exit
@@ -486,10 +488,17 @@ the budget:
 - When output exceeds a cap, the model receives a **tail preview** plus a marker
   stating how much was elided, and the
   **full output is spilled to a temp file** under a truncation directory in the
-  state dir. The marker points the model at that file so it can inspect the
+  state dir. The marker points the model at that file (noting the retention
+  window, since a resumed session may outlive it) so it can inspect the
   result with another `bash` call. Byte limiting is applied backward from the
   actual tail so the final exit-status line is retained; nothing is lost, it
   just is not forced into context.
+- The spill is **best-effort**: the command has already run by the time its
+  output is clamped, so a failed spill write (read-only state dir, disk full)
+  must never fail the tool result. The preview is returned with a note that the
+  full output could not be saved. A spill file that has since been pruned (or
+  never written) is likewise harmless — the model just gets a shell error when
+  it tries to read the path.
 - Spilled temp files are garbage-collected after a retention window (default 7
   days), pruned opportunistically on startup.
 
@@ -1167,7 +1176,15 @@ database (`<project>/.mu/sessions.db`) when a project is active, or the global
 database (`~/.mu/sessions.db`) otherwise. SQLite is chosen for zero-setup
 embedded storage, transactional durability, fast open, and easy querying. **WAL
 mode** is enabled so per-turn load/append is fast and concurrent shells do not
-block each other unnecessarily.
+block each other unnecessarily. Alongside WAL the connection sets
+`synchronous=NORMAL` (fsync at checkpoints only: an application crash loses
+nothing, an OS crash may lose the last commits but cannot corrupt the file —
+the right trade for a conversation log), `foreign_keys=ON` (declared relations
+are enforced, switched on after migrations so table rebuilds run unhindered),
+`trusted_schema=OFF` (a project-scope `sessions.db` can arrive inside a cloned
+repository, so functions embedded in a crafted schema are never run), and a
+`journal_size_limit` so a WAL file bloated by attachment blobs shrinks back
+after checkpointing instead of sitting at its high-water mark forever.
 
 Conceptual schema (flat and small):
 
@@ -1184,12 +1201,16 @@ Conceptual schema (flat and small):
 - **message** — `id`, `session_id`, `role`
   (`system`/`user`/`assistant`/`tool`/`summary`),
   `content`, optional full user content JSON for multi-part inputs, `created_at`,
-  ordering index, and for tool results `tool_call_id`. Assistant rows may also
+  ordering index, and for tool results `tool_call_id`. The per-session ordering
+  (`session_id`, `seq`) is enforced UNIQUE — replay order is the backbone of
+  the whole design, so a violated ordering invariant must surface as a loud
+  constraint error, not silent transcript corruption. Assistant rows may also
   contain exact origin-bound native replay: Chat reasoning for a tool-call
   message or a complete Responses output-item array. This native payload
   augments rather than replaces the semantic fields and is never rendered. The
   first message in a new session is the persisted system
-  prompt. For user messages with image or audio attachments, `content` remains
+  prompt, written in the same transaction as the session row and the
+  environment seed. For user messages with image or audio attachments, `content` remains
   a textual projection for listing/token estimates, while attachment metadata
   references content-addressed bytes stored once in SQLite. The full hydrated
   parts are reloaded for model context. A `summary` row is a compaction
@@ -1199,12 +1220,16 @@ Conceptual schema (flat and small):
 - **attachment_blob** — content-addressed attachment bytes keyed by SHA-256,
   with byte size and creation time. Message content stores filename, MIME type,
   and blob reference metadata; identical bytes are stored once per scope DB.
-- **tool_call** — `id`, `message_id`, `tool`, `args` (JSON), `risk`, `output`,
-  `status` (`ok` / `error` / `interrupted`), optional structured `exit_code`,
-  and optional `duration_ms`. Records the agent's tool
-  invocations for inspection and the renderer's truncation pointers. (Tool
-  *results* fed back to the model are stored as `tool` messages; this table is
-  the structured audit copy.)
+- **tool_call** — surrogate `id`, provider `call_id`, `message_id`, `tool`,
+  `args` (JSON), `risk`, `status` (`ok` / `error` / `interrupted`), optional
+  structured `exit_code`, and optional `duration_ms`. Records the agent's tool
+  invocations for inspection. Provider call ids are only unique within a single
+  response (many OpenAI-compatible backends emit `call_0`, `call_1`, …), so
+  rows are keyed `UNIQUE(message_id, call_id)` — id reuse across turns or
+  sessions can never overwrite an earlier audit row. The result text is **not**
+  duplicated here: it lives on the corresponding `tool` message row, joinable
+  via `call_id`; this table carries only the structured execution facts the
+  message row lacks.
 - **turn_attempt** — audit-only invocation records: session, invocation kind
   (`turn` / `retry`), model, start/end time, outcome, error class/text, partial
   assistant text that never became a completed message, provider-request count,

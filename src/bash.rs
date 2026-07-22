@@ -111,7 +111,7 @@ pub async fn execute(args: Value, ctx: &mut ToolContext<'_>) -> Result<ToolResul
     };
     let full = format!("{}\n[exit code: {}]", output, exit_code);
     Ok(ToolResult {
-        output: apply_truncation(full, &ctx.config.limits, "bash", ctx.state_dir, true)?,
+        output: apply_truncation(full, &ctx.config.limits, "bash", ctx.state_dir, true),
         exit_code,
         artifacts,
     })
@@ -280,7 +280,7 @@ fn execute_bash_task(
     };
     let full = format!("{output}\n[exit code: {exit_code}]");
     Ok(ToolResult {
-        output: apply_truncation(full, &config.limits, "bash", state_dir, true)?,
+        output: apply_truncation(full, &config.limits, "bash", state_dir, true),
         exit_code,
         artifacts,
     })

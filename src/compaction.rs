@@ -220,7 +220,7 @@ fn build_summarize_prompt(
 }
 
 pub fn prune_spills(state_dir: &Path) {
-    tools::prune_truncation_spills(state_dir, 7);
+    tools::prune_truncation_spills(state_dir, tools::SPILL_RETENTION_DAYS);
 }
 
 #[cfg(test)]

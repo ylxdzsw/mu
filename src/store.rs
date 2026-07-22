@@ -54,11 +54,10 @@ pub struct MessageRecord {
 
 pub struct ToolCallRecord<'a> {
     pub message_id: i64,
-    pub id: &'a str,
+    pub call_id: &'a str,
     pub tool: &'a str,
     pub args: &'a str,
     pub risk: Option<&'a str>,
-    pub output: &'a str,
     pub status: &'a str,
     pub exit_code: Option<i32>,
     pub duration_ms: Option<u64>,
@@ -102,7 +101,7 @@ impl std::fmt::Display for SessionBusy {
 
 impl std::error::Error for SessionBusy {}
 
-const CURRENT_SCHEMA_VERSION: i32 = 7;
+const CURRENT_SCHEMA_VERSION: i32 = 8;
 const COMPATIBLE_SCHEMA_BASELINE: i32 = 6;
 
 fn session_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Session> {
@@ -122,51 +121,70 @@ impl Store {
             .ok_or_else(|| anyhow::anyhow!("session database path must have a parent directory"))?;
         std::fs::create_dir_all(state_dir)?;
         let conn = Connection::open(path).context("opening SQLite database")?;
-        conn.execute_batch(
-            "PRAGMA journal_mode=WAL;
-             PRAGMA busy_timeout=5000;",
-        )?;
+        configure_connection(&conn)?;
         let store = Self {
             conn,
             lock_dir: state_dir.join("locks"),
         };
         store.ensure_schema()?;
+        store.enable_foreign_keys()?;
         Ok(store)
     }
 
     pub fn open_memory() -> Result<Self> {
         let conn = Connection::open_in_memory().context("opening in-memory SQLite database")?;
-        conn.execute_batch(
-            "PRAGMA journal_mode=WAL;
-             PRAGMA busy_timeout=5000;",
-        )?;
+        configure_connection(&conn)?;
         let store = Self {
             conn,
             lock_dir: std::env::temp_dir().join(format!("mu-memory-locks-{}", Uuid::new_v4())),
         };
         store.ensure_schema()?;
+        store.enable_foreign_keys()?;
         Ok(store)
     }
 
+    /// Foreign-key enforcement is switched on only after `ensure_schema` so
+    /// migrations can rebuild tables without fighting the checker (the pragma
+    /// is a no-op inside a transaction anyway, so it cannot be part of
+    /// `configure_connection` and take effect before migrations commit).
+    fn enable_foreign_keys(&self) -> Result<()> {
+        self.conn
+            .execute_batch("PRAGMA foreign_keys=ON;")
+            .context("enabling foreign key enforcement")
+    }
+
     fn ensure_schema(&self) -> Result<()> {
-        let version: i32 = self
+        let mut version: i32 = self
             .conn
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .context("reading SQLite schema version")?;
-        match version {
-            0 if !self.has_application_tables()? => self.create_schema(),
-            0 => anyhow::bail!(
+        if version == 0 {
+            if !self.has_application_tables()? {
+                return self.create_schema();
+            }
+            anyhow::bail!(
                 "unsupported pre-release session database schema; remove sessions.db to create a fresh release database"
-            ),
-            COMPATIBLE_SCHEMA_BASELINE => self.migrate_schema_v6_to_v7(),
-            CURRENT_SCHEMA_VERSION => Ok(()),
-            version if version > CURRENT_SCHEMA_VERSION => anyhow::bail!(
-                "session database schema version {version} is newer than this mu supports (maximum {CURRENT_SCHEMA_VERSION}); upgrade mu"
-            ),
-            version => anyhow::bail!(
-                "session database schema version {version} predates the compatibility baseline {COMPATIBLE_SCHEMA_BASELINE}; upgrade through a compatible mu release"
-            ),
+            );
         }
+        if version > CURRENT_SCHEMA_VERSION {
+            anyhow::bail!(
+                "session database schema version {version} is newer than this mu supports (maximum {CURRENT_SCHEMA_VERSION}); upgrade mu"
+            );
+        }
+        if version < COMPATIBLE_SCHEMA_BASELINE {
+            anyhow::bail!(
+                "session database schema version {version} predates the compatibility baseline {COMPATIBLE_SCHEMA_BASELINE}; upgrade through a compatible mu release"
+            );
+        }
+        while version < CURRENT_SCHEMA_VERSION {
+            match version {
+                6 => self.migrate_schema_v6_to_v7()?,
+                7 => self.migrate_schema_v7_to_v8()?,
+                other => anyhow::bail!("no migration path from schema version {other}"),
+            }
+            version += 1;
+        }
+        Ok(())
     }
 
     fn has_application_tables(&self) -> Result<bool> {
@@ -192,7 +210,7 @@ impl Store {
                 last_total_tokens INTEGER NOT NULL DEFAULT 0
             );
             CREATE TABLE IF NOT EXISTS message (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id INTEGER PRIMARY KEY,
                 session_id TEXT NOT NULL,
                 role TEXT NOT NULL,
                 content TEXT NOT NULL,
@@ -206,21 +224,22 @@ impl Store {
                 created_at TEXT NOT NULL,
                 FOREIGN KEY(session_id) REFERENCES session(id)
             );
-            CREATE INDEX IF NOT EXISTS idx_message_session_seq ON message(session_id, seq);
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_message_session_seq ON message(session_id, seq);
             CREATE TABLE IF NOT EXISTS tool_call (
-                id TEXT PRIMARY KEY,
+                id INTEGER PRIMARY KEY,
+                call_id TEXT NOT NULL,
                 message_id INTEGER NOT NULL,
                 tool TEXT NOT NULL,
                 args TEXT NOT NULL,
                 risk TEXT,
-                output TEXT,
                 status TEXT NOT NULL,
                 exit_code INTEGER,
                 duration_ms INTEGER,
+                UNIQUE(message_id, call_id),
                 FOREIGN KEY(message_id) REFERENCES message(id)
             );
             CREATE TABLE IF NOT EXISTS turn_attempt (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id INTEGER PRIMARY KEY,
                 session_id TEXT NOT NULL,
                 kind TEXT NOT NULL,
                 model TEXT NOT NULL,
@@ -239,7 +258,7 @@ impl Store {
             );
             CREATE INDEX IF NOT EXISTS idx_turn_attempt_session_id ON turn_attempt(session_id);
             CREATE TABLE IF NOT EXISTS turn_usage (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id INTEGER PRIMARY KEY,
                 session_id TEXT NOT NULL,
                 model TEXT NOT NULL,
                 input_tokens INTEGER NOT NULL DEFAULT 0,
@@ -259,7 +278,7 @@ impl Store {
                 created_at TEXT NOT NULL
             );
             CREATE TABLE IF NOT EXISTS review (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id INTEGER PRIMARY KEY,
                 session_id TEXT NOT NULL,
                 tool_call_id TEXT,
                 action_json TEXT NOT NULL,
@@ -267,9 +286,10 @@ impl Store {
                 user_auth_level TEXT NOT NULL,
                 outcome TEXT NOT NULL,
                 reason TEXT,
-                created_at TEXT NOT NULL
+                created_at TEXT NOT NULL,
+                FOREIGN KEY(session_id) REFERENCES session(id)
             );
-            PRAGMA user_version = 7;",
+            PRAGMA user_version = 8;",
         )?;
         Ok(())
     }
@@ -304,14 +324,187 @@ impl Store {
         Ok(())
     }
 
+    /// v8 drops AUTOINCREMENT from `message`, `turn_attempt`, `turn_usage`, and
+    /// `review` (it only prevents rowid reuse after deleting the max row —
+    /// irrelevant for append-only tables, and costs a `sqlite_sequence` write
+    /// per insert). Also rebuilds `tool_call` around a surrogate key: provider
+    /// call ids are only unique within a single response (many OpenAI-compatible
+    /// backends emit `call_0`, `call_1`, …), so using them as the table's
+    /// primary key let later turns silently overwrite earlier audit rows. The
+    /// result text also stops being duplicated here — it lives on the `tool`
+    /// message row, joinable via `call_id`. `message` gains a UNIQUE ordering
+    /// index (the replay contract), and `review` gains the session foreign key.
+    fn migrate_schema_v7_to_v8(&self) -> Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute_batch(
+            "CREATE TABLE message_v8 (
+                id INTEGER PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                role TEXT NOT NULL,
+                content TEXT NOT NULL,
+                reasoning_content TEXT,
+                native_replay_json TEXT,
+                user_content_json TEXT,
+                tool_content_json TEXT,
+                tool_call_id TEXT,
+                tool_calls_json TEXT,
+                seq INTEGER NOT NULL,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY(session_id) REFERENCES session(id)
+             );
+             INSERT INTO message_v8 (
+                id, session_id, role, content, reasoning_content, native_replay_json,
+                user_content_json, tool_content_json, tool_call_id, tool_calls_json,
+                seq, created_at
+             ) SELECT id, session_id, role, content, reasoning_content, native_replay_json,
+                user_content_json, tool_content_json, tool_call_id, tool_calls_json,
+                seq, created_at FROM message;
+             DROP TABLE message;
+             ALTER TABLE message_v8 RENAME TO message;
+             CREATE UNIQUE INDEX idx_message_session_seq ON message(session_id, seq);
+             CREATE TABLE turn_attempt_v8 (
+                id INTEGER PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                model TEXT NOT NULL,
+                started_at TEXT NOT NULL,
+                completed_at TEXT,
+                outcome TEXT NOT NULL,
+                error_class TEXT,
+                error TEXT,
+                partial_output TEXT,
+                provider_request_count INTEGER NOT NULL DEFAULT 0,
+                iteration_count INTEGER NOT NULL DEFAULT 0,
+                retry_count INTEGER NOT NULL DEFAULT 0,
+                duration_ms INTEGER,
+                context_tokens INTEGER NOT NULL DEFAULT 0,
+                FOREIGN KEY(session_id) REFERENCES session(id)
+             );
+             INSERT INTO turn_attempt_v8 SELECT * FROM turn_attempt;
+             DROP TABLE turn_attempt;
+             ALTER TABLE turn_attempt_v8 RENAME TO turn_attempt;
+             CREATE INDEX idx_turn_attempt_session_id ON turn_attempt(session_id);
+             CREATE TABLE turn_usage_v8 (
+                id INTEGER PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                model TEXT NOT NULL,
+                input_tokens INTEGER NOT NULL DEFAULT 0,
+                cache_read_input_tokens INTEGER NOT NULL DEFAULT 0,
+                cache_write_input_tokens INTEGER NOT NULL DEFAULT 0,
+                output_tokens INTEGER NOT NULL DEFAULT 0,
+                reasoning_output_tokens INTEGER NOT NULL DEFAULT 0,
+                total_tokens INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY(session_id) REFERENCES session(id)
+             );
+             INSERT INTO turn_usage_v8 SELECT * FROM turn_usage;
+             DROP TABLE turn_usage;
+             ALTER TABLE turn_usage_v8 RENAME TO turn_usage;
+             CREATE INDEX idx_turn_usage_session_id ON turn_usage(session_id);
+             CREATE TABLE tool_call_v8 (
+                id INTEGER PRIMARY KEY,
+                call_id TEXT NOT NULL,
+                message_id INTEGER NOT NULL,
+                tool TEXT NOT NULL,
+                args TEXT NOT NULL,
+                risk TEXT,
+                status TEXT NOT NULL,
+                exit_code INTEGER,
+                duration_ms INTEGER,
+                UNIQUE(message_id, call_id),
+                FOREIGN KEY(message_id) REFERENCES message(id)
+             );
+             INSERT INTO tool_call_v8 (
+                call_id, message_id, tool, args, risk, status, exit_code, duration_ms
+             ) SELECT id, message_id, tool, args, risk, status, exit_code, duration_ms
+               FROM tool_call;
+             DROP TABLE tool_call;
+             ALTER TABLE tool_call_v8 RENAME TO tool_call;
+             CREATE TABLE review_v8 (
+                id INTEGER PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                tool_call_id TEXT,
+                action_json TEXT NOT NULL,
+                risk_level TEXT NOT NULL,
+                user_auth_level TEXT NOT NULL,
+                outcome TEXT NOT NULL,
+                reason TEXT,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY(session_id) REFERENCES session(id)
+             );
+             INSERT INTO review_v8 (
+                id, session_id, tool_call_id, action_json, risk_level,
+                user_auth_level, outcome, reason, created_at
+             ) SELECT id, session_id, tool_call_id, action_json, risk_level,
+                user_auth_level, outcome, reason, created_at
+               FROM review;
+             DROP TABLE review;
+             ALTER TABLE review_v8 RENAME TO review;
+             DELETE FROM sqlite_sequence;
+             PRAGMA user_version = 8;",
+        )
+        .context(
+            "migrating session database to schema v8 (a duplicate-ordering failure here means the message log was already corrupt)",
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Test-only: production sessions are created via `create_session_seeded`
+    /// so the session row never exists without its system prompt.
+    #[cfg(test)]
     pub fn create_session(&self, cwd: &str, model: &str) -> Result<Session> {
         let id = Uuid::new_v4().to_string();
-        let now = chrono::Utc::now().to_rfc3339();
+        let now = now_rfc3339();
         self.conn.execute(
             "INSERT INTO session (id, created_at, updated_at, cwd, model, title, last_total_tokens)
              VALUES (?1, ?2, ?2, ?3, ?4, NULL, 0)",
             params![id, now, cwd, model],
         )?;
+        Ok(Session {
+            id,
+            cwd: cwd.into(),
+            model: model.into(),
+            title: None,
+            last_total_tokens: 0,
+        })
+    }
+
+    /// Create the session row, its system prompt, and the environment seed in
+    /// one transaction. A crash can therefore never leave a session that fails
+    /// to load with "missing persisted system prompt".
+    pub fn create_session_seeded(
+        &self,
+        cwd: &str,
+        model: &str,
+        system_prompt: &str,
+        environment_seed: &str,
+    ) -> Result<Session> {
+        let id = Uuid::new_v4().to_string();
+        let now = now_rfc3339();
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
+            "INSERT INTO session (id, created_at, updated_at, cwd, model, title, last_total_tokens)
+             VALUES (?1, ?2, ?2, ?3, ?4, NULL, 0)",
+            params![id, now, cwd, model],
+        )?;
+        insert_message_in(
+            &tx,
+            &id,
+            &Message::System {
+                content: system_prompt.to_string(),
+            },
+            &now,
+        )?;
+        insert_message_in(
+            &tx,
+            &id,
+            &Message::User {
+                content: UserContent::Text(environment_seed.to_string()),
+            },
+            &now,
+        )?;
+        tx.commit()?;
         Ok(Session {
             id,
             cwd: cwd.into(),
@@ -345,11 +538,23 @@ impl Store {
 
     pub fn session_summary(&self, id: &str) -> Result<Option<SessionSummary>> {
         let mut stmt = self.conn.prepare(
+            // turn_count = completed assistant replies (role='assistant' with no
+            // tool_calls_json, meaning the model finished without requesting a
+            // further tool). This is robust across both provider adapters:
+            //   - Chat Completions: completes with role=assistant, no tool_calls
+            //   - Responses: same persisted shape
+            // Counting user rows would be wrong: a session has the environment
+            // seed, the actual prompts, AND any cwd-change reminders appended
+            // mid-session — all as role='user'. Interrupted turns (assistant
+            // row still carrying tool_calls_json) are intentionally not counted.
             "SELECT
                 s.id, s.created_at, s.updated_at, s.cwd, s.title,
                 s.last_total_tokens,
                 COUNT(m.id) AS message_count,
-                COALESCE(SUM(CASE WHEN m.role = 'user' THEN 1 ELSE 0 END), 0) AS user_count
+                COALESCE(SUM(CASE
+                    WHEN m.role = 'assistant'
+                     AND (m.tool_calls_json IS NULL OR m.tool_calls_json = '[]')
+                    THEN 1 ELSE 0 END), 0) AS turn_count
              FROM session s
              LEFT JOIN message m ON m.session_id = s.id
              WHERE s.id = ?1
@@ -365,7 +570,7 @@ impl Store {
                     title: row.get(4)?,
                     last_total_tokens: row.get::<_, i64>(5)? as u64,
                     message_count: row.get::<_, i64>(6)? as u64,
-                    turn_count: row.get::<_, i64>(7)?.saturating_sub(1) as u64,
+                    turn_count: row.get::<_, i64>(7)? as u64,
                 })
             })
             .optional()?;
@@ -389,7 +594,7 @@ impl Store {
         title: Option<&str>,
         model: &str,
     ) -> Result<()> {
-        let now = chrono::Utc::now().to_rfc3339();
+        let now = now_rfc3339();
         let tx = self.conn.unchecked_transaction()?;
         if let Some(t) = title {
             tx.execute(
@@ -427,7 +632,7 @@ impl Store {
     }
 
     pub fn update_session_cwd(&self, id: &str, cwd: &str) -> Result<()> {
-        let now = chrono::Utc::now().to_rfc3339();
+        let now = now_rfc3339();
         self.conn.execute(
             "UPDATE session SET updated_at = ?1, cwd = ?2 WHERE id = ?3",
             params![now, cwd, id],
@@ -436,7 +641,7 @@ impl Store {
     }
 
     pub fn start_turn_attempt(&self, session_id: &str, kind: &str, model: &str) -> Result<i64> {
-        let now = chrono::Utc::now().to_rfc3339();
+        let now = now_rfc3339();
         self.conn.execute(
             "INSERT INTO turn_attempt (session_id, kind, model, started_at, outcome)
              VALUES (?1, ?2, ?3, ?4, 'running')",
@@ -450,7 +655,7 @@ impl Store {
         attempt_id: i64,
         completion: TurnAttemptCompletion<'_>,
     ) -> Result<()> {
-        let now = chrono::Utc::now().to_rfc3339();
+        let now = now_rfc3339();
         self.conn.execute(
             "UPDATE turn_attempt SET
                 completed_at = ?1,
@@ -548,11 +753,10 @@ impl Store {
                 session_id,
                 ToolCallRecord {
                     message_id: assistant_id,
-                    id: &call.id,
+                    call_id: &call.id,
                     tool: &call.function.name,
                     args: &call.function.arguments,
                     risk: risk.as_ref().map(|risk| risk.as_str()),
-                    output: INTERRUPTED_TOOL_RESULT,
                     status: "interrupted",
                     exit_code: None,
                     duration_ms: None,
@@ -683,7 +887,7 @@ impl Store {
     }
 
     pub fn append_message(&self, session_id: &str, message: &Message) -> Result<i64> {
-        let now = chrono::Utc::now().to_rfc3339();
+        let now = now_rfc3339();
         let tx = self.conn.unchecked_transaction()?;
         let id = insert_message_in(&tx, session_id, message, &now)?;
         tx.commit()?;
@@ -696,11 +900,19 @@ impl Store {
         content: &str,
         before_seq: i64,
     ) -> Result<()> {
-        let now = chrono::Utc::now().to_rfc3339();
+        let now = now_rfc3339();
         let tx = self.conn.unchecked_transaction()?;
+        // Shift in two passes through negative values: UNIQUE(session_id, seq)
+        // is checked per updated row, so a direct `seq = seq + 1` would collide
+        // with the not-yet-shifted neighbor. seq is never negative at rest, so
+        // the intermediate range is free.
         tx.execute(
-            "UPDATE message SET seq = seq + 1 WHERE session_id = ?1 AND seq >= ?2",
+            "UPDATE message SET seq = -(seq + 1) WHERE session_id = ?1 AND seq >= ?2",
             params![session_id, before_seq],
+        )?;
+        tx.execute(
+            "UPDATE message SET seq = -seq WHERE session_id = ?1 AND seq < 0",
+            params![session_id],
         )?;
         tx.execute(
             "INSERT INTO message (session_id, role, content, seq, created_at) VALUES (?1, 'summary', ?2, ?3, ?4)",
@@ -711,7 +923,7 @@ impl Store {
     }
 
     pub fn append_summary(&self, session_id: &str, content: &str) -> Result<()> {
-        let now = chrono::Utc::now().to_rfc3339();
+        let now = now_rfc3339();
         let tx = self.conn.unchecked_transaction()?;
         let seq = next_seq_in(&tx, session_id)?;
         tx.execute(
@@ -723,17 +935,19 @@ impl Store {
     }
 
     pub fn record_tool_call(&self, record: ToolCallRecord<'_>) -> Result<()> {
+        // OR REPLACE is scoped by UNIQUE(message_id, call_id): a re-persisted
+        // result for the same call replaces its own audit row, while provider
+        // call-id reuse across messages or sessions can never clobber history.
         self.conn.execute(
             "INSERT OR REPLACE INTO tool_call (
-                id, message_id, tool, args, risk, output, status, exit_code, duration_ms
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                call_id, message_id, tool, args, risk, status, exit_code, duration_ms
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             params![
-                record.id,
+                record.call_id,
                 record.message_id,
                 record.tool,
                 record.args,
                 record.risk,
-                record.output,
                 record.status,
                 record.exit_code,
                 record.duration_ms.map(u64_to_i64),
@@ -749,19 +963,18 @@ impl Store {
         content: &str,
         artifacts: &[ToolArtifact],
     ) -> Result<i64> {
-        let now = chrono::Utc::now().to_rfc3339();
+        let now = now_rfc3339();
         let tx = self.conn.unchecked_transaction()?;
         tx.execute(
             "INSERT OR REPLACE INTO tool_call (
-                id, message_id, tool, args, risk, output, status, exit_code, duration_ms
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                call_id, message_id, tool, args, risk, status, exit_code, duration_ms
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             params![
-                record.id,
+                record.call_id,
                 record.message_id,
                 record.tool,
                 record.args,
                 record.risk,
-                record.output,
                 record.status,
                 record.exit_code,
                 record.duration_ms.map(u64_to_i64),
@@ -770,7 +983,7 @@ impl Store {
         let message = Message::Tool {
             content: content.to_string(),
             artifacts: artifacts.to_vec(),
-            tool_call_id: record.id.to_string(),
+            tool_call_id: record.call_id.to_string(),
         };
         let message_id = insert_message_in(&tx, session_id, &message, &now)?;
         tx.execute(
@@ -782,7 +995,7 @@ impl Store {
     }
 
     pub fn record_review(&self, record: ReviewRecord<'_>) -> Result<()> {
-        let now = chrono::Utc::now().to_rfc3339();
+        let now = now_rfc3339();
         self.conn.execute(
             "INSERT INTO review (session_id, tool_call_id, action_json, risk_level, user_auth_level, outcome, reason, created_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
@@ -881,6 +1094,44 @@ impl Store {
 #[derive(Debug)]
 pub struct SessionLock {
     _file: std::fs::File,
+}
+
+/// Connection-level tuning, applied before the schema check.
+///
+/// - WAL + `synchronous=NORMAL`: in WAL mode NORMAL fsyncs only at
+///   checkpoints, so the per-message commits inside a turn stop paying an
+///   fsync each. An application crash loses nothing; an OS crash or power
+///   loss may lose the most recent commits but cannot corrupt the database —
+///   the right trade for a conversation log.
+/// - `busy_timeout`: rides out the rare cross-session write overlap under WAL
+///   (same-session writers are serialized by the per-session flock).
+/// - `trusted_schema=OFF`: a project-scope sessions.db can arrive in a cloned
+///   repository, so do not run functions embedded in a crafted schema. mu's
+///   own schema uses no views, triggers, or expression indexes.
+/// - `journal_size_limit`: attachment blobs can push the WAL file to tens of
+///   megabytes; without a limit it stays at its high-water mark forever.
+///   8 MiB caps the steady-state size while keeping normal turns unaffected.
+///
+/// `foreign_keys=ON` is deliberately not here — see `enable_foreign_keys`.
+fn configure_connection(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "PRAGMA journal_mode=WAL;
+         PRAGMA synchronous=NORMAL;
+         PRAGMA busy_timeout=5000;
+         PRAGMA trusted_schema=OFF;
+         PRAGMA journal_size_limit=8388608;",
+    )
+    .context("configuring SQLite connection")
+}
+
+/// UTC timestamp in RFC3339 format for all database writes.
+///
+/// RFC3339 strings sort lexicographically only when all values use the same
+/// UTC offset — chrono's `to_rfc3339()` always emits `+00:00`, so ORDER BY on
+/// any timestamp column is safe and correct. Do not substitute a local-time
+/// formatter here; it would silently break session ordering.
+fn now_rfc3339() -> String {
+    chrono::Utc::now().to_rfc3339()
 }
 
 type ContextRow = (
@@ -1323,6 +1574,16 @@ mod tests {
         assert!(message_columns.contains(&"reasoning_content".to_string()));
         assert!(message_columns.contains(&"native_replay_json".to_string()));
         assert!(message_columns.contains(&"tool_content_json".to_string()));
+        let ordering_index_is_unique: i64 = store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_index_list('message')
+                 WHERE name = 'idx_message_session_seq' AND \"unique\" = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(ordering_index_is_unique, 1);
         let tool_call_columns = store
             .conn
             .prepare("PRAGMA table_info(tool_call)")
@@ -1331,8 +1592,10 @@ mod tests {
             .unwrap()
             .collect::<rusqlite::Result<Vec<_>>>()
             .unwrap();
+        assert!(tool_call_columns.contains(&"call_id".to_string()));
         assert!(tool_call_columns.contains(&"exit_code".to_string()));
         assert!(tool_call_columns.contains(&"duration_ms".to_string()));
+        assert!(!tool_call_columns.contains(&"output".to_string()));
         let session_columns = store
             .conn
             .prepare("PRAGMA table_info(session)")
@@ -1342,6 +1605,26 @@ mod tests {
             .collect::<rusqlite::Result<Vec<_>>>()
             .unwrap();
         assert!(!session_columns.contains(&"archived".to_string()));
+        // v8: AUTOINCREMENT removed from message, turn_attempt, turn_usage, review.
+        let autoincrement_count: i64 = store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_schema
+                 WHERE type = 'table' AND sql LIKE '%AUTOINCREMENT%'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(autoincrement_count, 0, "no tables should use AUTOINCREMENT in v8");
+        let sqlite_sequence_exists: bool = store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM sqlite_schema WHERE name = 'sqlite_sequence'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(!sqlite_sequence_exists, "sqlite_sequence should not exist without AUTOINCREMENT tables");
         let _ = std::fs::remove_dir_all(tmp);
     }
 
@@ -1378,6 +1661,7 @@ mod tests {
         std::fs::create_dir_all(&tmp).unwrap();
         let db = tmp.join("mu.db");
         let conn = Connection::open(&db).unwrap();
+        // Faithful copy of the real v6 baseline schema (commit 170b4f5).
         conn.execute_batch(
             "CREATE TABLE session (
                 id TEXT PRIMARY KEY,
@@ -1400,8 +1684,10 @@ mod tests {
                 tool_call_id TEXT,
                 tool_calls_json TEXT,
                 seq INTEGER NOT NULL,
-                created_at TEXT NOT NULL
+                created_at TEXT NOT NULL,
+                FOREIGN KEY(session_id) REFERENCES session(id)
              );
+             CREATE INDEX idx_message_session_seq ON message(session_id, seq);
              CREATE TABLE tool_call (
                 id TEXT PRIMARY KEY,
                 message_id INTEGER NOT NULL,
@@ -1409,7 +1695,39 @@ mod tests {
                 args TEXT NOT NULL,
                 risk TEXT,
                 output TEXT,
-                status TEXT NOT NULL
+                status TEXT NOT NULL,
+                FOREIGN KEY(message_id) REFERENCES message(id)
+             );
+             CREATE TABLE turn_usage (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT NOT NULL,
+                model TEXT NOT NULL,
+                input_tokens INTEGER NOT NULL DEFAULT 0,
+                cache_read_input_tokens INTEGER NOT NULL DEFAULT 0,
+                cache_write_input_tokens INTEGER NOT NULL DEFAULT 0,
+                output_tokens INTEGER NOT NULL DEFAULT 0,
+                reasoning_output_tokens INTEGER NOT NULL DEFAULT 0,
+                total_tokens INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY(session_id) REFERENCES session(id)
+             );
+             CREATE INDEX idx_turn_usage_session_id ON turn_usage(session_id);
+             CREATE TABLE attachment_blob (
+                id TEXT PRIMARY KEY,
+                data BLOB NOT NULL,
+                size INTEGER NOT NULL,
+                created_at TEXT NOT NULL
+             );
+             CREATE TABLE review (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT NOT NULL,
+                tool_call_id TEXT,
+                action_json TEXT NOT NULL,
+                risk_level TEXT NOT NULL,
+                user_auth_level TEXT NOT NULL,
+                outcome TEXT NOT NULL,
+                reason TEXT,
+                created_at TEXT NOT NULL
              );
              INSERT INTO session VALUES (
                 'session-1', 'now', 'now', '/tmp', 'test/model', NULL, 0
@@ -1419,6 +1737,12 @@ mod tests {
              ) VALUES (1, 'session-1', 'assistant', '', 0, 'now');
              INSERT INTO tool_call VALUES (
                 'call-1', 1, 'bash', '{}', 'readonly', 'old output', 'ok'
+             );
+             INSERT INTO review (
+                session_id, tool_call_id, action_json, risk_level,
+                user_auth_level, outcome, reason, created_at
+             ) VALUES (
+                'session-1', 'call-1', '{}', 'readonly', 'reversible', 'allow', NULL, 'now'
              );
              PRAGMA user_version = 6;",
         )
@@ -1432,15 +1756,24 @@ mod tests {
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
         assert_eq!(version, CURRENT_SCHEMA_VERSION);
-        let migrated: (String, Option<i32>, Option<i64>) = store
+        let migrated: (i64, Option<i32>, Option<i64>) = store
             .conn
             .query_row(
-                "SELECT output, exit_code, duration_ms FROM tool_call WHERE id = 'call-1'",
+                "SELECT message_id, exit_code, duration_ms FROM tool_call WHERE call_id = 'call-1'",
                 [],
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .unwrap();
-        assert_eq!(migrated, ("old output".into(), None, None));
+        assert_eq!(migrated, (1, None, None));
+        let review_outcome: String = store
+            .conn
+            .query_row(
+                "SELECT outcome FROM review WHERE session_id = 'session-1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(review_outcome, "allow");
         assert!(
             store
                 .conn
@@ -1477,13 +1810,305 @@ mod tests {
         std::fs::create_dir_all(&tmp).unwrap();
         let db = tmp.join("mu.db");
         let conn = Connection::open(&db).unwrap();
-        conn.execute_batch("PRAGMA user_version = 8;").unwrap();
+        conn.execute_batch("PRAGMA user_version = 9;").unwrap();
         drop(conn);
 
         let error = Store::open(&db).err().unwrap().to_string();
 
-        assert!(error.contains("schema version 8 is newer"));
+        assert!(error.contains("schema version 9 is newer"));
         assert!(error.contains("upgrade mu"));
+        let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    #[test]
+    fn schema_v7_is_migrated_to_v8_preserving_audit_rows() {
+        let tmp = std::env::temp_dir().join(format!("mu-store-v7-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let db = tmp.join("mu.db");
+        let conn = Connection::open(&db).unwrap();
+        // v7 = v6 baseline + tool_call execution columns + turn_attempt.
+        conn.execute_batch(
+            "CREATE TABLE session (
+                id TEXT PRIMARY KEY,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                cwd TEXT NOT NULL,
+                model TEXT NOT NULL,
+                title TEXT,
+                last_total_tokens INTEGER NOT NULL DEFAULT 0
+             );
+             CREATE TABLE message (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT NOT NULL,
+                role TEXT NOT NULL,
+                content TEXT NOT NULL,
+                reasoning_content TEXT,
+                native_replay_json TEXT,
+                user_content_json TEXT,
+                tool_content_json TEXT,
+                tool_call_id TEXT,
+                tool_calls_json TEXT,
+                seq INTEGER NOT NULL,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY(session_id) REFERENCES session(id)
+             );
+             CREATE INDEX idx_message_session_seq ON message(session_id, seq);
+             CREATE TABLE tool_call (
+                id TEXT PRIMARY KEY,
+                message_id INTEGER NOT NULL,
+                tool TEXT NOT NULL,
+                args TEXT NOT NULL,
+                risk TEXT,
+                output TEXT,
+                status TEXT NOT NULL,
+                exit_code INTEGER,
+                duration_ms INTEGER,
+                FOREIGN KEY(message_id) REFERENCES message(id)
+             );
+             CREATE TABLE turn_attempt (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                model TEXT NOT NULL,
+                started_at TEXT NOT NULL,
+                completed_at TEXT,
+                outcome TEXT NOT NULL,
+                error_class TEXT,
+                error TEXT,
+                partial_output TEXT,
+                provider_request_count INTEGER NOT NULL DEFAULT 0,
+                iteration_count INTEGER NOT NULL DEFAULT 0,
+                retry_count INTEGER NOT NULL DEFAULT 0,
+                duration_ms INTEGER,
+                context_tokens INTEGER NOT NULL DEFAULT 0,
+                FOREIGN KEY(session_id) REFERENCES session(id)
+             );
+             CREATE INDEX idx_turn_attempt_session_id ON turn_attempt(session_id);
+             CREATE TABLE turn_usage (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT NOT NULL,
+                model TEXT NOT NULL,
+                input_tokens INTEGER NOT NULL DEFAULT 0,
+                cache_read_input_tokens INTEGER NOT NULL DEFAULT 0,
+                cache_write_input_tokens INTEGER NOT NULL DEFAULT 0,
+                output_tokens INTEGER NOT NULL DEFAULT 0,
+                reasoning_output_tokens INTEGER NOT NULL DEFAULT 0,
+                total_tokens INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY(session_id) REFERENCES session(id)
+             );
+             CREATE INDEX idx_turn_usage_session_id ON turn_usage(session_id);
+             CREATE TABLE attachment_blob (
+                id TEXT PRIMARY KEY,
+                data BLOB NOT NULL,
+                size INTEGER NOT NULL,
+                created_at TEXT NOT NULL
+             );
+             CREATE TABLE review (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT NOT NULL,
+                tool_call_id TEXT,
+                action_json TEXT NOT NULL,
+                risk_level TEXT NOT NULL,
+                user_auth_level TEXT NOT NULL,
+                outcome TEXT NOT NULL,
+                reason TEXT,
+                created_at TEXT NOT NULL
+             );
+             INSERT INTO session VALUES (
+                'session-1', 'now', 'now', '/tmp', 'test/model', NULL, 0
+             );
+             INSERT INTO message (
+                id, session_id, role, content, seq, created_at
+             ) VALUES (1, 'session-1', 'assistant', '', 0, 'now');
+             INSERT INTO tool_call VALUES (
+                'call-1', 1, 'bash', '{}', 'readonly', 'old output', 'ok', 3, 250
+             );
+             INSERT INTO review (
+                session_id, tool_call_id, action_json, risk_level,
+                user_auth_level, outcome, reason, created_at
+             ) VALUES (
+                'session-1', 'call-1', '{}', 'destructive', 'reversible', 'deny', 'too risky', 'now'
+             );
+             PRAGMA user_version = 7;",
+        )
+        .unwrap();
+        drop(conn);
+
+        let store = Store::open(&db).unwrap();
+
+        let version: i32 = store
+            .conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, CURRENT_SCHEMA_VERSION);
+        let migrated: (i64, String, Option<i32>, Option<i64>) = store
+            .conn
+            .query_row(
+                "SELECT message_id, status, exit_code, duration_ms
+                 FROM tool_call WHERE call_id = 'call-1'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(migrated, (1, "ok".into(), Some(3), Some(250)));
+        let review: (String, Option<String>) = store
+            .conn
+            .query_row(
+                "SELECT outcome, reason FROM review WHERE tool_call_id = 'call-1'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(review, ("deny".into(), Some("too risky".into())));
+        let ordering_index_is_unique: i64 = store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_index_list('message')
+                 WHERE name = 'idx_message_session_seq' AND \"unique\" = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(ordering_index_is_unique, 1);
+        let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    #[test]
+    fn reused_provider_call_ids_do_not_clobber_audit_rows() {
+        let (store, tmp) = temp_store();
+        let session = create_session_with_system(&store);
+
+        // Two turns whose provider reuses the same call id ("call_0" style).
+        for output in ["first", "second"] {
+            let assistant_id = store
+                .append_message(
+                    &session.id,
+                    &Message::Assistant {
+                        content: None,
+                        reasoning_content: None,
+                        native_replay: None,
+                        tool_calls: Some(vec![ToolCall {
+                            id: "call_0".into(),
+                            function: FunctionCall {
+                                name: "bash".into(),
+                                arguments: "{}".into(),
+                            },
+                        }]),
+                    },
+                )
+                .unwrap();
+            store
+                .persist_tool_result(
+                    &session.id,
+                    ToolCallRecord {
+                        message_id: assistant_id,
+                        call_id: "call_0",
+                        tool: "bash",
+                        args: "{}",
+                        risk: Some("readonly"),
+                        status: "ok",
+                        exit_code: Some(0),
+                        duration_ms: Some(1),
+                    },
+                    output,
+                    &[],
+                )
+                .unwrap();
+        }
+
+        let audit_rows: i64 = store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM tool_call WHERE call_id = 'call_0'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(audit_rows, 2);
+        let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    #[test]
+    fn insert_summary_before_shifts_multiple_rows_without_collisions() {
+        let (store, tmp) = temp_store();
+        let session = create_session_with_system(&store);
+        for text in ["one", "two", "three", "four"] {
+            store
+                .append_message(
+                    &session.id,
+                    &Message::User {
+                        content: UserContent::Text(text.into()),
+                    },
+                )
+                .unwrap();
+        }
+
+        // Shift the last three rows (seq 2..4) up by one; under the UNIQUE
+        // ordering index a naive `seq = seq + 1` would collide row-by-row.
+        store
+            .insert_summary_before(&session.id, "summary text", 2)
+            .unwrap();
+
+        let records = store.message_records_from_seq(&session.id, 0).unwrap();
+        let log: Vec<(i64, String, String)> = records
+            .into_iter()
+            .map(|record| (record.seq, record.role, record.content))
+            .collect();
+        assert_eq!(
+            log,
+            vec![
+                (0, "system".into(), "system".into()),
+                (1, "user".into(), "one".into()),
+                (2, "summary".into(), "summary text".into()),
+                (3, "user".into(), "two".into()),
+                (4, "user".into(), "three".into()),
+                (5, "user".into(), "four".into()),
+            ]
+        );
+        let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    #[test]
+    fn foreign_keys_are_enforced() {
+        let (store, tmp) = temp_store();
+
+        let error = store
+            .append_message(
+                "no-such-session",
+                &Message::User {
+                    content: UserContent::Text("orphan".into()),
+                },
+            )
+            .unwrap_err();
+
+        assert!(error.to_string().to_lowercase().contains("foreign key"));
+        let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    #[test]
+    fn create_session_seeded_writes_system_and_environment_in_one_step() {
+        let (store, tmp) = temp_store();
+
+        let session = store
+            .create_session_seeded("/tmp", "test/model", "system prompt", "[environment] cwd")
+            .unwrap();
+
+        let records = store.message_records_from_seq(&session.id, 0).unwrap();
+        let log: Vec<(i64, String, String)> = records
+            .into_iter()
+            .map(|record| (record.seq, record.role, record.content))
+            .collect();
+        assert_eq!(
+            log,
+            vec![
+                (0, "system".into(), "system prompt".into()),
+                (1, "user".into(), "[environment] cwd".into()),
+            ]
+        );
+        assert_eq!(store.system_prompt(&session.id).unwrap(), "system prompt");
+        // The lone environment seed leaves the session clean (no real turn yet).
+        assert!(store.is_session_clean(&session.id).unwrap());
         let _ = std::fs::remove_dir_all(tmp);
     }
 
@@ -1730,11 +2355,10 @@ mod tests {
                 &session.id,
                 ToolCallRecord {
                     message_id: assistant_id,
-                    id: "call-a",
+                    call_id: "call-a",
                     tool: "bash",
                     args: "{\"title\":\"a\",\"risk\":\"readonly\",\"command\":\"echo a\"}",
                     risk: Some("readonly"),
-                    output: "a",
                     status: "ok",
                     exit_code: Some(0),
                     duration_ms: Some(12),
@@ -1746,7 +2370,7 @@ mod tests {
         let execution: (Option<i32>, Option<i64>) = store
             .conn
             .query_row(
-                "SELECT exit_code, duration_ms FROM tool_call WHERE id = 'call-a'",
+                "SELECT exit_code, duration_ms FROM tool_call WHERE call_id = 'call-a'",
                 [],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )

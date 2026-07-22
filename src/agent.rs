@@ -453,14 +453,12 @@ impl<'a> AgentLoop<'a> {
                                             self.store
                                                 .append_message(self.session_id, &deny_msg)?;
                                             context.push(deny_msg);
-                                            let output = format!("error: {deny_err}");
                                             self.store.record_tool_call(ToolCallRecord {
                                                 message_id: msg_id,
-                                                id: &tc.id,
+                                                call_id: &tc.id,
                                                 tool: &tc.function.name,
                                                 args: &tc.function.arguments,
                                                 risk: risk.as_ref().map(|risk| risk.as_str()),
-                                                output: &output,
                                                 status: "error",
                                                 exit_code: None,
                                                 duration_ms: None,
@@ -611,11 +609,10 @@ impl<'a> AgentLoop<'a> {
             self.session_id,
             ToolCallRecord {
                 message_id,
-                id: &call.id,
+                call_id: &call.id,
                 tool: &call.function.name,
                 args: &call.function.arguments,
                 risk: risk.as_ref().map(|risk| risk.as_str()),
-                output: &output,
                 status,
                 exit_code,
                 duration_ms: Some(elapsed.as_millis().min(u64::MAX as u128) as u64),
