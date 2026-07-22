@@ -437,16 +437,24 @@ dispatches these applets:
 - **`view_image [--detail auto|low|high|original] PATH`** loads a validated PNG,
   JPEG, WebP, or GIF through the same attachment loader and 20 MiB limit used by
   `mu -a`. `--detail` is optional and defaults to `auto`. The command writes a
-  text summary normally and sends image bytes over a dedicated inherited
-  artifact descriptor; it fails when invoked without Mu's artifact channel.
+  text summary normally and publishes the image into the current bash call's
+  private artifact directory; it fails when invoked outside that live call.
 
 These are ordinary commands called through `bash`, not additional model-visible
-function tools. The artifact channel is versioned and length-framed, is drained
-concurrently with stdout, and is scoped to one bash call. A call may emit at
-most eight images. Tool-image metadata and SHA-256-deduplicated bytes persist
-with the tool message. Responses adapters serialize images in the native
-`function_call_output`; Chat Completions adapters retain the tool text and add a
-labeled multimodal user-message projection on the wire only.
+function tools. Before each call, Mu creates a mode-`0700` temporary directory
+and passes its path as `MU_ARTIFACT_DIR`; no directory or artifact descriptor is
+inherited. Each `view_image` invocation serializes one versioned, length-framed
+record to a mode-`0600` temporary file and atomically renames it to a numbered
+artifact file while holding a directory-local lock. When the direct bash
+process exits and stdout closes, Mu reads numbered files in order, validates
+them, and removes the directory on every completion path. A call may emit at
+most eight images. The applet never recreates a removed directory, so detached
+commands cannot publish late artifacts or keep a bash result open; they must
+save ordinary files for a later foreground `view_image` call. Tool-image
+metadata and SHA-256-deduplicated bytes persist with the tool message. Responses
+adapters serialize images in the native `function_call_output`; Chat
+Completions adapters retain the tool text and add a labeled multimodal
+user-message projection on the wire only.
 
 `title` is the short human-readable action shown in the terminal. `risk` is
 advisory metadata for UI/audit and drives optional guardrail review for

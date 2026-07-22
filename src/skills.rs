@@ -871,7 +871,7 @@ mod tests {
         fs::create_dir_all(&project).unwrap();
         fs::write(
             builtins.join("background-task.md"),
-            "---\nname: background-task\ndescription: Start background tasks.\n---\nUse systemd-run.\n",
+            "---\nname: background-task\ndescription: Start background tasks.\n---\nUse setsid.\n",
         )
         .unwrap();
         fs::write(
@@ -1006,6 +1006,11 @@ mod tests {
         assert!(names.contains(&"customize-mu"));
         assert!(names.contains(&"exa-search"));
         assert!(names.contains(&"subagent"));
+
+        let background = fs::read_to_string(builtins.join("background-task.md")).unwrap();
+        assert!(background.contains("setsid your-command"));
+        assert!(!background.contains("setsid -f your-command"));
+        assert!(!background.contains("systemd-run"));
         fs::remove_dir_all(root).unwrap();
     }
 

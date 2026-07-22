@@ -1,6 +1,4 @@
 use std::io::Write;
-use std::os::fd::AsRawFd;
-use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
 use std::os::unix::process::ExitStatusExt;
 use std::path::Path;
@@ -16,7 +14,7 @@ use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 use tokio::task::JoinHandle;
 
-use crate::artifact::{ARTIFACT_FD, ARTIFACT_FD_ENV, read_artifacts};
+use crate::artifact::{ARTIFACT_DIR_ENV, ArtifactDirectory};
 use crate::config::Config;
 use crate::config::EnvMap;
 use crate::provider::ToolArtifact;
@@ -304,9 +302,7 @@ fn run_bash_inner(
         args.command
     );
 
-    let (artifact_reader, artifact_writer) =
-        UnixStream::pair().context("creating Mu artifact channel")?;
-    let artifact_writer_fd = artifact_writer.as_raw_fd();
+    let artifact_dir = ArtifactDirectory::create()?;
 
     let mut command = Command::new("bash");
     command
@@ -314,7 +310,7 @@ fn run_bash_inner(
         .arg(command_text)
         .current_dir(&cwd)
         .envs(env)
-        .env(ARTIFACT_FD_ENV, ARTIFACT_FD.to_string())
+        .env(ARTIFACT_DIR_ENV, artifact_dir.path())
         .env(SUBAGENT_DEPTH_ENV, next_subagent_depth_env())
         .stdin(if args.stdin.is_some() {
             Stdio::piped()
@@ -324,7 +320,6 @@ fn run_bash_inner(
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
     configure_process_group(&mut command);
-    configure_artifact_fd(&mut command, artifact_writer_fd);
 
     let mut child = command.spawn().map_err(|error| {
         if is_e2big(&error) {
@@ -333,8 +328,6 @@ fn run_bash_inner(
             anyhow::anyhow!(error).context("spawning bash")
         }
     })?;
-    drop(artifact_writer);
-    let artifact_task = std::thread::spawn(move || read_artifacts(artifact_reader));
     let child_id = child.id();
     let _active = ActiveProcessGroup::new(child_id);
 
@@ -450,9 +443,7 @@ fn run_bash_inner(
 
     let status = status.unwrap_or_else(|| child.wait().expect("bash status"));
     flush_redactor(target, &mut output, redactor)?;
-    let artifacts = artifact_task
-        .join()
-        .map_err(|_| anyhow::anyhow!("Mu artifact reader panicked"))??;
+    let artifacts = artifact_dir.read()?;
     if let Some(error) = terminal_error {
         return Err(error);
     }
@@ -630,20 +621,6 @@ fn configure_process_group(command: &mut Command) {
     }
 }
 
-fn configure_artifact_fd(command: &mut Command, source_fd: i32) {
-    unsafe {
-        command.pre_exec(move || {
-            if libc::dup2(source_fd, ARTIFACT_FD) < 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            if libc::fcntl(ARTIFACT_FD, libc::F_SETFD, 0) < 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            Ok(())
-        });
-    }
-}
-
 fn terminate_child_group(child_id: u32, child: &mut std::process::Child) {
     let pgid = -(child_id as i32);
     unsafe {
@@ -802,10 +779,10 @@ mod tests {
     }
 
     #[test]
-    fn bash_collects_framed_image_artifacts_separately_from_stdout() {
+    fn bash_collects_file_image_artifacts_separately_from_stdout() {
         let mut renderer = Renderer::new();
         let command = r#"python - <<'PY'
-import json, os, struct
+import json, os, pathlib, struct
 data = b'\x89PNG\r\n\x1a\nrest'
 header = json.dumps({
     'version': 1,
@@ -815,8 +792,8 @@ header = json.dumps({
     'detail': 'high',
     'byte_length': len(data),
 }, separators=(',', ':')).encode()
-fd = int(os.environ['MU_ARTIFACT_FD'])
-os.write(fd, struct.pack('>I', len(header)) + header + struct.pack('>Q', len(data)) + data)
+path = pathlib.Path(os.environ['MU_ARTIFACT_DIR']) / '00000000.artifact'
+path.write_bytes(struct.pack('>I', len(header)) + header + struct.pack('>Q', len(data)) + data)
 print('visible')
 PY"#;
         let result = run_bash(
@@ -871,6 +848,71 @@ PY"#;
         assert!(!result.output.contains("tiny"));
 
         let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn redirected_setsid_command_detaches_with_pid_as_sid() {
+        let log = std::env::temp_dir().join(format!("mu-bg-test-{}", uuid::Uuid::new_v4()));
+        let command = format!(
+            "setsid sleep 10 </dev/null >{} 2>&1 & pid=$!; sleep 0.05; sid=$(ps -o sid= -p \"$pid\"); printf '%s %s' \"$pid\" \"$sid\"",
+            log.display()
+        );
+        let mut renderer = Renderer::new();
+        let started = std::time::Instant::now();
+        let result = run_bash(
+            args(&command),
+            5,
+            &mut renderer,
+            &empty_env(),
+            SecretRedactor::default(),
+        )
+        .unwrap();
+        let ids = result
+            .output
+            .split_whitespace()
+            .map(|value| value.parse::<i32>().unwrap())
+            .collect::<Vec<_>>();
+        if let Some(pid) = ids.first() {
+            unsafe {
+                libc::kill(-pid, libc::SIGKILL);
+            }
+        }
+        let _ = std::fs::remove_file(log);
+
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+        assert_eq!(ids.len(), 2);
+        assert_eq!(ids[0], ids[1]);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn redirected_setsid_command_can_read_tool_stdin() {
+        let output = std::env::temp_dir().join(format!("mu-bg-stdin-{}", uuid::Uuid::new_v4()));
+        let command = format!(
+            "setsid sh -c 'cat >\"$1\"' sh {} <&0 >/dev/null 2>&1 &",
+            output.display()
+        );
+        let mut input = args(&command);
+        input.stdin = Some("delegated prompt\n".into());
+        let mut renderer = Renderer::new();
+        run_bash(
+            input,
+            5,
+            &mut renderer,
+            &empty_env(),
+            SecretRedactor::default(),
+        )
+        .unwrap();
+
+        let contents = (0..40).find_map(|_| {
+            std::fs::read_to_string(&output).ok().or_else(|| {
+                std::thread::sleep(std::time::Duration::from_millis(25));
+                None
+            })
+        });
+        let _ = std::fs::remove_file(output);
+        assert_eq!(contents.as_deref(), Some("delegated prompt\n"));
     }
 
     #[test]

@@ -1,62 +1,39 @@
 ---
 name: background-task
-description: Start and stop long-running background services with systemd-run.
+description: Start, inspect, and stop a long-running command outside one bash call.
 ---
 
-Use this when a long-running service must survive a normal `bash` tool call so
-later foreground commands can test or inspect it, e.g., launching a dev server.
-
-Normal `bash` commands are run in an isolated process group. On timeout,
-interrupt, or main process exit, `mu` sends SIGTERM and then SIGKILL to that
-group, so `server &` does not reliably keep a service alive.
-
-Prefer a transient user service over `setsid` or other hacks:
+Use this when a command must keep running after its launching `bash` call returns.
 
 ```bash
-id="mu-bg-$(date +%s)-$RANDOM"
-unit="$id.service"
-log="${TMPDIR:-/tmp}/$id.log"
-: > "$log"
-chmod 600 "$log"
-
-systemd-run \
-  --unit="$unit" \
-  --property=Type=exec \
-  --property=KillMode=control-group \
-  --property=Restart=no \
-  --property=StandardOutput=append:"$log" \
-  --property=StandardError=append:"$log" \
-  --property=WorkingDirectory="$(pwd)" \
-  --expand-environment=no \
-  -E MU_SUBAGENT_DEPTH="${MU_SUBAGENT_DEPTH:-0}" \
-  bash -lc 'exec your-server-command-here'
-
-invocation_id=$(systemctl show "$unit" -P InvocationID 2>/dev/null || true)
-printf 'unit=%s\ninvocation_id=%s\nlog=%s\n' "$unit" "$invocation_id" "$log"
+log=$(mktemp "${TMPDIR:-/tmp}/mu-bg.XXXXXX")
+setsid your-command </dev/null >"$log" 2>&1 & sid=$!
+printf 'sid=%s start=%s log=%s\n' "$sid" "$(LC_ALL=C ps -o lstart= -p "$sid")" "$log"
 ```
 
-Run the service command in the foreground inside the unit. Do not append `&`.
-The `MU_SUBAGENT_DEPTH` variable prevents infinite recursion of delegation when
-running `mu` subagents. It is auto managed by `mu` in direct invocation but will
-be cleared by systemd unless we pass it explicitly as in the example.
+Use plain `setsid`, never `setsid -f`: under Mu's non-interactive bash, `$!`
+then remains the command's PID, process-group ID, and session ID. Keep the
+command in the foreground of that session; it must not daemonize or call
+`setsid` itself. CWD and environment are inherited normally.
 
-If the runtime user is not `root`, add `--user`.
-
-Read logs through a normal foreground `bash` command such as:
+An empty start time means launch was not confirmed. Later, inspect the recorded
+SID immediately before acting and manually verify that PID equals SID, start
+time matches, and the command is expected:
 
 ```bash
-tail -n 200 "$log"
+LC_ALL=C ps -o pid=,sid=,lstart=,command= -p 12345
+tail -n 200 /tmp/mu-bg.ABCDEF
 ```
 
-Stop the service:
+Stop every process still in the verified session with `pkill -TERM -s 12345`;
+inspect again before escalating to `pkill -KILL -s 12345`. Remove the log when
+it is no longer needed.
 
-```bash
-actual=$(systemctl show "$unit" -P InvocationID 2>/dev/null || true)
-if [ "$actual" = "$invocation_id" ]; then
-  systemctl stop "$unit"
-else
-  echo "service already disappeared"
-fi
-```
+Redirect all three standard streams as shown. For fixed launch input, replace
+`/dev/null` with an input file. This method reports running or gone, but cannot
+recover the command's exit status. Background commands cannot return tool
+artifacts; save ordinary files and inspect them in a later foreground call.
 
-You should always cleanup services when no longer needed. They are not automatically killed by `mu`.
+This recipe requires a compatible `setsid` executable (normally util-linux on
+Linux). If it is unavailable, report that background launch is unsupported
+instead of improvising another process manager.

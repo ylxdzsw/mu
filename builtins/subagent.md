@@ -63,10 +63,20 @@ The parent should check the child exit status before trusting the answer.
 
 ## Asynchronous Delegation
 
-Use `--output detail` for async delegation so the child writes a readable
-transcript while working. Do not use `cmd &` inside a normal bash tool call;
-ordinary bash children are cleaned up with the tool process group. Use
-background-task skill instead.
+Async delegation is a background task whose command is `mu --output final`.
+Pass the prompt through the bash tool's `stdin` field and launch it with:
+
+```bash
+log=$(mktemp "${TMPDIR:-/tmp}/mu-bg.XXXXXX")
+setsid mu --output final <&0 >"$log" 2>&1 & sid=$!
+printf 'sid=%s start=%s log=%s\n' "$sid" "$(LC_ALL=C ps -o lstart= -p "$sid")" "$log"
+```
+
+The explicit `<&0` gives the background command the tool-provided stdin. Use
+the `background-task` skill to inspect or stop it, then read the log after it
+disappears. This is one-shot delegation: its exit status and Mu session id are
+not retained. Files needed by the parent must be saved at reported paths and
+inspected from a later foreground call.
 
 ## Parent Responsibilities
 
