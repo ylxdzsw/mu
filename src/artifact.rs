@@ -1,8 +1,7 @@
-use std::fs::File;
+use std::fs::{File, OpenOptions};
 use std::io::{ErrorKind, Read, Write};
-use std::os::fd::{FromRawFd, RawFd};
 use std::path::Path;
-use std::str::FromStr;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -10,10 +9,10 @@ use serde::{Deserialize, Serialize};
 use crate::attachment::{MAX_ATTACHMENT_BYTES, attachment_media_type};
 use crate::provider::{Attachment, ImageDetail, ToolArtifact};
 
-pub const ARTIFACT_FD_ENV: &str = "MU_ARTIFACT_FD";
-pub const ARTIFACT_FD: RawFd = 3;
+pub const ARTIFACT_DIR_ENV: &str = "MU_ARTIFACT_DIR";
 pub const MAX_TOOL_ARTIFACTS: usize = 8;
 const MAX_HEADER_BYTES: usize = 16 * 1024;
+const COMMITTED_EXTENSION: &str = "artifact";
 
 #[derive(Debug, Serialize, Deserialize)]
 struct ImageArtifactHeader {
@@ -26,14 +25,37 @@ struct ImageArtifactHeader {
 }
 
 pub fn write_image_artifact(attachment: &Attachment, detail: ImageDetail) -> Result<()> {
-    let fd = std::env::var(ARTIFACT_FD_ENV)
+    let dir = std::env::var_os(ARTIFACT_DIR_ENV)
         .with_context(|| "view_image must run inside a Mu bash tool call")?;
-    let fd = RawFd::from_str(&fd).context("invalid Mu artifact file descriptor")?;
-    if fd < 0 {
-        bail!("invalid Mu artifact file descriptor");
+    let dir = crate::windows_msys2::native_env_path(&dir);
+    let order = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let stem = format!(
+        "{order:039}-{:010}-{}",
+        std::process::id(),
+        uuid::Uuid::new_v4()
+    );
+    let temporary = dir.join(format!("{stem}.tmp"));
+    let committed = dir.join(format!("{stem}.{COMMITTED_EXTENSION}"));
+    let result = (|| -> Result<()> {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)
+            .with_context(|| format!("creating artifact spool file {}", temporary.display()))?;
+        write_image_record(&mut file, attachment, detail)?;
+        file.sync_all()?;
+        drop(file);
+        std::fs::rename(&temporary, &committed)
+            .with_context(|| format!("committing artifact {}", committed.display()))?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(temporary);
     }
-    let mut file = unsafe { File::from_raw_fd(fd) };
-    write_image_record(&mut file, attachment, detail)
+    result
 }
 
 fn write_image_record(
@@ -59,18 +81,35 @@ fn write_image_record(
     Ok(())
 }
 
-pub fn read_artifacts(mut reader: impl Read) -> Result<Vec<ToolArtifact>> {
+pub fn read_artifacts(dir: &Path) -> Result<Vec<ToolArtifact>> {
+    let mut files = std::fs::read_dir(dir)
+        .with_context(|| format!("reading artifact spool {}", dir.display()))?
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.extension()
+                .is_some_and(|ext| ext == COMMITTED_EXTENSION)
+        })
+        .collect::<Vec<_>>();
+    files.sort();
     let mut artifacts = Vec::new();
-    loop {
-        let mut header_len = [0u8; 4];
-        match reader.read(&mut header_len[..1]) {
-            Ok(0) => break,
-            Ok(_) => reader.read_exact(&mut header_len[1..])?,
-            Err(error) if error.kind() == ErrorKind::Interrupted => continue,
-            Err(error) => return Err(error.into()),
-        }
+    for path in files {
         if artifacts.len() >= MAX_TOOL_ARTIFACTS {
             bail!("bash emitted more than {MAX_TOOL_ARTIFACTS} artifacts");
+        }
+        let mut reader = File::open(&path)
+            .with_context(|| format!("opening artifact record {}", path.display()))?;
+        let mut header_len = [0u8; 4];
+        loop {
+            match reader.read(&mut header_len[..1]) {
+                Ok(0) => bail!("empty artifact record {}", path.display()),
+                Ok(_) => {
+                    reader.read_exact(&mut header_len[1..])?;
+                    break;
+                }
+                Err(error) if error.kind() == ErrorKind::Interrupted => continue,
+                Err(error) => return Err(error.into()),
+            }
         }
         let header_len = u32::from_be_bytes(header_len) as usize;
         if header_len == 0 || header_len > MAX_HEADER_BYTES {
@@ -112,6 +151,10 @@ pub fn read_artifacts(mut reader: impl Read) -> Result<Vec<ToolArtifact>> {
             },
             detail: header.detail,
         });
+        let mut trailing = [0u8; 1];
+        if reader.read(&mut trailing)? != 0 {
+            bail!("trailing bytes in artifact record {}", path.display());
+        }
     }
     Ok(artifacts)
 }
@@ -127,11 +170,16 @@ mod tests {
             media_type: "image/png".into(),
             data: b"\x89PNG\r\n\x1a\nrest".to_vec(),
         };
-        let mut bytes = Vec::new();
-        write_image_record(&mut bytes, &attachment, ImageDetail::High).unwrap();
-        let artifacts = read_artifacts(bytes.as_slice()).unwrap();
+        let dir = std::env::temp_dir().join(format!("mu-artifacts-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("0001.artifact");
+        let mut file = File::create(path).unwrap();
+        write_image_record(&mut file, &attachment, ImageDetail::High).unwrap();
+        drop(file);
+        let artifacts = read_artifacts(&dir).unwrap();
         assert_eq!(artifacts.len(), 1);
         assert_eq!(artifacts[0].attachment, attachment);
         assert_eq!(artifacts[0].detail, ImageDetail::High);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

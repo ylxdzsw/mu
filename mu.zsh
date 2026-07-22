@@ -320,6 +320,11 @@ _mu_zsh_status_json() {
   "${command[@]}" 2>/dev/null
 }
 
+_mu_zsh_normalize_native_output_reply() {
+  REPLY=${1//$'\r\n'/$'\n'}
+  REPLY=${REPLY%$'\r'}
+}
+
 _mu_zsh_json_value_reply() {
   local json=$1
   local filter=$2
@@ -327,6 +332,8 @@ _mu_zsh_json_value_reply() {
 
   command -v jq >/dev/null 2>&1 || return 1
   value=$(jq -r "$filter" <<< "$json" 2>/dev/null) || return 1
+  _mu_zsh_normalize_native_output_reply "$value"
+  value=$REPLY
   [[ -n "$value" && "$value" != null ]] || return 1
   REPLY=$value
 }
@@ -344,6 +351,8 @@ _mu_zsh_build_mode_prompt() {
   status_json=$(_mu_zsh_status_json) || status_json=
   if [[ -n "$status_json" ]] && command -v jq >/dev/null 2>&1; then
     tsv=$(jq -r '[(.model.canonical // ""), (.context_percent // ""), (.project_root // ""), (if has("clean") then (.clean|tostring) else "" end)] | @tsv' <<< "$status_json" 2>/dev/null) || tsv=
+    _mu_zsh_normalize_native_output_reply "$tsv"
+    tsv=$REPLY
   fi
   fields=("${(@ps:\t:)tsv}")
   model=${fields[1]:-}
@@ -478,10 +487,13 @@ _mu_zsh_slash_command_candidates() {
 }
 
 _mu_zsh_custom_slash_commands() {
-  local json
+  local json commands
   json=$(_mu_zsh_status_json --include-commands) || return 1
   command -v jq >/dev/null 2>&1 || return 1
-  jq -r '.commands[]?.name | "/" + .' <<< "$json"
+  commands=$(jq -r '.commands[]?.name | "/" + .' <<< "$json") || return 1
+  _mu_zsh_normalize_native_output_reply "$commands"
+  commands=$REPLY
+  print -r -- "$commands"
 }
 
 _mu_zsh_has_custom_slash_command() {
@@ -494,15 +506,18 @@ _mu_zsh_has_custom_slash_command() {
 }
 
 _mu_zsh_model_records() {
-  local json
+  local json records
   json=$(_mu_zsh_status_json --include-models) || return 1
   command -v jq >/dev/null 2>&1 || return 1
-  jq -r '
+  records=$(jq -r '
     .available_models.providers[]? as $provider
     | $provider.models[]?
     | [(.id // ""), (.model_id // ""), ((.supported_efforts // []) | join(","))]
     | @tsv
-  ' <<< "$json"
+  ' <<< "$json") || return 1
+  _mu_zsh_normalize_native_output_reply "$records"
+  records=$REPLY
+  print -r -- "$records"
 }
 
 # Count how many providers expose each bare model_id, so a model_id that is

@@ -1149,7 +1149,8 @@ MU_TEST_EMPTY=
             "MU_TEST_EXPORTED",
             "MU_TEST_EMPTY",
         ];
-        let output = std::process::Command::new("bash")
+        let shell_path = crate::windows_msys2::shell_path(&path).unwrap();
+        let output = std::process::Command::new(crate::windows_msys2::bash_program().unwrap())
             .args([
                 "--noprofile",
                 "--norc",
@@ -1157,7 +1158,7 @@ MU_TEST_EMPTY=
                 "set -a\n. \"$1\"\nprintf '%s\\0' \"$MU_TEST_BARE\" \"$MU_TEST_SINGLE\" \"$MU_TEST_DOUBLE\" \"$MU_TEST_EXPORTED\" \"$MU_TEST_EMPTY\"",
                 "bash",
             ])
-            .arg(&path)
+            .arg(shell_path)
             .output()
             .unwrap();
         assert!(

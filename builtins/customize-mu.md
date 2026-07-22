@@ -23,7 +23,7 @@ Then read the relevant files from the active scopes:
 - Global config directory: `~/.mu`, or `$MU_CONFIG_DIR` when set.
 - Project config directory: `<project>/.mu` when the current directory resolves
   to a project.
-- Built-ins: `/usr/share/mu`.
+- Built-ins: `/ucrt64/share/mu`.
 
 `mu` discovers a project by walking upward from the invoking `pwd` until it
 finds `.mu` or `.git`. The walk stops before the user's home directory and

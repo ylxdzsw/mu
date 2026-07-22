@@ -122,13 +122,14 @@ pub fn global_dir() -> PathBuf {
 }
 
 pub fn builtins_dir() -> PathBuf {
-    PathBuf::from("/usr/share/mu")
+    crate::windows_msys2::builtins_dir()
 }
 
 fn dirs_home() -> PathBuf {
-    std::env::var("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("/tmp"))
+    std::env::var_os("HOME")
+        .map(|path| crate::windows_msys2::native_env_path(&path))
+        .or_else(|| std::env::var_os("USERPROFILE").map(PathBuf::from))
+        .unwrap_or_else(std::env::temp_dir)
 }
 
 pub fn ensure_dir(path: &std::path::Path) -> Result<()> {
@@ -255,7 +256,7 @@ fn absolutize(base: &Path, path: &Path) -> PathBuf {
     } else {
         base.join(path)
     };
-    absolute.canonicalize().unwrap_or(absolute)
+    crate::windows_msys2::canonical_path(&absolute).unwrap_or(absolute)
 }
 
 #[cfg(test)]

@@ -22,12 +22,12 @@ bash({
   title: "Delegate SPEC staleness review to subagent",
   risk: "readonly",
   command: "mu --output final",
-  cwd: "/root/mu",
+  cwd: "/c/path/to/mu",
   timeout: 600,
   stdin: `You are a focused mu subagent.
 
 Task: Review SPEC.md for stale claims about the current CLI.
-Scope: readonly. Inspect /root/mu only.
+Scope: readonly. Inspect /c/path/to/mu only.
 Do not delegate further.
 Fail fast if blocked or uncertain; report the blocker instead of broadening scope.
 
@@ -44,7 +44,7 @@ bash({
   title: "Run readwrite subagent",
   risk: "reversible",
   command: "mu --output final",
-  cwd: "/root/mu",
+  cwd: "/c/path/to/mu",
   timeout: 600,
   stdin: `You are a focused mu subagent.
 
@@ -61,12 +61,16 @@ Return:
 
 The parent should check the child exit status before trusting the answer.
 
-## Asynchronous Delegation
+## Long-Running Delegation
 
-Use `--output detail` for async delegation so the child writes a readable
-transcript while working. Do not use `cmd &` inside a normal bash tool call;
-ordinary bash children are cleaned up with the tool process group. Use
-background-task skill instead.
+Delegation is synchronous on this Windows branch. Increase the bash timeout and
+wait for the child to finish. Do not use `cmd &` inside a normal bash tool call:
+ordinary bash children remain in Mu's Windows Job Object and are cleaned up
+when the call ends.
+
+Mu deliberately does not provide an escape hatch for persistent background
+processes. If a service must outlive a tool call, ask the user to start and own
+it outside Mu, then interact with it from foreground calls.
 
 ## Parent Responsibilities
 

@@ -1,12 +1,14 @@
 # mu
 
 `mu` is a small, composable agent for the terminal: one prompt in, one
-completed agent turn out. It works equally well as a Unix command in scripts or
-as an interactive assistant inside zsh.
+completed agent turn out. This branch is the native Windows port for the MSYS2
+UCRT64 environment; it works equally well in shell scripts or as an interactive
+assistant inside zsh. See [WINDOWS.md](WINDOWS.md) for its platform and
+maintenance contract.
 
 ## Quick start
 
-Build the binary and put it on `PATH`:
+From an MSYS2 UCRT64 shell, build the binary and put it on `PATH`:
 
 ```sh
 cargo build --release
@@ -30,7 +32,10 @@ Continue the latest session for another turn:
 mu -c <<< 'Now identify the riskiest change.'
 ```
 
-`mu` targets Unix-like systems and expects `bash` on `PATH`.
+This branch requires `MSYSTEM=UCRT64`, with MSYS2 `bash`, `cygpath`, SQLite,
+zsh, jq, ripgrep, Python, and curl installed. The package recipe installs these
+runtime dependencies. The branch intentionally does not compile on Unix or
+support other Windows shells and MSYS2 environments.
 
 ## Interactive zsh usage
 
@@ -39,7 +44,7 @@ included plugin from `.zshrc`:
 
 ```zsh
 source /path/to/mu/mu.zsh
-# Arch package: source /usr/share/zsh/plugins/mu/mu.zsh
+# UCRT64 package: source /ucrt64/share/zsh/plugins/mu/mu.zsh
 ```
 
 At an empty shell prompt, press **Tab** to enter `mu>` mode, type a request, and
@@ -217,21 +222,22 @@ sequential and ANSI-free.
 Packaged installations also expose three Mu-owned commands inside agent `bash`
 calls: `apply_patch` for structured text edits, `edit` for exact text
 replacement, and `view_image` for loading a local image into the model's tool
-result. They are private symlinks under `/usr/libexec/mu`, all backed by the
-same `mu` executable. For a source-tree build, create equivalent sibling
-symlinks if you want to exercise the applets directly:
+result. They are private `.exe` hardlinks under `/ucrt64/libexec/mu`, all backed
+by the same `mu.exe`. For a source-tree build, create equivalent sibling
+hardlinks if you want to exercise the applets directly:
 
 ```sh
-ln -sf mu target/release/apply_patch
-ln -sf mu target/release/edit
-ln -sf mu target/release/view_image
+ln target/release/mu.exe target/release/apply_patch.exe
+ln target/release/mu.exe target/release/edit.exe
+ln target/release/mu.exe target/release/view_image.exe
 ```
 
 ## Reference
 
 See [SPEC.md](SPEC.md) for the complete product contract, including exact CLI,
 configuration, discovery, rendering, persistence, provider, and zsh behavior.
-Arch Linux packaging for this checkout is in [PKGBUILD](PKGBUILD).
+Windows-port decisions are recorded in [WINDOWS.md](WINDOWS.md), and the MSYS2
+UCRT64 package recipe is in [packaging/msys2/PKGBUILD](packaging/msys2/PKGBUILD).
 
 ## License
 

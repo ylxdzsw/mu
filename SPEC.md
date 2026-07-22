@@ -32,10 +32,10 @@ or config schema), it is spelled out concretely.
   command suite available inside it. A flat config directory. A
   SQLite file for state in the active scope. The core binary itself has no
   interactive input handling.
-- **Unix-like terminal native.** `mu` runs as an ordinary foreground process in
-  a Unix-like shell environment. Completion, history, job control, aliases, and
-  interactive programs remain owned by the user's shell because `mu` never
-  replaces it.
+- **MSYS2 terminal native.** `mu.exe` runs as an ordinary foreground native
+  Windows process from an MSYS2 UCRT64 shell. Completion, history, job control,
+  aliases, and interactive programs remain owned by Bash or zsh because `mu`
+  never replaces the shell.
 - **Day-to-day general purpose.** Coding is supported but not the focus. The
   agent is a general terminal assistant.
 
@@ -56,8 +56,9 @@ or config schema), it is spelled out concretely.
 - **No core shell emulation.** The core `mu` binary does not ship shell behavior,
   raw terminal editing, completion, or prompt rendering. The zsh plugin is a
   thin shell surface that owns zsh line editing and calls `mu` for each turn.
-- **No Windows support.** `mu` is Unix-ish-only. It expects Unix process
-  semantics, `bash -lc`, signals, process groups, and advisory file locks.
+- **No Unix or generic-Windows support.** This branch targets only native
+  Windows in MSYS2 UCRT64. It does not support Unix builds, PowerShell,
+  `cmd.exe`, Git Bash, Cygwin, WSL, or other MSYS2 environments.
 
 ---
 
@@ -74,8 +75,9 @@ is unacceptable here.
 Rationale:
 
 - Cold start in single-digit milliseconds. No runtime bootstrap, no JIT warmup.
-- One physical binary to install and update. Private `apply_patch`, `edit`, and
-  `view_image` symlinks dispatch back into it by `argv[0]`.
+- One physical binary to install and update. Private `apply_patch.exe`,
+  `edit.exe`, and `view_image.exe` hardlinks dispatch back into it by the file
+  stem of `argv[0]`.
 - Mature ecosystem for everything needed: async runtime (`tokio`), HTTP/SSE
   (`reqwest`), SQLite (`rusqlite`), JSONC/serde.
 - Because the shell owns line editing, `mu` needs **no** terminal/line-editor
@@ -113,7 +115,8 @@ Consequences:
 - `mu` remains scriptable and stateless on exit.
 - The zsh plugin never duplicates provider, tool, store, or agent-loop
   semantics.
-- Ctrl-C and terminal behavior remain ordinary Unix process behavior.
+- Ctrl-C is received through the Windows console-control handler and propagated
+  to every active Bash Job Object.
 
 ### 2.4 Minimal fixed toolset
 
@@ -127,7 +130,7 @@ advisory UI/audit metadata only; it is not a sandbox or approval proof.
 Skill metadata (name + description + path) is injected into the system prompt.
 The agent loads a skill file on demand using `bash` (`sed`, `cat`, `rg`, etc.).
 No dedicated "skill" tool — this keeps the model-visible surface at one tool
-and makes skills "just files". Built-in skills live in `/usr/share/mu` at the
+and makes skills "just files". Built-in skills live in `/ucrt64/share/mu` at the
 lowest precedence; shipped built-ins may include
 self-customization guidance such as `customize-mu` or delegation guidance such
 as `subagent`, but user and project instructions can shadow them by name.
@@ -357,11 +360,11 @@ double-count). For the `in`/`out` token display, sum `prompt_tokens` and
 cache reads and writes from `in`, and display those cache figures separately.
 
 **Interruption.** Steps 9d/9e persist only *after* a message is fully formed. If
-SIGINT / a dropped connection / a provider error occurs mid-stream, the partial
+Ctrl-C / a dropped connection / a provider error occurs mid-stream, the partial
 assistant message is never written; the DB holds only completed messages (§11).
 No tool call begins without first persisting its parent assistant message, and a
 result is persisted for every call that begins execution. Once tool execution
-has started, interrupts fan out to every active tool process group, stop
+has started, interrupts fan out to every active tool Job Object, stop
 launching new tools, drain partial output, and still persist tool results in
 request order, so Ctrl-C stops work without making already-produced tool output
 disappear. Nothing else is written on interruption: the process just exits. Any
@@ -385,10 +388,10 @@ bash({
 })
 ```
 
-`bash` prepends `/usr/libexec/mu` to its post-login `PATH`. That directory owns
-three private symlinks to the physical `/usr/bin/mu` binary. Before normal CLI
-parsing or async-runtime startup, `mu` checks the basename of `argv[0]` and
-dispatches these applets:
+`bash` prepends `/ucrt64/libexec/mu` to its post-login `PATH`. That directory
+owns three private hardlinks to the physical `/ucrt64/bin/mu.exe` binary.
+Before normal CLI parsing or async-runtime startup, `mu` checks the file stem of
+`argv[0]` and dispatches these applets:
 
 - **`apply_patch`** accepts one patch argument or reads it from stdin. Its
   `*** Begin Patch` / `*** End Patch` format supports add, update, move, and
@@ -398,7 +401,9 @@ dispatches these applets:
   destinations, then applies validated file changes. Updating through a
   symlink edits its regular-file target while preserving the link; deleting a
   symlink removes only the link; moving a symlink renames the link. Dangling
-  links can therefore be deleted or moved but cannot be updated.
+  links can therefore be deleted or moved but cannot be updated. Native Windows
+  symlinks are supported; MSYS2 emulated symlink files are rejected with an
+  instruction to enable native symlinks.
 - **`edit [--relaxed] [--all] FILE`** reads one or more replacement blocks from
   stdin. Each block has marker-only framing lines and this shape:
   ```text
@@ -437,13 +442,14 @@ dispatches these applets:
 - **`view_image [--detail auto|low|high|original] PATH`** loads a validated PNG,
   JPEG, WebP, or GIF through the same attachment loader and 20 MiB limit used by
   `mu -a`. `--detail` is optional and defaults to `auto`. The command writes a
-  text summary normally and sends image bytes over a dedicated inherited
-  artifact descriptor; it fails when invoked without Mu's artifact channel.
+  text summary normally and commits image bytes to the private per-call
+  artifact spool; it fails when invoked without Mu's artifact channel.
 
 These are ordinary commands called through `bash`, not additional model-visible
-function tools. The artifact channel is versioned and length-framed, is drained
-concurrently with stdout, and is scoped to one bash call. A call may emit at
-most eight images. Tool-image metadata and SHA-256-deduplicated bytes persist
+function tools. The artifact channel is versioned and length-framed, uses
+atomically committed files in a private per-call temporary directory, and is
+scoped to one bash call. Partial records are ignored and cleaned up. A call may
+emit at most eight images. Tool-image metadata and SHA-256-deduplicated bytes persist
 with the tool message. Responses adapters serialize images in the native
 `function_call_output`; Chat Completions adapters retain the tool text and add a
 labeled multimodal user-message projection on the wire only.
@@ -459,7 +465,7 @@ quotes, or heredoc delimiters without shell expansion.
 
 **Execution ordering.** Human-facing output may execute maximal contiguous
 batches of `risk:"readonly"` `bash` calls concurrently because each
-call runs in its own process group with isolated `cwd`, environment, timeout,
+call runs in its own Windows Job Object with isolated `cwd`, environment, timeout,
 and stdin. This is an execution optimization only: stored tool-call records,
 stored tool messages, and the next model request still see the original
 assistant tool-call order.
@@ -507,12 +513,14 @@ All local search, file reads, writes, edits, tests, and web fetches go through
 `sed`, `python - <<'PY'` only when appropriate, `curl`, `git diff`, etc.) and use
 literal `stdin` for content that should not be interpreted by the shell.
 
-**Process lifecycle.** Each call spawns one child process. On Unix it is placed
-in its own process group before `exec`, and on Linux `PR_SET_PDEATHSIG` asks the
-kernel to send SIGTERM if `mu` dies. On timeout or interrupt, `mu` sends SIGTERM
-to the process group, waits a short grace period, then sends SIGKILL; if group
-signaling fails it falls back to killing the direct child. Ordinary commands are
-expected not to outlive the tool call.
+**Process lifecycle.** Each call creates a Windows Job Object configured with
+`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`, starts Bash suspended, assigns it to the
+job, then resumes its primary thread. Bash uses a new Windows process group so
+Mu, rather than both Mu and Bash, owns Ctrl-C handling. This prevents Bash from
+creating an untracked descendant before assignment. On timeout or interrupt, `mu`
+terminates the job immediately; closing the job also removes descendants if
+`mu.exe` exits unexpectedly. Ordinary commands are expected not to outlive the
+tool call.
 
 For recursive `mu` delegation, the bash tool sets `MU_SUBAGENT_DEPTH` to one
 more than the current process depth. Normal management commands still work at
@@ -521,8 +529,8 @@ reports depth greater than `1`.
 
 `timeout` defaults to 120 seconds and must be greater than zero. `mu` does not
 pre-check command argv size; if `bash -lc <command>` fails with OS
-argument-list-too-long (`E2BIG`), the tool returns a clear error. `mu` does not
-fall back to temp scripts.
+command-line-too-long, the tool returns a clear error. `mu` does not fall back
+to temp scripts.
 
 ---
 
@@ -766,8 +774,8 @@ Consequences:
   directly.
 - Ctrl-C while editing in `mu>` mode cancels the current draft, leaves that
   prompt line visible in scrollback, and redraws `mu>` like a shell prompt
-  interrupt. Ctrl-C while a foreground `mu` turn is running uses ordinary Unix
-  signal behavior for the foreground process.
+  interrupt. Ctrl-C while a foreground `mu` turn is running is handled by
+  `mu.exe`, which cancels provider work and terminates active Bash jobs.
 - After each turn exits, zsh returns to `mu>` mode with the same session id.
 
 ### 6.2 Entry and exit
@@ -1148,13 +1156,13 @@ The assembled prompt has this fixed order:
 2. A `<runtime>` block of host-stable facts only, as plain `key: value` lines:
    ```
    <runtime>
-   os: linux (Ubuntu 24.04.2 LTS)
+   os: windows (MSYS2 UCRT64)
    date: 2026-06-18
-   user: alice (uid 1000)
+   user: alice
    </runtime>
    ```
-   On Linux, Mu appends the distribution's `PRETTY_NAME` from the standard
-   `os-release` file when available, falling back to `NAME`, then `ID`.
+   Windows has no Unix UID in this contract, so Mu records the Windows username
+   without inventing a numeric identity.
    Per-session environment — current working directory, project root, session
    id, and git worktree details — is **not** part of the system prompt. It is
    introduced once as the first user message when the session is created, and a
@@ -1469,8 +1477,8 @@ and re-prompt.
 
 **Exit codes.** `0` success; `1` general/config/provider error; `2` session busy
 (lock held) or `--session` not found; `128 + signal` when a forwarded
-terminating signal ends the turn — most commonly `130` for SIGINT (the shell's
-default for Ctrl-C), and `143` for SIGTERM. A signalled exit takes precedence
+terminating console event ends the turn — most commonly `130` for Ctrl-C, and
+`143` for console termination. An interrupted exit takes precedence
 over the generic error code even when the interruption first surfaces as a turn
 error. When enabled by the output density, the summary line is printed only on
 exit `0`.
@@ -1505,7 +1513,7 @@ The protections that remain are cheap and non-intrusive:
   SQLite history provide the audit trail.
 - **Interruptibility.** Because `mu` runs as a foreground job, Ctrl-C is the
   practical "stop" button: it stops launching new work, interrupts every active
-  tool process group, drains visible output where possible, persists completed
+  tool Job Object, drains visible output where possible, persists completed
   messages/tool results, and exits non-zero.
 - **Secrets** are never persisted by `mu`; provider keys come from the
   environment or `config.jsonc`, never the database.

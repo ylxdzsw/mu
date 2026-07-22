@@ -1,0 +1,97 @@
+_realname=mu
+pkgbase=mingw-w64-${_realname}
+pkgname="${MINGW_PACKAGE_PREFIX}-${_realname}"
+pkgver=0.1.0
+pkgrel=1
+pkgdesc='Small composable agent runtime for the terminal (MSYS2 UCRT64)'
+arch=('any')
+mingw_arch=('ucrt64')
+url='https://github.com/ylxdzsw/mu'
+license=('MIT')
+depends=(
+  "${MINGW_PACKAGE_PREFIX}-curl"
+  "${MINGW_PACKAGE_PREFIX}-jq"
+  "${MINGW_PACKAGE_PREFIX}-python"
+  "${MINGW_PACKAGE_PREFIX}-ripgrep"
+  "${MINGW_PACKAGE_PREFIX}-sqlite3"
+  'bash'
+  'zsh'
+)
+makedepends=(
+  "${MINGW_PACKAGE_PREFIX}-pkgconf"
+  "${MINGW_PACKAGE_PREFIX}-rust"
+  'git'
+)
+_source_url="${MU_SOURCE_URL:-${url}.git}"
+_source_branch="${MU_SOURCE_BRANCH:-msys2}"
+source=("${_realname}::git+${_source_url}#branch=${_source_branch}")
+sha256sums=('SKIP')
+
+pkgver() {
+  cd "${_realname}"
+  local _ver
+  _ver="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n1)"
+  printf '%s.r%s.g%s' \
+    "${_ver}" \
+    "$(git rev-list --count HEAD)" \
+    "$(git rev-parse --short HEAD)"
+}
+
+build() {
+  cd "${_realname}"
+  export CARGO_HOME="${srcdir}/cargo-home"
+  export CARGO_TARGET_DIR="${srcdir}/target"
+  export CARGO_INCREMENTAL=0
+  cargo build --release
+}
+
+check() {
+  cd "${_realname}"
+  export CARGO_HOME="${srcdir}/cargo-home"
+  export CARGO_TARGET_DIR="${srcdir}/target"
+  cargo test -- --test-threads=1
+  zsh -n mu.zsh test.zsh
+  MU_ZSH_SKIP_PTY=1 zsh test.zsh
+
+  local release="${srcdir}/target/release"
+  ln -f "${release}/mu.exe" "${release}/apply_patch.exe"
+  ln -f "${release}/mu.exe" "${release}/edit.exe"
+  ln -f "${release}/mu.exe" "${release}/view_image.exe"
+  "${release}/mu.exe" --help >/dev/null
+
+  local smoke
+  smoke="$(mktemp -d)"
+  printf '%s\n' \
+    '*** Begin Patch' \
+    '*** Add File: smoke.txt' \
+    '+works' \
+    '*** End Patch' \
+    | (cd "${smoke}" && "${release}/apply_patch.exe")
+  grep -qx 'works' "${smoke}/smoke.txt"
+  rm -r "${smoke}"
+}
+
+package() {
+  cd "${_realname}"
+  local bindir="${pkgdir}${MINGW_PREFIX}/bin"
+  local libexecdir="${pkgdir}${MINGW_PREFIX}/libexec/mu"
+
+  install -Dm755 "${srcdir}/target/release/mu.exe" "${bindir}/mu.exe"
+  install -dm755 "${libexecdir}"
+  ln "${bindir}/mu.exe" "${libexecdir}/apply_patch.exe"
+  ln "${bindir}/mu.exe" "${libexecdir}/edit.exe"
+  ln "${bindir}/mu.exe" "${libexecdir}/view_image.exe"
+
+  install -Dm644 mu.zsh \
+    "${pkgdir}${MINGW_PREFIX}/share/zsh/plugins/mu/mu.zsh"
+  install -dm755 "${pkgdir}${MINGW_PREFIX}/share/mu"
+  cp -a builtins/. "${pkgdir}${MINGW_PREFIX}/share/mu/"
+  install -Dm644 README.md \
+    "${pkgdir}${MINGW_PREFIX}/share/doc/${_realname}/README.md"
+  install -Dm644 SPEC.md \
+    "${pkgdir}${MINGW_PREFIX}/share/doc/${_realname}/SPEC.md"
+  install -Dm644 WINDOWS.md \
+    "${pkgdir}${MINGW_PREFIX}/share/doc/${_realname}/WINDOWS.md"
+  install -Dm644 LICENSE \
+    "${pkgdir}${MINGW_PREFIX}/share/licenses/${_realname}/LICENSE"
+}

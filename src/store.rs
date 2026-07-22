@@ -1065,9 +1065,7 @@ impl Store {
             .context("opening session lock file")?;
         match file.try_lock_exclusive() {
             Ok(()) => Ok(SessionLock { _file: file }),
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                Err(anyhow::Error::new(SessionBusy))
-            }
+            Err(error) if session_lock_is_contended(&error) => Err(anyhow::Error::new(SessionBusy)),
             Err(error) => Err(error).context("acquiring session lock"),
         }
     }
@@ -1081,7 +1079,7 @@ impl Store {
         };
         match file.try_lock_exclusive() {
             Ok(()) => Ok(false),
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => Ok(true),
+            Err(error) if session_lock_is_contended(&error) => Ok(true),
             Err(error) => Err(error).context("checking session lock"),
         }
     }
@@ -1089,6 +1087,10 @@ impl Store {
     fn session_lock_path(&self, session_id: &str) -> PathBuf {
         self.lock_dir.join(format!("{session_id}.lock"))
     }
+}
+
+fn session_lock_is_contended(error: &std::io::Error) -> bool {
+    error.kind() == std::io::ErrorKind::WouldBlock || error.raw_os_error() == Some(33)
 }
 
 #[derive(Debug)]

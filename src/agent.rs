@@ -519,15 +519,14 @@ impl<'a> AgentLoop<'a> {
                         }
 
                         let batch = &tool_calls[cursor..end];
-                        for (chunk_offset, chunk) in
-                            batch.chunks(bash::MAX_ACTIVE_PROCESS_GROUPS).enumerate()
+                        for (chunk_offset, chunk) in batch.chunks(bash::MAX_ACTIVE_JOBS).enumerate()
                         {
                             self.execute_concurrent_bash_batch(
                                 msg_id,
                                 chunk,
                                 &mut context,
                                 &mut command_headers,
-                                cursor + chunk_offset * bash::MAX_ACTIVE_PROCESS_GROUPS,
+                                cursor + chunk_offset * bash::MAX_ACTIVE_JOBS,
                             )
                             .await?;
                             if bash::cancellation_requested() {

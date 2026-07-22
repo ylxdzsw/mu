@@ -356,6 +356,9 @@ quoted=$(_mu_zsh_quote_prompt $'quote " dollar $ backslash \\ newline\nnext')
 eval "roundtrip=$quoted"
 [[ "$roundtrip" == $'quote " dollar $ backslash \\ newline\nnext' ]] || fail "quoted prompt roundtrips"
 
+_mu_zsh_normalize_native_output_reply $'first\r\nsecond\r'
+[[ "$REPLY" == $'first\nsecond' ]] || fail "normalizes native CRLF output"
+
 tmp=${TMPDIR:-/tmp}/mu-zsh-test-${$}.session
 print -r -- "session-from-file" > "$tmp"
 MU_ZSH_SESSION_FILE=$tmp

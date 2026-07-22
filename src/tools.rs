@@ -45,15 +45,6 @@ pub fn tool_definitions() -> Vec<Value> {
     })]
 }
 
-pub fn resolve_path(path: &str) -> PathBuf {
-    let p = PathBuf::from(path);
-    if p.is_absolute() {
-        p
-    } else {
-        std::env::current_dir().unwrap_or_default().join(p)
-    }
-}
-
 pub fn apply_truncation(
     output: String,
     limits: &LimitsConfig,
@@ -103,7 +94,7 @@ fn truncate_output(
     let spill_note = match write_spill(output, spill_prefix, state_dir) {
         Ok(spill_path) => format!(
             "full output saved for {SPILL_RETENTION_DAYS} days to {}; inspect it with `bash` if it still exists",
-            spill_path.display()
+            crate::windows_msys2::display_path(&spill_path)
         ),
         Err(error) => {
             format!("full output could not be saved ({error}); only this preview is available")

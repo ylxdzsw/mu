@@ -1,6 +1,4 @@
 use std::collections::BTreeMap;
-use std::ffi::OsString;
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Component, Path};
 
 use anyhow::{Context, Result};
@@ -380,13 +378,10 @@ fn build_root_index(
             warnings.push(format!("invalid skill {}: {error}", path.display()));
         }
         if parsed.is_command && commands.len() < MAX_COMMANDS {
+            let canonical = path.canonicalize().unwrap_or(path.clone());
             commands.push(CommandMeta {
                 name: entry.path.clone(),
-                path: path
-                    .canonicalize()
-                    .unwrap_or(path.clone())
-                    .display()
-                    .to_string(),
+                path: crate::windows_msys2::display_path(&canonical),
                 scope,
             });
         }
@@ -394,14 +389,11 @@ fn build_root_index(
             match expected_skill_name(relative) {
                 Some(expected) if expected == skill.name => {
                     if skills.len() < MAX_SKILLS && requirements_met(&skill.requirements, env) {
+                        let canonical = path.canonicalize().unwrap_or(path.clone());
                         skills.push(SkillMeta {
                             name: skill.name,
                             description: skill.description,
-                            path: path
-                                .canonicalize()
-                                .unwrap_or(path.clone())
-                                .display()
-                                .to_string(),
+                            path: crate::windows_msys2::display_path(&canonical),
                             scope,
                             requirements: skill.requirements,
                         });
@@ -567,12 +559,11 @@ fn command_in_path(command: &str, env: &EnvMap) -> bool {
     let Some(path) = env.get("PATH") else {
         return false;
     };
-    std::env::split_paths(&OsString::from(path)).any(|dir| {
-        let candidate = dir.join(command);
-        candidate.is_file()
-            && candidate
-                .metadata()
-                .is_ok_and(|metadata| metadata.permissions().mode() & 0o111 != 0)
+    let extensions = ["", ".exe", ".com", ".bat", ".cmd"];
+    std::env::split_paths(path).any(|dir| {
+        extensions
+            .iter()
+            .any(|extension| dir.join(format!("{command}{extension}")).is_file())
     })
 }
 
@@ -836,10 +827,7 @@ mod tests {
         let root = temp_root("command-requirements");
         let bin = root.join("bin");
         fs::create_dir_all(&bin).unwrap();
-        fs::write(bin.join("gh"), "#!/bin/sh\nexit 0\n").unwrap();
-        let mut permissions = fs::metadata(bin.join("gh")).unwrap().permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(bin.join("gh"), permissions).unwrap();
+        fs::write(bin.join("gh.exe"), "test").unwrap();
         fs::write(
             root.join("review.md"),
             "---\nname: review\ndescription: Review changes.\nrequires_commands: gh, jq\n---\nReview it.\n",
@@ -850,10 +838,7 @@ mod tests {
         let index = scan_instruction_index_with_builtins(None, &root, None, &missing).unwrap();
         assert!(index.skills.is_empty());
 
-        fs::write(bin.join("jq"), "#!/bin/sh\nexit 0\n").unwrap();
-        let mut permissions = fs::metadata(bin.join("jq")).unwrap().permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(bin.join("jq"), permissions).unwrap();
+        fs::write(bin.join("jq.exe"), "test").unwrap();
         let present = env_map(&[("PATH", &bin.display().to_string())]);
         let index = scan_instruction_index_with_builtins(None, &root, None, &present).unwrap();
         assert_eq!(index.skills.len(), 1);
@@ -870,8 +855,8 @@ mod tests {
         fs::create_dir_all(&global).unwrap();
         fs::create_dir_all(&project).unwrap();
         fs::write(
-            builtins.join("background-task.md"),
-            "---\nname: background-task\ndescription: Start background tasks.\n---\nUse systemd-run.\n",
+            builtins.join("long-task.md"),
+            "---\nname: long-task\ndescription: Run long tasks.\n---\nWait for completion.\n",
         )
         .unwrap();
         fs::write(
@@ -901,8 +886,8 @@ mod tests {
                 .unwrap();
 
         assert_eq!(index.skills.len(), 3);
-        assert_eq!(index.skills[0].name, "background-task");
-        assert_eq!(index.skills[1].name, "customize-mu");
+        assert_eq!(index.skills[0].name, "customize-mu");
+        assert_eq!(index.skills[1].name, "long-task");
         let review = index
             .skills
             .iter()
@@ -917,7 +902,7 @@ mod tests {
         assert_eq!(review_command.scope, InstructionScope::Project);
         assert_eq!(
             review_command.path,
-            project.join("review.md").display().to_string()
+            crate::windows_msys2::display_path(&project.join("review.md"))
         );
         fs::remove_dir_all(builtins).unwrap();
         fs::remove_dir_all(global).unwrap();
@@ -979,17 +964,16 @@ mod tests {
         let root = temp_root("repository-builtins");
         let bin = root.join("bin");
         fs::create_dir_all(&bin).unwrap();
-        fs::write(bin.join("agent-browser"), "#!/bin/sh\nexit 0\n").unwrap();
-        let mut permissions = fs::metadata(bin.join("agent-browser"))
-            .unwrap()
-            .permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(bin.join("agent-browser"), permissions).unwrap();
+        fs::write(bin.join("agent-browser.exe"), "test").unwrap();
 
-        let path = std::env::var("PATH").unwrap_or_default();
-        let path = format!("{}:{path}", bin.display());
+        let mut paths = vec![bin.clone()];
+        paths.extend(std::env::split_paths(
+            &std::env::var_os("PATH").unwrap_or_default(),
+        ));
+        let path = std::env::join_paths(paths).unwrap();
+        let path = path.to_string_lossy();
         let env = env_map(&[
-            ("PATH", path.as_str()),
+            ("PATH", path.as_ref()),
             ("BRAVE_API_KEY", "test-brave-key"),
             ("EXA_API_KEY", "test-exa-key"),
         ]);
@@ -1000,7 +984,7 @@ mod tests {
             .iter()
             .map(|skill| skill.name.as_str())
             .collect::<Vec<_>>();
-        assert!(names.contains(&"background-task"));
+        assert!(!names.contains(&"background-task"));
         assert!(names.contains(&"agent-browser"));
         assert!(names.contains(&"brave-search"));
         assert!(names.contains(&"customize-mu"));

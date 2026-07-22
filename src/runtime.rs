@@ -189,7 +189,7 @@ pub fn build_status_report(
             .as_ref()
             .map(|session| session.id.clone()),
         context_percent: context_percent(store, resolved.attached_session.as_ref(), &model_info),
-        project_root: project.map(|project| project.root.display().to_string()),
+        project_root: project.map(|project| crate::windows_msys2::display_path(&project.root)),
         context_window: model_info.context_window,
         supported_effort_levels: model_info.supported_effort_levels,
         git: project.map(git_status),
@@ -231,7 +231,7 @@ fn status_session(summary: crate::store::SessionSummary) -> StatusSession {
     StatusSession {
         id: summary.id,
         title: summary.title,
-        cwd: summary.cwd,
+        cwd: crate::windows_msys2::display_path(std::path::Path::new(&summary.cwd)),
         created_at: summary.created_at,
         updated_at: summary.updated_at,
         message_count: summary.message_count,
@@ -249,7 +249,7 @@ fn git_status(project: &crate::paths::Project) -> GitStatus {
         git_dir: project
             .worktree
             .as_ref()
-            .map(|info| info.git_dir.display().to_string()),
+            .map(|info| crate::windows_msys2::display_path(&info.git_dir)),
     }
 }
 

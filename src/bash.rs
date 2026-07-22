@@ -1,13 +1,10 @@
 use std::io::Write;
-use std::os::fd::AsRawFd;
-use std::os::unix::net::UnixStream;
-use std::os::unix::process::CommandExt;
-use std::os::unix::process::ExitStatusExt;
+use std::os::windows::io::AsRawHandle;
+use std::os::windows::process::CommandExt;
 use std::path::Path;
-use std::path::PathBuf;
 use std::process::{Command, ExitStatus, Stdio};
 use std::sync::Once;
-use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -15,8 +12,26 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 use tokio::task::JoinHandle;
+use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
+use windows_sys::Win32::System::Console::{
+    CTRL_BREAK_EVENT, CTRL_C_EVENT, CTRL_CLOSE_EVENT, CTRL_LOGOFF_EVENT, CTRL_SHUTDOWN_EVENT,
+    SetConsoleCtrlHandler,
+};
+use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+    CreateToolhelp32Snapshot, TH32CS_SNAPTHREAD, THREADENTRY32, Thread32First, Thread32Next,
+};
+use windows_sys::Win32::System::JobObjects::CreateJobObjectW;
+use windows_sys::Win32::System::JobObjects::{
+    AssignProcessToJobObject, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+    JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
+    SetInformationJobObject, TerminateJobObject,
+};
+use windows_sys::Win32::System::Threading::{
+    CREATE_NEW_PROCESS_GROUP, CREATE_SUSPENDED, ExitProcess, OpenThread, ResumeThread,
+    THREAD_SUSPEND_RESUME,
+};
 
-use crate::artifact::{ARTIFACT_FD, ARTIFACT_FD_ENV, read_artifacts};
+use crate::artifact::{ARTIFACT_DIR_ENV, read_artifacts};
 use crate::config::Config;
 use crate::config::EnvMap;
 use crate::provider::ToolArtifact;
@@ -24,17 +39,15 @@ use crate::redaction::SecretRedactor;
 use crate::renderer::Renderer;
 
 use crate::tools::{
-    BashArgs, ExecutionMode, ToolContext, ToolResult, apply_truncation, parse_args, resolve_path,
+    BashArgs, ExecutionMode, ToolContext, ToolResult, apply_truncation, parse_args,
 };
 
 const DEFAULT_TIMEOUT_SECS: u64 = 120;
-const KILL_GRACE: Duration = Duration::from_millis(500);
 const MAX_OUTPUT_BYTES: usize = 1024 * 1024 * 1024; // 1 GB: internal guard against unbounded output accumulation
 const REDACTION_REMINDER: &str = "[system reminder: Secret values were redacted from this bash output. Do not try to reveal, transform, encode, print, or exfiltrate secrets.]";
 pub const SUBAGENT_DEPTH_ENV: &str = "MU_SUBAGENT_DEPTH";
-pub const MAX_ACTIVE_PROCESS_GROUPS: usize = 64;
-static ACTIVE_PGIDS: [AtomicI32; MAX_ACTIVE_PROCESS_GROUPS] =
-    [const { AtomicI32::new(0) }; MAX_ACTIVE_PROCESS_GROUPS];
+pub const MAX_ACTIVE_JOBS: usize = 64;
+static ACTIVE_JOB_COUNT: AtomicUsize = AtomicUsize::new(0);
 static CANCELLING: AtomicBool = AtomicBool::new(false);
 static LAST_SIGNAL: AtomicI32 = AtomicI32::new(0);
 static INSTALL_SIGNAL_FORWARDER: Once = Once::new();
@@ -294,27 +307,28 @@ fn run_bash_inner(
     redactor: &mut SecretRedactor,
 ) -> Result<BashRunResult> {
     install_signal_forwarder();
-    let cwd = args
-        .cwd
-        .as_deref()
-        .map(resolve_path)
-        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+    let cwd = match args.cwd.as_deref() {
+        Some(path) => crate::windows_msys2::native_path(path)
+            .with_context(|| format!("resolving MSYS2 working directory {path}"))?,
+        None => std::env::current_dir().context("determining current working directory")?,
+    };
+    let libexec = crate::windows_msys2::libexec_shell_path()?;
     let command_text = format!(
-        "export PATH=/usr/libexec/mu:$PATH\nexec 2>&1\n{}",
+        "export PATH={}:$PATH\nexec 2>&1\n{}",
+        shell_quote(&libexec),
         args.command
     );
 
-    let (artifact_reader, artifact_writer) =
-        UnixStream::pair().context("creating Mu artifact channel")?;
-    let artifact_writer_fd = artifact_writer.as_raw_fd();
+    let artifact_spool = ArtifactSpool::new()?;
+    let job = Job::new()?;
 
-    let mut command = Command::new("bash");
+    let mut command = Command::new(crate::windows_msys2::bash_program()?);
     command
         .arg("-lc")
         .arg(command_text)
         .current_dir(&cwd)
         .envs(env)
-        .env(ARTIFACT_FD_ENV, ARTIFACT_FD.to_string())
+        .env(ARTIFACT_DIR_ENV, artifact_spool.path())
         .env(SUBAGENT_DEPTH_ENV, next_subagent_depth_env())
         .stdin(if args.stdin.is_some() {
             Stdio::piped()
@@ -322,9 +336,8 @@ fn run_bash_inner(
             Stdio::null()
         })
         .stdout(Stdio::piped())
-        .stderr(Stdio::null());
-    configure_process_group(&mut command);
-    configure_artifact_fd(&mut command, artifact_writer_fd);
+        .stderr(Stdio::null())
+        .creation_flags(CREATE_SUSPENDED | CREATE_NEW_PROCESS_GROUP);
 
     let mut child = command.spawn().map_err(|error| {
         if is_e2big(&error) {
@@ -333,11 +346,11 @@ fn run_bash_inner(
             anyhow::anyhow!(error).context("spawning bash")
         }
     })?;
-    drop(artifact_writer);
-    let artifact_task = std::thread::spawn(move || read_artifacts(artifact_reader));
-    let child_id = child.id();
-    let _active = ActiveProcessGroup::new(child_id);
-
+    if let Err(error) = job.assign_and_resume(&child) {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(error.context("starting bash inside a Windows Job Object"));
+    }
     if let Some(stdin) = args.stdin {
         let mut child_stdin = child.stdin.take().context("taking bash stdin")?;
         std::thread::spawn(move || {
@@ -373,7 +386,7 @@ fn run_bash_inner(
     loop {
         if cancellation_requested() {
             interrupted = true;
-            terminate_child_group(child_id, &mut child);
+            job.terminate(&mut child);
             drain_available(&rx, target, &mut output, redactor)?;
             flush_redactor(target, &mut output, redactor)?;
             let _ = child.wait();
@@ -392,7 +405,7 @@ fn run_bash_inner(
         }
 
         if Instant::now() >= deadline {
-            terminate_child_group(child_id, &mut child);
+            job.terminate(&mut child);
             drain_available(&rx, target, &mut output, redactor)?;
             flush_redactor(target, &mut output, redactor)?;
             let _ = child.wait();
@@ -419,7 +432,7 @@ fn run_bash_inner(
                 output.push_str(&redacted);
                 target.push_output(&redacted)?;
                 if output.len() > MAX_OUTPUT_BYTES {
-                    terminate_child_group(child_id, &mut child);
+                    job.terminate(&mut child);
                     drain_available(&rx, target, &mut output, redactor)?;
                     flush_redactor(target, &mut output, redactor)?;
                     let _ = child.wait();
@@ -450,13 +463,11 @@ fn run_bash_inner(
 
     let status = status.unwrap_or_else(|| child.wait().expect("bash status"));
     flush_redactor(target, &mut output, redactor)?;
-    let artifacts = artifact_task
-        .join()
-        .map_err(|_| anyhow::anyhow!("Mu artifact reader panicked"))??;
+    let artifacts = read_artifacts(artifact_spool.path())?;
     if let Some(error) = terminal_error {
         return Err(error);
     }
-    if interrupted || (cancellation_requested() && status.signal().is_some()) {
+    if interrupted || cancellation_requested() {
         let reminder = if redactor.did_redact() {
             format!("\n\n{REDACTION_REMINDER}")
         } else {
@@ -470,7 +481,7 @@ fn run_bash_inner(
         );
     }
     Ok(BashRunResult {
-        output: output.trim_end_matches('\n').to_string(),
+        output: output.trim_end_matches(['\r', '\n']).to_string(),
         exit_code: status.code().unwrap_or(1),
         redacted: redactor.did_redact(),
         artifacts,
@@ -503,7 +514,7 @@ fn flush_redactor(
 }
 
 fn partial_output_suffix(output: &str) -> String {
-    let output = output.trim_end_matches('\n');
+    let output = output.trim_end_matches(['\r', '\n']);
     if output.is_empty() {
         String::new()
     } else {
@@ -511,33 +522,40 @@ fn partial_output_suffix(output: &str) -> String {
     }
 }
 
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
 fn is_e2big(error: &std::io::Error) -> bool {
-    error.raw_os_error() == Some(libc::E2BIG)
+    error.raw_os_error() == Some(206)
 }
 
 pub fn install_signal_forwarder() {
-    INSTALL_SIGNAL_FORWARDER.call_once(|| unsafe {
-        libc::signal(libc::SIGINT, forward_signal as *const () as usize);
-        libc::signal(libc::SIGTERM, forward_signal as *const () as usize);
+    INSTALL_SIGNAL_FORWARDER.call_once(|| {
+        let installed = unsafe { SetConsoleCtrlHandler(Some(console_control_handler), 1) };
+        if installed == 0 {
+            eprintln!(
+                "warning: unable to install Windows console control handler: {}",
+                std::io::Error::last_os_error()
+            );
+        }
     });
 }
 
-extern "C" fn forward_signal(signal: i32) {
+unsafe extern "system" fn console_control_handler(control: u32) -> i32 {
+    let signal = match control {
+        CTRL_C_EVENT | CTRL_BREAK_EVENT => 2,
+        CTRL_CLOSE_EVENT | CTRL_LOGOFF_EVENT | CTRL_SHUTDOWN_EVENT => 15,
+        _ => return 0,
+    };
     LAST_SIGNAL.store(signal, Ordering::SeqCst);
-    let already_cancelling = CANCELLING.swap(true, Ordering::SeqCst);
-    for pgid in &ACTIVE_PGIDS {
-        let pgid = pgid.load(Ordering::SeqCst);
-        if pgid > 0 {
-            unsafe {
-                libc::kill(-pgid, signal);
-            }
-        }
-    }
-    if already_cancelling || !has_active_process_groups() {
+    CANCELLING.store(true, Ordering::SeqCst);
+    if ACTIVE_JOB_COUNT.load(Ordering::SeqCst) == 0 {
         unsafe {
-            libc::_exit(128 + signal);
+            ExitProcess((128 + signal) as u32);
         }
     }
+    1
 }
 
 pub fn reset_cancellation_state() {
@@ -549,130 +567,150 @@ pub fn cancellation_requested() -> bool {
     CANCELLING.load(Ordering::SeqCst)
 }
 
-/// If a terminating signal was forwarded during this turn, return its number so
-/// the process can exit with the shell-conventional `128 + signal` status
-/// (e.g. `130` for SIGINT). Returns `None` when no cancellation occurred.
+/// If a terminating console event occurred during this turn, return its number
+/// so the process can exit with the shell-conventional `128 + signal` status
+/// (e.g. `130` for Ctrl-C). Returns `None` when no cancellation occurred.
 pub fn cancellation_signal() -> Option<i32> {
     if !cancellation_requested() {
         return None;
     }
     let signal = LAST_SIGNAL.load(Ordering::SeqCst);
-    Some(if signal > 0 { signal } else { libc::SIGINT })
+    Some(if signal > 0 { signal } else { 2 })
 }
 
 fn last_signal() -> i32 {
     LAST_SIGNAL.load(Ordering::SeqCst)
 }
 
-fn has_active_process_groups() -> bool {
-    ACTIVE_PGIDS
-        .iter()
-        .any(|pgid| pgid.load(Ordering::SeqCst) > 0)
-}
-
 fn signal_name(signal: i32) -> &'static str {
     match signal {
-        libc::SIGINT => "SIGINT",
-        libc::SIGTERM => "SIGTERM",
-        _ => "signal",
+        2 => "Ctrl-C",
+        15 => "console termination",
+        _ => "console control event",
     }
 }
 
-struct ActiveProcessGroup {
-    slot: Option<usize>,
+struct Job {
+    handle: HANDLE,
 }
 
-impl ActiveProcessGroup {
-    fn new(child_id: u32) -> Self {
-        Self {
-            slot: set_active_process_group(child_id),
+impl Job {
+    fn new() -> Result<Self> {
+        let handle = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
+        if handle.is_null() {
+            return Err(std::io::Error::last_os_error()).context("creating Windows Job Object");
         }
+        let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+        limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        let configured = unsafe {
+            SetInformationJobObject(
+                handle,
+                JobObjectExtendedLimitInformation,
+                std::ptr::addr_of!(limits).cast(),
+                std::mem::size_of_val(&limits) as u32,
+            )
+        };
+        if configured == 0 {
+            let error = std::io::Error::last_os_error();
+            unsafe {
+                CloseHandle(handle);
+            }
+            return Err(error).context("configuring Windows Job Object");
+        }
+        ACTIVE_JOB_COUNT.fetch_add(1, Ordering::SeqCst);
+        Ok(Self { handle })
+    }
+
+    fn assign_and_resume(&self, child: &std::process::Child) -> Result<()> {
+        let process = child.as_raw_handle() as HANDLE;
+        if unsafe { AssignProcessToJobObject(self.handle, process) } == 0 {
+            return Err(std::io::Error::last_os_error())
+                .context("assigning bash to Windows Job Object");
+        }
+        resume_process_thread(child.id())
+    }
+
+    fn terminate(&self, child: &mut std::process::Child) {
+        if unsafe { TerminateJobObject(self.handle, 1) } == 0 {
+            let _ = child.kill();
+        }
+        let _ = child.wait();
     }
 }
 
-impl Drop for ActiveProcessGroup {
+impl Drop for Job {
     fn drop(&mut self) {
-        clear_active_process_group(self.slot);
-    }
-}
-
-fn set_active_process_group(child_id: u32) -> Option<usize> {
-    let pgid = child_id as i32;
-    for (idx, slot) in ACTIVE_PGIDS.iter().enumerate() {
-        if slot
-            .compare_exchange(0, pgid, Ordering::SeqCst, Ordering::SeqCst)
-            .is_ok()
-        {
-            return Some(idx);
+        unsafe {
+            CloseHandle(self.handle);
         }
-    }
-    None
-}
-
-fn clear_active_process_group(slot: Option<usize>) {
-    if let Some(slot) = slot {
-        ACTIVE_PGIDS[slot].store(0, Ordering::SeqCst);
+        ACTIVE_JOB_COUNT.fetch_sub(1, Ordering::SeqCst);
     }
 }
 
-fn configure_process_group(command: &mut Command) {
-    unsafe {
-        command.pre_exec(|| {
-            if libc::setpgid(0, 0) != 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            #[cfg(target_os = "linux")]
-            {
-                libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM);
-            }
-            Ok(())
-        });
+fn resume_process_thread(process_id: u32) -> Result<()> {
+    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) };
+    if snapshot == INVALID_HANDLE_VALUE {
+        return Err(std::io::Error::last_os_error()).context("enumerating bash threads");
     }
-}
-
-fn configure_artifact_fd(command: &mut Command, source_fd: i32) {
-    unsafe {
-        command.pre_exec(move || {
-            if libc::dup2(source_fd, ARTIFACT_FD) < 0 {
-                return Err(std::io::Error::last_os_error());
+    let result = (|| -> Result<()> {
+        let mut entry = THREADENTRY32 {
+            dwSize: std::mem::size_of::<THREADENTRY32>() as u32,
+            ..Default::default()
+        };
+        let mut available = unsafe { Thread32First(snapshot, &mut entry) } != 0;
+        while available {
+            if entry.th32OwnerProcessID == process_id {
+                let thread = unsafe { OpenThread(THREAD_SUSPEND_RESUME, 0, entry.th32ThreadID) };
+                if thread.is_null() {
+                    return Err(std::io::Error::last_os_error())
+                        .context("opening suspended bash thread");
+                }
+                let resumed = unsafe { ResumeThread(thread) };
+                unsafe {
+                    CloseHandle(thread);
+                }
+                if resumed == u32::MAX {
+                    return Err(std::io::Error::last_os_error())
+                        .context("resuming suspended bash thread");
+                }
+                return Ok(());
             }
-            if libc::fcntl(ARTIFACT_FD, libc::F_SETFD, 0) < 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            Ok(())
-        });
-    }
-}
-
-fn terminate_child_group(child_id: u32, child: &mut std::process::Child) {
-    let pgid = -(child_id as i32);
-    unsafe {
-        if libc::kill(pgid, libc::SIGTERM) != 0 {
-            let _ = child.kill();
+            available = unsafe { Thread32Next(snapshot, &mut entry) } != 0;
         }
-    }
-    let _ = wait_for_exit(child, KILL_GRACE);
+        bail!("unable to find the suspended bash thread")
+    })();
     unsafe {
-        if libc::kill(pgid, libc::SIGKILL) != 0 {
-            let _ = child.kill();
-        }
+        CloseHandle(snapshot);
+    }
+    result
+}
+
+struct ArtifactSpool {
+    path: std::path::PathBuf,
+}
+
+impl ArtifactSpool {
+    fn new() -> Result<Self> {
+        let path = std::env::temp_dir().join(format!("mu-artifacts-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&path)
+            .with_context(|| format!("creating artifact spool {}", path.display()))?;
+        Ok(Self { path })
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
     }
 }
 
-fn wait_for_exit(child: &mut std::process::Child, grace: Duration) -> bool {
-    let deadline = Instant::now() + grace;
-    while Instant::now() < deadline {
-        if matches!(child.try_wait(), Ok(Some(_))) {
-            return true;
-        }
-        std::thread::sleep(Duration::from_millis(25));
+impl Drop for ArtifactSpool {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.path);
     }
-    false
 }
 
 #[cfg(test)]
 mod tests {
-    use super::run_bash;
+    use super::{run_bash, shell_quote};
     use crate::config::EnvMap;
     use crate::config::{
         CompactionConfig, Config, GuardrailConfig, LimitsConfig, ProviderConfig, RedactionConfig,
@@ -751,7 +789,10 @@ mod tests {
         )
         .unwrap();
         assert_eq!(second_result.exit_code, 0);
-        assert_eq!(second_result.output, format!("{}|unset", tmp.display()));
+        assert_eq!(
+            second_result.output,
+            format!("{}|unset", crate::windows_msys2::shell_path(&tmp).unwrap())
+        );
 
         let _ = std::fs::remove_dir_all(&tmp);
     }
@@ -794,8 +835,9 @@ mod tests {
             SecretRedactor::default(),
         )
         .unwrap();
+        let libexec = crate::windows_msys2::libexec_shell_path().unwrap();
         assert!(
-            result.output.starts_with("/usr/libexec/mu:"),
+            result.output.starts_with(&format!("{libexec}:")),
             "{}",
             result.output
         );
@@ -804,8 +846,11 @@ mod tests {
     #[test]
     fn bash_collects_framed_image_artifacts_separately_from_stdout() {
         let mut renderer = Renderer::new();
-        let command = r#"python - <<'PY'
+        let command = r#"artifact_dir=$(cygpath -u "$MU_ARTIFACT_DIR")
+export artifact_dir
+python - <<'PY'
 import json, os, struct
+from pathlib import Path
 data = b'\x89PNG\r\n\x1a\nrest'
 header = json.dumps({
     'version': 1,
@@ -815,8 +860,8 @@ header = json.dumps({
     'detail': 'high',
     'byte_length': len(data),
 }, separators=(',', ':')).encode()
-fd = int(os.environ['MU_ARTIFACT_FD'])
-os.write(fd, struct.pack('>I', len(header)) + header + struct.pack('>Q', len(data)) + data)
+record = struct.pack('>I', len(header)) + header + struct.pack('>Q', len(data)) + data
+(Path(os.environ['artifact_dir']) / '0001.artifact').write_bytes(record)
 print('visible')
 PY"#;
         let result = run_bash(
@@ -875,30 +920,24 @@ PY"#;
 
     #[test]
     fn timeout_kills_background_descendants() {
-        let marker = format!("/tmp/mu-bash-descendant-{}", uuid::Uuid::new_v4());
-        let script = format!("sleep 20 & echo $! > {marker}; sleep 20");
+        let marker =
+            std::env::temp_dir().join(format!("mu-bash-descendant-{}", uuid::Uuid::new_v4()));
+        let shell_marker = crate::windows_msys2::shell_path(&marker).unwrap();
+        let script = format!(
+            "(sleep 3; printf survived > {}) & sleep 20",
+            shell_quote(&shell_marker)
+        );
         let mut renderer = Renderer::new();
         let result = run_bash(
             args(&script),
-            3,
+            1,
             &mut renderer,
             &empty_env(),
             SecretRedactor::default(),
         );
         assert!(result.is_err(), "expected timeout");
-
-        let pid_text = (0..20)
-            .find_map(|_| {
-                std::fs::read_to_string(&marker).ok().or_else(|| {
-                    std::thread::sleep(std::time::Duration::from_millis(50));
-                    None
-                })
-            })
-            .expect("background process marker should be written before timeout");
-        let pid: i32 = pid_text.trim().parse().unwrap();
-        std::thread::sleep(std::time::Duration::from_millis(200));
-        let alive = unsafe { libc::kill(pid, 0) == 0 };
-        assert!(!alive, "background sleep {pid} survived timeout");
+        std::thread::sleep(std::time::Duration::from_secs(3));
+        assert!(!marker.exists(), "background process survived timeout");
         let _ = std::fs::remove_file(marker);
     }
 }
