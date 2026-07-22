@@ -1615,7 +1615,10 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(autoincrement_count, 0, "no tables should use AUTOINCREMENT in v8");
+        assert_eq!(
+            autoincrement_count, 0,
+            "no tables should use AUTOINCREMENT in v8"
+        );
         let sqlite_sequence_exists: bool = store
             .conn
             .query_row(
@@ -1624,7 +1627,10 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert!(!sqlite_sequence_exists, "sqlite_sequence should not exist without AUTOINCREMENT tables");
+        assert!(
+            !sqlite_sequence_exists,
+            "sqlite_sequence should not exist without AUTOINCREMENT tables"
+        );
         let _ = std::fs::remove_dir_all(tmp);
     }
 

@@ -2,21 +2,38 @@ name: CI
 
 on:
   push:
-    branches: [master]
+    branches: [master, msys2]
+    tags: ["v*"]
   pull_request:
+    branches: [master]
+  workflow_dispatch:
 
 permissions:
   contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref_type != 'tag' }}
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  check:
+  linux:
+    name: Linux master
     runs-on: ubuntu-latest
 
     steps:
       - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Select master for an msys2-triggered run
+        if: github.ref == 'refs/heads/msys2'
+        run: |
+          git fetch --no-tags origin \
+            +refs/heads/master:refs/remotes/origin/master
+          git checkout --detach origin/master
 
       - name: Install system dependencies
         run: |
@@ -42,3 +59,158 @@ jobs:
 
       - name: Check package recipe
         run: bash -n PKGBUILD
+
+  windows:
+    name: Windows MSYS2 UCRT64
+    runs-on: windows-latest
+
+    defaults:
+      run:
+        shell: msys2 {0}
+
+    steps:
+      - name: Configure Git line endings
+        shell: pwsh
+        run: git config --global core.autocrlf input
+
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: true
+          install: >-
+            git
+            zip
+            zsh
+            mingw-w64-ucrt-x86_64-curl
+            mingw-w64-ucrt-x86_64-jq
+            mingw-w64-ucrt-x86_64-pkgconf
+            mingw-w64-ucrt-x86_64-python
+            mingw-w64-ucrt-x86_64-ripgrep
+            mingw-w64-ucrt-x86_64-rust
+            mingw-w64-ucrt-x86_64-sqlite3
+
+      - name: Rebase the Windows patch onto the candidate master
+        run: |
+          set -euo pipefail
+          candidate=$(git rev-parse HEAD)
+          git fetch --no-tags origin \
+            +refs/heads/master:refs/remotes/origin/master \
+            +refs/heads/msys2:refs/remotes/origin/msys2
+          if [[ "$GITHUB_REF" == refs/heads/msys2 ]]; then
+            candidate=$(git rev-parse origin/master)
+          fi
+          fork=$(git merge-base origin/master origin/msys2)
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git checkout -B ci-msys2 origin/msys2
+          git rebase --onto "$candidate" "$fork"
+
+      - name: Verify the native toolchain
+        run: |
+          test "$MSYSTEM" = UCRT64
+          rustc -vV | grep -F 'host: x86_64-pc-windows-gnu'
+
+      - name: Check formatting
+        run: cargo fmt --check
+
+      - name: Lint
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Build and test the MSYS2 package
+        id: package
+        run: |
+          set -euo pipefail
+          package_root=$(cygpath -u "$RUNNER_TEMP")/mu-package-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}
+          mkdir "$package_root"
+          cp packaging/msys2/PKGBUILD "$package_root/PKGBUILD"
+          source_url=$(cygpath -am "$PWD")
+          (
+            cd "$package_root"
+            MU_SOURCE_URL="file:///$source_url" \
+            MU_SOURCE_BRANCH=ci-msys2 \
+              makepkg-mingw --noconfirm --cleanbuild --clean --force
+          )
+          package=$(find "$package_root" -maxdepth 1 \
+            -name 'mingw-w64-ucrt-x86_64-mu-*.pkg.tar.zst' -print -quit)
+          test -n "$package"
+          mkdir dist
+          cp "$package" dist/
+          printf 'package_path=%s\n' "$package" >> "$GITHUB_OUTPUT"
+
+      - name: Install and smoke-test the package
+        run: |
+          set -euo pipefail
+          pacman --noconfirm -U '${{ steps.package.outputs.package_path }}'
+          /ucrt64/bin/mu.exe --help >/dev/null
+          test -f /ucrt64/share/mu/customize-mu.md
+          test -f /ucrt64/share/doc/mu/WINDOWS.md
+          smoke=$(mktemp -d)
+          printf '%s\n' \
+            '*** Begin Patch' \
+            '*** Add File: smoke.txt' \
+            '+works' \
+            '*** End Patch' \
+            | (cd "$smoke" && /ucrt64/libexec/mu/apply_patch.exe)
+          grep -qx works "$smoke/smoke.txt"
+
+      - name: Assemble Windows release artifacts
+        run: |
+          set -euo pipefail
+          archive=dist/mu-windows-msys2-ucrt64
+          mkdir -p \
+            "$archive/bin" \
+            "$archive/libexec" \
+            "$archive/share/zsh/plugins" \
+            "$archive/share/doc" \
+            "$archive/share/licenses"
+          cp /ucrt64/bin/mu.exe "$archive/bin/"
+          cp -a /ucrt64/libexec/mu "$archive/libexec/"
+          cp -a /ucrt64/share/mu "$archive/share/"
+          cp -a /ucrt64/share/zsh/plugins/mu "$archive/share/zsh/plugins/"
+          cp -a /ucrt64/share/doc/mu "$archive/share/doc/"
+          cp -a /ucrt64/share/licenses/mu "$archive/share/licenses/"
+          (cd dist && zip -qr mu-windows-msys2-ucrt64.zip mu-windows-msys2-ucrt64)
+          sha256sum dist/*.pkg.tar.zst dist/*.zip \
+            > dist/SHA256SUMS-windows-msys2-ucrt64.txt
+
+      - name: Upload Windows artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: windows-msys2-ucrt64
+          path: |
+            dist/*.pkg.tar.zst
+            dist/*.zip
+            dist/SHA256SUMS-windows-msys2-ucrt64.txt
+          if-no-files-found: error
+          retention-days: 14
+
+  release:
+    name: Add Windows artifacts to release
+    if: github.ref_type == 'tag'
+    needs: [linux, windows]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: windows-msys2-ucrt64
+          path: dist
+
+      - name: Create or update the GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" dist/* --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" dist/* \
+              --verify-tag \
+              --generate-notes \
+              --title "$GITHUB_REF_NAME"
+          fi

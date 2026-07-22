@@ -105,7 +105,9 @@ fn truncate_output(
             "full output saved for {SPILL_RETENTION_DAYS} days to {}; inspect it with `bash` if it still exists",
             spill_path.display()
         ),
-        Err(error) => format!("full output could not be saved ({error}); only this preview is available"),
+        Err(error) => {
+            format!("full output could not be saved ({error}); only this preview is available")
+        }
     };
 
     let elided_lines = total_lines.saturating_sub(preview.lines().count());
@@ -352,9 +354,7 @@ mod tests {
             "full output saved for {} days",
             super::SPILL_RETENTION_DAYS
         )));
-        let spilled: Vec<_> = std::fs::read_dir(tmp.join("truncation"))
-            .unwrap()
-            .collect();
+        let spilled: Vec<_> = std::fs::read_dir(tmp.join("truncation")).unwrap().collect();
         assert_eq!(spilled.len(), 1);
         let _ = std::fs::remove_dir_all(tmp);
     }
