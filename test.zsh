@@ -212,19 +212,20 @@ _mu_zsh_exit_mode
 [[ "$MU_ZSH_MODE" == shell ]] || fail "mode exit path returns to shell"
 [[ "$BUFFER" == "draft prompt" ]] || fail "mode exit path preserves shell buffer"
 
+primary_root=$tmpdir/primary-project
 worktree_root=$tmpdir/feature-worktree
 mkdir -p -- "$worktree_root/src"
 saved_project_root=$MU_ZSH_TEST_PROJECT_ROOT
-MU_ZSH_TEST_PROJECT_ROOT=$worktree_root
+MU_ZSH_TEST_PROJECT_ROOT=$primary_root
 saved_pwd=$PWD
 builtin cd "$worktree_root/src"
 worktree_prompt=$(_mu_zsh_build_mode_prompt)
 builtin cd "$saved_pwd"
 MU_ZSH_TEST_PROJECT_ROOT=$saved_project_root
-escaped_worktree_root=${worktree_root//\%/%%}
+escaped_primary_root=${primary_root//\%/%%}
 nested_pwd=$worktree_root/src
 escaped_nested_pwd=${nested_pwd//\%/%%}
-[[ "$worktree_prompt" == *"%F{12}${escaped_nested_pwd}%f %F{8}(${escaped_worktree_root})%f"* ]] || fail "shows worktree project root when cwd differs"
+[[ "$worktree_prompt" == *"%F{12}${escaped_nested_pwd}%f %F{8}(${escaped_primary_root})%f"* ]] || fail "shows primary project root from a linked worktree"
 
 global_fake_bin=$tmpdir/global-bin
 mkdir -p -- "$global_fake_bin"
@@ -295,11 +296,27 @@ builtin cd "$scope_discovery_dir"
 [[ "$(_mu_zsh_current_scope_key)" == "global" ]] || fail "starts uncached global"
 mkdir -p -- .mu
 [[ "$(_mu_zsh_current_scope_key)" == "project:$scope_discovery_dir" ]] || fail "scope detection refreshes project markers"
+primary_scope_dir=$tmpdir/scope-repo
 worktree_scope_dir=$tmpdir/scope-worktree
+mkdir -p -- "$primary_scope_dir/.mu" "$primary_scope_dir/.git/worktrees/feature"
 mkdir -p -- "$worktree_scope_dir/src"
-print -r -- 'gitdir: ../repo/.git/worktrees/feature' > "$worktree_scope_dir/.git"
+print -r -- "gitdir: $primary_scope_dir/.git/worktrees/feature" > "$worktree_scope_dir/.git"
+print -r -- '../..' > "$primary_scope_dir/.git/worktrees/feature/commondir"
+builtin cd "$primary_scope_dir"
+primary_scope_key=$(_mu_zsh_current_scope_key)
+MU_ZSH_SESSION_ID=session-primary
+MU_ZSH_SESSION_SCOPE=$primary_scope_key
+MU_ZSH_MODEL=model-primary
+MU_ZSH_MODEL_SCOPE=$primary_scope_key
 builtin cd "$worktree_scope_dir/src"
-[[ "$(_mu_zsh_current_scope_key)" == "project:$worktree_scope_dir" ]] || fail "scope detection stops at a worktree .git pointer"
+[[ "$(_mu_zsh_current_scope_key)" == "$primary_scope_key" ]] || fail "linked worktree shares the primary project scope"
+_mu_zsh_sync_state
+[[ "$MU_ZSH_EFFECTIVE_SESSION_ID" == session-primary ]] || fail "linked worktree reuses the primary project session"
+[[ "$MU_ZSH_EFFECTIVE_MODEL" == model-primary ]] || fail "linked worktree reuses the primary project model"
+_mu_zsh_clear_session_state
+_mu_zsh_clear_model_state
+mkdir -p -- "$worktree_scope_dir/.mu"
+[[ "$(_mu_zsh_current_scope_key)" == "project:$worktree_scope_dir" ]] || fail "worktree-local .mu creates an independent scope"
 builtin cd "$saved_pwd"
 HOME=$saved_home
 

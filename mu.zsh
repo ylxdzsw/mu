@@ -73,10 +73,34 @@ _mu_zsh_quote_prompt() {
   print -r -- "${(qqq)1}"
 }
 
+_mu_zsh_linked_project_root() {
+  local checkout_root=$1
+  local pointer git_dir common_dir
+
+  [[ -f "$checkout_root/.git" ]] || return 1
+  IFS= read -r pointer < "$checkout_root/.git" || return 1
+  [[ "$pointer" == gitdir:* ]] || return 1
+  git_dir=${pointer#gitdir:}
+  git_dir=${git_dir# }
+  [[ -n "$git_dir" ]] || return 1
+  [[ "$git_dir" == /* ]] || git_dir="$checkout_root/$git_dir"
+  git_dir=${git_dir:A}
+
+  [[ -r "$git_dir/commondir" ]] || return 1
+  IFS= read -r common_dir < "$git_dir/commondir" || return 1
+  [[ -n "$common_dir" ]] || return 1
+  [[ "$common_dir" == /* ]] || common_dir="$git_dir/$common_dir"
+  common_dir=${common_dir:A}
+
+  [[ "${common_dir:t}" == .git ]] || return 1
+  [[ "${git_dir:h:h}" == "$common_dir" ]] || return 1
+  REPLY=${common_dir:h}
+}
+
 _mu_zsh_set_scope_key_for_dir() {
   local dir=$1
   local home=${HOME:-}
-  local parent
+  local parent project_root
 
   while [[ -n "$dir" ]]; do
     if [[ -n "$home" && "$dir" == "$home" ]]; then
@@ -85,8 +109,16 @@ _mu_zsh_set_scope_key_for_dir() {
     if [[ "$dir" == "/" ]]; then
       break
     fi
-    if [[ -d "$dir/.mu" || -e "$dir/.git" ]]; then
+    if [[ -d "$dir/.mu" ]]; then
       REPLY="project:$dir"
+      return 0
+    fi
+    if [[ -e "$dir/.git" ]]; then
+      project_root=$dir
+      if _mu_zsh_linked_project_root "$dir"; then
+        project_root=$REPLY
+      fi
+      REPLY="project:$project_root"
       return 0
     fi
     parent=${dir:h}

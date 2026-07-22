@@ -242,7 +242,8 @@ fn status_session(summary: crate::store::SessionSummary) -> StatusSession {
 }
 
 fn git_status(project: &crate::paths::Project) -> GitStatus {
-    let (branch, dirty) = git_branch_and_dirty(&project.root).unwrap_or((None, None));
+    let checkout_root = git_checkout_root(project);
+    let (branch, dirty) = git_branch_and_dirty(checkout_root).unwrap_or((None, None));
     GitStatus {
         branch,
         dirty,
@@ -256,6 +257,14 @@ fn git_status(project: &crate::paths::Project) -> GitStatus {
             .and_then(|info| info.common_dir.as_ref())
             .map(|path| path.display().to_string()),
     }
+}
+
+fn git_checkout_root(project: &crate::paths::Project) -> &std::path::Path {
+    project
+        .worktree
+        .as_ref()
+        .map(|worktree| worktree.root.as_path())
+        .unwrap_or(&project.root)
 }
 
 fn git_branch_and_dirty(project_root: &std::path::Path) -> Option<(Option<String>, Option<bool>)> {
@@ -450,5 +459,23 @@ mod tests {
 
         assert_eq!(branch, None);
         assert_eq!(dirty, Some(true));
+    }
+
+    #[test]
+    fn git_status_uses_the_linked_checkout_root() {
+        let project = crate::paths::Project {
+            root: std::path::PathBuf::from("/tmp/primary"),
+            marker: crate::paths::ProjectMarker::Git,
+            worktree: Some(crate::paths::GitWorktreeInfo {
+                root: std::path::PathBuf::from("/tmp/linked"),
+                git_dir: std::path::PathBuf::from("/tmp/primary/.git/worktrees/linked"),
+                common_dir: Some(std::path::PathBuf::from("/tmp/primary/.git")),
+            }),
+        };
+
+        assert_eq!(
+            git_checkout_root(&project),
+            std::path::Path::new("/tmp/linked")
+        );
     }
 }

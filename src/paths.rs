@@ -17,6 +17,7 @@ pub enum ProjectMarker {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GitWorktreeInfo {
+    pub root: PathBuf,
     pub git_dir: PathBuf,
     pub common_dir: Option<PathBuf>,
 }
@@ -78,10 +79,15 @@ pub fn discover_project(cwd: &Path) -> Option<Project> {
             });
         }
         if dir.join(".git").exists() {
+            let worktree = git_worktree_info(dir);
+            let root = worktree
+                .as_ref()
+                .and_then(linked_project_root)
+                .unwrap_or_else(|| dir.to_path_buf());
             return Some(Project {
-                root: dir.to_path_buf(),
+                root,
                 marker: ProjectMarker::Git,
-                worktree: git_worktree_info(dir),
+                worktree,
             });
         }
     }
@@ -204,6 +210,7 @@ fn git_worktree_info(root: &Path) -> Option<GitWorktreeInfo> {
     let dot_git = root.join(".git");
     if dot_git.is_dir() {
         return Some(GitWorktreeInfo {
+            root: root.to_path_buf(),
             git_dir: dot_git,
             common_dir: None,
         });
@@ -216,9 +223,27 @@ fn git_worktree_info(root: &Path) -> Option<GitWorktreeInfo> {
         .ok()
         .map(|text| absolutize(&git_dir, Path::new(text.trim())));
     Some(GitWorktreeInfo {
+        root: root.to_path_buf(),
         git_dir,
         common_dir,
     })
+}
+
+fn linked_project_root(worktree: &GitWorktreeInfo) -> Option<PathBuf> {
+    let common_dir = worktree.common_dir.as_ref()?;
+    if common_dir.file_name()? != ".git" {
+        return None;
+    }
+
+    let admin_name = worktree
+        .git_dir
+        .strip_prefix(common_dir.join("worktrees"))
+        .ok()?;
+    if admin_name.components().count() != 1 {
+        return None;
+    }
+
+    Some(common_dir.parent()?.to_path_buf())
 }
 
 fn absolutize(base: &Path, path: &Path) -> PathBuf {
@@ -247,7 +272,7 @@ mod tests {
     }
 
     #[test]
-    fn treats_linked_worktree_as_its_own_project() {
+    fn linked_worktree_shares_the_primary_project() {
         let repository = std::env::temp_dir().join(format!("mu-worktree-{}", uuid::Uuid::new_v4()));
         let worktree = repository.join("worktrees/feature");
         let nested = worktree.join("src/nested");
@@ -263,15 +288,70 @@ mod tests {
 
         let project = discover_project(&nested).unwrap();
 
-        assert_eq!(project.root, worktree);
+        assert_eq!(project.root, repository);
         assert_eq!(project.marker, ProjectMarker::Git);
         assert_eq!(
             project.worktree,
             Some(GitWorktreeInfo {
+                root: worktree.clone(),
                 git_dir,
                 common_dir: Some(repository.join(".git")),
             })
         );
+        assert_eq!(
+            Scope::Project(project).session_db_path(),
+            repository.join(".mu/sessions.db")
+        );
+        assert!(validate_project_init_root(&worktree, false).is_err());
+        assert!(validate_project_init_root(&worktree, true).is_ok());
+
+        let _ = std::fs::remove_dir_all(repository);
+    }
+
+    #[test]
+    fn worktree_local_mu_directory_is_an_independent_project() {
+        let repository = std::env::temp_dir().join(format!("mu-worktree-{}", uuid::Uuid::new_v4()));
+        let worktree = repository.join("worktrees/feature");
+        let nested = worktree.join("src/nested");
+        let git_dir = repository.join(".git/worktrees/feature");
+        std::fs::create_dir_all(worktree.join(".mu")).unwrap();
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::create_dir_all(&git_dir).unwrap();
+        std::fs::write(
+            worktree.join(".git"),
+            format!("gitdir: {}\n", git_dir.display()),
+        )
+        .unwrap();
+        std::fs::write(git_dir.join("commondir"), "../..\n").unwrap();
+
+        let project = discover_project(&nested).unwrap();
+
+        assert_eq!(project.root, worktree);
+        assert_eq!(project.marker, ProjectMarker::Mu);
+
+        let _ = std::fs::remove_dir_all(repository);
+    }
+
+    #[test]
+    fn nonstandard_common_dir_keeps_worktree_local_scope() {
+        let repository =
+            std::env::temp_dir().join(format!("mu-bare-worktree-{}", uuid::Uuid::new_v4()));
+        let common_dir = repository.join("repo.git");
+        let git_dir = common_dir.join("worktrees/feature");
+        let worktree = repository.join("feature");
+        std::fs::create_dir_all(&git_dir).unwrap();
+        std::fs::create_dir_all(&worktree).unwrap();
+        std::fs::write(
+            worktree.join(".git"),
+            format!("gitdir: {}\n", git_dir.display()),
+        )
+        .unwrap();
+        std::fs::write(git_dir.join("commondir"), "../..\n").unwrap();
+
+        let project = discover_project(&worktree).unwrap();
+
+        assert_eq!(project.root, worktree);
+        assert_eq!(project.marker, ProjectMarker::Git);
 
         let _ = std::fs::remove_dir_all(repository);
     }

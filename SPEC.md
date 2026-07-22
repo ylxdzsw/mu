@@ -969,11 +969,20 @@ finding a project, `mu` uses the global scope rooted at `~/.mu`.
 Nested project merging is not supported. The first project found while walking
 upward is the active project.
 
-Git worktrees are treated as their own projects. If the discovered `.git`
-marker is a worktree pointer file and there is no closer `.mu`, the directory
-containing that `.git` file is the project root. The agent should be told both
-the project root and the current working directory. It should also be told
-relevant worktree information when available.
+Standard linked Git worktrees share the primary checkout's project scope. If
+the discovered `.git` marker is a worktree pointer file and there is no closer
+`.mu`, Mu resolves its `commondir`; when that is the primary checkout's `.git`
+directory, the primary checkout is the project root. Project configuration,
+instructions, sessions, and runtime state therefore come from the primary
+checkout's `.mu`, while the invoking `pwd` and Git branch/dirty state remain
+tied to the linked checkout. The agent is told the project root, worktree root,
+Git metadata, and current working directory.
+
+A `.mu` directory always wins over Git discovery, including at a linked
+worktree root; this provides an explicit independent project scope. Bare
+repositories, separate Git directories, malformed pointers, and other layouts
+without a standard primary `<project>/.git` fall back to the linked checkout as
+their project root without invoking Git to resolve it.
 
 The shell tool's working directory defaults to the process working directory,
 not the project root.

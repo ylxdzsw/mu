@@ -260,6 +260,7 @@ pub fn initial_environment_context(cwd: &Path, project: Option<&Project>) -> Str
         if let Some(worktree) = &project.worktree {
             lines.push(format!("git dir: {}", worktree.git_dir.display()));
             if let Some(common_dir) = &worktree.common_dir {
+                lines.push(format!("git worktree root: {}", worktree.root.display()));
                 lines.push(format!("git common dir: {}", common_dir.display()));
                 lines.push("git worktree: yes".into());
             }
@@ -344,12 +345,14 @@ mod tests {
                 root: PathBuf::from("/tmp/work"),
                 marker: ProjectMarker::Git,
                 worktree: Some(crate::paths::GitWorktreeInfo {
+                    root: PathBuf::from("/tmp/worktree"),
                     git_dir: PathBuf::from("/tmp/repo/.git/worktrees/feature"),
                     common_dir: Some(PathBuf::from("/tmp/repo/.git")),
                 }),
             }),
         );
         assert!(context.contains("project root: /tmp/work"));
+        assert!(context.contains("git worktree root: /tmp/worktree"));
         assert!(context.contains("git worktree: yes"));
         assert!(context.contains("current working directory: /tmp/work/subdir"));
         assert!(!context.contains("active session id"));
