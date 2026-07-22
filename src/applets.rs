@@ -9,7 +9,7 @@ pub enum Applet {
 }
 
 pub fn from_argv0(argv0: &OsStr) -> Option<Applet> {
-    match Path::new(argv0).file_name().and_then(OsStr::to_str) {
+    match Path::new(argv0).file_stem().and_then(OsStr::to_str) {
         Some("apply_patch") => Some(Applet::ApplyPatch),
         Some("edit") => Some(Applet::Edit),
         Some("view_image") => Some(Applet::ViewImage),
@@ -26,6 +26,10 @@ pub fn dispatch(applet: Applet) -> i32 {
 }
 
 mod apply_patch {
+    // This branch is Windows-only; clearing read-only changes one file
+    // attribute and does not make the file world-writable.
+    #![allow(clippy::permissions_set_readonly_false)]
+
     use std::collections::HashSet;
     use std::fs::{self, OpenOptions};
     use std::io::{Read, Seek, SeekFrom, Write};
@@ -267,11 +271,13 @@ mod apply_patch {
         Ok(path)
     }
 
-    fn resolve_path(cwd: &Path, path: &Path) -> PathBuf {
+    fn resolve_path(cwd: &Path, path: &Path) -> Result<PathBuf> {
         if path.is_absolute() {
-            path.to_path_buf()
+            Ok(path.to_path_buf())
+        } else if path.as_os_str().to_string_lossy().starts_with('/') {
+            crate::windows_msys2::native_path(&path.as_os_str().to_string_lossy())
         } else {
-            cwd.join(path)
+            Ok(cwd.join(path))
         }
     }
 
@@ -281,7 +287,7 @@ mod apply_patch {
         for operation in operations {
             match operation {
                 Operation::Add { path, content } => {
-                    let full = resolve_path(cwd, &path);
+                    let full = resolve_path(cwd, &path)?;
                     claim_path(&mut touched, &full, &path)?;
                     if fs::symlink_metadata(&full).is_ok() {
                         bail!(
@@ -295,7 +301,7 @@ mod apply_patch {
                     });
                 }
                 Operation::Delete { path } => {
-                    let full = resolve_path(cwd, &path);
+                    let full = resolve_path(cwd, &path)?;
                     claim_path(&mut touched, &full, &path)?;
                     file_or_symlink_metadata(&full, "delete")?;
                     changes.push(PlannedChange::Delete { path: full });
@@ -305,11 +311,12 @@ mod apply_patch {
                     move_to,
                     chunks,
                 } => {
-                    let full = resolve_path(cwd, &path);
+                    let full = resolve_path(cwd, &path)?;
                     claim_path(&mut touched, &full, &path)?;
                     let destination_full = move_to
                         .as_ref()
-                        .map(|destination| resolve_path(cwd, destination));
+                        .map(|destination| resolve_path(cwd, destination))
+                        .transpose()?;
                     if let (Some(destination), Some(destination_full)) =
                         (&move_to, &destination_full)
                     {
@@ -325,6 +332,7 @@ mod apply_patch {
                     let entry_metadata = fs::symlink_metadata(&full).with_context(|| {
                         format!("cannot update missing file {}", path.display())
                     })?;
+                    reject_msys_emulated_symlink(&full, &entry_metadata)?;
                     if entry_metadata.file_type().is_symlink() {
                         if chunks.is_empty() {
                             let destination = destination_full
@@ -718,7 +726,48 @@ mod apply_patch {
         path: &Path,
         content: &[u8],
         expected: Option<&str>,
-        _permissions: Option<fs::Permissions>,
+        permissions: Option<fs::Permissions>,
+    ) -> Result<()> {
+        let original_permissions = permissions.or_else(|| {
+            fs::metadata(path)
+                .ok()
+                .map(|metadata| metadata.permissions())
+        });
+        let was_readonly = original_permissions
+            .as_ref()
+            .is_some_and(fs::Permissions::readonly);
+        if was_readonly {
+            let mut writable = original_permissions
+                .as_ref()
+                .expect("read-only permissions")
+                .clone();
+            writable.set_readonly(false);
+            fs::set_permissions(path, writable)
+                .with_context(|| format!("making {} writable for update", path.display()))?;
+        }
+
+        let result = overwrite_existing_writable(path, content, expected);
+        if was_readonly
+            && let Some(permissions) = original_permissions
+            && let Err(error) = fs::set_permissions(path, permissions)
+        {
+            return match result {
+                Ok(()) => Err(error).with_context(|| {
+                    format!("restoring read-only attribute on {}", path.display())
+                }),
+                Err(update_error) => Err(update_error.context(format!(
+                    "also failed to restore read-only attribute on {}: {error}",
+                    path.display()
+                ))),
+            };
+        }
+        result
+    }
+
+    fn overwrite_existing_writable(
+        path: &Path,
+        content: &[u8],
+        expected: Option<&str>,
     ) -> Result<()> {
         let mut target = OpenOptions::new()
             .read(true)
@@ -785,6 +834,23 @@ mod apply_patch {
                 backup_path.display()
             )
         })
+    }
+
+    pub(super) fn reject_msys_emulated_symlink(path: &Path, metadata: &fs::Metadata) -> Result<()> {
+        if !metadata.is_file() || metadata.len() < 10 {
+            return Ok(());
+        }
+        let mut prefix = [0u8; 10];
+        let read = fs::File::open(path)
+            .and_then(|mut file| file.read(&mut prefix))
+            .unwrap_or(0);
+        if read >= 10 && &prefix == b"!<symlink>" {
+            bail!(
+                "MSYS2 emulated symlink is unsupported: {}; enable native symlinks and check out the repository again",
+                path.display()
+            );
+        }
+        Ok(())
     }
 
     fn format_summary(changes: &[PlannedChange], cwd: &Path) -> String {
@@ -961,13 +1027,13 @@ mod apply_patch {
                 }
                 let error = atomic_write(&path, "new\n", None, true, Some("old\n")).unwrap_err();
                 assert!(error.to_string().contains("file is busy"));
-                assert_eq!(fs::read_to_string(&path).unwrap(), "old\n");
                 Ok(())
             })();
 
             let _ = holder.kill();
             let _ = holder.wait();
             contention.unwrap();
+            assert_eq!(fs::read_to_string(&path).unwrap(), "old\n");
             atomic_write(&path, "new\n", None, true, Some("old\n")).unwrap();
             assert_eq!(fs::read_to_string(&path).unwrap(), "new\n");
             fs::remove_dir_all(dir).unwrap();
@@ -1399,11 +1465,13 @@ mod edit {
         matches!(line, "<<<<<<< SEARCH" | "=======" | ">>>>>>> REPLACE")
     }
 
-    fn resolve_path(cwd: &Path, path: &Path) -> PathBuf {
+    fn resolve_path(cwd: &Path, path: &Path) -> Result<PathBuf> {
         if path.is_absolute() {
-            path.to_path_buf()
+            Ok(path.to_path_buf())
+        } else if path.as_os_str().to_string_lossy().starts_with('/') {
+            crate::windows_msys2::native_path(&path.as_os_str().to_string_lossy())
         } else {
-            cwd.join(path)
+            Ok(cwd.join(path))
         }
     }
 
@@ -1414,9 +1482,10 @@ mod edit {
         replace_all: bool,
         relaxed: bool,
     ) -> Result<PlannedEdit> {
-        let path = resolve_path(cwd, &reported_path);
+        let path = resolve_path(cwd, &reported_path)?;
         let entry_metadata = fs::symlink_metadata(&path)
             .with_context(|| format!("cannot edit missing file {}", reported_path.display()))?;
+        super::apply_patch::reject_msys_emulated_symlink(&path, &entry_metadata)?;
         let target = if entry_metadata.file_type().is_symlink() {
             fs::canonicalize(&path)
                 .with_context(|| format!("resolving symlink to edit {}", reported_path.display()))?
@@ -2236,5 +2305,9 @@ mod tests {
         );
         assert_eq!(from_argv0(OsStr::new("mu")), None);
         assert_eq!(from_argv0(OsStr::new("renamed-mu")), None);
+        assert_eq!(
+            from_argv0(OsStr::new(r"C:\ucrt64\libexec\mu\apply_patch.exe")),
+            Some(Applet::ApplyPatch)
+        );
     }
 }

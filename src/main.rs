@@ -8,8 +8,8 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, bail};
 use clap::Parser;
 
-#[cfg(not(unix))]
-compile_error!("mu is supported only on Unix-like systems");
+#[cfg(not(windows))]
+compile_error!("the msys2 branch supports only Windows with MSYS2 UCRT64");
 
 mod agent;
 mod anthropic;
@@ -34,6 +34,7 @@ mod skills;
 mod store;
 mod system_prompt;
 mod tools;
+mod windows_msys2;
 
 #[cfg(test)]
 use attachment::MAX_ATTACHMENT_BYTES;
@@ -143,8 +144,8 @@ fn main() {
 
 /// Map a fatal error to a process exit code (SPEC §11).
 ///
-/// A forwarded terminating signal wins first (`128 + signal`, so `130` for
-/// SIGINT), then any error carrying an explicit `ExitError` code, otherwise the
+/// A terminating console event wins first (`128 + signal`, so `130` for
+/// Ctrl-C), then any error carrying an explicit `ExitError` code, otherwise the
 /// general error code `1`.
 fn exit_code_for(error: &anyhow::Error) -> i32 {
     if let Some(signal) = bash::cancellation_signal() {
@@ -294,12 +295,12 @@ fn inspect_project_path(base: &Path, path: &Path) -> Result<ProjectInfo> {
     let marker = project_marker_at(&path);
     let discovered = paths::discover_project(&path);
     Ok(ProjectInfo {
-        path: path.display().to_string(),
+        path: windows_msys2::display_path(&path),
         is_project: marker.is_some(),
         marker,
         project_root: discovered
             .as_ref()
-            .map(|project| project.root.display().to_string()),
+            .map(|project| windows_msys2::display_path(&project.root)),
         needs_confirmation: marker.is_none(),
     })
 }
@@ -354,6 +355,7 @@ fn open_store_with_session(db_path: &Path, session: &str) -> Result<store::Store
 }
 
 async fn run() -> Result<()> {
+    windows_msys2::validate_environment()?;
     let args = Args::parse();
     let cwd = std::env::current_dir()?;
     let scope = paths::discover_scope(&cwd);
@@ -372,8 +374,8 @@ async fn run() -> Result<()> {
                     let root = resolve_target_dir(&cwd, path.as_deref())?;
                     let result = paths::init_project_layout_at(&root, force)?;
                     let info = ProjectInitInfo {
-                        path: result.root.display().to_string(),
-                        project_root: result.root.display().to_string(),
+                        path: windows_msys2::display_path(&result.root),
+                        project_root: windows_msys2::display_path(&result.root),
                         created_files: result.created_files,
                         already_initialized: result.already_initialized,
                     };
@@ -803,7 +805,7 @@ fn resolve_prompt_source(
         skills::scan_instruction_index(&paths::global_dir(), project_config_dir.as_deref())?;
     if let Some(command) = skills::find_command(&index, &name) {
         return Ok(PromptSource::Command {
-            path: PathBuf::from(&command.path),
+            path: windows_msys2::native_path(&command.path)?,
             scope: command.scope,
         });
     }
@@ -1285,7 +1287,7 @@ mod tests {
             PromptSource::Command {
                 path,
                 scope: skills::InstructionScope::Project,
-            } if path == command_path.canonicalize().unwrap()
+            } if path == windows_msys2::canonical_path(&command_path).unwrap()
         ));
         std::fs::remove_dir_all(root).unwrap();
     }

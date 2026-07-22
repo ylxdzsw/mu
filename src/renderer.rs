@@ -34,6 +34,7 @@ pub(crate) const BASH_TITLE_PREVIEW_BYTES: usize = 120;
 const GUARDRAIL_REASON_PREVIEW_BYTES: usize = 180;
 const REASONING_TITLE_MAX_WIDTH: usize = 80;
 const DEFAULT_TERMINAL_WIDTH: usize = 80;
+#[cfg(unix)]
 const TERMINAL_RIGHT_MARGIN: usize = 1;
 const WRAP_LOOKBEHIND_CELLS: usize = 5;
 const MARKDOWN_RULE_WIDTH: usize = 40;

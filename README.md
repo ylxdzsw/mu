@@ -1,22 +1,24 @@
 # mu
 
 `mu` is a small, composable agent for the terminal: one prompt in, one
-completed agent turn out. It works equally well as a Unix command in scripts or
-as an interactive assistant inside zsh or Fish.
+completed agent turn out. This branch is the native Windows port for the MSYS2
+UCRT64 environment; it works equally well in shell scripts or as an interactive
+assistant inside zsh. See [WINDOWS.md](WINDOWS.md) for its platform and
+maintenance contract.
 
 ## Quick start
 
-Build the binary and put it on `PATH`:
+From an MSYS2 UCRT64 shell, build the binary and put it on `PATH`:
 
 ```sh
 cargo build --release --features portable
 export PATH="$PWD/target/release:$PATH"
 ```
 
-The `portable` feature bundles SQLite, uses vendored OpenSSL where OpenSSL is
-the platform TLS backend, and embeds Mu's built-in skills, so this source-tree
-binary can run without being installed. On its first normal invocation it
-writes the built-ins and three applet symlinks into your user cache.
+The `portable` feature bundles SQLite and embeds Mu's built-in skills, so this
+source-tree binary can run without being installed. On its first normal
+invocation it writes the built-ins and three applet hardlinks or copies into
+your user cache.
 
 Now ask it something:
 
@@ -35,26 +37,19 @@ Continue the latest session for another turn:
 mu -c <<< 'Now identify the riskiest change.'
 ```
 
-`mu` targets Unix-like systems and expects `bash` on `PATH`.
+This branch requires `MSYSTEM=UCRT64`, with MSYS2 `bash`, `cygpath`, SQLite,
+zsh, jq, ripgrep, Python, and curl installed. The package recipe installs these
+runtime dependencies. The branch intentionally does not compile on Unix or
+support other Windows shells and MSYS2 environments.
 
 ## Interactive shell usage
 
-The most comfortable way to use `mu` is right inside your shell. For zsh,
-source the included plugin from `.zshrc`:
+The most comfortable way to use `mu` is right inside zsh. Source the included
+plugin from `.zshrc`:
 
 ```zsh
 source /path/to/mu/mu.zsh
-# Arch package: source /usr/share/zsh/plugins/mu/mu.zsh
-```
-
-For Fish 4 or newer, source the Fish plugin near the end of `config.fish`, after
-your prompt and key bindings:
-
-```fish
-source /path/to/mu/mu.fish
-# The Arch package also loads /usr/share/fish/vendor_conf.d/mu.fish.
-# Source that file again at the end of config.fish if later configuration
-# replaces its prompt wrappers or Tab bindings.
+# UCRT64 package: source /ucrt64/share/zsh/plugins/mu/mu.zsh
 ```
 
 At an empty shell prompt, press **Tab** to enter `mu>` mode, type a request, and
@@ -79,9 +74,7 @@ Type `/` to list prompt-mode commands. The common ones:
   instruction. It reports when all history is already inside the configured
   recent-turn retention window.
 
-Both plugins require `jq` and `mu` on `PATH`, plus their respective shell. The
-Fish integration requires Fish 4 because it records replayable turns with
-`history append`.
+The plugin requires `zsh`, `jq`, and `mu` on `PATH`.
 
 The plugin keeps its session, model choice, and pending attachments together in
 one project scope. Changing directories only hides that state, so returning is
@@ -153,8 +146,8 @@ messages, and exits. A few ideas follow from that:
 
 - **A turn is the primitive.** `mu` is a fast native binary, not a daemon, TUI,
   or in-process REPL. Shell pipelines and prompt files compose it naturally.
-- **Shell-native interaction.** The zsh and Fish integrations add a persistent
-  prompt mode without replacing the shell or duplicating the agent runtime.
+- **Shell-native interaction.** The zsh integration adds a persistent prompt
+  mode without replacing the shell or duplicating the agent runtime.
 - **One universal tool.** The model sees `bash`; existing command-line tools
   provide search, editing, testing, web access, and specialized workflows.
 - **Streaming, durable sessions.** Output appears as it is produced, while
@@ -173,7 +166,7 @@ messages, and exits. A few ideas follow from that:
 - Persistent global or project-scoped sessions, continuation, transcripts,
   automatic context compaction, and interrupted-turn recovery.
 - Four output densities with automatic interactive-terminal rendering.
-- Image and audio attachments from the CLI and both shell prompt modes.
+- Image and audio attachments from the CLI and zsh prompt mode.
 - Reusable prompt files, executable prompts, slash commands, project/user
   instructions, and conditionally available skills.
 - A built-in safety guardrail and exact-value redaction for configured secrets,
@@ -299,62 +292,37 @@ percentage with `~` because it is estimated until the next provider response;
 the shell prompt uses the same marker and returns to an unprefixed percentage
 after that response supplies exact usage.
 
-## Native installation and portable builds
+## Packaged installations and portable source builds
 
 The default Cargo build is for a native installation and uses system SQLite
-plus the platform TLS backend: system OpenSSL on Linux and Apple Security on
-macOS.
+plus Windows SChannel through `native-tls`.
 
 ```sh
 cargo build --release
 ```
 
-For a binary installed as `<prefix>/bin/mu`, Mu always uses
-`<prefix>/share/mu/` for package-owned built-ins and
-`<prefix>/libexec/mu/` for package-owned applets. It assumes the installation
-is correct: it neither checks nor creates these directories at startup. Arch
-Linux packaging for this checkout is in [PKGBUILD](PKGBUILD) and uses this
-native default.
+For the packaged `/ucrt64/bin/mu.exe`, Mu uses `/ucrt64/share/mu/` for
+package-owned built-ins and `/ucrt64/libexec/mu/` for package-owned applets. It
+assumes the installation is correct: it neither checks nor creates these
+directories at startup. The MSYS2 UCRT64 recipe is in
+[packaging/msys2/PKGBUILD](packaging/msys2/PKGBUILD).
 
-Add `portable` for a standalone Unix binary:
+Add `portable` for a standalone Windows source-tree binary:
 
 ```sh
 cargo build --release --features portable
 ```
 
-Portable builds bundle SQLite, enable vendored OpenSSL on platforms whose
-native TLS backend is OpenSSL, and embed every shipped built-in. On macOS,
-native TLS continues to use the Apple Security framework. When the binary is
-under a `bin/` directory, each resource is resolved independently: an existing
-`<prefix>/share/mu/` wins for built-ins and an existing `<prefix>/libexec/mu/`
-wins for applets. Any resource without that installed directory falls back to
-the cache:
-
-- absolute `$XDG_CACHE_HOME/mu` when `XDG_CACHE_HOME` is set;
-- `$HOME/Library/Caches/mu` on macOS;
-- `$HOME/.cache/mu` on other Unix systems.
-
-Mu aborts rather than using `/tmp` if no cache root can be determined or if a
-cache path cannot be created. Cached resources live in fixed `builtins/` and
-`applets/` subdirectories. A missing subdirectory is created and populated in
-place; cached applets are absolute symlinks to the current executable. An
-existing directory is authoritative and is never inspected, refreshed, or
-repaired. A conflicting non-directory is an error, and a failed first
-population may leave a partial directory that later runs deliberately trust.
-Moving or upgrading the binary does not update either cache: remove the
-applicable cache subdirectory manually to regenerate it.
-
-Version tags publish portable Linux x86-64 musl and macOS ARM64/Intel archives
-with SHA-256 checksum files. The Linux archive statically links musl, SQLite,
-and vendored OpenSSL. The macOS archives retain only Apple system-library
-linkage. Built-ins are embedded, so those archives do not contain a separate
-`builtins/` directory. Releases continue to include the unchanged Windows
-MSYS2 UCRT64 package and archive.
+Portable builds bundle SQLite and embed every shipped built-in. Installed
+resource directories still win; otherwise Mu materializes built-ins and `.exe`
+applet hardlinks or copies below the user cache. An existing resource directory
+is authoritative and is never refreshed automatically.
 
 ## Reference
 
 See [SPEC.md](SPEC.md) for the complete product contract, including exact CLI,
-configuration, discovery, rendering, persistence, provider, and shell behavior.
+configuration, discovery, rendering, persistence, provider, and zsh behavior.
+Windows-port decisions are recorded in [WINDOWS.md](WINDOWS.md).
 
 ## License
 

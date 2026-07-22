@@ -1,22 +1,27 @@
 use std::fs::{File, OpenOptions};
-use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
+use windows_sys::Win32::Security::Cryptography::{
+    BCRYPT_USE_SYSTEM_PREFERRED_RNG, BCryptGenRandom,
+};
 
 const CROCKFORD: &[u8; 32] = b"0123456789abcdefghjkmnpqrstvwxyz";
 
-/// Read bytes from the operating system's cryptographic random source.
-///
-/// Mu only targets Unix-like systems today, and `/dev/urandom` is available
-/// on the supported platforms, including macOS. Keeping this small wrapper
-/// here avoids using an application-level UUID as a pathname primitive.
+/// Read bytes from the Windows system cryptographic random source.
 pub fn random_bytes<const N: usize>() -> Result<[u8; N]> {
     let mut bytes = [0u8; N];
-    let mut source = File::open("/dev/urandom").context("opening OS random source")?;
-    source
-        .read_exact(&mut bytes)
-        .context("reading OS random bytes")?;
+    let status = unsafe {
+        BCryptGenRandom(
+            std::ptr::null_mut(),
+            bytes.as_mut_ptr(),
+            N as u32,
+            BCRYPT_USE_SYSTEM_PREFERRED_RNG,
+        )
+    };
+    if status != 0 {
+        bail!("Windows random source failed with NTSTATUS {status:#x}");
+    }
     Ok(bytes)
 }
 
@@ -94,11 +99,8 @@ mod tests {
         assert!(seen.len() > 120);
     }
 
-    #[cfg(unix)]
     #[test]
-    fn temporary_files_are_exclusive_private_and_distinct() {
-        use std::os::unix::fs::MetadataExt;
-
+    fn temporary_files_are_exclusive_and_distinct() {
         let directory =
             std::env::temp_dir().join(format!("mu-random-test-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&directory).unwrap();
@@ -108,7 +110,6 @@ mod tests {
         first.sync_all().unwrap();
 
         assert_ne!(first_path, second_path);
-        assert_eq!(std::fs::metadata(&first_path).unwrap().mode() & 0o077, 0);
         assert_eq!(std::fs::read(&first_path).unwrap(), b"content");
         let _ = std::fs::remove_dir_all(directory);
     }

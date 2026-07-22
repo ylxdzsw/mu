@@ -61,22 +61,16 @@ Return:
 
 The parent should check the child exit status before trusting the answer.
 
-## Asynchronous Delegation
+## Long-Running Delegation
 
-Async delegation is a background task whose command is `mu --output final`.
-Pass the prompt through the bash tool's `stdin` field and launch it with:
+Delegation is synchronous on this Windows branch. Increase the bash timeout and
+wait for the child to finish. Do not use `cmd &` inside a normal bash tool call:
+ordinary bash children remain in Mu's Windows Job Object and are cleaned up
+when the call ends.
 
-```bash
-log=$(mktemp "${TMPDIR:-/tmp}/mu-bg.XXXXXX")
-setsid mu --output final <&0 >"$log" 2>&1 & sid=$!
-printf 'sid=%s start=%s log=%s\n' "$sid" "$(LC_ALL=C ps -o lstart= -p "$sid")" "$log"
-```
-
-The explicit `<&0` gives the background command the tool-provided stdin. Use
-the `background-task` skill to inspect or stop it, then read the log after it
-disappears. This is one-shot delegation: its exit status and Mu session id are
-not retained. Files needed by the parent must be saved at reported paths and
-inspected from a later foreground call.
+Mu deliberately does not provide an escape hatch for persistent background
+processes. If a service must outlive a tool call, ask the user to start and own
+it outside Mu, then interact with it from foreground calls.
 
 ## Parent Responsibilities
 

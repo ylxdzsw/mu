@@ -14,10 +14,6 @@ const BUILTINS: &[(&str, &str)] = &[
         include_str!("../builtins/agent-browser.md"),
     ),
     (
-        "background-task.md",
-        include_str!("../builtins/background-task.md"),
-    ),
-    (
         "brave-search.md",
         include_str!("../builtins/brave-search.md"),
     ),
@@ -31,7 +27,7 @@ const BUILTINS: &[(&str, &str)] = &[
 ];
 
 #[cfg(feature = "portable")]
-const APPLET_NAMES: &[&str] = &["apply_patch", "edit", "view_image"];
+const APPLET_NAMES: &[&str] = &["apply_patch.exe", "edit.exe", "view_image.exe"];
 
 pub fn prepare() -> Result<()> {
     #[cfg(feature = "portable")]
@@ -191,7 +187,7 @@ fn cache_root(
     macos: bool,
 ) -> Result<PathBuf> {
     if let Some(xdg) = xdg_cache_home {
-        let xdg = PathBuf::from(xdg);
+        let xdg = crate::windows_msys2::native_env_path(xdg);
         if !xdg.is_absolute() {
             bail!("XDG_CACHE_HOME must be an absolute path: {}", xdg.display());
         }
@@ -200,7 +196,7 @@ fn cache_root(
 
     let home = home
         .filter(|home| !home.is_empty())
-        .map(PathBuf::from)
+        .map(crate::windows_msys2::native_env_path)
         .context("cannot determine Mu cache directory: HOME is not set")?;
     if !home.is_absolute() {
         bail!(
@@ -247,8 +243,10 @@ fn initialize_applets(executable: &Path, directory: &Path, names: &[&str]) -> Re
         .with_context(|| format!("creating portable applets {}", directory.display()))?;
     for name in names {
         let path = directory.join(name);
-        std::os::unix::fs::symlink(executable, &path)
-            .with_context(|| format!("creating portable applet {}", path.display()))?;
+        if std::fs::hard_link(executable, &path).is_err() {
+            std::fs::copy(executable, &path)
+                .with_context(|| format!("creating portable applet {}", path.display()))?;
+        }
     }
     Ok(())
 }

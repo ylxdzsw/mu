@@ -22,7 +22,7 @@ or config schema), it is spelled out concretely.
 - **Responsive.** Output streams as it is produced. Control returns to the shell
   immediately when a turn completes.
 - **Composable.** The main abstraction is a turn, not a chat app, daemon,
-  terminal UI, or project manager. The zsh and Fish plugins and shell scripts
+  terminal UI, or project manager. The zsh plugin and shell scripts
   coordinate turns; they do not host a separate agent loop.
 - **Non-magical.** No TUI. The shell owns the terminal and line editing; `mu`
   just reads a prompt and appends output. Output streams as it is produced (a
@@ -32,10 +32,9 @@ or config schema), it is spelled out concretely.
   command suite available inside it. A flat config directory. A
   SQLite file for state in the active scope. The core binary itself has no
   interactive input handling.
-- **Unix-like terminal native.** `mu` runs as an ordinary foreground process in
-  a Unix-like shell environment. Completion, history, job control, aliases, and
-  interactive programs remain owned by the user's shell because `mu` never
-  replaces it.
+- **MSYS2 UCRT64 native.** `mu.exe` is a native Windows process that runs MSYS2
+  `bash` for tools and integrates with MSYS2 zsh. Completion, history, aliases,
+  and interactive editing remain owned by zsh because `mu` never replaces it.
 - **Day-to-day general purpose.** Coding is supported but not the focus. The
   agent is a general terminal assistant.
 
@@ -54,11 +53,11 @@ or config schema), it is spelled out concretely.
   via skills (markdown) and `bash` (call any CLI tool, including another `mu`
   process when independent delegation is useful).
 - **No core shell emulation.** The core `mu` binary does not ship shell behavior,
-  raw terminal editing, completion, or prompt rendering. The zsh and Fish
-  plugins are thin shell surfaces that own their native line editors and call
-  `mu` for each turn.
-- **No Windows support.** `mu` is Unix-ish-only. It expects Unix process
-  semantics, `bash -lc`, signals, process groups, and advisory file locks.
+  raw terminal editing, completion, or prompt rendering. The zsh plugin is a
+  thin shell surface that owns zsh line editing and calls `mu` for each turn.
+- **No Unix or generic-Windows support.** This branch targets only native
+  Windows in MSYS2 UCRT64. It does not support Unix builds, PowerShell,
+  `cmd.exe`, Git Bash, Cygwin, WSL, or other MSYS2 environments.
 
 ---
 
@@ -76,7 +75,7 @@ Rationale:
 
 - Cold start in single-digit milliseconds. No runtime bootstrap, no JIT warmup.
 - One physical binary to install and update. Private `apply_patch`, `edit`, and
-  `view_image` symlinks dispatch back into it by `argv[0]`.
+  `view_image` hardlinks or copies dispatch back into it by `argv[0]`.
 - Mature ecosystem for everything needed: async runtime (`tokio`), HTTP/SSE
   (`reqwest`), SQLite (`rusqlite`), JSONC/serde.
 - Because the shell owns line editing, `mu` needs **no** terminal/line-editor
@@ -95,38 +94,37 @@ path itself has no concept of prompts, key bindings, or long-lived UI state.
 
 Interactive use is a thin shell layer around that unit:
 
-- The zsh and Fish plugins are the preferred interactive surfaces. Each owns its
-  shell's line editing, prompt mode, and keybindings, then submits each entered
-  prompt by spawning `mu` for one foreground turn.
+- The zsh plugin is the preferred interactive surface. It owns zsh line
+  editing, prompt mode, and keybindings, then submits each entered prompt by
+  spawning `mu` for one foreground turn.
 
 This single-binary shape is the central decision (see §3 for the full rationale
 recap). It keeps the agent semantics small and scriptable while leaving the
 shell responsible for interaction.
 
-The default Cargo build is native and uses system SQLite plus `native-tls`:
-system OpenSSL on Linux and Apple Security on macOS. For an executable at
-`<prefix>/bin/mu`, built-ins are always `<prefix>/share/mu/` and applets are
-always `<prefix>/libexec/mu/`. Native startup derives those paths without
+The default Cargo build is native and uses UCRT64 system SQLite plus Windows
+SChannel through `native-tls`. For an executable at `<prefix>/bin/mu.exe`,
+built-ins are always `<prefix>/share/mu/` and applets are always
+`<prefix>/libexec/mu/`. Native startup derives those paths without
 checking, creating, or modifying package-owned resources.
 
 The single additive `portable` feature enables `rusqlite/bundled`,
 `reqwest/native-tls-vendored`, and compile-time `include_str!` entries for every
-shipped built-in. On OpenSSL platforms this replaces the system OpenSSL linkage
-with a vendored build; on macOS native TLS continues to use Apple Security.
-Portable resolution treats built-ins and applets independently. If the
-executable is under `bin/` and the corresponding native directory exists, that
-directory wins. Otherwise the resource uses a fixed directory under one
-selected cache root:
+shipped built-in. Provider HTTPS continues to use Windows SChannel. Portable
+resolution treats built-ins and applets independently. If the executable is
+under `bin/` and the corresponding native directory exists, that directory
+wins. Otherwise the resource uses a fixed directory under one selected cache
+root:
 
 - absolute `$XDG_CACHE_HOME/mu` when `XDG_CACHE_HOME` is set;
-- `$HOME/Library/Caches/mu` on macOS;
-- `$HOME/.cache/mu` on other Unix systems.
+- native `$HOME/.cache/mu` otherwise, after converting MSYS2 paths with
+  `cygpath`.
 
 A relative `XDG_CACHE_HOME`, missing usable home, conflicting object, or any
 creation/population error is fatal; `/tmp` is never a fallback. The fixed
 resource directories are `<cache-root>/builtins` and
 `<cache-root>/applets`. On first creation Mu writes the embedded built-in
-strings directly into the former and absolute symlinks to the current
+strings directly into the former and `.exe` hardlinks or copies of the current
 executable into the latter. Existing directories are authoritative regardless
 of their contents. Mu does not validate, refresh, repair, roll back, clean up,
 or atomically stage them; failed creation may therefore leave a partial
@@ -135,24 +133,22 @@ refresh cached paths. The user must remove the applicable resource directory
 to regenerate it. Applet `argv[0]` dispatch occurs before portable
 initialization.
 
-Version-tag artifacts add portable Linux x86-64 musl and macOS ARM64/Intel
-archives with SHA-256 checksums. The archives omit external built-ins because
-they are embedded. Linux statically links musl, SQLite, and vendored OpenSSL
-with no dynamic library dependency; macOS retains only Apple system-library
-linkage. The existing Windows MSYS2 UCRT64 package and release archive remain
-unchanged and are published alongside them.
+The Windows MSYS2 UCRT64 package and release archive remain the supported
+distribution artifacts for this branch.
 
 ### 2.3 Interactive mode lives in shell surfaces
 
-The zsh and Fish plugins are the built-in interactive surfaces. They own only
-line collection, prompt mode, keybindings, and session continuity; every
+The zsh plugin is the built-in interactive surface. It owns only line
+collection, prompt mode, keybindings, and session continuity; every
 non-empty submitted line still runs as a fresh foreground `mu` process.
 
 Consequences:
 
 - `mu` remains scriptable and stateless on exit.
-- Shell plugins never duplicate provider, tool, store, or agent-loop semantics.
-- Ctrl-C and terminal behavior remain ordinary Unix process behavior.
+- The zsh plugin never duplicates provider, tool, store, or agent-loop
+  semantics.
+- Ctrl-C is received through the Windows console-control handler and propagated
+  to every active Bash Job Object.
 
 ### 2.4 Minimal fixed toolset
 
@@ -188,13 +184,13 @@ WAL/SHM/journal sidecars are ordinary SQLite implementation files. See §9,
 
 ## 3. Architecture overview
 
-`mu` has one executable and small zsh and Fish integrations around it. The CLI
+`mu` has one executable and a small zsh integration around it. The CLI
 turn runner remains the core unit.
 
 ```
    ┌──────────────────────────── shell surfaces ────────────────────────────────┐
    │  shell scripts: `mu [opts]` with PROMPT on stdin                          │
-   │  zsh/Fish plugins: prompt mode; each entry spawns one `mu` turn           │
+   │  zsh plugin: prompt mode; each entry spawns one `mu` turn                 │
    └───────────────────────────────────┬───────────────────────────────────────┘
                                         │ invokes the same executable / command path
                                         ▼
@@ -261,8 +257,6 @@ accepts optional non-terminal stdin as a custom focus). The surface is small:
 - `mu.zsh` — zsh prompt mode; each accepted prompt runs one foreground `mu`
   turn and keeps using the same session. `MU_ZSH_SESSION_ID=<id>` seeds
   attachment to an existing session.
-- `mu.fish` — Fish 4 prompt mode with the same turn/session contract.
-  `MU_FISH_SESSION_ID=<id>` seeds attachment to an existing session.
 - `mu project inspect --path <dir>` — report whether a directory resolves to a
   project scope, and which marker (`.mu` or `.git`) was found.
 - `mu project init [--path <dir>] [--force]` — create minimal `.mu/` project
@@ -429,11 +423,11 @@ normal provider response supplies an exact total, status uses the bytes÷4
 projection and marks the percentage as estimated (`~N%` in shell prompts).
 
 **Interruption.** Steps 9d/9e persist only *after* a message is fully formed. If
-SIGINT / a dropped connection / a provider error occurs mid-stream, the partial
+Ctrl-C / a dropped connection / a provider error occurs mid-stream, the partial
 assistant message is never written; the DB holds only completed messages (§11).
 No tool call begins without first persisting its parent assistant message, and a
 result is persisted for every call that begins execution. Once tool execution
-has started, interrupts fan out to every active tool process group, stop
+has started, interrupts fan out to every active Windows Job Object, stop
 launching new tools, drain partial output, and still persist tool results in
 request order, so Ctrl-C stops work without making already-produced tool output
 disappear. Nothing else is written on interruption: the process just exits. Any
@@ -457,10 +451,11 @@ bash({
 })
 ```
 
-`bash` prepends the resolved applet directory to its post-login `PATH`: always
-`<prefix>/libexec/mu/` in a native build; in a portable build, that installed
-directory when present or the cached `applets/` directory otherwise. Before
-normal CLI parsing or portable initialization, `mu` checks the basename of
+`bash` prepends the resolved MSYS2 form of the applet directory to its
+post-login `PATH`: `/ucrt64/libexec/mu/` in a packaged native build; in a
+portable build, that installed directory when present or the cached `applets/`
+directory otherwise. Before normal CLI parsing or portable initialization,
+`mu` checks the file stem of
 `argv[0]` and dispatches these applets:
 
 - **`apply_patch`** accepts one patch argument or reads it from stdin. Its
@@ -547,7 +542,7 @@ quotes, or heredoc delimiters without shell expansion.
 
 **Execution ordering.** Human-facing output may execute maximal contiguous
 batches of `risk:"readonly"` `bash` calls concurrently because each
-call runs in its own process group with isolated `cwd`, environment, timeout,
+call runs in its own Windows Job Object with isolated `cwd`, environment, timeout,
 and stdin. This is an execution optimization only: stored tool-call records,
 stored tool messages, and the next model request still see the original
 assistant tool-call order.
@@ -593,12 +588,12 @@ All local search, file reads, writes, edits, tests, and web fetches go through
 `sed`, `python - <<'PY'` only when appropriate, `curl`, `git diff`, etc.) and use
 literal `stdin` for content that should not be interpreted by the shell.
 
-**Process lifecycle.** Each call spawns one child process. On Unix it is placed
-in its own process group before `exec`, and on Linux `PR_SET_PDEATHSIG` asks the
-kernel to send SIGTERM if `mu` dies. On timeout or interrupt, `mu` sends SIGTERM
-to the process group, waits a short grace period, then sends SIGKILL; if group
-signaling fails it falls back to killing the direct child. Ordinary commands are
-expected not to outlive the tool call.
+**Process lifecycle.** Each call creates a Windows Job Object with
+`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`, starts Bash suspended in a new Windows
+process group, assigns it to the job, and only then resumes its primary thread.
+On timeout or interruption, Mu terminates the Job Object immediately and drains
+available output. Closing the last job handle also kills remaining descendants
+if Mu exits unexpectedly. Ordinary commands cannot outlive the tool call.
 
 For recursive `mu` delegation, the bash tool sets `MU_SUBAGENT_DEPTH` to one
 more than the current process depth. Normal management commands still work at
@@ -607,7 +602,7 @@ reports depth greater than `1`.
 
 `timeout` defaults to 120 seconds and must be greater than zero. `mu` does not
 pre-check command argv size; if `bash -lc <command>` fails with OS
-argument-list-too-long (`E2BIG`), the tool returns a clear error. `mu` does not
+argument-list-too-long (Windows error 206), the tool returns a clear error. `mu` does not
 fall back to temp scripts.
 
 ---
@@ -846,10 +841,10 @@ duration meets `terminal_bell.min_duration_ms` (default 10s). In `detail` and
 
 ---
 
-## 6. zsh and Fish shell surfaces
+## 6. zsh shell surface
 
-The zsh and Fish plugins expose the same shell-native interaction contract.
-Each behaves like a shell editing mode: Tab with the cursor at the beginning of
+The zsh plugin exposes a shell-native interaction contract. It behaves like a
+shell editing mode: Tab with the cursor at the beginning of
 the line toggles the current prompt into or out of `mu>` mode while preserving
 the current buffer. Enter submits the current buffer as one `mu` turn when it
 contains non-whitespace text and otherwise just draws a fresh `mu>` prompt;
@@ -872,8 +867,8 @@ every turn, including the first, receives `--session`. The plugin forwards an
 explicit shell output override when configured, writes the prompt to the child
 process's stdin, waits for the turn to finish, and then redraws `mu>` with the
 same session id.
-`MU_ZSH_OUTPUT` or `MU_FISH_OUTPUT` optionally overrides the density; when
-unset, the child inherits the active `config.jsonc` default. It does not control
+`MU_ZSH_OUTPUT` optionally overrides the density; when unset, the child
+inherits the active `config.jsonc` default. It does not control
 whether the child is interactive.
 The prompt omits the context field while no session is attached and the next
 turn will create one. Once a session exists, it shows the rounded context
@@ -903,9 +898,9 @@ Consequences:
   directly.
 - Ctrl-C while editing in `mu>` mode cancels the current draft, leaves that
   prompt line visible in scrollback, and redraws `mu>` like a shell prompt
-  interrupt. Ctrl-C while a foreground `mu` turn is running uses ordinary Unix
-  signal behavior for the foreground process.
-- After each turn exits, the shell returns to `mu>` mode with the same session
+  interrupt. Ctrl-C while a foreground `mu` turn is running is handled by
+  `mu.exe`, which cancels provider work and terminates active Bash jobs.
+- After each turn exits, zsh returns to `mu>` mode with the same session
   id.
 
 ### 6.2 Entry and exit
@@ -961,35 +956,6 @@ Consequences:
   `MU_ZSH_EXIT_HOOKS` contain zsh function names; enter hooks run after prompt
   mode is active, and exit hooks run after the normal shell prompt is restored.
 
-### 6.2.2 Fish-specific integration
-
-- Source `mu.fish` near the end of `config.fish`. A package may install it as
-  `vendor_conf.d/mu.fish`; sourcing it again after user prompt/key
-  configuration is supported.
-- Fish 4, `jq`, and `mu` on `PATH` are required. `MU_FISH_BIN` overrides the
-  executable and `MU_FISH_OUTPUT` overrides output density. On an older Fish,
-  the plugin reports the version requirement and does not install its
-  integration.
-- The plugin copies and wraps the active `fish_prompt`, `fish_right_prompt`, and
-  `fish_mode_prompt`. Normal shell mode continues to call those saved
-  functions with the prior command status intact; Mu mode replaces them with
-  its status and `mu>` prompt.
-- Mu editing uses a dedicated `mumode` initialized from Fish's complete default
-  editing bindings. On exit, the prior `$fish_bind_mode` is restored. The
-  arrays `MU_FISH_ENTER_HOOKS` and `MU_FISH_EXIT_HOOKS` provide additional
-  function hooks.
-- In normal shell mode, Tab at cursor zero remains the Mu-mode toggle. Away from
-  cursor zero, it delegates to the binding that was active when `mu.fish` was
-  last sourced, separately for Fish's `default` and `insert` modes.
-- Slash/model completion uses Mu's status candidates and Fish filename
-  completion. Multiple candidates are listed with Fish repaint semantics;
-  completion does not promise zsh `zstyle` behavior.
-- Each accepted prompt is added to Fish history as a directly replayable
-  `printf ... | mu ...` command. Slash commands are recorded verbatim.
-- `MU_FISH_SESSION_ID=<id>` seeds an existing session. Session, model,
-  attachment, prompt color, hook, executable, and output state otherwise use
-  `MU_FISH_*` variables corresponding to the zsh variables.
-
 ### 6.3 Context boundaries
 
 - **Full structured history:** `mu` records prompts, assistant responses, and
@@ -1008,8 +974,7 @@ Session lifecycle is exposed through CLI commands:
 - A shell plugin without a session explicitly runs `mu session new` before its
   first submitted prompt, then passes any shell model override to the first
   actual turn and reuses that session for later prompts in the same shell.
-- Exporting the shell-specific `MU_ZSH_SESSION_ID=<id>` or
-  `MU_FISH_SESSION_ID=<id>` before entering `mu>` attaches the plugin to an
+- Exporting `MU_ZSH_SESSION_ID=<id>` before entering `mu>` attaches the plugin to an
   existing session.
 - `mu -c` continues the latest session in the active scope for a one-shot turn.
 - `mu session new` creates a session and prints its id.
@@ -1364,13 +1329,11 @@ The assembled prompt has this fixed order:
 2. A `<runtime>` block of host-stable facts only, as plain `key: value` lines:
    ```
    <runtime>
-   os: linux (Ubuntu 24.04.2 LTS)
+   os: windows (MSYS2 UCRT64)
    date: 2026-06-18
-   user: alice (uid 1000)
+   user: alice
    </runtime>
    ```
-   On Linux, Mu appends the distribution's `PRETTY_NAME` from the standard
-   `os-release` file when available, falling back to `NAME`, then `ID`.
    Per-session environment — current working directory, project root, session
    id, and git worktree details — is **not** part of the system prompt. It is
    introduced once as the first user message when the session is created, and a
@@ -1496,10 +1459,9 @@ fields do not remain as compatibility aliases.
   the first turn with `--session <id>` and any shell-owned model override. There
   is no rendezvous file or inherited descriptor, and the id is never printed by
   the turn itself.
-- **Attach / continue.** `MU_ZSH_SESSION_ID=<id>` and
-  `MU_FISH_SESSION_ID=<id>` seed their respective plugins with an existing
-  session, while `mu -s <id>` and `mu -c` handle one-shot re-entry from the
-  command line. `mu session list` lists recent candidates.
+- **Attach / continue.** `MU_ZSH_SESSION_ID=<id>` seeds the plugin with an
+  existing session, while `mu -s <id>` and `mu -c` handle one-shot re-entry
+  from the command line. `mu session list` lists recent candidates.
 - **Per-turn lifecycle.** Each turn: open DB → acquire `session.owner_pid` →
   normalize any interrupted tail → load session messages → run the turn
   (persisting each completed message as it lands and claiming tool calls before
@@ -1719,9 +1681,9 @@ exits non-zero, leaving all completed messages persisted so the user can inspect
 and re-prompt.
 
 **Exit codes.** `0` success; `1` general/config/provider error; `2` session busy
-(lock held) or `--session` not found; `128 + signal` when a forwarded
-terminating signal ends the turn — most commonly `130` for SIGINT (the shell's
-default for Ctrl-C), and `143` for SIGTERM. A signalled exit takes precedence
+(owned by a live Mu process) or `--session` not found; `128 + signal` when a
+Windows console-control event ends the turn — most commonly `130` for Ctrl-C,
+and `143` for console termination. An interrupted exit takes precedence
 over the generic error code even when the interruption first surfaces as a turn
 error. When enabled by the output density, the summary line is printed only on
 exit `0`.
@@ -1756,7 +1718,7 @@ The protections that remain are cheap and non-intrusive:
   SQLite history provide the audit trail.
 - **Interruptibility.** Because `mu` runs as a foreground job, Ctrl-C is the
   practical "stop" button: it stops launching new work, interrupts every active
-  tool process group, drains visible output where possible, persists completed
+  tool Job Object, drains visible output where possible, persists completed
   messages/tool results, and exits non-zero.
 - **Secrets** are never persisted by `mu`; provider keys come from the
   environment or `config.jsonc`, never the database.

@@ -43,15 +43,6 @@ pub fn tool_definitions() -> Vec<Value> {
     })]
 }
 
-pub fn resolve_path(path: &str) -> PathBuf {
-    let p = PathBuf::from(path);
-    if p.is_absolute() {
-        p
-    } else {
-        std::env::current_dir().unwrap_or_default().join(p)
-    }
-}
-
 pub fn apply_truncation(
     output: String,
     limits: &LimitsConfig,
@@ -99,7 +90,7 @@ fn truncate_output(
     let spill_note = match write_spill(output, spill_prefix) {
         Ok(spill_path) => format!(
             "full output was written to temporary file {}; it may disappear at any time",
-            spill_path.display()
+            crate::windows_msys2::display_path(&spill_path)
         ),
         Err(error) => {
             format!("full output could not be saved ({error}); only this preview is available")
@@ -241,8 +232,6 @@ pub fn parse_args<T: for<'de> Deserialize<'de>>(args: &Value) -> Result<T> {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
-
     use serde_json::json;
 
     use super::{tool_definitions, truncate_line};
@@ -307,7 +296,7 @@ mod tests {
         let marker = "temporary file ";
         let start = clamped.find(marker).unwrap() + marker.len();
         let end = clamped[start..].find(';').unwrap() + start;
-        let spill = PathBuf::from(&clamped[start..end]);
+        let spill = crate::windows_msys2::native_path(&clamped[start..end]).unwrap();
         assert_eq!(
             spill.parent().unwrap(),
             crate::paths::runtime_dir().unwrap()

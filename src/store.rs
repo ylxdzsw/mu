@@ -4,6 +4,12 @@ use anyhow::{Context, Result, bail};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use windows_sys::Win32::Foundation::{
+    CloseHandle, ERROR_ACCESS_DENIED, ERROR_INVALID_PARAMETER, STILL_ACTIVE,
+};
+use windows_sys::Win32::System::Threading::{
+    GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+};
 
 use crate::provider::{
     Attachment, ContentPart, ImageDetail, Message, ToolAttachment, ToolCall, Usage, UserContent,
@@ -1654,18 +1660,28 @@ impl Drop for SessionLock<'_> {
 }
 
 fn process_is_alive(pid: i64) -> Result<bool> {
-    let pid = i32::try_from(pid).context("invalid session owner PID")?;
-    if pid <= 0 {
+    let pid = u32::try_from(pid).context("invalid session owner PID")?;
+    if pid == 0 {
         return Ok(false);
     }
-    if unsafe { libc::kill(pid, 0) } == 0 {
-        return Ok(true);
+    let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+    if process.is_null() {
+        let error = std::io::Error::last_os_error();
+        return match error.raw_os_error().map(|code| code as u32) {
+            Some(ERROR_INVALID_PARAMETER) => Ok(false),
+            Some(ERROR_ACCESS_DENIED) => Ok(true),
+            _ => Err(error).context("checking session owner process"),
+        };
     }
-    match std::io::Error::last_os_error().raw_os_error() {
-        Some(libc::EPERM) => Ok(true),
-        Some(libc::ESRCH) => Ok(false),
-        _ => Err(std::io::Error::last_os_error()).context("checking session owner process"),
+    let mut exit_code = 0;
+    let result = unsafe { GetExitCodeProcess(process, &mut exit_code) };
+    unsafe {
+        CloseHandle(process);
     }
+    if result == 0 {
+        return Err(std::io::Error::last_os_error()).context("checking session owner process");
+    }
+    Ok(exit_code == STILL_ACTIVE as u32)
 }
 
 /// Connection-level tuning, applied before the schema check.
