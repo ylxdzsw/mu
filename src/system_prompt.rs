@@ -256,13 +256,13 @@ pub fn initial_environment_context(cwd: &Path, project: Option<&Project>) -> Str
     let mut lines = vec!["[environment]".to_string()];
 
     if let Some(project) = project {
-        lines.push(format!("project root: {}", project.root.display()));
+        lines.push(format!("mu project root: {}", project.root.display()));
         if let Some(worktree) = &project.worktree {
-            lines.push(format!("git dir: {}", worktree.git_dir.display()));
-            if let Some(common_dir) = &worktree.common_dir {
+            if let Some(main_root) = worktree.main_worktree_root() {
                 lines.push(format!("git worktree root: {}", worktree.root.display()));
-                lines.push(format!("git common dir: {}", common_dir.display()));
-                lines.push("git worktree: yes".into());
+                lines.push(format!("git main worktree root: {}", main_root.display()));
+            } else {
+                lines.push(format!("git root: {}", worktree.root.display()));
             }
         }
     }
@@ -351,11 +351,46 @@ mod tests {
                 }),
             }),
         );
-        assert!(context.contains("project root: /tmp/work"));
-        assert!(context.contains("git worktree root: /tmp/worktree"));
-        assert!(context.contains("git worktree: yes"));
-        assert!(context.contains("current working directory: /tmp/work/subdir"));
-        assert!(!context.contains("active session id"));
+        assert_eq!(
+            context,
+            "[environment]\nmu project root: /tmp/work\ngit worktree root: /tmp/worktree\ngit main worktree root: /tmp/repo\ncurrent working directory: /tmp/work/subdir"
+        );
+    }
+
+    #[test]
+    fn initial_environment_context_uses_git_root_for_a_regular_checkout() {
+        let context = initial_environment_context(
+            Path::new("/tmp/repo/src"),
+            Some(&Project {
+                root: PathBuf::from("/tmp/repo"),
+                marker: ProjectMarker::Git,
+                worktree: Some(crate::paths::GitWorktreeInfo {
+                    root: PathBuf::from("/tmp/repo"),
+                    git_dir: PathBuf::from("/tmp/repo/.git"),
+                    common_dir: None,
+                }),
+            }),
+        );
+        assert_eq!(
+            context,
+            "[environment]\nmu project root: /tmp/repo\ngit root: /tmp/repo\ncurrent working directory: /tmp/repo/src"
+        );
+    }
+
+    #[test]
+    fn initial_environment_context_omits_git_for_a_non_git_project() {
+        let context = initial_environment_context(
+            Path::new("/tmp/project/src"),
+            Some(&Project {
+                root: PathBuf::from("/tmp/project"),
+                marker: ProjectMarker::Mu,
+                worktree: None,
+            }),
+        );
+        assert_eq!(
+            context,
+            "[environment]\nmu project root: /tmp/project\ncurrent working directory: /tmp/project/src"
+        );
     }
 
     #[test]

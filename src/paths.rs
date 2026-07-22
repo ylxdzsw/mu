@@ -22,6 +22,25 @@ pub struct GitWorktreeInfo {
     pub common_dir: Option<PathBuf>,
 }
 
+impl GitWorktreeInfo {
+    pub fn main_worktree_root(&self) -> Option<&Path> {
+        let common_dir = self.common_dir.as_ref()?;
+        if common_dir.file_name()? != ".git" {
+            return None;
+        }
+
+        let admin_name = self
+            .git_dir
+            .strip_prefix(common_dir.join("worktrees"))
+            .ok()?;
+        if admin_name.components().count() != 1 {
+            return None;
+        }
+
+        common_dir.parent()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Scope {
     Project(Project),
@@ -82,7 +101,8 @@ pub fn discover_project(cwd: &Path) -> Option<Project> {
             let worktree = git_worktree_info(dir);
             let root = worktree
                 .as_ref()
-                .and_then(linked_project_root)
+                .and_then(GitWorktreeInfo::main_worktree_root)
+                .map(Path::to_path_buf)
                 .unwrap_or_else(|| dir.to_path_buf());
             return Some(Project {
                 root,
@@ -227,23 +247,6 @@ fn git_worktree_info(root: &Path) -> Option<GitWorktreeInfo> {
         git_dir,
         common_dir,
     })
-}
-
-fn linked_project_root(worktree: &GitWorktreeInfo) -> Option<PathBuf> {
-    let common_dir = worktree.common_dir.as_ref()?;
-    if common_dir.file_name()? != ".git" {
-        return None;
-    }
-
-    let admin_name = worktree
-        .git_dir
-        .strip_prefix(common_dir.join("worktrees"))
-        .ok()?;
-    if admin_name.components().count() != 1 {
-        return None;
-    }
-
-    Some(common_dir.parent()?.to_path_buf())
 }
 
 fn absolutize(base: &Path, path: &Path) -> PathBuf {

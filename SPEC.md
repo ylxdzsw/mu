@@ -975,8 +975,8 @@ the discovered `.git` marker is a worktree pointer file and there is no closer
 directory, the primary checkout is the project root. Project configuration,
 instructions, sessions, and runtime state therefore come from the primary
 checkout's `.mu`, while the invoking `pwd` and Git branch/dirty state remain
-tied to the linked checkout. The agent is told the project root, worktree root,
-Git metadata, and current working directory.
+tied to the linked checkout. The agent is told the Mu project root, active Git
+worktree root, main Git worktree root, and current working directory.
 
 A `.mu` directory always wins over Git discovery, including at a linked
 worktree root; this provides an explicit independent project scope. Bare

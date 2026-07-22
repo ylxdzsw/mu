@@ -61,7 +61,6 @@ pub struct GitStatus {
     pub branch: Option<String>,
     pub dirty: Option<bool>,
     pub git_dir: Option<String>,
-    pub common_dir: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -251,11 +250,6 @@ fn git_status(project: &crate::paths::Project) -> GitStatus {
             .worktree
             .as_ref()
             .map(|info| info.git_dir.display().to_string()),
-        common_dir: project
-            .worktree
-            .as_ref()
-            .and_then(|info| info.common_dir.as_ref())
-            .map(|path| path.display().to_string()),
     }
 }
 
