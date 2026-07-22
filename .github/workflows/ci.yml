@@ -127,10 +127,10 @@ jobs:
           package_root=$(cygpath -u "$RUNNER_TEMP")/mu-package-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}
           mkdir "$package_root"
           cp packaging/msys2/PKGBUILD "$package_root/PKGBUILD"
-          source_url=$(cygpath -am "$PWD")
+          source_url="file://$PWD"
           (
             cd "$package_root"
-            MU_SOURCE_URL="file:///$source_url" \
+            MU_SOURCE_URL="$source_url" \
             MU_SOURCE_BRANCH=ci-msys2 \
               makepkg-mingw --noconfirm --cleanbuild --clean --force
           )
