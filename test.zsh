@@ -212,14 +212,19 @@ _mu_zsh_exit_mode
 [[ "$MU_ZSH_MODE" == shell ]] || fail "mode exit path returns to shell"
 [[ "$BUFFER" == "draft prompt" ]] || fail "mode exit path preserves shell buffer"
 
+worktree_root=$tmpdir/feature-worktree
+mkdir -p -- "$worktree_root/src"
+saved_project_root=$MU_ZSH_TEST_PROJECT_ROOT
+MU_ZSH_TEST_PROJECT_ROOT=$worktree_root
 saved_pwd=$PWD
-builtin cd "$root/src"
-nested_prompt=$(_mu_zsh_build_mode_prompt)
+builtin cd "$worktree_root/src"
+worktree_prompt=$(_mu_zsh_build_mode_prompt)
 builtin cd "$saved_pwd"
-escaped_root=${root//\%/%%}
-nested_pwd=$root/src
+MU_ZSH_TEST_PROJECT_ROOT=$saved_project_root
+escaped_worktree_root=${worktree_root//\%/%%}
+nested_pwd=$worktree_root/src
 escaped_nested_pwd=${nested_pwd//\%/%%}
-[[ "$nested_prompt" == *"%F{12}${escaped_nested_pwd}%f %F{8}(${escaped_root})%f"* ]] || fail "shows project root when cwd differs"
+[[ "$worktree_prompt" == *"%F{12}${escaped_nested_pwd}%f %F{8}(${escaped_worktree_root})%f"* ]] || fail "shows worktree project root when cwd differs"
 
 global_fake_bin=$tmpdir/global-bin
 mkdir -p -- "$global_fake_bin"
@@ -290,6 +295,11 @@ builtin cd "$scope_discovery_dir"
 [[ "$(_mu_zsh_current_scope_key)" == "global" ]] || fail "starts uncached global"
 mkdir -p -- .mu
 [[ "$(_mu_zsh_current_scope_key)" == "project:$scope_discovery_dir" ]] || fail "scope detection refreshes project markers"
+worktree_scope_dir=$tmpdir/scope-worktree
+mkdir -p -- "$worktree_scope_dir/src"
+print -r -- 'gitdir: ../repo/.git/worktrees/feature' > "$worktree_scope_dir/.git"
+builtin cd "$worktree_scope_dir/src"
+[[ "$(_mu_zsh_current_scope_key)" == "project:$worktree_scope_dir" ]] || fail "scope detection stops at a worktree .git pointer"
 builtin cd "$saved_pwd"
 HOME=$saved_home
 

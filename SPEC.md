@@ -743,6 +743,10 @@ interactive.
 The prompt omits the context field while no session is attached and the next
 turn will create one. Once a session exists, it shows the rounded context
 percentage, including `0%` for a short session.
+The status line always shows the invoking `pwd`. When the active project root
+is not literally the same path, it also shows that project root in parentheses;
+this keeps a repository or worktree checkout visible while working in one of
+its subdirectories. In global scope it shows `(global)` instead.
 After ZLE commits the submitted prompt line to scrollback, the plugin prints one
 empty line before child-process output starts, independent of whether the child
 uses `concise`, `detail`, or `full` output.

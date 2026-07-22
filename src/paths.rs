@@ -222,11 +222,12 @@ fn git_worktree_info(root: &Path) -> Option<GitWorktreeInfo> {
 }
 
 fn absolutize(base: &Path, path: &Path) -> PathBuf {
-    if path.is_absolute() {
+    let absolute = if path.is_absolute() {
         path.to_path_buf()
     } else {
         base.join(path)
-    }
+    };
+    absolute.canonicalize().unwrap_or(absolute)
 }
 
 #[cfg(test)]
@@ -243,6 +244,36 @@ mod tests {
         let project = discover_project(&nested).unwrap();
         assert_eq!(project.root, root);
         assert_eq!(project.marker, ProjectMarker::Mu);
+    }
+
+    #[test]
+    fn treats_linked_worktree_as_its_own_project() {
+        let repository = std::env::temp_dir().join(format!("mu-worktree-{}", uuid::Uuid::new_v4()));
+        let worktree = repository.join("worktrees/feature");
+        let nested = worktree.join("src/nested");
+        let git_dir = repository.join(".git/worktrees/feature");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::create_dir_all(&git_dir).unwrap();
+        std::fs::write(
+            worktree.join(".git"),
+            format!("gitdir: {}\n", git_dir.display()),
+        )
+        .unwrap();
+        std::fs::write(git_dir.join("commondir"), "../..\n").unwrap();
+
+        let project = discover_project(&nested).unwrap();
+
+        assert_eq!(project.root, worktree);
+        assert_eq!(project.marker, ProjectMarker::Git);
+        assert_eq!(
+            project.worktree,
+            Some(GitWorktreeInfo {
+                git_dir,
+                common_dir: Some(repository.join(".git")),
+            })
+        );
+
+        let _ = std::fs::remove_dir_all(repository);
     }
 
     #[test]
