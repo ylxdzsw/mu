@@ -1,18 +1,21 @@
 use std::path::{Path, PathBuf};
 
-use fs2::FileExt;
-
-use anyhow::{Context, Result};
-use rusqlite::{Connection, OptionalExtension, params};
+use anyhow::{Context, Result, bail};
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use uuid::Uuid;
 
 use crate::provider::{
-    Attachment, ContentPart, ImageDetail, Message, ToolArtifact, ToolCall, Usage, UserContent,
+    Attachment, ContentPart, ImageDetail, Message, ToolAttachment, ToolCall, Usage, UserContent,
     approx_tokens,
 };
 use crate::tools::BashRisk;
+
+pub const SESSION_DB_ENV: &str = "MU_SESSION_DB";
+pub const BASH_CALL_ID_ENV: &str = "MU_BASH_CALL_ID";
+pub const SESSION_OWNER_PID_ENV: &str = "MU_SESSION_OWNER_PID";
+const MAX_BASH_ATTACHMENTS: i64 = 8;
+const SESSION_ID_RETRIES: usize = 16;
 
 #[derive(Debug, Clone)]
 pub struct Session {
@@ -20,7 +23,7 @@ pub struct Session {
     pub cwd: String,
     pub model: String,
     pub title: Option<String>,
-    pub last_total_tokens: u64,
+    pub last_context_tokens: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -30,7 +33,7 @@ pub struct SessionSummary {
     pub updated_at: String,
     pub cwd: String,
     pub title: Option<String>,
-    pub last_total_tokens: u64,
+    pub last_context_tokens: u64,
     pub message_count: u64,
     pub turn_count: u64,
 }
@@ -44,21 +47,15 @@ pub const INTERRUPTED_TOOL_RESULT: &str = "error: interrupted — this command m
 
 #[derive(Debug, Clone)]
 pub struct MessageRecord {
-    pub id: i64,
-    pub role: String,
+    pub kind: String,
     pub content: String,
-    pub tool_call_id: Option<String>,
-    pub tool_calls_json: Option<String>,
+    pub bash_calls: Vec<ToolCall>,
     pub seq: i64,
 }
 
-pub struct ToolCallRecord<'a> {
-    pub message_id: i64,
-    pub call_id: &'a str,
-    pub tool: &'a str,
-    pub args: &'a str,
-    pub risk: Option<&'a str>,
-    pub status: &'a str,
+pub struct BashResultRecord<'a> {
+    pub bash_call_id: i64,
+    pub outcome: &'a str,
     pub exit_code: Option<i32>,
     pub duration_ms: Option<u64>,
 }
@@ -76,9 +73,7 @@ pub struct TurnAttemptCompletion<'a> {
 }
 
 pub struct ReviewRecord<'a> {
-    pub session_id: &'a str,
-    pub tool_call_id: Option<&'a str>,
-    pub action_json: &'a str,
+    pub bash_call_id: i64,
     pub risk_level: &'a str,
     pub user_auth_level: &'a str,
     pub outcome: &'a str,
@@ -87,7 +82,7 @@ pub struct ReviewRecord<'a> {
 
 pub struct Store {
     conn: Connection,
-    lock_dir: PathBuf,
+    path: Option<PathBuf>,
 }
 
 #[derive(Debug)]
@@ -101,7 +96,7 @@ impl std::fmt::Display for SessionBusy {
 
 impl std::error::Error for SessionBusy {}
 
-const CURRENT_SCHEMA_VERSION: i32 = 8;
+const CURRENT_SCHEMA_VERSION: i32 = 9;
 const COMPATIBLE_SCHEMA_BASELINE: i32 = 6;
 
 fn session_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Session> {
@@ -110,7 +105,7 @@ fn session_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Session> {
         cwd: row.get(1)?,
         model: row.get(2)?,
         title: row.get(3)?,
-        last_total_tokens: row.get::<_, i64>(4)? as u64,
+        last_context_tokens: row.get::<_, i64>(4)? as u64,
     })
 }
 
@@ -124,7 +119,7 @@ impl Store {
         configure_connection(&conn)?;
         let store = Self {
             conn,
-            lock_dir: state_dir.join("locks"),
+            path: Some(path.to_path_buf()),
         };
         store.ensure_schema()?;
         store.enable_foreign_keys()?;
@@ -134,10 +129,7 @@ impl Store {
     pub fn open_memory() -> Result<Self> {
         let conn = Connection::open_in_memory().context("opening in-memory SQLite database")?;
         configure_connection(&conn)?;
-        let store = Self {
-            conn,
-            lock_dir: std::env::temp_dir().join(format!("mu-memory-locks-{}", Uuid::new_v4())),
-        };
+        let store = Self { conn, path: None };
         store.ensure_schema()?;
         store.enable_foreign_keys()?;
         Ok(store)
@@ -180,6 +172,7 @@ impl Store {
             match version {
                 6 => self.migrate_schema_v6_to_v7()?,
                 7 => self.migrate_schema_v7_to_v8()?,
+                8 => self.migrate_schema_v8_to_v9()?,
                 other => anyhow::bail!("no migration path from schema version {other}"),
             }
             version += 1;
@@ -207,36 +200,55 @@ impl Store {
                 cwd TEXT NOT NULL,
                 model TEXT NOT NULL,
                 title TEXT,
-                last_total_tokens INTEGER NOT NULL DEFAULT 0
+                last_context_tokens INTEGER NOT NULL DEFAULT 0,
+                owner_pid INTEGER CHECK(owner_pid IS NULL OR owner_pid > 0)
             );
             CREATE TABLE IF NOT EXISTS message (
                 id INTEGER PRIMARY KEY,
                 session_id TEXT NOT NULL,
-                role TEXT NOT NULL,
+                kind TEXT NOT NULL CHECK(kind IN (
+                    'system', 'user', 'assistant', 'bash_result', 'summary'
+                )),
                 content TEXT NOT NULL,
                 reasoning_content TEXT,
                 native_replay_json TEXT,
                 user_content_json TEXT,
-                tool_content_json TEXT,
-                tool_call_id TEXT,
-                tool_calls_json TEXT,
+                bash_call_id INTEGER,
+                bash_outcome TEXT CHECK(bash_outcome IN (
+                    'completed', 'error', 'interrupted'
+                )),
+                bash_exit_code INTEGER,
+                bash_duration_ms INTEGER CHECK(bash_duration_ms IS NULL OR bash_duration_ms >= 0),
                 seq INTEGER NOT NULL,
                 created_at TEXT NOT NULL,
-                FOREIGN KEY(session_id) REFERENCES session(id)
+                FOREIGN KEY(session_id) REFERENCES session(id),
+                FOREIGN KEY(bash_call_id) REFERENCES bash_call(id),
+                CHECK(
+                    (kind = 'bash_result' AND bash_call_id IS NOT NULL AND bash_outcome IS NOT NULL)
+                    OR
+                    (kind != 'bash_result' AND bash_call_id IS NULL AND bash_outcome IS NULL
+                        AND bash_exit_code IS NULL AND bash_duration_ms IS NULL)
+                ),
+                CHECK(
+                    bash_outcome IS NULL
+                    OR (bash_outcome = 'completed') = (bash_exit_code IS NOT NULL)
+                )
             );
             CREATE UNIQUE INDEX IF NOT EXISTS idx_message_session_seq ON message(session_id, seq);
-            CREATE TABLE IF NOT EXISTS tool_call (
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_message_bash_result
+                ON message(bash_call_id) WHERE bash_call_id IS NOT NULL;
+            CREATE TABLE IF NOT EXISTS bash_call (
                 id INTEGER PRIMARY KEY,
-                call_id TEXT NOT NULL,
-                message_id INTEGER NOT NULL,
-                tool TEXT NOT NULL,
-                args TEXT NOT NULL,
-                risk TEXT,
-                status TEXT NOT NULL,
-                exit_code INTEGER,
-                duration_ms INTEGER,
-                UNIQUE(message_id, call_id),
-                FOREIGN KEY(message_id) REFERENCES message(id)
+                assistant_message_id INTEGER NOT NULL,
+                position INTEGER NOT NULL CHECK(position >= 0),
+                provider_call_id TEXT NOT NULL,
+                arguments TEXT NOT NULL,
+                declared_risk TEXT CHECK(declared_risk IS NULL OR declared_risk IN (
+                    'readonly', 'reversible', 'destructive'
+                )),
+                UNIQUE(assistant_message_id, position),
+                UNIQUE(assistant_message_id, provider_call_id),
+                FOREIGN KEY(assistant_message_id) REFERENCES message(id)
             );
             CREATE TABLE IF NOT EXISTS turn_attempt (
                 id INTEGER PRIMARY KEY,
@@ -271,25 +283,35 @@ impl Store {
                 FOREIGN KEY(session_id) REFERENCES session(id)
             );
             CREATE INDEX IF NOT EXISTS idx_turn_usage_session_id ON turn_usage(session_id);
+            CREATE INDEX IF NOT EXISTS idx_session_updated_at ON session(updated_at);
             CREATE TABLE IF NOT EXISTS attachment_blob (
                 id TEXT PRIMARY KEY,
                 data BLOB NOT NULL,
                 size INTEGER NOT NULL,
-                created_at TEXT NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS review (
-                id INTEGER PRIMARY KEY,
-                session_id TEXT NOT NULL,
-                tool_call_id TEXT,
-                action_json TEXT NOT NULL,
-                risk_level TEXT NOT NULL,
-                user_auth_level TEXT NOT NULL,
-                outcome TEXT NOT NULL,
-                reason TEXT,
                 created_at TEXT NOT NULL,
-                FOREIGN KEY(session_id) REFERENCES session(id)
+                CHECK(size = length(data))
             );
-            PRAGMA user_version = 8;",
+            CREATE TABLE IF NOT EXISTS bash_attachment (
+                bash_call_id INTEGER NOT NULL,
+                position INTEGER NOT NULL CHECK(position >= 0),
+                blob_id TEXT NOT NULL,
+                filename TEXT NOT NULL,
+                media_type TEXT NOT NULL,
+                detail TEXT NOT NULL CHECK(detail IN ('auto', 'low', 'high', 'original')),
+                PRIMARY KEY(bash_call_id, position),
+                FOREIGN KEY(bash_call_id) REFERENCES bash_call(id),
+                FOREIGN KEY(blob_id) REFERENCES attachment_blob(id)
+            );
+            CREATE TABLE IF NOT EXISTS bash_review (
+                bash_call_id INTEGER PRIMARY KEY,
+                risk_level TEXT NOT NULL,
+                auth_level TEXT NOT NULL,
+                outcome TEXT NOT NULL CHECK(outcome IN ('allow', 'deny')),
+                reason TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY(bash_call_id) REFERENCES bash_call(id)
+            );
+            PRAGMA user_version = 9;",
         )?;
         Ok(())
     }
@@ -450,24 +472,229 @@ impl Store {
         Ok(())
     }
 
+    /// v9 specializes the durable function-call model for Bash. Assistant
+    /// messages and their immutable claims are represented separately, while a
+    /// `bash_result` message is itself the unique completion record.
+    fn migrate_schema_v8_to_v9(&self) -> Result<()> {
+        let non_bash_calls: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM tool_call WHERE tool != 'bash'",
+            [],
+            |row| row.get(0),
+        )?;
+        if non_bash_calls != 0 {
+            bail!("cannot migrate session database containing non-Bash tool calls")
+        }
+        let has_legacy_context_column: bool = self.conn.query_row(
+            "SELECT COUNT(*) > 0 FROM pragma_table_info('session') WHERE name = 'last_total_tokens'",
+            [],
+            |row| row.get(0),
+        )?;
+        let tx = self.conn.unchecked_transaction()?;
+        let rename = if has_legacy_context_column {
+            "ALTER TABLE session RENAME COLUMN last_total_tokens TO last_context_tokens;"
+        } else {
+            ""
+        };
+        tx.execute_batch(&format!(
+            "{rename}
+             ALTER TABLE session ADD COLUMN owner_pid INTEGER CHECK(owner_pid IS NULL OR owner_pid > 0);
+             ALTER TABLE message RENAME TO message_v8;
+             DROP INDEX idx_message_session_seq;
+             CREATE TABLE bash_call (
+                id INTEGER PRIMARY KEY,
+                assistant_message_id INTEGER NOT NULL,
+                position INTEGER NOT NULL CHECK(position >= 0),
+                provider_call_id TEXT NOT NULL,
+                arguments TEXT NOT NULL,
+                declared_risk TEXT CHECK(declared_risk IS NULL OR declared_risk IN (
+                    'readonly', 'reversible', 'destructive'
+                )),
+                UNIQUE(assistant_message_id, position),
+                UNIQUE(assistant_message_id, provider_call_id),
+                FOREIGN KEY(assistant_message_id) REFERENCES message(id)
+             );
+             INSERT INTO bash_call (
+                id, assistant_message_id, position, provider_call_id, arguments, declared_risk
+             ) SELECT
+                tc.id,
+                tc.message_id,
+                ROW_NUMBER() OVER (PARTITION BY tc.message_id ORDER BY tc.id) - 1,
+                tc.call_id,
+                tc.args,
+                tc.risk
+             FROM tool_call tc;
+             CREATE TEMP TABLE bash_result_v9 AS
+             SELECT
+                result.id AS message_id,
+                tc.id AS bash_call_id,
+                CASE tc.status
+                    WHEN 'ok' THEN 'completed'
+                    WHEN 'interrupted' THEN 'interrupted'
+                    ELSE 'error'
+                END AS outcome,
+                CASE tc.status WHEN 'ok' THEN COALESCE(tc.exit_code, 0) END AS exit_code,
+                tc.duration_ms
+             FROM message_v8 result
+             JOIN tool_call tc ON tc.id = (
+                SELECT candidate.id
+                FROM tool_call candidate
+                JOIN message_v8 assistant ON assistant.id = candidate.message_id
+                WHERE result.role = 'tool'
+                  AND candidate.call_id = result.tool_call_id
+                  AND assistant.session_id = result.session_id
+                  AND assistant.seq < result.seq
+                ORDER BY assistant.seq DESC
+                LIMIT 1
+             )
+             WHERE result.role = 'tool';
+             CREATE TABLE message (
+                id INTEGER PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                kind TEXT NOT NULL CHECK(kind IN (
+                    'system', 'user', 'assistant', 'bash_result', 'summary'
+                )),
+                content TEXT NOT NULL,
+                reasoning_content TEXT,
+                native_replay_json TEXT,
+                user_content_json TEXT,
+                bash_call_id INTEGER,
+                bash_outcome TEXT CHECK(bash_outcome IN (
+                    'completed', 'error', 'interrupted'
+                )),
+                bash_exit_code INTEGER,
+                bash_duration_ms INTEGER CHECK(bash_duration_ms IS NULL OR bash_duration_ms >= 0),
+                seq INTEGER NOT NULL,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY(session_id) REFERENCES session(id),
+                FOREIGN KEY(bash_call_id) REFERENCES bash_call(id),
+                CHECK(
+                    (kind = 'bash_result' AND bash_call_id IS NOT NULL AND bash_outcome IS NOT NULL)
+                    OR
+                    (kind != 'bash_result' AND bash_call_id IS NULL AND bash_outcome IS NULL
+                        AND bash_exit_code IS NULL AND bash_duration_ms IS NULL)
+                ),
+                CHECK(
+                    bash_outcome IS NULL
+                    OR (bash_outcome = 'completed') = (bash_exit_code IS NOT NULL)
+                )
+             );
+             INSERT INTO message (
+                id, session_id, kind, content, reasoning_content, native_replay_json,
+                user_content_json, bash_call_id, bash_outcome, bash_exit_code,
+                bash_duration_ms, seq, created_at
+             ) SELECT
+                old.id,
+                old.session_id,
+                CASE old.role WHEN 'tool' THEN 'bash_result' ELSE old.role END,
+                old.content,
+                old.reasoning_content,
+                old.native_replay_json,
+                old.user_content_json,
+                result.bash_call_id,
+                result.outcome,
+                result.exit_code,
+                result.duration_ms,
+                old.seq,
+                old.created_at
+             FROM message_v8 old
+             LEFT JOIN bash_result_v9 result ON result.message_id = old.id;
+             CREATE UNIQUE INDEX idx_message_session_seq ON message(session_id, seq);
+             CREATE UNIQUE INDEX idx_message_bash_result
+                ON message(bash_call_id) WHERE bash_call_id IS NOT NULL;
+             CREATE TABLE attachment_blob_v9 (
+                id TEXT PRIMARY KEY,
+                data BLOB NOT NULL,
+                size INTEGER NOT NULL,
+                created_at TEXT NOT NULL,
+                CHECK(size = length(data))
+             );
+             INSERT INTO attachment_blob_v9 SELECT * FROM attachment_blob;
+             DROP TABLE attachment_blob;
+             ALTER TABLE attachment_blob_v9 RENAME TO attachment_blob;
+             CREATE TABLE bash_attachment (
+                bash_call_id INTEGER NOT NULL,
+                position INTEGER NOT NULL CHECK(position >= 0),
+                blob_id TEXT NOT NULL,
+                filename TEXT NOT NULL,
+                media_type TEXT NOT NULL,
+                detail TEXT NOT NULL CHECK(detail IN ('auto', 'low', 'high', 'original')),
+                PRIMARY KEY(bash_call_id, position),
+                FOREIGN KEY(bash_call_id) REFERENCES bash_call(id),
+                FOREIGN KEY(blob_id) REFERENCES attachment_blob(id)
+             );
+             CREATE TABLE bash_review (
+                bash_call_id INTEGER PRIMARY KEY,
+                risk_level TEXT NOT NULL,
+                auth_level TEXT NOT NULL,
+                outcome TEXT NOT NULL CHECK(outcome IN ('allow', 'deny')),
+                reason TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY(bash_call_id) REFERENCES bash_call(id)
+             );
+             INSERT INTO bash_review (
+                bash_call_id, risk_level, auth_level, outcome, reason, created_at
+             ) SELECT
+                bc.id, legacy.risk_level, legacy.user_auth_level, legacy.outcome,
+                COALESCE(legacy.reason, ''), legacy.created_at
+             FROM review legacy
+             JOIN bash_call bc ON bc.id = (
+                SELECT candidate.id
+                FROM bash_call candidate
+                JOIN message assistant ON assistant.id = candidate.assistant_message_id
+                WHERE candidate.provider_call_id = legacy.tool_call_id
+                  AND assistant.session_id = legacy.session_id
+                  AND assistant.created_at <= legacy.created_at
+                ORDER BY assistant.seq DESC
+                LIMIT 1
+             );
+             CREATE INDEX idx_session_updated_at ON session(updated_at);
+             PRAGMA user_version = 9;"
+        ))
+        .context("migrating session database to schema v9")?;
+        migrate_v8_bash_attachments(&tx)?;
+        let legacy_review_count: i64 =
+            tx.query_row("SELECT COUNT(*) FROM review", [], |row| row.get(0))?;
+        let migrated_review_count: i64 =
+            tx.query_row("SELECT COUNT(*) FROM bash_review", [], |row| row.get(0))?;
+        if legacy_review_count != migrated_review_count {
+            bail!("cannot unambiguously link every legacy guardrail review to a Bash call")
+        }
+        tx.execute_batch(
+            "DROP TABLE review;
+             DROP TABLE tool_call;
+             DROP TABLE message_v8;
+             DROP TABLE bash_result_v9;",
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
     /// Test-only: production sessions are created via `create_session_seeded`
     /// so the session row never exists without its system prompt.
     #[cfg(test)]
     pub fn create_session(&self, cwd: &str, model: &str) -> Result<Session> {
-        let id = Uuid::new_v4().to_string();
-        let now = now_rfc3339();
-        self.conn.execute(
-            "INSERT INTO session (id, created_at, updated_at, cwd, model, title, last_total_tokens)
-             VALUES (?1, ?2, ?2, ?3, ?4, NULL, 0)",
-            params![id, now, cwd, model],
-        )?;
-        Ok(Session {
-            id,
-            cwd: cwd.into(),
-            model: model.into(),
-            title: None,
-            last_total_tokens: 0,
-        })
+        for _ in 0..SESSION_ID_RETRIES {
+            let id = crate::random::session_id()?;
+            let now = now_rfc3339();
+            match self.conn.execute(
+                "INSERT INTO session (id, created_at, updated_at, cwd, model, title, last_context_tokens)
+                 VALUES (?1, ?2, ?2, ?3, ?4, NULL, 0)",
+                params![id, now, cwd, model],
+            ) {
+                Ok(_) => {
+                    return Ok(Session {
+                        id,
+                        cwd: cwd.into(),
+                        model: model.into(),
+                        title: None,
+                        last_context_tokens: 0,
+                    });
+                }
+                Err(error) if is_session_id_conflict(&error) => continue,
+                Err(error) => return Err(error.into()),
+            }
+        }
+        bail!("could not allocate a unique session id")
     }
 
     /// Create the session row, its system prompt, and the environment seed in
@@ -480,43 +707,54 @@ impl Store {
         system_prompt: &str,
         environment_seed: &str,
     ) -> Result<Session> {
-        let id = Uuid::new_v4().to_string();
-        let now = now_rfc3339();
-        let tx = self.conn.unchecked_transaction()?;
-        tx.execute(
-            "INSERT INTO session (id, created_at, updated_at, cwd, model, title, last_total_tokens)
-             VALUES (?1, ?2, ?2, ?3, ?4, NULL, 0)",
-            params![id, now, cwd, model],
-        )?;
-        insert_message_in(
-            &tx,
-            &id,
-            &Message::System {
-                content: system_prompt.to_string(),
-            },
-            &now,
-        )?;
-        insert_message_in(
-            &tx,
-            &id,
-            &Message::User {
-                content: UserContent::Text(environment_seed.to_string()),
-            },
-            &now,
-        )?;
-        tx.commit()?;
-        Ok(Session {
-            id,
-            cwd: cwd.into(),
-            model: model.into(),
-            title: None,
-            last_total_tokens: 0,
-        })
+        for _ in 0..SESSION_ID_RETRIES {
+            let id = crate::random::session_id()?;
+            let now = now_rfc3339();
+            let tx = self.conn.unchecked_transaction()?;
+            match tx.execute(
+                "INSERT INTO session (id, created_at, updated_at, cwd, model, title, last_context_tokens)
+                 VALUES (?1, ?2, ?2, ?3, ?4, NULL, 0)",
+                params![id, now, cwd, model],
+            ) {
+                Ok(_) => {
+                    insert_message_in(
+                        &tx,
+                        &id,
+                        &Message::System {
+                            content: system_prompt.to_string(),
+                        },
+                        &now,
+                    )?;
+                    insert_message_in(
+                        &tx,
+                        &id,
+                        &Message::User {
+                            content: UserContent::Text(environment_seed.to_string()),
+                        },
+                        &now,
+                    )?;
+                    tx.commit()?;
+                    return Ok(Session {
+                        id,
+                        cwd: cwd.into(),
+                        model: model.into(),
+                        title: None,
+                        last_context_tokens: 0,
+                    });
+                }
+                Err(error) if is_session_id_conflict(&error) => {
+                    drop(tx);
+                    continue;
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+        bail!("could not allocate a unique session id")
     }
 
     pub fn get_session(&self, id: &str) -> Result<Option<Session>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, cwd, model, title, last_total_tokens
+            "SELECT id, cwd, model, title, last_context_tokens
              FROM session WHERE id = ?1",
         )?;
         let row = stmt.query_row(params![id], session_from_row).optional()?;
@@ -525,7 +763,7 @@ impl Store {
 
     pub fn list_sessions(&self, limit: usize) -> Result<Vec<(Session, String)>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, cwd, model, title, last_total_tokens, updated_at
+            "SELECT id, cwd, model, title, last_context_tokens, updated_at
              FROM session
              ORDER BY updated_at DESC LIMIT ?1",
         )?;
@@ -538,22 +776,20 @@ impl Store {
 
     pub fn session_summary(&self, id: &str) -> Result<Option<SessionSummary>> {
         let mut stmt = self.conn.prepare(
-            // turn_count = completed assistant replies (role='assistant' with no
-            // tool_calls_json, meaning the model finished without requesting a
-            // further tool). This is robust across both provider adapters:
-            //   - Chat Completions: completes with role=assistant, no tool_calls
-            //   - Responses: same persisted shape
+            // turn_count = completed assistant replies with no Bash claims.
             // Counting user rows would be wrong: a session has the environment
             // seed, the actual prompts, AND any cwd-change reminders appended
             // mid-session — all as role='user'. Interrupted turns (assistant
-            // row still carrying tool_calls_json) are intentionally not counted.
+            // row with Bash claims) are intentionally not counted.
             "SELECT
                 s.id, s.created_at, s.updated_at, s.cwd, s.title,
-                s.last_total_tokens,
+                s.last_context_tokens,
                 COUNT(m.id) AS message_count,
                 COALESCE(SUM(CASE
-                    WHEN m.role = 'assistant'
-                     AND (m.tool_calls_json IS NULL OR m.tool_calls_json = '[]')
+                    WHEN m.kind = 'assistant'
+                     AND NOT EXISTS (
+                        SELECT 1 FROM bash_call bc WHERE bc.assistant_message_id = m.id
+                     )
                     THEN 1 ELSE 0 END), 0) AS turn_count
              FROM session s
              LEFT JOIN message m ON m.session_id = s.id
@@ -568,7 +804,7 @@ impl Store {
                     updated_at: row.get(2)?,
                     cwd: row.get(3)?,
                     title: row.get(4)?,
-                    last_total_tokens: row.get::<_, i64>(5)? as u64,
+                    last_context_tokens: row.get::<_, i64>(5)? as u64,
                     message_count: row.get::<_, i64>(6)? as u64,
                     turn_count: row.get::<_, i64>(7)? as u64,
                 })
@@ -579,7 +815,7 @@ impl Store {
 
     pub fn latest_session(&self) -> Result<Option<Session>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, cwd, model, title, last_total_tokens
+            "SELECT id, cwd, model, title, last_context_tokens
              FROM session ORDER BY updated_at DESC LIMIT 1",
         )?;
         let row = stmt.query_row([], session_from_row).optional()?;
@@ -598,13 +834,13 @@ impl Store {
         let tx = self.conn.unchecked_transaction()?;
         if let Some(t) = title {
             tx.execute(
-                "UPDATE session SET updated_at = ?1, last_total_tokens = ?2,
+                "UPDATE session SET updated_at = ?1, last_context_tokens = ?2,
                  title = COALESCE(title, ?3), model = ?4 WHERE id = ?5",
                 params![now, context_tokens as i64, t, model, id],
             )?;
         } else {
             tx.execute(
-                "UPDATE session SET updated_at = ?1, last_total_tokens = ?2,
+                "UPDATE session SET updated_at = ?1, last_context_tokens = ?2,
                  model = ?3 WHERE id = ?4",
                 params![now, context_tokens as i64, model, id],
             )?;
@@ -687,29 +923,36 @@ impl Store {
     }
 
     /// A session is "clean" when its last turn finished — the last message is a
-    /// completed assistant reply with no `tool_calls`. A trailing user prompt,
-    /// tool result, or assistant message still carrying `tool_calls` means the
+    /// completed assistant reply with no Bash calls. A trailing user prompt,
+    /// Bash result, or assistant message carrying Bash calls means the
     /// turn was interrupted. A session whose only message is the synthetic
     /// environment seed (a lone leading user message) is also clean, since no
     /// real turn has run yet. Derived purely from the log so it can never drift
     /// out of sync with the messages (unlike a stored flag).
     pub fn is_session_clean(&self, session_id: &str) -> Result<bool> {
         let mut stmt = self.conn.prepare(
-            "SELECT role, tool_calls_json FROM message
+            "SELECT id, kind FROM message
              WHERE session_id = ?1 ORDER BY seq DESC LIMIT 1",
         )?;
-        let last: Option<(String, Option<String>)> = stmt
+        let last: Option<(i64, String)> = stmt
             .query_row(params![session_id], |row| Ok((row.get(0)?, row.get(1)?)))
             .optional()?;
-        let Some((role, tool_calls_json)) = last else {
+        let Some((message_id, kind)) = last else {
             return Ok(true);
         };
-        match role.as_str() {
-            "assistant" => Ok(!has_tool_calls(tool_calls_json.as_deref())),
+        match kind.as_str() {
+            "assistant" => {
+                let count: i64 = self.conn.query_row(
+                    "SELECT COUNT(*) FROM bash_call WHERE assistant_message_id = ?1",
+                    params![message_id],
+                    |row| row.get(0),
+                )?;
+                Ok(count == 0)
+            }
             "summary" => Ok(true),
             "user" => {
                 let count: i64 = self.conn.query_row(
-                    "SELECT COUNT(*) FROM message WHERE session_id = ?1 AND role != 'system'",
+                    "SELECT COUNT(*) FROM message WHERE session_id = ?1 AND kind != 'system'",
                     params![session_id],
                     |row| row.get(0),
                 )?;
@@ -720,44 +963,49 @@ impl Store {
         }
     }
 
-    /// Make an interrupted turn's history API-valid: every `tool_call` in the
-    /// most recent assistant tool-call message must be followed by a `tool`
+    /// Make an interrupted turn's history API-valid: every Bash claim in the
+    /// most recent assistant call message must be followed by a Bash result
     /// result. Calls that finished keep their real result; result-less calls get
     /// a synthesized interrupted result (see `INTERRUPTED_TOOL_RESULT`).
     /// Idempotent — a no-op once the latest tool-call message is fully answered,
     /// so it is safe to call before every turn/retry. Returns the number of
     /// results synthesized.
     pub fn normalize_interrupted_tail(&self, session_id: &str) -> Result<usize> {
-        let records = self.message_records_from_seq(session_id, 0)?;
-        let Some(idx) = records.iter().rposition(|record| {
-            record.role == "assistant"
-                && parse_tool_calls(record.tool_calls_json.as_deref()).is_some()
-        }) else {
+        let assistant_id: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT m.id
+                 FROM message m
+                 WHERE m.session_id = ?1 AND m.kind = 'assistant'
+                   AND EXISTS (
+                       SELECT 1 FROM bash_call bc WHERE bc.assistant_message_id = m.id
+                   )
+                 ORDER BY m.seq DESC LIMIT 1",
+                params![session_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(assistant_id) = assistant_id else {
             return Ok(0);
         };
-        let assistant_id = records[idx].id;
-        let calls = parse_tool_calls(records[idx].tool_calls_json.as_deref()).unwrap_or_default();
-        let answered: std::collections::HashSet<&str> = records[idx + 1..]
-            .iter()
-            .filter(|record| record.role == "tool")
-            .filter_map(|record| record.tool_call_id.as_deref())
-            .collect();
+        let mut stmt = self.conn.prepare(
+            "SELECT bc.id
+             FROM bash_call bc
+             LEFT JOIN message result ON result.bash_call_id = bc.id
+             WHERE bc.assistant_message_id = ?1 AND result.id IS NULL
+             ORDER BY bc.position",
+        )?;
+        let unanswered = stmt
+            .query_map(params![assistant_id], |row| row.get::<_, i64>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
 
         let mut synthesized = 0;
-        for call in &calls {
-            if answered.contains(call.id.as_str()) {
-                continue;
-            }
-            let risk = BashRisk::from_args_json(&call.function.arguments);
-            self.persist_tool_result(
+        for bash_call_id in unanswered {
+            self.persist_bash_result(
                 session_id,
-                ToolCallRecord {
-                    message_id: assistant_id,
-                    call_id: &call.id,
-                    tool: &call.function.name,
-                    args: &call.function.arguments,
-                    risk: risk.as_ref().map(|risk| risk.as_str()),
-                    status: "interrupted",
+                BashResultRecord {
+                    bash_call_id,
+                    outcome: "interrupted",
                     exit_code: None,
                     duration_ms: None,
                 },
@@ -775,22 +1023,46 @@ impl Store {
         start_seq: i64,
     ) -> Result<Vec<MessageRecord>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, role, content, user_content_json, tool_call_id, tool_calls_json, seq, created_at
+            "SELECT id, kind, content, seq
              FROM message
              WHERE session_id = ?1 AND seq >= ?2
              ORDER BY seq ASC",
         )?;
-        let rows = stmt.query_map(params![session_id, start_seq], load_message_record_row)?;
-        rows.collect::<rusqlite::Result<Vec<_>>>()
-            .context("loading message records")
+        let rows = stmt
+            .query_map(params![session_id, start_seq], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        rows.into_iter()
+            .map(|(id, kind, content, seq)| {
+                Ok(MessageRecord {
+                    bash_calls: if kind == "assistant" {
+                        load_bash_calls(&self.conn, id)?
+                    } else {
+                        Vec::new()
+                    },
+                    kind,
+                    content,
+                    seq,
+                })
+            })
+            .collect()
     }
 
     pub fn load_context_messages(&self, session_id: &str) -> Result<Vec<Message>> {
         let summary_seq = self.latest_summary_seq(session_id)?;
         let start_seq = summary_seq.unwrap_or(-1);
         let mut stmt = self.conn.prepare(
-            "SELECT role, content, reasoning_content, user_content_json, tool_content_json, tool_call_id, tool_calls_json, native_replay_json FROM message
-             WHERE session_id = ?1 AND seq > ?2 AND role NOT IN ('system', 'summary')
+            "SELECT m.id, m.kind, m.content, m.reasoning_content, m.user_content_json,
+                    m.native_replay_json, m.bash_call_id, bc.provider_call_id
+             FROM message m
+             LEFT JOIN bash_call bc ON bc.id = m.bash_call_id
+             WHERE m.session_id = ?1 AND m.seq > ?2 AND m.kind NOT IN ('system', 'summary')
              ORDER BY seq ASC",
         )?;
         let rows = stmt.query_map(params![session_id, start_seq], load_context_row)?;
@@ -811,23 +1083,21 @@ impl Store {
 
         for row in rows {
             let (
-                role,
+                message_id,
+                kind,
                 content,
                 reasoning_content,
                 user_content_json,
-                tool_content_json,
-                tool_call_id,
-                tool_calls_json,
                 native_replay_json,
+                bash_call_id,
+                provider_call_id,
             ) = row?;
-            match role.as_str() {
+            match kind.as_str() {
                 "user" => messages.push(Message::User {
                     content: load_user_content(&self.conn, content, user_content_json)?,
                 }),
                 "assistant" => {
-                    let tool_calls = tool_calls_json
-                        .as_ref()
-                        .and_then(|j| serde_json::from_str(j).ok());
+                    let tool_calls = load_bash_calls(&self.conn, message_id)?;
                     messages.push(Message::Assistant {
                         content: if content.is_empty() {
                             None
@@ -835,16 +1105,20 @@ impl Store {
                             Some(content)
                         },
                         reasoning_content,
-                        tool_calls,
+                        tool_calls: (!tool_calls.is_empty()).then_some(tool_calls),
                         native_replay: native_replay_json
                             .as_deref()
                             .and_then(|json| serde_json::from_str(json).ok()),
                     });
                 }
-                "tool" => messages.push(Message::Tool {
+                "bash_result" => messages.push(Message::Tool {
                     content,
-                    artifacts: load_tool_artifacts(&self.conn, tool_content_json)?,
-                    tool_call_id: tool_call_id.unwrap_or_default(),
+                    attachments: load_bash_attachments(
+                        &self.conn,
+                        bash_call_id.context("Bash result is missing its call identity")?,
+                    )?,
+                    tool_call_id: provider_call_id
+                        .context("Bash result is missing its provider call identity")?,
                 }),
                 other => messages.push(Message::User {
                     content: UserContent::Text(format!("[{other}] {content}")),
@@ -857,7 +1131,7 @@ impl Store {
     pub fn system_prompt(&self, session_id: &str) -> Result<String> {
         let mut stmt = self.conn.prepare(
             "SELECT content FROM message
-             WHERE session_id = ?1 AND role = 'system'
+             WHERE session_id = ?1 AND kind = 'system'
              ORDER BY seq ASC LIMIT 1",
         )?;
         stmt.query_row(params![session_id], |row| row.get(0))
@@ -867,7 +1141,7 @@ impl Store {
 
     fn latest_summary_seq(&self, session_id: &str) -> Result<Option<i64>> {
         let mut stmt = self.conn.prepare(
-            "SELECT seq FROM message WHERE session_id = ?1 AND role = 'summary' ORDER BY seq DESC LIMIT 1",
+            "SELECT seq FROM message WHERE session_id = ?1 AND kind = 'summary' ORDER BY seq DESC LIMIT 1",
         )?;
         let row = stmt
             .query_row(params![session_id], |row| row.get(0))
@@ -887,11 +1161,23 @@ impl Store {
     }
 
     pub fn append_message(&self, session_id: &str, message: &Message) -> Result<i64> {
+        self.append_message_with_bash_calls(session_id, message)
+            .map(|(message_id, _)| message_id)
+    }
+
+    /// Persist a provider response and all of its Bash execution claims as one
+    /// atomic log mutation. Returned ids correspond positionally to the
+    /// assistant message's calls and are the only identities execution uses.
+    pub fn append_message_with_bash_calls(
+        &self,
+        session_id: &str,
+        message: &Message,
+    ) -> Result<(i64, Vec<i64>)> {
         let now = now_rfc3339();
         let tx = self.conn.unchecked_transaction()?;
-        let id = insert_message_in(&tx, session_id, message, &now)?;
+        let (message_id, bash_call_ids) = insert_message_in(&tx, session_id, message, &now)?;
         tx.commit()?;
-        Ok(id)
+        Ok((message_id, bash_call_ids))
     }
 
     pub fn insert_summary_before(
@@ -915,7 +1201,7 @@ impl Store {
             params![session_id],
         )?;
         tx.execute(
-            "INSERT INTO message (session_id, role, content, seq, created_at) VALUES (?1, 'summary', ?2, ?3, ?4)",
+            "INSERT INTO message (session_id, kind, content, seq, created_at) VALUES (?1, 'summary', ?2, ?3, ?4)",
             params![session_id, content, before_seq, now],
         )?;
         tx.commit()?;
@@ -927,86 +1213,122 @@ impl Store {
         let tx = self.conn.unchecked_transaction()?;
         let seq = next_seq_in(&tx, session_id)?;
         tx.execute(
-            "INSERT INTO message (session_id, role, content, seq, created_at) VALUES (?1, 'summary', ?2, ?3, ?4)",
+            "INSERT INTO message (session_id, kind, content, seq, created_at) VALUES (?1, 'summary', ?2, ?3, ?4)",
             params![session_id, content, seq, now],
         )?;
         tx.commit()?;
         Ok(())
     }
 
-    pub fn record_tool_call(&self, record: ToolCallRecord<'_>) -> Result<()> {
-        // OR REPLACE is scoped by UNIQUE(message_id, call_id): a re-persisted
-        // result for the same call replaces its own audit row, while provider
-        // call-id reuse across messages or sessions can never clobber history.
-        self.conn.execute(
-            "INSERT OR REPLACE INTO tool_call (
-                call_id, message_id, tool, args, risk, status, exit_code, duration_ms
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-            params![
-                record.call_id,
-                record.message_id,
-                record.tool,
-                record.args,
-                record.risk,
-                record.status,
-                record.exit_code,
-                record.duration_ms.map(u64_to_i64),
-            ],
+    pub fn append_bash_attachment(
+        &self,
+        bash_call_id: i64,
+        owner_pid: i64,
+        attachment: &Attachment,
+        detail: ImageDetail,
+    ) -> Result<()> {
+        let tx = rusqlite::Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        let state: Option<(Option<i64>, bool)> = tx
+            .query_row(
+                "SELECT session.owner_pid,
+                        EXISTS(
+                            SELECT 1 FROM message result
+                            WHERE result.bash_call_id = bash_call.id
+                        )
+                 FROM bash_call
+                 JOIN message assistant ON assistant.id = bash_call.assistant_message_id
+                 JOIN session ON session.id = assistant.session_id
+                 WHERE bash_call.id = ?1",
+                params![bash_call_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let Some((actual_owner, has_result)) = state else {
+            bail!("Bash attachment sink does not exist")
+        };
+        if actual_owner != Some(owner_pid) {
+            bail!("Bash attachment sink is not owned by this Mu process")
+        }
+        if has_result {
+            bail!("Bash attachment sink is already closed")
+        }
+        persist_bash_attachment_in(
+            &tx,
+            bash_call_id,
+            &ToolAttachment {
+                attachment: attachment.clone(),
+                detail,
+            },
+            &now_rfc3339(),
         )?;
+        tx.commit()?;
         Ok(())
     }
 
-    pub fn persist_tool_result(
+    pub fn persist_bash_result(
         &self,
         session_id: &str,
-        record: ToolCallRecord<'_>,
+        record: BashResultRecord<'_>,
         content: &str,
-        artifacts: &[ToolArtifact],
-    ) -> Result<i64> {
+        attachments: &[ToolAttachment],
+    ) -> Result<(i64, Vec<ToolAttachment>)> {
         let now = now_rfc3339();
         let tx = self.conn.unchecked_transaction()?;
+        let call_session_id: String = tx
+            .query_row(
+                "SELECT assistant.session_id
+                 FROM bash_call bc
+                 JOIN message assistant ON assistant.id = bc.assistant_message_id
+                 WHERE bc.id = ?1",
+                params![record.bash_call_id],
+                |row| row.get(0),
+            )
+            .context("locating Bash claim for result persistence")?;
+        if call_session_id != session_id {
+            bail!("Bash claim belongs to a different session")
+        }
+        for attachment in attachments {
+            persist_bash_attachment_in(&tx, record.bash_call_id, attachment, &now)?;
+        }
+        let attachments = load_bash_attachments(&tx, record.bash_call_id)?;
+        let seq = next_seq_in(&tx, session_id)?;
         tx.execute(
-            "INSERT OR REPLACE INTO tool_call (
-                call_id, message_id, tool, args, risk, status, exit_code, duration_ms
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            "INSERT INTO message (
+                session_id, kind, content, bash_call_id, bash_outcome,
+                bash_exit_code, bash_duration_ms, seq, created_at
+             ) VALUES (?1, 'bash_result', ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             params![
-                record.call_id,
-                record.message_id,
-                record.tool,
-                record.args,
-                record.risk,
-                record.status,
+                session_id,
+                content,
+                record.bash_call_id,
+                record.outcome,
                 record.exit_code,
                 record.duration_ms.map(u64_to_i64),
+                seq,
+                now,
             ],
         )?;
-        let message = Message::Tool {
-            content: content.to_string(),
-            artifacts: artifacts.to_vec(),
-            tool_call_id: record.call_id.to_string(),
-        };
-        let message_id = insert_message_in(&tx, session_id, &message, &now)?;
+        let message_id = tx.last_insert_rowid();
         tx.execute(
             "UPDATE session SET updated_at = ?1 WHERE id = ?2",
             params![now, session_id],
         )?;
         tx.commit()?;
-        Ok(message_id)
+        Ok((message_id, attachments))
     }
 
     pub fn record_review(&self, record: ReviewRecord<'_>) -> Result<()> {
         let now = now_rfc3339();
         self.conn.execute(
-            "INSERT INTO review (session_id, tool_call_id, action_json, risk_level, user_auth_level, outcome, reason, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            "INSERT INTO bash_review (
+                bash_call_id, risk_level, auth_level, outcome, reason, created_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             params![
-                record.session_id,
-                record.tool_call_id,
-                record.action_json,
+                record.bash_call_id,
                 record.risk_level,
                 record.user_auth_level,
                 record.outcome,
-                record.reason,
+                record.reason.unwrap_or(""),
                 now
             ],
         )?;
@@ -1054,46 +1376,113 @@ impl Store {
             .unwrap_or(0)
     }
 
-    pub fn acquire_session_lock(&self, session_id: &str) -> Result<SessionLock> {
-        crate::paths::ensure_dir(&self.lock_dir)?;
-        let lock_path = self.session_lock_path(session_id);
-        let file = std::fs::OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(false)
-            .open(&lock_path)
-            .context("opening session lock file")?;
-        match file.try_lock_exclusive() {
-            Ok(()) => Ok(SessionLock { _file: file }),
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                Err(anyhow::Error::new(SessionBusy))
-            }
-            Err(error) => Err(error).context("acquiring session lock"),
+    pub fn database_path(&self) -> Option<&Path> {
+        self.path.as_deref()
+    }
+
+    pub fn acquire_session_lock(&self, session_id: &str) -> Result<SessionLock<'_>> {
+        let pid = i64::from(std::process::id());
+        let changed = self.conn.execute(
+            "UPDATE session SET owner_pid = ?1 WHERE id = ?2 AND owner_pid IS NULL",
+            params![pid, session_id],
+        )?;
+        if changed == 1 {
+            return Ok(SessionLock {
+                store: self,
+                session_id: session_id.to_string(),
+                pid,
+            });
         }
+
+        let tx = rusqlite::Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        let owner: Option<Option<i64>> = tx
+            .query_row(
+                "SELECT owner_pid FROM session WHERE id = ?1",
+                params![session_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(owner) = owner else {
+            bail!("session not found: {session_id}");
+        };
+        if let Some(owner) = owner
+            && process_is_alive(owner)?
+        {
+            return Err(anyhow::Error::new(SessionBusy));
+        }
+        let changed = tx.execute(
+            "UPDATE session SET owner_pid = ?1 WHERE id = ?2",
+            params![pid, session_id],
+        )?;
+        if changed != 1 {
+            bail!("session disappeared while acquiring ownership: {session_id}");
+        }
+        tx.commit()?;
+        Ok(SessionLock {
+            store: self,
+            session_id: session_id.to_string(),
+            pid,
+        })
     }
 
     pub fn is_session_busy(&self, session_id: &str) -> Result<bool> {
-        let lock_path = self.session_lock_path(session_id);
-        let file = match std::fs::OpenOptions::new().write(true).open(&lock_path) {
-            Ok(file) => file,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-            Err(error) => return Err(error).context("opening session lock file"),
-        };
-        match file.try_lock_exclusive() {
-            Ok(()) => Ok(false),
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => Ok(true),
-            Err(error) => Err(error).context("checking session lock"),
+        let owner: Option<Option<i64>> = self
+            .conn
+            .query_row(
+                "SELECT owner_pid FROM session WHERE id = ?1",
+                params![session_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        match owner.flatten() {
+            Some(pid) => process_is_alive(pid),
+            None => Ok(false),
         }
     }
 
-    fn session_lock_path(&self, session_id: &str) -> PathBuf {
-        self.lock_dir.join(format!("{session_id}.lock"))
+    fn release_session_lock(&self, session_id: &str, pid: i64) -> Result<()> {
+        self.conn.execute(
+            "UPDATE session SET owner_pid = NULL WHERE id = ?1 AND owner_pid = ?2",
+            params![session_id, pid],
+        )?;
+        Ok(())
     }
 }
 
-#[derive(Debug)]
-pub struct SessionLock {
-    _file: std::fs::File,
+pub struct SessionLock<'a> {
+    store: &'a Store,
+    session_id: String,
+    pid: i64,
+}
+
+impl std::fmt::Debug for SessionLock<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SessionLock")
+            .field("session_id", &self.session_id)
+            .field("pid", &self.pid)
+            .finish()
+    }
+}
+
+impl Drop for SessionLock<'_> {
+    fn drop(&mut self) {
+        let _ = self.store.release_session_lock(&self.session_id, self.pid);
+    }
+}
+
+fn process_is_alive(pid: i64) -> Result<bool> {
+    let pid = i32::try_from(pid).context("invalid session owner PID")?;
+    if pid <= 0 {
+        return Ok(false);
+    }
+    if unsafe { libc::kill(pid, 0) } == 0 {
+        return Ok(true);
+    }
+    match std::io::Error::last_os_error().raw_os_error() {
+        Some(libc::EPERM) => Ok(true),
+        Some(libc::ESRCH) => Ok(false),
+        _ => Err(std::io::Error::last_os_error()).context("checking session owner process"),
+    }
 }
 
 /// Connection-level tuning, applied before the schema check.
@@ -1104,7 +1493,7 @@ pub struct SessionLock {
 ///   loss may lose the most recent commits but cannot corrupt the database —
 ///   the right trade for a conversation log.
 /// - `busy_timeout`: rides out the rare cross-session write overlap under WAL
-///   (same-session writers are serialized by the per-session flock).
+///   (same-session turns are serialized by `session.owner_pid`).
 /// - `trusted_schema=OFF`: a project-scope sessions.db can arrive in a cloned
 ///   repository, so do not run functions embedded in a crafted schema. mu's
 ///   own schema uses no views, triggers, or expression indexes.
@@ -1135,23 +1524,15 @@ fn now_rfc3339() -> String {
 }
 
 type ContextRow = (
+    i64,
     String,
     String,
     Option<String>,
     Option<String>,
     Option<String>,
-    Option<String>,
-    Option<String>,
+    Option<i64>,
     Option<String>,
 );
-
-pub fn write_session_id(path: &Path, id: &str) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    std::fs::write(path, id)?;
-    Ok(())
-}
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(untagged)]
@@ -1176,56 +1557,122 @@ struct PersistedAttachment {
 
 #[derive(Debug, Serialize, Deserialize)]
 struct PersistedToolContent {
-    artifacts: Vec<PersistedToolArtifact>,
+    #[serde(alias = "artifacts")]
+    attachments: Vec<PersistedToolAttachment>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-struct PersistedToolArtifact {
+struct PersistedToolAttachment {
     attachment: PersistedAttachment,
     detail: ImageDetail,
 }
 
-fn load_tool_artifacts(
-    conn: &Connection,
-    tool_content_json: Option<String>,
-) -> Result<Vec<ToolArtifact>> {
-    let Some(json) = tool_content_json else {
-        return Ok(Vec::new());
-    };
-    let persisted: PersistedToolContent =
-        serde_json::from_str(&json).context("decoding persisted tool artifacts")?;
-    persisted
-        .artifacts
-        .into_iter()
-        .map(|artifact| {
-            Ok(ToolArtifact {
-                attachment: load_persisted_attachment(conn, artifact.attachment)?,
-                detail: artifact.detail,
-            })
-        })
-        .collect()
+fn migrate_v8_bash_attachments(tx: &rusqlite::Transaction<'_>) -> Result<()> {
+    let mut stmt = tx.prepare(
+        "SELECT result.bash_call_id, legacy.tool_content_json
+         FROM bash_result_v9 result
+         JOIN message_v8 legacy ON legacy.id = result.message_id
+         WHERE legacy.tool_content_json IS NOT NULL",
+    )?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    drop(stmt);
+    for (bash_call_id, json) in rows {
+        let persisted: PersistedToolContent = serde_json::from_str(&json)
+            .context("decoding legacy Bash attachments during schema v9 migration")?;
+        for (position, attachment) in persisted.attachments.into_iter().enumerate() {
+            tx.execute(
+                "INSERT INTO bash_attachment (
+                    bash_call_id, position, blob_id, filename, media_type, detail
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    bash_call_id,
+                    position as i64,
+                    attachment.attachment.blob_id,
+                    attachment.attachment.filename,
+                    attachment.attachment.media_type,
+                    attachment.detail.to_string(),
+                ],
+            )?;
+        }
+    }
+    Ok(())
 }
 
-fn persist_tool_artifacts(
+fn persist_bash_attachment_in(
     tx: &rusqlite::Transaction<'_>,
-    artifacts: &[ToolArtifact],
+    bash_call_id: i64,
+    attachment: &ToolAttachment,
     now: &str,
-) -> Result<Option<String>> {
-    if artifacts.is_empty() {
-        return Ok(None);
+) -> Result<()> {
+    let next: i64 = tx.query_row(
+        "SELECT COALESCE(MAX(position), -1) + 1
+         FROM bash_attachment WHERE bash_call_id = ?1",
+        params![bash_call_id],
+        |row| row.get(0),
+    )?;
+    if next >= MAX_BASH_ATTACHMENTS {
+        bail!("Bash emitted more than {MAX_BASH_ATTACHMENTS} attachments")
     }
-    let artifacts = artifacts
-        .iter()
-        .map(|artifact| {
-            Ok(PersistedToolArtifact {
-                attachment: persist_attachment(tx, &artifact.attachment, now)?,
-                detail: artifact.detail,
-            })
-        })
-        .collect::<Result<Vec<_>>>()?;
-    Ok(Some(serde_json::to_string(&PersistedToolContent {
-        artifacts,
-    })?))
+    let persisted = persist_attachment(tx, &attachment.attachment, now)?;
+    tx.execute(
+        "INSERT INTO bash_attachment (
+            bash_call_id, position, blob_id, filename, media_type, detail
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        params![
+            bash_call_id,
+            next,
+            persisted.blob_id,
+            persisted.filename,
+            persisted.media_type,
+            attachment.detail.to_string(),
+        ],
+    )?;
+    Ok(())
+}
+
+fn load_bash_attachments(conn: &Connection, bash_call_id: i64) -> Result<Vec<ToolAttachment>> {
+    let mut stmt = conn.prepare(
+        "SELECT ta.blob_id, ta.filename, ta.media_type, ta.detail, ab.data
+         FROM bash_attachment ta
+         JOIN attachment_blob ab ON ab.id = ta.blob_id
+         WHERE ta.bash_call_id = ?1
+         ORDER BY ta.position",
+    )?;
+    let rows = stmt.query_map(params![bash_call_id], |row| {
+        let blob_id: String = row.get(0)?;
+        let filename: String = row.get(1)?;
+        let media_type: String = row.get(2)?;
+        let detail: String = row.get(3)?;
+        let data: Vec<u8> = row.get(4)?;
+        Ok((blob_id, filename, media_type, detail, data))
+    })?;
+    let mut attachments = Vec::new();
+    for row in rows {
+        let (blob_id, filename, media_type, detail, data) = row?;
+        if attachment_blob_id(&data) != blob_id {
+            bail!("corrupt attachment blob {blob_id}")
+        }
+        let detail = match detail.as_str() {
+            "auto" => ImageDetail::Auto,
+            "low" => ImageDetail::Low,
+            "high" => ImageDetail::High,
+            "original" => ImageDetail::Original,
+            other => bail!("invalid Bash attachment detail {other}"),
+        };
+        attachments.push(ToolAttachment {
+            attachment: Attachment {
+                filename,
+                media_type,
+                data,
+            },
+            detail,
+        });
+    }
+    Ok(attachments)
 }
 
 fn load_persisted_attachment(
@@ -1327,6 +1774,12 @@ fn attachment_blob_id(data: &[u8]) -> String {
     digest.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
+fn is_session_id_conflict(error: &rusqlite::Error) -> bool {
+    error
+        .to_string()
+        .contains("UNIQUE constraint failed: session.id")
+}
+
 fn u64_to_i64(value: u64) -> i64 {
     value.min(i64::MAX as u64) as i64
 }
@@ -1356,13 +1809,13 @@ fn insert_message_in(
     session_id: &str,
     message: &Message,
     now: &str,
-) -> Result<i64> {
+) -> Result<(i64, Vec<i64>)> {
     let seq = next_seq_in(tx, session_id)?;
     match message {
         Message::User { content } => {
             let user_content_json = persist_user_content(tx, content, now)?;
             tx.execute(
-                "INSERT INTO message (session_id, role, content, user_content_json, seq, created_at)
+                "INSERT INTO message (session_id, kind, content, user_content_json, seq, created_at)
                  VALUES (?1, 'user', ?2, ?3, ?4, ?5)",
                 params![session_id, content.text(), user_content_json, seq, now],
             )?;
@@ -1373,67 +1826,81 @@ fn insert_message_in(
             tool_calls,
             native_replay,
         } => {
-            let tc_json = tool_calls.as_ref().map(serde_json::to_string).transpose()?;
+            let calls = tool_calls.as_deref().unwrap_or_default();
+            for call in calls {
+                if call.function.name != "bash" {
+                    bail!(
+                        "provider requested unsupported function: {}",
+                        call.function.name
+                    )
+                }
+            }
             let native_json = native_replay
                 .as_ref()
                 .map(serde_json::to_string)
                 .transpose()?;
             tx.execute(
-                "INSERT INTO message (session_id, role, content, reasoning_content, tool_calls_json, native_replay_json, seq, created_at)
-                 VALUES (?1, 'assistant', ?2, ?3, ?4, ?5, ?6, ?7)",
+                "INSERT INTO message (session_id, kind, content, reasoning_content, native_replay_json, seq, created_at)
+                 VALUES (?1, 'assistant', ?2, ?3, ?4, ?5, ?6)",
                 params![
                     session_id,
                     content.as_deref().unwrap_or(""),
                     reasoning_content,
-                    tc_json,
                     native_json,
                     seq,
                     now
                 ],
             )?;
+            let message_id = tx.last_insert_rowid();
+            let mut bash_call_ids = Vec::with_capacity(calls.len());
+            for (position, call) in calls.iter().enumerate() {
+                let risk = BashRisk::from_args_json(&call.function.arguments);
+                tx.execute(
+                    "INSERT INTO bash_call (
+                        assistant_message_id, position, provider_call_id, arguments, declared_risk
+                     ) VALUES (?1, ?2, ?3, ?4, ?5)",
+                    params![
+                        message_id,
+                        position as i64,
+                        call.id,
+                        call.function.arguments,
+                        risk.map(BashRisk::as_str),
+                    ],
+                )?;
+                bash_call_ids.push(tx.last_insert_rowid());
+            }
+            return Ok((message_id, bash_call_ids));
         }
-        Message::Tool {
-            content,
-            artifacts,
-            tool_call_id,
-        } => {
-            let tool_content_json = persist_tool_artifacts(tx, artifacts, now)?;
-            tx.execute(
-                "INSERT INTO message (session_id, role, content, tool_content_json, tool_call_id, seq, created_at)
-                 VALUES (?1, 'tool', ?2, ?3, ?4, ?5, ?6)",
-                params![session_id, content, tool_content_json, tool_call_id, seq, now],
-            )?;
-        }
+        Message::Tool { .. } => bail!("Bash results require an internal Bash call identity"),
         Message::System { content } => {
             tx.execute(
-                "INSERT INTO message (session_id, role, content, seq, created_at)
+                "INSERT INTO message (session_id, kind, content, seq, created_at)
                  VALUES (?1, 'system', ?2, ?3, ?4)",
                 params![session_id, content, seq, now],
             )?;
         }
     }
-    Ok(tx.last_insert_rowid())
+    Ok((tx.last_insert_rowid(), Vec::new()))
 }
 
-fn load_message_record_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<MessageRecord> {
-    Ok(MessageRecord {
-        id: row.get(0)?,
-        role: row.get(1)?,
-        content: row.get(2)?,
-        tool_call_id: row.get(4)?,
-        tool_calls_json: row.get(5)?,
-        seq: row.get(6)?,
-    })
-}
-
-pub(crate) fn parse_tool_calls(json: Option<&str>) -> Option<Vec<ToolCall>> {
-    let json = json?;
-    let calls: Vec<ToolCall> = serde_json::from_str(json).ok()?;
-    (!calls.is_empty()).then_some(calls)
-}
-
-fn has_tool_calls(json: Option<&str>) -> bool {
-    parse_tool_calls(json).is_some()
+fn load_bash_calls(conn: &Connection, assistant_message_id: i64) -> Result<Vec<ToolCall>> {
+    let mut stmt = conn.prepare(
+        "SELECT provider_call_id, arguments
+         FROM bash_call
+         WHERE assistant_message_id = ?1
+         ORDER BY position",
+    )?;
+    let rows = stmt.query_map(params![assistant_message_id], |row| {
+        Ok(ToolCall {
+            id: row.get(0)?,
+            function: crate::provider::FunctionCall {
+                name: "bash".to_string(),
+                arguments: row.get(1)?,
+            },
+        })
+    })?;
+    rows.collect::<rusqlite::Result<Vec<_>>>()
+        .context("loading Bash calls")
 }
 
 #[cfg(test)]
@@ -1460,6 +1927,338 @@ mod tests {
             )
             .unwrap();
         session
+    }
+
+    fn bash_call(id: &str) -> ToolCall {
+        ToolCall {
+            id: id.into(),
+            function: FunctionCall {
+                name: "bash".into(),
+                arguments: r#"{"title":"inspect","risk":"readonly","command":"true"}"#.into(),
+            },
+        }
+    }
+
+    #[test]
+    fn assistant_and_bash_claims_commit_atomically() {
+        let (store, tmp) = temp_store();
+        let session = create_session_with_system(&store);
+        let before: i64 = store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM message WHERE session_id = ?1",
+                params![session.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let duplicate = bash_call("duplicate");
+
+        let error = store
+            .append_message_with_bash_calls(
+                &session.id,
+                &Message::Assistant {
+                    content: None,
+                    reasoning_content: None,
+                    native_replay: None,
+                    tool_calls: Some(vec![duplicate.clone(), duplicate]),
+                },
+            )
+            .unwrap_err();
+
+        assert!(error.to_string().contains("UNIQUE constraint failed"));
+        let after: i64 = store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM message WHERE session_id = ?1",
+                params![session.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(after, before);
+        let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    #[test]
+    fn rejects_non_bash_calls_but_persists_malformed_bash_arguments() {
+        let (store, tmp) = temp_store();
+        let session = create_session_with_system(&store);
+        let before: i64 = store
+            .conn
+            .query_row("SELECT COUNT(*) FROM message", [], |row| row.get(0))
+            .unwrap();
+        let mut unsupported = bash_call("unsupported");
+        unsupported.function.name = "python".into();
+        let error = store
+            .append_message_with_bash_calls(
+                &session.id,
+                &Message::Assistant {
+                    content: None,
+                    reasoning_content: None,
+                    native_replay: None,
+                    tool_calls: Some(vec![unsupported]),
+                },
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("unsupported function: python"));
+        let after: i64 = store
+            .conn
+            .query_row("SELECT COUNT(*) FROM message", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(after, before);
+
+        let mut malformed = bash_call("malformed");
+        malformed.function.arguments = "{not json".into();
+        let (_, call_ids) = store
+            .append_message_with_bash_calls(
+                &session.id,
+                &Message::Assistant {
+                    content: None,
+                    reasoning_content: None,
+                    native_replay: None,
+                    tool_calls: Some(vec![malformed]),
+                },
+            )
+            .unwrap();
+        let stored: (String, Option<String>) = store
+            .conn
+            .query_row(
+                "SELECT arguments, declared_risk FROM bash_call WHERE id = ?1",
+                params![call_ids[0]],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(stored, ("{not json".into(), None));
+        store
+            .persist_bash_result(
+                &session.id,
+                BashResultRecord {
+                    bash_call_id: call_ids[0],
+                    outcome: "error",
+                    exit_code: None,
+                    duration_ms: Some(0),
+                },
+                "error: malformed Bash arguments",
+                &[],
+            )
+            .unwrap();
+        let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    #[test]
+    fn bash_result_requires_a_persisted_execution_claim() {
+        let (store, tmp) = temp_store();
+        let session = create_session_with_system(&store);
+        let call = bash_call("call-unclaimed");
+        let (_assistant_id, call_ids) = store
+            .append_message_with_bash_calls(
+                &session.id,
+                &Message::Assistant {
+                    content: None,
+                    reasoning_content: None,
+                    native_replay: None,
+                    tool_calls: Some(vec![call.clone()]),
+                },
+            )
+            .unwrap();
+
+        let error = store
+            .persist_bash_result(
+                &session.id,
+                BashResultRecord {
+                    bash_call_id: i64::MAX,
+                    outcome: "completed",
+                    exit_code: Some(0),
+                    duration_ms: Some(1),
+                },
+                "unexpected",
+                &[],
+            )
+            .unwrap_err();
+
+        assert!(error.to_string().contains("locating Bash claim"));
+        assert_eq!(call_ids.len(), 1);
+        assert_eq!(store.normalize_interrupted_tail(&session.id).unwrap(), 1);
+        let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    #[test]
+    fn review_records_internal_bash_call_reference() {
+        let (store, tmp) = temp_store();
+        let session = create_session_with_system(&store);
+        let call = bash_call("call-reviewed");
+        let (_, call_ids) = store
+            .append_message_with_bash_calls(
+                &session.id,
+                &Message::Assistant {
+                    content: None,
+                    reasoning_content: None,
+                    native_replay: None,
+                    tool_calls: Some(vec![call.clone()]),
+                },
+            )
+            .unwrap();
+        let claim_id = call_ids[0];
+
+        store
+            .record_review(ReviewRecord {
+                bash_call_id: claim_id,
+                risk_level: "destructive",
+                user_auth_level: "reversible",
+                outcome: "deny",
+                reason: Some("too risky"),
+            })
+            .unwrap();
+
+        let stored: (i64, String) = store
+            .conn
+            .query_row("SELECT bash_call_id, outcome FROM bash_review", [], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })
+            .unwrap();
+        assert_eq!(stored, (claim_id, "deny".into()));
+        let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    #[test]
+    fn bash_attachment_sink_is_owned_until_result_and_hydrates() {
+        let (store, tmp) = temp_store();
+        let session = create_session_with_system(&store);
+        let lock = store.acquire_session_lock(&session.id).unwrap();
+        let call = bash_call("call-image");
+        let (assistant_id, ids) = store
+            .append_message_with_bash_calls(
+                &session.id,
+                &Message::Assistant {
+                    content: None,
+                    reasoning_content: None,
+                    native_replay: None,
+                    tool_calls: Some(vec![call.clone()]),
+                },
+            )
+            .unwrap();
+        assert_eq!(ids.len(), 1);
+        let attachment = Attachment {
+            filename: "tool.png".into(),
+            media_type: "image/png".into(),
+            data: b"png bytes".to_vec(),
+        };
+
+        let wrong_owner = store
+            .append_bash_attachment(ids[0], lock.pid + 1, &attachment, ImageDetail::High)
+            .unwrap_err();
+        assert!(wrong_owner.to_string().contains("not owned"));
+        store
+            .append_bash_attachment(ids[0], lock.pid, &attachment, ImageDetail::High)
+            .unwrap();
+
+        let (message_id, hydrated) = store
+            .persist_bash_result(
+                &session.id,
+                BashResultRecord {
+                    bash_call_id: ids[0],
+                    outcome: "completed",
+                    exit_code: Some(0),
+                    duration_ms: Some(4),
+                },
+                "Viewed image",
+                &[],
+            )
+            .unwrap();
+        assert!(message_id > assistant_id);
+        assert_eq!(hydrated.len(), 1);
+        assert_eq!(hydrated[0].attachment, attachment);
+        assert_eq!(hydrated[0].detail, ImageDetail::High);
+
+        let closed = store
+            .append_bash_attachment(ids[0], lock.pid, &attachment, ImageDetail::Low)
+            .unwrap_err();
+        assert!(closed.to_string().contains("already closed"));
+        let result: (String, i64) = store
+            .conn
+            .query_row(
+                "SELECT bash_outcome, bash_call_id FROM message
+                 WHERE bash_call_id = ?1",
+                params![ids[0]],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(result, ("completed".into(), ids[0]));
+        let messages = store.load_context_messages(&session.id).unwrap();
+        assert!(
+            matches!(messages.last(), Some(Message::Tool { attachments, .. }) if attachments == &hydrated)
+        );
+
+        drop(lock);
+        let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    #[test]
+    fn interrupted_bash_result_keeps_committed_attachments_and_enforces_cap() {
+        let (store, tmp) = temp_store();
+        let session = create_session_with_system(&store);
+        let lock = store.acquire_session_lock(&session.id).unwrap();
+        let call = bash_call("call-many");
+        let (_, call_ids) = store
+            .append_message_with_bash_calls(
+                &session.id,
+                &Message::Assistant {
+                    content: None,
+                    reasoning_content: None,
+                    native_replay: None,
+                    tool_calls: Some(vec![call.clone()]),
+                },
+            )
+            .unwrap();
+        let bash_call_id = call_ids[0];
+        for index in 0..8u8 {
+            store
+                .append_bash_attachment(
+                    bash_call_id,
+                    lock.pid,
+                    &Attachment {
+                        filename: format!("{index}.png"),
+                        media_type: "image/png".into(),
+                        data: vec![index],
+                    },
+                    ImageDetail::Auto,
+                )
+                .unwrap();
+        }
+        let cap_error = store
+            .append_bash_attachment(
+                bash_call_id,
+                lock.pid,
+                &Attachment {
+                    filename: "too-many.png".into(),
+                    media_type: "image/png".into(),
+                    data: vec![9],
+                },
+                ImageDetail::Auto,
+            )
+            .unwrap_err();
+        assert!(cap_error.to_string().contains("more than 8 attachments"));
+
+        assert_eq!(store.normalize_interrupted_tail(&session.id).unwrap(), 1);
+        assert_eq!(store.normalize_interrupted_tail(&session.id).unwrap(), 0);
+        let tool = store
+            .load_context_messages(&session.id)
+            .unwrap()
+            .into_iter()
+            .find_map(|message| match message {
+                Message::Tool {
+                    attachments,
+                    content,
+                    ..
+                } => Some((attachments, content)),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(tool.0.len(), 8);
+        assert!(tool.1.contains("interrupted"));
+        assert_eq!(tool.0[7].attachment.data, vec![7]);
+
+        drop(lock);
+        let _ = std::fs::remove_dir_all(tmp);
     }
 
     #[test]
@@ -1555,10 +2354,11 @@ mod tests {
             tables,
             vec![
                 "attachment_blob",
+                "bash_attachment",
+                "bash_call",
+                "bash_review",
                 "message",
-                "review",
                 "session",
-                "tool_call",
                 "turn_attempt",
                 "turn_usage"
             ]
@@ -1573,7 +2373,8 @@ mod tests {
             .unwrap();
         assert!(message_columns.contains(&"reasoning_content".to_string()));
         assert!(message_columns.contains(&"native_replay_json".to_string()));
-        assert!(message_columns.contains(&"tool_content_json".to_string()));
+        assert!(message_columns.contains(&"bash_call_id".to_string()));
+        assert!(message_columns.contains(&"bash_outcome".to_string()));
         let ordering_index_is_unique: i64 = store
             .conn
             .query_row(
@@ -1584,18 +2385,17 @@ mod tests {
             )
             .unwrap();
         assert_eq!(ordering_index_is_unique, 1);
-        let tool_call_columns = store
+        let bash_call_columns = store
             .conn
-            .prepare("PRAGMA table_info(tool_call)")
+            .prepare("PRAGMA table_info(bash_call)")
             .unwrap()
             .query_map([], |row| row.get::<_, String>(1))
             .unwrap()
             .collect::<rusqlite::Result<Vec<_>>>()
             .unwrap();
-        assert!(tool_call_columns.contains(&"call_id".to_string()));
-        assert!(tool_call_columns.contains(&"exit_code".to_string()));
-        assert!(tool_call_columns.contains(&"duration_ms".to_string()));
-        assert!(!tool_call_columns.contains(&"output".to_string()));
+        assert!(bash_call_columns.contains(&"provider_call_id".to_string()));
+        assert!(bash_call_columns.contains(&"arguments".to_string()));
+        assert!(!bash_call_columns.contains(&"status".to_string()));
         let session_columns = store
             .conn
             .prepare("PRAGMA table_info(session)")
@@ -1605,7 +2405,7 @@ mod tests {
             .collect::<rusqlite::Result<Vec<_>>>()
             .unwrap();
         assert!(!session_columns.contains(&"archived".to_string()));
-        // v8: AUTOINCREMENT removed from message, turn_attempt, turn_usage, review.
+        // v9 uses native rowids without AUTOINCREMENT.
         let autoincrement_count: i64 = store
             .conn
             .query_row(
@@ -1617,7 +2417,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             autoincrement_count, 0,
-            "no tables should use AUTOINCREMENT in v8"
+            "no tables should use AUTOINCREMENT in v9"
         );
         let sqlite_sequence_exists: bool = store
             .conn
@@ -1648,7 +2448,7 @@ mod tests {
                 cwd TEXT NOT NULL,
                 model TEXT NOT NULL,
                 title TEXT,
-                last_total_tokens INTEGER NOT NULL DEFAULT 0
+                last_context_tokens INTEGER NOT NULL DEFAULT 0
              );",
         )
         .unwrap();
@@ -1676,7 +2476,7 @@ mod tests {
                 cwd TEXT NOT NULL,
                 model TEXT NOT NULL,
                 title TEXT,
-                last_total_tokens INTEGER NOT NULL DEFAULT 0
+                last_context_tokens INTEGER NOT NULL DEFAULT 0
              );
              CREATE TABLE message (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1762,22 +2562,22 @@ mod tests {
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
         assert_eq!(version, CURRENT_SCHEMA_VERSION);
-        let migrated: (i64, Option<i32>, Option<i64>) = store
+        let migrated: (i64, String, String, Option<String>) = store
             .conn
             .query_row(
-                "SELECT message_id, exit_code, duration_ms FROM tool_call WHERE call_id = 'call-1'",
+                "SELECT assistant_message_id, provider_call_id, arguments, declared_risk
+                 FROM bash_call WHERE provider_call_id = 'call-1'",
                 [],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
             )
             .unwrap();
-        assert_eq!(migrated, (1, None, None));
+        assert_eq!(
+            migrated,
+            (1, "call-1".into(), "{}".into(), Some("readonly".into()))
+        );
         let review_outcome: String = store
             .conn
-            .query_row(
-                "SELECT outcome FROM review WHERE session_id = 'session-1'",
-                [],
-                |row| row.get(0),
-            )
+            .query_row("SELECT outcome FROM bash_review", [], |row| row.get(0))
             .unwrap();
         assert_eq!(review_outcome, "allow");
         assert!(
@@ -1816,32 +2616,32 @@ mod tests {
         std::fs::create_dir_all(&tmp).unwrap();
         let db = tmp.join("mu.db");
         let conn = Connection::open(&db).unwrap();
-        conn.execute_batch("PRAGMA user_version = 9;").unwrap();
+        conn.execute_batch("PRAGMA user_version = 10;").unwrap();
         drop(conn);
 
         let error = Store::open(&db).err().unwrap().to_string();
 
-        assert!(error.contains("schema version 9 is newer"));
+        assert!(error.contains("schema version 10 is newer"));
         assert!(error.contains("upgrade mu"));
         let _ = std::fs::remove_dir_all(tmp);
     }
 
     #[test]
-    fn schema_v7_is_migrated_to_v8_preserving_audit_rows() {
+    fn schema_v7_is_migrated_to_v9_preserving_bash_audit_rows() {
         let tmp = std::env::temp_dir().join(format!("mu-store-v7-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&tmp).unwrap();
         let db = tmp.join("mu.db");
         let conn = Connection::open(&db).unwrap();
         // v7 = v6 baseline + tool_call execution columns + turn_attempt.
         conn.execute_batch(
-            "CREATE TABLE session (
+            r#"CREATE TABLE session (
                 id TEXT PRIMARY KEY,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
                 cwd TEXT NOT NULL,
                 model TEXT NOT NULL,
                 title TEXT,
-                last_total_tokens INTEGER NOT NULL DEFAULT 0
+                last_context_tokens INTEGER NOT NULL DEFAULT 0
              );
              CREATE TABLE message (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1924,9 +2724,21 @@ mod tests {
              INSERT INTO session VALUES (
                 'session-1', 'now', 'now', '/tmp', 'test/model', NULL, 0
              );
+             INSERT INTO attachment_blob VALUES (
+                '2d711642b726b04401627ca9fbac32f5c8530fb1903cc4db02258717921a4881',
+                X'78', 1, 'now'
+             );
              INSERT INTO message (
                 id, session_id, role, content, seq, created_at
              ) VALUES (1, 'session-1', 'assistant', '', 0, 'now');
+             INSERT INTO message (
+                id, session_id, role, content, tool_content_json,
+                tool_call_id, seq, created_at
+             ) VALUES (
+                2, 'session-1', 'tool', 'old output',
+                '{"attachments":[{"attachment":{"blob_id":"2d711642b726b04401627ca9fbac32f5c8530fb1903cc4db02258717921a4881","filename":"old.png","media_type":"image/png"},"detail":"high"}]}',
+                'call-1', 1, 'now'
+             );
              INSERT INTO tool_call VALUES (
                 'call-1', 1, 'bash', '{}', 'readonly', 'old output', 'ok', 3, 250
              );
@@ -1936,7 +2748,7 @@ mod tests {
              ) VALUES (
                 'session-1', 'call-1', '{}', 'destructive', 'reversible', 'deny', 'too risky', 'now'
              );
-             PRAGMA user_version = 7;",
+             PRAGMA user_version = 7;"#,
         )
         .unwrap();
         drop(conn);
@@ -1951,22 +2763,57 @@ mod tests {
         let migrated: (i64, String, Option<i32>, Option<i64>) = store
             .conn
             .query_row(
-                "SELECT message_id, status, exit_code, duration_ms
-                 FROM tool_call WHERE call_id = 'call-1'",
+                "SELECT bc.assistant_message_id, m.bash_outcome,
+                        m.bash_exit_code, m.bash_duration_ms
+                 FROM bash_call bc JOIN message m ON m.bash_call_id = bc.id
+                 WHERE bc.provider_call_id = 'call-1'",
                 [],
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
             )
             .unwrap();
-        assert_eq!(migrated, (1, "ok".into(), Some(3), Some(250)));
-        let review: (String, Option<String>) = store
+        assert_eq!(migrated, (1, "completed".into(), Some(3), Some(250)));
+        let review: (String, String) = store
+            .conn
+            .query_row("SELECT outcome, reason FROM bash_review", [], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })
+            .unwrap();
+        assert_eq!(review, ("deny".into(), "too risky".into()));
+        let migrated_attachment: (String, String, String, String, Vec<u8>) = store
             .conn
             .query_row(
-                "SELECT outcome, reason FROM review WHERE tool_call_id = 'call-1'",
+                "SELECT ba.filename, ba.media_type, ba.detail, ba.blob_id, ab.data
+                 FROM bash_attachment ba
+                 JOIN attachment_blob ab ON ab.id = ba.blob_id",
                 [],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
             )
             .unwrap();
-        assert_eq!(review, ("deny".into(), Some("too risky".into())));
+        assert_eq!(
+            migrated_attachment,
+            (
+                "old.png".into(),
+                "image/png".into(),
+                "high".into(),
+                "2d711642b726b04401627ca9fbac32f5c8530fb1903cc4db02258717921a4881".into(),
+                b"x".to_vec(),
+            )
+        );
+        let foreign_key_errors: i64 = store
+            .conn
+            .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(foreign_key_errors, 0);
         let ordering_index_is_unique: i64 = store
             .conn
             .query_row(
@@ -1987,8 +2834,8 @@ mod tests {
 
         // Two turns whose provider reuses the same call id ("call_0" style).
         for output in ["first", "second"] {
-            let assistant_id = store
-                .append_message(
+            let (_, call_ids) = store
+                .append_message_with_bash_calls(
                     &session.id,
                     &Message::Assistant {
                         content: None,
@@ -2005,15 +2852,11 @@ mod tests {
                 )
                 .unwrap();
             store
-                .persist_tool_result(
+                .persist_bash_result(
                     &session.id,
-                    ToolCallRecord {
-                        message_id: assistant_id,
-                        call_id: "call_0",
-                        tool: "bash",
-                        args: "{}",
-                        risk: Some("readonly"),
-                        status: "ok",
+                    BashResultRecord {
+                        bash_call_id: call_ids[0],
+                        outcome: "completed",
                         exit_code: Some(0),
                         duration_ms: Some(1),
                     },
@@ -2026,7 +2869,7 @@ mod tests {
         let audit_rows: i64 = store
             .conn
             .query_row(
-                "SELECT COUNT(*) FROM tool_call WHERE call_id = 'call_0'",
+                "SELECT COUNT(*) FROM bash_call WHERE provider_call_id = 'call_0'",
                 [],
                 |row| row.get(0),
             )
@@ -2059,7 +2902,7 @@ mod tests {
         let records = store.message_records_from_seq(&session.id, 0).unwrap();
         let log: Vec<(i64, String, String)> = records
             .into_iter()
-            .map(|record| (record.seq, record.role, record.content))
+            .map(|record| (record.seq, record.kind, record.content))
             .collect();
         assert_eq!(
             log,
@@ -2103,7 +2946,7 @@ mod tests {
         let records = store.message_records_from_seq(&session.id, 0).unwrap();
         let log: Vec<(i64, String, String)> = records
             .into_iter()
-            .map(|record| (record.seq, record.role, record.content))
+            .map(|record| (record.seq, record.kind, record.content))
             .collect();
         assert_eq!(
             log,
@@ -2173,7 +3016,7 @@ mod tests {
 
         store
             .conn
-            .execute("UPDATE attachment_blob SET data = X'FF'", [])
+            .execute("UPDATE attachment_blob SET data = X'FF', size = 1", [])
             .unwrap();
         let error = store.load_context_messages(&session.id).unwrap_err();
         assert!(error.to_string().contains("corrupt attachment blob"));
@@ -2189,11 +3032,11 @@ mod tests {
     }
 
     #[test]
-    fn reloads_tool_image_artifacts_and_reuses_attachment_blobs() {
+    fn reloads_tool_image_attachments_and_reuses_attachment_blobs() {
         let (store, tmp) = temp_store();
         let session = create_session_with_system(&store);
         let data = b"\x89PNG\r\n\x1a\nrest".to_vec();
-        let artifact = ToolArtifact {
+        let attachment = ToolAttachment {
             attachment: Attachment {
                 filename: "tool.png".into(),
                 media_type: "image/png".into(),
@@ -2201,14 +3044,28 @@ mod tests {
             },
             detail: ImageDetail::High,
         };
-        store
-            .append_message(
+        let (_, call_ids) = store
+            .append_message_with_bash_calls(
                 &session.id,
-                &Message::Tool {
-                    content: "Viewed image".into(),
-                    artifacts: vec![artifact.clone()],
-                    tool_call_id: "call-image".into(),
+                &Message::Assistant {
+                    content: None,
+                    reasoning_content: None,
+                    tool_calls: Some(vec![bash_call("call-image")]),
+                    native_replay: None,
                 },
+            )
+            .unwrap();
+        store
+            .persist_bash_result(
+                &session.id,
+                BashResultRecord {
+                    bash_call_id: call_ids[0],
+                    outcome: "completed",
+                    exit_code: Some(0),
+                    duration_ms: Some(1),
+                },
+                "Viewed image",
+                std::slice::from_ref(&attachment),
             )
             .unwrap();
         store
@@ -2216,18 +3073,17 @@ mod tests {
                 &session.id,
                 &Message::User {
                     content: UserContent::Parts(vec![ContentPart::Attachment {
-                        attachment: artifact.attachment.clone(),
+                        attachment: attachment.attachment.clone(),
                     }]),
                 },
             )
             .unwrap();
 
         let messages = store.load_context_messages(&session.id).unwrap();
-        assert!(matches!(
-            &messages[1],
-            Message::Tool { artifacts, .. }
-                if artifacts == &vec![artifact]
-        ));
+        assert!(messages.iter().any(|message| matches!(
+            message,
+            Message::Tool { attachments, .. } if attachments == &vec![attachment.clone()]
+        )));
         let blob_count: i64 = store
             .conn
             .query_row("SELECT COUNT(*) FROM attachment_blob", [], |row| row.get(0))
@@ -2325,8 +3181,8 @@ mod tests {
                 },
             )
             .unwrap();
-        let assistant_id = store
-            .append_message(
+        let (_, call_ids) = store
+            .append_message_with_bash_calls(
                 &session.id,
                 &Message::Assistant {
                     content: None,
@@ -2357,15 +3213,11 @@ mod tests {
             .unwrap();
         // Only the first call finished cleanly.
         store
-            .persist_tool_result(
+            .persist_bash_result(
                 &session.id,
-                ToolCallRecord {
-                    message_id: assistant_id,
-                    call_id: "call-a",
-                    tool: "bash",
-                    args: "{\"title\":\"a\",\"risk\":\"readonly\",\"command\":\"echo a\"}",
-                    risk: Some("readonly"),
-                    status: "ok",
+                BashResultRecord {
+                    bash_call_id: call_ids[0],
+                    outcome: "completed",
                     exit_code: Some(0),
                     duration_ms: Some(12),
                 },
@@ -2376,8 +3228,9 @@ mod tests {
         let execution: (Option<i32>, Option<i64>) = store
             .conn
             .query_row(
-                "SELECT exit_code, duration_ms FROM tool_call WHERE call_id = 'call-a'",
-                [],
+                "SELECT bash_exit_code, bash_duration_ms
+                 FROM message WHERE bash_call_id = ?1",
+                params![call_ids[0]],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .unwrap();

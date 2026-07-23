@@ -40,7 +40,7 @@ TRAPEXIT() {
   local exit_code=$?
   if (( ZSH_SUBSHELL == 0 )); then
     if (( exit_code )); then
-      print -u2 -- "test artifacts: $tmpdir"
+      print -u2 -- "test files: $tmpdir"
     else
       rm -rf -- "$tmpdir"
     fi
@@ -87,14 +87,19 @@ if [[ "$1" == "status" ]]; then
   fi
   exit 0
 fi
+if [[ "$1" == "--model" ]]; then
+  shift 2
+fi
+if [[ "$1" == "session" && "$2" == "new" ]]; then
+  print -r -- "$*" >> "$MU_ZSH_FAKE_LOG"
+  print -r -- "ses_01234567"
+  exit 0
+fi
 if [[ "$1" == "--output" && "$3" == "review.md" ]]; then
   print -r -- "$*" >> "$MU_ZSH_FAKE_LOG"
   if [[ ! -t 0 ]]; then
     prompt=$(cat)
     [[ -n "$prompt" ]] && print -r -- "prompt=$prompt" >> "$MU_ZSH_FAKE_LOG"
-  fi
-  if [[ -n "$MU_SESSION_FILE" ]]; then
-    print -r -- "created-session" > "$MU_SESSION_FILE"
   fi
   exit 0
 fi
@@ -113,9 +118,6 @@ fi
 print -r -- "$*" >> "$MU_ZSH_FAKE_LOG"
 prompt=$(cat)
 print -r -- "prompt=$prompt" >> "$MU_ZSH_FAKE_LOG"
-if [[ -n "$MU_SESSION_FILE" ]]; then
-  print -r -- "created-session" > "$MU_SESSION_FILE"
-fi
 EOF
 chmod +x "$prompt_fake_bin/mu"
 MU_ZSH_BIN=$prompt_fake_bin/mu
@@ -356,29 +358,20 @@ quoted=$(_mu_zsh_quote_prompt $'quote " dollar $ backslash \\ newline\nnext')
 eval "roundtrip=$quoted"
 [[ "$roundtrip" == $'quote " dollar $ backslash \\ newline\nnext' ]] || fail "quoted prompt roundtrips"
 
-tmp=${TMPDIR:-/tmp}/mu-zsh-test-${$}.session
-print -r -- "session-from-file" > "$tmp"
-MU_ZSH_SESSION_FILE=$tmp
-MU_ZSH_SESSION_ID=
-_mu_zsh_read_session_file
-[[ "$MU_ZSH_SESSION_ID" == "session-from-file" ]] || fail "reads session file"
-rm -f "$tmp"
-
 export MU_ZSH_FAKE_LOG=${TMPDIR:-/tmp}/mu-zsh-test-${$}.log
 rm -f "$MU_ZSH_FAKE_LOG"
 MU_ZSH_OUTPUT=detail
-MU_ZSH_SESSION_FILE=${TMPDIR:-/tmp}/mu-zsh-test-submit-${$}.session
 MU_ZSH_SESSION_ID=
 _mu_zsh_submit_prompt "first prompt"
-[[ "$MU_ZSH_SESSION_ID" == "created-session" ]] || fail "captures session id after first submit"
+[[ "$MU_ZSH_SESSION_ID" == "ses_01234567" ]] || fail "captures session id after explicit session creation"
 
 _mu_zsh_submit_prompt "second prompt"
 grep -q -- "--output detail" "$MU_ZSH_FAKE_LOG" || fail "passes output mode"
-grep -q -- "-s created-session" "$MU_ZSH_FAKE_LOG" || fail "passes session id on later submit"
+grep -q -- "-s ses_01234567" "$MU_ZSH_FAKE_LOG" || fail "passes session id on later submit"
 grep -q -- "prompt=first prompt" "$MU_ZSH_FAKE_LOG" || fail "sends first prompt on stdin"
 grep -q -- "prompt=second prompt" "$MU_ZSH_FAKE_LOG" || fail "sends second prompt on stdin"
 
-rm -f "$MU_ZSH_FAKE_LOG" "$MU_ZSH_SESSION_FILE"
+rm -f "$MU_ZSH_FAKE_LOG"
 
 MU_ZSH_BIN=$prompt_fake_bin/mu
 MU_ZSH_OUTPUT=detail
@@ -490,13 +483,13 @@ custom_prompt=$(cat "$MU_ZSH_FAKE_LOG")
 [[ "$custom_prompt" == *$'prompt=First line\nSecond line'* ]] || fail "custom slash command preserves multiline instruction"
 _mu_zsh_run_slash_command "/new"
 [[ -z "$MU_ZSH_SESSION_ID" && -z "$MU_ZSH_SESSION_SCOPE" ]] || fail "new slash command lazily clears tracked session"
-rm -f "$MU_ZSH_FAKE_LOG" "$MU_ZSH_SESSION_FILE"
+rm -f "$MU_ZSH_FAKE_LOG"
 _mu_zsh_run_slash_command "/review.md"
-[[ "$MU_ZSH_SESSION_ID" == "created-session" ]] || fail "custom slash command captures new session id"
+[[ "$MU_ZSH_SESSION_ID" == "ses_01234567" ]] || fail "custom slash command captures new session id"
 _mu_zsh_clear_session_state
-rm -f "$MU_ZSH_FAKE_LOG" "$MU_ZSH_SESSION_FILE"
+rm -f "$MU_ZSH_FAKE_LOG"
 _mu_zsh_run_slash_command "/review.md Start a fresh session"
-[[ "$MU_ZSH_SESSION_ID" == "created-session" ]] || fail "custom slash instruction captures new session id"
+[[ "$MU_ZSH_SESSION_ID" == "ses_01234567" ]] || fail "custom slash instruction captures new session id"
 grep -Fxq -- "prompt=Start a fresh session" "$MU_ZSH_FAKE_LOG" || fail "fresh custom slash command pipes instruction"
 _mu_zsh_clear_session_state
 if _mu_zsh_run_slash_command "/retry"; then
@@ -536,19 +529,27 @@ if [[ "$1" == "status" ]]; then
   print -r -- "{\"model\":{\"provider_id\":\"test\",\"model_id\":\"scope-model\",\"effort\":null,\"canonical\":\"scope-model\"},\"context_percent\":10.0,\"project_root\":\"$scope_root\"}"
   exit 0
 fi
+if [[ "$1" == "--model" ]]; then
+  shift 2
+fi
+if [[ "$1" == "session" && "$2" == "new" ]]; then
+  print -r -- "$PWD :: $*" >> "$MU_ZSH_SCOPE_LOG"
+  case "$scope_name" in
+    project-a) print -r -- "ses_0000000a" ;;
+    project-b) print -r -- "ses_0000000b" ;;
+    *) print -r -- "ses_0000000c" ;;
+  esac
+  exit 0
+fi
 print -r -- "$PWD :: $*" >> "$MU_ZSH_SCOPE_LOG"
 prompt=$(cat)
 print -r -- "prompt=$prompt" >> "$MU_ZSH_SCOPE_LOG"
-if [[ -n "$MU_SESSION_FILE" ]]; then
-  print -r -- "session-$scope_name" > "$MU_SESSION_FILE"
-fi
 EOF
 chmod +x "$scope_fake_bin/mu"
 MU_ZSH_BIN=$scope_fake_bin/mu
 MU_ZSH_OUTPUT=detail
-MU_ZSH_SESSION_FILE=${TMPDIR:-/tmp}/mu-zsh-scope-submit-${$}.session
 export MU_ZSH_SCOPE_LOG=${TMPDIR:-/tmp}/mu-zsh-scope-${$}.log
-rm -f "$MU_ZSH_SCOPE_LOG" "$MU_ZSH_SESSION_FILE"
+rm -f "$MU_ZSH_SCOPE_LOG"
 MU_ZSH_SESSION_ID=
 MU_ZSH_SESSION_SCOPE=
 MU_ZSH_EFFECTIVE_SESSION_ID=
@@ -556,7 +557,7 @@ MU_ZSH_EFFECTIVE_SESSION_ID=
 saved_pwd=$PWD
 builtin cd "$project_a/subdir"
 _mu_zsh_submit_prompt "project a prompt"
-[[ "$MU_ZSH_SESSION_ID" == "session-project-a" ]] || fail "creates a scoped session for the first project"
+[[ "$MU_ZSH_SESSION_ID" == "ses_0000000a" ]] || fail "creates a scoped session for the first project"
 
 MU_ZSH_MODEL=model-for-a
 MU_ZSH_MODEL_SCOPE=$(_mu_zsh_current_scope_key)
@@ -567,15 +568,15 @@ assert_command_reply "does not reuse another project's session before submitting
 : > "$MU_ZSH_SCOPE_LOG"
 status_json=$(_mu_zsh_status_json)
 [[ "$status_json" == *"\"project_root\":\"$project_b\""* ]] || fail "status follows the current project"
-! grep -q -- "-s session-project-a" "$MU_ZSH_SCOPE_LOG" || fail "status should not attach the first project's session in a different project"
+! grep -q -- "-s ses_0000000a" "$MU_ZSH_SCOPE_LOG" || fail "status should not attach the first project's session in a different project"
 
 builtin cd "$project_a/subdir"
 _mu_zsh_base_command_reply
-assert_command_reply "returns to the original scoped session and model after cd-ing back" "$scope_fake_bin/mu" --output detail -s session-project-a --model model-for-a
+assert_command_reply "returns to the original scoped session and model after cd-ing back" "$scope_fake_bin/mu" --output detail -s ses_0000000a --model model-for-a
 
 builtin cd "$project_b/subdir"
 _mu_zsh_submit_prompt "project b prompt"
-[[ "$MU_ZSH_SESSION_ID" == "session-project-b" ]] || fail "creates a new scoped session after submitting in the second project"
+[[ "$MU_ZSH_SESSION_ID" == "ses_0000000b" ]] || fail "creates a new scoped session after submitting in the second project"
 [[ "$MU_ZSH_SESSION_SCOPE" == "project:$project_b" ]] || fail "moves the tracked session scope after starting in the second project"
 [[ -z "$MU_ZSH_MODEL" && -z "$MU_ZSH_MODEL_SCOPE" ]] || fail "forgets pending model after submitting in another project"
 
@@ -585,7 +586,7 @@ assert_command_reply "forgets the first project's session once a new one starts 
 
 builtin cd "$saved_pwd"
 MU_ZSH_BIN=$prompt_fake_bin/mu
-rm -f "$MU_ZSH_SCOPE_LOG" "$MU_ZSH_SESSION_FILE"
+rm -f "$MU_ZSH_SCOPE_LOG"
 
 if [[ ${MU_ZSH_SKIP_PTY:-0} == 1 ]]; then
   print -- ok
@@ -637,12 +638,16 @@ if [ "$1" = "status" ]; then
   fi
   exit 0
 fi
+if [ "$1" = "--model" ]; then
+  shift 2
+fi
+if [ "$1" = "session" ] && [ "$2" = "new" ]; then
+  printf '%s\n' "ses_01234567"
+  exit 0
+fi
 printf x >> "$TEST_CAPTURE_CALLS"
 printf '%s\n' "$@" > "$TEST_CAPTURE_ARGS"
 cat > "$TEST_CAPTURE_STDIN"
-if [ -n "$MU_SESSION_FILE" ]; then
-  printf '%s\n' "created-session" > "$MU_SESSION_FILE"
-fi
 if [ "$2" = detail ]; then
   printf '%s\n\n' "[thought 100ms, 2 tokens]"
 fi
@@ -736,7 +741,7 @@ print -rn -- 'hello'$'\n' > "$interactive_expected_stdin"
 cmp -- "$interactive_expected_stdin" "$interactive_capture_stdin" || fail "interactive prompt should be passed on stdin"
 
 interactive_args=("${(@f)$(<"$interactive_capture_args")}")
-expected_interactive_args=(--output detail)
+expected_interactive_args=(--output detail -s ses_01234567)
 [[ "${(j:\0:)interactive_args}" == "${(j:\0:)expected_interactive_args}" ]] || fail "unexpected interactive args: ${interactive_args[*]}"
 
 no_prompt_sp_transcript=$tmpdir/no-prompt-sp-transcript
@@ -803,7 +808,7 @@ custom_slash_expected_stdin=$tmpdir/custom-slash-expected-stdin
 print -rn -- 'First line'$'\n''Second line' > "$custom_slash_expected_stdin"
 cmp -- "$custom_slash_expected_stdin" "$interactive_capture_stdin" || fail "custom slash instruction should preserve multiline text"
 interactive_args=("${(@f)$(<"$interactive_capture_args")}")
-expected_custom_slash_args=(--output detail review.md)
+expected_custom_slash_args=(--output detail -s ses_01234567 review.md)
 [[ "${(j:\0:)interactive_args}" == "${(j:\0:)expected_custom_slash_args}" ]] || fail "custom slash command should use the command path"
 
 concise_transcript=$tmpdir/concise-transcript
@@ -826,7 +831,7 @@ raw_newline_count_between "$concise_transcript" 'concise prompt' "Hello! I'm you
 after_response=${normalized#*"Hello! I'm your terminal agent."}
 [[ "$after_response" != *'[mu] tokens:'* ]] || fail "concise output should omit the token summary"
 interactive_args=("${(@f)$(<"$interactive_capture_args")}")
-expected_concise_args=(--output concise)
+expected_concise_args=(--output concise -s ses_01234567)
 [[ "${(j:\0:)interactive_args}" == "${(j:\0:)expected_concise_args}" ]] || fail "unexpected concise interactive args: ${interactive_args[*]}"
 
 model_switch_transcript=$tmpdir/model-switch-transcript
@@ -1004,7 +1009,7 @@ interactive_status=0
 [[ ! -e "$history_disabled_replay" ]] || fail "mu-mode arrows should not execute the recalled shell history entry"
 [[ $(<"$interactive_capture_calls") == x ]] || fail "mu-mode arrows should still submit exactly one mu prompt"
 
-[[ "$(<"$interactive_capture_args")" == "" ]] || fail "default zsh invocation should inherit config output: $(<"$interactive_capture_args")"
+[[ "$(<"$interactive_capture_args")" == $'-s\nses_01234567' ]] || fail "default zsh invocation should inherit config output: $(<"$interactive_capture_args")"
 print -rn -- "$history_disabled_prompt"$'\n' > "$interactive_expected_stdin"
 cmp -- "$interactive_expected_stdin" "$interactive_capture_stdin" || fail "mu-mode arrows should leave the draft unchanged before submit"
 

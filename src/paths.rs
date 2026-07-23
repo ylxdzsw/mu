@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Project {
@@ -136,6 +136,67 @@ pub fn ensure_dir(path: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
+/// Return Mu's private, flat runtime directory.
+///
+/// The directory is deliberately outside project state. It is shared by the
+/// current user's Mu processes, but never treated as a world-shared `/tmp`
+/// namespace. A pre-existing unsafe directory is rejected instead of being
+/// relaxed or followed.
+pub fn runtime_dir() -> Result<PathBuf> {
+    let directory = std::env::temp_dir().join("mu");
+    let metadata = match std::fs::symlink_metadata(&directory) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::DirBuilderExt;
+
+                let mut builder = std::fs::DirBuilder::new();
+                builder.mode(0o700);
+                match builder.create(&directory) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                    Err(error) => {
+                        return Err(error).with_context(|| {
+                            format!(
+                                "creating private Mu temporary directory {}",
+                                directory.display()
+                            )
+                        });
+                    }
+                }
+            }
+            std::fs::symlink_metadata(&directory).with_context(|| {
+                format!("checking Mu temporary directory {}", directory.display())
+            })?
+        }
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!("checking Mu temporary directory {}", directory.display())
+            });
+        }
+    };
+    if !metadata.is_dir() {
+        bail!(
+            "Mu temporary path is not a directory: {}",
+            directory.display()
+        );
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let mode = metadata.mode() & 0o777;
+        let uid = unsafe { libc::geteuid() };
+        if metadata.uid() != uid || mode & 0o077 != 0 {
+            bail!(
+                "Mu temporary directory is not private to this user: {}",
+                directory.display()
+            );
+        }
+    }
+    Ok(directory)
+}
+
 pub fn ensure_project_layout(scope: &Scope) -> Result<()> {
     let layout = match scope {
         Scope::Global => StateLayout::Global,
@@ -224,7 +285,7 @@ fn project_marker_name(marker: ProjectMarker) -> &'static str {
 const PROJECT_CONFIG_TEMPLATE: &str =
     "{\n  // Optional project-local overrides merged over ~/.mu/config.jsonc.\n}\n";
 
-const STATE_GITIGNORE: &str = ".gitignore\n.env\nsessions.db\nsessions.db-*\nlocks/\ntruncation/\n";
+const STATE_GITIGNORE: &str = ".gitignore\n.env\nsessions.db\nsessions.db-*\n";
 
 fn git_worktree_info(root: &Path) -> Option<GitWorktreeInfo> {
     let dot_git = root.join(".git");
@@ -261,6 +322,18 @@ fn absolutize(base: &Path, path: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn runtime_directory_is_private_and_owned_by_the_current_user() {
+        use std::os::unix::fs::MetadataExt;
+
+        let directory = runtime_dir().unwrap();
+        let metadata = std::fs::symlink_metadata(directory).unwrap();
+        assert!(metadata.is_dir());
+        assert_eq!(metadata.uid(), unsafe { libc::geteuid() });
+        assert_eq!(metadata.mode() & 0o077, 0);
+    }
 
     #[test]
     fn discovers_nearest_mu_project_without_creating_files() {

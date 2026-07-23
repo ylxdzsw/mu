@@ -72,7 +72,7 @@ pub struct StatusSession {
     pub updated_at: String,
     pub message_count: u64,
     pub turn_count: u64,
-    pub last_total_tokens: u64,
+    pub last_context_tokens: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Default)]
@@ -219,8 +219,8 @@ fn context_percent(
 ) -> Option<f64> {
     let session = session?;
     let context_window = model_info.context_window?;
-    let tokens = if session.last_total_tokens > 0 {
-        session.last_total_tokens
+    let tokens = if session.last_context_tokens > 0 {
+        session.last_context_tokens
     } else {
         store.estimate_context_tokens(&session.id)
     };
@@ -236,7 +236,7 @@ fn status_session(summary: crate::store::SessionSummary) -> StatusSession {
         updated_at: summary.updated_at,
         message_count: summary.message_count,
         turn_count: summary.turn_count,
-        last_total_tokens: summary.last_total_tokens,
+        last_context_tokens: summary.last_context_tokens,
     }
 }
 

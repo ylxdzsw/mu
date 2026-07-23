@@ -28,7 +28,7 @@ pub fn dispatch(applet: Applet) -> i32 {
 mod apply_patch {
     use std::collections::HashSet;
     use std::fs::{self, OpenOptions};
-    use std::io::{Read, Write};
+    use std::io::{Read, Seek, SeekFrom, Write};
     use std::path::{Component, Path, PathBuf};
 
     use anyhow::{Context, Result, bail};
@@ -75,19 +75,21 @@ mod apply_patch {
         Update {
             path: PathBuf,
             reported_path: PathBuf,
+            original: String,
             content: String,
             permissions: fs::Permissions,
         },
         Move {
             from: PathBuf,
             to: PathBuf,
+            original: String,
             content: String,
             permissions: fs::Permissions,
         },
         MoveSymlink {
             from: PathBuf,
             to: PathBuf,
-            target_update: Option<(PathBuf, String, fs::Permissions)>,
+            target_update: Option<(PathBuf, String, String, fs::Permissions)>,
         },
     }
 
@@ -347,12 +349,18 @@ mod apply_patch {
                             changes.push(PlannedChange::MoveSymlink {
                                 from: full,
                                 to: destination,
-                                target_update: Some((target, content, metadata.permissions())),
+                                target_update: Some((
+                                    target,
+                                    original,
+                                    content,
+                                    metadata.permissions(),
+                                )),
                             });
                         } else {
                             changes.push(PlannedChange::Update {
                                 path: target,
                                 reported_path: full,
+                                original,
                                 content,
                                 permissions: metadata.permissions(),
                             });
@@ -365,7 +373,7 @@ mod apply_patch {
                     let original = fs::read_to_string(&full)
                         .with_context(|| format!("reading file to update {}", path.display()))?;
                     let content = if chunks.is_empty() {
-                        original
+                        original.clone()
                     } else {
                         apply_chunks(&original, &path, &chunks)?
                     };
@@ -373,6 +381,7 @@ mod apply_patch {
                         changes.push(PlannedChange::Move {
                             from: full,
                             to: destination_full,
+                            original,
                             content,
                             permissions: entry_metadata.permissions(),
                         });
@@ -380,6 +389,7 @@ mod apply_patch {
                         changes.push(PlannedChange::Update {
                             reported_path: full.clone(),
                             path: full,
+                            original,
                             content,
                             permissions: entry_metadata.permissions(),
                         });
@@ -569,24 +579,53 @@ mod apply_patch {
         let mut completed = Vec::new();
         for change in changes {
             let result = match change {
-                PlannedChange::Add { path, content } => atomic_write(path, content, None, false),
+                PlannedChange::Add { path, content } => {
+                    atomic_write(path, content, None, false, None)
+                }
                 PlannedChange::Delete { path } => {
                     fs::remove_file(path).with_context(|| format!("deleting {}", path.display()))
                 }
                 PlannedChange::Update {
                     path,
                     reported_path: _,
+                    original,
                     content,
                     permissions,
-                } => atomic_write(path, content, Some(permissions.clone()), true),
+                } => atomic_write(
+                    path,
+                    content,
+                    Some(permissions.clone()),
+                    true,
+                    Some(original),
+                ),
                 PlannedChange::Move {
                     from,
                     to,
+                    original,
                     content,
                     permissions,
-                } => atomic_write(to, content, Some(permissions.clone()), false).and_then(|()| {
-                    fs::remove_file(from).with_context(|| format!("removing {}", from.display()))
-                }),
+                } => {
+                    fs::rename(from, to).with_context(|| {
+                        format!("moving {} to {}", from.display(), to.display())
+                    })?;
+                    if let Err(error) =
+                        atomic_write(to, content, Some(permissions.clone()), true, Some(original))
+                    {
+                        return match fs::rename(to, from) {
+                            Ok(()) => Err(error.context(format!(
+                                "updating moved file {}; move rolled back",
+                                to.display()
+                            ))),
+                            Err(rollback_error) => Err(error.context(format!(
+                                "updating moved file {}; also failed to roll back {} to {}: {rollback_error}",
+                                to.display(),
+                                to.display(),
+                                from.display()
+                            ))),
+                        };
+                    }
+                    Ok(())
+                }
                 PlannedChange::MoveSymlink {
                     from,
                     to,
@@ -599,9 +638,14 @@ mod apply_patch {
                     fs::rename(from, to).with_context(|| {
                         format!("moving symlink {} to {}", from.display(), to.display())
                     })?;
-                    if let Some((target, content, permissions)) = target_update
-                        && let Err(error) =
-                            atomic_write(target, content, Some(permissions.clone()), true)
+                    if let Some((target, original, content, permissions)) = target_update
+                        && let Err(error) = atomic_write(
+                            target,
+                            content,
+                            Some(permissions.clone()),
+                            true,
+                            Some(original),
+                        )
                     {
                         return match fs::rename(to, from) {
                             Ok(()) => Err(error.context(format!(
@@ -637,41 +681,110 @@ mod apply_patch {
         content: &str,
         permissions: Option<fs::Permissions>,
         replace: bool,
+        expected: Option<&str>,
     ) -> Result<()> {
         let parent = path.parent().unwrap_or_else(|| Path::new("."));
         fs::create_dir_all(parent)
             .with_context(|| format!("creating parent directory {}", parent.display()))?;
+        if replace {
+            return overwrite_existing(path, content.as_bytes(), expected, permissions);
+        }
+
         let filename = path
             .file_name()
             .and_then(|name| name.to_str())
             .unwrap_or("file");
-        let temporary = parent.join(format!(".{filename}.mu-{}.tmp", uuid::Uuid::new_v4()));
+        let (mut file, temporary) =
+            crate::random::create_temp_file(parent, &format!(".{filename}.mu-tmp-"), ".tmp")?;
         let result = (|| -> Result<()> {
-            let mut file = OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&temporary)
-                .with_context(|| format!("creating temporary file {}", temporary.display()))?;
             file.write_all(content.as_bytes())?;
-            file.sync_all()?;
             if let Some(permissions) = permissions {
                 file.set_permissions(permissions)?;
             }
+            file.sync_all()?;
             drop(file);
-            if replace {
-                fs::rename(&temporary, path)
-                    .with_context(|| format!("replacing {}", path.display()))?;
-            } else {
-                fs::hard_link(&temporary, path)
-                    .with_context(|| format!("creating {} without overwriting", path.display()))?;
-                fs::remove_file(&temporary)?;
-            }
+            fs::hard_link(&temporary, path)
+                .with_context(|| format!("creating {} without overwriting", path.display()))?;
+            fs::remove_file(&temporary)?;
             Ok(())
         })();
         if result.is_err() {
             let _ = fs::remove_file(&temporary);
         }
         result
+    }
+
+    fn overwrite_existing(
+        path: &Path,
+        content: &[u8],
+        expected: Option<&str>,
+        _permissions: Option<fs::Permissions>,
+    ) -> Result<()> {
+        let mut target = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .with_context(|| format!("opening {} for locked update", path.display()))?;
+        target
+            .try_lock()
+            .map_err(|error| anyhow::anyhow!("file is busy or cannot be locked: {error}"))?;
+        target.seek(SeekFrom::Start(0))?;
+        let mut old = Vec::new();
+        target.read_to_end(&mut old)?;
+        if let Some(expected) = expected
+            && old != expected.as_bytes()
+        {
+            bail!(
+                "file changed while the edit was being prepared; re-read {} and retry",
+                path.display()
+            );
+        }
+
+        let parent = path.parent().unwrap_or_else(|| Path::new("."));
+        let filename = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("file");
+        let (mut backup, backup_path) =
+            crate::random::create_temp_file(parent, &format!(".{filename}.mu-backup-"), ".tmp")?;
+        if let Err(error) = backup.write_all(&old).and_then(|()| backup.sync_all()) {
+            drop(backup);
+            let _ = fs::remove_file(&backup_path);
+            return Err(error)
+                .with_context(|| format!("writing edit backup {}", backup_path.display()));
+        }
+        drop(backup);
+
+        let result = (|| -> Result<()> {
+            target.set_len(0)?;
+            target.seek(SeekFrom::Start(0))?;
+            target.write_all(content)?;
+            target.sync_all()?;
+            Ok(())
+        })();
+        if let Err(error) = result {
+            let restore = (|| -> Result<()> {
+                target.set_len(0)?;
+                target.seek(SeekFrom::Start(0))?;
+                target.write_all(&old)?;
+                target.sync_all()?;
+                Ok(())
+            })();
+            if restore.is_ok() {
+                let _ = fs::remove_file(&backup_path);
+                return Err(error.context("edit failed; the original file was restored"));
+            }
+            return Err(error.context(format!(
+                "edit failed; recovery backup remains at {}",
+                backup_path.display()
+            )));
+        }
+        fs::remove_file(&backup_path).with_context(|| {
+            format!(
+                "file was updated, but transient edit backup could not be removed: {}",
+                backup_path.display()
+            )
+        })
     }
 
     fn format_summary(changes: &[PlannedChange], cwd: &Path) -> String {
@@ -728,6 +841,23 @@ mod apply_patch {
         }
 
         #[test]
+        #[ignore = "invoked only by the advisory-lock subprocess test"]
+        fn file_lock_holder_for_subprocess_test() {
+            let path = std::env::var_os("MU_EDIT_LOCK_TEST_PATH").unwrap();
+            let ready = std::env::var_os("MU_EDIT_LOCK_TEST_READY").unwrap();
+            let file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(path)
+                .unwrap();
+            file.lock().unwrap();
+            fs::write(ready, "locked").unwrap();
+            loop {
+                std::thread::sleep(std::time::Duration::from_secs(1));
+            }
+        }
+
+        #[test]
         fn parses_and_applies_add_update_move_delete() {
             let dir = temp_dir();
             fs::write(dir.join("old.txt"), "one\ntwo\n").unwrap();
@@ -745,6 +875,101 @@ mod apply_patch {
             );
             assert!(!dir.join("old.txt").exists());
             assert!(!dir.join("delete.txt").exists());
+            fs::remove_dir_all(dir).unwrap();
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn existing_file_update_preserves_inode_and_hardlinks_and_removes_backup() {
+            use std::os::unix::fs::MetadataExt;
+
+            let dir = temp_dir();
+            let path = dir.join("file.txt");
+            let hardlink = dir.join("hardlink.txt");
+            fs::write(&path, "old\n").unwrap();
+            fs::hard_link(&path, &hardlink).unwrap();
+            let before = fs::metadata(&path).unwrap();
+
+            atomic_write(&path, "new\n", None, true, Some("old\n")).unwrap();
+
+            let after = fs::metadata(&path).unwrap();
+            assert_eq!((after.dev(), after.ino()), (before.dev(), before.ino()));
+            assert_eq!(fs::read_to_string(&hardlink).unwrap(), "new\n");
+            let backup_prefix = ".file.txt.mu-backup-";
+            assert!(fs::read_dir(&dir).unwrap().all(|entry| {
+                !entry
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(backup_prefix)
+            }));
+            fs::remove_dir_all(dir).unwrap();
+        }
+
+        #[test]
+        fn changed_snapshot_aborts_without_writing_or_leaving_backup() {
+            let dir = temp_dir();
+            let path = dir.join("file.txt");
+            fs::write(&path, "changed\n").unwrap();
+
+            let error = atomic_write(&path, "new\n", None, true, Some("old\n")).unwrap_err();
+
+            assert!(
+                error
+                    .to_string()
+                    .contains("changed while the edit was being prepared")
+            );
+            assert_eq!(fs::read_to_string(&path).unwrap(), "changed\n");
+            assert!(fs::read_dir(&dir).unwrap().all(|entry| {
+                !entry
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".file.txt.mu-backup-")
+            }));
+            fs::remove_dir_all(dir).unwrap();
+        }
+
+        #[test]
+        fn existing_file_update_rejects_another_process_advisory_lock() {
+            let dir = temp_dir();
+            let path = dir.join("file.txt");
+            let ready = dir.join("ready");
+            fs::write(&path, "old\n").unwrap();
+            let mut holder = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "applets::apply_patch::tests::file_lock_holder_for_subprocess_test",
+                    "--ignored",
+                    "--nocapture",
+                ])
+                .env("MU_EDIT_LOCK_TEST_PATH", &path)
+                .env("MU_EDIT_LOCK_TEST_READY", &ready)
+                .spawn()
+                .unwrap();
+
+            let contention = (|| -> Result<()> {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                while !ready.exists() {
+                    if let Some(status) = holder.try_wait()? {
+                        bail!("file-lock holder exited before becoming ready: {status}");
+                    }
+                    if std::time::Instant::now() >= deadline {
+                        bail!("timed out waiting for file-lock holder");
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                let error = atomic_write(&path, "new\n", None, true, Some("old\n")).unwrap_err();
+                assert!(error.to_string().contains("file is busy"));
+                assert_eq!(fs::read_to_string(&path).unwrap(), "old\n");
+                Ok(())
+            })();
+
+            let _ = holder.kill();
+            let _ = holder.wait();
+            contention.unwrap();
+            atomic_write(&path, "new\n", None, true, Some("old\n")).unwrap();
+            assert_eq!(fs::read_to_string(&path).unwrap(), "new\n");
             fs::remove_dir_all(dir).unwrap();
         }
 
@@ -1030,6 +1255,7 @@ mod edit {
     struct PlannedEdit {
         target: PathBuf,
         reported_path: PathBuf,
+        original: String,
         content: String,
         permissions: fs::Permissions,
         blocks: usize,
@@ -1077,6 +1303,7 @@ mod edit {
             &planned.content,
             Some(planned.permissions.clone()),
             true,
+            Some(&planned.original),
         )?;
         Ok(format_summary(&planned, &cwd))
     }
@@ -1308,6 +1535,7 @@ mod edit {
         }
 
         let replacements = matches.len();
+        let original_snapshot = original.clone();
         let mut content = original;
         for found in matches.iter().rev() {
             content.replace_range(found.start..found.end, &found.replacement);
@@ -1315,6 +1543,7 @@ mod edit {
         Ok(PlannedEdit {
             target,
             reported_path,
+            original: original_snapshot,
             content,
             permissions: metadata.permissions(),
             blocks: blocks.len(),
@@ -1686,6 +1915,7 @@ mod edit {
                 &planned.content,
                 Some(planned.permissions.clone()),
                 true,
+                Some(&planned.original),
             )
             .unwrap();
             assert_eq!(
@@ -1894,6 +2124,7 @@ mod edit {
                 &planned.content,
                 Some(planned.permissions.clone()),
                 true,
+                Some(&planned.original),
             )
             .unwrap();
 
@@ -1918,9 +2149,9 @@ mod view_image {
 
     use clap::Parser;
 
-    use crate::artifact::write_image_artifact;
     use crate::attachment::load_attachment;
     use crate::provider::ImageDetail;
+    use crate::tool_attachment::write_image_attachment;
 
     #[derive(Debug, Parser)]
     #[command(
@@ -1955,7 +2186,7 @@ mod view_image {
         if !attachment.media_type.starts_with("image/") {
             anyhow::bail!("unsupported image type: {}", attachment.media_type);
         }
-        write_image_artifact(&attachment, args.detail)?;
+        write_image_attachment(&attachment, args.detail)?;
         println!(
             "Viewed image: {} ({}, {} bytes, detail={})",
             attachment.filename,

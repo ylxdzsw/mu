@@ -32,7 +32,7 @@ it is no longer needed.
 Redirect all three standard streams as shown. For fixed launch input, replace
 `/dev/null` with an input file. This method reports running or gone, but cannot
 recover the command's exit status. Background commands cannot return tool
-artifacts; save ordinary files and inspect them in a later foreground call.
+attachments; save ordinary files and inspect them in a later foreground call.
 
 This recipe requires a compatible `setsid` executable (normally util-linux on
 Linux). If it is unavailable, report that background launch is unsupported

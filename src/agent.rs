@@ -1,4 +1,3 @@
-use std::path::Path;
 use std::time::{Duration, Instant};
 
 use anyhow::{Result, bail};
@@ -14,7 +13,7 @@ use crate::provider::{
     approx_tokens,
 };
 use crate::renderer::Renderer;
-use crate::store::{ReviewRecord, Store, ToolCallRecord, TurnAttemptCompletion};
+use crate::store::{BashResultRecord, ReviewRecord, Store, TurnAttemptCompletion};
 use crate::tools::{BashRisk, ExecutionMode, ToolContext, ToolResult};
 use crate::{bash, tools};
 use bash::RunningBash;
@@ -24,7 +23,7 @@ pub struct TurnResult {
     /// Total tokens reported by the *last* model call of the turn — i.e. the
     /// current context size. Distinct from `usage.total_tokens`, which is
     /// cumulative across every call in the turn. Drives the context-fullness
-    /// gauge and `session.last_total_tokens`.
+    /// gauge and `session.last_context_tokens`.
     pub context_tokens: u64,
     pub final_assistant: Option<String>,
 }
@@ -110,7 +109,6 @@ pub struct AgentLoop<'a> {
     pub attempt_kind: &'a str,
     pub model_context_window: Option<u64>,
     pub renderer: &'a mut Renderer,
-    pub state_dir: &'a Path,
 }
 
 impl<'a> AgentLoop<'a> {
@@ -312,9 +310,9 @@ impl<'a> AgentLoop<'a> {
                 audit.context_tokens = context_tokens;
             }
 
-            let msg_id = self
+            let (_message_id, bash_call_ids) = self
                 .store
-                .append_message(self.session_id, &stream_result.message)?;
+                .append_message_with_bash_calls(self.session_id, &stream_result.message)?;
             audit.commit_provider_response();
             context.push(stream_result.message.clone());
 
@@ -367,8 +365,8 @@ impl<'a> AgentLoop<'a> {
                                     let err = anyhow::anyhow!(
                                         "bash tool call missing required `risk` field"
                                     );
-                                    self.persist_tool_result(
-                                        msg_id,
+                                    self.persist_bash_result(
+                                        bash_call_ids[cursor],
                                         tc,
                                         Err(err),
                                         Duration::ZERO,
@@ -382,8 +380,6 @@ impl<'a> AgentLoop<'a> {
                                     risk.as_ref().map(|risk| risk.as_str()).unwrap_or(""),
                                 ) {
                                     let args_for_review = args.clone();
-                                    let action_json =
-                                        serde_json::to_string(&args_for_review).unwrap_or_default();
                                     let command = args_for_review
                                         .get("command")
                                         .and_then(|v| v.as_str())
@@ -400,9 +396,7 @@ impl<'a> AgentLoop<'a> {
                                                 command,
                                             )?;
                                             self.store.record_review(ReviewRecord {
-                                                session_id: self.session_id,
-                                                tool_call_id: Some(&tc.id),
-                                                action_json: &action_json,
+                                                bash_call_id: bash_call_ids[cursor],
                                                 risk_level: &risk_level,
                                                 user_auth_level: &user_auth_level,
                                                 outcome: a.outcome(),
@@ -420,9 +414,7 @@ impl<'a> AgentLoop<'a> {
                                                 command,
                                             )?;
                                             self.store.record_review(ReviewRecord {
-                                                session_id: self.session_id,
-                                                tool_call_id: Some(&tc.id),
-                                                action_json: &action_json,
+                                                bash_call_id: bash_call_ids[cursor],
                                                 risk_level: &risk_level,
                                                 user_auth_level: &user_auth_level,
                                                 outcome: a.outcome(),
@@ -445,24 +437,14 @@ impl<'a> AgentLoop<'a> {
                                                 a.user_auth_level,
                                                 a.reason
                                             );
-                                            let deny_msg = Message::Tool {
-                                                content: format!("error: {deny_err}"),
-                                                artifacts: Vec::new(),
-                                                tool_call_id: tc.id.clone(),
-                                            };
-                                            self.store
-                                                .append_message(self.session_id, &deny_msg)?;
-                                            context.push(deny_msg);
-                                            self.store.record_tool_call(ToolCallRecord {
-                                                message_id: msg_id,
-                                                call_id: &tc.id,
-                                                tool: &tc.function.name,
-                                                args: &tc.function.arguments,
-                                                risk: risk.as_ref().map(|risk| risk.as_str()),
-                                                status: "error",
-                                                exit_code: None,
-                                                duration_ms: None,
-                                            })?;
+                                            self.persist_bash_result(
+                                                bash_call_ids[cursor],
+                                                tc,
+                                                Err(deny_err),
+                                                Duration::ZERO,
+                                                &mut context,
+                                                false,
+                                            )?;
                                             cursor += 1;
                                             continue;
                                         }
@@ -485,15 +467,17 @@ impl<'a> AgentLoop<'a> {
                                 let mut ctx = ToolContext {
                                     config: self.config,
                                     renderer: self.renderer,
-                                    state_dir: self.state_dir,
+                                    database_path: self.store.database_path(),
+                                    bash_call_id: bash_call_ids[cursor],
+                                    owner_pid: i64::from(std::process::id()),
                                 };
                                 bash::execute(args, &mut ctx).await
                             } else {
                                 Err(anyhow::anyhow!("unknown tool: {}", tc.function.name))
                             };
 
-                            self.persist_tool_result(
-                                msg_id,
+                            self.persist_bash_result(
+                                bash_call_ids[cursor],
                                 tc,
                                 tool_result,
                                 started.elapsed(),
@@ -523,8 +507,12 @@ impl<'a> AgentLoop<'a> {
                             batch.chunks(bash::MAX_ACTIVE_PROCESS_GROUPS).enumerate()
                         {
                             self.execute_concurrent_bash_batch(
-                                msg_id,
                                 chunk,
+                                &bash_call_ids[cursor
+                                    + chunk_offset * bash::MAX_ACTIVE_PROCESS_GROUPS
+                                    ..cursor
+                                        + chunk_offset * bash::MAX_ACTIVE_PROCESS_GROUPS
+                                        + chunk.len()],
                                 &mut context,
                                 &mut command_headers,
                                 cursor + chunk_offset * bash::MAX_ACTIVE_PROCESS_GROUPS,
@@ -569,24 +557,24 @@ impl<'a> AgentLoop<'a> {
         self.store.load_context_messages(self.session_id)
     }
 
-    fn persist_tool_result(
+    fn persist_bash_result(
         &mut self,
-        message_id: i64,
+        bash_call_id: i64,
         call: &ToolCall,
         result: Result<ToolResult>,
         elapsed: Duration,
         context: &mut Vec<Message>,
         emit_renderer: bool,
     ) -> Result<()> {
-        let (output, artifacts, status, exit_code) = match result {
+        let (output, attachments, outcome, exit_code) = match result {
             Ok(result) => {
                 if emit_renderer {
                     self.renderer.tool_finished(result.exit_code, elapsed)?;
                 }
                 (
                     result.output,
-                    result.artifacts,
-                    "ok",
+                    result.attachments,
+                    "completed",
                     Some(result.exit_code),
                 )
             }
@@ -604,25 +592,20 @@ impl<'a> AgentLoop<'a> {
             }
         };
 
-        let risk = BashRisk::from_args_json(&call.function.arguments);
-        self.store.persist_tool_result(
+        let (_, attachments) = self.store.persist_bash_result(
             self.session_id,
-            ToolCallRecord {
-                message_id,
-                call_id: &call.id,
-                tool: &call.function.name,
-                args: &call.function.arguments,
-                risk: risk.as_ref().map(|risk| risk.as_str()),
-                status,
+            BashResultRecord {
+                bash_call_id,
+                outcome,
                 exit_code,
                 duration_ms: Some(elapsed.as_millis().min(u64::MAX as u128) as u64),
             },
             &output,
-            &artifacts,
+            &attachments,
         )?;
         context.push(Message::Tool {
             content: output,
-            artifacts,
+            attachments,
             tool_call_id: call.id.clone(),
         });
         Ok(())
@@ -645,14 +628,14 @@ impl<'a> AgentLoop<'a> {
 
     async fn execute_concurrent_bash_batch(
         &mut self,
-        message_id: i64,
         batch: &[ToolCall],
+        bash_call_ids: &[i64],
         context: &mut Vec<Message>,
         command_headers: &mut StreamingCommandHeaders,
         header_start_index: usize,
     ) -> Result<()> {
         let mut executions = Vec::new();
-        for call in batch {
+        for (call, bash_call_id) in batch.iter().zip(bash_call_ids) {
             let args = parse_tool_args(call);
             let bash_args = tools::parse_args(&args)?;
             executions.push(ConcurrentBashExecution {
@@ -661,7 +644,9 @@ impl<'a> AgentLoop<'a> {
                 running: Some(bash::start_bash_task(
                     bash_args,
                     self.config,
-                    self.state_dir,
+                    self.store.database_path(),
+                    *bash_call_id,
+                    i64::from(std::process::id()),
                 )?),
                 streamed_len: 0,
             });
@@ -694,7 +679,14 @@ impl<'a> AgentLoop<'a> {
                 .finish()
                 .await;
             self.flush_buffered_bash_output(exec, &final_output)?;
-            self.persist_tool_result(message_id, exec.call, result, elapsed, context, true)?;
+            self.persist_bash_result(
+                bash_call_ids[index],
+                exec.call,
+                result,
+                elapsed,
+                context,
+                true,
+            )?;
         }
 
         Ok(())
@@ -2062,7 +2054,6 @@ mod tests {
             attempt_kind: "turn",
             model_context_window: None,
             renderer: &mut renderer,
-            state_dir: &tmp,
         };
 
         let result = agent.run_turn().await.unwrap();
@@ -2157,7 +2148,6 @@ mod tests {
             attempt_kind: "retry",
             model_context_window: None,
             renderer: &mut renderer,
-            state_dir: &tmp,
         };
 
         let error = match agent.run_turn().await {
@@ -2247,7 +2237,6 @@ mod tests {
             attempt_kind: "turn",
             model_context_window: None,
             renderer: &mut renderer,
-            state_dir: &tmp,
         };
 
         let result = agent.run_turn().await.unwrap();
@@ -2439,7 +2428,6 @@ mod tests {
             // The ~3KB tool result blows past it, forcing an in-loop compaction.
             model_context_window: Some(200),
             renderer: &mut renderer,
-            state_dir: &tmp,
         };
 
         agent.run_turn().await.unwrap();
@@ -2569,7 +2557,6 @@ mod tests {
             attempt_kind: "turn",
             model_context_window: None,
             renderer: &mut renderer,
-            state_dir: &tmp,
         };
 
         let result = agent.run_turn().await.unwrap();
@@ -2654,7 +2641,6 @@ mod tests {
             attempt_kind: "turn",
             model_context_window: None,
             renderer: &mut renderer,
-            state_dir: &tmp,
         };
 
         let result = agent.run_turn().await.unwrap();

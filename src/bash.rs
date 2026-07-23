@@ -14,10 +14,9 @@ use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 use tokio::task::JoinHandle;
 
-use crate::artifact::{ARTIFACT_DIR_ENV, ArtifactDirectory};
 use crate::config::Config;
 use crate::config::EnvMap;
-use crate::provider::ToolArtifact;
+use crate::provider::ToolAttachment;
 use crate::redaction::SecretRedactor;
 use crate::renderer::Renderer;
 
@@ -98,9 +97,21 @@ pub async fn execute(args: Value, ctx: &mut ToolContext<'_>) -> Result<ToolResul
         ctx.renderer.notice(&format!("[redaction] {warning}"))?;
     }
 
-    let result = run_bash(args, timeout, ctx.renderer, &ctx.config.env, redactor)?;
+    let attachment_context = ctx.database_path.map(|database_path| AttachmentContext {
+        database_path: database_path.to_path_buf(),
+        bash_call_id: ctx.bash_call_id,
+        owner_pid: ctx.owner_pid,
+    });
+    let result = run_bash(
+        args,
+        timeout,
+        ctx.renderer,
+        &ctx.config.env,
+        redactor,
+        attachment_context.as_ref(),
+    )?;
     let exit_code = result.exit_code;
-    let artifacts = result.artifacts;
+    let attachments = result.attachments;
 
     let output = if result.redacted {
         format!("{}\n\n{}", result.output, REDACTION_REMINDER)
@@ -109,9 +120,9 @@ pub async fn execute(args: Value, ctx: &mut ToolContext<'_>) -> Result<ToolResul
     };
     let full = format!("{}\n[exit code: {}]", output, exit_code);
     Ok(ToolResult {
-        output: apply_truncation(full, &ctx.config.limits, "bash", ctx.state_dir, true),
+        output: apply_truncation(full, &ctx.config.limits, "bash", true),
         exit_code,
-        artifacts,
+        attachments,
     })
 }
 
@@ -120,7 +131,7 @@ struct BashRunResult {
     output: String,
     exit_code: i32,
     redacted: bool,
-    artifacts: Vec<ToolArtifact>,
+    attachments: Vec<ToolAttachment>,
 }
 
 #[derive(Default)]
@@ -219,11 +230,21 @@ impl BashOutputTarget for BufferedBashTarget {
     }
 }
 
-pub fn start_bash_task(args: BashArgs, config: &Config, state_dir: &Path) -> Result<RunningBash> {
+pub fn start_bash_task(
+    args: BashArgs,
+    config: &Config,
+    database_path: Option<&Path>,
+    bash_call_id: i64,
+    owner_pid: i64,
+) -> Result<RunningBash> {
     let redactor = SecretRedactor::from_config(config)?;
     let warnings = redactor.warnings().to_vec();
     let config = config.clone();
-    let state_dir = state_dir.to_path_buf();
+    let attachment_context = database_path.map(|database_path| AttachmentContext {
+        database_path: database_path.to_path_buf(),
+        bash_call_id,
+        owner_pid,
+    });
     let shared = Arc::new(SharedBashState::default());
     let shared_for_task = Arc::clone(&shared);
     let task = tokio::task::spawn_blocking(move || {
@@ -231,9 +252,9 @@ pub fn start_bash_task(args: BashArgs, config: &Config, state_dir: &Path) -> Res
         let result = execute_bash_task(
             args,
             &config,
-            &state_dir,
             Arc::clone(&shared_for_task),
             redactor,
+            attachment_context.as_ref(),
         );
         shared_for_task.mark_finished();
         (result, started.elapsed())
@@ -251,16 +272,31 @@ fn run_bash(
     renderer: &mut Renderer,
     env: &EnvMap,
     mut redactor: SecretRedactor,
+    attachment_context: Option<&AttachmentContext>,
 ) -> Result<BashRunResult> {
-    run_bash_inner(args, timeout_secs, renderer, env, &mut redactor)
+    run_bash_inner(
+        args,
+        timeout_secs,
+        renderer,
+        env,
+        &mut redactor,
+        attachment_context,
+    )
+}
+
+#[derive(Debug, Clone)]
+struct AttachmentContext {
+    database_path: PathBuf,
+    bash_call_id: i64,
+    owner_pid: i64,
 }
 
 fn execute_bash_task(
     args: BashArgs,
     config: &Config,
-    state_dir: &Path,
     shared: Arc<SharedBashState>,
     mut redactor: SecretRedactor,
+    attachment_context: Option<&AttachmentContext>,
 ) -> Result<ToolResult> {
     let timeout = args.timeout.unwrap_or(DEFAULT_TIMEOUT_SECS);
     if timeout == 0 {
@@ -268,9 +304,16 @@ fn execute_bash_task(
     }
 
     let mut target = BufferedBashTarget::new(shared);
-    let result = run_bash_inner(args, timeout, &mut target, &config.env, &mut redactor)?;
+    let result = run_bash_inner(
+        args,
+        timeout,
+        &mut target,
+        &config.env,
+        &mut redactor,
+        attachment_context,
+    )?;
     let exit_code = result.exit_code;
-    let artifacts = result.artifacts;
+    let attachments = result.attachments;
     let output = if result.redacted {
         format!("{}\n\n{}", result.output, REDACTION_REMINDER)
     } else {
@@ -278,9 +321,9 @@ fn execute_bash_task(
     };
     let full = format!("{output}\n[exit code: {exit_code}]");
     Ok(ToolResult {
-        output: apply_truncation(full, &config.limits, "bash", state_dir, true),
+        output: apply_truncation(full, &config.limits, "bash", true),
         exit_code,
-        artifacts,
+        attachments,
     })
 }
 
@@ -290,6 +333,7 @@ fn run_bash_inner(
     target: &mut impl BashOutputTarget,
     env: &EnvMap,
     redactor: &mut SecretRedactor,
+    attachment_context: Option<&AttachmentContext>,
 ) -> Result<BashRunResult> {
     install_signal_forwarder();
     let cwd = args
@@ -302,15 +346,12 @@ fn run_bash_inner(
         args.command
     );
 
-    let artifact_dir = ArtifactDirectory::create()?;
-
     let mut command = Command::new("bash");
     command
         .arg("-lc")
         .arg(command_text)
         .current_dir(&cwd)
         .envs(env)
-        .env(ARTIFACT_DIR_ENV, artifact_dir.path())
         .env(SUBAGENT_DEPTH_ENV, next_subagent_depth_env())
         .stdin(if args.stdin.is_some() {
             Stdio::piped()
@@ -319,6 +360,21 @@ fn run_bash_inner(
         })
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
+    if let Some(attachment_context) = attachment_context {
+        command
+            .env(
+                crate::store::SESSION_DB_ENV,
+                &attachment_context.database_path,
+            )
+            .env(
+                crate::store::BASH_CALL_ID_ENV,
+                attachment_context.bash_call_id.to_string(),
+            )
+            .env(
+                crate::store::SESSION_OWNER_PID_ENV,
+                attachment_context.owner_pid.to_string(),
+            );
+    }
     configure_process_group(&mut command);
 
     let mut child = command.spawn().map_err(|error| {
@@ -443,7 +499,6 @@ fn run_bash_inner(
 
     let status = status.unwrap_or_else(|| child.wait().expect("bash status"));
     flush_redactor(target, &mut output, redactor)?;
-    let artifacts = artifact_dir.read()?;
     if let Some(error) = terminal_error {
         return Err(error);
     }
@@ -464,7 +519,7 @@ fn run_bash_inner(
         output: output.trim_end_matches('\n').to_string(),
         exit_code: status.code().unwrap_or(1),
         redacted: redactor.did_redact(),
-        artifacts,
+        attachments: Vec::new(),
     })
 }
 
@@ -649,7 +704,9 @@ fn wait_for_exit(child: &mut std::process::Child, grace: Duration) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::run_bash;
+    use std::path::PathBuf;
+
+    use super::{AttachmentContext, run_bash};
     use crate::config::EnvMap;
     use crate::config::{
         CompactionConfig, Config, GuardrailConfig, LimitsConfig, ProviderConfig, RedactionConfig,
@@ -712,6 +769,7 @@ mod tests {
             &mut renderer,
             &empty_env(),
             SecretRedactor::default(),
+            None,
         )
         .unwrap();
         assert_eq!(first_result.exit_code, 0);
@@ -725,6 +783,7 @@ mod tests {
             &mut renderer,
             &empty_env(),
             SecretRedactor::default(),
+            None,
         )
         .unwrap();
         assert_eq!(second_result.exit_code, 0);
@@ -754,6 +813,7 @@ mod tests {
             &mut renderer,
             &env,
             SecretRedactor::default(),
+            None,
         )
         .unwrap();
 
@@ -769,6 +829,7 @@ mod tests {
             &mut renderer,
             &empty_env(),
             SecretRedactor::default(),
+            None,
         )
         .unwrap();
         assert!(
@@ -779,49 +840,45 @@ mod tests {
     }
 
     #[test]
-    fn bash_collects_file_image_artifacts_separately_from_stdout() {
+    fn bash_without_attachment_context_exports_no_sink_identity() {
         let mut renderer = Renderer::new();
-        let command = r#"python - <<'PY'
-import json, os, pathlib, struct
-data = b'\x89PNG\r\n\x1a\nrest'
-header = json.dumps({
-    'version': 1,
-    'kind': 'image',
-    'filename': 'tool.png',
-    'media_type': 'image/png',
-    'detail': 'high',
-    'byte_length': len(data),
-}, separators=(',', ':')).encode()
-path = pathlib.Path(os.environ['MU_ARTIFACT_DIR']) / '00000000.artifact'
-path.write_bytes(struct.pack('>I', len(header)) + header + struct.pack('>Q', len(data)) + data)
-print('visible')
-PY"#;
+        let command = "test -z \"${MU_SESSION_DB+x}\" && test -z \"${MU_BASH_CALL_ID+x}\" && test -z \"${MU_SESSION_OWNER_PID+x}\"; printf 'visible'";
         let result = run_bash(
             args(command),
             5,
             &mut renderer,
             &empty_env(),
             SecretRedactor::default(),
+            None,
         )
         .unwrap();
         assert_eq!(result.output, "visible");
-        assert_eq!(result.artifacts.len(), 1);
-        assert_eq!(result.artifacts[0].attachment.filename, "tool.png");
-        assert_eq!(
-            result.artifacts[0].attachment.data,
-            b"\x89PNG\r\n\x1a\nrest"
-        );
-        assert_eq!(
-            result.artifacts[0].detail,
-            crate::provider::ImageDetail::High
-        );
+        assert!(result.attachments.is_empty());
+    }
+
+    #[test]
+    fn bash_attachment_context_exports_database_call_and_owner_identity() {
+        let mut renderer = Renderer::new();
+        let context = AttachmentContext {
+            database_path: PathBuf::from("/tmp/session.db"),
+            bash_call_id: 42,
+            owner_pid: 99,
+        };
+        let result = run_bash(
+            args("printf '%s|%s|%s' \"$MU_SESSION_DB\" \"$MU_BASH_CALL_ID\" \"$MU_SESSION_OWNER_PID\""),
+            5,
+            &mut renderer,
+            &empty_env(),
+            SecretRedactor::default(),
+            Some(&context),
+        )
+        .unwrap();
+        assert_eq!(result.output, "/tmp/session.db|42|99");
     }
 
     #[tokio::test]
     async fn bash_receives_env_and_redacts_configured_values() {
         let mut renderer = Renderer::new();
-        let tmp = std::env::temp_dir().join(format!("mu-bash-redact-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&tmp).unwrap();
         let config = test_config(
             &[
                 ("OPENAI_API_KEY", "provider-secret"),
@@ -832,7 +889,9 @@ PY"#;
         let mut ctx = ToolContext {
             config: &config,
             renderer: &mut renderer,
-            state_dir: &tmp,
+            database_path: None,
+            bash_call_id: 0,
+            owner_pid: i64::from(std::process::id()),
         };
         let args = serde_json::json!({
             "title": "redact",
@@ -846,8 +905,6 @@ PY"#;
         assert!(result.output.contains("[redacted:CUSTOM_SECRET]"));
         assert!(!result.output.contains("provider-secret"));
         assert!(!result.output.contains("tiny"));
-
-        let _ = std::fs::remove_dir_all(tmp);
     }
 
     #[cfg(target_os = "linux")]
@@ -866,6 +923,7 @@ PY"#;
             &mut renderer,
             &empty_env(),
             SecretRedactor::default(),
+            None,
         )
         .unwrap();
         let ids = result
@@ -902,6 +960,7 @@ PY"#;
             &mut renderer,
             &empty_env(),
             SecretRedactor::default(),
+            None,
         )
         .unwrap();
 
@@ -926,6 +985,7 @@ PY"#;
             &mut renderer,
             &empty_env(),
             SecretRedactor::default(),
+            None,
         );
         assert!(result.is_err(), "expected timeout");
 

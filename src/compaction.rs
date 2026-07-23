@@ -1,12 +1,10 @@
-use std::path::Path;
-
 use anyhow::Result;
 
+use crate::bash;
 use crate::config::Config;
 use crate::models::RequestOptions;
 use crate::provider::{Message, Provider, ProviderError};
 use crate::store::Store;
-use crate::{bash, tools};
 
 /// Per-message caps applied only to the *summarization input*, so a very large
 /// history (e.g. many big tool outputs) cannot make the compaction request
@@ -46,8 +44,8 @@ pub async fn maybe_compact(
 
     let threshold = config.compaction.fraction;
 
-    let tokens = if session.last_total_tokens > 0 {
-        session.last_total_tokens
+    let tokens = if session.last_context_tokens > 0 {
+        session.last_context_tokens
     } else {
         store.estimate_context_tokens(session_id)
     };
@@ -79,7 +77,7 @@ pub async fn run_compaction(
     // Count user turns from the end
     let mut user_turn_starts: Vec<i64> = Vec::new();
     for rec in records.iter().rev() {
-        if rec.role == "user" {
+        if rec.kind == "user" {
             user_turn_starts.push(rec.seq);
             if user_turn_starts.len() >= keep {
                 break;
@@ -96,12 +94,12 @@ pub async fn run_compaction(
 
     let to_summarize: Vec<String> = records
         .iter()
-        .filter(|m| m.seq < cut_seq && m.role != "summary" && m.role != "system")
+        .filter(|m| m.seq < cut_seq && m.kind != "summary" && m.kind != "system")
         .map(|m| {
-            let (role, cap) = match m.role.as_str() {
+            let (role, cap) = match m.kind.as_str() {
                 "user" => ("user", MAX_SUMMARY_ENTRY_CHARS),
                 "assistant" => ("assistant", MAX_SUMMARY_ENTRY_CHARS),
-                "tool" => ("tool-result", MAX_SUMMARY_TOOL_CHARS),
+                "bash_result" => ("bash-result", MAX_SUMMARY_TOOL_CHARS),
                 _ => ("system", MAX_SUMMARY_ENTRY_CHARS),
             };
             let mut text = if m.content.is_empty() {
@@ -110,10 +108,8 @@ pub async fn run_compaction(
                 format!("[{role}]: {}", clamp_for_summary(&m.content, cap))
             };
             // Include toolcall requests so compaction sees what the assistant actually asked for
-            if m.role == "assistant"
-                && let Some(calls) = crate::store::parse_tool_calls(m.tool_calls_json.as_deref())
-            {
-                for c in calls {
+            if m.kind == "assistant" {
+                for c in &m.bash_calls {
                     text.push_str(&format!(
                         "\n[toolcall {}]: {}",
                         c.function.name,
@@ -131,7 +127,7 @@ pub async fn run_compaction(
 
     let prior_summary = records
         .iter()
-        .rfind(|m| m.role == "summary")
+        .rfind(|m| m.kind == "summary")
         .map(|m| m.content.as_str());
 
     let summarize_prompt =
@@ -170,7 +166,7 @@ pub async fn run_compaction(
             // will eventually bail with a clear error. If there is no prior
             // summary at all, insert an honest minimal note so the model knows
             // earlier history was lost.
-            let has_prior = records.iter().any(|m| m.role == "summary");
+            let has_prior = records.iter().any(|m| m.kind == "summary");
             if !has_prior {
                 let note = "Earlier conversation history was lost due to context overflow.";
                 if keep == 0 || cut_seq == i64::MAX {
@@ -217,10 +213,6 @@ fn build_summarize_prompt(
     }
     prompt.push_str(transcript);
     prompt
-}
-
-pub fn prune_spills(state_dir: &Path) {
-    tools::prune_truncation_spills(state_dir, tools::SPILL_RETENTION_DAYS);
 }
 
 #[cfg(test)]

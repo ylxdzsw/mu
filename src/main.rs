@@ -13,7 +13,6 @@ compile_error!("mu is supported only on Unix-like systems");
 
 mod agent;
 mod applets;
-mod artifact;
 mod attachment;
 mod bash;
 mod chat_completions;
@@ -24,6 +23,7 @@ mod guardrail;
 mod models;
 mod paths;
 mod provider;
+mod random;
 mod redaction;
 mod renderer;
 mod responses;
@@ -31,6 +31,7 @@ mod runtime;
 mod skills;
 mod store;
 mod system_prompt;
+mod tool_attachment;
 mod tools;
 
 #[cfg(test)]
@@ -104,7 +105,6 @@ struct RunTurnArgs<'a> {
     /// an existing turn and must not overwrite the stored title.
     title: Option<&'a str>,
     output: cli::OutputFormat,
-    state_dir: &'a std::path::Path,
     /// A short notice rendered before the turn (e.g. "resuming interrupted turn").
     preamble_notice: Option<&'a str>,
 }
@@ -215,11 +215,11 @@ fn exit_session_busy(output: cli::OutputFormat) -> ! {
     process::exit(2);
 }
 
-fn acquire_session_lock_or_exit(
-    store: &store::Store,
+fn acquire_session_lock_or_exit<'a>(
+    store: &'a store::Store,
     session_id: &str,
     output: cli::OutputFormat,
-) -> Result<store::SessionLock> {
+) -> Result<store::SessionLock<'a>> {
     match store.acquire_session_lock(session_id) {
         Ok(lock) => Ok(lock),
         Err(error) if error.downcast_ref::<store::SessionBusy>().is_some() => {
@@ -370,13 +370,15 @@ async fn run() -> Result<()> {
                 SessionSub::New => {
                     paths::ensure_project_layout(&scope)?;
                     let store = store::Store::open(&db_path)?;
-                    let latest = store.latest_session()?;
-                    let model = match latest.as_ref().map(|session| session.model.clone()) {
-                        Some(model) => model,
-                        None => {
-                            let config = Config::load_for_scope(project_config_dir.as_deref())?;
-                            models::first_model_ref(&config)?.canonical
-                        }
+                    let model = if let Some(model) = default_turn.selection.model.as_deref() {
+                        let config = Config::load_for_scope(project_config_dir.as_deref())?;
+                        models::resolve_model_ref(&config, model)?.canonical
+                    } else if let Some(model) = store.latest_session()?.map(|session| session.model)
+                    {
+                        model
+                    } else {
+                        let config = Config::load_for_scope(project_config_dir.as_deref())?;
+                        models::first_model_ref(&config)?.canonical
                     };
                     let session = store.create_session_seeded(
                         &cwd.display().to_string(),
@@ -403,14 +405,11 @@ async fn run() -> Result<()> {
                 SessionSub::Transcript { session } => {
                     let store = open_store_with_session(&db_path, &session)?;
                     for r in store.message_records_from_seq(&session, 0)? {
-                        println!("[{}:{}] {}", r.seq, r.role, r.content);
+                        println!("[{}:{}] {}", r.seq, r.kind, r.content);
 
                         // Emit toolcall requests immediately under their assistant message
-                        if r.role == "assistant"
-                            && let Some(calls) =
-                                crate::store::parse_tool_calls(r.tool_calls_json.as_deref())
-                        {
-                            for tc in calls {
+                        if r.kind == "assistant" {
+                            for tc in &r.bash_calls {
                                 println!(
                                     "[{}:toolcall] {} {}",
                                     r.seq, tc.function.name, tc.function.arguments
@@ -419,7 +418,7 @@ async fn run() -> Result<()> {
                         }
 
                         // Surface the tool schema together with the system message
-                        if r.role == "system"
+                        if r.kind == "system"
                             && let Ok(schema) =
                                 serde_json::to_string_pretty(&crate::tools::tool_definitions())
                         {
@@ -496,7 +495,6 @@ async fn run() -> Result<()> {
             paths::ensure_project_layout(&scope)?;
             let state_dir = scope.state_dir();
             paths::ensure_dir(&state_dir)?;
-            compaction::prune_spills(&state_dir);
 
             let db_path = scope.session_db_path();
             let store = store::Store::open(&db_path)?;
@@ -538,7 +536,6 @@ async fn run() -> Result<()> {
                 model_context_window: model_info.context_window,
                 title: None,
                 output,
-                state_dir: &state_dir,
                 preamble_notice: Some("[mu] resuming interrupted turn"),
             })
             .await?;
@@ -609,7 +606,6 @@ async fn run_turn_from_source(
     paths::ensure_project_layout(scope)?;
     let state_dir = scope.state_dir();
     paths::ensure_dir(&state_dir)?;
-    compaction::prune_spills(&state_dir);
 
     let db_path = scope.session_db_path();
     let store = store::Store::open(&db_path)?;
@@ -646,11 +642,7 @@ async fn run_turn_from_source(
     // redirect after a Ctrl-C without being forced to `mu retry` first.
     store.normalize_interrupted_tail(&session_id)?;
 
-    if created {
-        if let Ok(session_file) = std::env::var("MU_SESSION_FILE") {
-            store::write_session_id(PathBuf::from(&session_file).as_path(), &session_id)?;
-        }
-    } else if session.cwd != cwd.display().to_string() {
+    if !created && session.cwd != cwd.display().to_string() {
         store.append_message(
             &session_id,
             &provider::Message::User {
@@ -679,7 +671,6 @@ async fn run_turn_from_source(
         model_context_window: model_info.context_window,
         title: Some(&title),
         output,
-        state_dir: &state_dir,
         preamble_notice: None,
     })
     .await?;
@@ -828,7 +819,6 @@ async fn run_turn(args: RunTurnArgs<'_>) -> Result<()> {
         model_context_window,
         title,
         output,
-        state_dir,
         preamble_notice,
     } = args;
 
@@ -850,7 +840,6 @@ async fn run_turn(args: RunTurnArgs<'_>) -> Result<()> {
         attempt_kind,
         model_context_window,
         renderer: &mut renderer,
-        state_dir,
     };
 
     let result = agent.run_turn().await;

@@ -9,7 +9,6 @@
 
 typeset -g MU_ZSH_MODE=${MU_ZSH_MODE:-shell}
 typeset -g MU_ZSH_SESSION_ID=${MU_ZSH_SESSION_ID:-}
-typeset -g MU_ZSH_SESSION_FILE=${MU_ZSH_SESSION_FILE:-${TMPDIR:-/tmp}/mu-zsh-${$}.session}
 typeset -g MU_ZSH_SESSION_SCOPE=${MU_ZSH_SESSION_SCOPE:-}
 typeset -g MU_ZSH_EFFECTIVE_SESSION_ID=${MU_ZSH_EFFECTIVE_SESSION_ID:-}
 typeset -g MU_ZSH_MODEL=${MU_ZSH_MODEL:-}
@@ -271,14 +270,20 @@ _mu_zsh_print_block_message() {
   print
 }
 
-_mu_zsh_read_session_file() {
-  local scope=${1:-$(_mu_zsh_current_scope_key)}
-  [[ -r "$MU_ZSH_SESSION_FILE" ]] || return 0
-
+_mu_zsh_create_session_for_scope() {
+  local scope=$1
+  local model=$MU_ZSH_EFFECTIVE_MODEL
   local id
-  id=$(<"$MU_ZSH_SESSION_FILE")
+  local -a command
+  command=("$MU_ZSH_BIN")
+  [[ -n "$model" ]] && command+=(--model "$model")
+  id=$("${command[@]}" session new) || return $?
   id=${id//$'\n'/}
-  [[ -n "$id" ]] && _mu_zsh_remember_session_for_scope "$id" "$scope"
+  [[ "$id" =~ '^ses_[0-9a-hjkmnpqrstvwxyz]{8}$' ]] || {
+    print -u2 -- "mu: session new returned an invalid session id"
+    return 1
+  }
+  _mu_zsh_remember_session_for_scope "$id" "$scope"
 }
 
 _mu_zsh_base_command_reply() {
@@ -784,6 +789,9 @@ _mu_zsh_run_custom_slash_command() {
   _mu_zsh_set_current_scope_key
   scope=$REPLY
   _mu_zsh_forget_state_outside_scope "$scope"
+  _mu_zsh_sync_state "$scope"
+  [[ -n "$MU_ZSH_EFFECTIVE_SESSION_ID" ]] ||
+    _mu_zsh_create_session_for_scope "$scope" || return $?
   _mu_zsh_base_command_reply "$scope"
   session_id=$MU_ZSH_EFFECTIVE_SESSION_ID
 
@@ -795,24 +803,12 @@ _mu_zsh_run_custom_slash_command() {
   command+=("$name")
   MU_ZSH_PENDING_ATTACHMENTS=()
 
-  if [[ -n "$session_id" ]]; then
-    if [[ -n "$instruction" ]]; then
-      print -rn -- "$instruction" | "${command[@]}"
-      exit_status=${pipestatus[2]}
-    else
-      "${command[@]}"
-      exit_status=$?
-    fi
+  if [[ -n "$instruction" ]]; then
+    print -rn -- "$instruction" | "${command[@]}"
+    exit_status=${pipestatus[2]}
   else
-    rm -f -- "$MU_ZSH_SESSION_FILE" 2>/dev/null || true
-    if [[ -n "$instruction" ]]; then
-      print -rn -- "$instruction" | MU_SESSION_FILE=$MU_ZSH_SESSION_FILE "${command[@]}"
-      exit_status=${pipestatus[2]}
-    else
-      MU_SESSION_FILE=$MU_ZSH_SESSION_FILE "${command[@]}"
-      exit_status=$?
-    fi
-    _mu_zsh_read_session_file "$scope"
+    "${command[@]}"
+    exit_status=$?
   fi
 
   return $exit_status
@@ -996,6 +992,11 @@ _mu_zsh_submit_prompt() {
   scope=$REPLY
   _mu_zsh_forget_state_outside_scope "$scope"
 
+  _mu_zsh_sync_state "$scope"
+  [[ -n "$MU_ZSH_EFFECTIVE_SESSION_ID" ]] ||
+    _mu_zsh_create_session_for_scope "$scope" || return $?
+  # Create the session before recording history so the replay command can
+  # address the exact session even for the first turn in a scope.
   _mu_zsh_record_history "$input" "$scope"
   _mu_zsh_base_command_reply "$scope"
   session_id=$MU_ZSH_EFFECTIVE_SESSION_ID
@@ -1006,15 +1007,8 @@ _mu_zsh_submit_prompt() {
   done
   MU_ZSH_PENDING_ATTACHMENTS=()
 
-  if [[ -n "$session_id" ]]; then
-    "${command[@]}" <<< "$input"
-    exit_status=$?
-  else
-    rm -f -- "$MU_ZSH_SESSION_FILE" 2>/dev/null || true
-    MU_SESSION_FILE=$MU_ZSH_SESSION_FILE "${command[@]}" <<< "$input"
-    exit_status=$?
-    _mu_zsh_read_session_file "$scope"
-  fi
+  "${command[@]}" <<< "$input"
+  exit_status=$?
 
   return $exit_status
 }

@@ -30,7 +30,7 @@ pub enum Message {
     },
     Tool {
         content: String,
-        artifacts: Vec<ToolArtifact>,
+        attachments: Vec<ToolAttachment>,
         tool_call_id: String,
     },
 }
@@ -274,7 +274,7 @@ impl std::fmt::Display for ImageDetail {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ToolArtifact {
+pub struct ToolAttachment {
     pub attachment: Attachment,
     pub detail: ImageDetail,
 }

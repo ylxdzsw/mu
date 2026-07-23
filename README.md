@@ -206,6 +206,13 @@ runtime state it needs. Use `mu project init` when you explicitly want a local
 configuration scaffold, and keep project-specific guidance in `AGENTS.md` or
 `.mu` instruction files.
 
+Mu keeps one SQLite database per active scope: `<project>/.mu/sessions.db` in a
+project, or `~/.mu/sessions.db` globally (with the usual SQLite WAL/SHM
+sidecars). `.mu` contains that database family and authored files only. Session
+ownership lives in the database; ephemeral oversized-output spills use
+exclusive random files in the private OS temporary directory `$TMPDIR/mu`, and
+image attachments are stored directly in SQLite.
+
 Setting `"output": "concise"` in global or project `config.jsonc` changes the
 default output density; an explicit `--output` always wins. Output density
 controls brevity, not terminal behavior: `mu` automatically enables live lines,

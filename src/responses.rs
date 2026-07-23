@@ -153,25 +153,25 @@ fn responses_input_items(
         }
         Message::Tool {
             content,
-            artifacts,
+            attachments,
             tool_call_id,
         } => {
-            let output = if artifacts.is_empty() {
+            let output = if attachments.is_empty() {
                 Value::String(content.clone())
             } else {
                 let mut parts = vec![serde_json::json!({
                     "type": "input_text",
                     "text": content,
                 })];
-                parts.extend(artifacts.iter().map(|artifact| {
+                parts.extend(attachments.iter().map(|attachment| {
                     serde_json::json!({
                         "type": "input_image",
                         "image_url": format!(
                             "data:{};base64,{}",
-                            artifact.attachment.media_type,
-                            base64_encode(&artifact.attachment.data)
+                            attachment.attachment.media_type,
+                            base64_encode(&attachment.attachment.data)
                         ),
-                        "detail": artifact.detail.to_string(),
+                        "detail": attachment.detail.to_string(),
                     })
                 }));
                 Value::Array(parts)

@@ -180,18 +180,18 @@ fn build_chat_request_body(
 
 fn chat_messages_json(messages: &[Message], endpoint: &str, model: &str) -> Vec<Value> {
     let mut serialized = Vec::new();
-    let mut pending_tool_artifacts = Vec::new();
+    let mut pending_tool_attachments = Vec::new();
     for message in messages {
         let mut values = chat_message_json(message, endpoint, model);
         if matches!(message, Message::Tool { .. }) {
             serialized.push(values.remove(0));
-            pending_tool_artifacts.extend(values);
+            pending_tool_attachments.extend(values);
         } else {
-            serialized.append(&mut pending_tool_artifacts);
+            serialized.append(&mut pending_tool_attachments);
             serialized.append(&mut values);
         }
     }
-    serialized.append(&mut pending_tool_artifacts);
+    serialized.append(&mut pending_tool_attachments);
     serialized
 }
 
@@ -242,7 +242,7 @@ fn chat_message_json(message: &Message, endpoint: &str, model: &str) -> Vec<Valu
         }
         Message::Tool {
             content,
-            artifacts,
+            attachments,
             tool_call_id,
         } => {
             let mut messages = vec![serde_json::json!({
@@ -250,23 +250,23 @@ fn chat_message_json(message: &Message, endpoint: &str, model: &str) -> Vec<Valu
                 "content": content,
                 "tool_call_id": tool_call_id,
             })];
-            if !artifacts.is_empty() {
+            if !attachments.is_empty() {
                 let mut content = vec![serde_json::json!({
                     "type": "text",
                     "text": format!(
                         "Images returned by the preceding tool call `{tool_call_id}`."
                     ),
                 })];
-                content.extend(artifacts.iter().map(|artifact| {
+                content.extend(attachments.iter().map(|attachment| {
                     serde_json::json!({
                         "type": "image_url",
                         "image_url": {
                             "url": format!(
                                 "data:{};base64,{}",
-                                artifact.attachment.media_type,
-                                base64_encode(&artifact.attachment.data)
+                                attachment.attachment.media_type,
+                                base64_encode(&attachment.attachment.data)
                             ),
-                            "detail": artifact.detail.to_string(),
+                            "detail": attachment.detail.to_string(),
                         },
                     })
                 }));
@@ -887,7 +887,7 @@ mod tests {
             assistant,
             Message::Tool {
                 content: "ok".into(),
-                artifacts: Vec::new(),
+                attachments: Vec::new(),
                 tool_call_id: "call_1".into(),
             },
         ];
@@ -919,7 +919,7 @@ mod tests {
 
     #[test]
     fn serializes_tool_images_natively_for_responses_and_as_chat_fallback() {
-        let artifact = crate::provider::ToolArtifact {
+        let attachment = crate::provider::ToolAttachment {
             attachment: crate::provider::Attachment {
                 filename: "tool.png".into(),
                 media_type: "image/png".into(),
@@ -929,7 +929,7 @@ mod tests {
         };
         let messages = vec![Message::Tool {
             content: "Viewed image".into(),
-            artifacts: vec![artifact],
+            attachments: vec![attachment],
             tool_call_id: "call-image".into(),
         }];
 
@@ -964,7 +964,7 @@ mod tests {
 
     #[test]
     fn chat_serializes_parallel_tool_replies_before_image_fallbacks() {
-        let artifact = |filename: &str| crate::provider::ToolArtifact {
+        let attachment = |filename: &str| crate::provider::ToolAttachment {
             attachment: crate::provider::Attachment {
                 filename: filename.into(),
                 media_type: "image/png".into(),
@@ -975,12 +975,12 @@ mod tests {
         let messages = vec![
             Message::Tool {
                 content: "first".into(),
-                artifacts: vec![artifact("first.png")],
+                attachments: vec![attachment("first.png")],
                 tool_call_id: "call-1".into(),
             },
             Message::Tool {
                 content: "second".into(),
-                artifacts: vec![artifact("second.png")],
+                attachments: vec![attachment("second.png")],
                 tool_call_id: "call-2".into(),
             },
         ];

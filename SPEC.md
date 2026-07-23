@@ -135,11 +135,13 @@ Skills may declare optional `requires_env` and `requires_commands` frontmatter
 keys. Each key is a comma-separated list, and every listed requirement must be
 met before the skill is injected.
 
-### 2.6 Flat config, single SQLite state file
+### 2.6 Flat config, one SQLite scope database
 
 All user-facing configuration and instruction files live under a flat `.mu`
-directory (`config.jsonc`, `AGENTS.md`, prompt/skill/command files). Runtime state is one SQLite database
-in the active global/project scope. See §9, §10, and §11.
+directory (`config.jsonc`, `AGENTS.md`, prompt/skill/command files). Runtime
+state is one SQLite database family in the active global/project scope; its
+WAL/SHM/journal sidecars are ordinary SQLite implementation files. See §9,
+§10, and §11.
 
 ---
 
@@ -288,8 +290,10 @@ This is the exact sequence the binary follows for one turn invocation:
    error to stderr and exit non-zero (§7). Resolve the effective model:
    `--model` if given, else the session's stored `model`, else the merged
    config default.
-3. **Open the active-scope SQLite DB** (create the current schema if absent; reject non-current schemas with instructions to remove `sessions.db`):
-   project-local when inside a project, global otherwise.
+3. **Open the active-scope SQLite DB** (create it if absent and run the
+   supported migrations; reject an unknown newer or pre-baseline schema with
+   an upgrade instruction): project-local when inside a project, global
+   otherwise. SQLite WAL/SHM/journal sidecars remain beside this database.
 4. **Resolve the session:**
    - If `--session <id>` is given and the row exists in the active scope → use
      it.
@@ -301,11 +305,11 @@ This is the exact sequence the binary follows for one turn invocation:
    - If neither `--session` nor `--continue-latest` is given → create a new
      session row, its persisted system prompt, and the environment seed in one
      transaction (so a crash can never leave a session without its system
-     message), and
-     write its id to the runtime file named by `$MU_SESSION_FILE` when that env var
-     is set (§11).
-5. **Acquire the session `flock`** (§11). If held, print "session busy", exit
-   non-zero.
+     message).
+5. **Acquire session ownership** (§11). A conditional SQLite update claims a
+   NULL `session.owner_pid`; on contention a short immediate transaction checks
+   the recorded PID and replaces it only when that process is absent. If the
+   owner is live, print "session busy" and exit non-zero.
 6. **Normalize any interrupted tail, then build the context list.** If the
    previous turn was interrupted it may have left a dangling assistant
    tool-call message (some `tool_calls` without a result). Synthesize an
@@ -315,7 +319,7 @@ This is the exact sequence the binary follows for one turn invocation:
    compaction summary message as user context (if any), then all non-system
    messages after that summary, in order.
 7. **Pre-turn compaction check** (§11, Tier 1): if the session's stored
-   `last_total_tokens` (or bytes÷4 on the first turn) exceeds the configured
+   `last_context_tokens` (or bytes÷4 on the first turn) exceeds the configured
    fraction of the model context window, run compaction now, then rebuild the
    context list.
 8. **Append the new user message** to the DB and to the context list. If files
@@ -330,25 +334,30 @@ This is the exact sequence the binary follows for one turn invocation:
       deltas; see §7 for the delta-accumulation rules).
    c. On stream end, record this response's `usage` (accumulate into the turn's
       running totals; see "usage accounting" below).
-   d. **Persist the completed assistant message** (including any `tool_calls`)
-      to the DB and append it to the context list.
+   d. **Persist the completed assistant message and all requested Bash calls in
+      one transaction**, then append the message to the context list. Each call
+      becomes an immutable `bash_call` claim before execution begins. Reject a
+      response naming any function other than `bash` before persisting it;
+      malformed Bash argument JSON is still a valid claim and later receives an
+      error result.
    e. If `finish_reason` is `tool_calls`: split the calls into maximal
       contiguous batches of eligible readonly work. All output densities may
       execute contiguous `risk:"readonly"` `bash` calls concurrently, but
-      **persist tool result
-      messages** (`role: "tool"`, with their `tool_call_id`) in the model's
+      **persist Bash-result messages** (serialized back to providers as
+      `role: "tool"`, with their provider `tool_call_id`) in the model's
       original call order before looping back to (a). Any non-readonly call,
       unknown tool, or call that requires guardrail review is a sequential
       barrier.
    f. If `finish_reason` is `stop`: the loop ends.
-10. **Update the session row:** `last_total_tokens` = the `total_tokens` from the
+10. **Update the session row:** `last_context_tokens` = the `total_tokens` from the
     *final* provider response of the turn (this already reflects the full context
     incl. prior turns); bump `updated_at`.
 11. **For `detail` and `full`, print the turn summary line** to stderr (§5),
-    release the `flock`, exit 0. `concise` and `final` omit it.
+    release `session.owner_pid` conditionally, and exit 0. `concise` and
+    `final` omit it.
 
 **Usage accounting.** Each provider response in the loop carries its own `usage`.
-For the **context fullness** figure (`last_total_tokens`, the summary's
+For the **context fullness** figure (`last_context_tokens`, the summary's
 `context: N%`) use only the **final** response's `total_tokens` — because
 `prompt_tokens` already includes the entire prior context, the last response's
 `total_tokens` is the true current context size (summing across iterations would
@@ -429,30 +438,36 @@ dispatches these applets:
   absolute paths are used as written.
   Updating through a symlink edits its regular-file target while preserving
   the link and its target's permissions. The entire document is preflighted
-  before one atomic file replacement, so a parse, match, overlap, read, or
-  write failure leaves the existing file unchanged. Success is reported
-  compactly as `Done!`, an `M PATH` line, and an applied block/replacement
-  count; failures identify the responsible block and corrective action. The
-  updated file or a full diff is not returned.
+  before the target is opened; Mu then takes a non-blocking advisory lock on
+  the existing inode and revalidates the original snapshot before writing.
+  Mu syncs a transient random sibling backup, overwrites and syncs the same
+  inode, and removes the backup after success. Ordinary write failures attempt
+  to restore the original bytes into that inode; a crash or failed restoration
+  may leave the backup for manual recovery. This preserves inode-bound
+  metadata and hard links but cannot give atomic visibility to readers that
+  ignore the advisory lock. New-file creation still publishes a fully synced
+  sibling with a no-clobber operation. Success is reported compactly as
+  `Done!`, an `M PATH` line, and an applied block/replacement count; failures
+  identify the responsible block and corrective action. The updated file or a
+  full diff is not returned.
 - **`view_image [--detail auto|low|high|original] PATH`** loads a validated PNG,
   JPEG, WebP, or GIF through the same attachment loader and 20 MiB limit used by
   `mu -a`. `--detail` is optional and defaults to `auto`. The command writes a
-  text summary normally and publishes the image into the current bash call's
-  private artifact directory; it fails when invoked outside that live call.
+  text summary normally and, when invoked inside a live Mu tool call, inserts
+  the image directly into SQLite's `bash_attachment` and `attachment_blob`
+  tables. It fails outside a live tool call or when the owning session/tool
+  claim is no longer open.
 
 These are ordinary commands called through `bash`, not additional model-visible
-function tools. Before each call, Mu creates a mode-`0700` temporary directory
-and passes its path as `MU_ARTIFACT_DIR`; no directory or artifact descriptor is
-inherited. Each `view_image` invocation serializes one versioned, length-framed
-record to a mode-`0600` temporary file and atomically renames it to a numbered
-artifact file while holding a directory-local lock. When the direct bash
-process exits and stdout closes, Mu reads numbered files in order, validates
-them, and removes the directory on every completion path. A call may emit at
-most eight images. The applet never recreates a removed directory, so detached
-commands cannot publish late artifacts or keep a bash result open; they must
-save ordinary files for a later foreground `view_image` call. Tool-image
-metadata and SHA-256-deduplicated bytes persist with the tool message. Responses
-adapters serialize images in the native `function_call_output`; Chat
+function tools. Mu passes the active database path, internal Bash-call id, and
+session owner PID to the bash child only for a live tool call. `view_image`
+persists validated bytes transactionally and caps a call at eight images;
+content-addressed SHA-256 blobs are shared by all references in that scope.
+Descendants inherit the ordinary environment, but a sink is accepted only while
+the owning Mu PID still owns the session and before the result is committed.
+Once the direct call closes its result, a late descendant is rejected; detached
+work must save ordinary files for a later foreground `view_image` call.
+Responses adapters serialize images in the native `function_call_output`; Chat
 Completions adapters retain the tool text and add a labeled multimodal
 user-message projection on the wire only.
 
@@ -494,21 +509,19 @@ the budget:
   (`limits.max_line_bytes`, default 10 KB) also applies, so a single pathological
   line cannot dominate.
 - When output exceeds a cap, the model receives a **tail preview** plus a marker
-  stating how much was elided, and the
-  **full output is spilled to a temp file** under a truncation directory in the
-  state dir. The marker points the model at that file (noting the retention
-  window, since a resumed session may outlive it) so it can inspect the
-  result with another `bash` call. Byte limiting is applied backward from the
-  actual tail so the final exit-status line is retained; nothing is lost, it
-  just is not forced into context.
+  stating how much was elided, and the full output is best-effort written to an
+  exclusive, randomly named file in the private flat `$TMPDIR/mu` runtime
+  directory. The marker points the model at that ephemeral path so it can
+  inspect the result with another `bash` call while it exists. Byte limiting is
+  applied backward from the actual tail so the final exit-status line is
+  retained; nothing is lost, it just is not forced into context.
 - The spill is **best-effort**: the command has already run by the time its
-  output is clamped, so a failed spill write (read-only state dir, disk full)
-  must never fail the tool result. The preview is returned with a note that the
-  full output could not be saved. A spill file that has since been pruned (or
-  never written) is likewise harmless — the model just gets a shell error when
-  it tries to read the path.
-- Spilled temp files are garbage-collected after a retention window (default 7
-  days), pruned opportunistically on startup.
+  output is clamped, so a failed spill write (unavailable temporary directory,
+  permission error, or disk full) must never fail the tool result. The preview
+  is returned with a note that the full output could not be saved. Mu does not
+  actively remove spill files, and it makes no retention promise; the OS or an
+  administrator may remove one at any time. A missing spill is likewise
+  harmless — the model just gets a shell error when it tries to read the path.
 
 All local search, file reads, writes, edits, tests, and web fetches go through
 `bash`. The model should choose ordinary structured CLI patterns (`rg`, `find`,
@@ -751,9 +764,11 @@ the plugin.
 ### 6.1 Invocation pattern
 
 Submitting a non-empty prompt runs `mu` as an ordinary foreground child process.
-The plugin passes `--session` after the first turn, forwards an explicit shell
-output override when configured, writes the prompt to the child process's stdin,
-waits for the turn to finish, and then redraws `mu>` with the same session id.
+When needed, the plugin first creates a session with the management command;
+every turn, including the first, receives `--session`. The plugin forwards an
+explicit shell output override when configured, writes the prompt to the child
+process's stdin, waits for the turn to finish, and then redraws `mu>` with the
+same session id.
 `MU_ZSH_OUTPUT` optionally overrides the density; when unset, the child inherits
 the active `config.jsonc` default. It does not control whether the child is
 interactive.
@@ -827,8 +842,8 @@ Consequences:
 
 - **Full structured history:** `mu` records prompts, assistant responses, and
   tool calls in SQLite (§11). Tool output is stored with the shared
-  truncation/spill policy, so the DB keeps the structured transcript and spill
-  files hold oversized raw command output.
+  truncation/spill policy, so the DB keeps the structured transcript and an
+  ephemeral temporary file may hold oversized raw command output.
 - **No shell-command sharing:** commands run outside `mu` or the shell
   plugin are
   not automatically fed to the agent. `mu` keeps the boundary explicit and
@@ -838,8 +853,9 @@ Consequences:
 
 Session lifecycle is exposed through CLI commands:
 
-- The zsh plugin without a session lazily creates one on its first submitted
-  prompt and reuses that session for later prompts in the same shell.
+- The zsh plugin without a session explicitly runs `mu [--model MODEL] session
+  new` before its first submitted prompt, then reuses that session for later
+  prompts in the same shell.
 - Exporting `MU_ZSH_SESSION_ID=<id>` before entering `mu>` attaches the zsh
   plugin to an existing session.
 - `mu -c` continues the latest session in the active scope for a one-shot turn.
@@ -1003,7 +1019,14 @@ The project-local directory is `.mu`. It may contain:
 - optional instruction files that may be plain references, custom commands,
   skills, or both.
 - `sessions.db`, the project-local session history and state database.
-- `.gitignore`, which ignores session database and related SQLite files.
+- SQLite-managed `sessions.db-wal`, `sessions.db-shm`, or journal sidecars while
+  required by the selected journal mode.
+- `.gitignore`, which ignores the session database and related SQLite files.
+
+Mu creates no lock, spill, per-session, or attachment-staging directory under
+`.mu`. Oversized tool-output spills are the sole Mu-created runtime files
+outside SQLite and use exclusive random names in the private `$TMPDIR/mu`
+directory; they are ephemeral and have no retention promise.
 
 Project state is private to the project. A project should be movable and
 understandable by inspecting its `.mu` directory, while still avoiding committing
@@ -1032,6 +1055,7 @@ The global and project directories have the same conceptual shape:
   .env              # optional environment values for provider lookup + bash
   AGENTS.md         # agent instructions, appended to system prompt
   review.md         # optional command/skill/reference instruction file
+  sessions.db       # one scope-wide SQLite database (+ SQLite sidecars)
 ```
 
 When a project is active, global configuration is loaded first and project
@@ -1190,10 +1214,13 @@ stay terse and `AGENTS.md` carries user customization.
 
 State is stored in a SQLite database in exactly one active scope: the project
 database (`<project>/.mu/sessions.db`) when a project is active, or the global
-database (`~/.mu/sessions.db`) otherwise. SQLite is chosen for zero-setup
-embedded storage, transactional durability, fast open, and easy querying. **WAL
-mode** is enabled so per-turn load/append is fast and concurrent shells do not
-block each other unnecessarily. Alongside WAL the connection sets
+database (`$MU_CONFIG_DIR/sessions.db`, normally `~/.mu/sessions.db`) otherwise.
+The database, its WAL/SHM/journal sidecars, and authored configuration files are
+the only Mu-managed state under `.mu`; locks, spills, and attachment staging
+are outside it. SQLite is chosen for zero-setup embedded storage, transactional
+durability, fast open, and easy querying. **WAL mode** is enabled so per-turn
+load/append is fast and concurrent shells do not block each other unnecessarily.
+Alongside WAL the connection sets
 `synchronous=NORMAL` (fsync at checkpoints only: an application crash loses
 nothing, an OS crash may lose the last commits but cannot corrupt the file —
 the right trade for a conversation log), `foreign_keys=ON` (declared relations
@@ -1205,20 +1232,24 @@ after checkpointing instead of sitting at its high-water mark forever.
 
 Conceptual schema (flat and small):
 
-- **session** — `id`, `created_at`, `updated_at`, `cwd`, `model`,
-  `title`,
-  `last_total_tokens` (the most recent `usage.total_tokens` reported by the
-  provider; used for the pre-turn overflow check, §"Context window and
-  compaction"). `model` is set at session creation from the
+- **session** — `id`, `created_at`, `updated_at`, `cwd`, `model`, `title`,
+  `last_context_tokens`, and nullable `owner_pid`. `last_context_tokens` is the
+  most recent `usage.total_tokens` reported by the
+  provider; used for the pre-turn overflow check in §"Context window and
+  compaction". `owner_pid` is the opportunistic same-session mutex described
+  below. `model` is set at session creation from the
   effective model (lifecycle step 2). After a successful turn or retry, `model`
   is updated to that invocation's effective model; failed invocations do not
   update it. `cwd` records the last working directory used for that session.
   `title` is set lazily from the first user prompt (first ~60 chars) and is
   display-only for `mu session list`.
-- **message** — `id`, `session_id`, `role`
-  (`system`/`user`/`assistant`/`tool`/`summary`),
+- **message** — `id`, `session_id`, `kind`
+  (`system`/`user`/`assistant`/`bash_result`/`summary`),
   `content`, optional full user content JSON for multi-part inputs, `created_at`,
-  ordering index, and for tool results `tool_call_id`. The per-session ordering
+  and ordering index. A `bash_result` row also carries the internal
+  `bash_call_id`, outcome (`completed`, `error`, or `interrupted`), optional exit
+  code, and optional duration. It is itself the unique completion record; there
+  is no separate result table. The per-session ordering
   (`session_id`, `seq`) is enforced UNIQUE — replay order is the backbone of
   the whole design, so a violated ordering invariant must surface as a loud
   constraint error, not silent transcript corruption. Assistant rows may also
@@ -1237,16 +1268,16 @@ Conceptual schema (flat and small):
 - **attachment_blob** — content-addressed attachment bytes keyed by SHA-256,
   with byte size and creation time. Message content stores filename, MIME type,
   and blob reference metadata; identical bytes are stored once per scope DB.
-- **tool_call** — surrogate `id`, provider `call_id`, `message_id`, `tool`,
-  `args` (JSON), `risk`, `status` (`ok` / `error` / `interrupted`), optional
-  structured `exit_code`, and optional `duration_ms`. Records the agent's tool
-  invocations for inspection. Provider call ids are only unique within a single
-  response (many OpenAI-compatible backends emit `call_0`, `call_1`, …), so
-  rows are keyed `UNIQUE(message_id, call_id)` — id reuse across turns or
-  sessions can never overwrite an earlier audit row. The result text is **not**
-  duplicated here: it lives on the corresponding `tool` message row, joinable
-  via `call_id`; this table carries only the structured execution facts the
-  message row lacks.
+- **bash_call** — immutable Bash execution claims: SQLite integer `id`,
+  `assistant_message_id`, call `position`, provider call id, raw argument
+  string, and nullable projected declared risk. Provider call ids are unique
+  only within one assistant response, so both position and provider id are
+  constrained within that parent message. The assistant message and all its
+  claims commit together. Only the process holding an internal claim id may
+  execute it; absence of a linked `bash_result` message means unresolved.
+- **bash_attachment** — ordered attachment metadata for a Bash claim, pointing
+  at an `attachment_blob` row and carrying filename, media type, and image
+  detail. The sink is open only while the owning PID holds the session.
 - **turn_attempt** — audit-only invocation records: session, invocation kind
   (`turn` / `retry`), model, start/end time, outcome, error class/text, partial
   assistant text that never became a completed message, provider-request count,
@@ -1255,6 +1286,11 @@ Conceptual schema (flat and small):
   compaction. There is intentionally **no** turn-status or checkpoint column on
   `session`: whether the last turn finished is derived from the message tail
   (§"Interrupted turns and retry").
+- **turn_usage** — provider usage aggregates for each completed invocation,
+  including input/cache/output/reasoning/total token counts.
+- **bash_review** — at most one guardrail decision per Bash claim, containing
+  the assessed risk, authorization level, allow/deny outcome, reason, and time.
+  The raw action is already present in `bash_call.arguments` and is not copied.
 
 **Compatibility baseline.** Schema version 6 is the durable compatibility
 baseline. Later schema versions retain ordered, transactional migrations from
@@ -1267,18 +1303,20 @@ must retain an accepted legacy spelling or provide an explicit migration path.
 
 `mu` maps each interactive shell instance to at most one active session:
 
-- **Lazy creation.** On the first submitted prompt, the zsh plugin invokes `mu`
-  without `--session`, exporting `MU_SESSION_FILE` to a temporary path. `mu`
-  creates the session row and writes the new id to that file. After `mu` exits,
-  the plugin reads the id and passes `--session <id>` on later prompts. The id is
-  never printed to stdout by the turn, so the transcript stays clean.
+- **First-turn creation.** When zsh has no attached session, it first invokes
+  `mu [--model MODEL] session new`, captures and validates the single id printed
+  by that management command, and remembers it for the current scope. It then
+  invokes the first turn with `--session <id>`. There is no rendezvous file or
+  inherited descriptor, and the id is never printed by the turn itself.
 - **Attach / continue.** `MU_ZSH_SESSION_ID=<id>` seeds the zsh plugin with an
   existing session, while `mu -s <id>` and `mu -c` handle one-shot re-entry from
   the command line. `mu session list` lists recent candidates.
-- **Per-turn lifecycle.** Each turn: open DB → acquire session lock → normalize
-  any interrupted tail → load session messages → run turn (persisting each
-  completed message as it lands) → release lock → exit. The connection opens
-  lazily so a turn that errors early stays cheap.
+- **Per-turn lifecycle.** Each turn: open DB → acquire `session.owner_pid` →
+  normalize any interrupted tail → load session messages → run the turn
+  (persisting each completed message as it lands and claiming tool calls before
+  execution) → conditionally clear the owner PID → exit. The slow ownership
+  transaction is held only while checking/replacing a stale PID, never during
+  provider or tool work.
 
 Sessions are append-only logs; resuming replays messages into the context
 window. Multiple shells holding *different* sessions run concurrently (safe under
@@ -1320,9 +1358,10 @@ Persistence is at **message granularity**, and only **completed** messages are
 written:
 
 - The user prompt is written when the turn starts. As the turn proceeds, each
-  fully-formed assistant message (including its `tool_calls`) is committed as its
-  stream completes, and each tool result is committed when that tool finishes.
-  A result is persisted for **every tool call that begins execution** — even one
+  fully formed assistant message and all its `bash_call` claims commit in one
+  transaction when its stream completes, and each Bash result is committed
+  when that call finishes. A result is persisted for **every Bash call that
+  begins execution** — even one
   killed mid-run gets a result recorded — so a side-effecting command is never
   lost from history.
 - A partial/in-flight assistant message (streamed text, reasoning) is **never**
@@ -1338,11 +1377,11 @@ There is **no** stored turn-status flag or checkpoint. Whether the last turn
 finished is *derived* from the message log:
 
 - A session is **clean** when its last message is a completed assistant reply
-  (an `assistant` message with no `tool_calls`), a compaction `summary`, or when
+  (an `assistant` message with no `bash_call` children), a compaction `summary`, or when
   its only message is the synthetic environment seed (no real turn yet).
 - Otherwise it is **unclean**: the tail is a user prompt with no reply, a tool
   result with no following assistant turn, or an assistant message still
-  carrying `tool_calls`.
+  carrying `bash_call` children.
 
 **Rationale — derive, don't store.** A separate boolean can drift out of sync
 with the messages (precisely in the crash cases that matter) and would risk
@@ -1350,8 +1389,8 @@ with the messages (precisely in the crash cases that matter) and would risk
 truth, so cleanliness is read from it and cannot desync.
 
 **Normalizing an interrupted tail.** Before any turn or retry runs, mu makes the
-tail API-valid: for the most recent assistant tool-call message, every
-`tool_call` that has no result gets a synthesized interrupted result
+tail API-valid: for the most recent assistant call message, every
+`bash_call` that has no `bash_result` message gets a synthesized interrupted result
 (`INTERRUPTED_TOOL_RESULT`: "may have started and not completed; verify state").
 Calls that finished keep their real result untouched. This is idempotent (a
 no-op on a clean session).
@@ -1375,28 +1414,28 @@ per-call "running" marker in the database.
   retry; the zsh `/retry` command forwards active shell overrides. It refuses on
   a clean session ("nothing to retry").
 
-### Session concurrency lock
+### Session concurrency ownership
 
 Two processes can target the same session, so concurrent turns against one
-session are possible and must be serialized. Each turn acquires a per-session
-lock for its duration; a second `mu` targeting the same session finds it held
-and **fails fast** with a "session busy" message rather than interleaving
-writes.
+session must be serialized. The session row contains only a nullable
+`owner_pid`; no lock file is created. Each turn first runs the fast conditional
+update `owner_pid = current_pid WHERE owner_pid IS NULL`. One changed row means
+that process owns the session.
 
-The lock is an advisory `flock` on a per-session lock file under the active
-state directory's `locks/` folder (for example `<project>/.mu/locks/` or
-`~/.mu/locks/`), acquired in lifecycle step 5 before any DB writes. This is
-deliberately *not* a SQLite-level lock:
-`BEGIN IMMEDIATE` takes a reserved lock on the **whole database file**, which
-would serialize unrelated sessions against each other. A per-session `flock`
-lets different sessions proceed independently.
+If the fast update finds a non-NULL owner, Mu opens a short
+`BEGIN IMMEDIATE` transaction, reads the PID, and checks it with the POSIX
+`kill(pid, 0)` liveness probe. A live PID produces a **fails fast** `session
+busy` error. An absent PID is replaced with the current PID and the transaction
+commits. The transaction is never held across provider or tool work. Normal
+exit clears the owner with `WHERE owner_pid = current_pid`, so a late cleanup
+cannot clear a newer owner. A crash can leave a PID behind; PID reuse can
+therefore cause a conservative false-busy result, which is accepted because it
+does not permit concurrent execution.
 
-WAL caveat: WAL lets readers and writers not block each other, but **two writers
-still serialize at the SQLite level** (only one write transaction at a time).
-Different sessions writing concurrently is rare and brief (per-turn appends), so
-mu sets a `busy_timeout` (e.g. 5s) on the connection to ride out the momentary
-contention rather than erroring. The `flock` handles same-session serialization;
-`busy_timeout` handles the rare cross-session write overlap.
+This is deliberately a logical mutex rather than a kernel advisory lock. SQLite
+still serializes its brief write transactions, and `busy_timeout` handles rare
+cross-session overlap; unrelated sessions do not hold a database transaction
+while waiting on a provider or tool.
 
 ### Context window and compaction
 
