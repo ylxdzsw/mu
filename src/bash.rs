@@ -341,8 +341,10 @@ fn run_bash_inner(
         .as_deref()
         .map(resolve_path)
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+    let applets = crate::paths::applets_dir()?;
     let command_text = format!(
-        "export PATH=/usr/libexec/mu:$PATH\nexec 2>&1\n{}",
+        "export PATH={}:$PATH\nexec 2>&1\n{}",
+        shell_quote(&applets.to_string_lossy()),
         args.command
     );
 
@@ -521,6 +523,10 @@ fn run_bash_inner(
         redacted: redactor.did_redact(),
         attachments: Vec::new(),
     })
+}
+
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\"'\"'"))
 }
 
 fn drain_available(
@@ -832,10 +838,11 @@ mod tests {
             None,
         )
         .unwrap();
+        let applets = crate::paths::applets_dir().unwrap();
         assert!(
-            result.output.starts_with("/usr/libexec/mu:"),
-            "{}",
-            result.output
+            result
+                .output
+                .starts_with(&format!("{}:", applets.display()))
         );
     }
 

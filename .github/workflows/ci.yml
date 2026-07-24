@@ -44,13 +44,25 @@ jobs:
         run: cargo fmt --check
 
       - name: Lint
-        run: cargo clippy --all-targets --all-features -- -D warnings
+        run: |
+          cargo clippy --all-targets -- -D warnings
+          cargo clippy --all-targets --features portable -- -D warnings
 
-      - name: Test
-        run: cargo test --all-features -- --test-threads=1
+      - name: Test native and portable builds
+        run: |
+          cargo test -- --test-threads=1
+          cargo test --features portable -- --test-threads=1
 
       - name: Build binaries
-        run: cargo build --bins
+        run: |
+          cargo build --bins
+          smoke=$(mktemp -d)
+          mkdir "$smoke/bin"
+          cp target/debug/mu "$smoke/bin/"
+          env -u HOME -u XDG_CACHE_HOME "$smoke/bin/mu" --help >/dev/null
+          test ! -e "$smoke/share"
+          test ! -e "$smoke/libexec"
+          cargo build --bins --features portable
 
       - name: Test zsh integration
         run: |
@@ -59,6 +71,225 @@ jobs:
 
       - name: Check package recipe
         run: bash -n PKGBUILD
+
+  linux-package:
+    name: Native Arch Linux package
+    runs-on: ubuntu-latest
+    container: archlinux:base-devel
+
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Select master for an msys2-triggered run
+        if: github.ref == 'refs/heads/msys2'
+        run: |
+          git fetch --no-tags origin \
+            +refs/heads/master:refs/remotes/origin/master
+          git checkout --detach origin/master
+
+      - name: Install package dependencies
+        run: |
+          pacman -Syu --noconfirm
+          pacman -S --needed --noconfirm git rust jq sqlite zsh
+
+      - name: Build the native package from this revision
+        run: |
+          useradd --create-home builder
+          chown -R builder:builder "$GITHUB_WORKSPACE"
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          git update-ref refs/heads/ci-package HEAD
+          runuser -u builder -- env \
+            MU_SOURCE_URL="file://$GITHUB_WORKSPACE" \
+            MU_SOURCE_BRANCH=ci-package \
+            makepkg --noconfirm --cleanbuild --clean --force
+
+      - name: Install and smoke-test the native package
+        run: |
+          package=$(find . -maxdepth 1 -name 'mu-*.pkg.tar.zst' -print -quit)
+          test -n "$package"
+          pacman --noconfirm -U "$package"
+          test -f /usr/share/mu/customize-mu.md
+          test -L /usr/libexec/mu/apply_patch
+          test ! -e /usr/bin/applets
+          before=$(find /usr/libexec/mu /usr/share/mu -type f -print0 \
+            | sort -z | xargs -0 sha256sum)
+          /usr/bin/mu --help >/dev/null
+          after=$(find /usr/libexec/mu /usr/share/mu -type f -print0 \
+            | sort -z | xargs -0 sha256sum)
+          test "$before" = "$after"
+          test ! -e /usr/bin/applets
+          smoke=$(mktemp -d)
+          printf '%s\n' \
+            '*** Begin Patch' \
+            '*** Add File: smoke.txt' \
+            '+works' \
+            '*** End Patch' \
+            | (cd "$smoke" && /usr/libexec/mu/apply_patch)
+          grep -qx works "$smoke/smoke.txt"
+
+  portable-linux:
+    name: Portable Linux x86-64
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Select master for an msys2-triggered run
+        if: github.ref == 'refs/heads/msys2'
+        run: |
+          git fetch --no-tags origin \
+            +refs/heads/master:refs/remotes/origin/master
+          git checkout --detach origin/master
+
+      - name: Install the musl target
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes musl-tools
+          rustup target add x86_64-unknown-linux-musl
+
+      - name: Build the portable binary
+        run: |
+          cargo build --release --target x86_64-unknown-linux-musl \
+            --features portable
+
+      - name: Smoke-test the standalone binary and generated applet
+        run: |
+          set -euo pipefail
+          binary=target/x86_64-unknown-linux-musl/release/mu
+          smoke=$(mktemp -d)
+          cp "$binary" "$smoke/mu"
+          XDG_CACHE_HOME="$smoke/cache" "$smoke/mu" --help >/dev/null
+          test -f "$smoke/cache/mu/builtins/customize-mu.md"
+          for applet in apply_patch edit view_image; do
+            test -L "$smoke/cache/mu/applets/$applet"
+            test "$(readlink "$smoke/cache/mu/applets/$applet")" = "$smoke/mu"
+          done
+          printf '%s\n' \
+            '*** Begin Patch' \
+            '*** Add File: smoke.txt' \
+            '+works' \
+            '*** End Patch' \
+            | (cd "$smoke" && "$smoke/cache/mu/applets/apply_patch")
+          grep -qx works "$smoke/smoke.txt"
+          printf old >"$smoke/edit.txt"
+          printf '%s\n' \
+            '<<<<<<< SEARCH' \
+            'old' \
+            '=======' \
+            'new' \
+            '>>>>>>> REPLACE' \
+            | (cd "$smoke" && "$smoke/cache/mu/applets/edit" edit.txt)
+          grep -qx new "$smoke/edit.txt"
+          "$smoke/cache/mu/applets/view_image" --help >/dev/null
+          if readelf -l "$binary" | grep -F 'Requesting program interpreter'; then
+            echo "portable Linux binary has a dynamic interpreter" >&2
+            exit 1
+          fi
+          if readelf -d "$binary" 2>/dev/null \
+            | grep -E 'NEEDED.*(libc\.so|libsqlite3)'; then
+            echo "portable Linux binary depends on dynamic libc or SQLite" >&2
+            exit 1
+          fi
+
+      - name: Assemble the portable archive
+        run: |
+          set -euo pipefail
+          archive=mu-linux-x86_64-musl
+          mkdir -p "dist/$archive"
+          cp target/x86_64-unknown-linux-musl/release/mu "dist/$archive/"
+          cp mu.zsh README.md SPEC.md LICENSE "dist/$archive/"
+          tar -czf "dist/$archive.tar.gz" -C dist "$archive"
+          (cd dist && sha256sum "$archive.tar.gz" \
+            > SHA256SUMS-linux-x86_64-musl.txt)
+
+      - name: Upload the portable archive
+        uses: actions/upload-artifact@v7
+        with:
+          name: portable-linux-x86_64-musl
+          path: |
+            dist/*.tar.gz
+            dist/SHA256SUMS-linux-x86_64-musl.txt
+          if-no-files-found: error
+          retention-days: 14
+
+  portable-macos:
+    name: Portable macOS ${{ matrix.arch }}
+    strategy:
+      matrix:
+        include:
+          - runner: macos-15
+            arch: aarch64
+            file_arch: arm64
+          - runner: macos-15-intel
+            arch: x86_64
+            file_arch: x86_64
+    runs-on: ${{ matrix.runner }}
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Select master for an msys2-triggered run
+        if: github.ref == 'refs/heads/msys2'
+        run: |
+          git fetch --no-tags origin \
+            +refs/heads/master:refs/remotes/origin/master
+          git checkout --detach origin/master
+
+      - name: Build the portable binary
+        run: cargo build --release --features portable
+
+      - name: Smoke-test the standalone binary and generated applet
+        run: |
+          set -euo pipefail
+          smoke=$(mktemp -d)
+          cp target/release/mu "$smoke/mu"
+          XDG_CACHE_HOME="$smoke/cache" "$smoke/mu" --help >/dev/null
+          test -f "$smoke/cache/mu/builtins/customize-mu.md"
+          for applet in apply_patch edit view_image; do
+            test -L "$smoke/cache/mu/applets/$applet"
+            test "$(readlink "$smoke/cache/mu/applets/$applet")" = "$smoke/mu"
+          done
+          printf '%s\n' \
+            '*** Begin Patch' \
+            '*** Add File: smoke.txt' \
+            '+works' \
+            '*** End Patch' \
+            | (cd "$smoke" && "$smoke/cache/mu/applets/apply_patch")
+          grep -qx works "$smoke/smoke.txt"
+          printf old >"$smoke/edit.txt"
+          printf '%s\n' \
+            '<<<<<<< SEARCH' \
+            'old' \
+            '=======' \
+            'new' \
+            '>>>>>>> REPLACE' \
+            | (cd "$smoke" && "$smoke/cache/mu/applets/edit" edit.txt)
+          grep -qx new "$smoke/edit.txt"
+          "$smoke/cache/mu/applets/view_image" --help >/dev/null
+          file target/release/mu | grep -F '${{ matrix.file_arch }}'
+
+      - name: Assemble the portable archive
+        run: |
+          set -euo pipefail
+          archive=mu-macos-${{ matrix.arch }}
+          mkdir -p "dist/$archive"
+          cp target/release/mu "dist/$archive/"
+          cp mu.zsh README.md SPEC.md LICENSE "dist/$archive/"
+          tar -czf "dist/$archive.tar.gz" -C dist "$archive"
+          (cd dist && shasum -a 256 "$archive.tar.gz" \
+            > "SHA256SUMS-macos-${{ matrix.arch }}.txt")
+
+      - name: Upload the portable archive
+        uses: actions/upload-artifact@v7
+        with:
+          name: portable-macos-${{ matrix.arch }}
+          path: |
+            dist/*.tar.gz
+            dist/SHA256SUMS-macos-${{ matrix.arch }}.txt
+          if-no-files-found: error
+          retention-days: 14
 
   windows:
     name: Windows MSYS2 UCRT64
@@ -189,14 +420,19 @@ jobs:
           retention-days: 14
 
   release:
-    name: Add Windows artifacts to release
+    name: Publish release artifacts
     if: github.ref_type == 'tag'
-    needs: [linux, windows]
+    needs: [linux, linux-package, portable-linux, portable-macos, windows]
     runs-on: ubuntu-latest
     permissions:
       contents: write
 
     steps:
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: portable-*
+          path: dist
+          merge-multiple: true
       - uses: actions/download-artifact@v8
         with:
           name: windows-msys2-ucrt64

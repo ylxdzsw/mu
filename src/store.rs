@@ -1501,10 +1501,13 @@ fn process_is_alive(pid: i64) -> Result<bool> {
 ///   megabytes; without a limit it stays at its high-water mark forever.
 ///   8 MiB caps the steady-state size while keeping normal turns unaffected.
 ///
-/// `foreign_keys=ON` is deliberately not here — see `enable_foreign_keys`.
+/// `foreign_keys=OFF` makes the migration contract independent of SQLite's
+/// compile-time default. Enforcement is enabled after migration; see
+/// `enable_foreign_keys`.
 fn configure_connection(conn: &Connection) -> Result<()> {
     conn.execute_batch(
-        "PRAGMA journal_mode=WAL;
+        "PRAGMA foreign_keys=OFF;
+         PRAGMA journal_mode=WAL;
          PRAGMA synchronous=NORMAL;
          PRAGMA busy_timeout=5000;
          PRAGMA trusted_schema=OFF;

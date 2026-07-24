@@ -20,6 +20,7 @@ mod cli;
 mod compaction;
 mod config;
 mod guardrail;
+mod install;
 mod models;
 mod paths;
 mod provider;
@@ -115,11 +116,13 @@ fn main() {
         process::exit(applets::dispatch(applet));
     }
 
-    let result = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .context("initializing Mu async runtime")
-        .and_then(|runtime| runtime.block_on(run()));
+    let result = install::prepare().and_then(|()| {
+        tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .context("initializing Mu async runtime")
+            .and_then(|runtime| runtime.block_on(run()))
+    });
     if let Err(e) = result {
         if error_output_format() == cli::OutputFormat::Final {
             let _ = write_final_error(&e.to_string());

@@ -118,7 +118,7 @@ pub fn scan_instruction_index_with_env(
     project_config_dir: Option<&Path>,
     env: &EnvMap,
 ) -> Result<InstructionIndex> {
-    let builtins_dir = crate::paths::builtins_dir();
+    let builtins_dir = crate::paths::builtins_dir()?;
     scan_instruction_index_with_builtins(
         Some(builtins_dir.as_path()),
         global_config_dir,

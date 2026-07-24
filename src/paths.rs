@@ -121,8 +121,12 @@ pub fn global_dir() -> PathBuf {
     dirs_home().join(".mu")
 }
 
-pub fn builtins_dir() -> PathBuf {
-    PathBuf::from("/usr/share/mu")
+pub fn builtins_dir() -> Result<PathBuf> {
+    crate::install::builtins_dir()
+}
+
+pub fn applets_dir() -> Result<PathBuf> {
+    crate::install::applets_dir()
 }
 
 fn dirs_home() -> PathBuf {

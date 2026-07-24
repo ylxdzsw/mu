@@ -93,7 +93,7 @@ pub fn build_context(
         .filter(|skill| skill.scope != InstructionScope::Builtin)
         .collect::<Vec<_>>();
     let env_paths = existing_env_paths(global_config_dir, project_config_dir);
-    let preamble = export_preamble(&env_paths);
+    let preamble = export_preamble(&env_paths)?;
     let context = assemble_context(
         &user_skills,
         global_config_dir,
@@ -121,9 +121,9 @@ fn existing_env_paths(
         .collect()
 }
 
-fn export_preamble(env_paths: &[std::path::PathBuf]) -> String {
+fn export_preamble(env_paths: &[std::path::PathBuf]) -> anyhow::Result<String> {
     let mut preamble = EXPORT_PREAMBLE.to_string();
-    let customize = crate::paths::builtins_dir().join("customize-mu.md");
+    let customize = crate::paths::builtins_dir()?.join("customize-mu.md");
     if customize.is_file() {
         preamble.push_str(&format!(
             "\nTo understand mu's configuration, skills, and command contract, read {}.",
@@ -141,7 +141,7 @@ fn export_preamble(env_paths: &[std::path::PathBuf]) -> String {
         ));
     }
     preamble.push_str(EXPORT_PREAMBLE_CLOSE);
-    preamble
+    Ok(preamble)
 }
 
 fn assemble_context(
@@ -468,7 +468,7 @@ mod tests {
         let global_env = global.join(".env").canonicalize().unwrap();
         let project_env = project.join(".env").canonicalize().unwrap();
 
-        let preamble = export_preamble(&[global_env.clone(), project_env.clone()]);
+        let preamble = export_preamble(&[global_env.clone(), project_env.clone()]).unwrap();
         fs::remove_dir_all(&global).unwrap();
         fs::remove_dir_all(&project).unwrap();
 
@@ -485,6 +485,7 @@ mod tests {
         // On a packaged or source checkout the built-in reference exists, so the
         // pointer is appended; otherwise the preamble is just opened and closed.
         if crate::paths::builtins_dir()
+            .unwrap()
             .join("customize-mu.md")
             .is_file()
         {
@@ -504,7 +505,7 @@ mod tests {
         );
         assert!(!encoded.contains("--"));
 
-        let preamble = export_preamble(&[path]);
+        let preamble = export_preamble(&[path]).unwrap();
         assert_eq!(preamble.matches("-->").count(), 1);
         assert!(!preamble.contains("injected\nname"));
     }

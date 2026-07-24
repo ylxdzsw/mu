@@ -102,6 +102,41 @@ This single-binary shape is the central decision (see §3 for the full rationale
 recap). It keeps the agent semantics small and scriptable while leaving the
 shell responsible for interaction.
 
+The default Cargo build is native and uses system SQLite. For an executable at
+`<prefix>/bin/mu`, built-ins are always `<prefix>/share/mu/` and applets are
+always `<prefix>/libexec/mu/`. Native startup derives those paths without
+checking, creating, or modifying package-owned resources.
+
+The single additive `portable` feature enables `rusqlite/bundled` and embeds
+every shipped built-in with compile-time `include_str!` entries. Portable
+resolution treats built-ins and applets independently. If the executable is
+under `bin/` and the corresponding native directory exists, that directory
+wins. Otherwise the resource uses a fixed directory under one selected cache
+root:
+
+- absolute `$XDG_CACHE_HOME/mu` when `XDG_CACHE_HOME` is set;
+- `$HOME/Library/Caches/mu` on macOS;
+- `$HOME/.cache/mu` on other Unix systems.
+
+A relative `XDG_CACHE_HOME`, missing usable home, conflicting object, or any
+creation/population error is fatal; `/tmp` is never a fallback. The fixed
+resource directories are `<cache-root>/builtins` and
+`<cache-root>/applets`. On first creation Mu writes the embedded built-in
+strings directly into the former and absolute symlinks to the current
+executable into the latter. Existing directories are authoritative regardless
+of their contents. Mu does not validate, refresh, repair, roll back, clean up,
+or atomically stage them; failed creation may therefore leave a partial
+directory that subsequent runs trust. Moving or upgrading the binary does not
+refresh cached paths. The user must remove the applicable resource directory
+to regenerate it. Applet `argv[0]` dispatch occurs before portable
+initialization.
+
+Version-tag artifacts add portable Linux x86-64 musl and macOS ARM64/Intel
+archives with SHA-256 checksums. The archives omit external built-ins because
+they are embedded. Linux has no dynamic libc or SQLite dependency; macOS
+retains Apple system-library linkage. The existing Windows MSYS2 UCRT64 package
+and release archive remain unchanged and are published alongside them.
+
 ### 2.3 Interactive mode lives in the shell surface
 
 The zsh plugin is the built-in interactive direction. It owns only line
@@ -127,10 +162,12 @@ advisory UI/audit metadata only; it is not a sandbox or approval proof.
 Skill metadata (name + description + path) is injected into the system prompt.
 The agent loads a skill file on demand using `bash` (`sed`, `cat`, `rg`, etc.).
 No dedicated "skill" tool — this keeps the model-visible surface at one tool
-and makes skills "just files". Built-in skills live in `/usr/share/mu` at the
-lowest precedence; shipped built-ins may include
-self-customization guidance such as `customize-mu` or delegation guidance such
-as `subagent`, but user and project instructions can shadow them by name.
+and makes skills "just files". Native built-ins live in
+`<prefix>/share/mu/`; portable builds use that directory when installed and
+otherwise materialize their embedded built-ins in the user cache. They have the
+lowest precedence; shipped built-ins may include self-customization guidance
+such as `customize-mu` or delegation guidance such as `subagent`, but user and
+project instructions can shadow them by name.
 Skills may declare optional `requires_env` and `requires_commands` frontmatter
 keys. Each key is a comma-separated list, and every listed requirement must be
 met before the skill is injected.
@@ -394,10 +431,11 @@ bash({
 })
 ```
 
-`bash` prepends `/usr/libexec/mu` to its post-login `PATH`. That directory owns
-three private symlinks to the physical `/usr/bin/mu` binary. Before normal CLI
-parsing or async-runtime startup, `mu` checks the basename of `argv[0]` and
-dispatches these applets:
+`bash` prepends the resolved applet directory to its post-login `PATH`: always
+`<prefix>/libexec/mu/` in a native build; in a portable build, that installed
+directory when present or the cached `applets/` directory otherwise. Before
+normal CLI parsing or portable initialization, `mu` checks the basename of
+`argv[0]` and dispatches these applets:
 
 - **`apply_patch`** accepts one patch argument or reads it from stdin. Its
   `*** Begin Patch` / `*** End Patch` format supports add, update, move, and

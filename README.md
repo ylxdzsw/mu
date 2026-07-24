@@ -9,9 +9,14 @@ as an interactive assistant inside zsh.
 Build the binary and put it on `PATH`:
 
 ```sh
-cargo build --release
+cargo build --release --features portable
 export PATH="$PWD/target/release:$PATH"
 ```
+
+The `portable` feature bundles SQLite and embeds Mu's built-in skills, so this
+source-tree binary can run without being installed. On its first normal
+invocation it writes the built-ins and three applet symlinks into your user
+cache.
 
 Now ask it something:
 
@@ -219,26 +224,56 @@ controls brevity, not terminal behavior: `mu` automatically enables live lines,
 color, and rich Markdown when stdout is a terminal, and redirected output is
 sequential and ANSI-free.
 
-## Packaged installations
+## Native installation and portable builds
 
-Packaged installations also expose three Mu-owned commands inside agent `bash`
-calls: `apply_patch` for structured text edits, `edit` for exact text
-replacement, and `view_image` for loading a local image into the model's tool
-result. They are private symlinks under `/usr/libexec/mu`, all backed by the
-same `mu` executable. For a source-tree build, create equivalent sibling
-symlinks if you want to exercise the applets directly:
+The default Cargo build is for a native installation and uses system SQLite:
 
 ```sh
-ln -sf mu target/release/apply_patch
-ln -sf mu target/release/edit
-ln -sf mu target/release/view_image
+cargo build --release
 ```
+
+For a binary installed as `<prefix>/bin/mu`, Mu always uses
+`<prefix>/share/mu/` for package-owned built-ins and
+`<prefix>/libexec/mu/` for package-owned applets. It assumes the installation
+is correct: it neither checks nor creates these directories at startup. Arch
+Linux packaging for this checkout is in [PKGBUILD](PKGBUILD) and uses this
+native default.
+
+Add `portable` for a standalone Unix binary:
+
+```sh
+cargo build --release --features portable
+```
+
+Portable builds bundle SQLite and embed every shipped built-in. When the binary
+is under a `bin/` directory, each resource is resolved independently: an
+existing `<prefix>/share/mu/` wins for built-ins and an existing
+`<prefix>/libexec/mu/` wins for applets. Any resource without that installed
+directory falls back to the cache:
+
+- absolute `$XDG_CACHE_HOME/mu` when `XDG_CACHE_HOME` is set;
+- `$HOME/Library/Caches/mu` on macOS;
+- `$HOME/.cache/mu` on other Unix systems.
+
+Mu aborts rather than using `/tmp` if no cache root can be determined or if a
+cache path cannot be created. Cached resources live in fixed `builtins/` and
+`applets/` subdirectories. A missing subdirectory is created and populated in
+place; cached applets are absolute symlinks to the current executable. An
+existing directory is authoritative and is never inspected, refreshed, or
+repaired. A conflicting non-directory is an error, and a failed first
+population may leave a partial directory that later runs deliberately trust.
+Moving or upgrading the binary does not update either cache: remove the
+applicable cache subdirectory manually to regenerate it.
+
+Version tags publish portable Linux x86-64 musl and macOS ARM64/Intel archives
+with SHA-256 checksum files. Built-ins are embedded, so those archives do not
+contain a separate `builtins/` directory. Releases continue to include the
+unchanged Windows MSYS2 UCRT64 package and archive.
 
 ## Reference
 
 See [SPEC.md](SPEC.md) for the complete product contract, including exact CLI,
 configuration, discovery, rendering, persistence, provider, and zsh behavior.
-Arch Linux packaging for this checkout is in [PKGBUILD](PKGBUILD).
 
 ## License
 
