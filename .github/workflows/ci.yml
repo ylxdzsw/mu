@@ -110,13 +110,14 @@ jobs:
               makepkg --noconfirm --cleanbuild --clean --force
           )
           package=$(find "$package_root" -maxdepth 1 \
-            -name 'mu-*.pkg.tar.zst' -print -quit)
+            -name 'mu-*.pkg.tar.zst' ! -name 'mu-debug-*' -print -quit)
           test -n "$package"
           cp "$package" "$GITHUB_WORKSPACE/"
 
       - name: Install and smoke-test the native package
         run: |
-          package=$(find . -maxdepth 1 -name 'mu-*.pkg.tar.zst' -print -quit)
+          package=$(find . -maxdepth 1 \
+            -name 'mu-*.pkg.tar.zst' ! -name 'mu-debug-*' -print -quit)
           test -n "$package"
           pacman --noconfirm -U "$package"
           test -f /usr/share/mu/customize-mu.md
