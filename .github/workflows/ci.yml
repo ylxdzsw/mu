@@ -78,6 +78,11 @@ jobs:
     container: archlinux:base-devel
 
     steps:
+      - name: Install package dependencies
+        run: |
+          pacman -Syu --noconfirm
+          pacman -S --needed --noconfirm git rust jq sqlite zsh
+
       - uses: actions/checkout@v6
         with:
           fetch-depth: 0
@@ -88,11 +93,6 @@ jobs:
           git fetch --no-tags origin \
             +refs/heads/master:refs/remotes/origin/master
           git checkout --detach origin/master
-
-      - name: Install package dependencies
-        run: |
-          pacman -Syu --noconfirm
-          pacman -S --needed --noconfirm git rust jq sqlite zsh
 
       - name: Build the native package from this revision
         run: |
