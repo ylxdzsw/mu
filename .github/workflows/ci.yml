@@ -97,13 +97,22 @@ jobs:
       - name: Build the native package from this revision
         run: |
           useradd --create-home builder
-          chown -R builder:builder "$GITHUB_WORKSPACE"
+          package_root=$(mktemp -d)
+          cp PKGBUILD "$package_root/"
+          chown -R builder:builder "$GITHUB_WORKSPACE" "$package_root"
           git config --global --add safe.directory "$GITHUB_WORKSPACE"
           git update-ref refs/heads/ci-package HEAD
-          runuser -u builder -- env \
-            MU_SOURCE_URL="file://$GITHUB_WORKSPACE" \
-            MU_SOURCE_BRANCH=ci-package \
-            makepkg --noconfirm --cleanbuild --clean --force
+          (
+            cd "$package_root"
+            runuser -u builder -- env \
+              MU_SOURCE_URL="file://$GITHUB_WORKSPACE" \
+              MU_SOURCE_BRANCH=ci-package \
+              makepkg --noconfirm --cleanbuild --clean --force
+          )
+          package=$(find "$package_root" -maxdepth 1 \
+            -name 'mu-*.pkg.tar.zst' -print -quit)
+          test -n "$package"
+          cp "$package" "$GITHUB_WORKSPACE/"
 
       - name: Install and smoke-test the native package
         run: |
