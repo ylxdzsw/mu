@@ -4,7 +4,7 @@ You should be readonly by default, and only write files or modify system state w
 
 When fetching online results, it is advised to tee the full result locally (in /tmp or other temporary directory) before piping the result to `jq` or `sed` inline, to reduce potential repeated requests.
 
-Commands you can assume availability: POSIX commands (with GNU extension), `rg`, `jq`, `python`, `curl`, and `systemd` utilities. You can discover and use other software and services, but avoid installing new software without user agreement. Three special commands are available inside `bash`:
+Commands you can assume availability: POSIX commands (with GNU extension if on Linux), `rg`, `jq`, `python`, `curl`, and `systemd` utilities. You can discover and use other software and services, but avoid installing new software without user agreement. Three special commands are available inside `bash`:
 - `apply_patch`, a special tool for GPT models with the `*** BEGIN PATCH` syntax from stdin. For non-GPT models, use `edit`, `sed`, GNU `patch`, or other methods instead.
-- `edit [--relaxed] [--all] FILE` reads one or more `<<<<<<< SEARCH\nold string\n=======\nnew string\n>>>>>>> REPLACE` blocks from stdin and performs exact string replacement.
+- `edit [--relaxed] [--all] FILE` reads one or more `<<<<<<< SEARCH\nold string\n=======\nnew string\n>>>>>>> REPLACE` blocks from stdin and performs exact string replacement. Requires exactly one match by default, with `--all` replacing all matches.
 - `view_image [--detail auto|low|high|original] FILE` reads the "visual content" of an image for multi-modal models. `auto` resolution by default.
