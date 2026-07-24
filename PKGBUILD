@@ -7,6 +7,7 @@ url='https://github.com/ylxdzsw/mu'
 license=('MIT')
 depends=('bash' 'jq' 'sqlite')
 makedepends=('cargo' 'git')
+options=('!lto')
 _source_url="${MU_SOURCE_URL:-$url.git}"
 _source_branch="${MU_SOURCE_BRANCH:-master}"
 source=("$pkgname::git+$_source_url#branch=$_source_branch")
