@@ -29,7 +29,7 @@ build() {
 check() {
   export CARGO_HOME="$srcdir/cargo-home"
   export CARGO_TARGET_DIR="$srcdir/target"
-  cargo test --manifest-path "$srcdir/$pkgname/Cargo.toml" -- --test-threads=1
+  cargo test --manifest-path "$srcdir/$pkgname/Cargo.toml"
 }
 
 package() {

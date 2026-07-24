@@ -736,6 +736,23 @@ mod tests {
         EnvMap::new()
     }
 
+    fn process_is_running(pid: i32) -> bool {
+        if unsafe { libc::kill(pid, 0) } != 0 {
+            return false;
+        }
+
+        #[cfg(target_os = "linux")]
+        if let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat"))
+            && stat
+                .rsplit_once(") ")
+                .is_some_and(|(_, status)| status.starts_with('Z'))
+        {
+            return false;
+        }
+
+        true
+    }
+
     fn test_config(env: &[(&str, &str)], redaction_env: &[&str]) -> Config {
         Config {
             providers: crate::config::OrderedMap::from_iter([(
@@ -1005,9 +1022,14 @@ mod tests {
             })
             .expect("background process marker should be written before timeout");
         let pid: i32 = pid_text.trim().parse().unwrap();
-        std::thread::sleep(std::time::Duration::from_millis(200));
-        let alive = unsafe { libc::kill(pid, 0) == 0 };
-        assert!(!alive, "background sleep {pid} survived timeout");
+        let stopped = (0..40).any(|_| {
+            if !process_is_running(pid) {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            false
+        });
+        assert!(stopped, "background sleep {pid} survived timeout");
         let _ = std::fs::remove_file(marker);
     }
 }
