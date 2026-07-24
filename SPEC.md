@@ -242,15 +242,15 @@ The core binary is invoked one of two ways: as a **turn** (default, reads a
 prompt on stdin) or as a **subcommand** (management; manual compaction alone
 accepts optional non-terminal stdin as a custom focus). The surface is small:
 
-- `mu [-s <id>] [-c] [--model <id>] [-a <file>] [--output final|concise|detail|full]`
+- `mu [-s <id>] [-c] [-m|--model <id>] [-a <file>] [-o|--output final|concise|detail|full]`
   — run one turn; prompt read from stdin. `-a/--attach` is repeatable and accepts
   supported image or audio files.
-- `mu [-s <id>] [-c] [--model <id>] [-a <file>] [--output final|concise|detail|full] <prompt-file>`
+- `mu [-s <id>] [-c] [-m|--model <id>] [-a <file>] [-o|--output final|concise|detail|full] <prompt-file>`
   — run one turn from a prompt file; if the first line starts with `#!`, drop
   it before sending the prompt. A `mu` shebang may contain exactly
   `--model <id>` as a turn-local default. Non-terminal stdin is appended as a
   custom instruction. `-a/--attach` is repeatable.
-- `mu [-s <id>] [-c] [--model <id>] [--output final|concise|detail|full] <custom-command>`
+- `mu [-s <id>] [-c] [-m|--model <id>] [-o|--output final|concise|detail|full] <custom-command>`
   — run a discovered shebang command from the active project/global `.mu`
   instruction index. Command names are relative `.mu` paths including
   extensions; built-in subcommands and explicit prompt paths win.
@@ -291,7 +291,7 @@ accepts optional non-terminal stdin as a custom focus). The surface is small:
   transcript.
 - `mu compact --session <id>` — force compaction. Terminal stdin is not read;
   non-terminal stdin is an optional verbatim custom focus instruction.
-- `mu retry [-s <id>] [-c] [--model <id>] [--output final|concise|detail|full]`
+- `mu retry [-s <id>] [-c] [-m|--model <id>] [-o|--output final|concise|detail|full]`
   — resume an interrupted (unclean) turn: normalize the tail and continue the
   agent loop with no new prompt. `--model` overrides the session model and
   `--output` overrides the merged config default for the retry. No-op on a clean

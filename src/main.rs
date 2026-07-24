@@ -152,7 +152,7 @@ fn exit_code_for(error: &anyhow::Error) -> i32 {
 fn error_output_format() -> cli::OutputFormat {
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
-        if arg == "--output" {
+        if arg == "--output" || arg == "-o" {
             return match args.next().as_deref() {
                 Some("final") => cli::OutputFormat::Final,
                 Some("concise") => cli::OutputFormat::Concise,
@@ -161,6 +161,14 @@ fn error_output_format() -> cli::OutputFormat {
             };
         }
         if let Some(value) = arg.strip_prefix("--output=") {
+            return match value {
+                "final" => cli::OutputFormat::Final,
+                "concise" => cli::OutputFormat::Concise,
+                "full" => cli::OutputFormat::Full,
+                _ => cli::OutputFormat::Detail,
+            };
+        }
+        if let Some(value) = arg.strip_prefix("-o").filter(|value| !value.is_empty()) {
             return match value {
                 "final" => cli::OutputFormat::Final,
                 "concise" => cli::OutputFormat::Concise,

@@ -25,7 +25,7 @@ pub struct SelectionArgs {
     #[arg(short = 'c', long)]
     pub continue_latest: bool,
 
-    #[arg(long)]
+    #[arg(short = 'm', long)]
     pub model: Option<String>,
 }
 
@@ -38,7 +38,7 @@ pub struct TurnArgs {
     pub attachments: Vec<PathBuf>,
 
     /// Output density (overrides config)
-    #[arg(long, value_enum)]
+    #[arg(short = 'o', long, value_enum)]
     pub output: Option<OutputFormat>,
 }
 
@@ -48,7 +48,7 @@ pub struct RetryArgs {
     pub selection: SelectionArgs,
 
     /// Output density (overrides config)
-    #[arg(long, value_enum)]
+    #[arg(short = 'o', long, value_enum)]
     pub output: Option<OutputFormat>,
 }
 
@@ -187,6 +187,13 @@ mod tests {
     }
 
     #[test]
+    fn parses_short_model_and_output_options() {
+        let args = Args::try_parse_from(["mu", "-m", "gpt-test", "-o", "concise"]).unwrap();
+        assert_eq!(args.turn.selection.model.as_deref(), Some("gpt-test"));
+        assert_eq!(args.turn.output, Some(OutputFormat::Concise));
+    }
+
+    #[test]
     fn leaves_output_unspecified_for_config_resolution() {
         let args = Args::try_parse_from(["mu"]).unwrap();
         assert_eq!(args.turn.output, None);
@@ -252,9 +259,9 @@ mod tests {
             "retry",
             "-s",
             "session-1",
-            "--model",
+            "-m",
             "opencode/mimo-v2.5-free",
-            "--output",
+            "-o",
             "detail",
         ])
         .unwrap();

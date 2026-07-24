@@ -74,7 +74,7 @@ The plugin requires `zsh`, `jq`, and `mu` on `PATH`.
 Use a specific model or attach files to a one-shot turn:
 
 ```sh
-mu --model openai/gpt-5:high -a screenshot.png -a recording.wav <<"EOF"
+mu -m openai/gpt-5:high -a screenshot.png -a recording.wav <<"EOF"
 Describe these inputs.
 EOF
 ```
@@ -99,10 +99,10 @@ model:
 Choose how much the caller sees:
 
 ```sh
-mu --output final prompt.md       # final assistant message only
-mu --output concise prompt.md     # assistant text plus one-line tool calls
-mu --output detail prompt.md      # normal human transcript (built-in default)
-mu --output full prompt.md        # complete reasoning and tool details
+mu -o final prompt.md       # final assistant message only
+mu -o concise prompt.md     # assistant text plus one-line tool calls
+mu -o detail prompt.md      # normal human transcript (built-in default)
+mu -o full prompt.md        # complete reasoning and tool details
 ```
 
 Inspect sessions and resolved state with `mu session list`, `mu session
@@ -194,7 +194,7 @@ file if needed):
 OPENAI_API_KEY=...
 ```
 
-Then select it per turn with `mu --model openai/gpt-4o`, or reorder the
+Then select it per turn with `mu -m openai/gpt-4o` (`--model` also works), or reorder the
 providers in `config.jsonc` so yours comes first and becomes the default. Any
 OpenAI-compatible endpoint works; edit the endpoint, API-key environment
 variable, and model list to match your provider.
@@ -219,7 +219,7 @@ exclusive random files in the private OS temporary directory `$TMPDIR/mu`, and
 image attachments are stored directly in SQLite.
 
 Setting `"output": "concise"` in global or project `config.jsonc` changes the
-default output density; an explicit `--output` always wins. Output density
+default output density; an explicit `-o`/`--output` always wins. Output density
 controls brevity, not terminal behavior: `mu` automatically enables live lines,
 color, and rich Markdown when stdout is a terminal, and redirected output is
 sequential and ANSI-free.
