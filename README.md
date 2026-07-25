@@ -175,7 +175,7 @@ reloads the projection after context compaction:
   "hooks": {
     "SessionStart": [
       {
-        "matcher": "startup|resume|clear|compact",
+        "matcher": "startup|compact",
         "hooks": [
           {
             "type": "command",
