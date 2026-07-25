@@ -33,7 +33,6 @@ mod runtime;
 mod skills;
 mod store;
 mod system_prompt;
-mod tool_attachment;
 mod tools;
 
 #[cfg(test)]
