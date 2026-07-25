@@ -22,8 +22,8 @@ or config schema), it is spelled out concretely.
 - **Responsive.** Output streams as it is produced. Control returns to the shell
   immediately when a turn completes.
 - **Composable.** The main abstraction is a turn, not a chat app, daemon,
-  terminal UI, or project manager. The zsh plugin and shell scripts coordinate
-  turns; they do not host a separate agent loop.
+  terminal UI, or project manager. The zsh and Fish plugins and shell scripts
+  coordinate turns; they do not host a separate agent loop.
 - **Non-magical.** No TUI. The shell owns the terminal and line editing; `mu`
   just reads a prompt and appends output. Output streams as it is produced (a
   tool line may appear before its output), but once a line is printed it is never
@@ -54,8 +54,9 @@ or config schema), it is spelled out concretely.
   via skills (markdown) and `bash` (call any CLI tool, including another `mu`
   process when independent delegation is useful).
 - **No core shell emulation.** The core `mu` binary does not ship shell behavior,
-  raw terminal editing, completion, or prompt rendering. The zsh plugin is a
-  thin shell surface that owns zsh line editing and calls `mu` for each turn.
+  raw terminal editing, completion, or prompt rendering. The zsh and Fish
+  plugins are thin shell surfaces that own their native line editors and call
+  `mu` for each turn.
 - **No Windows support.** `mu` is Unix-ish-only. It expects Unix process
   semantics, `bash -lc`, signals, process groups, and advisory file locks.
 
@@ -94,9 +95,9 @@ path itself has no concept of prompts, key bindings, or long-lived UI state.
 
 Interactive use is a thin shell layer around that unit:
 
-- The zsh plugin is the preferred interactive surface. It owns zsh line editing,
-  prompt mode, and keybindings, then submits each entered prompt by spawning
-  `mu` for one foreground turn.
+- The zsh and Fish plugins are the preferred interactive surfaces. Each owns its
+  shell's line editing, prompt mode, and keybindings, then submits each entered
+  prompt by spawning `mu` for one foreground turn.
 
 This single-binary shape is the central decision (see §3 for the full rationale
 recap). It keeps the agent semantics small and scriptable while leaving the
@@ -137,17 +138,16 @@ they are embedded. Linux has no dynamic libc or SQLite dependency; macOS
 retains Apple system-library linkage. The existing Windows MSYS2 UCRT64 package
 and release archive remain unchanged and are published alongside them.
 
-### 2.3 Interactive mode lives in the shell surface
+### 2.3 Interactive mode lives in shell surfaces
 
-The zsh plugin is the built-in interactive direction. It owns only line
-collection, prompt mode, keybindings, and session continuity; every non-empty
-submitted line still runs as a fresh foreground `mu` process.
+The zsh and Fish plugins are the built-in interactive surfaces. They own only
+line collection, prompt mode, keybindings, and session continuity; every
+non-empty submitted line still runs as a fresh foreground `mu` process.
 
 Consequences:
 
 - `mu` remains scriptable and stateless on exit.
-- The zsh plugin never duplicates provider, tool, store, or agent-loop
-  semantics.
+- Shell plugins never duplicate provider, tool, store, or agent-loop semantics.
 - Ctrl-C and terminal behavior remain ordinary Unix process behavior.
 
 ### 2.4 Minimal fixed toolset
@@ -184,13 +184,13 @@ WAL/SHM/journal sidecars are ordinary SQLite implementation files. See §9,
 
 ## 3. Architecture overview
 
-`mu` has one executable and a small zsh integration around it. The CLI turn
-runner remains the core unit.
+`mu` has one executable and small zsh and Fish integrations around it. The CLI
+turn runner remains the core unit.
 
 ```
    ┌──────────────────────────── shell surfaces ────────────────────────────────┐
-   │  shell scripts: `mu [opts] <<< PROMPT`                                    │
-   │  zsh plugin: prompt mode; every entered line spawns one `mu` turn         │
+   │  shell scripts: `mu [opts]` with PROMPT on stdin                          │
+   │  zsh/Fish plugins: prompt mode; each entry spawns one `mu` turn           │
    └───────────────────────────────────┬───────────────────────────────────────┘
                                         │ invokes the same executable / command path
                                         ▼
@@ -257,6 +257,8 @@ accepts optional non-terminal stdin as a custom focus). The surface is small:
 - `mu.zsh` — zsh prompt mode; each accepted prompt runs one foreground `mu`
   turn and keeps using the same session. `MU_ZSH_SESSION_ID=<id>` seeds
   attachment to an existing session.
+- `mu.fish` — Fish 4 prompt mode with the same turn/session contract.
+  `MU_FISH_SESSION_ID=<id>` seeds attachment to an existing session.
 - `mu project inspect --path <dir>` — report whether a directory resolves to a
   project scope, and which marker (`.mu` or `.git`) was found.
 - `mu project init [--path <dir>] [--force]` — create minimal `.mu/` project
@@ -659,11 +661,11 @@ produced them, preserving raw Markdown for downstream consumers.
 ### 5.1 TTY block-spacing contract
 
 Interactive output is structured as a sequence of top-level transcript blocks:
-the zsh `mu>` prompt, assistant text, committed thought lines, bash tool blocks,
+the shell's `mu>` prompt, assistant text, committed thought lines, bash tool blocks,
 notices, and similar human-facing sections. Spacing has exactly one owner at
-each boundary: zsh owns the transition from a submitted `mu>` prompt to the
-child process's first visible block, and the renderer owns subsequent
-renderer-to-renderer block transitions.
+each boundary: the active shell plugin owns the transition from a submitted
+`mu>` prompt to the child process's first visible block, and the renderer owns
+subsequent renderer-to-renderer block transitions.
 
 - Top-level transcript blocks are separated by exactly one empty line.
 - After submission, the canonical normalized prefix is
@@ -783,21 +785,21 @@ duration meets `terminal_bell.min_duration_ms` (default 10s). In `detail` and
 
 ---
 
-## 6. zsh shell surface
+## 6. zsh and Fish shell surfaces
 
-The zsh plugin is the preferred interactive surface. It behaves like a shell
-editing mode: Tab with the cursor at the beginning of the line toggles the
-current prompt into or out of `mu>` mode while preserving the current buffer;
-Enter submits the current buffer as one `mu` turn when it contains non-whitespace
-text and otherwise just draws a fresh `mu>` prompt; Ctrl-C cancels the current
-`mu>` draft but leaves the cancelled line in scrollback; Backspace remains an
-ordinary delete key; and Ctrl-D keeps normal shell EOF behavior even while
-`mu>` mode is active. Up and Down stay within the current `mu>` buffer and do
-not browse shell history; the user leaves `mu>` mode first if they want normal
-shell history navigation. The plugin must not duplicate agent-loop, provider,
-store, or tool semantics.
+The zsh and Fish plugins expose the same shell-native interaction contract.
+Each behaves like a shell editing mode: Tab with the cursor at the beginning of
+the line toggles the current prompt into or out of `mu>` mode while preserving
+the current buffer. Enter submits the current buffer as one `mu` turn when it
+contains non-whitespace text and otherwise just draws a fresh `mu>` prompt;
+Ctrl-C cancels the `mu>` draft but leaves the cancelled line in scrollback;
+Backspace remains an ordinary delete key; and Ctrl-D keeps normal shell EOF
+behavior even while `mu>` mode is active. Up and Down stay within the current
+`mu>` buffer and do not browse shell history; the user leaves `mu>` mode first
+if they want normal shell history navigation. A plugin must not duplicate
+agent-loop, provider, store, or tool semantics.
 
-The plugin requires zsh, `jq`, and the `mu` binary on `PATH`. Setting
+The zsh plugin requires zsh, `jq`, and the `mu` binary on `PATH`. Setting
 `MU_ZSH_BIN` to a specific executable overrides the binary name/path used by
 the plugin.
 
@@ -809,9 +811,9 @@ every turn, including the first, receives `--session`. The plugin forwards an
 explicit shell output override when configured, writes the prompt to the child
 process's stdin, waits for the turn to finish, and then redraws `mu>` with the
 same session id.
-`MU_ZSH_OUTPUT` optionally overrides the density; when unset, the child inherits
-the active `config.jsonc` default. It does not control whether the child is
-interactive.
+`MU_ZSH_OUTPUT` or `MU_FISH_OUTPUT` optionally overrides the density; when
+unset, the child inherits the active `config.jsonc` default. It does not control
+whether the child is interactive.
 The prompt omits the context field while no session is attached and the next
 turn will create one. Once a session exists, it shows the rounded context
 percentage, including `0%` for a short session.
@@ -819,9 +821,9 @@ The status line always shows the invoking `pwd`. When the active project root
 is not literally the same path, it also shows that project root in parentheses;
 this keeps a repository or worktree checkout visible while working in one of
 its subdirectories. In global scope it shows `(global)` instead.
-After ZLE commits the submitted prompt line to scrollback, the plugin prints one
-empty line before child-process output starts, independent of whether the child
-uses `concise`, `detail`, or `full` output.
+After the native line editor commits the submitted prompt line to scrollback,
+the plugin prints one empty line before child-process output starts, independent
+of whether the child uses `concise`, `detail`, or `full` output.
 
 Consequences:
 
@@ -831,11 +833,11 @@ Consequences:
   prompt line visible in scrollback, and redraws `mu>` like a shell prompt
   interrupt. Ctrl-C while a foreground `mu` turn is running uses ordinary Unix
   signal behavior for the foreground process.
-- After each turn exits, zsh returns to `mu>` mode with the same session id.
+- After each turn exits, the shell returns to `mu>` mode with the same session
+  id.
 
 ### 6.2 Entry and exit
 
-- Source `mu.zsh` from `.zshrc`.
 - Press Tab with the cursor at the beginning of the line to enter `mu>` mode;
   press Tab at the beginning of a `mu>` line to leave it again. In both
   directions, keep the current buffer and cursor position intact.
@@ -851,11 +853,10 @@ Consequences:
   shell history navigation is desired.
 - Shift+Enter inserts a newline without submitting when the terminal sends the
   CSI-u sequence `Esc [ 13 ; 2 u`. Terminals that send ordinary Enter for this
-  key combination cannot be distinguished by zsh and require a matching key
-  configuration.
+  key combination cannot be distinguished by the shell and require a matching
+  key configuration.
 - Typing `/` at the start of a `mu>` line proactively lists slash commands.
-  After that, Tab delegates matching, candidate lists, and menu selection to
-  the user's normal zsh completion settings.
+  After that, Tab performs shell-native candidate matching and listing.
 - A buffer beginning with `/` is a slash command. Known custom commands take
   everything after their name as a custom instruction, including inserted
   newlines; `/compact` accepts the same instruction syntax as a custom focus.
@@ -868,15 +869,44 @@ Consequences:
   mode changes, `/model`, `/new`, `/retry`, and `/compact` do not consume the
   queue; the next ordinary prompt or custom command passes every staged file as
   a repeatable `-a` argument and clears the queue before launching `mu`.
+- Ctrl-D is the normal terminal EOT key (`^D`). xterm-style and browser-terminal
+  input paths forward it as input when the browser or OS has
+  not intercepted the key before the terminal receives it.
+
+### 6.2.1 zsh-specific integration
+
+- Source `mu.zsh` from `.zshrc`.
+- Tab completion delegates matching, candidate lists, and menu selection to the
+  user's normal zsh completion settings.
 - While `mu>` mode is active, conflicting line-editor plugins should be
   suspended. Common ZLE helpers such as syntax highlighting and autosuggestions
   may be disabled automatically; additional plugin toggles may be attached with
   mode enter/exit hooks. The arrays `MU_ZSH_ENTER_HOOKS` and
   `MU_ZSH_EXIT_HOOKS` contain zsh function names; enter hooks run after prompt
   mode is active, and exit hooks run after the normal shell prompt is restored.
-- Ctrl-D is the normal terminal EOT key (`^D`). xterm-style and browser-terminal
-  input paths forward it as input when the browser or OS has
-  not intercepted the key before the terminal receives it.
+
+### 6.2.2 Fish-specific integration
+
+- Source `mu.fish` near the end of `config.fish`. A package may install it as
+  `vendor_conf.d/mu.fish`; sourcing it again after user prompt/key
+  configuration is supported.
+- Fish 4, `jq`, and `mu` on `PATH` are required. `MU_FISH_BIN` overrides the
+  executable and `MU_FISH_OUTPUT` overrides output density.
+- The plugin copies and wraps the active `fish_prompt`, `fish_right_prompt`, and
+  `fish_mode_prompt`. Normal shell mode continues to call those saved
+  functions; Mu mode replaces them with its status and `mu>` prompt.
+- Mu editing uses a dedicated `mumode` initialized from Fish's complete default
+  editing bindings. On exit, the prior `$fish_bind_mode` is restored. The
+  arrays `MU_FISH_ENTER_HOOKS` and `MU_FISH_EXIT_HOOKS` provide additional
+  function hooks.
+- Slash/model completion uses Mu's status candidates and Fish filename
+  completion. Multiple candidates are listed with Fish repaint semantics;
+  completion does not promise zsh `zstyle` behavior.
+- Each accepted prompt is added to Fish history as a directly replayable
+  `printf ... | mu ...` command. Slash commands are recorded verbatim.
+- `MU_FISH_SESSION_ID=<id>` seeds an existing session. Session, model,
+  attachment, prompt color, hook, executable, and output state otherwise use
+  `MU_FISH_*` variables corresponding to the zsh variables.
 
 ### 6.3 Context boundaries
 
@@ -893,11 +923,12 @@ Consequences:
 
 Session lifecycle is exposed through CLI commands:
 
-- The zsh plugin without a session explicitly runs `mu [--model MODEL] session
+- A shell plugin without a session explicitly runs `mu [--model MODEL] session
   new` before its first submitted prompt, then reuses that session for later
   prompts in the same shell.
-- Exporting `MU_ZSH_SESSION_ID=<id>` before entering `mu>` attaches the zsh
-  plugin to an existing session.
+- Exporting the shell-specific `MU_ZSH_SESSION_ID=<id>` or
+  `MU_FISH_SESSION_ID=<id>` before entering `mu>` attaches the plugin to an
+  existing session.
 - `mu -c` continues the latest session in the active scope for a one-shot turn.
 - `mu session new` creates a session and prints its id.
 - `mu session list` lists recent sessions.
@@ -1369,14 +1400,15 @@ must retain an accepted legacy spelling or provide an explicit migration path.
 
 `mu` maps each interactive shell instance to at most one active session:
 
-- **First-turn creation.** When zsh has no attached session, it first invokes
+- **First-turn creation.** When a shell plugin has no attached session, it first invokes
   `mu [--model MODEL] session new`, captures and validates the single id printed
   by that management command, and remembers it for the current scope. It then
   invokes the first turn with `--session <id>`. There is no rendezvous file or
   inherited descriptor, and the id is never printed by the turn itself.
-- **Attach / continue.** `MU_ZSH_SESSION_ID=<id>` seeds the zsh plugin with an
-  existing session, while `mu -s <id>` and `mu -c` handle one-shot re-entry from
-  the command line. `mu session list` lists recent candidates.
+- **Attach / continue.** `MU_ZSH_SESSION_ID=<id>` and
+  `MU_FISH_SESSION_ID=<id>` seed their respective plugins with an existing
+  session, while `mu -s <id>` and `mu -c` handle one-shot re-entry from the
+  command line. `mu session list` lists recent candidates.
 - **Per-turn lifecycle.** Each turn: open DB → acquire `session.owner_pid` →
   normalize any interrupted tail → load session messages → run the turn
   (persisting each completed message as it lands and claiming tool calls before
@@ -1477,8 +1509,8 @@ per-call "running" marker in the database.
 - **`mu retry`** normalizes the tail and re-runs the loop with *no* new prompt,
   so the model continues the interrupted turn. `--model` overrides the stored
   session model and `--output` overrides the merged config default for that
-  retry; the zsh `/retry` command forwards active shell overrides. It refuses on
-  a clean session ("nothing to retry").
+  retry; each shell plugin's `/retry` command forwards active shell overrides.
+  It refuses on a clean session ("nothing to retry").
 
 ### Session concurrency ownership
 
@@ -1568,9 +1600,9 @@ Like a prompt file or custom command, it leaves terminal stdin alone and reads
 non-terminal stdin through EOF as an optional verbatim custom instruction. The
 instruction gives relevant material more of the available detail and summary
 budget, while the summarizer must still preserve every important fact needed to
-continue correctly. In zsh prompt mode, `/compact <instruction>` pipes the text
-after the command through this same stdin path. Automatic compaction never
-supplies a custom focus.
+continue correctly. In either shell prompt mode, `/compact <instruction>` pipes
+the text after the command through this same stdin path. Automatic compaction
+never supplies a custom focus.
 
 ### Agent-loop bounds
 

@@ -1,0 +1,300 @@
+#!/usr/bin/env fish
+
+set -g TEST_ROOT (path resolve (path dirname (status filename)))
+set -g TEST_TMPDIR (mktemp -d /tmp/mu-fish-test.XXXXXX)
+
+function _test_cleanup --on-event fish_exit
+    if set -q MU_FISH_KEEP_TEST_TMP
+        printf 'kept test files in %s\n' "$TEST_TMPDIR" >&2
+    else
+        rm -rf -- "$TEST_TMPDIR"
+    end
+end
+
+function fail --argument-names message
+    printf 'FAIL: %s\n' "$message" >&2
+    exit 1
+end
+
+function assert_equal --argument-names actual expected message
+    test "$actual" = "$expected"; or fail "$message: expected <$expected>, got <$actual>"
+end
+
+function assert_contains --argument-names actual expected message
+    string match -q "*$expected*" -- "$actual"; or fail "$message: missing <$expected>"
+end
+
+set -gx HOME "$TEST_TMPDIR/home"
+set -gx XDG_CONFIG_HOME "$HOME/.config"
+set -gx XDG_DATA_HOME "$HOME/.local/share"
+set -gx XDG_CACHE_HOME "$HOME/.cache"
+mkdir -p "$XDG_CONFIG_HOME" "$XDG_DATA_HOME" "$XDG_CACHE_HOME"
+set -g fish_history mu_fish_test_(random)
+
+source "$TEST_ROOT/mu.fish"
+
+assert_equal "$MU_FISH_MODE" shell 'starts in shell mode'
+assert_equal (_mu_fish_current_scope) "project:$TEST_ROOT" 'discovers repository scope'
+
+set project_a "$TEST_TMPDIR/project-a"
+set project_b "$TEST_TMPDIR/project-b"
+mkdir -p "$project_a/subdir" "$project_b/subdir" "$project_b/.mu"
+mkdir "$project_a/.git"
+assert_equal (_mu_fish_scope_for_dir "$project_a/subdir") "project:$project_a" 'discovers Git project'
+assert_equal (_mu_fish_scope_for_dir "$project_b/subdir") "project:$project_b" 'discovers .mu project'
+assert_equal (_mu_fish_scope_for_dir "$HOME") global 'stops project discovery at HOME'
+
+set main_worktree "$TEST_TMPDIR/main-worktree"
+set linked_worktree "$TEST_TMPDIR/linked-worktree"
+set linked_git_dir "$main_worktree/.git/worktrees/linked-worktree"
+mkdir -p "$linked_git_dir" "$linked_worktree/subdir"
+printf 'gitdir: %s\n' "$linked_git_dir" >"$linked_worktree/.git"
+printf '../..\n' >"$linked_git_dir/commondir"
+assert_equal (_mu_fish_scope_for_dir "$linked_worktree/subdir") "project:$main_worktree" 'maps linked worktree to main scope'
+mkdir "$linked_worktree/.mu"
+assert_equal (_mu_fish_scope_for_dir "$linked_worktree/subdir") "project:$linked_worktree" 'worktree-local .mu overrides shared scope'
+
+set fake_bin "$TEST_TMPDIR/bin"
+set capture_args "$TEST_TMPDIR/args"
+set capture_stdin "$TEST_TMPDIR/stdin"
+set capture_calls "$TEST_TMPDIR/calls"
+set session_counter "$TEST_TMPDIR/session-counter"
+mkdir "$fake_bin"
+
+begin
+    printf '%s\n' '#!/bin/sh'
+    printf '%s\n' 'if [ "$1" = status ]; then'
+    printf '%s\n' '  model=local/test'
+    printf '%s\n' '  include_commands=0'
+    printf '%s\n' '  include_models=0'
+    printf '%s\n' '  while [ "$#" -gt 0 ]; do'
+    printf '%s\n' '    case "$1" in'
+    printf '%s\n' '      --model) shift; model=$1 ;;'
+    printf '%s\n' '      --include-commands) include_commands=1 ;;'
+    printf '%s\n' '      --include-models) include_models=1 ;;'
+    printf '%s\n' '    esac'
+    printf '%s\n' '    shift'
+    printf '%s\n' '  done'
+    printf '%s\n' '  [ "$model" = unknown ] && exit 1'
+    printf '%s\n' '  [ "$model" = gpt ] && model=openai/gpt'
+    printf '%s\n' '  if [ "$include_models" -eq 1 ]; then'
+    printf '%s\n' '    printf "%s\n" "{\"model\":{\"canonical\":\"$model\"},\"context_percent\":25.0,\"project_root\":\"$TEST_PROJECT_ROOT\",\"clean\":true,\"available_models\":{\"providers\":[{\"id\":\"local\",\"models\":[{\"id\":\"local/solo\",\"model_id\":\"solo\",\"supported_efforts\":[\"max\"]},{\"id\":\"local/shared\",\"model_id\":\"shared\",\"supported_efforts\":[]}]},{\"id\":\"openai\",\"models\":[{\"id\":\"openai/gpt\",\"model_id\":\"gpt\",\"supported_efforts\":[\"low\",\"high\"]},{\"id\":\"openai/shared\",\"model_id\":\"shared\",\"supported_efforts\":[\"medium\"]}]}]}}"'
+    printf '%s\n' '  elif [ "$include_commands" -eq 1 ]; then'
+    printf '%s\n' '    printf "%s\n" "{\"model\":{\"canonical\":\"$model\"},\"context_percent\":25.0,\"project_root\":\"$TEST_PROJECT_ROOT\",\"clean\":true,\"commands\":[{\"name\":\"review.md\"}]}"'
+    printf '%s\n' '  else'
+    printf '%s\n' '    printf "%s\n" "{\"model\":{\"canonical\":\"$model\"},\"context_percent\":25.0,\"project_root\":\"$TEST_PROJECT_ROOT\",\"clean\":true}"'
+    printf '%s\n' '  fi'
+    printf '%s\n' '  exit 0'
+    printf '%s\n' fi
+    printf '%s\n' 'if [ "$1" = --model ]; then shift 2; fi'
+    printf '%s\n' 'if [ "$1" = session ] && [ "$2" = new ]; then'
+    printf '%s\n' '  printf "%s\n" ses_01234567'
+    printf '%s\n' '  exit 0'
+    printf '%s\n' fi
+    printf '%s\n' 'printf x >>"$TEST_CAPTURE_CALLS"'
+    printf '%s\n' 'printf "%s\n" "$@" >"$TEST_CAPTURE_ARGS"'
+    printf '%s\n' 'cat >"$TEST_CAPTURE_STDIN"'
+    printf '%s\n' 'printf "%s\n\n" "Hello from Fish."'
+end >"$fake_bin/mu"
+chmod +x "$fake_bin/mu"
+
+set -gx TEST_PROJECT_ROOT "$TEST_ROOT"
+set -gx TEST_CAPTURE_ARGS "$capture_args"
+set -gx TEST_CAPTURE_STDIN "$capture_stdin"
+set -gx TEST_CAPTURE_CALLS "$capture_calls"
+set -g MU_FISH_BIN "$fake_bin/mu"
+set -g MU_FISH_OUTPUT detail
+
+set prompt (_mu_fish_build_mode_prompt | string collect)
+assert_contains "$prompt" local/test 'prompt shows model'
+assert_contains "$prompt" "$TEST_ROOT" 'prompt shows cwd'
+assert_contains "$prompt" 'mu> ' 'prompt shows input marker'
+string match -q '*25%*' -- "$prompt"; and fail 'fresh prompt should omit context'
+
+set -g MU_FISH_SESSION_ID ses_0000000a
+set -g MU_FISH_SESSION_SCOPE (_mu_fish_current_scope)
+_mu_fish_sync_state
+set prompt (_mu_fish_build_mode_prompt | string collect)
+assert_contains "$prompt" '25%' 'session prompt shows context'
+
+set command (_mu_fish_base_command)
+assert_equal (string join \x1e -- $command) (string join \x1e -- "$fake_bin/mu" --output detail -s ses_0000000a) 'builds active turn command'
+
+set attachment "$TEST_TMPDIR/file with spaces.png"
+printf image >"$attachment"
+set -g MU_FISH_PENDING_ATTACHMENTS "$attachment"
+rm -f "$capture_args" "$capture_stdin" "$capture_calls"
+_mu_fish_submit_prompt 'inspect this'
+assert_equal (cat "$capture_calls") x 'submits one turn'
+assert_equal (cat "$capture_stdin") 'inspect this' 'passes prompt on stdin'
+set submitted_args (cat "$capture_args")
+assert_equal (string join \x1e -- $submitted_args) (string join \x1e -- --output detail -s ses_0000000a -a "$attachment") 'forwards session and attachment'
+not set -q MU_FISH_PENDING_ATTACHMENTS[1]; or fail 'submission clears attachments'
+
+if _mu_fish_supports_history_append
+    set replay (builtin history search --max 1 | string collect)
+    assert_contains "$replay" "printf '%s\\n'" 'records replayable Fish history'
+    assert_contains "$replay" 'inspect this' 'history preserves submitted prompt'
+    fish -n -c "$replay"; or fail 'recorded Fish history is not valid Fish syntax'
+end
+
+_mu_fish_run_slash_command "/attach $attachment"
+assert_equal "$MU_FISH_PENDING_ATTACHMENTS[1]" "$attachment" '/attach stages resolved file'
+_mu_fish_run_slash_command /attach
+_mu_fish_run_slash_command '/attach --clear'
+not set -q MU_FISH_PENDING_ATTACHMENTS[1]; or fail '/attach --clear clears queue'
+
+_mu_fish_run_slash_command '/model gpt'
+assert_equal "$MU_FISH_EFFECTIVE_MODEL" openai/gpt '/model stores canonical model'
+_mu_fish_run_slash_command '/model unknown'; and fail '/model should reject unknown model'
+
+set models (_mu_fish_model_candidates gp)
+contains gpt $models; or fail 'model candidates include unique shorthand'
+contains openai/gpt $models; or fail 'model candidates include canonical id'
+not contains shared $models; or fail 'model candidates omit ambiguous shorthand'
+set efforts (_mu_fish_model_effort_suffixes gpt)
+contains :low $efforts; or fail 'effort candidates include low'
+contains :high $efforts; or fail 'effort candidates include high'
+
+set -g MU_FISH_SESSION_ID ses_0000000a
+set -g MU_FISH_SESSION_SCOPE (_mu_fish_current_scope)
+_mu_fish_sync_state
+_mu_fish_run_slash_command /new
+not set -q MU_FISH_SESSION_ID[1]; or fail '/new clears session'
+
+rm -f "$capture_args" "$capture_stdin" "$capture_calls"
+_mu_fish_run_slash_command '/review.md First line
+Second line'
+assert_equal (cat "$capture_calls") x 'custom slash command runs one turn'
+set custom_stdin (cat "$capture_stdin" | string collect)
+set expected_custom_stdin 'First line
+Second line'
+assert_equal "$custom_stdin" "$expected_custom_stdin" 'custom slash command preserves multiline instruction'
+set custom_args (cat "$capture_args")
+assert_equal "$custom_args[-1]" review.md 'custom slash command selects prompt file'
+
+function _test_enter_hook
+    set -g TEST_ENTER_HOOK_RAN yes
+end
+function _test_exit_hook
+    set -g TEST_EXIT_HOOK_RAN yes
+end
+set -g MU_FISH_ENTER_HOOKS _test_enter_hook
+set -g MU_FISH_EXIT_HOOKS _test_exit_hook
+_mu_fish_enter_mode
+assert_equal "$MU_FISH_MODE" mu 'enters Mu mode'
+assert_equal "$TEST_ENTER_HOOK_RAN" yes 'runs enter hooks'
+_mu_fish_exit_mode
+assert_equal "$MU_FISH_MODE" shell 'exits Mu mode'
+assert_equal "$TEST_EXIT_HOOK_RAN" yes 'runs exit hooks'
+
+function fish_prompt
+    printf 'custom:%s:%s> ' $status (string join , $pipestatus)
+end
+source "$TEST_ROOT/mu.fish"
+set status_prompt "$TEST_TMPDIR/status-prompt"
+false | true
+fish_prompt >"$status_prompt"
+assert_equal (cat "$status_prompt") 'custom:0:1,0> ' 're-sourced wrapper preserves prompt status'
+
+if test "$MU_FISH_SKIP_PTY" = 1
+    printf 'ok\n'
+    exit 0
+end
+
+for dependency in script timeout perl col jq
+    command -q "$dependency"; or fail "missing test dependency: $dependency"
+end
+
+set interactive_home "$TEST_TMPDIR/interactive-home"
+set interactive_ready "$TEST_TMPDIR/interactive-ready"
+mkdir -p "$interactive_home"
+rm -f "$capture_args" "$capture_stdin" "$capture_calls"
+
+set setup_parts \
+    "set -gx HOME "(string escape "$interactive_home") \
+    "set -gx XDG_CONFIG_HOME "(string escape "$interactive_home/.config") \
+    "set -gx XDG_DATA_HOME "(string escape "$interactive_home/.local/share") \
+    "set -gx XDG_CACHE_HOME "(string escape "$interactive_home/.cache") \
+    "set -gx TEST_PROJECT_ROOT "(string escape "$TEST_ROOT") \
+    "set -gx TEST_CAPTURE_ARGS "(string escape "$capture_args") \
+    "set -gx TEST_CAPTURE_STDIN "(string escape "$capture_stdin") \
+    "set -gx TEST_CAPTURE_CALLS "(string escape "$capture_calls") \
+    "set -g MU_FISH_BIN "(string escape "$fake_bin/mu") \
+    'set -g MU_FISH_OUTPUT detail' \
+    "source "(string escape "$TEST_ROOT/mu.fish")
+set interactive_setup (string join '; ' $setup_parts)
+
+function send_interactive_setup --argument-names setup ready
+    rm -f -- "$ready"
+    printf '%s; touch %s\r' "$setup" (string escape "$ready")
+    for attempt in (seq 1 100)
+        test -e "$ready"; and return 0
+        sleep 0.05
+    end
+    fail 'interactive Fish did not finish setup'
+end
+
+set transcript "$TEST_TMPDIR/transcript"
+begin
+    sleep 0.2
+    send_interactive_setup "$interactive_setup" "$interactive_ready"
+    printf '\t'
+    sleep 0.2
+    printf '\r'
+    sleep 0.2
+    printf '   \r'
+    sleep 0.2
+    printf cancel-me
+    sleep 0.2
+    printf '\x03'
+    sleep 0.3
+    printf /mo
+    sleep 0.2
+    printf '\t'
+    sleep 0.2
+    printf 'gpt\r'
+    sleep 0.3
+    printf hello
+    sleep 0.2
+    printf '\r'
+    sleep 0.5
+    printf '\x04'
+end | timeout 10 script -qfec \
+    'env fish_features=no-query-term,no-keyboard-protocols,no-mark-prompt TERM=xterm-256color fish --no-config' \
+    "$transcript" >/dev/null
+set interactive_status $pipestatus[2]
+test $interactive_status -eq 0; or fail "interactive transcript exited with status $interactive_status"
+
+test (cat "$capture_calls") = x; or fail 'interactive fake Mu should run exactly once'
+assert_equal (cat "$capture_stdin") hello 'interactive prompt reaches stdin'
+set interactive_args (cat "$capture_args")
+assert_equal (string join \x1e -- $interactive_args) (string join \x1e -- --output detail -s ses_01234567 --model openai/gpt) 'interactive turn uses created session and completed model'
+
+set normalized (perl -pe 's/\e\[[0-?]*[ -\/]*[@-~]//g' "$transcript" | col -b | string collect)
+set raw_transcript (string collect <"$transcript")
+assert_contains "$raw_transcript" cancel-me 'Ctrl-C leaves cancelled draft in scrollback'
+assert_contains "$normalized" 'hello
+
+Hello from Fish.' 'submitted prompt remains visible before streamed output'
+assert_contains "$normalized" 'next turns in this scope will use openai/gpt' 'Tab completes slash command before model selection'
+assert_contains "$normalized" 'Hello from Fish.' 'interactive output streams'
+assert_contains "$normalized" 'mu>' 'Mu prompt redraws after the turn'
+
+set shift_transcript "$TEST_TMPDIR/shift-transcript"
+rm -f "$capture_args" "$capture_stdin" "$capture_calls" "$interactive_ready"
+begin
+    sleep 0.2
+    send_interactive_setup "$interactive_setup" "$interactive_ready"
+    printf '\tfirst line\e[13;2usecond line\r'
+    sleep 0.5
+    printf '\x04'
+end | timeout 10 script -qfec \
+    'env fish_features=no-query-term,no-keyboard-protocols,no-mark-prompt TERM=xterm-256color fish --no-config' \
+    "$shift_transcript" >/dev/null
+set interactive_status $pipestatus[2]
+test $interactive_status -eq 0; or fail "Shift+Enter transcript exited with status $interactive_status"
+assert_equal (cat "$capture_stdin" | string collect) 'first line
+second line' 'Shift+Enter submits one multiline prompt'
+
+printf 'ok\n'

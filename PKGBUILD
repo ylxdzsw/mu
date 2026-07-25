@@ -6,6 +6,7 @@ arch=('x86_64')
 url='https://github.com/ylxdzsw/mu'
 license=('MIT')
 depends=('bash' 'jq' 'sqlite')
+optdepends=('fish: Fish prompt mode' 'zsh: zsh prompt mode')
 makedepends=('cargo' 'git')
 options=('!lto')
 _source_url="${MU_SOURCE_URL:-$url.git}"
@@ -39,6 +40,7 @@ package() {
   ln -s ../../bin/mu "$pkgdir/usr/libexec/mu/edit"
   ln -s ../../bin/mu "$pkgdir/usr/libexec/mu/view_image"
   install -Dm644 "$srcdir/$pkgname/mu.zsh" "$pkgdir/usr/share/zsh/plugins/mu/mu.zsh"
+  install -Dm644 "$srcdir/$pkgname/mu.fish" "$pkgdir/usr/share/fish/vendor_conf.d/mu.fish"
   install -dm755 "$pkgdir/usr/share/mu"
   cp -a "$srcdir/$pkgname/builtins/." "$pkgdir/usr/share/mu/"
   install -Dm644 "$srcdir/$pkgname/README.md" "$pkgdir/usr/share/doc/$pkgname/README.md"

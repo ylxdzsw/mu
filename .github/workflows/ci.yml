@@ -38,7 +38,7 @@ jobs:
       - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install --yes bsdextrautils zsh jq sqlite3
+          sudo apt-get install --yes bsdextrautils fish zsh jq sqlite3
 
       - name: Check formatting
         run: cargo fmt --check
@@ -64,10 +64,12 @@ jobs:
           test ! -e "$smoke/libexec"
           cargo build --bins --features portable
 
-      - name: Test zsh integration
+      - name: Test shell integrations
         run: |
           zsh -n mu.zsh test.zsh
           MU_ZSH_SKIP_PTY=1 zsh test.zsh
+          fish -n mu.fish test.fish
+          MU_FISH_SKIP_PTY=1 fish test.fish
 
       - name: Check package recipe
         run: bash -n PKGBUILD
@@ -121,6 +123,7 @@ jobs:
           test -n "$package"
           pacman --noconfirm -U "$package"
           test -f /usr/share/mu/customize-mu.md
+          test -f /usr/share/fish/vendor_conf.d/mu.fish
           test -L /usr/libexec/mu/apply_patch
           test ! -e /usr/bin/applets
           before=$(find /usr/libexec/mu /usr/share/mu -type f -print0 \
@@ -209,7 +212,7 @@ jobs:
           archive=mu-linux-x86_64-musl
           mkdir -p "dist/$archive"
           cp target/x86_64-unknown-linux-musl/release/mu "dist/$archive/"
-          cp mu.zsh README.md SPEC.md LICENSE "dist/$archive/"
+          cp mu.zsh mu.fish README.md SPEC.md LICENSE "dist/$archive/"
           tar -czf "dist/$archive.tar.gz" -C dist "$archive"
           (cd dist && sha256sum "$archive.tar.gz" \
             > SHA256SUMS-linux-x86_64-musl.txt)
@@ -286,7 +289,7 @@ jobs:
           archive=mu-macos-${{ matrix.arch }}
           mkdir -p "dist/$archive"
           cp target/release/mu "dist/$archive/"
-          cp mu.zsh README.md SPEC.md LICENSE "dist/$archive/"
+          cp mu.zsh mu.fish README.md SPEC.md LICENSE "dist/$archive/"
           tar -czf "dist/$archive.tar.gz" -C dist "$archive"
           (cd dist && shasum -a 256 "$archive.tar.gz" \
             > "SHA256SUMS-macos-${{ matrix.arch }}.txt")

@@ -2,7 +2,7 @@
 
 `mu` is a small, composable agent for the terminal: one prompt in, one
 completed agent turn out. It works equally well as a Unix command in scripts or
-as an interactive assistant inside zsh.
+as an interactive assistant inside zsh or Fish.
 
 ## Quick start
 
@@ -37,14 +37,24 @@ mu -c <<< 'Now identify the riskiest change.'
 
 `mu` targets Unix-like systems and expects `bash` on `PATH`.
 
-## Interactive zsh usage
+## Interactive shell usage
 
-The most comfortable way to use `mu` is right inside your shell. Source the
-included plugin from `.zshrc`:
+The most comfortable way to use `mu` is right inside your shell. For zsh,
+source the included plugin from `.zshrc`:
 
 ```zsh
 source /path/to/mu/mu.zsh
 # Arch package: source /usr/share/zsh/plugins/mu/mu.zsh
+```
+
+For Fish 4 or newer, source the Fish plugin near the end of `config.fish`, after
+your prompt and key bindings:
+
+```fish
+source /path/to/mu/mu.fish
+# The Arch package also loads /usr/share/fish/vendor_conf.d/mu.fish.
+# Source that file again at the end of config.fish if later configuration
+# replaces its prompt wrappers or Tab bindings.
 ```
 
 At an empty shell prompt, press **Tab** to enter `mu>` mode, type a request, and
@@ -67,7 +77,9 @@ Type `/` to list prompt-mode commands. The common ones:
 - `/retry` resumes a turn interrupted by Ctrl-C, a crash, or a lost connection.
 - `/compact` compacts a long session, optionally with a focus instruction.
 
-The plugin requires `zsh`, `jq`, and `mu` on `PATH`.
+Both plugins require `jq` and `mu` on `PATH`, plus their respective shell. The
+Fish integration requires Fish 4 because it records replayable turns with
+`history append`.
 
 ## More ways to run a turn
 
@@ -117,8 +129,8 @@ messages, and exits. A few ideas follow from that:
 
 - **A turn is the primitive.** `mu` is a fast native binary, not a daemon, TUI,
   or in-process REPL. Shell pipelines and prompt files compose it naturally.
-- **Shell-native interaction.** The zsh integration adds a persistent prompt
-  mode without replacing zsh or duplicating the agent runtime.
+- **Shell-native interaction.** The zsh and Fish integrations add a persistent
+  prompt mode without replacing the shell or duplicating the agent runtime.
 - **One universal tool.** The model sees `bash`; existing command-line tools
   provide search, editing, testing, web access, and specialized workflows.
 - **Streaming, durable sessions.** Output appears as it is produced, while
@@ -137,7 +149,7 @@ messages, and exits. A few ideas follow from that:
 - Persistent global or project-scoped sessions, continuation, transcripts,
   automatic context compaction, and interrupted-turn recovery.
 - Four output densities with automatic interactive-terminal rendering.
-- Image and audio attachments from both the CLI and zsh prompt mode.
+- Image and audio attachments from the CLI and both shell prompt modes.
 - Reusable prompt files, executable prompts, slash commands, project/user
   instructions, and conditionally available skills.
 - A built-in safety guardrail and exact-value redaction for configured secrets,
@@ -301,7 +313,7 @@ unchanged Windows MSYS2 UCRT64 package and archive.
 ## Reference
 
 See [SPEC.md](SPEC.md) for the complete product contract, including exact CLI,
-configuration, discovery, rendering, persistence, provider, and zsh behavior.
+configuration, discovery, rendering, persistence, provider, and shell behavior.
 
 ## License
 
