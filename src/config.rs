@@ -919,7 +919,7 @@ mod tests {
         assert!(
             error
                 .to_string()
-                .contains("must end in `/chat/completions` or `/responses`")
+                .contains("must end in `/chat/completions`, `/responses`, or `/messages`")
         );
     }
 

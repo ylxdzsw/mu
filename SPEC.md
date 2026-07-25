@@ -505,8 +505,9 @@ Descendants inherit the ordinary environment, but a sink is accepted only while
 the owning Mu PID still owns the session and before the result is committed.
 Once the direct call closes its result, a late descendant is rejected; detached
 work must save ordinary files for a later foreground `view_image` call.
-Responses adapters serialize images in the native `function_call_output`; Chat
-Completions adapters retain the tool text and add a labeled multimodal
+Responses adapters serialize images in the native `function_call_output`;
+Anthropic Messages adapters serialize them inside the native `tool_result`;
+Chat Completions adapters retain the tool text and add a labeled multimodal
 user-message projection on the wire only.
 
 `title` is the short human-readable action shown in the terminal. `risk` is
@@ -736,8 +737,9 @@ stderr TTY detection suppresses the summary when redirected.
   completion, and unsupported Markdown stays raw.
 - **Reasoning progress.** Detail creates the interactive mutable thought line.
   Chat reasoning uses `[thought <duration>, <tokens> tokens]`; opaque Responses
-  reasoning uses `[thought <duration>]` with an optional conservative title from
-  the first bold-only or ATX-heading summary line. Detail commits that line when
+  or Anthropic reasoning uses `[thought <duration>]` with an optional
+  conservative title from the first bold-only or ATX-heading summary line.
+  Detail commits that line when
   reasoning finishes, including when no exposed reasoning text exists. Concise
   uses the same interactive indicator but erases it at completion and is silent
   when redirected. A Responses title received while reasoning continues appears
@@ -746,9 +748,9 @@ stderr TTY detection suppresses the summary when redirected.
   flashed or committed. Immediately after a concise tool the indicator occupies
   the next line without an empty separator, and ephemeral reasoning does not
   break a consecutive tool block. Full streams Chat reasoning deltas and every
-  exposed Responses summary part directly in provider order, without a live or
-  committed thought indicator; providers exposing neither produce no reasoning
-  output.
+  exposed Responses or Anthropic summary part directly in provider order,
+  without a live or committed thought indicator; providers exposing neither
+  produce no reasoning output.
 - **Errors.** Always printed and clearly prefixed, with TTY styling when
   available. Fatal turn failure produces a non-zero process exit code so the
   shell's `$?` is meaningful.
@@ -905,17 +907,18 @@ Session lifecycle is exposed through CLI commands:
 
 ## 7. Provider / model integration
 
-Mu supports exactly two hand-written HTTP/SSE protocols: OpenAI-compatible
-Chat Completions and OpenAI Responses. Each configured provider has a required
-complete `endpoint`. After URL parsing and optional trailing-slash
-normalization, a case-sensitive path ending in `/chat/completions` selects Chat
-Completions and a path ending in `/responses` selects Responses. Query parameters
-are preserved but do not affect classification. Every other path fails during
-configuration loading; Mu never infers a protocol from a hostname, provider id,
-or model name. A gateway exposing both protocols is represented by two provider
-entries.
+Mu supports exactly three hand-written HTTP/SSE protocols: OpenAI-compatible
+Chat Completions, OpenAI Responses, and Anthropic Messages. Each configured
+provider has a required complete `endpoint`. After URL parsing and optional
+trailing-slash normalization, a case-sensitive path ending in
+`/chat/completions` selects Chat Completions, `/responses` selects Responses,
+and `/messages` selects Anthropic Messages. Query parameters are preserved but
+do not affect classification. Every other path fails during configuration
+loading; Mu never infers a protocol from a hostname, provider id, or model
+name. A gateway exposing multiple protocols is represented by one provider
+entry per endpoint.
 
-Both adapters accept the semantic transcript and Mu's `bash` function schema,
+All adapters accept the semantic transcript and Mu's `bash` function schema,
 stream protocol-neutral text/reasoning/tool-call events, and return a semantic
 assistant result plus usage. The renderer, tool executor, guardrail, retries,
 and compaction remain protocol-neutral.
@@ -942,6 +945,25 @@ array is stored unchanged, including encrypted reasoning and any summary, and
 replayed as input only for the same endpoint and wire model. Semantic tool
 results become `function_call_output` items connected by `call_id`.
 
+**Anthropic Messages.** Mu posts directly to the configured endpoint using
+`x-api-key` and `anthropic-version:2023-06-01`, with `stream:true`,
+`max_tokens:64000`, adaptive thinking displayed as summaries, and automatic
+five-minute prompt caching. A resolved effort is sent as
+`output_config:{effort}`. The leading semantic system message becomes the
+top-level `system`; user text and images become content blocks; assistant Bash
+claims become `tool_use`; and consecutive Bash results become `tool_result`
+blocks in one user message. Image detail is intentionally omitted because
+Messages has no equivalent field. Audio is rejected while assembling the
+provider request, before network I/O.
+
+Anthropic text, thinking summaries, signatures, citations, tool input, usage,
+and stop reasons are accumulated from indexed SSE content-block events.
+Complete successful assistant content arrays are stored unchanged, including
+`thinking`, `redacted_thinking`, signatures, text, citations, and `tool_use`,
+and replayed only for the same endpoint and wire model. The adapter assumes
+current adaptive-thinking models; it has no manual thinking-budget mode,
+old-model compatibility matrix, or model-name heuristics.
+
 The semantic transcript remains authoritative for display, compaction, and
 cross-model continuation. Switching model or protocol inside a session keeps
 semantic messages and reconstructs function calls/results, but omits native
@@ -949,11 +971,12 @@ state whose endpoint or model origin does not match. Changing only effort does
 not invalidate native replay. Compaction excludes native state before the
 active summary boundary and retains it with the recent semantic suffix.
 
-Text and images are supported by both adapters. Images serialize as Chat
-`image_url` or Responses `input_image`. Existing audio inputs serialize as Chat
-`input_audio`; a Responses endpoint rejects audio locally with a clear error.
-Only successfully completed streams produce replay state, so retries never
-depend on a partial or remote response chain.
+Text and images are supported by all adapters. Images serialize as Chat
+`image_url`, Responses `input_image`, or Anthropic `image` blocks. Existing
+audio inputs serialize as Chat `input_audio`; Responses and Anthropic endpoints
+reject audio locally with a clear error. Only successfully completed streams
+produce replay state, so retries never depend on a partial or remote response
+chain.
 
 **Model context window.** The 75% threshold needs the model's max context size.
 Source it from `config.jsonc`: each configured model entry carries a
@@ -1296,9 +1319,10 @@ Conceptual schema (flat and small):
   the whole design, so a violated ordering invariant must surface as a loud
   constraint error, not silent transcript corruption. Assistant rows may also
   contain exact origin-bound native replay: Chat reasoning for a tool-call
-  message or a complete Responses output-item array. This native payload
-  augments rather than replaces the semantic fields and is never rendered. The
-  first message in a new session is the persisted system
+  message, a complete Responses output-item array, or a complete Anthropic
+  assistant content-block array. This native payload augments rather than
+  replaces the semantic fields and is never rendered. The first message in a
+  new session is the persisted system
   prompt, written in the same transaction as the session row and the
   environment seed. For user messages with image or audio attachments, `content` remains
   a textual projection for listing/token estimates, while attachment metadata
@@ -1482,9 +1506,9 @@ while waiting on a provider or tool.
 ### Context window and compaction
 
 **Token counting (source of truth).** mu does not run a tokenizer. It uses the
-**provider's reported usage** — both adapters map native Chat or Responses usage
-into input, output, total, cache-read, optional cache-write, and reasoning-output
-token fields. mu stores
+**provider's reported usage** — all adapters map native Chat, Responses, or
+Anthropic usage into input, output, total, cache-read, optional cache-write, and
+reasoning-output token fields. mu stores
 the latest `total_tokens` on the session after each turn; that figure is the
 authoritative measure of how full the context is.
 

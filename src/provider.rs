@@ -47,6 +47,7 @@ pub struct NativeReplay {
 pub enum NativeReplayPayload {
     ChatReasoning(String),
     ResponsesOutput(Vec<Value>),
+    AnthropicContent(Vec<Value>),
 }
 
 impl NativeReplay {
@@ -59,6 +60,7 @@ impl NativeReplay {
 pub enum ModelApi {
     ChatCompletions,
     Responses,
+    AnthropicMessages,
 }
 
 /// Bound the connect phase so a dead host fails fast instead of hanging the turn.
@@ -102,11 +104,8 @@ impl HttpProvider {
         body: &Value,
         on_sse: &mut dyn FnMut(SseEvent) -> Result<(), ProviderError>,
     ) -> Result<(), ProviderError> {
-        let mut request = self.client.post(&self.endpoint).json(body);
-        if let Some(key) = &self.api_key {
-            request = request.bearer_auth(key);
-        }
-        let response = request
+        let response = self
+            .post_request(body)
             .send()
             .await
             .map_err(|error| ProviderError::Transport(error.to_string()))?;
@@ -167,6 +166,20 @@ impl HttpProvider {
         }
         Ok(())
     }
+
+    fn post_request(&self, body: &Value) -> reqwest::RequestBuilder {
+        let mut request = self.client.post(&self.endpoint).json(body);
+        if let Some(key) = &self.api_key {
+            request = match self.api {
+                ModelApi::AnthropicMessages => request.header("x-api-key", key),
+                ModelApi::ChatCompletions | ModelApi::Responses => request.bearer_auth(key),
+            };
+        }
+        if self.api == ModelApi::AnthropicMessages {
+            request = request.header("anthropic-version", "2023-06-01");
+        }
+        request
+    }
 }
 
 fn consume_sse_events(
@@ -197,9 +210,11 @@ pub fn classify_endpoint(endpoint: &str) -> anyhow::Result<ModelApi> {
         Ok(ModelApi::ChatCompletions)
     } else if path.ends_with("/responses") {
         Ok(ModelApi::Responses)
+    } else if path.ends_with("/messages") {
+        Ok(ModelApi::AnthropicMessages)
     } else {
         anyhow::bail!(
-            "unsupported provider endpoint `{endpoint}`; path must end in `/chat/completions` or `/responses`"
+            "unsupported provider endpoint `{endpoint}`; path must end in `/chat/completions`, `/responses`, or `/messages`"
         )
     }
 }
@@ -418,6 +433,9 @@ impl Provider for HttpProvider {
             ModelApi::Responses => {
                 crate::responses::stream(self, request, messages, tools, on_event).await
             }
+            ModelApi::AnthropicMessages => {
+                crate::anthropic::stream(self, request, messages, tools, on_event).await
+            }
         }
     }
 }
@@ -539,12 +557,34 @@ mod tests {
             classify_endpoint("https://gateway.test/custom/responses/").unwrap(),
             ModelApi::Responses
         );
+        assert_eq!(
+            classify_endpoint("https://gateway.test/v1/messages?route=a").unwrap(),
+            ModelApi::AnthropicMessages
+        );
         for endpoint in [
             "https://gateway.test/v1",
             "https://gateway.test/v1/Responses",
+            "https://gateway.test/v1/message",
             "https://gateway.test/v1/chat/completions/extra",
         ] {
             assert!(classify_endpoint(endpoint).is_err(), "accepted {endpoint}");
         }
+    }
+
+    #[test]
+    fn anthropic_requests_use_native_headers_without_bearer_auth() {
+        let provider = HttpProvider::new(
+            "https://api.anthropic.test/v1/messages".into(),
+            Some("test-key".into()),
+        )
+        .unwrap();
+        let request = provider
+            .post_request(&serde_json::json!({ "model": "claude-test" }))
+            .build()
+            .unwrap();
+
+        assert_eq!(request.headers()["x-api-key"], "test-key");
+        assert_eq!(request.headers()["anthropic-version"], "2023-06-01");
+        assert!(request.headers().get("authorization").is_none());
     }
 }

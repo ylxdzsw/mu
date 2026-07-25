@@ -131,9 +131,9 @@ messages, and exits. A few ideas follow from that:
 
 ## Key features
 
-- OpenAI-compatible Chat Completions and OpenAI Responses providers, with
-  strict full-endpoint selection, ordered model selection, and per-turn model
-  and reasoning-effort overrides.
+- OpenAI-compatible Chat Completions, OpenAI Responses, and Anthropic Messages
+  providers, with strict full-endpoint selection, ordered model selection, and
+  per-turn model and reasoning-effort overrides.
 - Persistent global or project-scoped sessions, continuation, transcripts,
   automatic context compaction, and interrupted-turn recovery.
 - Four output densities with automatic interactive-terminal rendering.

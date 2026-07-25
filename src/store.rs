@@ -3155,6 +3155,38 @@ mod tests {
     }
 
     #[test]
+    fn reloads_exact_native_anthropic_blocks_and_origin() {
+        let (store, tmp) = temp_store();
+        let session = create_session_with_system(&store);
+        let native = NativeReplay {
+            endpoint: "https://api.anthropic.test/v1/messages".into(),
+            model: "claude-opus-5".into(),
+            payload: NativeReplayPayload::AnthropicContent(vec![serde_json::json!({
+                "type": "thinking",
+                "thinking": "summary",
+                "signature": "opaque-signature"
+            })]),
+        };
+        store
+            .append_message(
+                &session.id,
+                &Message::Assistant {
+                    content: None,
+                    reasoning_content: None,
+                    tool_calls: None,
+                    native_replay: Some(native.clone()),
+                },
+            )
+            .unwrap();
+
+        let messages = store.load_context_messages(&session.id).unwrap();
+        assert!(matches!(&messages[1], Message::Assistant {
+            native_replay: Some(saved), ..
+        } if saved == &native));
+        let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    #[test]
     fn list_sessions_includes_every_session() {
         let (store, tmp) = temp_store();
         let first = store.create_session("/tmp", "first-model").unwrap();

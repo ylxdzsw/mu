@@ -12,6 +12,7 @@ use clap::Parser;
 compile_error!("mu is supported only on Unix-like systems");
 
 mod agent;
+mod anthropic;
 mod applets;
 mod attachment;
 mod bash;
