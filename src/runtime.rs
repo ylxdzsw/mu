@@ -423,7 +423,7 @@ mod tests {
             &store,
             &test_config(),
             &InvocationOverrides {
-                session: Some(session.id.clone()),
+                session: Some(session.id),
                 continue_latest: false,
                 model: None,
             },

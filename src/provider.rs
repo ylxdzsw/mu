@@ -67,7 +67,7 @@ pub enum ModelApi {
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 /// Maximum gap between stream bytes. This is an inter-chunk idle bound, not a
 /// total-turn bound; models may legitimately reason for a long time.
-const DEFAULT_STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(600);
+const DEFAULT_STREAM_IDLE_TIMEOUT: Duration = Duration::from_mins(10);
 
 pub struct HttpProvider {
     client: Client,

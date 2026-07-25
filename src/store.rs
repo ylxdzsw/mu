@@ -2051,7 +2051,6 @@ mod tests {
     fn bash_result_requires_a_persisted_execution_claim() {
         let (store, tmp) = temp_store();
         let session = create_session_with_system(&store);
-        let call = bash_call("call-unclaimed");
         let (_assistant_id, call_ids) = store
             .append_message_with_bash_calls(
                 &session.id,
@@ -2059,7 +2058,7 @@ mod tests {
                     content: None,
                     reasoning_content: None,
                     native_replay: None,
-                    tool_calls: Some(vec![call.clone()]),
+                    tool_calls: Some(vec![bash_call("call-unclaimed")]),
                 },
             )
             .unwrap();
@@ -2088,7 +2087,6 @@ mod tests {
     fn review_records_internal_bash_call_reference() {
         let (store, tmp) = temp_store();
         let session = create_session_with_system(&store);
-        let call = bash_call("call-reviewed");
         let (_, call_ids) = store
             .append_message_with_bash_calls(
                 &session.id,
@@ -2096,7 +2094,7 @@ mod tests {
                     content: None,
                     reasoning_content: None,
                     native_replay: None,
-                    tool_calls: Some(vec![call.clone()]),
+                    tool_calls: Some(vec![bash_call("call-reviewed")]),
                 },
             )
             .unwrap();
@@ -2127,7 +2125,6 @@ mod tests {
         let (store, tmp) = temp_store();
         let session = create_session_with_system(&store);
         let lock = store.acquire_session_lock(&session.id).unwrap();
-        let call = bash_call("call-image");
         let (assistant_id, ids) = store
             .append_message_with_bash_calls(
                 &session.id,
@@ -2135,7 +2132,7 @@ mod tests {
                     content: None,
                     reasoning_content: None,
                     native_replay: None,
-                    tool_calls: Some(vec![call.clone()]),
+                    tool_calls: Some(vec![bash_call("call-image")]),
                 },
             )
             .unwrap();
@@ -2200,7 +2197,6 @@ mod tests {
         let (store, tmp) = temp_store();
         let session = create_session_with_system(&store);
         let lock = store.acquire_session_lock(&session.id).unwrap();
-        let call = bash_call("call-many");
         let (_, call_ids) = store
             .append_message_with_bash_calls(
                 &session.id,
@@ -2208,7 +2204,7 @@ mod tests {
                     content: None,
                     reasoning_content: None,
                     native_replay: None,
-                    tool_calls: Some(vec![call.clone()]),
+                    tool_calls: Some(vec![bash_call("call-many")]),
                 },
             )
             .unwrap();

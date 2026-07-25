@@ -251,8 +251,7 @@ fn scan_root(root: &Path, scope: InstructionScope, env: &EnvMap) -> Result<RootI
         max_files: MAX_FILES_PER_ROOT,
     };
     let snapshot = collect_snapshot(root, limits)?;
-    let (index, _warnings) = build_root_index(root, scope, &snapshot, env)?;
-    Ok(index)
+    Ok(build_root_index(root, scope, &snapshot, env))
 }
 
 fn collect_snapshot(root: &Path, limits: ScanLimits) -> Result<ScanSnapshot> {
@@ -304,9 +303,8 @@ fn collect_snapshot_dir(
 
     for (name, path) in children {
         let relative = relative_dir.join(&name);
-        let metadata = match std::fs::symlink_metadata(&path) {
-            Ok(metadata) => metadata,
-            Err(_) => continue,
+        let Ok(metadata) = std::fs::symlink_metadata(&path) else {
+            continue;
         };
         if metadata.is_dir() {
             if is_valid_instruction_relative_path(&relative) {
@@ -348,7 +346,7 @@ fn build_root_index(
     scope: InstructionScope,
     snapshot: &ScanSnapshot,
     env: &EnvMap,
-) -> Result<(RootIndex, Vec<String>)> {
+) -> RootIndex {
     let mut skills = Vec::new();
     let mut commands = Vec::new();
     let mut warnings = Vec::new();
@@ -384,7 +382,7 @@ fn build_root_index(
                 name: entry.path.clone(),
                 path: path
                     .canonicalize()
-                    .unwrap_or(path.clone())
+                    .unwrap_or_else(|_| path.clone())
                     .display()
                     .to_string(),
                 scope,
@@ -399,7 +397,7 @@ fn build_root_index(
                             description: skill.description,
                             path: path
                                 .canonicalize()
-                                .unwrap_or(path.clone())
+                                .unwrap_or_else(|_| path.clone())
                                 .display()
                                 .to_string(),
                             scope,
@@ -425,7 +423,7 @@ fn build_root_index(
         eprintln!("warning: {warning}");
     }
 
-    Ok((RootIndex { skills, commands }, warnings))
+    RootIndex { skills, commands }
 }
 
 fn parse_instruction(content: &str) -> ParsedInstruction {

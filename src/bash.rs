@@ -649,7 +649,7 @@ impl Drop for ActiveProcessGroup {
 }
 
 fn set_active_process_group(child_id: u32) -> Option<usize> {
-    let pgid = child_id as i32;
+    let pgid = child_id.cast_signed();
     for (idx, slot) in ACTIVE_PGIDS.iter().enumerate() {
         if slot
             .compare_exchange(0, pgid, Ordering::SeqCst, Ordering::SeqCst)
@@ -683,7 +683,7 @@ fn configure_process_group(command: &mut Command) {
 }
 
 fn terminate_child_group(child_id: u32, child: &mut std::process::Child) {
-    let pgid = -(child_id as i32);
+    let pgid = -child_id.cast_signed();
     unsafe {
         if libc::kill(pgid, libc::SIGTERM) != 0 {
             let _ = child.kill();

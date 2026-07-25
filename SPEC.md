@@ -1714,8 +1714,9 @@ length errors are not retried.
 }
 ```
 
-**Audit.** Each review is recorded in the `review` table (SQLite): action JSON,
-risk level, auth level, outcome, reason, and timestamp.
+**Audit.** Each review is recorded in the `bash_review` table (SQLite), keyed to
+its immutable `bash_call`: risk level, auth level, outcome, reason, and
+timestamp. The action remains in `bash_call.arguments` rather than being copied.
 
 **Concurrency.** Guardrail only targets `destructive` calls, which are always
 sequential (concurrent batches only run `readonly` tools). There is no

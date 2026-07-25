@@ -50,10 +50,7 @@ pub async fn maybe_compact(
         store.estimate_context_tokens(session_id)
     };
 
-    let should_compact = match context_window {
-        Some(cw) => (tokens as f64) > (cw as f64 * threshold),
-        None => false,
-    };
+    let should_compact = context_window.is_some_and(|cw| (tokens as f64) > (cw as f64 * threshold));
 
     if should_compact {
         run_compaction(store, config, session_id, request, provider, None).await?;
