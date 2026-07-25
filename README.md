@@ -165,6 +165,34 @@ Because `--export` re-reads your instructions and skills on every call, it stays
 current with no separate sync step. In a project with no user `AGENTS.md` and no
 user skills it prints nothing, so it is safe to wire up unconditionally.
 
+For Codex, add a personal `SessionStart` hook at `~/.codex/hooks.json`. Plain
+text printed by the hook is added as developer context, and including `compact`
+reloads the projection after context compaction:
+
+```json
+{
+  "description": "Load mu instructions and skills.",
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "startup|resume|clear|compact",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "mu context --export",
+            "timeout": 10,
+            "statusMessage": "Loading mu context"
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+On the next Codex session, use `/hooks` to review and trust the new command hook.
+Codex records trust against the hook definition and asks again after it changes.
+
 For Claude Code, run it from a `SessionStart` hook so each new session ingests
 your mu context. Add to `~/.claude/settings.json`:
 
