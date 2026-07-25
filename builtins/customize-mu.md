@@ -48,6 +48,8 @@ the installed `mu` package or this repository's shipped defaults.
 `config.jsonc` accepts comments and trailing commas. Global config is created
 automatically with a starter provider if it does not exist. Project config from
 `mu project init` is only an overlay stub.
+Other omitted fields inherit from mu's bundled `default_config.jsonc`; its
+provider entries are used only when creating a missing global config.
 
 Common shape:
 
@@ -73,7 +75,7 @@ Common shape:
     "max_bytes": 51200,
     "max_line_bytes": 10240
   },
-  "redaction": { "env": [] },
+  "redaction": { "env": ["*_API_KEY", "*_API_TOKEN", "*_AUTH_TOKEN"] },
   "guardrail": {
     "enabled": true,
     "review_model": "openai/gpt-4o:low",

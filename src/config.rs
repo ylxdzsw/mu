@@ -166,19 +166,12 @@ fn parse_double_quoted_env_value(source: &str) -> std::result::Result<String, &'
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Config {
-    #[serde(default)]
     pub providers: OrderedMap<ProviderConfig>,
-    #[serde(default)]
     pub output: OutputFormat,
-    #[serde(default)]
     pub compaction: CompactionConfig,
-    #[serde(default)]
     pub limits: LimitsConfig,
-    #[serde(default)]
     pub guardrail: GuardrailConfig,
-    #[serde(default)]
     pub terminal_bell: TerminalBellConfig,
-    #[serde(default)]
     pub redaction: RedactionConfig,
     #[serde(skip)]
     pub env: EnvMap,
@@ -203,57 +196,41 @@ pub struct ModelConfig {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct CompactionConfig {
-    #[serde(default = "default_fraction")]
     pub fraction: f64,
-    #[serde(default = "default_keep_recent")]
     pub keep_recent_turns: usize,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct LimitsConfig {
-    #[serde(default = "default_max_iterations")]
     pub max_iterations: usize,
-    #[serde(default = "default_max_lines")]
     pub max_lines: usize,
-    #[serde(default = "default_max_bytes")]
     pub max_bytes: usize,
-    #[serde(default = "default_max_line_bytes")]
     pub max_line_bytes: usize,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct GuardrailConfig {
-    #[serde(default = "default_guardrail_enabled")]
     pub enabled: bool,
-    #[serde(default)]
     pub review_model: Option<String>,
-    #[serde(default = "default_guardrail_timeout_ms")]
     pub timeout_ms: u64,
-    #[serde(default)]
     pub circuit_breaker: CircuitBreakerConfig,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct CircuitBreakerConfig {
-    #[serde(default = "default_cb_consecutive")]
     pub consecutive: u32,
-    #[serde(default = "default_cb_window")]
     pub window: usize,
-    #[serde(default = "default_cb_window_denials")]
     pub window_denials: u32,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct TerminalBellConfig {
-    #[serde(default = "default_terminal_bell_enabled")]
     pub enabled: bool,
-    #[serde(default = "default_terminal_bell_min_duration_ms")]
     pub min_duration_ms: u64,
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct RedactionConfig {
-    #[serde(default)]
     pub env: Vec<String>,
 }
 
@@ -389,96 +366,6 @@ where
     }
 }
 
-fn default_fraction() -> f64 {
-    0.75
-}
-fn default_keep_recent() -> usize {
-    2
-}
-fn default_max_iterations() -> usize {
-    50
-}
-fn default_max_lines() -> usize {
-    2000
-}
-fn default_max_bytes() -> usize {
-    51200
-}
-fn default_max_line_bytes() -> usize {
-    10240
-}
-fn default_guardrail_enabled() -> bool {
-    true
-}
-fn default_guardrail_timeout_ms() -> u64 {
-    90_000
-}
-fn default_terminal_bell_enabled() -> bool {
-    true
-}
-fn default_terminal_bell_min_duration_ms() -> u64 {
-    10_000
-}
-fn default_cb_consecutive() -> u32 {
-    3
-}
-fn default_cb_window() -> usize {
-    50
-}
-fn default_cb_window_denials() -> u32 {
-    10
-}
-
-impl Default for CompactionConfig {
-    fn default() -> Self {
-        Self {
-            fraction: default_fraction(),
-            keep_recent_turns: default_keep_recent(),
-        }
-    }
-}
-
-impl Default for LimitsConfig {
-    fn default() -> Self {
-        Self {
-            max_iterations: default_max_iterations(),
-            max_lines: default_max_lines(),
-            max_bytes: default_max_bytes(),
-            max_line_bytes: default_max_line_bytes(),
-        }
-    }
-}
-
-impl Default for GuardrailConfig {
-    fn default() -> Self {
-        Self {
-            enabled: default_guardrail_enabled(),
-            review_model: None,
-            timeout_ms: default_guardrail_timeout_ms(),
-            circuit_breaker: CircuitBreakerConfig::default(),
-        }
-    }
-}
-
-impl Default for CircuitBreakerConfig {
-    fn default() -> Self {
-        Self {
-            consecutive: default_cb_consecutive(),
-            window: default_cb_window(),
-            window_denials: default_cb_window_denials(),
-        }
-    }
-}
-
-impl Default for TerminalBellConfig {
-    fn default() -> Self {
-        Self {
-            enabled: default_terminal_bell_enabled(),
-            min_duration_ms: default_terminal_bell_min_duration_ms(),
-        }
-    }
-}
-
 impl Config {
     pub fn load_for_scope(project_config_dir: Option<&Path>) -> Result<Self> {
         let global_path = paths::global_dir().join("config.jsonc");
@@ -588,12 +475,15 @@ fn ensure_starter_config(path: &Path) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    std::fs::write(path, STARTER_CONFIG)?;
+    std::fs::write(path, DEFAULT_CONFIG)?;
     Ok(())
 }
 
 fn config_from_value(value: serde_json::Value) -> Result<Config> {
-    let config: Config = serde_json::from_value(value).context("invalid config.jsonc structure")?;
+    let mut merged = bundled_defaults()?;
+    merge_json(&mut merged, value);
+    let config: Config =
+        serde_json::from_value(merged).context("invalid config.jsonc structure")?;
     config.validate_structure()?;
     Ok(config)
 }
@@ -604,16 +494,29 @@ fn read_config_file(path: &Path) -> Result<(serde_json::Value, ConfigOrder)> {
     }
     let raw =
         std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+    parse_config_source(&raw, &path.display().to_string())
+}
+
+fn parse_config_source(raw: &str, source: &str) -> Result<(serde_json::Value, ConfigOrder)> {
     let value =
-        jsonc_parser::parse_to_serde_value::<Option<serde_json::Value>>(&raw, &Default::default())
-            .map_err(|e| anyhow::anyhow!("parsing {}: {e}", path.display()))?
-            .ok_or_else(|| anyhow::anyhow!("{} is empty", path.display()))?;
+        jsonc_parser::parse_to_serde_value::<Option<serde_json::Value>>(raw, &Default::default())
+            .map_err(|e| anyhow::anyhow!("parsing {source}: {e}"))?
+            .ok_or_else(|| anyhow::anyhow!("{source} is empty"))?;
     let order =
-        jsonc_parser::parse_to_serde_value::<Option<ConfigOrderRaw>>(&raw, &Default::default())
-            .map_err(|e| anyhow::anyhow!("parsing {}: {e}", path.display()))?
+        jsonc_parser::parse_to_serde_value::<Option<ConfigOrderRaw>>(raw, &Default::default())
+            .map_err(|e| anyhow::anyhow!("parsing {source}: {e}"))?
             .unwrap_or_default()
             .into_order();
     Ok((value, order))
+}
+
+fn bundled_defaults() -> Result<serde_json::Value> {
+    let (mut value, _) = parse_config_source(DEFAULT_CONFIG, "bundled default config")?;
+    let object = value
+        .as_object_mut()
+        .ok_or_else(|| anyhow!("bundled default config must be a JSON object"))?;
+    object.insert("providers".into(), serde_json::json!({}));
+    Ok(value)
 }
 
 #[derive(Debug, Clone, Default)]
@@ -706,55 +609,65 @@ fn merge_json(base: &mut serde_json::Value, overlay: serde_json::Value) {
     }
 }
 
-const STARTER_CONFIG: &str = r#"{
-  "output": "detail",
-  "providers": {
-    // Default provider: OpenCode Zen's free DeepSeek model. It needs no API
-    // key, so mu works out of the box. Other free models include
-    // "big-pickle", "mimo-v2.5-free", and "north-mini-code-free".
-    "opencode": {
-      "endpoint": "https://opencode.ai/zen/v1/chat/completions",
-      "api_key_env": "",
-      "models": {
-        "deepseek-v4-flash-free": {
-          "context_window": 128000
-        }
-      }
-    },
-    // Example keyed provider. Add OPENAI_API_KEY to ~/.mu/.env, then select it
-    // with `mu --model openai/gpt-4o` or reorder providers to make it default.
-    "openai": {
-      "endpoint": "https://api.openai.com/v1/chat/completions",
-      "api_key_env": "OPENAI_API_KEY",
-      "models": {
-        "gpt-4o": {
-          "context_window": 128000,
-          "supported_efforts": ["low", "medium", "high"]
-        }
-      }
-    }
-  },
-  "terminal_bell": {
-    "enabled": true,
-    "min_duration_ms": 10000
-  },
-  "compaction": { "fraction": 0.75, "keep_recent_turns": 2 },
-  "limits": {
-    "max_iterations": 50,
-    "max_lines": 2000,
-    "max_bytes": 51200,
-    "max_line_bytes": 10240
-  },
-  "redaction": {
-    "env": []
-  },
-  "guardrail": {
-    "enabled": true,
-    "timeout_ms": 90000,
-    "circuit_breaker": { "consecutive": 3, "window": 50, "window_denials": 10 }
-  }
+const DEFAULT_CONFIG: &str = include_str!("default_config.jsonc");
+
+#[cfg(test)]
+fn bundled_test_default<T>(pointer: &str) -> T
+where
+    T: serde::de::DeserializeOwned,
+{
+    let (value, _) =
+        parse_config_source(DEFAULT_CONFIG, "bundled default config").expect("valid defaults");
+    serde_json::from_value(
+        value
+            .pointer(pointer)
+            .unwrap_or_else(|| panic!("missing bundled default at {pointer}"))
+            .clone(),
+    )
+    .unwrap_or_else(|error| panic!("invalid bundled default at {pointer}: {error}"))
 }
-"#;
+
+#[cfg(test)]
+impl Default for CompactionConfig {
+    fn default() -> Self {
+        bundled_test_default("/compaction")
+    }
+}
+
+#[cfg(test)]
+impl Default for LimitsConfig {
+    fn default() -> Self {
+        bundled_test_default("/limits")
+    }
+}
+
+#[cfg(test)]
+impl Default for GuardrailConfig {
+    fn default() -> Self {
+        bundled_test_default("/guardrail")
+    }
+}
+
+#[cfg(test)]
+impl Default for CircuitBreakerConfig {
+    fn default() -> Self {
+        bundled_test_default("/guardrail/circuit_breaker")
+    }
+}
+
+#[cfg(test)]
+impl Default for TerminalBellConfig {
+    fn default() -> Self {
+        bundled_test_default("/terminal_bell")
+    }
+}
+
+#[cfg(test)]
+impl Default for RedactionConfig {
+    fn default() -> Self {
+        bundled_test_default("/redaction")
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -832,7 +745,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_accepts_without_explicit_default() {
+    fn bundled_defaults_fill_omitted_fields_without_adding_starter_providers() {
         let value = serde_json::json!({
             "providers": {
                 "openai": {
@@ -843,7 +756,70 @@ mod tests {
         });
 
         let config = config_from_value(value).unwrap();
+        assert_eq!(
+            config
+                .providers
+                .keys()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            ["openai"]
+        );
         assert_eq!(config.output, OutputFormat::Detail);
+        assert_eq!(config.compaction.fraction, 0.75);
+        assert_eq!(config.compaction.keep_recent_turns, 2);
+        assert_eq!(config.limits.max_iterations, 50);
+        assert_eq!(config.guardrail.timeout_ms, 90_000);
+        assert!(config.terminal_bell.enabled);
+        assert_eq!(
+            config.redaction.env,
+            ["*_API_KEY", "*_API_TOKEN", "*_AUTH_TOKEN"]
+        );
+    }
+
+    #[test]
+    fn user_and_project_values_recursively_override_bundled_defaults() {
+        let mut user = serde_json::json!({
+            "providers": {
+                "custom": {
+                    "endpoint": "http://localhost/chat/completions",
+                    "models": {"model": {"context_window": 128000}}
+                }
+            },
+            "limits": {"max_lines": 123},
+            "guardrail": {"circuit_breaker": {"window": 7}}
+        });
+        let project = serde_json::json!({
+            "limits": {"max_bytes": 456},
+            "guardrail": {"enabled": false}
+        });
+        merge_json(&mut user, project);
+
+        let config = config_from_value(user).unwrap();
+        assert_eq!(config.limits.max_iterations, 50);
+        assert_eq!(config.limits.max_lines, 123);
+        assert_eq!(config.limits.max_bytes, 456);
+        assert_eq!(config.limits.max_line_bytes, 10_240);
+        assert!(!config.guardrail.enabled);
+        assert_eq!(config.guardrail.timeout_ms, 90_000);
+        assert_eq!(config.guardrail.circuit_breaker.consecutive, 3);
+        assert_eq!(config.guardrail.circuit_breaker.window, 7);
+        assert_eq!(config.guardrail.circuit_breaker.window_denials, 10);
+    }
+
+    #[test]
+    fn explicit_empty_redaction_list_disables_default_patterns() {
+        let value = serde_json::json!({
+            "providers": {
+                "openai": {
+                    "endpoint": "http://localhost/chat/completions",
+                    "models": {"gpt-4o": {"context_window": 128000}}
+                }
+            },
+            "redaction": {"env": []}
+        });
+
+        let config = config_from_value(value).unwrap();
+        assert!(config.redaction.env.is_empty());
     }
 
     #[test]
@@ -999,13 +975,13 @@ mod tests {
     }
 
     #[test]
-    fn starter_config_is_the_full_global_template() {
+    fn bundled_default_config_is_written_as_the_full_global_template() {
         let root = std::env::temp_dir().join(format!("mu-config-{}", uuid::Uuid::new_v4()));
         let config = root.join("config.jsonc");
 
         ensure_starter_config(&config).unwrap();
 
-        assert_eq!(std::fs::read_to_string(&config).unwrap(), STARTER_CONFIG);
+        assert_eq!(std::fs::read_to_string(&config).unwrap(), DEFAULT_CONFIG);
         assert!(!root.join(".gitignore").exists());
 
         let _ = std::fs::remove_dir_all(root);

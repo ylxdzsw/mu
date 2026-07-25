@@ -1,0 +1,48 @@
+{
+  "output": "detail",
+  "providers": {
+    // Default provider: OpenCode Zen's free DeepSeek model. It needs no API
+    // key, so mu works out of the box. Other free models include
+    // "big-pickle", "mimo-v2.5-free", and "north-mini-code-free".
+    "opencode": {
+      "endpoint": "https://opencode.ai/zen/v1/chat/completions",
+      "api_key_env": "",
+      "models": {
+        "deepseek-v4-flash-free": {
+          "context_window": 128000
+        }
+      }
+    },
+    // Example keyed provider. Add OPENAI_API_KEY to ~/.mu/.env, then select it
+    // with `mu --model openai/gpt-4o` or reorder providers to make it default.
+    "openai": {
+      "endpoint": "https://api.openai.com/v1/chat/completions",
+      "api_key_env": "OPENAI_API_KEY",
+      "models": {
+        "gpt-4o": {
+          "context_window": 128000,
+          "supported_efforts": ["low", "medium", "high"]
+        }
+      }
+    }
+  },
+  "terminal_bell": {
+    "enabled": true,
+    "min_duration_ms": 10000
+  },
+  "compaction": { "fraction": 0.75, "keep_recent_turns": 2 },
+  "limits": {
+    "max_iterations": 50,
+    "max_lines": 2000,
+    "max_bytes": 51200,
+    "max_line_bytes": 10240
+  },
+  "redaction": {
+    "env": ["*_API_KEY", "*_API_TOKEN", "*_AUTH_TOKEN"]
+  },
+  "guardrail": {
+    "enabled": true,
+    "timeout_ms": 90000,
+    "circuit_breaker": { "consecutive": 3, "window": 50, "window_denials": 10 }
+  }
+}

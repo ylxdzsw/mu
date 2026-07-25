@@ -1168,7 +1168,7 @@ one scope are not visible in another.
     "compaction": { "fraction": 0.75, "keep_recent_turns": 2 },  // optional
     "limits": { "max_iterations": 50, "max_lines": 2000, "max_bytes": 51200, "max_line_bytes": 10240 },
     "redaction": {
-      "env": ["GITHUB_TOKEN", "*_TOKEN"]         // optional; provider api_key_env is implicit
+      "env": ["*_API_KEY", "*_API_TOKEN", "*_AUTH_TOKEN"] // optional; these are the defaults
     }
   }
   ```
@@ -1182,7 +1182,9 @@ one scope are not visible in another.
   completion but does not restrict manually entered effort suffixes. If global
   `config.jsonc` is missing, `mu` creates a starter file automatically. `mu`
   hard-fails on a turn if the required fields are missing or the API-key env var
-  is unset (§7).
+  is unset (§7). Effective configuration is a recursive overlay of bundled
+  defaults, global config, then project config. Bundled provider entries are
+  starter examples only and are not inherited by an existing global config.
 - **.env** — optional restricted shell-compatible assignment data. Values are
   visible to `bash`; this is
   convenience, not sandboxing. Values from provider `api_key_env` and
@@ -1192,7 +1194,9 @@ one scope are not visible in another.
   suffix, such as `*_TOKEN`. The suffix form matches all effective environment
   variable names ending in that suffix. Other wildcard placements, multiple or
   consecutive wildcards, and wildcard-only selectors are invalid. Matching is
-  case-sensitive. Empty redaction values are ignored with a warning. Short
+  case-sensitive. The default selectors are `*_API_KEY`, `*_API_TOKEN`, and
+  `*_AUTH_TOKEN`; an explicit empty list disables these defaults. Empty
+  redaction values are ignored with a warning. Short
   redaction values are still redacted with a warning.
 - **AGENTS.md** — system-prompt addendum. Global instructions are loaded first;
   active-project instructions are appended after them when a project is active.
