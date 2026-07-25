@@ -15,12 +15,9 @@ const ROLE_PREAMBLE: &str = include_str!("system_preamble.md");
 /// intent rather than followed literally. A pointer to the `customize-mu`
 /// reference is appended at runtime when that built-in file is present.
 const EXPORT_PREAMBLE: &str = "\
-<!-- Injected by `mu context --export`. The instructions and skills below are the
-user's own mu configuration (global + project); mu's built-in skills are omitted.
-They were authored for `mu`, a terminal agent whose only tool is `bash`. Adapt
-their intent to your own tools — for example, read a skill file with your
-file-reading tool instead of mu's shell. Mu `.env` files may contain API keys or
-other secrets.";
+<!-- Injected by `mu context --export`. The instructions and skills below were authored
+for `mu`, a terminal agent whose only tool is `bash`. Adapt their intent to your own
+tools. Mu `.env` files may contain secrets needed for some skills.";
 
 const EXPORT_PREAMBLE_CLOSE: &str = " -->";
 
@@ -404,7 +401,7 @@ mod tests {
         fs::remove_dir_all(&global).unwrap();
 
         assert!(context.starts_with(EXPORT_PREAMBLE));
-        assert!(context.contains("Mu `.env` files may contain API keys"));
+        assert!(context.contains("Mu `.env` files may contain secrets"));
         assert!(context.contains(&format!(
             "<agents_md scope=\"global\" path=\"{}\">\nGlobal mu instructions.\n</agents_md>",
             agents_path.display()
