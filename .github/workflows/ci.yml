@@ -69,7 +69,6 @@ jobs:
           zsh -n mu.zsh test.zsh
           MU_ZSH_SKIP_PTY=1 zsh test.zsh
           fish -n mu.fish test.fish
-          MU_FISH_SKIP_PTY=1 fish test.fish
 
       - name: Check package recipe
         run: bash -n PKGBUILD
@@ -83,7 +82,7 @@ jobs:
       - name: Install package dependencies
         run: |
           pacman -Syu --noconfirm
-          pacman -S --needed --noconfirm git rust jq sqlite zsh
+          pacman -S --needed --noconfirm fish git jq perl rust sqlite util-linux zsh
 
       - uses: actions/checkout@v6
         with:
@@ -95,6 +94,12 @@ jobs:
           git fetch --no-tags origin \
             +refs/heads/master:refs/remotes/origin/master
           git checkout --detach origin/master
+
+      - name: Test Fish 4 integration
+        run: |
+          fish -c 'test (string split -m1 . $version)[1] -ge 4'
+          fish -n mu.fish test.fish
+          fish test.fish
 
       - name: Build the native package from this revision
         run: |

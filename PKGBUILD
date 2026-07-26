@@ -6,7 +6,7 @@ arch=('x86_64')
 url='https://github.com/ylxdzsw/mu'
 license=('MIT')
 depends=('bash' 'jq' 'sqlite')
-optdepends=('fish: Fish prompt mode' 'zsh: zsh prompt mode')
+optdepends=('fish>=4: Fish prompt mode' 'zsh: zsh prompt mode')
 makedepends=('cargo' 'git')
 options=('!lto')
 _source_url="${MU_SOURCE_URL:-$url.git}"

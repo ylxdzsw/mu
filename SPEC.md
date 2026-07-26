@@ -891,14 +891,20 @@ Consequences:
   `vendor_conf.d/mu.fish`; sourcing it again after user prompt/key
   configuration is supported.
 - Fish 4, `jq`, and `mu` on `PATH` are required. `MU_FISH_BIN` overrides the
-  executable and `MU_FISH_OUTPUT` overrides output density.
+  executable and `MU_FISH_OUTPUT` overrides output density. On an older Fish,
+  the plugin reports the version requirement and does not install its
+  integration.
 - The plugin copies and wraps the active `fish_prompt`, `fish_right_prompt`, and
   `fish_mode_prompt`. Normal shell mode continues to call those saved
-  functions; Mu mode replaces them with its status and `mu>` prompt.
+  functions with the prior command status intact; Mu mode replaces them with
+  its status and `mu>` prompt.
 - Mu editing uses a dedicated `mumode` initialized from Fish's complete default
   editing bindings. On exit, the prior `$fish_bind_mode` is restored. The
   arrays `MU_FISH_ENTER_HOOKS` and `MU_FISH_EXIT_HOOKS` provide additional
   function hooks.
+- In normal shell mode, Tab at cursor zero remains the Mu-mode toggle. Away from
+  cursor zero, it delegates to the binding that was active when `mu.fish` was
+  last sourced, separately for Fish's `default` and `insert` modes.
 - Slash/model completion uses Mu's status candidates and Fish filename
   completion. Multiple candidates are listed with Fish repaint semantics;
   completion does not promise zsh `zstyle` behavior.

@@ -1,15 +1,29 @@
 #!/usr/bin/env fish
 
-set -g TEST_ROOT (path resolve (path dirname (status filename)))
-set -g TEST_TMPDIR (mktemp -d /tmp/mu-fish-test.XXXXXX)
+if not set -q MU_FISH_TEST_ISOLATED; or not set -q TEST_TMPDIR[1]
+    set -l test_root (path resolve (path dirname (status filename)))
+    set -l test_tmpdir (mktemp -d /tmp/mu-fish-test.XXXXXX); or exit 1
+    mkdir -p "$test_tmpdir/home/.config" "$test_tmpdir/home/.local/share" "$test_tmpdir/home/.cache"; or exit 1
 
-function _test_cleanup --on-event fish_exit
+    env \
+        MU_FISH_TEST_ISOLATED=1 \
+        TEST_TMPDIR="$test_tmpdir" \
+        HOME="$test_tmpdir/home" \
+        XDG_CONFIG_HOME="$test_tmpdir/home/.config" \
+        XDG_DATA_HOME="$test_tmpdir/home/.local/share" \
+        XDG_CACHE_HOME="$test_tmpdir/home/.cache" \
+        (status fish-path) "$test_root/test.fish" $argv
+    set -l test_status $status
+
     if set -q MU_FISH_KEEP_TEST_TMP
-        printf 'kept test files in %s\n' "$TEST_TMPDIR" >&2
+        printf 'kept test files in %s\n' "$test_tmpdir" >&2
     else
-        rm -rf -- "$TEST_TMPDIR"
+        rm -rf -- "$test_tmpdir"
     end
+    exit $test_status
 end
+
+set -g TEST_ROOT (path resolve (path dirname (status filename)))
 
 function fail --argument-names message
     printf 'FAIL: %s\n' "$message" >&2
@@ -24,11 +38,6 @@ function assert_contains --argument-names actual expected message
     string match -q "*$expected*" -- "$actual"; or fail "$message: missing <$expected>"
 end
 
-set -gx HOME "$TEST_TMPDIR/home"
-set -gx XDG_CONFIG_HOME "$HOME/.config"
-set -gx XDG_DATA_HOME "$HOME/.local/share"
-set -gx XDG_CACHE_HOME "$HOME/.cache"
-mkdir -p "$XDG_CONFIG_HOME" "$XDG_DATA_HOME" "$XDG_CACHE_HOME"
 set -g fish_history mu_fish_test_(random)
 
 source "$TEST_ROOT/mu.fish"
@@ -131,12 +140,13 @@ set submitted_args (cat "$capture_args")
 assert_equal (string join \x1e -- $submitted_args) (string join \x1e -- --output detail -s ses_0000000a -a "$attachment") 'forwards session and attachment'
 not set -q MU_FISH_PENDING_ATTACHMENTS[1]; or fail 'submission clears attachments'
 
-if _mu_fish_supports_history_append
-    set replay (builtin history search --max 1 | string collect)
-    assert_contains "$replay" "printf '%s\\n'" 'records replayable Fish history'
-    assert_contains "$replay" 'inspect this' 'history preserves submitted prompt'
-    fish -n -c "$replay"; or fail 'recorded Fish history is not valid Fish syntax'
-end
+set replay (builtin history search --max 1 | string collect)
+assert_contains "$replay" "printf '%s\\n'" 'records replayable Fish history'
+assert_contains "$replay" 'inspect this' 'history preserves submitted prompt'
+fish -n -c "$replay"; or fail 'recorded Fish history is not valid Fish syntax'
+builtin history save
+set expected_history_file "$XDG_DATA_HOME/fish/$fish_history"_history
+test -f "$expected_history_file"; or fail "test history escaped isolated data directory: $expected_history_file"
 
 _mu_fish_run_slash_command "/attach $attachment"
 assert_equal "$MU_FISH_PENDING_ATTACHMENTS[1]" "$attachment" '/attach stages resolved file'
@@ -155,6 +165,9 @@ not contains shared $models; or fail 'model candidates omit ambiguous shorthand'
 set efforts (_mu_fish_model_effort_suffixes gpt)
 contains :low $efforts; or fail 'effort candidates include low'
 contains :high $efforts; or fail 'effort candidates include high'
+assert_equal (_mu_fish_common_prefix 'file*one' 'file*two') 'file*' 'common prefix treats wildcard characters literally'
+set literal_matches (_mu_fish_matching_candidates 'file*' 'file*star' file-other)
+assert_equal (string join \x1e -- $literal_matches) 'file*star' 'candidate matching treats wildcard characters literally'
 
 set -g MU_FISH_SESSION_ID ses_0000000a
 set -g MU_FISH_SESSION_SCOPE (_mu_fish_current_scope)
@@ -191,11 +204,36 @@ assert_equal "$TEST_EXIT_HOOK_RAN" yes 'runs exit hooks'
 function fish_prompt
     printf 'custom:%s:%s> ' $status (string join , $pipestatus)
 end
+function fish_right_prompt
+    printf 'right:%s:%s> ' $status (string join , $pipestatus)
+end
+function fish_mode_prompt
+    printf 'mode:%s:%s> ' $status (string join , $pipestatus)
+end
 source "$TEST_ROOT/mu.fish"
 set status_prompt "$TEST_TMPDIR/status-prompt"
 false | true
 fish_prompt >"$status_prompt"
 assert_equal (cat "$status_prompt") 'custom:0:1,0> ' 're-sourced wrapper preserves prompt status'
+false | true
+fish_right_prompt >"$status_prompt"
+assert_equal (cat "$status_prompt") 'right:0:1,0> ' 'right prompt wrapper preserves prompt status'
+false | true
+fish_mode_prompt >"$status_prompt"
+assert_equal (cat "$status_prompt") 'mode:0:1,0> ' 'mode prompt wrapper preserves prompt status'
+
+function _test_default_tab
+end
+function _test_insert_tab
+end
+bind -M default tab _test_default_tab
+bind -M insert tab _test_insert_tab
+_mu_fish_configure_keymap
+assert_equal (string join \x1e -- $_MU_FISH_DEFAULT_TAB_BINDING) _test_default_tab 'captures default-mode Tab binding'
+assert_equal (string join \x1e -- $_MU_FISH_INSERT_TAB_BINDING) _test_insert_tab 'captures insert-mode Tab binding'
+_mu_fish_configure_keymap
+assert_equal (string join \x1e -- $_MU_FISH_DEFAULT_TAB_BINDING) _test_default_tab 'reconfiguration preserves default-mode Tab binding'
+assert_equal (string join \x1e -- $_MU_FISH_INSERT_TAB_BINDING) _test_insert_tab 'reconfiguration preserves insert-mode Tab binding'
 
 if test "$MU_FISH_SKIP_PTY" = 1
     printf 'ok\n'
@@ -256,6 +294,7 @@ begin
     printf 'gpt\r'
     sleep 0.3
     printf hello
+    printf '\e[A\e[B'
     sleep 0.2
     printf '\r'
     sleep 0.5
@@ -296,5 +335,43 @@ set interactive_status $pipestatus[2]
 test $interactive_status -eq 0; or fail "Shift+Enter transcript exited with status $interactive_status"
 assert_equal (cat "$capture_stdin" | string collect) 'first line
 second line' 'Shift+Enter submits one multiline prompt'
+
+set saved_tab_transcript "$TEST_TMPDIR/saved-tab-transcript"
+set saved_tab_capture "$TEST_TMPDIR/saved-tab-capture"
+set saved_tab_buffer "$TEST_TMPDIR/saved-tab-buffer"
+set saved_tab_roundtrip_capture "$TEST_TMPDIR/saved-tab-roundtrip-capture"
+rm -f "$saved_tab_capture" "$saved_tab_buffer" "$saved_tab_roundtrip_capture" "$interactive_ready"
+set saved_tab_setup_parts \
+    "$interactive_setup" \
+    "set -gx TEST_SAVED_TAB_CAPTURE "(string escape "$saved_tab_capture") \
+    "set -gx TEST_SAVED_TAB_BUFFER "(string escape "$saved_tab_buffer") \
+    "set -gx TEST_TAB_ROUNDTRIP_CAPTURE "(string escape "$saved_tab_roundtrip_capture") \
+    'function _test_saved_tab; printf x >>$TEST_SAVED_TAB_CAPTURE; commandline -i -- -preserved; commandline >$TEST_SAVED_TAB_BUFFER; end' \
+    'function _test_tab_roundtrip; commandline -r -- "printf x >\$TEST_TAB_ROUNDTRIP_CAPTURE"; commandline -C 0; _mu_fish_tab; _mu_fish_tab; end' \
+    'bind -M default tab _test_saved_tab' \
+    'bind -M default ctrl-t _test_tab_roundtrip' \
+    "source "(string escape "$TEST_ROOT/mu.fish")
+set saved_tab_setup (string join '; ' $saved_tab_setup_parts)
+
+begin
+    sleep 0.2
+    send_interactive_setup "$saved_tab_setup" "$interactive_ready"
+    printf 'x\t'
+    sleep 0.2
+    printf '\x03'
+    sleep 0.2
+    printf '\x14\r'
+    sleep 0.3
+    printf '\x04'
+end | timeout 10 script -qfec \
+    'env fish_features=no-query-term,no-keyboard-protocols,no-mark-prompt TERM=xterm-256color fish --no-config' \
+    "$saved_tab_transcript" >/dev/null
+set interactive_status $pipestatus[2]
+test $interactive_status -eq 0; or fail "saved Tab transcript exited with status $interactive_status"
+test -f "$saved_tab_capture"; or fail 'shell Tab binding was not delegated'
+assert_equal (cat "$saved_tab_capture") x 'shell Tab binding runs exactly once'
+assert_equal (cat "$saved_tab_buffer") x-preserved 'shell Tab binding keeps its buffer behavior'
+test -f "$saved_tab_roundtrip_capture"; or fail 'Tab mode roundtrip did not execute the preserved shell buffer'
+assert_equal (cat "$saved_tab_roundtrip_capture") x 'Tab mode roundtrip executes the preserved shell buffer once'
 
 printf 'ok\n'

@@ -5,6 +5,12 @@
 # non-blank turn, Ctrl-C cancels the draft, Ctrl-D keeps Fish's normal EOF
 # behavior, and Up/Down move within the current multiline buffer.
 
+set -l _mu_fish_version_major (string split -m1 . "$version")[1]
+if not string match -qr '^[0-9]+$' -- "$_mu_fish_version_major"; or test "$_mu_fish_version_major" -lt 4
+    printf '%s\n' 'mu: mu.fish requires Fish 4 or newer' >&2
+    return 1
+end
+
 set -q MU_FISH_MODE; or set -g MU_FISH_MODE shell
 set -q MU_FISH_SESSION_ID; or set -g MU_FISH_SESSION_ID
 set -q MU_FISH_SESSION_SCOPE; or set -g MU_FISH_SESSION_SCOPE
@@ -19,6 +25,9 @@ set -q MU_FISH_PENDING_ATTACHMENTS; or set -g MU_FISH_PENDING_ATTACHMENTS
 set -q MU_FISH_SAVED_BIND_MODE; or set -g MU_FISH_SAVED_BIND_MODE default
 set -q MU_FISH_ENTER_HOOKS; or set -g MU_FISH_ENTER_HOOKS
 set -q MU_FISH_EXIT_HOOKS; or set -g MU_FISH_EXIT_HOOKS
+set -q _MU_FISH_DEFAULT_TAB_BINDING; or set -g _MU_FISH_DEFAULT_TAB_BINDING
+set -q _MU_FISH_INSERT_TAB_BINDING; or set -g _MU_FISH_INSERT_TAB_BINDING
+set -q _MU_FISH_INPUT_FUNCTIONS; or set -g _MU_FISH_INPUT_FUNCTIONS
 
 set -q MU_FISH_PROMPT_MODEL_COLOR; or set -g MU_FISH_PROMPT_MODEL_COLOR cyan
 set -q MU_FISH_PROMPT_CONTEXT_COLOR; or set -g MU_FISH_PROMPT_CONTEXT_COLOR magenta
@@ -213,13 +222,7 @@ function _mu_fish_create_session_for_scope --argument-names scope
     _mu_fish_remember_session_for_scope "$id" "$scope"
 end
 
-function _mu_fish_supports_history_append
-    set -l major (string split -m1 . "$version")[1]
-    test "$major" -ge 4
-end
-
 function _mu_fish_append_history --argument-names entry
-    _mu_fish_supports_history_append; or return 0
     builtin history append "$entry"
 end
 
@@ -313,6 +316,44 @@ function _mu_fish_run_hooks
             $hook
         else
             printf 'mu mu.fish: hook function not found: %s\n' "$hook" >&2
+        end
+    end
+end
+
+function _mu_fish_capture_tab_binding --argument-names mode variable_name
+    set -l binding (bind --user -M "$mode" tab 2>/dev/null | string collect)
+    if test -z "$binding"
+        set binding (bind --preset -M "$mode" tab 2>/dev/null | string collect)
+    end
+
+    set -l commands
+    if test -n "$binding"
+        set binding (string replace -r '^bind( --preset)?( -M [^[:space:]]+)? tab[[:space:]]+' '' -- "$binding")
+        printf '%s\n' "$binding" | read --tokenize -a commands
+    end
+    test (count $commands) -gt 0; or set commands complete
+
+    # Re-sourcing our own wrapper must not replace the saved user binding.
+    contains -- _mu_fish_tab $commands; and return 0
+    set -g $variable_name $commands
+end
+
+function _mu_fish_call_saved_tab --argument-names mode
+    set -l _mu_fish_saved_commands
+    switch "$mode"
+        case insert
+            set _mu_fish_saved_commands $_MU_FISH_INSERT_TAB_BINDING
+        case '*'
+            set _mu_fish_saved_commands $_MU_FISH_DEFAULT_TAB_BINDING
+    end
+    test (count $_mu_fish_saved_commands) -gt 0; or set _mu_fish_saved_commands complete
+
+    # Fish bindings may contain editor functions or arbitrary Fish commands.
+    for _mu_fish_saved_action in $_mu_fish_saved_commands
+        if contains -- "$_mu_fish_saved_action" $_MU_FISH_INPUT_FUNCTIONS
+            commandline -f "$_mu_fish_saved_action"
+        else
+            eval "$_mu_fish_saved_action"
         end
     end
 end
@@ -594,13 +635,26 @@ function _mu_fish_common_prefix
     test (count $argv) -gt 0; or return 0
     set -l prefix "$argv[1]"
     for candidate in $argv[2..-1]
-        while not string match -q "$prefix*" -- "$candidate"
-            set prefix (string sub --end -2 -- "$prefix")
-            test -n "$prefix"; or break
+        while test -n "$prefix"
+            set -l candidate_prefix (string sub --length (string length -- "$prefix") -- "$candidate")
+            test "$candidate_prefix" = "$prefix"; and break
+            set prefix (string sub --end -1 -- "$prefix")
         end
         test -n "$prefix"; or break
     end
     printf '%s' "$prefix"
+end
+
+function _mu_fish_matching_candidates --argument-names fragment
+    set -e argv[1]
+    set -l fragment_length (string length -- "$fragment")
+    set -l folded_fragment (string lower -- "$fragment")
+    for candidate in $argv
+        set -l candidate_prefix (string sub --length $fragment_length -- "$candidate")
+        if test (string lower -- "$candidate_prefix") = "$folded_fragment"
+            printf '%s\n' "$candidate"
+        end
+    end
 end
 
 function _mu_fish_list_candidates
@@ -611,10 +665,7 @@ end
 
 function _mu_fish_complete_values --argument-names prefix fragment suffix
     set -e argv[1..3]
-    set -l candidates
-    for candidate in $argv
-        string match -qi "$fragment*" -- "$candidate"; and set -a candidates "$candidate"
-    end
+    set -l candidates (_mu_fish_matching_candidates "$fragment" $argv)
     test (count $candidates) -gt 0; or return 1
 
     set -l replacement
@@ -714,7 +765,7 @@ function _mu_fish_tab
         commandline -f repaint
         return
     end
-    commandline -f complete
+    _mu_fish_call_saved_tab "$fish_bind_mode"
 end
 
 function _mu_fish_slash
@@ -763,6 +814,10 @@ function mu-fish-exit-mode
 end
 
 function _mu_fish_configure_keymap
+    set -g _MU_FISH_INPUT_FUNCTIONS (bind --function-names)
+    _mu_fish_capture_tab_binding default _MU_FISH_DEFAULT_TAB_BINDING
+    _mu_fish_capture_tab_binding insert _MU_FISH_INSERT_TAB_BINDING
+
     # Use Fish's complete Emacs-style editing set inside the dedicated mode,
     # then narrow only the keys whose meaning Mu owns.
     fish_default_key_bindings -M mumode
@@ -793,12 +848,20 @@ if functions -q fish_right_prompt
         functions -e _mu_fish_original_right_prompt 2>/dev/null
         functions --copy fish_right_prompt _mu_fish_original_right_prompt
     end
+else
+    functions -e _mu_fish_original_right_prompt 2>/dev/null
+    function _mu_fish_original_right_prompt
+    end
 end
 if functions -q fish_mode_prompt
     set -l _mu_fish_current_mode_prompt (functions fish_mode_prompt | string collect)
     if not string match -q '*_mu_fish_original_mode_prompt*' -- "$_mu_fish_current_mode_prompt"
         functions -e _mu_fish_original_mode_prompt 2>/dev/null
         functions --copy fish_mode_prompt _mu_fish_original_mode_prompt
+    end
+else
+    functions -e _mu_fish_original_mode_prompt 2>/dev/null
+    function _mu_fish_original_mode_prompt
     end
 end
 
@@ -815,14 +878,20 @@ function fish_prompt
 end
 
 function fish_right_prompt
-    if test "$MU_FISH_MODE" != mu; and functions -q _mu_fish_original_right_prompt
-        _mu_fish_original_right_prompt
+    switch "$MU_FISH_MODE"
+        case mu
+            return 0
+        case '*'
+            _mu_fish_original_right_prompt
     end
 end
 
 function fish_mode_prompt
-    if test "$MU_FISH_MODE" != mu; and functions -q _mu_fish_original_mode_prompt
-        _mu_fish_original_mode_prompt
+    switch "$MU_FISH_MODE"
+        case mu
+            return 0
+        case '*'
+            _mu_fish_original_mode_prompt
     end
 end
 
