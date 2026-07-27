@@ -3,6 +3,8 @@ use std::time::{Duration, Instant};
 use anyhow::{Result, bail};
 use serde_json::Value;
 use tokio::time::sleep;
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
 
 use crate::compaction;
 use crate::config::Config;
@@ -924,6 +926,7 @@ impl CommandHeaderDisplay {
                     value,
                     title.is_complete(),
                     crate::renderer::BASH_TITLE_PREVIEW_BYTES,
+                    renderer.bash_header_preview_width(),
                     &mut self.title_displayed_bytes,
                     |text| renderer.bash_header_title_delta(text),
                 )?;
@@ -956,6 +959,7 @@ impl CommandHeaderDisplay {
                 value,
                 command.is_complete(),
                 crate::renderer::BASH_COMMAND_PREVIEW_BYTES,
+                renderer.bash_header_preview_width(),
                 &mut self.command_displayed_bytes,
                 |text| renderer.bash_header_command_delta(text),
             )?;
@@ -1013,6 +1017,7 @@ impl CommandHeaderDisplay {
                     value,
                     title.is_complete(),
                     crate::renderer::BASH_TITLE_PREVIEW_BYTES,
+                    renderer.bash_header_preview_width(),
                     &mut self.title_displayed_bytes,
                     |text| renderer.bash_header_title_delta(text),
                 )?;
@@ -1310,9 +1315,14 @@ fn stream_first_line(
     value: &str,
     complete: bool,
     max_bytes: usize,
+    max_cells: Option<usize>,
     displayed_bytes: &mut usize,
     mut write: impl FnMut(&str) -> std::io::Result<()>,
 ) -> std::io::Result<bool> {
+    if let Some(max_cells) = max_cells {
+        return stream_first_line_cells(value, complete, max_cells, displayed_bytes, write);
+    }
+
     let body_limit = max_bytes.saturating_sub(crate::renderer::ELLIPSIS.len());
     let start = (*displayed_bytes).min(value.len());
     let mut out = String::new();
@@ -1345,6 +1355,52 @@ fn stream_first_line(
         return Ok(true);
     }
     Ok(false)
+}
+
+fn stream_first_line_cells(
+    value: &str,
+    complete: bool,
+    max_cells: usize,
+    displayed_bytes: &mut usize,
+    mut write: impl FnMut(&str) -> std::io::Result<()>,
+) -> std::io::Result<bool> {
+    let ellipsis_width = UnicodeWidthStr::width(crate::renderer::ELLIPSIS);
+    let body_limit = max_cells.saturating_sub(ellipsis_width);
+    let start = (*displayed_bytes).min(value.len());
+    let already_width = UnicodeWidthStr::width(&value[..start]);
+    let mut out = String::new();
+    let mut out_width = 0usize;
+    let mut consumed = start;
+
+    for (relative, grapheme) in value[start..].grapheme_indices(true) {
+        let absolute = start + relative;
+        if grapheme.contains('\n') {
+            if max_cells >= ellipsis_width {
+                out.push_str(crate::renderer::ELLIPSIS);
+            }
+            write(&out)?;
+            return Ok(true);
+        }
+        let next_width = UnicodeWidthStr::width(grapheme);
+        if already_width
+            .saturating_add(out_width)
+            .saturating_add(next_width)
+            > body_limit
+        {
+            if max_cells >= ellipsis_width {
+                out.push_str(crate::renderer::ELLIPSIS);
+            }
+            write(&out)?;
+            return Ok(true);
+        }
+        out.push_str(grapheme);
+        out_width = out_width.saturating_add(next_width);
+        consumed = absolute + grapheme.len();
+    }
+
+    *displayed_bytes = consumed;
+    write(&out)?;
+    Ok(complete)
 }
 
 fn stream_all(
@@ -1551,6 +1607,7 @@ mod tests {
                 },
             )]),
             output: Default::default(),
+            line_wrapping: true,
             compaction: CompactionConfig::default(),
             limits: LimitsConfig::default(),
             guardrail: GuardrailConfig::default(),
@@ -1558,6 +1615,43 @@ mod tests {
             redaction: RedactionConfig::default(),
             env: HashMap::new(),
         }
+    }
+
+    #[test]
+    fn cell_limited_streamed_line_keeps_unicode_graphemes_whole() {
+        let mut displayed_bytes = 0;
+        let mut rendered = String::new();
+
+        let done = stream_first_line(
+            "界",
+            false,
+            crate::renderer::BASH_TITLE_PREVIEW_BYTES,
+            Some(5),
+            &mut displayed_bytes,
+            |text| {
+                rendered.push_str(text);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert!(!done);
+
+        let done = stream_first_line(
+            "界界👩‍💻tail",
+            true,
+            crate::renderer::BASH_TITLE_PREVIEW_BYTES,
+            Some(5),
+            &mut displayed_bytes,
+            |text| {
+                rendered.push_str(text);
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert!(done);
+        assert_eq!(rendered, "界界…");
+        assert_eq!(UnicodeWidthStr::width(rendered.as_str()), 5);
     }
 
     #[test]

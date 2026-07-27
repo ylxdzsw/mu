@@ -168,6 +168,7 @@ fn parse_double_quoted_env_value(source: &str) -> std::result::Result<String, &'
 pub struct Config {
     pub providers: OrderedMap<ProviderConfig>,
     pub output: OutputFormat,
+    pub line_wrapping: bool,
     pub compaction: CompactionConfig,
     pub limits: LimitsConfig,
     pub guardrail: GuardrailConfig,
@@ -730,6 +731,7 @@ mod tests {
                 },
             )]),
             output: OutputFormat::Detail,
+            line_wrapping: true,
             compaction: CompactionConfig::default(),
             limits: LimitsConfig::default(),
             guardrail: GuardrailConfig::default(),
@@ -765,6 +767,7 @@ mod tests {
             ["openai"]
         );
         assert_eq!(config.output, OutputFormat::Detail);
+        assert!(config.line_wrapping);
         assert_eq!(config.compaction.fraction, 0.75);
         assert_eq!(config.compaction.keep_recent_turns, 2);
         assert_eq!(config.limits.max_iterations, 50);
@@ -786,6 +789,7 @@ mod tests {
                 }
             },
             "limits": {"max_lines": 123},
+            "line_wrapping": false,
             "guardrail": {"circuit_breaker": {"window": 7}}
         });
         let project = serde_json::json!({
@@ -799,6 +803,7 @@ mod tests {
         assert_eq!(config.limits.max_lines, 123);
         assert_eq!(config.limits.max_bytes, 456);
         assert_eq!(config.limits.max_line_bytes, 10_240);
+        assert!(!config.line_wrapping);
         assert!(!config.guardrail.enabled);
         assert_eq!(config.guardrail.timeout_ms, 90_000);
         assert_eq!(config.guardrail.circuit_breaker.consecutive, 3);

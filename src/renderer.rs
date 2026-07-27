@@ -1,4 +1,6 @@
 use std::io::{self, IsTerminal, Write};
+#[cfg(unix)]
+use std::os::fd::AsRawFd;
 use std::path::{Component, Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -31,7 +33,12 @@ pub(crate) const BASH_COMMAND_PREVIEW_BYTES: usize = 160;
 pub(crate) const BASH_TITLE_PREVIEW_BYTES: usize = 120;
 const GUARDRAIL_REASON_PREVIEW_BYTES: usize = 180;
 const REASONING_TITLE_MAX_WIDTH: usize = 80;
-const DEFAULT_MAX_TABLE_COLUMN_WIDTH: usize = 40;
+const DEFAULT_TERMINAL_WIDTH: usize = 80;
+const TERMINAL_RIGHT_MARGIN: usize = 1;
+const WRAP_LOOKBEHIND_CELLS: usize = 5;
+const MARKDOWN_RULE_WIDTH: usize = 40;
+const MAX_TABLE_COLUMN_WIDTH: usize = 80;
+const MIN_TABLE_COLUMN_WIDTH: usize = 3;
 const BASH_HEAD_LINE_BUDGET: usize = 3;
 const BASH_HEAD_BYTE_BUDGET: usize = 1024;
 const BASH_HEAD_LINE_CAP_BYTES: usize = 120;
@@ -48,6 +55,7 @@ pub struct Renderer {
     trailing_newlines: usize,
     has_committed_stdout: bool,
     styled: bool,
+    terminal_layout: Option<TerminalLayout>,
     markdown: MarkdownStream,
     assistant_block_open: bool,
     live_line: Option<LiveLine>,
@@ -59,6 +67,61 @@ pub struct Renderer {
     turn_done_bell_min_duration: Option<Duration>,
     format: OutputFormat,
     final_only: bool,
+}
+
+#[derive(Clone, Copy)]
+struct TerminalLayout {
+    line_width: usize,
+    line_wrapping: bool,
+}
+
+impl TerminalLayout {
+    fn new(line_wrapping: bool, detected_width: Option<usize>) -> Self {
+        let line_width = if line_wrapping {
+            detected_width.unwrap_or(DEFAULT_TERMINAL_WIDTH)
+        } else {
+            DEFAULT_TERMINAL_WIDTH
+        }
+        .max(1);
+        Self {
+            line_width,
+            line_wrapping,
+        }
+    }
+
+    fn markdown(self) -> MarkdownLayout {
+        if self.line_wrapping {
+            MarkdownLayout {
+                prose_width: Some(self.line_width),
+                table_width: Some(self.line_width),
+            }
+        } else {
+            MarkdownLayout::default()
+        }
+    }
+}
+
+fn stdout_terminal_width(stdout: &io::Stdout) -> Option<usize> {
+    #[cfg(unix)]
+    {
+        let mut size = std::mem::MaybeUninit::<libc::winsize>::zeroed();
+        // SAFETY: TIOCGWINSZ initializes the winsize pointed to by the third
+        // argument and does not retain that pointer.
+        let result =
+            unsafe { libc::ioctl(stdout.as_raw_fd(), libc::TIOCGWINSZ, size.as_mut_ptr()) };
+        if result != 0 {
+            return None;
+        }
+        // SAFETY: A successful TIOCGWINSZ call initialized the structure.
+        let columns = unsafe { size.assume_init() }.ws_col as usize;
+        (columns > 0).then_some(columns.saturating_sub(TERMINAL_RIGHT_MARGIN).max(1))
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = stdout;
+        None
+    }
 }
 
 #[cfg(test)]
@@ -94,15 +157,22 @@ impl Renderer {
     }
 
     pub fn with_format(format: OutputFormat) -> Self {
-        Self::with_terminal_bell(format, None)
+        Self::with_terminal_bell(format, None, true)
     }
 
     pub fn with_terminal_bell(
         format: OutputFormat,
         turn_done_bell_min_duration: Option<Duration>,
+        line_wrapping: bool,
     ) -> Self {
         let stdout = io::stdout();
         let styled = format != OutputFormat::Final && stdout.is_terminal();
+        let detected_width = if styled && line_wrapping {
+            stdout_terminal_width(&stdout)
+        } else {
+            None
+        };
+        let terminal_layout = styled.then(|| TerminalLayout::new(line_wrapping, detected_width));
         let stderr = io::stderr();
         let stderr_is_terminal = stderr.is_terminal();
         Self {
@@ -113,7 +183,12 @@ impl Renderer {
             trailing_newlines: 0,
             has_committed_stdout: false,
             styled,
-            markdown: MarkdownStream::default(),
+            terminal_layout,
+            markdown: MarkdownStream::new(
+                terminal_layout
+                    .map(TerminalLayout::markdown)
+                    .unwrap_or_default(),
+            ),
             assistant_block_open: false,
             live_line: None,
             live_line_rendered: false,
@@ -130,6 +205,9 @@ impl Renderer {
     #[cfg(test)]
     pub(crate) fn force_styled_for_test(&mut self) {
         self.styled = true;
+        let layout = TerminalLayout::new(true, Some(DEFAULT_TERMINAL_WIDTH));
+        self.terminal_layout = Some(layout);
+        self.markdown.set_layout(layout.markdown());
     }
 
     #[cfg(test)]
@@ -141,6 +219,8 @@ impl Renderer {
     ) -> (Self, SharedOutput, SharedOutput) {
         let stdout = SharedOutput::default();
         let stderr = SharedOutput::default();
+        let terminal_layout = (format != OutputFormat::Final && stdout_is_terminal)
+            .then(|| TerminalLayout::new(true, Some(DEFAULT_TERMINAL_WIDTH)));
         (
             Self {
                 stdout: Box::new(stdout.clone()),
@@ -150,7 +230,12 @@ impl Renderer {
                 trailing_newlines: 0,
                 has_committed_stdout: false,
                 styled: format != OutputFormat::Final && stdout_is_terminal,
-                markdown: MarkdownStream::default(),
+                terminal_layout,
+                markdown: MarkdownStream::new(
+                    terminal_layout
+                        .map(TerminalLayout::markdown)
+                        .unwrap_or_default(),
+                ),
                 assistant_block_open: false,
                 live_line: None,
                 live_line_rendered: false,
@@ -173,7 +258,26 @@ impl Renderer {
         output_is_terminal: bool,
         turn_done_bell_min_duration: Option<Duration>,
     ) -> (Self, SharedOutput) {
+        Self::with_test_shared_output_layout(
+            format,
+            output_is_terminal,
+            true,
+            Some(DEFAULT_TERMINAL_WIDTH),
+            turn_done_bell_min_duration,
+        )
+    }
+
+    #[cfg(test)]
+    fn with_test_shared_output_layout(
+        format: OutputFormat,
+        output_is_terminal: bool,
+        line_wrapping: bool,
+        detected_width: Option<usize>,
+        turn_done_bell_min_duration: Option<Duration>,
+    ) -> (Self, SharedOutput) {
         let output = SharedOutput::default();
+        let terminal_layout = (format != OutputFormat::Final && output_is_terminal)
+            .then(|| TerminalLayout::new(line_wrapping, detected_width));
         (
             Self {
                 stdout: Box::new(output.clone()),
@@ -183,7 +287,12 @@ impl Renderer {
                 trailing_newlines: 0,
                 has_committed_stdout: false,
                 styled: format != OutputFormat::Final && output_is_terminal,
-                markdown: MarkdownStream::default(),
+                terminal_layout,
+                markdown: MarkdownStream::new(
+                    terminal_layout
+                        .map(TerminalLayout::markdown)
+                        .unwrap_or_default(),
+                ),
                 assistant_block_open: false,
                 live_line: None,
                 live_line_rendered: false,
@@ -355,6 +464,7 @@ impl Renderer {
         if self.final_only {
             return Ok(());
         }
+        let one_line_width = self.one_line_width();
         let Some(reasoning) = self.reasoning.as_mut() else {
             return Ok(());
         };
@@ -389,12 +499,15 @@ impl Renderer {
             ),
             ReasoningVisibility::Opaque => None,
         };
-        let line = format_thought_line(
+        let mut line = format_thought_line(
             reasoning.started.elapsed(),
             tokens,
             reasoning.title.as_deref(),
             self.styled,
         );
+        if let Some(width) = one_line_width {
+            line = truncate_styled_line(&line, width);
+        }
         reasoning.committed = true;
         self.live_line = None;
         self.ensure_block_separator_if_needed()?;
@@ -583,16 +696,23 @@ impl Renderer {
             return Ok(true);
         }
         self.bash_header_title_start()?;
-        self.bash_header_title_delta(&preview_first_line(title, BASH_TITLE_PREVIEW_BYTES))?;
+        let preview = preview_first_line_for_width(
+            title,
+            BASH_TITLE_PREVIEW_BYTES,
+            self.bash_header_preview_width(),
+        );
+        self.bash_header_title_delta(&preview)?;
         self.bash_header_title_end()?;
         self.bash_header_command_start(risk)?;
         if self.format == OutputFormat::Full {
             self.bash_header_command_delta(command)?;
         } else {
-            self.bash_header_command_delta(&preview_first_line(
+            let preview = preview_first_line_for_width(
                 command,
                 BASH_COMMAND_PREVIEW_BYTES,
-            ))?;
+                self.bash_header_preview_width(),
+            );
+            self.bash_header_command_delta(&preview)?;
         }
         self.bash_header_command_end()?;
         if let Some(cwd) = args.get("cwd").and_then(|value| value.as_str()) {
@@ -614,7 +734,8 @@ impl Renderer {
         if self.final_only || !should_render_bash_cwd(raw_cwd) {
             return Ok(());
         }
-        self.write_stdout_committed(&format_cwd_line(raw_cwd, self.styled))
+        let line = self.fit_one_line(&format_cwd_line(raw_cwd, self.styled));
+        self.write_stdout_committed(&line)
     }
 
     pub fn cancel_live_state(&mut self) -> io::Result<()> {
@@ -670,6 +791,7 @@ impl Renderer {
             return Ok(());
         }
         let sanitized = strip_ansi(text);
+        let one_line_width = self.one_line_width();
         let Some(preview) = self.bash_preview.as_mut() else {
             return if self.styled {
                 self.write_committed(&format!("{GRAY}{sanitized}{RESET}"))
@@ -678,7 +800,7 @@ impl Renderer {
             };
         };
         preview.raw.push_str(&sanitized);
-        let snapshot = compute_bash_preview_snapshot(&preview.raw, false);
+        let snapshot = compute_bash_preview_snapshot(&preview.raw, false, one_line_width);
         if snapshot.head_rendered.len() > preview.committed_head_len {
             let next = snapshot.head_rendered[preview.committed_head_len..].to_string();
             preview.committed_head_len = snapshot.head_rendered.len();
@@ -737,7 +859,8 @@ impl Renderer {
         } else {
             format!("✗ {name} failed: {error} · {elapsed}\n")
         };
-        self.write_stdout_committed(&terminal_trim_committed_text(&line))
+        let line = self.fit_one_line(&terminal_trim_committed_text(&line));
+        self.write_stdout_committed(&line)
     }
 
     pub fn tool_rejected(&mut self) -> io::Result<()> {
@@ -779,7 +902,8 @@ impl Renderer {
                 "[guardrail: {verdict}] risk={risk_level} auth={user_auth_level} — {reason_preview}\n"
             )
         };
-        self.write_stdout_committed(&terminal_trim_committed_text(&line))
+        let line = self.fit_one_line(&terminal_trim_committed_text(&line));
+        self.write_stdout_committed(&line)
     }
 
     pub fn error(&mut self, msg: &str) -> io::Result<()> {
@@ -900,6 +1024,21 @@ impl Renderer {
         self.format
     }
 
+    pub(crate) fn bash_header_preview_width(&self) -> Option<usize> {
+        self.terminal_layout
+            .map(|layout| layout.line_width.saturating_sub(2))
+    }
+
+    fn one_line_width(&self) -> Option<usize> {
+        self.terminal_layout.map(|layout| layout.line_width)
+    }
+
+    fn fit_one_line(&self, text: &str) -> String {
+        self.one_line_width()
+            .map(|width| truncate_styled_line(text, width))
+            .unwrap_or_else(|| text.to_string())
+    }
+
     fn full_reasoning_text(&mut self, text: &str, summary_part: Option<usize>) -> io::Result<()> {
         let Some(reasoning) = self.reasoning.as_ref() else {
             return Ok(());
@@ -943,7 +1082,13 @@ impl Renderer {
         } else {
             self.ensure_line_start()?;
         }
-        let line = format_concise_tool(&tool.title, tool.risk.as_deref(), exit_code, self.styled);
+        let line = format_concise_tool(
+            &tool.title,
+            tool.risk.as_deref(),
+            exit_code,
+            self.styled,
+            self.one_line_width(),
+        );
         self.write_stdout_committed(&line)?;
         self.last_committed_block = Some(CommittedBlock::Tool);
         Ok(())
@@ -1016,7 +1161,7 @@ impl Renderer {
     }
 
     fn format_live_line(&self) -> Option<String> {
-        match self.live_line {
+        let line = match self.live_line {
             Some(LiveLine::Thinking) => {
                 let reasoning = self.reasoning.as_ref()?;
                 Some(format_thinking_live(
@@ -1033,6 +1178,7 @@ impl Renderer {
                     &tool.title,
                     tool.risk.as_deref(),
                     self.styled,
+                    self.one_line_width(),
                 ))
             }
             Some(LiveLine::TableBuffering { chars }) => Some(format_table_live(
@@ -1049,7 +1195,8 @@ impl Renderer {
             )),
             Some(LiveLine::BashStdin { bytes }) => Some(format_stdin_summary(bytes, self.styled)),
             None => None,
-        }
+        }?;
+        Some(self.fit_one_line(&line))
     }
 
     fn sync_table_live_line(&mut self, live: Option<TableBufferLive>) -> io::Result<()> {
@@ -1091,7 +1238,7 @@ impl Renderer {
         let Some(preview) = self.bash_preview.take() else {
             return Ok(());
         };
-        let snapshot = compute_bash_preview_snapshot(&preview.raw, true);
+        let snapshot = compute_bash_preview_snapshot(&preview.raw, true, self.one_line_width());
         self.clear_live_line()?;
         self.live_line = None;
         if snapshot.head_rendered.len() > preview.committed_head_len {
@@ -1167,8 +1314,15 @@ impl Default for Renderer {
     }
 }
 
-#[derive(Default)]
+#[derive(Clone, Copy, Default)]
+struct MarkdownLayout {
+    prose_width: Option<usize>,
+    table_width: Option<usize>,
+}
+
 struct MarkdownStream {
+    layout: MarkdownLayout,
+    line_wrapper: Option<TerminalLineWrapper>,
     pending_line: String,
     pending_block_separator: bool,
     line_stream: Option<LineStreamState>,
@@ -1177,6 +1331,233 @@ struct MarkdownStream {
     code_fence: Option<FenceState>,
     table_candidate: Option<String>,
     table_buffer: Option<String>,
+}
+
+impl Default for MarkdownStream {
+    fn default() -> Self {
+        Self::new(MarkdownLayout::default())
+    }
+}
+
+struct TerminalLineWrapper {
+    width: usize,
+    column: usize,
+    pending: String,
+}
+
+#[derive(Clone, Copy)]
+struct DisplayUnit {
+    start: usize,
+    end: usize,
+    width: usize,
+    whitespace: bool,
+}
+
+impl TerminalLineWrapper {
+    fn new(width: usize) -> Self {
+        Self {
+            width: width.max(1),
+            column: 0,
+            pending: String::new(),
+        }
+    }
+
+    fn push(&mut self, text: &str, out: &mut String) {
+        for part in text.split_inclusive('\n') {
+            let has_newline = part.ends_with('\n');
+            let body = part.strip_suffix('\n').unwrap_or(part);
+            self.pending.push_str(body);
+            self.flush_overflow(out);
+            if has_newline {
+                self.flush_all(out);
+                out.push('\n');
+                self.column = 0;
+            }
+        }
+        self.flush_safe(out);
+    }
+
+    fn finish(&mut self, out: &mut String) {
+        self.flush_overflow(out);
+        self.flush_all(out);
+    }
+
+    fn flush_overflow(&mut self, out: &mut String) {
+        loop {
+            let units = display_units(&self.pending);
+            let pending_width = display_units_width(&units);
+            if self.column.saturating_add(pending_width) <= self.width {
+                return;
+            }
+
+            let capacity = self.width.saturating_sub(self.column);
+            if capacity == 0 && self.column > 0 {
+                out.push('\n');
+                self.column = 0;
+                continue;
+            }
+
+            let hard_end = display_prefix_fitting(&units, capacity);
+            if let Some(boundary) = opportunistic_whitespace_boundary(&units, hard_end, self.column)
+            {
+                let suffix = display_suffix_without_leading_whitespace(
+                    &self.pending,
+                    &units[boundary + 1..],
+                );
+                self.emit_raw_prefix(units[boundary].start, out);
+                self.pending = suffix;
+                out.push('\n');
+                self.column = 0;
+                continue;
+            }
+
+            let emit_end = if hard_end > 0 {
+                units[hard_end - 1].end
+            } else if self.column > 0 {
+                out.push('\n');
+                self.column = 0;
+                continue;
+            } else {
+                units
+                    .iter()
+                    .position(|unit| unit.width > 0)
+                    .map(|idx| units[idx].end)
+                    .unwrap_or(self.pending.len())
+            };
+            self.emit_raw_prefix(emit_end, out);
+            if !self.pending.is_empty() {
+                out.push('\n');
+                self.column = 0;
+            }
+        }
+    }
+
+    fn flush_safe(&mut self, out: &mut String) {
+        let units = display_units(&self.pending);
+        let pending_width = display_units_width(&units);
+        let emit_width = pending_width.saturating_sub(WRAP_LOOKBEHIND_CELLS);
+        if emit_width == 0 {
+            return;
+        }
+        let end = display_prefix_fitting(&units, emit_width);
+        if end > 0 {
+            self.emit_raw_prefix(units[end - 1].end, out);
+        }
+    }
+
+    fn flush_all(&mut self, out: &mut String) {
+        if self.pending.is_empty() {
+            return;
+        }
+        self.column = self
+            .column
+            .saturating_add(display_units_width(&display_units(&self.pending)));
+        out.push_str(&self.pending);
+        self.pending.clear();
+    }
+
+    fn emit_raw_prefix(&mut self, end: usize, out: &mut String) {
+        if end == 0 {
+            return;
+        }
+        let emitted = self.pending[..end].to_string();
+        self.column = self
+            .column
+            .saturating_add(display_units_width(&display_units(&emitted)));
+        out.push_str(&emitted);
+        self.pending.replace_range(..end, "");
+    }
+}
+
+fn display_units(input: &str) -> Vec<DisplayUnit> {
+    let mut units = Vec::new();
+    let mut offset = 0;
+    while offset < input.len() {
+        if input.as_bytes()[offset] == b'\x1b' {
+            let end = ansi_sequence_end(input, offset);
+            units.push(DisplayUnit {
+                start: offset,
+                end,
+                width: 0,
+                whitespace: false,
+            });
+            offset = end;
+            continue;
+        }
+
+        let next_escape = input[offset..]
+            .find('\x1b')
+            .map(|relative| offset + relative)
+            .unwrap_or(input.len());
+        for (relative, grapheme) in input[offset..next_escape].grapheme_indices(true) {
+            let start = offset + relative;
+            units.push(DisplayUnit {
+                start,
+                end: start + grapheme.len(),
+                width: display_grapheme_width(grapheme),
+                whitespace: grapheme.chars().all(char::is_whitespace),
+            });
+        }
+        offset = next_escape;
+    }
+    units
+}
+
+fn display_grapheme_width(grapheme: &str) -> usize {
+    if grapheme == "\t" {
+        1
+    } else {
+        UnicodeWidthStr::width(grapheme)
+    }
+}
+
+fn display_units_width(units: &[DisplayUnit]) -> usize {
+    units.iter().map(|unit| unit.width).sum()
+}
+
+fn display_prefix_fitting(units: &[DisplayUnit], width: usize) -> usize {
+    let mut used = 0usize;
+    let mut end = 0usize;
+    for (idx, unit) in units.iter().enumerate() {
+        if unit.width > 0 && used.saturating_add(unit.width) > width {
+            break;
+        }
+        used = used.saturating_add(unit.width);
+        end = idx + 1;
+    }
+    end
+}
+
+fn opportunistic_whitespace_boundary(
+    units: &[DisplayUnit],
+    hard_end: usize,
+    committed_width: usize,
+) -> Option<usize> {
+    let search_end =
+        hard_end + usize::from(units.get(hard_end).is_some_and(|unit| unit.whitespace));
+    (0..search_end).rev().find(|idx| {
+        let unit = units[*idx];
+        unit.whitespace
+            && committed_width.saturating_add(display_units_width(&units[..*idx])) > 0
+            && display_units_width(&units[(idx + 1).min(hard_end)..hard_end])
+                <= WRAP_LOOKBEHIND_CELLS
+    })
+}
+
+fn display_suffix_without_leading_whitespace(input: &str, units: &[DisplayUnit]) -> String {
+    let mut out = String::new();
+    let mut trimming = true;
+    for unit in units {
+        if unit.width == 0 {
+            out.push_str(&input[unit.start..unit.end]);
+        } else if trimming && unit.whitespace {
+            continue;
+        } else {
+            trimming = false;
+            out.push_str(&input[unit.start..unit.end]);
+        }
+    }
+    out
 }
 
 #[derive(Clone, Copy)]
@@ -1266,6 +1647,60 @@ struct BashPreviewSnapshot {
 }
 
 impl MarkdownStream {
+    fn new(layout: MarkdownLayout) -> Self {
+        Self {
+            layout,
+            line_wrapper: layout.prose_width.map(TerminalLineWrapper::new),
+            pending_line: String::new(),
+            pending_block_separator: false,
+            line_stream: None,
+            line_prefix: None,
+            inline_stream: InlineStream::default(),
+            code_fence: None,
+            table_candidate: None,
+            table_buffer: None,
+        }
+    }
+
+    #[cfg(test)]
+    fn set_layout(&mut self, layout: MarkdownLayout) {
+        self.layout = layout;
+        self.line_wrapper = layout.prose_width.map(TerminalLineWrapper::new);
+    }
+
+    fn emit_wrappable(&mut self, text: &str, out: &mut Vec<String>) {
+        if text.is_empty() {
+            return;
+        }
+        if let Some(wrapper) = self.line_wrapper.as_mut() {
+            let mut rendered = String::new();
+            wrapper.push(text, &mut rendered);
+            if !rendered.is_empty() {
+                out.push(rendered);
+            }
+        } else {
+            out.push(text.to_string());
+        }
+    }
+
+    fn finish_wrappable(&mut self, out: &mut Vec<String>) {
+        let Some(wrapper) = self.line_wrapper.as_mut() else {
+            return;
+        };
+        let mut rendered = String::new();
+        wrapper.finish(&mut rendered);
+        if !rendered.is_empty() {
+            out.push(rendered);
+        }
+    }
+
+    fn emit_verbatim(&mut self, text: &str, out: &mut Vec<String>) {
+        self.finish_wrappable(out);
+        if !text.is_empty() {
+            out.push(text.to_string());
+        }
+    }
+
     fn push(&mut self, text: &str) -> Vec<String> {
         let mut out = Vec::new();
         self.pending_line.push_str(text);
@@ -1283,7 +1718,7 @@ impl MarkdownStream {
         if self.line_stream.is_some() {
             if !self.pending_line.is_empty() {
                 let text = std::mem::take(&mut self.pending_line);
-                self.inline_stream.push(&text, &mut out);
+                self.push_line_stream_text(&text, &mut out);
             }
             self.finish_line_stream(&mut out);
         } else if !self.pending_line.is_empty() {
@@ -1294,7 +1729,11 @@ impl MarkdownStream {
         self.flush_table_buffer(&mut out);
         self.flush_pending_block_separator(&mut out);
         if self.code_fence.take().is_some() {
-            out.push(RESET.to_string());
+            self.emit_verbatim(RESET, &mut out);
+        }
+        self.finish_wrappable(&mut out);
+        if let Some(wrapper) = self.line_wrapper.as_mut() {
+            wrapper.column = 0;
         }
         out
     }
@@ -1361,21 +1800,20 @@ impl MarkdownStream {
         if rendered.is_empty() {
             return;
         }
-        self.emit_rendered_line_prefix(out);
-        out.extend(rendered);
+        let mut combined = self.take_rendered_line_prefix();
+        combined.push_str(&rendered.concat());
+        self.emit_wrappable(&combined, out);
     }
 
-    fn emit_rendered_line_prefix(&mut self, out: &mut Vec<String>) {
+    fn take_rendered_line_prefix(&mut self) -> String {
         let Some(prefix) = self.line_prefix.as_mut() else {
-            return;
+            return String::new();
         };
         if prefix.emitted {
-            return;
-        }
-        if !prefix.rendered.is_empty() {
-            out.push(prefix.rendered.clone());
+            return String::new();
         }
         prefix.emitted = true;
+        prefix.rendered.clone()
     }
 
     fn finish_line_stream(&mut self, out: &mut Vec<String>) {
@@ -1388,28 +1826,31 @@ impl MarkdownStream {
             .line_prefix
             .as_ref()
             .is_some_and(|prefix| !prefix.emitted);
+        let mut combined = String::new();
         if raw_fallback {
             if let Some(prefix) = self.line_prefix.take() {
-                out.push(prefix.raw);
+                combined.push_str(&prefix.raw);
             }
-            out.extend(rendered);
-            out.push("\n".to_string());
+            combined.push_str(&rendered.concat());
+            combined.push('\n');
+            self.emit_wrappable(&combined, out);
             return;
         }
         self.line_prefix = None;
-        out.extend(rendered);
+        combined.push_str(&rendered.concat());
         if matches!(
             state,
             LineStreamState::Heading { .. } | LineStreamState::Quote
         ) {
-            out.push(RESET.to_string());
+            combined.push_str(RESET);
         }
         if matches!(state, LineStreamState::Heading { .. }) {
-            out.push("\n".to_string());
+            combined.push('\n');
             self.pending_block_separator = true;
         } else {
-            out.push("\n".to_string());
+            combined.push('\n');
         }
+        self.emit_wrappable(&combined, out);
     }
 
     fn push_line(&mut self, line: &str, complete: bool, out: &mut Vec<String>) {
@@ -1417,13 +1858,14 @@ impl MarkdownStream {
         if let Some(fence) = self.code_fence {
             if complete && is_closing_fence(line, fence) {
                 self.code_fence = None;
-                out.push(RESET.to_string());
+                let mut closing = RESET.to_string();
                 if !fence.has_content {
-                    out.push("\n".to_string());
+                    closing.push('\n');
                 }
+                self.emit_verbatim(&closing, out);
             } else {
                 self.code_fence.as_mut().unwrap().has_content = true;
-                out.push(line.to_string());
+                self.emit_verbatim(line, out);
             }
             return;
         }
@@ -1432,12 +1874,11 @@ impl MarkdownStream {
             self.flush_table_candidate(out);
             self.flush_table_buffer(out);
             self.code_fence = Some(fence);
-            out.push(
-                code_block_styles()
-                    .iter()
-                    .map(|style| style.ansi())
-                    .collect::<String>(),
-            );
+            let styles = code_block_styles()
+                .iter()
+                .map(|style| style.ansi())
+                .collect::<String>();
+            self.emit_verbatim(&styles, out);
             return;
         }
 
@@ -1473,31 +1914,32 @@ impl MarkdownStream {
 
     fn push_non_table_line(&mut self, line: &str, complete: bool, out: &mut Vec<String>) {
         if line.trim().is_empty() {
-            out.push(line.to_string());
+            self.emit_wrappable(line, out);
             return;
         }
         if parse_heading_line(line).is_some() {
             if let Some(rendered) = render_heading_line(line) {
-                out.push(rendered);
+                self.emit_wrappable(&rendered, out);
                 self.pending_block_separator = true;
             } else {
-                out.push(line.to_string());
+                self.emit_wrappable(line, out);
             }
             return;
         }
         if is_single_line_block(line.trim()) {
-            out.push(render_markdown(line));
+            let rendered = render_markdown(line, self.layout.prose_width);
+            self.emit_wrappable(&rendered, out);
             return;
         }
         if let Some(rendered) = render_list_line(line, complete) {
-            out.push(rendered);
+            self.emit_wrappable(&rendered, out);
             return;
         }
         if let Some(rendered) = render_block_quote_line(line, complete) {
-            out.push(rendered);
+            self.emit_wrappable(&rendered, out);
             return;
         }
-        out.push(render_inline_or_raw_line(line, complete));
+        self.emit_wrappable(&render_inline_or_raw_line(line, complete), out);
     }
 
     fn flush_table_candidate(&mut self, out: &mut Vec<String>) {
@@ -1508,7 +1950,8 @@ impl MarkdownStream {
 
     fn flush_table_buffer(&mut self, out: &mut Vec<String>) {
         if let Some(table) = self.table_buffer.take() {
-            out.push(render_markdown(&table));
+            let rendered = render_markdown(&table, self.layout.table_width);
+            self.emit_verbatim(&rendered, out);
         }
     }
 
@@ -1518,14 +1961,14 @@ impl MarkdownStream {
         }
         self.pending_block_separator = false;
         if !line.trim().is_empty() {
-            out.push("\n".to_string());
+            self.emit_wrappable("\n", out);
         }
     }
 
     fn flush_pending_block_separator(&mut self, out: &mut Vec<String>) {
         if self.pending_block_separator {
             self.pending_block_separator = false;
-            out.push("\n".to_string());
+            self.emit_wrappable("\n", out);
         }
     }
 }
@@ -2217,7 +2660,7 @@ impl TableState {
     }
 }
 
-fn render_markdown(markdown: &str) -> String {
+fn render_markdown(markdown: &str, max_width: Option<usize>) -> String {
     let options =
         Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TABLES | Options::ENABLE_TASKLISTS;
     let parser = Parser::new_ext(markdown, options);
@@ -2369,7 +2812,7 @@ fn render_markdown(markdown: &str) -> String {
                 }
                 TagEnd::Table => {
                     if let Some(table) = table_state.take() {
-                        out.push_str(&render_table(&table));
+                        out.push_str(&render_table(&table, max_width));
                     }
                 }
                 TagEnd::Emphasis => pop_styles(
@@ -2423,8 +2866,14 @@ fn render_markdown(markdown: &str) -> String {
             Event::SoftBreak | Event::HardBreak => {
                 current_render_target(&mut out, &mut table_state).push('\n')
             }
-            Event::Rule => current_render_target(&mut out, &mut table_state)
-                .push_str("────────────────────────────────────────\n\n"),
+            Event::Rule => {
+                let width = max_width
+                    .unwrap_or(MARKDOWN_RULE_WIDTH)
+                    .min(MARKDOWN_RULE_WIDTH);
+                let target = current_render_target(&mut out, &mut table_state);
+                target.push_str(&"─".repeat(width));
+                target.push_str("\n\n");
+            }
             Event::TaskListMarker(done) => current_render_target(&mut out, &mut table_state)
                 .push_str(if done { "[✓] " } else { "[ ] " }),
             Event::Html(html) | Event::InlineHtml(html) => {
@@ -2492,7 +2941,7 @@ fn normalize_table_cell(cell: &str) -> String {
         .join(" ")
 }
 
-fn render_table(table: &TableState) -> String {
+fn render_table(table: &TableState, max_width: Option<usize>) -> String {
     let cols = table
         .header
         .len()
@@ -2502,34 +2951,163 @@ fn render_table(table: &TableState) -> String {
         return String::new();
     }
 
-    let mut widths = vec![3usize; cols];
+    let mut natural_widths = vec![MIN_TABLE_COLUMN_WIDTH; cols];
     for row in std::iter::once(&table.header).chain(table.rows.iter()) {
         for (idx, cell) in row.iter().enumerate() {
-            widths[idx] = widths[idx].max(visible_text_width(cell));
+            natural_widths[idx] = natural_widths[idx].max(visible_text_width(cell));
         }
     }
-    let max_column_width = max_table_column_width(cols);
-    for width in &mut widths {
-        *width = (*width).min(max_column_width);
-    }
 
+    let widths = match max_width {
+        Some(max_width) => {
+            let Some(widths) = allocate_table_widths(&natural_widths, max_width) else {
+                return render_stacked_table(table, max_width.max(1));
+            };
+            debug_assert!(table_grid_width(&widths) <= max_width);
+            widths
+        }
+        None => natural_widths,
+    };
+    render_table_grid(table, &widths)
+}
+
+fn render_table_grid(table: &TableState, widths: &[usize]) -> String {
     let mut out = String::new();
-    out.push_str(&render_table_row(&table.header, &widths, &table.alignments));
-    out.push_str(&render_table_separator(&widths, &table.alignments));
+    out.push_str(&render_table_row(&table.header, widths, &table.alignments));
+    out.push_str(&render_table_separator(widths, &table.alignments));
     for row in &table.rows {
-        out.push_str(&render_table_row(row, &widths, &table.alignments));
+        out.push_str(&render_table_row(row, widths, &table.alignments));
     }
     out.push('\n');
     out
 }
 
-fn max_table_column_width(column_count: usize) -> usize {
-    match column_count {
-        1 | 2 => 80,
-        3 => 60,
-        4 => 45,
-        _ => DEFAULT_MAX_TABLE_COLUMN_WIDTH,
+fn allocate_table_widths(natural_widths: &[usize], max_width: usize) -> Option<Vec<usize>> {
+    if natural_widths.is_empty() {
+        return Some(Vec::new());
     }
+    let framing = 1usize.saturating_add(3usize.saturating_mul(natural_widths.len()));
+    let minimum_content = MIN_TABLE_COLUMN_WIDTH.saturating_mul(natural_widths.len());
+    if max_width < framing.saturating_add(minimum_content) {
+        return None;
+    }
+
+    let content_budget = max_width - framing;
+    let mut widths = natural_widths
+        .iter()
+        .map(|width| (*width).clamp(MIN_TABLE_COLUMN_WIDTH, MAX_TABLE_COLUMN_WIDTH))
+        .collect::<Vec<_>>();
+    let mut total = widths.iter().sum::<usize>();
+    while total > content_budget {
+        let (idx, _) = widths
+            .iter()
+            .enumerate()
+            .filter(|(_, width)| **width > MIN_TABLE_COLUMN_WIDTH)
+            .max_by_key(|(_, width)| **width)?;
+        widths[idx] -= 1;
+        total -= 1;
+    }
+    Some(widths)
+}
+
+fn table_grid_width(widths: &[usize]) -> usize {
+    1usize
+        .saturating_add(3usize.saturating_mul(widths.len()))
+        .saturating_add(widths.iter().sum::<usize>())
+}
+
+fn render_stacked_table(table: &TableState, max_width: usize) -> String {
+    let cols = table
+        .header
+        .len()
+        .max(table.rows.iter().map(Vec::len).max().unwrap_or(0))
+        .max(table.alignments.len());
+    let has_body = !table.rows.is_empty();
+    let labels = if has_body {
+        (0..cols)
+            .map(|idx| {
+                table
+                    .header
+                    .get(idx)
+                    .filter(|label| !label.is_empty())
+                    .cloned()
+                    .unwrap_or_else(|| format!("Column {}", idx + 1))
+            })
+            .collect::<Vec<_>>()
+    } else {
+        (1..=cols)
+            .map(|idx| format!("Column {idx}"))
+            .collect::<Vec<_>>()
+    };
+    let records = if has_body {
+        table.rows.clone()
+    } else {
+        vec![table.header.clone()]
+    };
+
+    let label_width = labels
+        .iter()
+        .map(|label| visible_text_width(label))
+        .max()
+        .unwrap_or(MIN_TABLE_COLUMN_WIDTH)
+        .min((max_width / 3).max(MIN_TABLE_COLUMN_WIDTH));
+    let value_width = records
+        .iter()
+        .flat_map(|row| row.iter())
+        .map(|value| visible_text_width(value))
+        .max()
+        .unwrap_or(MIN_TABLE_COLUMN_WIDTH);
+
+    if let Some(widths) = allocate_table_widths(&[label_width, value_width], max_width) {
+        let mut out = String::new();
+        for (row_idx, row) in records.iter().enumerate() {
+            for (col, label) in labels.iter().enumerate().take(cols) {
+                let cells = [label.clone(), row.get(col).cloned().unwrap_or_default()];
+                let alignments = [
+                    Alignment::Left,
+                    table
+                        .alignments
+                        .get(col)
+                        .copied()
+                        .unwrap_or(Alignment::None),
+                ];
+                out.push_str(&render_table_row(&cells, &widths, &alignments));
+            }
+            if row_idx + 1 < records.len() {
+                out.push('\n');
+            }
+        }
+        out.push('\n');
+        return out;
+    }
+
+    render_linear_table(&labels, &records, max_width)
+}
+
+fn render_linear_table(labels: &[String], records: &[Vec<String>], max_width: usize) -> String {
+    let mut out = String::new();
+    for (row_idx, row) in records.iter().enumerate() {
+        for (col, label) in labels.iter().enumerate() {
+            let label = if max_width > 1 {
+                format!("{label}:")
+            } else {
+                label.clone()
+            };
+            for line in wrap_table_cell(&label, max_width) {
+                out.push_str(&line);
+                out.push('\n');
+            }
+            for line in wrap_table_cell(row.get(col).map(String::as_str).unwrap_or(""), max_width) {
+                out.push_str(&line);
+                out.push('\n');
+            }
+        }
+        if row_idx + 1 < records.len() {
+            out.push('\n');
+        }
+    }
+    out.push('\n');
+    out
 }
 
 fn render_table_row(row: &[String], widths: &[usize], alignments: &[Alignment]) -> String {
@@ -2668,52 +3246,45 @@ fn ansi_sequence_end(input: &str, start: usize) -> usize {
 
 fn wrap_styled_graphemes(units: &[StyledGrapheme], width: usize) -> Vec<Vec<StyledGrapheme>> {
     let mut lines = Vec::new();
-    let mut line = Vec::new();
-    let mut pending_whitespace = Vec::new();
     let mut idx = 0;
 
     while idx < units.len() {
-        if units[idx].whitespace {
-            pending_whitespace.push(units[idx].clone());
-            idx += 1;
-            continue;
-        }
-
-        let word_start = idx;
-        while idx < units.len() && !units[idx].whitespace {
-            idx += 1;
-        }
-        let word = &units[word_start..idx];
-        let line_width = styled_graphemes_width(&line);
-        let whitespace_width = styled_graphemes_width(&pending_whitespace);
-        let word_width = styled_graphemes_width(word);
-
-        if !line.is_empty() && line_width + whitespace_width + word_width <= width {
-            line.append(&mut pending_whitespace);
-            line.extend_from_slice(word);
-            continue;
-        }
-
-        if !line.is_empty() {
-            lines.push(std::mem::take(&mut line));
-        }
-        pending_whitespace.clear();
-
-        if word_width <= width {
-            line.extend_from_slice(word);
-            continue;
-        }
-
-        for unit in word {
-            if !line.is_empty() && styled_graphemes_width(&line) + unit.width > width {
-                lines.push(std::mem::take(&mut line));
+        let mut hard_end = idx;
+        let mut used = 0usize;
+        while hard_end < units.len() {
+            let next = units[hard_end].width;
+            if next > 0 && used.saturating_add(next) > width.max(1) {
+                break;
             }
-            line.push(unit.clone());
+            used = used.saturating_add(next);
+            hard_end += 1;
         }
-    }
+        if hard_end == idx {
+            hard_end += 1;
+        }
+        if hard_end == units.len() {
+            lines.push(units[idx..].to_vec());
+            break;
+        }
 
-    if !line.is_empty() {
-        lines.push(line);
+        let search_end =
+            hard_end + usize::from(units.get(hard_end).is_some_and(|unit| unit.whitespace));
+        let boundary = (idx..search_end).rev().find(|boundary| {
+            units[*boundary].whitespace
+                && styled_graphemes_width(&units[idx..*boundary]) > 0
+                && styled_graphemes_width(&units[(boundary + 1).min(hard_end)..hard_end])
+                    <= WRAP_LOOKBEHIND_CELLS
+        });
+        if let Some(boundary) = boundary {
+            lines.push(units[idx..boundary].to_vec());
+            idx = boundary + 1;
+            while idx < units.len() && units[idx].whitespace {
+                idx += 1;
+            }
+        } else {
+            lines.push(units[idx..hard_end].to_vec());
+            idx = hard_end;
+        }
     }
     if lines.is_empty() {
         lines.push(Vec::new());
@@ -2854,7 +3425,15 @@ fn format_tool(exit_code: i32, elapsed: Duration, styled: bool) -> String {
     }
 }
 
-fn format_concise_tool_live(title: &str, risk: Option<&str>, styled: bool) -> String {
+fn format_concise_tool_live(
+    title: &str,
+    risk: Option<&str>,
+    styled: bool,
+    max_width: Option<usize>,
+) -> String {
+    let title = max_width
+        .map(|width| truncate_visible_text(title, width.saturating_sub(3)))
+        .unwrap_or_else(|| title.to_string());
     let body = format!("=> {title}");
     if styled {
         format!("{}{body}{RESET}", bash_risk_color(risk))
@@ -2868,16 +3447,31 @@ fn format_concise_tool(
     risk: Option<&str>,
     exit_code: Option<i32>,
     styled: bool,
+    max_width: Option<usize>,
 ) -> String {
     let outcome = exit_code
         .map(|code| format!("exit {code}"))
         .unwrap_or_else(|| "error".to_string());
-    let body = format!("=> {title} · {outcome}");
-    if styled {
+    let suffix = format!(" · {outcome}");
+    let title = max_width
+        .map(|width| {
+            truncate_visible_text(
+                title,
+                width
+                    .saturating_sub(UnicodeWidthStr::width("=> "))
+                    .saturating_sub(UnicodeWidthStr::width(suffix.as_str())),
+            )
+        })
+        .unwrap_or_else(|| title.to_string());
+    let body = format!("=> {title}{suffix}");
+    let line = if styled {
         format!("{}{body}{RESET}\n", bash_risk_color(risk))
     } else {
         format!("{body}\n")
-    }
+    };
+    max_width
+        .map(|width| truncate_styled_line(&line, width))
+        .unwrap_or(line)
 }
 
 #[cfg(test)]
@@ -3087,6 +3681,9 @@ fn truncate_visible_text(text: &str, max_width: usize) -> String {
     if UnicodeWidthStr::width(text) <= max_width {
         return text.to_string();
     }
+    if max_width == 0 {
+        return String::new();
+    }
     let budget = max_width.saturating_sub(UnicodeWidthStr::width(ELLIPSIS));
     let mut out = String::new();
     let mut width = 0;
@@ -3099,6 +3696,39 @@ fn truncate_visible_text(text: &str, max_width: usize) -> String {
         width += next;
     }
     out.push_str(ELLIPSIS);
+    out
+}
+
+fn truncate_styled_line(text: &str, max_width: usize) -> String {
+    let newline = text.ends_with('\n');
+    let body = text.strip_suffix('\n').unwrap_or(text);
+    if visible_text_width(body) <= max_width {
+        return text.to_string();
+    }
+    if max_width == 0 {
+        return if newline {
+            "\n".to_string()
+        } else {
+            String::new()
+        };
+    }
+
+    let budget = max_width.saturating_sub(UnicodeWidthStr::width(ELLIPSIS));
+    let units = styled_graphemes(body);
+    let mut kept = Vec::new();
+    let mut width = 0usize;
+    for unit in units {
+        if unit.width > 0 && width.saturating_add(unit.width) > budget {
+            break;
+        }
+        width = width.saturating_add(unit.width);
+        kept.push(unit);
+    }
+    let mut out = render_styled_graphemes(&kept);
+    out.push_str(ELLIPSIS);
+    if newline {
+        out.push('\n');
+    }
     out
 }
 
@@ -3136,7 +3766,7 @@ fn terminal_trim_committed_text(text: &str) -> String {
 fn preview_first_line(text: &str, max_bytes: usize) -> String {
     let mut lines = text.lines();
     let first = lines.next().unwrap_or_default();
-    let mut preview = truncate_prefix(first, max_bytes, false).rendered;
+    let mut preview = truncate_prefix(first, max_bytes, None, false).rendered;
     if preview.is_empty() {
         return preview;
     }
@@ -3146,7 +3776,40 @@ fn preview_first_line(text: &str, max_bytes: usize) -> String {
     preview
 }
 
-fn compute_bash_preview_snapshot(text: &str, finalizing: bool) -> BashPreviewSnapshot {
+fn preview_first_line_for_width(text: &str, max_bytes: usize, max_cells: Option<usize>) -> String {
+    let Some(max_cells) = max_cells else {
+        return preview_first_line(text, max_bytes);
+    };
+    let mut lines = text.lines();
+    let first = lines.next().unwrap_or_default();
+    let needs_ellipsis = lines.next().is_some() || UnicodeWidthStr::width(first) > max_cells;
+    if !needs_ellipsis {
+        return first.to_string();
+    }
+    if max_cells == 0 {
+        return String::new();
+    }
+
+    let budget = max_cells.saturating_sub(UnicodeWidthStr::width(ELLIPSIS));
+    let mut preview = String::new();
+    let mut width = 0usize;
+    for grapheme in first.graphemes(true) {
+        let next = UnicodeWidthStr::width(grapheme);
+        if width.saturating_add(next) > budget {
+            break;
+        }
+        preview.push_str(grapheme);
+        width = width.saturating_add(next);
+    }
+    preview.push_str(ELLIPSIS);
+    preview
+}
+
+fn compute_bash_preview_snapshot(
+    text: &str,
+    finalizing: bool,
+    max_cells: Option<usize>,
+) -> BashPreviewSnapshot {
     let mut complete_lines = Vec::new();
     let mut trailing = String::new();
     for part in text.split_inclusive('\n') {
@@ -3182,7 +3845,7 @@ fn compute_bash_preview_snapshot(text: &str, finalizing: bool) -> BashPreviewSna
         if head_count >= BASH_HEAD_LINE_BUDGET {
             break;
         }
-        let preview = truncate_prefix(line, BASH_HEAD_LINE_CAP_BYTES, true);
+        let preview = truncate_prefix(line, BASH_HEAD_LINE_CAP_BYTES, max_cells, true);
         let next_bytes = head_bytes + preview.rendered.len();
         if next_bytes > BASH_HEAD_BYTE_BUDGET {
             break;
@@ -3216,7 +3879,12 @@ fn compute_bash_preview_snapshot(text: &str, finalizing: bool) -> BashPreviewSna
 
     let mut head_fragment_kept = 0usize;
     if finalizing && head_count == 0 && !trimmed_trailing.is_empty() {
-        let preview = truncate_prefix(&trimmed_trailing, BASH_HEAD_LINE_CAP_BYTES, false);
+        let preview = truncate_prefix(
+            &trimmed_trailing,
+            BASH_HEAD_LINE_CAP_BYTES,
+            max_cells,
+            false,
+        );
         head_fragment_kept = preview.raw_kept_bytes;
         head_rendered.push_str(&preview.rendered);
     }
@@ -3239,12 +3907,12 @@ fn compute_bash_preview_snapshot(text: &str, finalizing: bool) -> BashPreviewSna
     let mut tail_segments = Vec::new();
     let mut hidden_tail_bytes = 0usize;
     for line in reserved_complete {
-        let (rendered, kept) = cap_tail_line(line, true);
+        let (rendered, kept) = cap_tail_line(line, true, max_cells);
         hidden_tail_bytes += line.len().saturating_sub(kept);
         tail_segments.push(rendered);
     }
     if !fallback_reserved.is_empty() {
-        let (rendered, kept) = cap_tail_line(&fallback_reserved, false);
+        let (rendered, kept) = cap_tail_line(&fallback_reserved, false, max_cells);
         let overlap = head_fragment_kept
             .saturating_add(kept)
             .saturating_sub(trimmed_trailing.len());
@@ -3298,13 +3966,41 @@ fn trim_to_last_bytes(text: &str, max_bytes: usize) -> String {
     text[start..].to_string()
 }
 
-fn cap_tail_line(line: &str, complete_line: bool) -> (String, usize) {
+fn cap_tail_line(line: &str, complete_line: bool, max_cells: Option<usize>) -> (String, usize) {
     let newline = complete_line && line.ends_with('\n');
     let body = if newline {
         line.strip_suffix('\n').unwrap_or(line)
     } else {
         line
     };
+    if let Some(max_cells) = max_cells {
+        if UnicodeWidthStr::width(body) <= max_cells {
+            let mut out = body.to_string();
+            if newline {
+                out.push('\n');
+            }
+            return (out, body.len() + usize::from(newline));
+        }
+        if max_cells == 0 {
+            return (
+                if newline {
+                    "\n".to_string()
+                } else {
+                    String::new()
+                },
+                usize::from(newline),
+            );
+        }
+        let kept_width = max_cells.saturating_sub(UnicodeWidthStr::width(ELLIPSIS));
+        let suffix = trim_to_last_cells(body, kept_width);
+        let mut out = String::from(ELLIPSIS);
+        out.push_str(&suffix);
+        if newline {
+            out.push('\n');
+        }
+        return (out, suffix.len() + usize::from(newline));
+    }
+
     let body_bytes = body.len();
     if body_bytes <= BASH_TAIL_LINE_CAP_BYTES {
         let mut out = body.to_string();
@@ -3325,13 +4021,52 @@ fn cap_tail_line(line: &str, complete_line: bool) -> (String, usize) {
     (out, suffix.len() + usize::from(newline))
 }
 
-fn truncate_prefix(text: &str, max_bytes: usize, preserve_newline: bool) -> LinePreview {
+fn truncate_prefix(
+    text: &str,
+    max_bytes: usize,
+    max_cells: Option<usize>,
+    preserve_newline: bool,
+) -> LinePreview {
     let newline = preserve_newline && text.ends_with('\n');
     let body = if newline {
         text.strip_suffix('\n').unwrap_or(text)
     } else {
         text
     };
+    if let Some(max_cells) = max_cells {
+        if UnicodeWidthStr::width(body) <= max_cells {
+            let mut rendered = body.to_string();
+            if newline {
+                rendered.push('\n');
+            }
+            return LinePreview {
+                rendered,
+                raw_kept_bytes: body.len() + usize::from(newline),
+            };
+        }
+        if max_cells == 0 {
+            return LinePreview {
+                rendered: if newline {
+                    "\n".to_string()
+                } else {
+                    String::new()
+                },
+                raw_kept_bytes: usize::from(newline),
+            };
+        }
+        let kept_width = max_cells.saturating_sub(UnicodeWidthStr::width(ELLIPSIS));
+        let prefix = trim_to_first_cells(body, kept_width);
+        let mut rendered = prefix.clone();
+        rendered.push_str(ELLIPSIS);
+        if newline {
+            rendered.push('\n');
+        }
+        return LinePreview {
+            rendered,
+            raw_kept_bytes: prefix.len() + usize::from(newline),
+        };
+    }
+
     if body.len() <= max_bytes {
         let mut rendered = body.to_string();
         if newline {
@@ -3354,6 +4089,43 @@ fn truncate_prefix(text: &str, max_bytes: usize, preserve_newline: bool) -> Line
         rendered,
         raw_kept_bytes: prefix.len() + usize::from(newline),
     }
+}
+
+fn trim_to_first_cells(text: &str, max_cells: usize) -> String {
+    let mut width = 0usize;
+    let end = text
+        .grapheme_indices(true)
+        .take_while(|(_, grapheme)| {
+            let next = UnicodeWidthStr::width(*grapheme);
+            let fits = width.saturating_add(next) <= max_cells;
+            if fits {
+                width = width.saturating_add(next);
+            }
+            fits
+        })
+        .last()
+        .map(|(idx, grapheme)| idx + grapheme.len())
+        .unwrap_or(0);
+    text[..end].to_string()
+}
+
+fn trim_to_last_cells(text: &str, max_cells: usize) -> String {
+    let mut width = 0usize;
+    let start = text
+        .grapheme_indices(true)
+        .rev()
+        .take_while(|(_, grapheme)| {
+            let next = UnicodeWidthStr::width(*grapheme);
+            let fits = width.saturating_add(next) <= max_cells;
+            if fits {
+                width = width.saturating_add(next);
+            }
+            fits
+        })
+        .last()
+        .map(|(idx, _)| idx)
+        .unwrap_or(text.len());
+    text[start..].to_string()
 }
 
 fn trim_to_first_bytes(text: &str, max_bytes: usize) -> String {
@@ -3483,8 +4255,10 @@ mod tests {
 
     #[test]
     fn markdown_renderer_handles_lists_and_tables() {
-        let rendered =
-            render_markdown("- one\n  - two\n\n| Name | Value |\n| --- | --- |\n| a | b |\n");
+        let rendered = render_markdown(
+            "- one\n  - two\n\n| Name | Value |\n| --- | --- |\n| a | b |\n",
+            Some(DEFAULT_TERMINAL_WIDTH),
+        );
         let plain = strip_ansi(&rendered);
         assert!(rendered.contains("• one"));
         assert!(rendered.contains("• two"));
@@ -3494,7 +4268,7 @@ mod tests {
 
     #[test]
     fn markdown_renderer_keeps_nested_list_items_on_separate_lines() {
-        let rendered = render_markdown("- parent\n  - child\n");
+        let rendered = render_markdown("- parent\n  - child\n", Some(DEFAULT_TERMINAL_WIDTH));
         let plain = strip_ansi(&rendered);
 
         assert!(plain.contains("• parent\n  • child\n"), "{plain:?}");
@@ -3503,23 +4277,20 @@ mod tests {
 
     #[test]
     fn markdown_renderer_aligns_wide_table_cells() {
-        let rendered =
-            render_markdown("| Name | Value |\n| --- | ---: |\n| 字 | 10 |\n| ascii | 2 |\n");
+        let rendered = render_markdown(
+            "| Name | Value |\n| --- | ---: |\n| 字 | 10 |\n| ascii | 2 |\n",
+            Some(DEFAULT_TERMINAL_WIDTH),
+        );
         assert_table_grid_aligned(&strip_ansi(&rendered));
     }
 
     #[test]
-    fn markdown_renderer_caps_table_columns_by_column_count() {
-        for (column_count, expected_limit) in [(1, 80), (2, 80), (3, 60), (4, 45), (5, 40)] {
-            let at_limit = "a".repeat(expected_limit);
-            let over_limit = "b".repeat(expected_limit + 1);
-            let mut header = vec!["Text"; column_count];
-            let separator = vec!["---"; column_count];
-            let mut first_row = vec!["x".to_string(); column_count];
-            let mut second_row = vec!["y".to_string(); column_count];
-            header[0] = "Long";
-            first_row[0] = at_limit.clone();
-            second_row[0] = over_limit.clone();
+    fn markdown_renderer_bounds_complete_grid_to_terminal_width() {
+        for max_width in [40, 60, 80] {
+            let header = ["First", "Second", "Third"];
+            let separator = ["---", "---", "---"];
+            let first_row = ["a".repeat(90), "short".into(), "x".repeat(50)];
+            let second_row = ["b".repeat(70), "another value".into(), "tail".into()];
             let markdown = format!(
                 "| {} |\n| {} |\n| {} |\n| {} |\n",
                 header.join(" | "),
@@ -3528,28 +4299,19 @@ mod tests {
                 second_row.join(" | ")
             );
 
-            let plain = strip_ansi(&render_markdown(&markdown));
+            let plain = strip_ansi(&render_markdown(&markdown, Some(max_width)));
             let table_lines = plain
                 .lines()
                 .filter(|line| line.starts_with('|') && line.ends_with('|'))
                 .collect::<Vec<_>>();
 
-            assert_eq!(
-                bar_columns(table_lines[0])[1],
-                expected_limit + 3,
-                "column_count={column_count}: {plain:?}"
-            );
-            assert_eq!(
-                table_lines.len(),
-                5,
-                "column_count={column_count}: {plain:?}"
-            );
-            assert!(table_lines[2].contains(&at_limit), "{plain:?}");
+            assert!(!table_lines.is_empty(), "{plain:?}");
             assert!(
-                table_lines[3].contains(&"b".repeat(expected_limit)),
-                "{plain:?}"
+                table_lines
+                    .iter()
+                    .all(|line| UnicodeWidthStr::width(*line) <= max_width),
+                "max_width={max_width}: {plain:?}"
             );
-            assert!(table_lines[4].contains("b"), "{plain:?}");
             assert_table_grid_aligned(&plain);
         }
     }
@@ -3566,6 +4328,163 @@ mod tests {
             strip_ansi(&rendered),
             "| alpha beta | x   |\n| gamma      |     |\n"
         );
+    }
+
+    #[test]
+    fn five_cell_heuristic_prefers_nearby_whitespace_then_hard_splits() {
+        assert_eq!(
+            wrap_table_cell("alpha beta gamma", 10),
+            ["alpha beta", "gamma"]
+        );
+        assert_eq!(
+            wrap_table_cell("hello wonderful", 10),
+            ["hello", "wonderful"]
+        );
+        assert_eq!(wrap_table_cell("abc defghij", 10), ["abc defghi", "j"]);
+    }
+
+    #[test]
+    fn streaming_wrapper_is_chunk_partition_invariant() {
+        let text = "alpha wonderful world, then abcdefghijkl and done";
+        let whole = wrap_terminal_chunks(&[text], 12);
+        let chunks = text.graphemes(true).collect::<Vec<_>>();
+        let split = wrap_terminal_chunks(&chunks, 12);
+
+        assert_eq!(split, whole);
+        assert_visible_lines_fit(&whole, 12);
+        assert_eq!(
+            whole
+                .chars()
+                .filter(|ch| !ch.is_whitespace())
+                .collect::<String>(),
+            text.chars()
+                .filter(|ch| !ch.is_whitespace())
+                .collect::<String>()
+        );
+    }
+
+    #[test]
+    fn streaming_wrapper_keeps_unicode_graphemes_intact() {
+        for text in [
+            "漢字仮名交じり文",
+            "👩‍💻👩‍💻👩‍💻👩‍💻",
+            "e\u{301}e\u{301}e\u{301}e\u{301}e\u{301}",
+        ] {
+            let chunks = text.chars().map(|ch| ch.to_string()).collect::<Vec<_>>();
+            let refs = chunks.iter().map(String::as_str).collect::<Vec<_>>();
+            let wrapped = wrap_terminal_chunks(&refs, 6);
+            assert_visible_lines_fit(&wrapped, 6);
+            assert_eq!(wrapped.replace('\n', ""), text);
+        }
+    }
+
+    #[test]
+    fn streaming_wrapper_preserves_ansi_and_hyperlink_sequences() {
+        let open = open_hyperlink("https://example.com");
+        let styled = format!("{BOLD}alpha wonderful{RESET} {open}linked text{OSC8_CLOSE}");
+        let wrapped = wrap_terminal_chunks(&[&styled], 10);
+        let plain = strip_ansi(&wrapped);
+
+        assert_visible_lines_fit(&plain, 10);
+        assert_eq!(wrapped.matches(BOLD).count(), 1);
+        assert_eq!(wrapped.matches(&open).count(), 1);
+        assert_eq!(wrapped.matches(OSC8_CLOSE).count(), 1);
+        assert_eq!(
+            plain
+                .chars()
+                .filter(|ch| !ch.is_whitespace())
+                .collect::<String>(),
+            "alphawonderfullinkedtext"
+        );
+    }
+
+    #[test]
+    fn narrow_horizontal_rule_stays_on_one_row() {
+        let mut stream = MarkdownStream::new(MarkdownLayout {
+            prose_width: Some(12),
+            table_width: Some(12),
+        });
+
+        let rendered = strip_ansi(&stream.push("---\n").concat());
+        let visible = rendered
+            .lines()
+            .filter(|line| !line.is_empty())
+            .collect::<Vec<_>>();
+
+        assert_eq!(visible, ["────────────"]);
+    }
+
+    #[test]
+    fn narrow_multi_column_tables_fall_back_to_stacked_rows() {
+        let markdown = "\
+| Name | Role | Region | Notes |
+| --- | --- | --- | --- |
+| Ada | Engineer | Europe | Designs distributed systems |
+| Lin | Reviewer | Asia | Checks release artifacts |
+";
+        let plain = strip_ansi(&render_markdown(markdown, Some(20)));
+
+        assert_visible_lines_fit(&plain, 20);
+        assert!(plain.contains("Name"), "{plain:?}");
+        assert!(plain.contains("Ada"), "{plain:?}");
+        assert!(plain.contains("Notes"), "{plain:?}");
+        assert!(plain.contains("distrib"), "{plain:?}");
+        assert!(plain.contains("uted"), "{plain:?}");
+        assert!(plain.lines().any(|line| line.matches('|').count() == 3));
+    }
+
+    #[test]
+    fn extremely_narrow_tables_use_linear_rows() {
+        let markdown = "\
+| Name | Notes |
+| --- | --- |
+| Ada | abcdefghijkl |
+";
+        let plain = strip_ansi(&render_markdown(markdown, Some(9)));
+
+        assert_visible_lines_fit(&plain, 9);
+        assert!(plain.contains("Name:"), "{plain:?}");
+        assert!(plain.contains("Ada"), "{plain:?}");
+        assert!(plain.contains("abcdefghi\njkl"), "{plain:?}");
+    }
+
+    #[test]
+    fn unbounded_tables_keep_cells_on_one_renderer_row() {
+        let long = "x".repeat(100);
+        let markdown = format!("| Name |\n| --- |\n| {long} |\n");
+        let plain = strip_ansi(&render_markdown(&markdown, None));
+        let table_lines = plain
+            .lines()
+            .filter(|line| line.starts_with('|'))
+            .collect::<Vec<_>>();
+
+        assert_eq!(table_lines.len(), 3, "{plain:?}");
+        assert!(table_lines[2].contains(&long), "{plain:?}");
+        assert!(UnicodeWidthStr::width(table_lines[2]) > DEFAULT_TERMINAL_WIDTH);
+    }
+
+    #[test]
+    fn responsive_tables_respect_every_ascii_ruler_width() {
+        for max_width in 1..=80 {
+            for columns in 1..=12 {
+                let header = (1..=columns)
+                    .map(|idx| format!("Heading {idx}"))
+                    .collect::<Vec<_>>();
+                let separator = vec!["---"; columns];
+                let row = (1..=columns)
+                    .map(|idx| format!("value-{idx}-abcdefghijkl"))
+                    .collect::<Vec<_>>();
+                let markdown = format!(
+                    "| {} |\n| {} |\n| {} |\n",
+                    header.join(" | "),
+                    separator.join(" | "),
+                    row.join(" | ")
+                );
+                let plain = strip_ansi(&render_markdown(&markdown, Some(max_width)));
+
+                assert_visible_lines_fit(&plain, max_width);
+            }
+        }
     }
 
     #[test]
@@ -3762,9 +4681,12 @@ mod tests {
 
     #[test]
     fn markdown_stream_wraps_long_table_headers_and_cells_on_commit() {
-        let mut stream = MarkdownStream::default();
+        let mut stream = MarkdownStream::new(MarkdownLayout {
+            prose_width: None,
+            table_width: Some(DEFAULT_TERMINAL_WIDTH),
+        });
         let header = "heading ".repeat(12);
-        let body = "x".repeat(max_table_column_width(2) + 1);
+        let body = "x".repeat(MAX_TABLE_COLUMN_WIDTH + 1);
 
         assert!(stream.push(&format!("| {header} | Side |\n")).is_empty());
         assert!(stream.push("| --- | --- |\n").is_empty());
@@ -3964,6 +4886,45 @@ mod tests {
         columns
     }
 
+    fn wrap_terminal_chunks(chunks: &[&str], width: usize) -> String {
+        let mut wrapper = TerminalLineWrapper::new(width);
+        let mut out = String::new();
+        for chunk in chunks {
+            wrapper.push(chunk, &mut out);
+        }
+        wrapper.finish(&mut out);
+        out
+    }
+
+    fn assert_visible_lines_fit(text: &str, width: usize) {
+        for line in text.lines() {
+            assert!(
+                UnicodeWidthStr::width(line) <= width,
+                "line exceeds {width} cells: {line:?} in {text:?}"
+            );
+        }
+    }
+
+    fn simulated_terminal_rows(transcript: &str) -> Vec<String> {
+        let transcript = transcript.replace("\r\x1b[2K", "\r");
+        let mut rows = Vec::new();
+        let mut current = String::new();
+        for ch in transcript.chars() {
+            match ch {
+                '\r' => current.clear(),
+                '\n' => {
+                    rows.push(strip_ansi(&current));
+                    current.clear();
+                }
+                _ => current.push(ch),
+            }
+        }
+        if !current.is_empty() {
+            rows.push(strip_ansi(&current));
+        }
+        rows
+    }
+
     #[test]
     fn bash_header_renders_title_and_risk_colored_script_without_risk_label() {
         let header = format_bash_header("List files", "printf 'a'\npwd", Some("readonly"), true);
@@ -4074,7 +5035,7 @@ mod tests {
 
     #[test]
     fn bash_preview_does_not_duplicate_short_unterminated_output_on_finish() {
-        let snapshot = compute_bash_preview_snapshot("first", true);
+        let snapshot = compute_bash_preview_snapshot("first", true, None);
 
         assert_eq!(snapshot.head_rendered, "first");
         assert_eq!(snapshot.tail_rendered, "");
@@ -4084,7 +5045,8 @@ mod tests {
 
     #[test]
     fn bash_preview_keeps_a_single_middle_line() {
-        let snapshot = compute_bash_preview_snapshot("one\ntwo\nthree\nfour\nfive\nsix\n", true);
+        let snapshot =
+            compute_bash_preview_snapshot("one\ntwo\nthree\nfour\nfive\nsix\n", true, None);
 
         assert_eq!(snapshot.head_rendered, "one\ntwo\nthree\n");
         assert_eq!(snapshot.tail_rendered, "four\nfive\nsix\n");
@@ -4095,7 +5057,7 @@ mod tests {
     #[test]
     fn bash_preview_still_omits_multiple_middle_lines() {
         let snapshot =
-            compute_bash_preview_snapshot("one\ntwo\nthree\nfour\nfive\nsix\nseven\n", true);
+            compute_bash_preview_snapshot("one\ntwo\nthree\nfour\nfive\nsix\nseven\n", true, None);
 
         assert_eq!(snapshot.head_rendered, "one\ntwo\nthree\n");
         assert_eq!(snapshot.tail_rendered, "six\nseven\n");
@@ -4108,7 +5070,7 @@ mod tests {
         let middle = "m".repeat(BASH_TAIL_LINE_CAP_BYTES + 80);
         let raw = format!("one\ntwo\nthree\n{middle}\nfive\nsix\n");
 
-        let snapshot = compute_bash_preview_snapshot(&raw, true);
+        let snapshot = compute_bash_preview_snapshot(&raw, true, None);
 
         assert_eq!(snapshot.omitted_lines, 0);
         assert_eq!(
@@ -4126,7 +5088,7 @@ mod tests {
         let raw =
             format!("{head}\nhead two\nhead three\nomitted one\nomitted two\n{tail_a}\n{tail_b}\n");
 
-        let snapshot = compute_bash_preview_snapshot(&raw, true);
+        let snapshot = compute_bash_preview_snapshot(&raw, true, None);
 
         let rendered_head = snapshot.head_rendered.lines().next().unwrap();
         let rendered_tail = snapshot.tail_rendered.lines().next().unwrap();
@@ -4448,6 +5410,171 @@ mod tests {
             .unwrap();
 
         assert_eq!(output.transcript(), "=> Inspect files · exit 7\n");
+    }
+
+    #[test]
+    fn interactive_prose_wraps_to_detected_width() {
+        let (mut renderer, output) = Renderer::with_test_shared_output_layout(
+            OutputFormat::Detail,
+            true,
+            true,
+            Some(12),
+            None,
+        );
+        let text = "alpha wonderful world and 漢字仮名";
+
+        for chunk in ["alpha won", "derful world", " and 漢", "字仮名"] {
+            renderer.assistant_text(chunk).unwrap();
+        }
+        renderer.assistant_end().unwrap();
+
+        let plain = strip_ansi(&output.transcript());
+        assert_visible_lines_fit(&plain, 12);
+        assert_eq!(
+            plain
+                .chars()
+                .filter(|ch| !ch.is_whitespace())
+                .collect::<String>(),
+            text.chars()
+                .filter(|ch| !ch.is_whitespace())
+                .collect::<String>()
+        );
+    }
+
+    #[test]
+    fn wrapping_column_resets_between_assistant_messages() {
+        let (mut renderer, output) = Renderer::with_test_shared_output_layout(
+            OutputFormat::Detail,
+            true,
+            true,
+            Some(10),
+            None,
+        );
+
+        renderer.assistant_text("1234567").unwrap();
+        renderer.assistant_end().unwrap();
+        renderer.assistant_text("abcdefghij").unwrap();
+        renderer.assistant_end().unwrap();
+
+        let plain = strip_ansi(&output.transcript());
+        assert!(plain.contains("1234567\n\nabcdefghij"), "{plain:?}");
+    }
+
+    #[test]
+    fn disabled_interactive_wrapping_leaves_prose_and_table_cells_unbounded() {
+        let (mut renderer, output) = Renderer::with_test_shared_output_layout(
+            OutputFormat::Detail,
+            true,
+            false,
+            Some(12),
+            None,
+        );
+        let prose = "alpha wonderful world without renderer wrapping";
+        renderer.assistant_text(prose).unwrap();
+        renderer.assistant_text("\n\n").unwrap();
+        let long = "x".repeat(100);
+        renderer
+            .assistant_text(&format!("| Name |\n| --- |\n| {long} |\n\n"))
+            .unwrap();
+        renderer.assistant_end().unwrap();
+
+        let plain = strip_ansi(&output.transcript());
+        assert!(plain.lines().any(|line| line == prose), "{plain:?}");
+        assert!(plain.lines().any(|line| line.contains(&long)), "{plain:?}");
+    }
+
+    #[test]
+    fn interactive_tool_rows_use_dynamic_or_fixed_eighty_cell_limits() {
+        let args = json!({
+            "title": "Inspect an intentionally very long collection of generated artifacts",
+            "risk": "readonly",
+            "command": "printf 'this command is intentionally much too long for the ruler'",
+        });
+        let (mut wrapped, wrapped_output) = Renderer::with_test_shared_output_layout(
+            OutputFormat::Detail,
+            true,
+            true,
+            Some(24),
+            None,
+        );
+        wrapped.bash_header_full(Some("call_1"), &args).unwrap();
+        for row in simulated_terminal_rows(&wrapped_output.transcript()) {
+            assert!(UnicodeWidthStr::width(row.as_str()) <= 24, "{row:?}");
+        }
+
+        let (mut disabled, disabled_output) = Renderer::with_test_shared_output_layout(
+            OutputFormat::Detail,
+            true,
+            false,
+            Some(24),
+            None,
+        );
+        disabled.bash_header_full(Some("call_1"), &args).unwrap();
+        let rows = simulated_terminal_rows(&disabled_output.transcript());
+        assert!(
+            rows.iter()
+                .any(|row| UnicodeWidthStr::width(row.as_str()) > 24),
+            "{rows:?}"
+        );
+        assert!(
+            rows.iter()
+                .all(|row| UnicodeWidthStr::width(row.as_str()) <= 80),
+            "{rows:?}"
+        );
+    }
+
+    #[test]
+    fn concise_tool_truncation_preserves_completion_suffix() {
+        let (mut renderer, output) = Renderer::with_test_shared_output_layout(
+            OutputFormat::Concise,
+            true,
+            true,
+            Some(24),
+            None,
+        );
+        renderer.bash_header_start(Some("call_1")).unwrap();
+        renderer
+            .concise_tool_ready(
+                Some("Inspect an intentionally long generated artifact name"),
+                Some("readonly"),
+            )
+            .unwrap();
+        renderer.tool_finished(7, Duration::from_millis(1)).unwrap();
+
+        let rows = simulated_terminal_rows(&output.transcript());
+        let completed = rows.last().expect("completed concise row");
+        assert!(completed.ends_with(" · exit 7"), "{rows:?}");
+        assert!(UnicodeWidthStr::width(completed.as_str()) <= 24);
+    }
+
+    #[test]
+    fn interactive_full_command_remains_unwrapped() {
+        let (mut renderer, output) = Renderer::with_test_shared_output_layout(
+            OutputFormat::Full,
+            true,
+            true,
+            Some(20),
+            None,
+        );
+        let command = "printf 'a command that remains complete in full output'";
+        renderer
+            .bash_header_full(
+                Some("call_1"),
+                &json!({
+                    "title": "Run a long command",
+                    "risk": "readonly",
+                    "command": command,
+                }),
+            )
+            .unwrap();
+
+        let rows = simulated_terminal_rows(&output.transcript());
+        assert!(rows.iter().any(|row| row.contains(command)), "{rows:?}");
+        assert!(
+            rows.iter()
+                .any(|row| UnicodeWidthStr::width(row.as_str()) > 20),
+            "{rows:?}"
+        );
     }
 
     #[test]

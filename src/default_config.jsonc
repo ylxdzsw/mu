@@ -1,5 +1,6 @@
 {
   "output": "detail",
+  "line_wrapping": true,
   "providers": {
     // Default provider: OpenCode Zen's free DeepSeek model. It needs no API
     // key, so mu works out of the box. Other free models include

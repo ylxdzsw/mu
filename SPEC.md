@@ -617,12 +617,28 @@ aliases.
   summary without a thought indicator, and shows the complete command, stdin,
   and redacted tool output. Model-facing tool-result truncation remains in force.
 
-Interactivity is independent from density and is not configurable. Stdout TTY
+Interactivity is independent from density. Whether stdout is interactive is
+always detected from its TTY status and is not configurable. Stdout TTY
 detection enables ANSI styling, parsed terminal Markdown, and the single mutable
 live line in every non-final density. Redirected stdout is sequential and
 ANSI-free. `final` ignores interactivity. Interactive rendering keeps normal
 scrollback and never uses an alternate screen, clears the screen, or requires
 mouse interaction.
+
+The top-level `line_wrapping` setting controls only interactive presentation and
+defaults to `true`. When enabled, the renderer samples the stdout terminal width
+once at turn startup, reserves the final terminal column, and uses 80 visible
+cells if width detection fails. It wraps assistant prose and bounds rendered
+tables to that ruler. Compact renderer-owned rows such as tool titles, command
+previews, and mutable live lines are ellipsized to the same ruler. Mu does not
+handle `SIGWINCH`, reflow committed output, or rewrite scrollback after a
+terminal resize.
+
+When `line_wrapping` is `false`, assistant prose is left for the terminal to
+hard-wrap and table cells are not split into continuation rows. Renderer-owned
+single-row presentation is still ellipsized to a fixed 80 visible cells.
+Neither value changes redirected output, `final` output, persisted messages, or
+model-visible content.
 
 **Concurrency contract.** All output modes may run contiguous readonly
 `bash` calls concurrently. Interactive output keeps append-only scrollback and
@@ -638,25 +654,40 @@ selected density and detected interactivity.
 Assistant Markdown is parsed on TTYs. The renderer commits only output whose
 terminal representation is stable: ordinary prose streams as soon as it is not
 being held for an inline span, while headings, quotes, and list items stream once
-their line prefix is unambiguous. A heading prefix waits for the space after the
-full opening `#` run, so `##` is not rendered as h2 until it cannot still become
-h3. Closing heading hashes are not special-cased and are rendered literally.
+their line prefix is unambiguous. With `line_wrapping` enabled, the renderer
+retains at most five visible cells so an approaching ruler can replace the most
+recent retained whitespace with a newline. If no such whitespace exists, it
+hard-wraps at a Unicode grapheme boundary. ANSI and hyperlink controls consume
+zero cells; combining sequences, emoji ZWJ sequences, and other extended
+graphemes are never split. CJK text therefore falls back to grapheme-boundary
+wrapping. This is intentionally not full Unicode line breaking, dictionary
+segmentation, or hyphenation.
+
+A heading prefix waits for the space after the full opening `#` run, so `##` is
+not rendered as h2 until it cannot still become h3. Closing heading hashes are
+not special-cased and are rendered literally.
 Inline links, inline code, emphasis, strong text, and double-tilde
 strikethrough wait for the current span to complete; fenced code starts terminal
 code styling at the opening fence, streams code lines without printing fence
 markers, and resets styling at the closing fence or response boundary. Markdown
 tables are buffered until the table is complete enough to align and commit once,
-so columns never require rewriting prior output. Each column is at most 80
-visible terminal cells wide in one- and two-column tables, 60 in three-column
-tables, 45 in four-column tables, and 40 in tables with more columns. Longer
-header or body cells wrap into aligned continuation rows without truncating
-their content. While a confirmed table is
-buffered, interactive output shows a mutable `[table ~N tokens]` live indicator;
-the completed table clears and overwrites that indicator instead of committing a
-final table-status line. Markdown features outside this supported terminal
-subset are emitted as raw Markdown rather than partially rendered. When stdout
-is piped or redirected, assistant deltas pass through byte-for-byte as the model
-produced them, preserving raw Markdown for downstream consumers.
+so columns never require rewriting prior output. With wrapping enabled, table
+layout counts every border and padding cell, caps any one content column at 80
+cells, and shrinks the widest columns until the complete grid fits the sampled
+terminal ruler. Cells wrap with the same five-cell whitespace heuristic as
+prose. If a grid cannot give every column three content cells, the table becomes
+a stacked header/value grid; terminals too narrow even for that use a linear
+header/value layout. Every emitted table row stays within the ruler unless one
+indivisible grapheme is itself wider than the terminal. With wrapping disabled,
+columns use their natural widths and cells remain on one renderer row.
+
+While a confirmed table is buffered, interactive output shows a mutable
+`[table ~N tokens]` live indicator; the completed table clears and overwrites
+that indicator instead of committing a final table-status line. Markdown
+features outside this supported terminal subset are emitted as raw Markdown
+rather than partially rendered. When stdout is piped or redirected, assistant
+deltas pass through byte-for-byte as the model produced them, preserving raw
+Markdown for downstream consumers.
 
 ### 5.1 TTY block-spacing contract
 
@@ -1208,6 +1239,7 @@ one scope are not visible in another.
   ```jsonc
   {
     "output": "detail",                         // optional default density
+    "line_wrapping": true,                      // interactive presentation only
     "providers": {
       "openai": {
         "endpoint": "https://api.openai.com/v1/responses", // required complete POST URL
@@ -1235,7 +1267,8 @@ one scope are not visible in another.
 
   At least one provider and one model are required; everything else has the
   defaults shown. `output` accepts `final`, `concise`, `detail`, or `full`; an
-  explicit CLI `--output` overrides it. Provider and model order is meaningful:
+  explicit CLI `--output` overrides it. `line_wrapping` is a boolean and has no
+  CLI override. Provider and model order is meaningful:
   project config entries are listed before inherited global entries, and model
   suggestions follow that order. `supported_efforts` contains arbitrary
   provider-defined strings and is advisory: it drives status output and shell

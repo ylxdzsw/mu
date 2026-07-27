@@ -837,7 +837,8 @@ async fn run_turn(args: RunTurnArgs<'_>) -> Result<()> {
         .terminal_bell
         .enabled
         .then_some(Duration::from_millis(config.terminal_bell.min_duration_ms));
-    let mut renderer = Renderer::with_terminal_bell(output, turn_done_bell_min_duration);
+    let mut renderer =
+        Renderer::with_terminal_bell(output, turn_done_bell_min_duration, config.line_wrapping);
     let turn_started = Instant::now();
     if let Some(notice) = preamble_notice {
         renderer.notice(notice)?;

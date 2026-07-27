@@ -628,6 +628,7 @@ mod tests {
             runtime: Config {
                 providers: Default::default(),
                 output: Default::default(),
+                line_wrapping: true,
                 compaction: crate::config::CompactionConfig::default(),
                 limits: crate::config::LimitsConfig::default(),
                 guardrail: GuardrailConfig::default(),
@@ -664,6 +665,7 @@ mod tests {
             runtime: Config {
                 providers: Default::default(),
                 output: Default::default(),
+                line_wrapping: true,
                 compaction: crate::config::CompactionConfig::default(),
                 limits: crate::config::LimitsConfig::default(),
                 guardrail: GuardrailConfig::default(),

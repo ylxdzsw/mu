@@ -764,6 +764,7 @@ mod tests {
                 },
             )]),
             output: Default::default(),
+            line_wrapping: true,
             compaction: CompactionConfig::default(),
             limits: LimitsConfig::default(),
             guardrail: GuardrailConfig::default(),

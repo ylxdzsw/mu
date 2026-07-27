@@ -262,7 +262,12 @@ Setting `"output": "concise"` in global or project `config.jsonc` changes the
 default output density; an explicit `-o`/`--output` always wins. Output density
 controls brevity, not terminal behavior: `mu` automatically enables live lines,
 color, and rich Markdown when stdout is a terminal, and redirected output is
-sequential and ANSI-free.
+sequential and ANSI-free. Interactive output also defaults to
+`"line_wrapping": true`: prose and tables fit the detected terminal width, while
+compact tool and status rows are ellipsized to it. Setting it to `false` leaves
+prose and table cells for the terminal to wrap, but still caps compact rows at
+80 visible cells. It never changes redirected, final, persisted, or
+model-visible text.
 
 ## Native installation and portable builds
 
