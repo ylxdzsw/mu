@@ -315,7 +315,7 @@ mod tests {
         let tmp = std::env::temp_dir().join(format!("mu-compaction-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&tmp).unwrap();
         let store = Store::open(&tmp.join("mu.db")).unwrap();
-        let session = store.create_session("/tmp", "test/fake-model").unwrap();
+        let session = store.create_session("/tmp").unwrap();
         let request_model =
             crate::models::resolve_model_ref(&test_config(), "test/fake-model").unwrap();
         store

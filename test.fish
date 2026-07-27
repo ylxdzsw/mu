@@ -67,7 +67,7 @@ set fake_bin "$TEST_TMPDIR/bin"
 set capture_args "$TEST_TMPDIR/args"
 set capture_stdin "$TEST_TMPDIR/stdin"
 set capture_calls "$TEST_TMPDIR/calls"
-set session_counter "$TEST_TMPDIR/session-counter"
+set capture_session_args "$TEST_TMPDIR/session-args"
 mkdir "$fake_bin"
 
 begin
@@ -95,8 +95,8 @@ begin
     printf '%s\n' '  fi'
     printf '%s\n' '  exit 0'
     printf '%s\n' fi
-    printf '%s\n' 'if [ "$1" = --model ]; then shift 2; fi'
     printf '%s\n' 'if [ "$1" = session ] && [ "$2" = new ]; then'
+    printf '%s\n' '  printf "%s\n" "$@" >"$TEST_CAPTURE_SESSION_ARGS"'
     printf '%s\n' '  printf "%s\n" ses_01234567'
     printf '%s\n' '  exit 0'
     printf '%s\n' fi
@@ -111,6 +111,7 @@ set -gx TEST_PROJECT_ROOT "$TEST_ROOT"
 set -gx TEST_CAPTURE_ARGS "$capture_args"
 set -gx TEST_CAPTURE_STDIN "$capture_stdin"
 set -gx TEST_CAPTURE_CALLS "$capture_calls"
+set -gx TEST_CAPTURE_SESSION_ARGS "$capture_session_args"
 set -g MU_FISH_BIN "$fake_bin/mu"
 set -g MU_FISH_OUTPUT detail
 
@@ -121,7 +122,7 @@ assert_contains "$prompt" 'mu> ' 'prompt shows input marker'
 string match -q '*25%*' -- "$prompt"; and fail 'fresh prompt should omit context'
 
 set -g MU_FISH_SESSION_ID ses_0000000a
-set -g MU_FISH_SESSION_SCOPE (_mu_fish_current_scope)
+set -g MU_FISH_TRACKED_SCOPE (_mu_fish_current_scope)
 _mu_fish_sync_state
 set prompt (_mu_fish_build_mode_prompt | string collect)
 assert_contains "$prompt" '25%' 'session prompt shows context'
@@ -170,10 +171,13 @@ set literal_matches (_mu_fish_matching_candidates 'file*' 'file*star' file-other
 assert_equal (string join \x1e -- $literal_matches) 'file*star' 'candidate matching treats wildcard characters literally'
 
 set -g MU_FISH_SESSION_ID ses_0000000a
-set -g MU_FISH_SESSION_SCOPE (_mu_fish_current_scope)
+set -g MU_FISH_TRACKED_SCOPE (_mu_fish_current_scope)
 _mu_fish_sync_state
+_mu_fish_run_slash_command "/attach $attachment"
 _mu_fish_run_slash_command /new
 not set -q MU_FISH_SESSION_ID[1]; or fail '/new clears session'
+assert_equal "$MU_FISH_MODEL" openai/gpt '/new preserves model override'
+set -q MU_FISH_PENDING_ATTACHMENTS[1]; or fail '/new preserves pending attachments'
 
 rm -f "$capture_args" "$capture_stdin" "$capture_calls"
 _mu_fish_run_slash_command '/review.md First line
@@ -185,6 +189,56 @@ Second line'
 assert_equal "$custom_stdin" "$expected_custom_stdin" 'custom slash command preserves multiline instruction'
 set custom_args (cat "$capture_args")
 assert_equal "$custom_args[-1]" review.md 'custom slash command selects prompt file'
+
+set saved_pwd "$PWD"
+_mu_fish_clear_tracked_state
+cd "$project_a/subdir"
+set -g MU_FISH_TRACKED_SCOPE (_mu_fish_current_scope)
+set -g MU_FISH_SESSION_ID ses_0000000a
+set -g MU_FISH_MODEL local/solo
+set -g MU_FISH_PENDING_ATTACHMENTS "$attachment"
+_mu_fish_sync_state
+
+cd "$project_b/subdir"
+set observed_command (_mu_fish_base_command)
+assert_equal (string join \x1e -- $observed_command) (string join \x1e -- "$fake_bin/mu" --output detail) 'passive observation hides another scope bundle'
+set observed_prompt (_mu_fish_build_mode_prompt | string collect)
+not string match -q '*attachments*' -- "$observed_prompt"; or fail 'prompt hides another scope attachments'
+
+cd "$project_a/subdir"
+_mu_fish_sync_state
+assert_equal "$MU_FISH_EFFECTIVE_SESSION_ID" ses_0000000a 'returning without an action restores parked session'
+assert_equal "$MU_FISH_EFFECTIVE_MODEL" local/solo 'returning without an action restores parked model'
+assert_equal "$MU_FISH_EFFECTIVE_ATTACHMENT_COUNT" 1 'returning without an action restores parked attachments'
+
+cd "$project_b/subdir"
+_mu_fish_run_slash_command '/model unknown'; and fail 'invalid model elsewhere should fail'
+_mu_fish_run_slash_command "/attach $TEST_TMPDIR/missing-scope-file"; and fail 'invalid attachment elsewhere should fail'
+cd "$project_a/subdir"
+_mu_fish_sync_state
+assert_equal "$MU_FISH_SESSION_ID" ses_0000000a 'invalid actions elsewhere preserve parked session'
+assert_equal "$MU_FISH_MODEL" local/solo 'invalid actions elsewhere preserve parked model'
+set -q MU_FISH_PENDING_ATTACHMENTS[1]; or fail 'invalid actions elsewhere preserve parked attachments'
+
+cd "$project_b/subdir"
+_mu_fish_run_slash_command '/model gpt'
+not set -q MU_FISH_SESSION_ID[1]; or fail 'valid model action elsewhere invalidates parked session'
+assert_equal "$MU_FISH_MODEL" openai/gpt 'valid model action elsewhere replaces parked model'
+not set -q MU_FISH_PENDING_ATTACHMENTS[1]; or fail 'valid model action elsewhere invalidates parked attachments'
+assert_equal "$MU_FISH_TRACKED_SCOPE" "project:$project_b" 'valid model action moves tracked scope'
+
+rm -f "$capture_args" "$capture_stdin" "$capture_calls" "$capture_session_args"
+_mu_fish_submit_prompt 'project b prompt'
+set session_args (cat "$capture_session_args")
+assert_equal (string join \x1e -- $session_args) (string join \x1e -- session new) 'creates an empty session without forwarding model override'
+set submitted_args (cat "$capture_args")
+assert_equal (string join \x1e -- $submitted_args) (string join \x1e -- --output detail -s ses_01234567 --model openai/gpt) 'forwards model override on first real turn'
+
+cd "$project_a/subdir"
+set observed_command (_mu_fish_base_command)
+assert_equal (string join \x1e -- $observed_command) (string join \x1e -- "$fake_bin/mu" --output detail) 'old scope bundle stays invalidated'
+cd "$saved_pwd"
+_mu_fish_clear_tracked_state
 
 function _test_enter_hook
     set -g TEST_ENTER_HOOK_RAN yes
@@ -258,6 +312,7 @@ set setup_parts \
     "set -gx TEST_CAPTURE_ARGS "(string escape "$capture_args") \
     "set -gx TEST_CAPTURE_STDIN "(string escape "$capture_stdin") \
     "set -gx TEST_CAPTURE_CALLS "(string escape "$capture_calls") \
+    "set -gx TEST_CAPTURE_SESSION_ARGS "(string escape "$capture_session_args") \
     "set -g MU_FISH_BIN "(string escape "$fake_bin/mu") \
     'set -g MU_FISH_OUTPUT detail' \
     "source "(string escape "$TEST_ROOT/mu.fish")

@@ -44,7 +44,10 @@ use models::RequestOptions;
 use provider::{ContentPart, UserContent};
 use provider::{Provider, build_provider};
 use renderer::Renderer;
-use runtime::{InvocationOverrides, StatusReport, build_status_report, resolve_invocation};
+use runtime::{
+    InvocationOverrides, StatusReport, build_status_report, resolve_invocation,
+    resolve_retry_model, resolve_session_model,
+};
 
 const MAX_SUBAGENT_TURN_DEPTH: u32 = 1;
 const OUTPUT_FINAL: u8 = 0;
@@ -379,21 +382,13 @@ async fn run() -> Result<()> {
             let db_path = scope.session_db_path();
             match sub {
                 SessionSub::New => {
+                    if default_turn.selection.model.is_some() {
+                        bail!("--model does not apply to `session new`; pass it to the first turn");
+                    }
                     paths::ensure_project_layout(&scope)?;
                     let store = store::Store::open(&db_path)?;
-                    let model = if let Some(model) = default_turn.selection.model.as_deref() {
-                        let config = Config::load_for_scope(project_config_dir.as_deref())?;
-                        models::resolve_model_ref(&config, model)?.canonical
-                    } else if let Some(model) = store.latest_session()?.map(|session| session.model)
-                    {
-                        model
-                    } else {
-                        let config = Config::load_for_scope(project_config_dir.as_deref())?;
-                        models::first_model_ref(&config)?.canonical
-                    };
                     let session = store.create_session_seeded(
                         &cwd.display().to_string(),
-                        &model,
                         &system_prompt::build_system_prompt(
                             &paths::global_dir(),
                             project_config_dir.as_deref(),
@@ -410,7 +405,8 @@ async fn run() -> Result<()> {
                     let sessions = store.list_sessions(limit)?;
                     for (s, updated) in sessions {
                         let title = s.title.unwrap_or_else(|| "(untitled)".into());
-                        println!("{}  {}  {}  {}", s.id, title, s.model, updated);
+                        let model = s.last_model.unwrap_or_else(|| "-".into());
+                        println!("{}  {}  {}  {}", s.id, title, model, updated);
                     }
                 }
                 SessionSub::Transcript { session } => {
@@ -526,12 +522,11 @@ async fn run() -> Result<()> {
             store.normalize_interrupted_tail(&session.id)?;
 
             let request = RequestOptions {
-                model: models::resolve_model_ref(
+                model: resolve_retry_model(
+                    &store,
                     &config,
-                    effective_retry_model_ref(
-                        &session.model,
-                        retry_args.selection.model.as_deref(),
-                    ),
+                    &session,
+                    retry_args.selection.model.as_deref(),
                 )?,
             };
             let model_info = models::resolve_model_info(&config, &request.model);
@@ -565,7 +560,7 @@ async fn run() -> Result<()> {
                 .get_session(&session)?
                 .ok_or_else(|| ExitError::session_not_found(&session))?;
             let request = RequestOptions {
-                model: models::resolve_model_ref(&config, &session_state.model)?,
+                model: resolve_session_model(&store, &config, &session_state)?,
             };
             let provider = build_provider(&config, &request.model.provider_id)?;
             let _lock = acquire_session_lock_or_exit(&store, &session, cli::OutputFormat::Detail)?;
@@ -635,13 +630,7 @@ async fn run_turn_from_source(
     let (session, created) = if let Some(session) = resolved.attached_session.clone() {
         (session, false)
     } else {
-        create_seeded_session(
-            &store,
-            cwd,
-            scope.project(),
-            project_config_dir,
-            &resolved.session_seed,
-        )?
+        create_seeded_session(&store, cwd, scope.project(), project_config_dir)?
     };
     let session_id = session.id.clone();
 
@@ -901,11 +890,9 @@ fn create_seeded_session(
     cwd: &std::path::Path,
     project: Option<&paths::Project>,
     project_config_dir: Option<&std::path::Path>,
-    seed: &RequestOptions,
 ) -> Result<(store::Session, bool)> {
     let session = store.create_session_seeded(
         &cwd.display().to_string(),
-        &seed.model.canonical,
         &system_prompt::build_system_prompt(&paths::global_dir(), project_config_dir)?,
         &system_prompt::initial_environment_context(cwd, project),
     )?;
@@ -938,10 +925,6 @@ fn resolve_retry_session(
         ));
     }
     store.latest_session()
-}
-
-fn effective_retry_model_ref<'a>(stored: &'a str, override_ref: Option<&'a str>) -> &'a str {
-    override_ref.unwrap_or(stored)
 }
 
 fn open_status_store(path: &std::path::Path) -> Result<store::Store> {
@@ -1062,21 +1045,6 @@ mod tests {
         assert_eq!(
             model_override(None, Some("command/model".into())).as_deref(),
             Some("command/model")
-        );
-    }
-
-    #[test]
-    fn retry_model_override_wins_over_stored_model() {
-        assert_eq!(
-            effective_retry_model_ref(
-                "opencode/deepseek-v4-flash-free",
-                Some("opencode/mimo-v2.5-free"),
-            ),
-            "opencode/mimo-v2.5-free"
-        );
-        assert_eq!(
-            effective_retry_model_ref("opencode/deepseek-v4-flash-free", None),
-            "opencode/deepseek-v4-flash-free"
         );
     }
 

@@ -21,7 +21,7 @@ const SESSION_ID_RETRIES: usize = 16;
 pub struct Session {
     pub id: String,
     pub cwd: String,
-    pub model: String,
+    pub last_model: Option<String>,
     pub title: Option<String>,
     pub last_context_tokens: u64,
 }
@@ -96,14 +96,14 @@ impl std::fmt::Display for SessionBusy {
 
 impl std::error::Error for SessionBusy {}
 
-const CURRENT_SCHEMA_VERSION: i32 = 9;
+const CURRENT_SCHEMA_VERSION: i32 = 10;
 const COMPATIBLE_SCHEMA_BASELINE: i32 = 6;
 
 fn session_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Session> {
     Ok(Session {
         id: row.get(0)?,
         cwd: row.get(1)?,
-        model: row.get(2)?,
+        last_model: row.get(2)?,
         title: row.get(3)?,
         last_context_tokens: row.get::<_, i64>(4)? as u64,
     })
@@ -173,6 +173,7 @@ impl Store {
                 6 => self.migrate_schema_v6_to_v7()?,
                 7 => self.migrate_schema_v7_to_v8()?,
                 8 => self.migrate_schema_v8_to_v9()?,
+                9 => self.migrate_schema_v9_to_v10()?,
                 other => anyhow::bail!("no migration path from schema version {other}"),
             }
             version += 1;
@@ -198,7 +199,6 @@ impl Store {
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
                 cwd TEXT NOT NULL,
-                model TEXT NOT NULL,
                 title TEXT,
                 last_context_tokens INTEGER NOT NULL DEFAULT 0,
                 owner_pid INTEGER CHECK(owner_pid IS NULL OR owner_pid > 0)
@@ -311,7 +311,7 @@ impl Store {
                 created_at TEXT NOT NULL,
                 FOREIGN KEY(bash_call_id) REFERENCES bash_call(id)
             );
-            PRAGMA user_version = 9;",
+            PRAGMA user_version = 10;",
         )?;
         Ok(())
     }
@@ -669,23 +669,33 @@ impl Store {
         Ok(())
     }
 
+    /// v10 derives model selection from the append-only turn audit instead of
+    /// duplicating the latest successful model on the mutable session row.
+    fn migrate_schema_v9_to_v10(&self) -> Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute_batch("ALTER TABLE session DROP COLUMN model; PRAGMA user_version = 10;")
+            .context("migrating session database to schema v10")?;
+        tx.commit()?;
+        Ok(())
+    }
+
     /// Test-only: production sessions are created via `create_session_seeded`
     /// so the session row never exists without its system prompt.
     #[cfg(test)]
-    pub fn create_session(&self, cwd: &str, model: &str) -> Result<Session> {
+    pub fn create_session(&self, cwd: &str) -> Result<Session> {
         for _ in 0..SESSION_ID_RETRIES {
             let id = crate::random::session_id()?;
             let now = now_rfc3339();
             match self.conn.execute(
-                "INSERT INTO session (id, created_at, updated_at, cwd, model, title, last_context_tokens)
-                 VALUES (?1, ?2, ?2, ?3, ?4, NULL, 0)",
-                params![id, now, cwd, model],
+                "INSERT INTO session (id, created_at, updated_at, cwd, title, last_context_tokens)
+                 VALUES (?1, ?2, ?2, ?3, NULL, 0)",
+                params![id, now, cwd],
             ) {
                 Ok(_) => {
                     return Ok(Session {
                         id,
                         cwd: cwd.into(),
-                        model: model.into(),
+                        last_model: None,
                         title: None,
                         last_context_tokens: 0,
                     });
@@ -703,7 +713,6 @@ impl Store {
     pub fn create_session_seeded(
         &self,
         cwd: &str,
-        model: &str,
         system_prompt: &str,
         environment_seed: &str,
     ) -> Result<Session> {
@@ -712,9 +721,9 @@ impl Store {
             let now = now_rfc3339();
             let tx = self.conn.unchecked_transaction()?;
             match tx.execute(
-                "INSERT INTO session (id, created_at, updated_at, cwd, model, title, last_context_tokens)
-                 VALUES (?1, ?2, ?2, ?3, ?4, NULL, 0)",
-                params![id, now, cwd, model],
+                "INSERT INTO session (id, created_at, updated_at, cwd, title, last_context_tokens)
+                 VALUES (?1, ?2, ?2, ?3, NULL, 0)",
+                params![id, now, cwd],
             ) {
                 Ok(_) => {
                     insert_message_in(
@@ -737,7 +746,7 @@ impl Store {
                     return Ok(Session {
                         id,
                         cwd: cwd.into(),
-                        model: model.into(),
+                        last_model: None,
                         title: None,
                         last_context_tokens: 0,
                     });
@@ -754,8 +763,12 @@ impl Store {
 
     pub fn get_session(&self, id: &str) -> Result<Option<Session>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, cwd, model, title, last_context_tokens
-             FROM session WHERE id = ?1",
+            "SELECT s.id, s.cwd,
+                    (SELECT ta.model FROM turn_attempt ta
+                     WHERE ta.session_id = s.id AND ta.outcome = 'completed'
+                     ORDER BY ta.id DESC LIMIT 1),
+                    s.title, s.last_context_tokens
+             FROM session s WHERE s.id = ?1",
         )?;
         let row = stmt.query_row(params![id], session_from_row).optional()?;
         Ok(row)
@@ -763,9 +776,13 @@ impl Store {
 
     pub fn list_sessions(&self, limit: usize) -> Result<Vec<(Session, String)>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, cwd, model, title, last_context_tokens, updated_at
-             FROM session
-             ORDER BY updated_at DESC LIMIT ?1",
+            "SELECT s.id, s.cwd,
+                    (SELECT ta.model FROM turn_attempt ta
+                     WHERE ta.session_id = s.id AND ta.outcome = 'completed'
+                     ORDER BY ta.id DESC LIMIT 1),
+                    s.title, s.last_context_tokens, s.updated_at
+             FROM session s
+             ORDER BY s.updated_at DESC LIMIT ?1",
         )?;
         let rows = stmt.query_map(params![limit as i64], |row| {
             Ok((session_from_row(row)?, row.get::<_, String>(5)?))
@@ -815,11 +832,40 @@ impl Store {
 
     pub fn latest_session(&self) -> Result<Option<Session>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, cwd, model, title, last_context_tokens
-             FROM session ORDER BY updated_at DESC LIMIT 1",
+            "SELECT s.id, s.cwd,
+                    (SELECT ta.model FROM turn_attempt ta
+                     WHERE ta.session_id = s.id AND ta.outcome = 'completed'
+                     ORDER BY ta.id DESC LIMIT 1),
+                    s.title, s.last_context_tokens
+             FROM session s ORDER BY s.updated_at DESC LIMIT 1",
         )?;
         let row = stmt.query_row([], session_from_row).optional()?;
         Ok(row)
+    }
+
+    pub fn latest_completed_model(&self) -> Result<Option<String>> {
+        self.conn
+            .query_row(
+                "SELECT model FROM turn_attempt
+                 WHERE outcome = 'completed'
+                 ORDER BY completed_at DESC, id DESC LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub fn latest_attempt_model(&self, session_id: &str) -> Result<Option<String>> {
+        self.conn
+            .query_row(
+                "SELECT model FROM turn_attempt
+                 WHERE session_id = ?1 ORDER BY id DESC LIMIT 1",
+                params![session_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(Into::into)
     }
 
     pub fn update_session(
@@ -835,14 +881,13 @@ impl Store {
         if let Some(t) = title {
             tx.execute(
                 "UPDATE session SET updated_at = ?1, last_context_tokens = ?2,
-                 title = COALESCE(title, ?3), model = ?4 WHERE id = ?5",
-                params![now, context_tokens as i64, t, model, id],
+                 title = COALESCE(title, ?3) WHERE id = ?4",
+                params![now, context_tokens as i64, t, id],
             )?;
         } else {
             tx.execute(
-                "UPDATE session SET updated_at = ?1, last_context_tokens = ?2,
-                 model = ?3 WHERE id = ?4",
-                params![now, context_tokens as i64, model, id],
+                "UPDATE session SET updated_at = ?1, last_context_tokens = ?2 WHERE id = ?3",
+                params![now, context_tokens as i64, id],
             )?;
         }
         tx.execute(
@@ -1920,7 +1965,7 @@ mod tests {
     }
 
     fn create_session_with_system(store: &Store) -> Session {
-        let session = store.create_session("/tmp", "fake-model").unwrap();
+        let session = store.create_session("/tmp").unwrap();
         store
             .append_message(
                 &session.id,
@@ -2404,7 +2449,8 @@ mod tests {
             .collect::<rusqlite::Result<Vec<_>>>()
             .unwrap();
         assert!(!session_columns.contains(&"archived".to_string()));
-        // v9 uses native rowids without AUTOINCREMENT.
+        assert!(!session_columns.contains(&"model".to_string()));
+        // v10 uses native rowids without AUTOINCREMENT.
         let autoincrement_count: i64 = store
             .conn
             .query_row(
@@ -2416,7 +2462,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             autoincrement_count, 0,
-            "no tables should use AUTOINCREMENT in v9"
+            "no tables should use AUTOINCREMENT in v10"
         );
         let sqlite_sequence_exists: bool = store
             .conn
@@ -2615,18 +2661,18 @@ mod tests {
         std::fs::create_dir_all(&tmp).unwrap();
         let db = tmp.join("mu.db");
         let conn = Connection::open(&db).unwrap();
-        conn.execute_batch("PRAGMA user_version = 10;").unwrap();
+        conn.execute_batch("PRAGMA user_version = 11;").unwrap();
         drop(conn);
 
         let error = Store::open(&db).err().unwrap().to_string();
 
-        assert!(error.contains("schema version 10 is newer"));
+        assert!(error.contains("schema version 11 is newer"));
         assert!(error.contains("upgrade mu"));
         let _ = std::fs::remove_dir_all(tmp);
     }
 
     #[test]
-    fn schema_v7_is_migrated_to_v9_preserving_bash_audit_rows() {
+    fn schema_v7_is_migrated_to_v10_preserving_bash_audit_rows_and_model_history() {
         let tmp = std::env::temp_dir().join(format!("mu-store-v7-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&tmp).unwrap();
         let db = tmp.join("mu.db");
@@ -2723,6 +2769,11 @@ mod tests {
              INSERT INTO session VALUES (
                 'session-1', 'now', 'now', '/tmp', 'test/model', NULL, 0
              );
+             INSERT INTO turn_attempt (
+                session_id, kind, model, started_at, completed_at, outcome
+             ) VALUES (
+                'session-1', 'turn', 'test/history-model', 'now', 'later', 'completed'
+             );
              INSERT INTO attachment_blob VALUES (
                 '2d711642b726b04401627ca9fbac32f5c8530fb1903cc4db02258717921a4881',
                 X'78', 1, 'now'
@@ -2778,6 +2829,15 @@ mod tests {
             })
             .unwrap();
         assert_eq!(review, ("deny".into(), "too risky".into()));
+        assert_eq!(
+            store
+                .get_session("session-1")
+                .unwrap()
+                .unwrap()
+                .last_model
+                .as_deref(),
+            Some("test/history-model")
+        );
         let migrated_attachment: (String, String, String, String, Vec<u8>) = store
             .conn
             .query_row(
@@ -2939,7 +2999,7 @@ mod tests {
         let (store, tmp) = temp_store();
 
         let session = store
-            .create_session_seeded("/tmp", "test/model", "system prompt", "[environment] cwd")
+            .create_session_seeded("/tmp", "system prompt", "[environment] cwd")
             .unwrap();
 
         let records = store.message_records_from_seq(&session.id, 0).unwrap();
@@ -3185,8 +3245,8 @@ mod tests {
     #[test]
     fn list_sessions_includes_every_session() {
         let (store, tmp) = temp_store();
-        let first = store.create_session("/tmp", "first-model").unwrap();
-        let second = store.create_session("/tmp", "second-model").unwrap();
+        let first = store.create_session("/tmp").unwrap();
+        let second = store.create_session("/tmp").unwrap();
 
         let sessions = store.list_sessions(20).unwrap();
 

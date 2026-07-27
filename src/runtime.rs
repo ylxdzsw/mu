@@ -21,7 +21,6 @@ pub struct InvocationOverrides {
 pub struct ResolvedInvocation {
     pub attached_session: Option<Session>,
     pub request: RequestOptions,
-    pub session_seed: RequestOptions,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -106,40 +105,56 @@ pub fn resolve_invocation(
         None
     };
 
-    if let Some(session) = attached_session {
-        let stored_model = session.model.clone();
-        let request_ref = overrides.model.as_deref().unwrap_or(&stored_model);
-        return Ok(ResolvedInvocation {
-            attached_session: Some(session),
-            request: RequestOptions {
-                model: resolve_model_ref(config, request_ref)?,
-            },
-            session_seed: RequestOptions {
-                model: resolve_model_ref(config, &stored_model)?,
-            },
-        });
-    }
-
-    let seed_model = if let Some(model_ref) = overrides.model.as_deref() {
+    let model = if let Some(model_ref) = overrides.model.as_deref() {
         resolve_model_ref(config, model_ref)?
-    } else if let Some(session) = store.latest_session()? {
-        resolve_model_ref(config, &session.model)?
+    } else if let Some(session) = attached_session.as_ref() {
+        resolve_session_model(store, config, session)?
     } else {
-        first_model_ref(config)?
-    };
-    let request_model = if let Some(model_ref) = overrides.model.as_deref() {
-        resolve_model_ref(config, model_ref)?
-    } else {
-        seed_model.clone()
+        resolve_scope_model(store, config)?
     };
 
     Ok(ResolvedInvocation {
-        attached_session: None,
-        request: RequestOptions {
-            model: request_model,
-        },
-        session_seed: RequestOptions { model: seed_model },
+        attached_session,
+        request: RequestOptions { model },
     })
+}
+
+pub fn resolve_scope_model(
+    store: &Store,
+    config: &Config,
+) -> Result<crate::models::ResolvedModelRef> {
+    if let Some(model) = store.latest_completed_model()? {
+        resolve_model_ref(config, &model)
+    } else {
+        first_model_ref(config)
+    }
+}
+
+pub fn resolve_session_model(
+    store: &Store,
+    config: &Config,
+    session: &Session,
+) -> Result<crate::models::ResolvedModelRef> {
+    if let Some(model) = session.last_model.as_deref() {
+        resolve_model_ref(config, model)
+    } else {
+        resolve_scope_model(store, config)
+    }
+}
+
+pub fn resolve_retry_model(
+    store: &Store,
+    config: &Config,
+    session: &Session,
+    override_ref: Option<&str>,
+) -> Result<crate::models::ResolvedModelRef> {
+    if let Some(model) = override_ref {
+        return resolve_model_ref(config, model);
+    }
+    if let Some(model) = store.latest_attempt_model(&session.id)? {
+        return resolve_model_ref(config, &model);
+    }
+    resolve_session_model(store, config, session)
 }
 
 pub fn build_status_report(
@@ -331,6 +346,26 @@ mod tests {
         }
     }
 
+    fn finish_attempt(store: &Store, session_id: &str, model: &str, outcome: &str) {
+        let attempt = store.start_turn_attempt(session_id, "turn", model).unwrap();
+        store
+            .finish_turn_attempt(
+                attempt,
+                crate::store::TurnAttemptCompletion {
+                    outcome,
+                    error_class: None,
+                    error: None,
+                    partial_output: None,
+                    provider_request_count: 1,
+                    iteration_count: 1,
+                    retry_count: 0,
+                    duration_ms: 1,
+                    context_tokens: 1,
+                },
+            )
+            .unwrap();
+    }
+
     #[test]
     fn new_scope_uses_first_configured_model() {
         let store = Store::open_memory().unwrap();
@@ -339,15 +374,11 @@ mod tests {
             resolve_invocation(&store, &test_config(), &InvocationOverrides::default()).unwrap();
 
         assert_eq!(resolved.request.model.canonical, "alpha/default-model");
-        assert_eq!(resolved.session_seed.model.canonical, "alpha/default-model");
     }
 
     #[test]
-    fn explicit_model_override_seeds_new_session_with_override() {
+    fn explicit_model_override_wins_for_new_session() {
         let store = Store::open_memory().unwrap();
-        store
-            .create_session("/tmp", "alpha/default-model:high")
-            .unwrap();
 
         let resolved = resolve_invocation(
             &store,
@@ -361,18 +392,72 @@ mod tests {
         .unwrap();
 
         assert_eq!(resolved.request.model.canonical, "alpha/default-model:low");
-        assert_eq!(
-            resolved.session_seed.model.canonical,
-            "alpha/default-model:low"
+    }
+
+    #[test]
+    fn completed_attempts_supply_session_and_scope_models() {
+        let store = Store::open_memory().unwrap();
+        let completed = store.create_session("/tmp").unwrap();
+        finish_attempt(
+            &store,
+            &completed.id,
+            "alpha/default-model:high",
+            "completed",
         );
+        let empty = store.create_session("/tmp").unwrap();
+        let newer = store.create_session("/tmp").unwrap();
+        finish_attempt(&store, &newer.id, "alpha/default-model:low", "completed");
+
+        let attached = resolve_invocation(
+            &store,
+            &test_config(),
+            &InvocationOverrides {
+                session: Some(completed.id),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(attached.request.model.canonical, "alpha/default-model:high");
+
+        let empty = resolve_invocation(
+            &store,
+            &test_config(),
+            &InvocationOverrides {
+                session: Some(empty.id),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(empty.request.model.canonical, "alpha/default-model:low");
+    }
+
+    #[test]
+    fn retry_prefers_latest_attempt_but_normal_turn_uses_latest_completed() {
+        let store = Store::open_memory().unwrap();
+        let session = store.create_session("/tmp").unwrap();
+        finish_attempt(&store, &session.id, "alpha/default-model:high", "completed");
+        finish_attempt(&store, &session.id, "alpha/default-model:low", "error");
+        let session = store.get_session(&session.id).unwrap().unwrap();
+
+        let normal = resolve_session_model(&store, &test_config(), &session).unwrap();
+        let retry = resolve_retry_model(&store, &test_config(), &session, None).unwrap();
+        let overridden = resolve_retry_model(
+            &store,
+            &test_config(),
+            &session,
+            Some("alpha/default-model"),
+        )
+        .unwrap();
+
+        assert_eq!(normal.canonical, "alpha/default-model:high");
+        assert_eq!(retry.canonical, "alpha/default-model:low");
+        assert_eq!(overridden.canonical, "alpha/default-model");
     }
 
     #[test]
     fn status_report_reports_cleanliness() {
         let store = Store::open_memory().unwrap();
-        let session = store
-            .create_session("/tmp", "alpha/default-model:high")
-            .unwrap();
+        let session = store.create_session("/tmp").unwrap();
         // A user prompt with no assistant reply => interrupted => unclean.
         store
             .append_message(

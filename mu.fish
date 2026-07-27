@@ -12,12 +12,12 @@ if not string match -qr '^[0-9]+$' -- "$_mu_fish_version_major"; or test "$_mu_f
 end
 
 set -q MU_FISH_MODE; or set -g MU_FISH_MODE shell
+set -q MU_FISH_TRACKED_SCOPE; or set -g MU_FISH_TRACKED_SCOPE
 set -q MU_FISH_SESSION_ID; or set -g MU_FISH_SESSION_ID
-set -q MU_FISH_SESSION_SCOPE; or set -g MU_FISH_SESSION_SCOPE
 set -q MU_FISH_EFFECTIVE_SESSION_ID; or set -g MU_FISH_EFFECTIVE_SESSION_ID
 set -q MU_FISH_MODEL; or set -g MU_FISH_MODEL
-set -q MU_FISH_MODEL_SCOPE; or set -g MU_FISH_MODEL_SCOPE
 set -q MU_FISH_EFFECTIVE_MODEL; or set -g MU_FISH_EFFECTIVE_MODEL
+set -q MU_FISH_EFFECTIVE_ATTACHMENT_COUNT; or set -g MU_FISH_EFFECTIVE_ATTACHMENT_COUNT 0
 set -q MU_FISH_BIN; or set -g MU_FISH_BIN mu
 set -q MU_FISH_OUTPUT; or set -g MU_FISH_OUTPUT
 set -q MU_FISH_PROMPT_INPUT; or set -g MU_FISH_PROMPT_INPUT 'mu> '
@@ -97,86 +97,74 @@ function _mu_fish_current_scope
     _mu_fish_scope_for_dir "$PWD"
 end
 
-function _mu_fish_sync_session_state --argument-names requested_scope
-    set -l scope $requested_scope
-    test -n "$scope"; or set scope (_mu_fish_current_scope)
-
-    if not set -q MU_FISH_SESSION_ID[1]; or test -z "$MU_FISH_SESSION_ID"
-        set -g MU_FISH_SESSION_SCOPE
-        set -g MU_FISH_EFFECTIVE_SESSION_ID
-        return 0
-    end
-
-    if not set -q MU_FISH_SESSION_SCOPE[1]; or test -z "$MU_FISH_SESSION_SCOPE"
-        set -g MU_FISH_SESSION_SCOPE $scope
-    end
-
-    if test "$MU_FISH_SESSION_SCOPE" = "$scope"
-        set -g MU_FISH_EFFECTIVE_SESSION_ID $MU_FISH_SESSION_ID
-    else
-        set -g MU_FISH_EFFECTIVE_SESSION_ID
-    end
-end
-
-function _mu_fish_sync_model_state --argument-names requested_scope
-    set -l scope $requested_scope
-    test -n "$scope"; or set scope (_mu_fish_current_scope)
-
-    if not set -q MU_FISH_MODEL[1]; or test -z "$MU_FISH_MODEL"
-        set -g MU_FISH_MODEL_SCOPE
-        set -g MU_FISH_EFFECTIVE_MODEL
-        return 0
-    end
-
-    if not set -q MU_FISH_MODEL_SCOPE[1]; or test -z "$MU_FISH_MODEL_SCOPE"
-        set -g MU_FISH_MODEL_SCOPE $scope
-    end
-
-    if test "$MU_FISH_MODEL_SCOPE" = "$scope"
-        set -g MU_FISH_EFFECTIVE_MODEL $MU_FISH_MODEL
-    else
-        set -g MU_FISH_EFFECTIVE_MODEL
-    end
-end
-
 function _mu_fish_sync_state --argument-names requested_scope
     set -l scope $requested_scope
     test -n "$scope"; or set scope (_mu_fish_current_scope)
-    _mu_fish_sync_session_state "$scope"
-    _mu_fish_sync_model_state "$scope"
+
+    set -l has_state 0
+    if set -q MU_FISH_SESSION_ID[1]; and test -n "$MU_FISH_SESSION_ID"
+        set has_state 1
+    else if set -q MU_FISH_MODEL[1]; and test -n "$MU_FISH_MODEL"
+        set has_state 1
+    else if set -q MU_FISH_PENDING_ATTACHMENTS[1]
+        set has_state 1
+    end
+
+    if test $has_state -eq 1
+        and begin
+            not set -q MU_FISH_TRACKED_SCOPE[1]; or test -z "$MU_FISH_TRACKED_SCOPE"
+        end
+        set -g MU_FISH_TRACKED_SCOPE $scope
+    end
+
+    if set -q MU_FISH_TRACKED_SCOPE[1]
+        and test -n "$MU_FISH_TRACKED_SCOPE"
+        and test "$MU_FISH_TRACKED_SCOPE" = "$scope"
+        set -g MU_FISH_EFFECTIVE_SESSION_ID $MU_FISH_SESSION_ID
+        set -g MU_FISH_EFFECTIVE_MODEL $MU_FISH_MODEL
+        set -g MU_FISH_EFFECTIVE_ATTACHMENT_COUNT (count $MU_FISH_PENDING_ATTACHMENTS)
+    else
+        set -g MU_FISH_EFFECTIVE_SESSION_ID
+        set -g MU_FISH_EFFECTIVE_MODEL
+        set -g MU_FISH_EFFECTIVE_ATTACHMENT_COUNT 0
+    end
+    return 0
 end
 
 function _mu_fish_clear_session_state
     set -g MU_FISH_SESSION_ID
-    set -g MU_FISH_SESSION_SCOPE
     set -g MU_FISH_EFFECTIVE_SESSION_ID
 end
 
 function _mu_fish_clear_model_state
     set -g MU_FISH_MODEL
-    set -g MU_FISH_MODEL_SCOPE
     set -g MU_FISH_EFFECTIVE_MODEL
 end
 
-function _mu_fish_forget_state_outside_scope --argument-names scope
-    if set -q MU_FISH_SESSION_SCOPE[1]
-        and test -n "$MU_FISH_SESSION_SCOPE"
-        and test "$MU_FISH_SESSION_SCOPE" != "$scope"
-        _mu_fish_clear_session_state
+function _mu_fish_clear_tracked_state
+    _mu_fish_clear_session_state
+    _mu_fish_clear_model_state
+    set -g MU_FISH_PENDING_ATTACHMENTS
+    set -g MU_FISH_TRACKED_SCOPE
+    set -g MU_FISH_EFFECTIVE_ATTACHMENT_COUNT 0
+end
+
+function _mu_fish_activate_scope --argument-names scope
+    if set -q MU_FISH_TRACKED_SCOPE[1]
+        and test -n "$MU_FISH_TRACKED_SCOPE"
+        and test "$MU_FISH_TRACKED_SCOPE" != "$scope"
+        _mu_fish_clear_tracked_state
     end
-    if set -q MU_FISH_MODEL_SCOPE[1]
-        and test -n "$MU_FISH_MODEL_SCOPE"
-        and test "$MU_FISH_MODEL_SCOPE" != "$scope"
-        _mu_fish_clear_model_state
-    end
+    set -g MU_FISH_TRACKED_SCOPE $scope
+    _mu_fish_sync_state "$scope"
 end
 
 function _mu_fish_remember_session_for_scope --argument-names id requested_scope
     test -n "$id"; or return 0
     set -l scope $requested_scope
     test -n "$scope"; or set scope (_mu_fish_current_scope)
+    _mu_fish_activate_scope "$scope"
     set -g MU_FISH_SESSION_ID $id
-    set -g MU_FISH_SESSION_SCOPE $scope
     set -g MU_FISH_EFFECTIVE_SESSION_ID $id
 end
 
@@ -210,7 +198,6 @@ end
 
 function _mu_fish_create_session_for_scope --argument-names scope
     set -l command "$MU_FISH_BIN"
-    set -q MU_FISH_EFFECTIVE_MODEL[1]; and test -n "$MU_FISH_EFFECTIVE_MODEL"; and set -a command --model "$MU_FISH_EFFECTIVE_MODEL"
     set -l id ($command session new | string collect)
     set -l command_status $pipestatus[1]
     test $command_status -eq 0; or return $command_status
@@ -299,10 +286,10 @@ function _mu_fish_build_mode_prompt
         set_color normal
     end
 
-    if set -q MU_FISH_PENDING_ATTACHMENTS[1]
+    if test "$MU_FISH_EFFECTIVE_ATTACHMENT_COUNT" -gt 0
         printf ' '
         set_color "$MU_FISH_PROMPT_CONTEXT_COLOR"
-        printf '[%d attachments]' (count $MU_FISH_PENDING_ATTACHMENTS)
+        printf '[%d attachments]' "$MU_FISH_EFFECTIVE_ATTACHMENT_COUNT"
         set_color normal
     end
 
@@ -359,7 +346,7 @@ function _mu_fish_call_saved_tab --argument-names mode
 end
 
 function _mu_fish_has_effective_session
-    _mu_fish_sync_session_state
+    _mu_fish_sync_state
     set -q MU_FISH_EFFECTIVE_SESSION_ID[1]; and test -n "$MU_FISH_EFFECTIVE_SESSION_ID"
 end
 
@@ -460,7 +447,7 @@ function _mu_fish_model_effort_suffixes --argument-names fragment
 end
 
 function _mu_fish_require_effective_session --argument-names slash_command
-    _mu_fish_sync_session_state
+    _mu_fish_sync_state
     if not set -q MU_FISH_EFFECTIVE_SESSION_ID[1]; or test -z "$MU_FISH_EFFECTIVE_SESSION_ID"
         _mu_fish_print_block_message "[mu] $slash_command requires an active session in this scope"
         return 1
@@ -468,7 +455,7 @@ function _mu_fish_require_effective_session --argument-names slash_command
 end
 
 function _mu_fish_validate_model_ref --argument-names model
-    _mu_fish_sync_session_state
+    _mu_fish_sync_state
     set -l command "$MU_FISH_BIN" status --json --model "$model"
     set -q MU_FISH_EFFECTIVE_SESSION_ID[1]; and test -n "$MU_FISH_EFFECTIVE_SESSION_ID"; and set -a command -s "$MU_FISH_EFFECTIVE_SESSION_ID"
     set -l json ($command 2>/dev/null | string collect)
@@ -480,8 +467,7 @@ end
 
 function _mu_fish_run_custom_slash_command --argument-names slash_command instruction
     set -l scope (_mu_fish_current_scope)
-    _mu_fish_forget_state_outside_scope "$scope"
-    _mu_fish_sync_state "$scope"
+    _mu_fish_activate_scope "$scope"
     if not set -q MU_FISH_EFFECTIVE_SESSION_ID[1]; or test -z "$MU_FISH_EFFECTIVE_SESSION_ID"
         _mu_fish_create_session_for_scope "$scope"; or return $status
     end
@@ -492,6 +478,7 @@ function _mu_fish_run_custom_slash_command --argument-names slash_command instru
     end
     set -a command (string replace -r '^/' '' -- "$slash_command")
     set -g MU_FISH_PENDING_ATTACHMENTS
+    set -g MU_FISH_EFFECTIVE_ATTACHMENT_COUNT 0
 
     if test -n "$instruction"
         printf '%s' "$instruction" | $command
@@ -511,10 +498,12 @@ function _mu_fish_run_slash_command --argument-names line
     set -l exit_status 0
 
     _mu_fish_append_history "$line"
+    set -l scope (_mu_fish_current_scope)
 
     switch "$slash_command"
         case /attach
             if test -z "$rest"
+                _mu_fish_activate_scope "$scope"
                 if set -q MU_FISH_PENDING_ATTACHMENTS[1]
                     _mu_fish_print_block_message "[mu] pending attachments: "(string join ', ' -- $MU_FISH_PENDING_ATTACHMENTS)
                 else
@@ -523,7 +512,9 @@ function _mu_fish_run_slash_command --argument-names line
                 return 0
             end
             if test "$rest" = --clear
+                _mu_fish_activate_scope "$scope"
                 set -g MU_FISH_PENDING_ATTACHMENTS
+                set -g MU_FISH_EFFECTIVE_ATTACHMENT_COUNT 0
                 _mu_fish_print_block_message '[mu] cleared pending attachments'
                 return 0
             end
@@ -540,8 +531,10 @@ function _mu_fish_run_slash_command --argument-names line
                 return 1
             end
             set attachment_path (path resolve -- "$attachment_path")
+            _mu_fish_activate_scope "$scope"
             set -ga MU_FISH_PENDING_ATTACHMENTS "$attachment_path"
             set -l count (count $MU_FISH_PENDING_ATTACHMENTS)
+            set -g MU_FISH_EFFECTIVE_ATTACHMENT_COUNT $count
             set -l label files
             test $count -eq 1; and set label file
             _mu_fish_print_block_message "[mu] attached "(path basename "$attachment_path")" for the next message ($count $label)"
@@ -559,8 +552,8 @@ function _mu_fish_run_slash_command --argument-names line
                 _mu_fish_print_block_message "[mu] unknown or unsupported model: $rest"
                 return 1
             end
+            _mu_fish_activate_scope "$scope"
             set -g MU_FISH_MODEL "$_MU_FISH_VALIDATED_MODEL"
-            set -g MU_FISH_MODEL_SCOPE (_mu_fish_current_scope)
             set -g MU_FISH_EFFECTIVE_MODEL "$_MU_FISH_VALIDATED_MODEL"
             _mu_fish_print_block_message "[mu] next turns in this scope will use $_MU_FISH_VALIDATED_MODEL"
 
@@ -569,6 +562,7 @@ function _mu_fish_run_slash_command --argument-names line
                 _mu_fish_print_block_message '[mu] /new does not accept arguments'
                 return 1
             end
+            _mu_fish_activate_scope "$scope"
             _mu_fish_require_effective_session /new; or return 1
             _mu_fish_clear_session_state
             _mu_fish_print_block_message '[mu] next turn will start a new session'
@@ -578,6 +572,7 @@ function _mu_fish_run_slash_command --argument-names line
                 _mu_fish_print_block_message '[mu] /retry does not accept arguments'
                 return 1
             end
+            _mu_fish_activate_scope "$scope"
             _mu_fish_require_effective_session /retry; or return 1
             set -l retry_command "$MU_FISH_BIN" retry -s "$MU_FISH_EFFECTIVE_SESSION_ID"
             set -q MU_FISH_EFFECTIVE_MODEL[1]; and test -n "$MU_FISH_EFFECTIVE_MODEL"; and set -a retry_command --model "$MU_FISH_EFFECTIVE_MODEL"
@@ -586,6 +581,7 @@ function _mu_fish_run_slash_command --argument-names line
             set exit_status $status
 
         case /compact
+            _mu_fish_activate_scope "$scope"
             _mu_fish_require_effective_session /compact; or return 1
             if test -n "$instruction"
                 printf '%s' "$instruction" | "$MU_FISH_BIN" compact --session "$MU_FISH_EFFECTIVE_SESSION_ID"
@@ -606,16 +602,13 @@ function _mu_fish_run_slash_command --argument-names line
             end
     end
 
-    set -l scope (_mu_fish_current_scope)
     _mu_fish_sync_state "$scope"
-    _mu_fish_forget_state_outside_scope "$scope"
     return $exit_status
 end
 
 function _mu_fish_submit_prompt --argument-names input
     set -l scope (_mu_fish_current_scope)
-    _mu_fish_forget_state_outside_scope "$scope"
-    _mu_fish_sync_state "$scope"
+    _mu_fish_activate_scope "$scope"
     if not set -q MU_FISH_EFFECTIVE_SESSION_ID[1]; or test -z "$MU_FISH_EFFECTIVE_SESSION_ID"
         _mu_fish_create_session_for_scope "$scope"; or return $status
     end
@@ -626,6 +619,7 @@ function _mu_fish_submit_prompt --argument-names input
     end
     _mu_fish_record_turn_history "$input" $command
     set -g MU_FISH_PENDING_ATTACHMENTS
+    set -g MU_FISH_EFFECTIVE_ATTACHMENT_COUNT 0
 
     printf '%s\n' "$input" | $command
     return $pipestatus[2]

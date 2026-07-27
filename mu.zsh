@@ -8,12 +8,12 @@
 # the current buffer instead of browsing shell history.
 
 typeset -g MU_ZSH_MODE=${MU_ZSH_MODE:-shell}
+typeset -g MU_ZSH_TRACKED_SCOPE=${MU_ZSH_TRACKED_SCOPE:-}
 typeset -g MU_ZSH_SESSION_ID=${MU_ZSH_SESSION_ID:-}
-typeset -g MU_ZSH_SESSION_SCOPE=${MU_ZSH_SESSION_SCOPE:-}
 typeset -g MU_ZSH_EFFECTIVE_SESSION_ID=${MU_ZSH_EFFECTIVE_SESSION_ID:-}
 typeset -g MU_ZSH_MODEL=${MU_ZSH_MODEL:-}
-typeset -g MU_ZSH_MODEL_SCOPE=${MU_ZSH_MODEL_SCOPE:-}
 typeset -g MU_ZSH_EFFECTIVE_MODEL=${MU_ZSH_EFFECTIVE_MODEL:-}
+typeset -gi MU_ZSH_EFFECTIVE_ATTACHMENT_COUNT=0
 typeset -g MU_ZSH_BIN=${MU_ZSH_BIN:-mu}
 typeset -g MU_ZSH_OUTPUT=${MU_ZSH_OUTPUT:-}
 typeset -g MU_ZSH_PROMPT_INPUT=${MU_ZSH_PROMPT_INPUT:-${MU_ZSH_PROMPT:-'mu> '}}
@@ -137,85 +137,55 @@ _mu_zsh_current_scope_key() {
   print -r -- "$REPLY"
 }
 
-_mu_zsh_sync_session_state() {
-  local scope=${1:-}
-  [[ -n "$scope" ]] || {
-    _mu_zsh_set_current_scope_key
-    scope=$REPLY
-  }
-
-  if [[ -z "$MU_ZSH_SESSION_ID" ]]; then
-    MU_ZSH_SESSION_SCOPE=
-    MU_ZSH_EFFECTIVE_SESSION_ID=
-    return 0
-  fi
-
-  if [[ -z "$MU_ZSH_SESSION_SCOPE" ]]; then
-    MU_ZSH_SESSION_SCOPE=$scope
-  fi
-
-  if [[ "$MU_ZSH_SESSION_SCOPE" == "$scope" ]]; then
-    MU_ZSH_EFFECTIVE_SESSION_ID=$MU_ZSH_SESSION_ID
-  else
-    MU_ZSH_EFFECTIVE_SESSION_ID=
-  fi
-}
-
-_mu_zsh_sync_model_state() {
-  local scope=${1:-}
-  [[ -n "$scope" ]] || {
-    _mu_zsh_set_current_scope_key
-    scope=$REPLY
-  }
-
-  if [[ -z "$MU_ZSH_MODEL" ]]; then
-    MU_ZSH_MODEL_SCOPE=
-    MU_ZSH_EFFECTIVE_MODEL=
-    return 0
-  fi
-
-  if [[ -z "$MU_ZSH_MODEL_SCOPE" ]]; then
-    MU_ZSH_MODEL_SCOPE=$scope
-  fi
-
-  if [[ "$MU_ZSH_MODEL_SCOPE" == "$scope" ]]; then
-    MU_ZSH_EFFECTIVE_MODEL=$MU_ZSH_MODEL
-  else
-    MU_ZSH_EFFECTIVE_MODEL=
-  fi
-}
-
 _mu_zsh_sync_state() {
   local scope=${1:-}
   [[ -n "$scope" ]] || {
     _mu_zsh_set_current_scope_key
     scope=$REPLY
   }
-  _mu_zsh_sync_session_state "$scope"
-  _mu_zsh_sync_model_state "$scope"
+
+  if [[ -z "$MU_ZSH_TRACKED_SCOPE" ]] &&
+    [[ -n "$MU_ZSH_SESSION_ID" || -n "$MU_ZSH_MODEL" || ${#MU_ZSH_PENDING_ATTACHMENTS[@]} -gt 0 ]]; then
+    MU_ZSH_TRACKED_SCOPE=$scope
+  fi
+
+  if [[ -n "$MU_ZSH_TRACKED_SCOPE" && "$MU_ZSH_TRACKED_SCOPE" == "$scope" ]]; then
+    MU_ZSH_EFFECTIVE_SESSION_ID=$MU_ZSH_SESSION_ID
+    MU_ZSH_EFFECTIVE_MODEL=$MU_ZSH_MODEL
+    MU_ZSH_EFFECTIVE_ATTACHMENT_COUNT=${#MU_ZSH_PENDING_ATTACHMENTS[@]}
+  else
+    MU_ZSH_EFFECTIVE_SESSION_ID=
+    MU_ZSH_EFFECTIVE_MODEL=
+    MU_ZSH_EFFECTIVE_ATTACHMENT_COUNT=0
+  fi
 }
 
 _mu_zsh_clear_session_state() {
   MU_ZSH_SESSION_ID=
-  MU_ZSH_SESSION_SCOPE=
   MU_ZSH_EFFECTIVE_SESSION_ID=
 }
 
 _mu_zsh_clear_model_state() {
   MU_ZSH_MODEL=
-  MU_ZSH_MODEL_SCOPE=
   MU_ZSH_EFFECTIVE_MODEL=
 }
 
-_mu_zsh_forget_state_outside_scope() {
+_mu_zsh_clear_tracked_state() {
+  _mu_zsh_clear_session_state
+  _mu_zsh_clear_model_state
+  MU_ZSH_PENDING_ATTACHMENTS=()
+  MU_ZSH_TRACKED_SCOPE=
+  MU_ZSH_EFFECTIVE_ATTACHMENT_COUNT=0
+}
+
+_mu_zsh_activate_scope() {
   local scope=$1
 
-  if [[ -n "$MU_ZSH_SESSION_SCOPE" && "$MU_ZSH_SESSION_SCOPE" != "$scope" ]]; then
-    _mu_zsh_clear_session_state
+  if [[ -n "$MU_ZSH_TRACKED_SCOPE" && "$MU_ZSH_TRACKED_SCOPE" != "$scope" ]]; then
+    _mu_zsh_clear_tracked_state
   fi
-  if [[ -n "$MU_ZSH_MODEL_SCOPE" && "$MU_ZSH_MODEL_SCOPE" != "$scope" ]]; then
-    _mu_zsh_clear_model_state
-  fi
+  MU_ZSH_TRACKED_SCOPE=$scope
+  _mu_zsh_sync_state "$scope"
 }
 
 _mu_zsh_remember_session_for_scope() {
@@ -228,8 +198,8 @@ _mu_zsh_remember_session_for_scope() {
   }
 
   [[ -n "$id" ]] || return 0
+  _mu_zsh_activate_scope "$scope"
   MU_ZSH_SESSION_ID=$id
-  MU_ZSH_SESSION_SCOPE=$scope
   MU_ZSH_EFFECTIVE_SESSION_ID=$id
 }
 
@@ -272,11 +242,9 @@ _mu_zsh_print_block_message() {
 
 _mu_zsh_create_session_for_scope() {
   local scope=$1
-  local model=$MU_ZSH_EFFECTIVE_MODEL
   local id
   local -a command
   command=("$MU_ZSH_BIN")
-  [[ -n "$model" ]] && command+=(--model "$model")
   id=$("${command[@]}" session new) || return $?
   id=${id//$'\n'/}
   [[ "$id" =~ '^ses_[0-9a-hjkmnpqrstvwxyz]{8}$' ]] || {
@@ -382,8 +350,8 @@ _mu_zsh_build_mode_prompt() {
     project_segment=
   fi
 
-  if (( ${#MU_ZSH_PENDING_ATTACHMENTS[@]} )); then
-    attachment_segment=" %F{$MU_ZSH_PROMPT_CONTEXT_COLOR}[${#MU_ZSH_PENDING_ATTACHMENTS[@]} attachments]%f"
+  if (( MU_ZSH_EFFECTIVE_ATTACHMENT_COUNT )); then
+    attachment_segment=" %F{$MU_ZSH_PROMPT_CONTEXT_COLOR}[${MU_ZSH_EFFECTIVE_ATTACHMENT_COUNT} attachments]%f"
   else
     attachment_segment=
   fi
@@ -462,7 +430,7 @@ _mu_zsh_reset_mode_prompt() {
 }
 
 _mu_zsh_has_effective_session() {
-  _mu_zsh_sync_session_state
+  _mu_zsh_sync_state
   [[ -n "$MU_ZSH_EFFECTIVE_SESSION_ID" ]]
 }
 
@@ -749,7 +717,7 @@ _mu_zsh_is_known_slash_command() {
 
 _mu_zsh_require_effective_session() {
   local command=$1
-  _mu_zsh_sync_session_state
+  _mu_zsh_sync_state
   if [[ -z "$MU_ZSH_EFFECTIVE_SESSION_ID" ]]; then
     _mu_zsh_print_block_message "[mu] $command requires an active session in this scope"
     return 1
@@ -771,7 +739,7 @@ _mu_zsh_validate_model_ref() {
   local model=$1
   local -a command
   local status_json
-  _mu_zsh_sync_session_state
+  _mu_zsh_sync_state
   command=("$MU_ZSH_BIN" status --json --model "$model")
   [[ -n "$MU_ZSH_EFFECTIVE_SESSION_ID" ]] && command+=(-s "$MU_ZSH_EFFECTIVE_SESSION_ID")
   status_json=$("${command[@]}" 2>/dev/null) || return 1
@@ -788,8 +756,7 @@ _mu_zsh_run_custom_slash_command() {
 
   _mu_zsh_set_current_scope_key
   scope=$REPLY
-  _mu_zsh_forget_state_outside_scope "$scope"
-  _mu_zsh_sync_state "$scope"
+  _mu_zsh_activate_scope "$scope"
   [[ -n "$MU_ZSH_EFFECTIVE_SESSION_ID" ]] ||
     _mu_zsh_create_session_for_scope "$scope" || return $?
   _mu_zsh_base_command_reply "$scope"
@@ -802,6 +769,7 @@ _mu_zsh_run_custom_slash_command() {
   done
   command+=("$name")
   MU_ZSH_PENDING_ATTACHMENTS=()
+  MU_ZSH_EFFECTIVE_ATTACHMENT_COUNT=0
 
   if [[ -n "$instruction" ]]; then
     print -rn -- "$instruction" | "${command[@]}"
@@ -837,9 +805,12 @@ _mu_zsh_run_slash_command() {
   fi
 
   print -sr -- "$line"
+  _mu_zsh_set_current_scope_key
+  scope=$REPLY
   case "$command" in
     /attach)
       if [[ -z "$rest" ]]; then
+        _mu_zsh_activate_scope "$scope"
         if (( ${#MU_ZSH_PENDING_ATTACHMENTS[@]} )); then
           _mu_zsh_print_block_message "[mu] pending attachments: ${(j:, :)MU_ZSH_PENDING_ATTACHMENTS}"
         else
@@ -848,7 +819,9 @@ _mu_zsh_run_slash_command() {
         return 0
       fi
       if [[ "$rest" == --clear ]]; then
+        _mu_zsh_activate_scope "$scope"
         MU_ZSH_PENDING_ATTACHMENTS=()
+        MU_ZSH_EFFECTIVE_ATTACHMENT_COUNT=0
         _mu_zsh_print_block_message "[mu] cleared pending attachments"
         return 0
       fi
@@ -863,8 +836,10 @@ _mu_zsh_run_slash_command() {
         _mu_zsh_print_block_message "[mu] attachment is not a readable file: $rest"
         return 1
       fi
+      _mu_zsh_activate_scope "$scope"
       MU_ZSH_PENDING_ATTACHMENTS+=("$attachment_path")
       local attachment_count=${#MU_ZSH_PENDING_ATTACHMENTS[@]}
+      MU_ZSH_EFFECTIVE_ATTACHMENT_COUNT=$attachment_count
       local attachment_label=files
       (( attachment_count == 1 )) && attachment_label=file
       _mu_zsh_print_block_message "[mu] attached ${attachment_path:t} for the next message ($attachment_count $attachment_label)"
@@ -883,20 +858,21 @@ _mu_zsh_run_slash_command() {
         return 1
       fi
       resolved_model=$REPLY
+      _mu_zsh_activate_scope "$scope"
       MU_ZSH_MODEL=$resolved_model
-      _mu_zsh_set_current_scope_key
-      MU_ZSH_MODEL_SCOPE=$REPLY
       MU_ZSH_EFFECTIVE_MODEL=$resolved_model
       _mu_zsh_print_block_message "[mu] next turns in this scope will use $resolved_model"
       ;;
     /new)
       _mu_zsh_validate_no_args "$command" "$rest" || return 1
+      _mu_zsh_activate_scope "$scope"
       _mu_zsh_require_effective_session "$command" || return 1
       _mu_zsh_clear_session_state
       _mu_zsh_print_block_message "[mu] next turn will start a new session"
       ;;
     /retry)
       _mu_zsh_validate_no_args "$command" "$rest" || return 1
+      _mu_zsh_activate_scope "$scope"
       _mu_zsh_require_effective_session "$command" || return 1
       session_id=$MU_ZSH_EFFECTIVE_SESSION_ID
       local -a retry_command
@@ -910,6 +886,7 @@ _mu_zsh_run_slash_command() {
       fi
       ;;
     /compact)
+      _mu_zsh_activate_scope "$scope"
       _mu_zsh_require_effective_session "$command" || return 1
       session_id=$MU_ZSH_EFFECTIVE_SESSION_ID
       if [[ -n "$instruction" ]]; then
@@ -935,10 +912,7 @@ _mu_zsh_run_slash_command() {
       ;;
   esac
 
-  _mu_zsh_set_current_scope_key
-  scope=$REPLY
   _mu_zsh_sync_state "$scope"
-  _mu_zsh_forget_state_outside_scope "$scope"
   return $exit_status
 }
 
@@ -990,9 +964,7 @@ _mu_zsh_submit_prompt() {
 
   _mu_zsh_set_current_scope_key
   scope=$REPLY
-  _mu_zsh_forget_state_outside_scope "$scope"
-
-  _mu_zsh_sync_state "$scope"
+  _mu_zsh_activate_scope "$scope"
   [[ -n "$MU_ZSH_EFFECTIVE_SESSION_ID" ]] ||
     _mu_zsh_create_session_for_scope "$scope" || return $?
   # Create the session before recording history so the replay command can
@@ -1006,6 +978,7 @@ _mu_zsh_submit_prompt() {
     command+=(-a "$attachment")
   done
   MU_ZSH_PENDING_ATTACHMENTS=()
+  MU_ZSH_EFFECTIVE_ATTACHMENT_COUNT=0
 
   "${command[@]}" <<< "$input"
   exit_status=$?

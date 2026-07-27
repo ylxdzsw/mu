@@ -287,7 +287,8 @@ accepts optional non-terminal stdin as a custom focus). The surface is small:
   configuration. Neither mode loads
   a provider; scope resolves from the working directory like other introspection
   commands. See the README for a Claude Code hook example.
-- `mu session new` — create a session and print its id.
+- `mu session new` — create a model-free session and print its id. `--model` is
+  rejected; model selection belongs to an actual turn.
 - `mu session list` — list recent sessions.
 - `mu session transcript --session <id>` — print a persisted session
   transcript.
@@ -295,9 +296,9 @@ accepts optional non-terminal stdin as a custom focus). The surface is small:
   non-terminal stdin is an optional verbatim custom focus instruction.
 - `mu retry [-s <id>] [-c] [-m|--model <id>] [-o|--output final|concise|detail|full]`
   — resume an interrupted (unclean) turn: normalize the tail and continue the
-  agent loop with no new prompt. `--model` overrides the session model and
-  `--output` overrides the merged config default for the retry. No-op on a clean
-  session.
+  agent loop with no new prompt. `--model` overrides the latest attempted model
+  and `--output` overrides the merged config default for the retry. No-op on a
+  clean session.
 
 The turn runner remains one completed turn per invocation. Bare `mu` reads the
 prompt from stdin; a positional name first resolves to a discovered custom
@@ -310,10 +311,10 @@ complete prompt.
 Exact subcommand names win at the top level, so a prompt file that collides with
 a subcommand name must be passed with a disambiguating path such as `./status`.
 `mu session list`, `mu session transcript`, and project inspection/init do
-**not** require a configured provider. `mu session new` can reuse the latest
-session model, but in a fresh scope it needs a resolvable configured model.
-Turn invocation and `mu compact` require a configured provider because they can
-contact the provider (§7).
+**not** require a configured provider. `mu session new` neither resolves nor
+stores a model and also does not require a configured provider. Turn invocation
+and `mu compact` require a configured provider because they can contact the
+provider (§7).
 
 ### Turn lifecycle (authoritative end-to-end flow)
 
@@ -325,10 +326,7 @@ This is the exact sequence the binary follows for one turn invocation:
    most 20 MiB and must be PNG, JPEG, WebP, GIF, WAV, or MP3 content matching
    its filename extension.
 2. **Load config** (§9): global first, then project config over it when a
-   project is active. If the provider's required fields are missing, print an
-   error to stderr and exit non-zero (§7). Resolve the effective model:
-   `--model` if given, else the session's stored `model`, else the merged
-   config default.
+   project is active.
 3. **Open the active-scope SQLite DB** (create it if absent and run the
    supported migrations; reject an unknown newer or pre-baseline schema with
    an upgrade instruction): project-local when inside a project, global
@@ -345,6 +343,11 @@ This is the exact sequence the binary follows for one turn invocation:
      session row, its persisted system prompt, and the environment seed in one
      transaction (so a crash can never leave a session without its system
      message).
+   Then resolve the effective model: explicit `--model`, else that session's
+   latest completed `turn_attempt`, else the active scope's latest completed
+   `turn_attempt`, else the first configured model. An empty session therefore
+   has no model of its own. If the selected provider's required fields are
+   missing, print an error to stderr and exit non-zero (§7).
 5. **Acquire session ownership** (§11). A conditional SQLite update claims a
    NULL `session.owner_pid`; on contention a short immediate transaction checks
    the recorded PID and replaces it only when that process is absent. If the
@@ -852,6 +855,17 @@ The status line always shows the invoking `pwd`. When the active project root
 is not literally the same path, it also shows that project root in parentheses;
 this keeps a repository or worktree checkout visible while working in one of
 its subdirectories. In global scope it shows `(global)` instead.
+Each plugin keeps one in-memory tracked bundle containing its scope, optional
+session id, optional sticky model override, and staged attachments. Merely
+changing directory masks a bundle owned by another scope; returning without a
+Mu action restores it. Prompt rendering plus status, command-discovery, and
+completion lookups are passive observations and do not invalidate it. An
+accepted prompt or slash action activates its current scope, atomically
+discarding a bundle owned by another scope before the action runs. Malformed or
+unknown slash input, an unsupported model, and an unreadable attachment are
+rejected before activation; a later runtime failure does not restore discarded
+state. Within the same scope, `/new` clears only the session id and preserves the
+model override and attachments.
 After the native line editor commits the submitted prompt line to scrollback,
 the plugin prints one empty line before child-process output starts, independent
 of whether the child uses `concise`, `detail`, or `full` output.
@@ -896,10 +910,14 @@ Consequences:
 - `/attach <file>` resolves and stages one readable regular file in shell
   memory for the next user message and may be repeated. It creates no session
   message itself. `/attach` lists pending files and `/attach --clear` discards
-  them. The prompt shows the pending count. Empty Enter, draft cancellation,
+  them. Attachments belong to the tracked scope, and the prompt shows the count
+  only while that scope is active. Empty Enter, draft cancellation,
   mode changes, `/model`, `/new`, `/retry`, and `/compact` do not consume the
   queue; the next ordinary prompt or custom command passes every staged file as
   a repeatable `-a` argument and clears the queue before launching `mu`.
+- `/model <model>` validates and stores a shell-only sticky override in the
+  tracked bundle. It is forwarded as `--model` to later turns and `/retry`; it
+  does not mutate persisted session state.
 - Ctrl-D is the normal terminal EOT key (`^D`). xterm-style and browser-terminal
   input paths forward it as input when the browser or OS has
   not intercepted the key before the terminal receives it.
@@ -960,9 +978,9 @@ Consequences:
 
 Session lifecycle is exposed through CLI commands:
 
-- A shell plugin without a session explicitly runs `mu [--model MODEL] session
-  new` before its first submitted prompt, then reuses that session for later
-  prompts in the same shell.
+- A shell plugin without a session explicitly runs `mu session new` before its
+  first submitted prompt, then passes any shell model override to the first
+  actual turn and reuses that session for later prompts in the same shell.
 - Exporting the shell-specific `MU_ZSH_SESSION_ID=<id>` or
   `MU_FISH_SESSION_ID=<id>` before entering `mu>` attaches the plugin to an
   existing session.
@@ -1059,9 +1077,10 @@ global config file is missing, `mu` creates a starter `~/.mu/config.jsonc`
 automatically before loading configuration. The starter's first provider is a
 keyless OpenCode Zen free model (`api_key_env: ""`), so a freshly built `mu`
 runs a turn with no additional setup; it also ships a commented keyed provider
-example. In a scope with no sessions, the first configured model is used. API
-keys are read from environment variables; `mu` does not store secrets in its
-database.
+example. Without an explicit override, model selection follows the current
+session's latest completed attempt, then the active scope's latest completed
+attempt, then the first configured model. API keys are read from environment
+variables; `mu` does not store secrets in its database.
 
 **No provider, hard fail.** If no provider is configured, a provider has no
 valid supported endpoint, or a non-empty configured key env var is unset, a *turn* invocation
@@ -1367,15 +1386,12 @@ after checkpointing instead of sitting at its high-water mark forever.
 
 Conceptual schema (flat and small):
 
-- **session** — `id`, `created_at`, `updated_at`, `cwd`, `model`, `title`,
+- **session** — `id`, `created_at`, `updated_at`, `cwd`, `title`,
   `last_context_tokens`, and nullable `owner_pid`. `last_context_tokens` is the
   most recent `usage.total_tokens` reported by the
   provider; used for the pre-turn overflow check in §"Context window and
   compaction". `owner_pid` is the opportunistic same-session mutex described
-  below. `model` is set at session creation from the
-  effective model (lifecycle step 2). After a successful turn or retry, `model`
-  is updated to that invocation's effective model; failed invocations do not
-  update it. `cwd` records the last working directory used for that session.
+  below. `cwd` records the last working directory used for that session.
   `title` is set lazily from the first user prompt (first ~60 chars) and is
   display-only for `mu session list`.
 - **message** — `id`, `session_id`, `kind`
@@ -1418,10 +1434,12 @@ Conceptual schema (flat and small):
   (`turn` / `retry`), model, start/end time, outcome, error class/text, partial
   assistant text that never became a completed message, provider-request count,
   iteration/retry counts, duration, and last reported context size. Attempt rows
-  are never loaded into model context and never participate in retry or
-  compaction. There is intentionally **no** turn-status or checkpoint column on
-  `session`: whether the last turn finished is derived from the message tail
-  (§"Interrupted turns and retry").
+  are never loaded into model context or compaction. Their model field is the
+  model-selection history: normal turns prefer the session's latest completed
+  attempt, while retry prefers its latest attempt even when that attempt failed
+  or was interrupted. There is intentionally **no** turn-status, checkpoint, or
+  model column on `session`: whether the last turn finished is derived from the
+  message tail (§"Interrupted turns and retry").
 - **turn_usage** — provider usage aggregates for each completed invocation,
   including input/cache/output/reasoning/total token counts.
 - **bash_review** — at most one guardrail decision per Bash claim, containing
@@ -1439,11 +1457,12 @@ must retain an accepted legacy spelling or provide an explicit migration path.
 
 `mu` maps each interactive shell instance to at most one active session:
 
-- **First-turn creation.** When a shell plugin has no attached session, it first invokes
-  `mu [--model MODEL] session new`, captures and validates the single id printed
-  by that management command, and remembers it for the current scope. It then
-  invokes the first turn with `--session <id>`. There is no rendezvous file or
-  inherited descriptor, and the id is never printed by the turn itself.
+- **First-turn creation.** When a shell plugin has no attached session, it first
+  invokes `mu session new`, captures and validates the single id printed by that
+  management command, and remembers it for the current scope. It then invokes
+  the first turn with `--session <id>` and any shell-owned model override. There
+  is no rendezvous file or inherited descriptor, and the id is never printed by
+  the turn itself.
 - **Attach / continue.** `MU_ZSH_SESSION_ID=<id>` and
   `MU_FISH_SESSION_ID=<id>` seed their respective plugins with an existing
   session, while `mu -s <id>` and `mu -c` handle one-shot re-entry from the
@@ -1546,10 +1565,12 @@ per-call "running" marker in the database.
   just type the next instruction; the agent sees the interrupted results and the
   new prompt and continues or redirects. No forced retry, no stuck session.
 - **`mu retry`** normalizes the tail and re-runs the loop with *no* new prompt,
-  so the model continues the interrupted turn. `--model` overrides the stored
-  session model and `--output` overrides the merged config default for that
+  so the model continues the interrupted turn. `--model` overrides the latest
+  attempted model and `--output` overrides the merged config default for that
   retry; each shell plugin's `/retry` command forwards active shell overrides.
-  It refuses on a clean session ("nothing to retry").
+  Without an override, retry uses the session's latest attempt model, including
+  a failed or interrupted attempt. It refuses on a clean session ("nothing to
+  retry").
 
 ### Session concurrency ownership
 

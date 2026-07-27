@@ -2114,7 +2114,7 @@ mod tests {
         let tmp = std::env::temp_dir().join(format!("mu-agent-retry-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&tmp).unwrap();
         let store = Store::open(&tmp.join("mu.db")).unwrap();
-        let session = store.create_session("/tmp", "test/fake-model").unwrap();
+        let session = store.create_session("/tmp").unwrap();
         let config = test_config();
         let request_model = crate::models::resolve_model_ref(&config, "test/fake-model").unwrap();
         store
@@ -2211,7 +2211,7 @@ mod tests {
         let tmp = std::env::temp_dir().join(format!("mu-agent-partial-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&tmp).unwrap();
         let store = Store::open(&tmp.join("mu.db")).unwrap();
-        let session = store.create_session("/tmp", "test/fake-model").unwrap();
+        let session = store.create_session("/tmp").unwrap();
         let config = test_config();
         let request_model = crate::models::resolve_model_ref(&config, "test/fake-model").unwrap();
         store
@@ -2296,7 +2296,7 @@ mod tests {
         ));
         std::fs::create_dir_all(&tmp).unwrap();
         let store = Store::open(&tmp.join("mu.db")).unwrap();
-        let session = store.create_session("/tmp", "test/fake-model").unwrap();
+        let session = store.create_session("/tmp").unwrap();
         let config = test_config();
         let request_model = crate::models::resolve_model_ref(&config, "test/fake-model").unwrap();
         store
@@ -2453,7 +2453,7 @@ mod tests {
         let tmp = std::env::temp_dir().join(format!("mu-agent-proactive-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&tmp).unwrap();
         let store = Store::open(&tmp.join("mu.db")).unwrap();
-        let session = store.create_session("/tmp", "test/fake-model").unwrap();
+        let session = store.create_session("/tmp").unwrap();
         let config = test_config();
         let request_model = crate::models::resolve_model_ref(&config, "test/fake-model").unwrap();
         store
@@ -2617,7 +2617,7 @@ mod tests {
         let tmp = std::env::temp_dir().join(format!("mu-agent-usage-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&tmp).unwrap();
         let store = Store::open(&tmp.join("mu.db")).unwrap();
-        let session = store.create_session("/tmp", "test/fake-model").unwrap();
+        let session = store.create_session("/tmp").unwrap();
         let config = test_config();
         let request_model = crate::models::resolve_model_ref(&config, "test/fake-model").unwrap();
         store
@@ -2703,7 +2703,7 @@ mod tests {
         let tmp = std::env::temp_dir().join(format!("mu-agent-length-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&tmp).unwrap();
         let store = Store::open(&tmp.join("mu.db")).unwrap();
-        let session = store.create_session("/tmp", "test/fake-model").unwrap();
+        let session = store.create_session("/tmp").unwrap();
         let config = test_config();
         let request_model = crate::models::resolve_model_ref(&config, "test/fake-model").unwrap();
         store

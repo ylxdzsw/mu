@@ -71,8 +71,8 @@ line editing, history, and job control.
 
 Type `/` to list prompt-mode commands. The common ones:
 
-- `/new` starts a new session.
-- `/model` selects a configured model.
+- `/new` starts a new session while keeping the current model and attachments.
+- `/model` selects a configured model for later turns in this shell scope.
 - `/attach <file>` adds an image or audio file to the next turn.
 - `/retry` resumes a turn interrupted by Ctrl-C, a crash, or a lost connection.
 - `/compact` compacts a long session, optionally with a focus instruction.
@@ -80,6 +80,11 @@ Type `/` to list prompt-mode commands. The common ones:
 Both plugins require `jq` and `mu` on `PATH`, plus their respective shell. The
 Fish integration requires Fish 4 because it records replayable turns with
 `history append`.
+
+The plugin keeps its session, model choice, and pending attachments together in
+one project scope. Changing directories only hides that state, so returning is
+non-destructive. Running a Mu prompt or slash action in another scope discards
+the old bundle; invalid model and attachment input leaves it untouched.
 
 ## More ways to run a turn
 
@@ -256,7 +261,7 @@ project, or `~/.mu/sessions.db` globally (with the usual SQLite WAL/SHM
 sidecars). `.mu` contains that database family and authored files only. Session
 ownership lives in the database; ephemeral oversized-output spills use
 exclusive random files in the private OS temporary directory `$TMPDIR/mu`, and
-image attachments are stored directly in SQLite.
+submitted image and audio attachments are stored directly in SQLite.
 
 Setting `"output": "concise"` in global or project `config.jsonc` changes the
 default output density; an explicit `-o`/`--output` always wins. Output density

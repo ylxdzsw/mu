@@ -87,9 +87,6 @@ if [[ "$1" == "status" ]]; then
   fi
   exit 0
 fi
-if [[ "$1" == "--model" ]]; then
-  shift 2
-fi
 if [[ "$1" == "session" && "$2" == "new" ]]; then
   print -r -- "$*" >> "$MU_ZSH_FAKE_LOG"
   print -r -- "ses_01234567"
@@ -150,7 +147,7 @@ exit 1
 EOF
 chmod +x "$short_fake_bin/mu"
 MU_ZSH_SESSION_ID=short-session
-MU_ZSH_SESSION_SCOPE=$(_mu_zsh_current_scope_key)
+MU_ZSH_TRACKED_SCOPE=$(_mu_zsh_current_scope_key)
 MU_ZSH_BIN=$short_fake_bin/mu
 short_prompt=$(_mu_zsh_build_mode_prompt)
 MU_ZSH_BIN=$prompt_fake_bin/mu
@@ -307,9 +304,8 @@ print -r -- '../..' > "$primary_scope_dir/.git/worktrees/feature/commondir"
 builtin cd "$primary_scope_dir"
 primary_scope_key=$(_mu_zsh_current_scope_key)
 MU_ZSH_SESSION_ID=session-primary
-MU_ZSH_SESSION_SCOPE=$primary_scope_key
 MU_ZSH_MODEL=model-primary
-MU_ZSH_MODEL_SCOPE=$primary_scope_key
+MU_ZSH_TRACKED_SCOPE=$primary_scope_key
 builtin cd "$worktree_scope_dir/src"
 [[ "$(_mu_zsh_current_scope_key)" == "$primary_scope_key" ]] || fail "linked worktree shares the primary project scope"
 _mu_zsh_sync_state
@@ -317,6 +313,7 @@ _mu_zsh_sync_state
 [[ "$MU_ZSH_EFFECTIVE_MODEL" == model-primary ]] || fail "linked worktree reuses the primary project model"
 _mu_zsh_clear_session_state
 _mu_zsh_clear_model_state
+MU_ZSH_TRACKED_SCOPE=
 mkdir -p -- "$worktree_scope_dir/.mu"
 [[ "$(_mu_zsh_current_scope_key)" == "project:$worktree_scope_dir" ]] || fail "worktree-local .mu creates an independent scope"
 builtin cd "$saved_pwd"
@@ -325,30 +322,29 @@ HOME=$saved_home
 MU_ZSH_BIN=mu
 MU_ZSH_OUTPUT=
 MU_ZSH_SESSION_ID=
-MU_ZSH_SESSION_SCOPE=
+MU_ZSH_TRACKED_SCOPE=
 _mu_zsh_base_command_reply
 assert_command_reply "inherits configured output by default" mu
 
 MU_ZSH_OUTPUT=detail
 MU_ZSH_SESSION_ID=abc123
-MU_ZSH_SESSION_SCOPE=$(_mu_zsh_current_scope_key)
+MU_ZSH_TRACKED_SCOPE=$(_mu_zsh_current_scope_key)
 _mu_zsh_base_command_reply
 assert_command_reply "builds attached command" mu --output detail -s abc123
 
 MU_ZSH_SESSION_ID=
-MU_ZSH_SESSION_SCOPE=
+MU_ZSH_TRACKED_SCOPE=
 _mu_zsh_base_command_reply
 assert_command_reply "builds new-session command" mu --output detail
 MU_ZSH_BIN=$prompt_fake_bin/mu
 
 MU_ZSH_MODEL=openai/gpt
-MU_ZSH_MODEL_SCOPE=$(_mu_zsh_current_scope_key)
+MU_ZSH_TRACKED_SCOPE=$(_mu_zsh_current_scope_key)
 _mu_zsh_base_command_reply
 assert_command_reply "builds pending-model command" "$prompt_fake_bin/mu" --output detail --model openai/gpt
 status_json=$(_mu_zsh_status_json)
 [[ "$status_json" == *"\"canonical\":\"openai/gpt\""* ]] || fail "status uses pending model"
 MU_ZSH_SESSION_ID=abc123
-MU_ZSH_SESSION_SCOPE=$(_mu_zsh_current_scope_key)
 _mu_zsh_base_command_reply
 assert_command_reply "builds attached pending-model command" "$prompt_fake_bin/mu" --output detail -s abc123 --model openai/gpt
 _mu_zsh_clear_model_state
@@ -376,11 +372,11 @@ rm -f "$MU_ZSH_FAKE_LOG"
 MU_ZSH_BIN=$prompt_fake_bin/mu
 MU_ZSH_OUTPUT=detail
 MU_ZSH_SESSION_ID=
-MU_ZSH_SESSION_SCOPE=
+MU_ZSH_TRACKED_SCOPE=
 command_candidates=("${(@f)$(_mu_zsh_slash_command_candidates)}")
 [[ "${(j:,:)command_candidates}" == "/attach,/model,/review.md" ]] || fail "hides session commands without a valid session"
 MU_ZSH_SESSION_ID=tracked-session
-MU_ZSH_SESSION_SCOPE=$(_mu_zsh_current_scope_key)
+MU_ZSH_TRACKED_SCOPE=$(_mu_zsh_current_scope_key)
 command_candidates=("${(@f)$(_mu_zsh_slash_command_candidates)}")
 [[ "${(j:,:)command_candidates}" == "/attach,/model,/new,/retry,/compact,/review.md" ]] || fail "shows session commands with a valid session: ${(j:,:)command_candidates}"
 BUFFER="/ret"
@@ -481,8 +477,15 @@ rm -f "$MU_ZSH_FAKE_LOG"
 _mu_zsh_run_slash_command $'/review.md First line\nSecond line'
 custom_prompt=$(cat "$MU_ZSH_FAKE_LOG")
 [[ "$custom_prompt" == *$'prompt=First line\nSecond line'* ]] || fail "custom slash command preserves multiline instruction"
+_mu_zsh_run_slash_command "/model gpt"
+_mu_zsh_run_slash_command "/attach $attachment_one"
 _mu_zsh_run_slash_command "/new"
-[[ -z "$MU_ZSH_SESSION_ID" && -z "$MU_ZSH_SESSION_SCOPE" ]] || fail "new slash command lazily clears tracked session"
+[[ -z "$MU_ZSH_SESSION_ID" && -n "$MU_ZSH_TRACKED_SCOPE" ]] || fail "new slash command lazily clears only the tracked session"
+[[ "$MU_ZSH_MODEL" == openai/gpt ]] || fail "new slash command preserves the model override"
+(( ${#MU_ZSH_PENDING_ATTACHMENTS[@]} == 1 )) || fail "new slash command preserves pending attachments"
+_mu_zsh_clear_model_state
+MU_ZSH_PENDING_ATTACHMENTS=()
+MU_ZSH_EFFECTIVE_ATTACHMENT_COUNT=0
 rm -f "$MU_ZSH_FAKE_LOG"
 _mu_zsh_run_slash_command "/review.md"
 [[ "$MU_ZSH_SESSION_ID" == "ses_01234567" ]] || fail "custom slash command captures new session id"
@@ -503,7 +506,7 @@ if _mu_zsh_run_slash_command "/unknown"; then
 fi
 _mu_zsh_run_slash_command "/model gpt"
 [[ "$MU_ZSH_MODEL" == openai/gpt ]] || fail "model slash command records canonical model"
-[[ "$MU_ZSH_MODEL_SCOPE" == "$(_mu_zsh_current_scope_key)" ]] || fail "model slash command records scope"
+[[ "$MU_ZSH_TRACKED_SCOPE" == "$(_mu_zsh_current_scope_key)" ]] || fail "model slash command records scope"
 if _mu_zsh_run_slash_command "/model invalid/model"; then
   fail "model slash command should validate model refs"
 fi
@@ -526,11 +529,17 @@ done
 scope_name=${scope_root:t}
 if [[ "$1" == "status" ]]; then
   print -r -- "$*" >> "$MU_ZSH_SCOPE_LOG"
-  print -r -- "{\"model\":{\"provider_id\":\"test\",\"model_id\":\"scope-model\",\"effort\":null,\"canonical\":\"scope-model\"},\"context_percent\":10.0,\"project_root\":\"$scope_root\"}"
+  model=scope-model
+  while (( $# )); do
+    if [[ "$1" == "--model" ]]; then
+      shift
+      model=$1
+    fi
+    shift
+  done
+  [[ "$model" == invalid/* ]] && exit 1
+  print -r -- "{\"model\":{\"provider_id\":\"test\",\"model_id\":\"$model\",\"effort\":null,\"canonical\":\"$model\"},\"context_percent\":10.0,\"project_root\":\"$scope_root\"}"
   exit 0
-fi
-if [[ "$1" == "--model" ]]; then
-  shift 2
 fi
 if [[ "$1" == "session" && "$2" == "new" ]]; then
   print -r -- "$PWD :: $*" >> "$MU_ZSH_SCOPE_LOG"
@@ -551,7 +560,7 @@ MU_ZSH_OUTPUT=detail
 export MU_ZSH_SCOPE_LOG=${TMPDIR:-/tmp}/mu-zsh-scope-${$}.log
 rm -f "$MU_ZSH_SCOPE_LOG"
 MU_ZSH_SESSION_ID=
-MU_ZSH_SESSION_SCOPE=
+MU_ZSH_TRACKED_SCOPE=
 MU_ZSH_EFFECTIVE_SESSION_ID=
 
 saved_pwd=$PWD
@@ -560,11 +569,14 @@ _mu_zsh_submit_prompt "project a prompt"
 [[ "$MU_ZSH_SESSION_ID" == "ses_0000000a" ]] || fail "creates a scoped session for the first project"
 
 MU_ZSH_MODEL=model-for-a
-MU_ZSH_MODEL_SCOPE=$(_mu_zsh_current_scope_key)
+MU_ZSH_PENDING_ATTACHMENTS=("$attachment_one")
+_mu_zsh_sync_state
 
 builtin cd "$project_b/subdir"
 _mu_zsh_base_command_reply
 assert_command_reply "does not reuse another project's session before submitting there" "$scope_fake_bin/mu" --output detail
+parked_prompt=$(_mu_zsh_build_mode_prompt)
+[[ "$parked_prompt" != *'[1 attachments]'* ]] || fail "prompt hides another scope's attachments"
 : > "$MU_ZSH_SCOPE_LOG"
 status_json=$(_mu_zsh_status_json)
 [[ "$status_json" == *"\"project_root\":\"$project_b\""* ]] || fail "status follows the current project"
@@ -573,12 +585,35 @@ status_json=$(_mu_zsh_status_json)
 builtin cd "$project_a/subdir"
 _mu_zsh_base_command_reply
 assert_command_reply "returns to the original scoped session and model after cd-ing back" "$scope_fake_bin/mu" --output detail -s ses_0000000a --model model-for-a
+(( ${#MU_ZSH_PENDING_ATTACHMENTS[@]} == 1 )) || fail "passive scope observation preserves parked attachments"
+restored_prompt=$(_mu_zsh_build_mode_prompt)
+[[ "$restored_prompt" == *'[1 attachments]'* ]] || fail "prompt restores parked attachments in their scope"
 
 builtin cd "$project_b/subdir"
+if _mu_zsh_run_slash_command "/model invalid/model"; then
+  fail "invalid model in another scope should fail"
+fi
+if _mu_zsh_run_slash_command "/attach $tmpdir/missing-scope-file"; then
+  fail "invalid attachment in another scope should fail"
+fi
+builtin cd "$project_a/subdir"
+_mu_zsh_sync_state
+[[ "$MU_ZSH_SESSION_ID" == "ses_0000000a" && "$MU_ZSH_MODEL" == model-for-a ]] || fail "invalid actions elsewhere preserve parked session and model"
+(( ${#MU_ZSH_PENDING_ATTACHMENTS[@]} == 1 )) || fail "invalid actions elsewhere preserve parked attachments"
+
+builtin cd "$project_b/subdir"
+_mu_zsh_run_slash_command "/model model-for-b"
+[[ -z "$MU_ZSH_SESSION_ID" ]] || fail "valid model action elsewhere invalidates the parked session"
+[[ "$MU_ZSH_MODEL" == model-for-b ]] || fail "valid model action elsewhere replaces the parked model"
+(( ${#MU_ZSH_PENDING_ATTACHMENTS[@]} == 0 )) || fail "valid model action elsewhere invalidates parked attachments"
+[[ "$MU_ZSH_TRACKED_SCOPE" == "project:$project_b" ]] || fail "valid model action moves the tracked scope"
+
+: > "$MU_ZSH_SCOPE_LOG"
 _mu_zsh_submit_prompt "project b prompt"
 [[ "$MU_ZSH_SESSION_ID" == "ses_0000000b" ]] || fail "creates a new scoped session after submitting in the second project"
-[[ "$MU_ZSH_SESSION_SCOPE" == "project:$project_b" ]] || fail "moves the tracked session scope after starting in the second project"
-[[ -z "$MU_ZSH_MODEL" && -z "$MU_ZSH_MODEL_SCOPE" ]] || fail "forgets pending model after submitting in another project"
+[[ "$MU_ZSH_TRACKED_SCOPE" == "project:$project_b" ]] || fail "keeps the tracked scope after starting in the second project"
+grep -Fxq -- "$project_b/subdir :: session new" "$MU_ZSH_SCOPE_LOG" || fail "creates an empty session without forwarding the model override"
+grep -Fq -- "$project_b/subdir :: --output detail -s ses_0000000b --model model-for-b" "$MU_ZSH_SCOPE_LOG" || fail "forwards the model override on the first real turn"
 
 builtin cd "$project_a/subdir"
 _mu_zsh_base_command_reply
@@ -856,7 +891,7 @@ after_model_switch=${normalized#*$'[mu] next turns in this scope will use openai
 new_session_transcript=$tmpdir/new-session-transcript
 rm -f -- "$interactive_capture_args" "$interactive_capture_stdin" "$interactive_capture_calls"
 interactive_status=0
-new_session_setup="$interactive_setup; MU_ZSH_SESSION_ID=tracked-session; MU_ZSH_SESSION_SCOPE=\$(_mu_zsh_current_scope_key); _mu_zsh_sync_state"
+new_session_setup="$interactive_setup; MU_ZSH_SESSION_ID=tracked-session; MU_ZSH_TRACKED_SCOPE=\$(_mu_zsh_current_scope_key); _mu_zsh_sync_state"
 {
   send_interactive_setup "$new_session_setup"
   print -rn -- $'\t'"/new"$'\r'
