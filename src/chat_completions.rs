@@ -52,9 +52,9 @@ struct UsageJson {
     completion_tokens: u64,
     total_tokens: u64,
     #[serde(default)]
-    prompt_tokens_details: PromptTokensDetailsJson,
+    prompt_tokens_details: Option<PromptTokensDetailsJson>,
     #[serde(default)]
-    completion_tokens_details: CompletionTokensDetailsJson,
+    completion_tokens_details: Option<CompletionTokensDetailsJson>,
     #[serde(default)]
     prompt_cache_hit_tokens: u64,
     #[serde(default)]
@@ -348,8 +348,9 @@ fn consume_sse_buffer(
             }
 
             if let Some(u) = parsed.usage {
-                let cache_read = u
-                    .prompt_tokens_details
+                let prompt_tokens_details = u.prompt_tokens_details.unwrap_or_default();
+                let completion_tokens_details = u.completion_tokens_details.unwrap_or_default();
+                let cache_read = prompt_tokens_details
                     .cached_tokens
                     .max(u.prompt_cache_hit_tokens);
                 let input_tokens = u
@@ -358,9 +359,9 @@ fn consume_sse_buffer(
                 state.usage = Some(Usage {
                     input_tokens,
                     cache_read_input_tokens: cache_read,
-                    cache_write_input_tokens: u.prompt_tokens_details.cache_creation_tokens,
+                    cache_write_input_tokens: prompt_tokens_details.cache_creation_tokens,
                     output_tokens: u.completion_tokens,
-                    reasoning_output_tokens: u.completion_tokens_details.reasoning_tokens,
+                    reasoning_output_tokens: completion_tokens_details.reasoning_tokens,
                     total_tokens: u.total_tokens,
                 });
             }
@@ -593,6 +594,27 @@ mod tests {
         assert_eq!(usage.output_tokens, 5);
         assert_eq!(usage.total_tokens, 17);
         assert_eq!(usage.cache_write_input_tokens, None);
+    }
+
+    #[test]
+    fn accepts_null_usage_detail_objects() {
+        let mut on_event = |_event: StreamEvent| -> Result<(), ProviderError> { Ok(()) };
+        let mut buffer = concat!(
+            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":12,\"completion_tokens\":5,\"total_tokens\":17,\"prompt_tokens_details\":null,\"completion_tokens_details\":null}}\n\n",
+            "data: [DONE]\n\n",
+        )
+        .to_string();
+        let mut state = StreamParseState::default();
+
+        consume_sse_buffer(&mut buffer, &mut state, &mut on_event).unwrap();
+
+        let usage = state.usage.unwrap();
+        assert_eq!(usage.input_tokens, 12);
+        assert_eq!(usage.cache_read_input_tokens, 0);
+        assert_eq!(usage.cache_write_input_tokens, None);
+        assert_eq!(usage.output_tokens, 5);
+        assert_eq!(usage.reasoning_output_tokens, 0);
+        assert_eq!(usage.total_tokens, 17);
     }
 
     #[test]
