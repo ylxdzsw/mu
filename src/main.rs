@@ -85,10 +85,14 @@ impl fmt::Display for ExitError {
 
 impl std::error::Error for ExitError {}
 
+#[derive(Clone)]
 enum PromptSource {
     Stdin,
     File(PathBuf),
-    Command(PathBuf),
+    Command {
+        path: PathBuf,
+        scope: skills::InstructionScope,
+    },
 }
 
 #[derive(Debug)]
@@ -497,6 +501,15 @@ async fn run() -> Result<()> {
             }
             return Ok(());
         }
+        Some(Command::Cat { target }) => {
+            let prompt_source = resolve_prompt_source(target, &scope)?;
+            let provenance_source = prompt_source.clone();
+            let prompt = load_prompt(prompt_source)?;
+            let provenance =
+                prompt_source_provenance(&provenance_source, &cwd, prompt.model.as_deref());
+            Renderer::new().markdown_document(&provenance, &prompt.text)?;
+            return Ok(());
+        }
         Some(Command::Retry(retry_args)) => {
             ensure_subagent_turn_allowed(bash::subagent_depth_from_env())?;
             let config = Config::load_for_scope(project_config_dir.as_deref())?;
@@ -713,7 +726,7 @@ fn load_prompt_with_stdin(
                 model,
             })
         }
-        PromptSource::Command(path) => {
+        PromptSource::Command { path, .. } => {
             let prompt = skills::command_prompt(&path)?;
             Ok(LoadedPrompt {
                 text: append_stdin_instruction(prompt.text, stdin_is_terminal, stdin)?,
@@ -771,9 +784,43 @@ fn resolve_prompt_source(
     let index =
         skills::scan_instruction_index(&paths::global_dir(), project_config_dir.as_deref())?;
     if let Some(command) = skills::find_command(&index, &name) {
-        return Ok(PromptSource::Command(PathBuf::from(&command.path)));
+        return Ok(PromptSource::Command {
+            path: PathBuf::from(&command.path),
+            scope: command.scope,
+        });
     }
     Ok(PromptSource::File(path))
+}
+
+fn prompt_source_provenance(source: &PromptSource, cwd: &Path, model: Option<&str>) -> String {
+    let mut provenance = match source {
+        PromptSource::Stdin => "[stdin]".to_string(),
+        PromptSource::File(path) => {
+            format!("[prompt file] {}", display_prompt_path(path, cwd).display())
+        }
+        PromptSource::Command { path, scope } => {
+            let kind = match scope {
+                skills::InstructionScope::Builtin => "builtin command",
+                skills::InstructionScope::Global => "global command",
+                skills::InstructionScope::Project => "project command",
+            };
+            format!("[{kind}] {}", display_prompt_path(path, cwd).display())
+        }
+    };
+    if let Some(model) = model {
+        provenance.push_str(&format!(" (model default: {model})"));
+    }
+    provenance
+}
+
+fn display_prompt_path(path: &Path, cwd: &Path) -> PathBuf {
+    path.canonicalize().unwrap_or_else(|_| {
+        if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            cwd.join(path)
+        }
+    })
 }
 
 fn is_explicit_prompt_path(path: &Path) -> bool {
@@ -1080,6 +1127,15 @@ mod tests {
     }
 
     #[test]
+    fn stdin_prompt_source_uses_stdin_as_the_complete_prompt() {
+        let mut stdin = Cursor::new("# Standalone prompt\n\nBody.\n");
+        let prompt = load_prompt_with_stdin(PromptSource::Stdin, false, &mut stdin).unwrap();
+
+        assert_eq!(prompt.text, "# Standalone prompt\n\nBody.");
+        assert_eq!(prompt.model, None);
+    }
+
+    #[test]
     fn prompt_file_ignores_empty_non_terminal_stdin() {
         let path = temp_file_path("empty-instruction");
         std::fs::write(&path, "Use the release-note format.\n").unwrap();
@@ -1122,11 +1178,91 @@ mod tests {
         )
         .unwrap();
         let mut stdin = Cursor::new("Focus on auth.");
-        let prompt =
-            load_prompt_with_stdin(PromptSource::Command(path.clone()), false, &mut stdin).unwrap();
+        let prompt = load_prompt_with_stdin(
+            PromptSource::Command {
+                path: path.clone(),
+                scope: skills::InstructionScope::Project,
+            },
+            false,
+            &mut stdin,
+        )
+        .unwrap();
         std::fs::remove_file(path).unwrap();
         assert_eq!(prompt.text, "Review the checkout.\n---\n\nFocus on auth.");
         assert_eq!(prompt.model.as_deref(), Some("openai/gpt-5:high"));
+    }
+
+    #[test]
+    fn prompt_source_provenance_reports_resolved_kind_path_and_model() {
+        let path = temp_file_path("provenance");
+        std::fs::write(&path, "prompt").unwrap();
+        let cwd = std::env::current_dir().unwrap();
+
+        assert_eq!(
+            prompt_source_provenance(
+                &PromptSource::Command {
+                    path: path.clone(),
+                    scope: skills::InstructionScope::Project,
+                },
+                &cwd,
+                Some("openai/gpt-5:high"),
+            ),
+            format!(
+                "[project command] {} (model default: openai/gpt-5:high)",
+                path.canonicalize().unwrap().display()
+            )
+        );
+        assert_eq!(
+            prompt_source_provenance(&PromptSource::File(path.clone()), &cwd, None),
+            format!("[prompt file] {}", path.canonicalize().unwrap().display())
+        );
+        assert_eq!(
+            prompt_source_provenance(&PromptSource::Stdin, &cwd, None),
+            "[stdin]"
+        );
+
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn explicit_prompt_paths_bypass_command_lookup() {
+        let scope = paths::Scope::Global;
+        for path in ["./review.md", "../review.md", "/tmp/review.md"] {
+            assert!(matches!(
+                resolve_prompt_source(Some(PathBuf::from(path)), &scope).unwrap(),
+                PromptSource::File(resolved) if resolved.as_path() == Path::new(path)
+            ));
+        }
+    }
+
+    #[test]
+    fn bare_prompt_name_resolves_to_project_command() {
+        let root = temp_file_path("resolve-project-command");
+        let command_dir = root.join(".mu");
+        let command_path = command_dir.join("preview-command.md");
+        std::fs::create_dir_all(&command_dir).unwrap();
+        std::fs::write(
+            &command_path,
+            "#!/usr/bin/env mu\nPreview the current checkout.\n",
+        )
+        .unwrap();
+        let scope = paths::Scope::Project(paths::Project {
+            root: root.clone(),
+            marker: paths::ProjectMarker::Mu,
+            worktree: None,
+        });
+
+        let resolved =
+            resolve_prompt_source(Some(PathBuf::from("preview-command.md")), &scope).unwrap();
+
+        assert!(matches!(
+            resolved,
+            PromptSource::Command {
+                path,
+                scope: skills::InstructionScope::Project,
+            } if path == command_path.canonicalize().unwrap()
+        ));
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

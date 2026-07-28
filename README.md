@@ -113,6 +113,22 @@ model:
 #!/usr/bin/env -S mu --model openai/gpt-5:high
 ```
 
+Preview the exact user-prompt text without starting a turn:
+
+```sh
+mu cat review.md
+printf 'Focus on authentication.' | mu cat review.md
+printf '# Standalone prompt\n' | mu cat
+```
+
+`mu cat` resolves a target exactly like a turn: explicit paths select prompt
+files, while other names select the active project, global, or built-in command
+before falling back to a file in the current directory. For file-backed prompts,
+non-terminal stdin is appended after the same `---` separator used during
+execution. A terminal shows the resolved source and rendered Markdown;
+redirected output is the exact composed prompt text. It does not contact a
+provider or create a session.
+
 Choose how much the caller sees:
 
 ```sh

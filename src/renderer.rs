@@ -308,6 +308,21 @@ impl Renderer {
         )
     }
 
+    pub fn markdown_document(&mut self, provenance: &str, text: &str) -> io::Result<()> {
+        if !self.styled {
+            return self.write_stdout_committed(text);
+        }
+
+        let header = self.fit_one_line(&format!("{GRAY}{provenance}{RESET}"));
+        self.write_stdout_committed(&format!("{header}\n\n"))?;
+
+        let mut blocks = self.markdown.push(text);
+        blocks.extend(self.markdown.finish());
+        self.write_assistant_blocks(blocks)?;
+        self.assistant_block_open = false;
+        self.ensure_line_start()
+    }
+
     pub fn assistant_text(&mut self, text: &str) -> io::Result<()> {
         if self.final_only {
             return Ok(());
@@ -331,17 +346,7 @@ impl Renderer {
             return self.render_live_line();
         }
 
-        for block in blocks {
-            if !self.assistant_block_open && rendered_block_is_blank(&block) {
-                continue;
-            }
-            if !self.assistant_block_open {
-                self.ensure_block_separator_if_needed()?;
-                self.assistant_block_open = true;
-                self.last_committed_block = Some(CommittedBlock::Other);
-            }
-            self.write_committed(&block)?;
-        }
+        self.write_assistant_blocks(blocks)?;
         self.render_live_line()
     }
 
@@ -360,8 +365,15 @@ impl Renderer {
             self.assistant_block_open = false;
             return Ok(());
         }
-        for rendered in blocks {
-            if !self.assistant_block_open && rendered_block_is_blank(&rendered) {
+
+        self.write_assistant_blocks(blocks)?;
+        self.assistant_block_open = false;
+        self.render_live_line()
+    }
+
+    fn write_assistant_blocks(&mut self, blocks: Vec<String>) -> io::Result<()> {
+        for block in blocks {
+            if !self.assistant_block_open && rendered_block_is_blank(&block) {
                 continue;
             }
             if !self.assistant_block_open {
@@ -369,10 +381,9 @@ impl Renderer {
                 self.assistant_block_open = true;
                 self.last_committed_block = Some(CommittedBlock::Other);
             }
-            self.write_committed(&rendered)?;
+            self.write_committed(&block)?;
         }
-        self.assistant_block_open = false;
-        self.render_live_line()
+        Ok(())
     }
 
     pub fn reasoning_start(&mut self, visibility: ReasoningVisibility) -> io::Result<()> {
@@ -5302,6 +5313,60 @@ mod tests {
         plain.assistant_text("Hello.\n").unwrap();
         plain.assistant_end().unwrap();
         assert_eq!(plain_output.transcript(), "Hello.\n");
+    }
+
+    #[test]
+    fn markdown_document_renders_terminal_provenance_and_finishes_the_line() {
+        let (mut renderer, output) =
+            Renderer::with_test_shared_output(OutputFormat::Detail, true, None);
+
+        renderer
+            .markdown_document(
+                "[project command] /tmp/review.md",
+                "# Review\n\nUse **care**.",
+            )
+            .unwrap();
+
+        let raw = output.transcript();
+        let plain = strip_ansi(&raw);
+        assert!(
+            plain.starts_with("[project command] /tmp/review.md\n\nReview\n\n"),
+            "{plain:?}"
+        );
+        assert!(plain.contains("Use care."), "{plain:?}");
+        assert!(plain.ends_with('\n'), "{plain:?}");
+        assert!(!plain.contains("[mu]"), "{plain:?}");
+    }
+
+    #[test]
+    fn markdown_document_redirected_output_is_exact_and_header_free() {
+        let (mut renderer, output) =
+            Renderer::with_test_shared_output(OutputFormat::Detail, false, None);
+        let prompt = "# Review\n\nBase\n---\n\nFocus on auth.\n";
+
+        renderer
+            .markdown_document("[project command] /tmp/review.md", prompt)
+            .unwrap();
+
+        assert_eq!(output.transcript(), prompt);
+    }
+
+    #[test]
+    fn markdown_document_does_not_show_a_table_buffering_live_line() {
+        let (mut renderer, output) =
+            Renderer::with_test_shared_output(OutputFormat::Detail, true, None);
+
+        renderer
+            .markdown_document(
+                "[prompt file] /tmp/table.md",
+                "| Name | Value |\n| --- | --- |\n| a | b |",
+            )
+            .unwrap();
+
+        let raw = output.transcript();
+        assert!(!raw.contains("[buffering table]"), "{raw:?}");
+        assert!(!raw.contains('\r'), "{raw:?}");
+        assert!(strip_ansi(&raw).contains("| Name | Value |"), "{raw:?}");
     }
 
     #[test]

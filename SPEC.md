@@ -290,6 +290,12 @@ accepts optional non-terminal stdin as a custom focus). The surface is small:
   configuration. Neither mode loads
   a provider; scope resolves from the working directory like other introspection
   commands. See the README for a Claude Code hook example.
+- `mu cat [<prompt-file-or-command>]` — resolve and load the same user-prompt
+  text as a turn without contacting a provider or creating session state. With
+  no target, stdin is the complete prompt. With a file-backed target, terminal
+  stdin is left unread and non-terminal stdin is appended verbatim after
+  `\n---\n\n`. Interactive stdout shows a resolved-source line and rendered
+  Markdown; redirected stdout contains only the exact composed prompt text.
 - `mu session new` — create a model-free session and print its id. `--model` is
   rejected; model selection belongs to an actual turn.
 - `mu session list` — list recent sessions.
@@ -313,6 +319,7 @@ the loaded file body with `\n---\n\n`. Bare `mu` continues to use stdin as its
 complete prompt.
 Exact subcommand names win at the top level, so a prompt file that collides with
 a subcommand name must be passed with a disambiguating path such as `./status`.
+`cat` is therefore also reserved as a top-level subcommand name.
 `mu session list`, `mu session transcript`, and project inspection/init do
 **not** require a configured provider. `mu session new` neither resolves nor
 stores a model and also does not require a configured provider. Turn invocation

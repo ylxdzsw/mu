@@ -78,6 +78,11 @@ pub enum Command {
     Status(StatusArgs),
     /// Print the user's mu instructions and skills for a foreign agent
     Context(ContextArgs),
+    /// Preview the resolved user prompt
+    Cat {
+        #[arg(value_name = "TARGET")]
+        target: Option<PathBuf>,
+    },
     /// Resume an interrupted (unclean) turn in a session
     Retry(RetryArgs),
     /// Force compaction for a session
@@ -268,6 +273,25 @@ mod tests {
             Some(Command::Context(context)) => assert!(context.export),
             other => panic!("expected context command, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn parses_cat_with_optional_target() {
+        let args = Args::try_parse_from(["mu", "cat"]).unwrap();
+        match args.command {
+            Some(Command::Cat { target }) => assert_eq!(target, None),
+            other => panic!("expected cat command, got {other:?}"),
+        }
+
+        let args = Args::try_parse_from(["mu", "cat", "review.md"]).unwrap();
+        match args.command {
+            Some(Command::Cat { target }) => {
+                assert_eq!(target, Some(PathBuf::from("review.md")));
+            }
+            other => panic!("expected cat command, got {other:?}"),
+        }
+
+        assert!(Args::try_parse_from(["mu", "cat", "one.md", "two.md"]).is_err());
     }
 
     #[test]
