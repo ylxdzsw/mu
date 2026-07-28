@@ -305,7 +305,7 @@ _mu_zsh_json_value_reply() {
 }
 
 _mu_zsh_build_mode_prompt() {
-  local status_json model context_raw context context_segment cwd project_root project_segment attachment_segment
+  local status_json model context_raw context context_source context_segment cwd project_root project_segment attachment_segment
   local clean unclean_segment
   local escaped_model escaped_context escaped_project_root escaped_unclean_text
 
@@ -316,7 +316,7 @@ _mu_zsh_build_mode_prompt() {
   _mu_zsh_sync_state
   status_json=$(_mu_zsh_status_json) || status_json=
   if [[ -n "$status_json" ]] && command -v jq >/dev/null 2>&1; then
-    tsv=$(jq -r '[(.model.canonical // ""), (.context_percent // ""), (.project_root // ""), (if has("clean") then (.clean|tostring) else "" end)] | @tsv' <<< "$status_json" 2>/dev/null) || tsv=
+    tsv=$(jq -r '[(.model.canonical // ""), (.context_percent // ""), (.project_root // ""), (if has("clean") then (.clean|tostring) else "" end), (.context_usage_source // "")] | @tsv' <<< "$status_json" 2>/dev/null) || tsv=
   fi
   fields=("${(@ps:\t:)tsv}")
   model=${fields[1]:-}
@@ -324,12 +324,14 @@ _mu_zsh_build_mode_prompt() {
   context_raw=${fields[2]:-}
   project_root=${fields[3]:-}
   clean=${fields[4]:-}
+  context_source=${fields[5]:-}
   if [[ -n "$MU_ZSH_EFFECTIVE_SESSION_ID" ]]; then
     if [[ -z "$context_raw" || "$context_raw" == null ]]; then
       context=0%
     elif ! printf -v context '%.0f%%' "$context_raw" 2>/dev/null; then
       context=0%
     fi
+    [[ "$context_source" == estimated ]] && context="~$context"
     escaped_context=$context
     escaped_context=${escaped_context//\%/%%}
     context_segment=" %F{$MU_ZSH_PROMPT_CONTEXT_COLOR}${escaped_context}%f"

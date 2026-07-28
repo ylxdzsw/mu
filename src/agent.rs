@@ -157,6 +157,7 @@ impl<'a> AgentLoop<'a> {
             &self.request,
             self.model_context_window,
             self.provider.as_ref(),
+            self.renderer,
         )
         .await?;
 
@@ -201,6 +202,7 @@ impl<'a> AgentLoop<'a> {
                         &self.request,
                         self.provider.as_ref(),
                         None,
+                        Some(self.renderer),
                     )
                     .await?;
                     context = self.load_context()?;
@@ -274,6 +276,7 @@ impl<'a> AgentLoop<'a> {
                             &self.request,
                             self.provider.as_ref(),
                             None,
+                            Some(self.renderer),
                         )
                         .await?;
                         context = self.load_context()?;

@@ -36,6 +36,7 @@ pub struct StatusReport {
     pub model: StatusModel,
     pub session_id: Option<String>,
     pub context_percent: Option<f64>,
+    pub context_usage_source: Option<ContextUsageSource>,
     pub project_root: Option<String>,
     pub context_window: Option<u64>,
     pub supported_effort_levels: Vec<String>,
@@ -57,6 +58,13 @@ pub struct StatusReport {
     pub commands: Option<Vec<CommandMeta>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub skills: Option<Vec<SkillMeta>>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ContextUsageSource {
+    Reported,
+    Estimated,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -216,6 +224,7 @@ pub fn build_status_report(
         .transpose()?
         .unwrap_or(true);
     let model = status_model(&resolved.request.model);
+    let context_usage = context_usage(store, resolved.attached_session.as_ref(), &model_info);
 
     Ok(StatusReport {
         model,
@@ -223,7 +232,8 @@ pub fn build_status_report(
             .attached_session
             .as_ref()
             .map(|session| session.id.clone()),
-        context_percent: context_percent(store, resolved.attached_session.as_ref(), &model_info),
+        context_percent: context_usage.map(|(percent, _)| percent),
+        context_usage_source: context_usage.map(|(_, source)| source),
         project_root: project.map(|project| project.root.display().to_string()),
         context_window: model_info.context_window,
         supported_effort_levels: model_info.supported_effort_levels,
@@ -247,19 +257,22 @@ fn status_model(model: &ResolvedModelRef) -> StatusModel {
     }
 }
 
-fn context_percent(
+fn context_usage(
     store: &Store,
     session: Option<&Session>,
     model_info: &ResolvedModelInfo,
-) -> Option<f64> {
+) -> Option<(f64, ContextUsageSource)> {
     let session = session?;
     let context_window = model_info.context_window?;
-    let tokens = if session.last_context_tokens > 0 {
-        session.last_context_tokens
+    let (tokens, source) = if session.last_context_tokens > 0 {
+        (session.last_context_tokens, ContextUsageSource::Reported)
     } else {
-        store.estimate_context_tokens(&session.id)
+        (
+            store.estimate_context_tokens(&session.id),
+            ContextUsageSource::Estimated,
+        )
     };
-    Some((tokens as f64 / context_window as f64) * 100.0)
+    Some(((tokens as f64 / context_window as f64) * 100.0, source))
 }
 
 fn status_session(summary: crate::store::SessionSummary) -> StatusSession {
@@ -540,6 +553,76 @@ mod tests {
         )
         .unwrap();
         assert!(report.clean);
+    }
+
+    #[test]
+    fn context_usage_reports_when_exact_and_marks_post_compaction_estimates() {
+        let store = Store::open_memory().unwrap();
+        let session = store
+            .create_session_seeded("/tmp", "system prompt", "[environment]\ncurrent cwd")
+            .unwrap();
+        let overrides = InvocationOverrides {
+            session: Some(session.id.clone()),
+            continue_latest: false,
+            model: None,
+        };
+
+        let initial = build_status_report(
+            &store,
+            &test_config(),
+            &overrides,
+            None,
+            StatusIncludes::default(),
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            initial.context_usage_source,
+            Some(ContextUsageSource::Estimated)
+        );
+
+        store
+            .update_session(
+                &session.id,
+                &crate::provider::Usage::default(),
+                25,
+                None,
+                "alpha/default-model",
+            )
+            .unwrap();
+        let reported = build_status_report(
+            &store,
+            &test_config(),
+            &overrides,
+            None,
+            StatusIncludes::default(),
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(reported.context_percent, Some(25.0));
+        assert_eq!(
+            reported.context_usage_source,
+            Some(ContextUsageSource::Reported)
+        );
+
+        store.append_summary(&session.id, "summary").unwrap();
+        let estimated = build_status_report(
+            &store,
+            &test_config(),
+            &overrides,
+            None,
+            StatusIncludes::default(),
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            estimated.context_usage_source,
+            Some(ContextUsageSource::Estimated)
+        );
+        assert_ne!(estimated.context_percent, Some(25.0));
     }
 
     #[test]

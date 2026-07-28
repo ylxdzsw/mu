@@ -579,18 +579,36 @@ async fn run() -> Result<()> {
             let request = RequestOptions {
                 model: resolve_session_model(&store, &config, &session_state)?,
             };
+            let model_info = models::resolve_model_info(&config, &request.model);
             let provider = build_provider(&config, &request.model.provider_id)?;
             let _lock = acquire_session_lock_or_exit(&store, &session, cli::OutputFormat::Detail)?;
-            compaction::run_compaction(
+            let mut renderer =
+                Renderer::with_terminal_bell(cli::OutputFormat::Detail, None, config.line_wrapping);
+            let started = Instant::now();
+            let outcome = compaction::run_compaction(
                 &store,
                 &config,
                 &session,
                 &request,
                 provider.as_ref(),
                 custom_focus.as_deref(),
+                Some(&mut renderer),
             )
             .await?;
-            eprintln!("compacted session {session}");
+            match outcome {
+                compaction::CompactionOutcome::Applied {
+                    before_context_tokens,
+                    after_context_tokens_estimate,
+                } => renderer.compaction_result(
+                    before_context_tokens,
+                    after_context_tokens_estimate,
+                    model_info.context_window,
+                    started.elapsed(),
+                )?,
+                compaction::CompactionOutcome::NotNeeded { keep_recent_turns } => {
+                    renderer.compaction_not_needed(keep_recent_turns)?
+                }
+            }
             return Ok(());
         }
         None => {}
@@ -992,7 +1010,14 @@ fn print_status_report(report: &StatusReport) {
         .clone()
         .unwrap_or_else(|| "(new session)".into());
     let context = match (report.context_percent, report.context_window) {
-        (Some(percent), Some(window)) => format!("{percent:.2}% of {window}"),
+        (Some(percent), Some(window)) => format!(
+            "{}{percent:.2}% of {window}",
+            if report.context_usage_source == Some(runtime::ContextUsageSource::Estimated) {
+                "~"
+            } else {
+                ""
+            }
+        ),
         _ => "n/a".into(),
     };
     let project = report

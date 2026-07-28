@@ -933,6 +933,72 @@ impl Renderer {
         Ok(())
     }
 
+    pub fn compaction_start(&mut self) -> io::Result<()> {
+        if self.final_only {
+            return Ok(());
+        }
+        self.assistant_block_open = false;
+        self.live_line = Some(LiveLine::Compacting {
+            started: Instant::now(),
+        });
+        self.render_live_line()
+    }
+
+    pub fn compaction_tick(&mut self) -> io::Result<()> {
+        if !matches!(self.live_line, Some(LiveLine::Compacting { .. })) {
+            return Ok(());
+        }
+        self.render_live_line()
+    }
+
+    pub fn compaction_end(&mut self) -> io::Result<()> {
+        if matches!(self.live_line, Some(LiveLine::Compacting { .. })) {
+            self.clear_live_line()?;
+            self.live_line = None;
+        }
+        Ok(())
+    }
+
+    pub fn compaction_result(
+        &mut self,
+        before_context_tokens: u64,
+        after_context_tokens_estimate: u64,
+        context_window: Option<u64>,
+        elapsed: Duration,
+    ) -> io::Result<()> {
+        self.compaction_end()?;
+        let line = format_compaction_result(
+            before_context_tokens,
+            after_context_tokens_estimate,
+            context_window,
+            elapsed,
+        );
+        if self.styled {
+            self.notice(&line)
+        } else {
+            writeln!(self.stderr, "{line}")?;
+            self.stderr.flush()
+        }
+    }
+
+    pub fn compaction_not_needed(&mut self, keep_recent_turns: usize) -> io::Result<()> {
+        self.compaction_end()?;
+        let line = format!(
+            "[mu] nothing to compact — keeping {keep_recent_turns} recent {}",
+            if keep_recent_turns == 1 {
+                "turn"
+            } else {
+                "turns"
+            }
+        );
+        if self.styled {
+            self.notice(&line)
+        } else {
+            writeln!(self.stderr, "{line}")?;
+            self.stderr.flush()
+        }
+    }
+
     pub fn turn_retry(
         &mut self,
         retry_count: u64,
@@ -1145,7 +1211,12 @@ impl Renderer {
             self.stdout.write_all(b"\r\x1b[2K")?;
         } else if matches!(
             self.live_line,
-            Some(LiveLine::Thinking | LiveLine::ToolComposition | LiveLine::ConciseTool)
+            Some(
+                LiveLine::Thinking
+                    | LiveLine::ToolComposition
+                    | LiveLine::Compacting { .. }
+                    | LiveLine::ConciseTool
+            )
         ) {
             let continues_concise_tools = self.format == OutputFormat::Concise
                 && self.last_committed_block == Some(CommittedBlock::Tool);
@@ -1183,6 +1254,10 @@ impl Renderer {
                 ))
             }
             Some(LiveLine::ToolComposition) => Some(format!("{GRAY}[preparing toolcall]{RESET}")),
+            Some(LiveLine::Compacting { started }) => Some(format!(
+                "{GRAY}[compacting {}]{RESET}",
+                format_duration(started.elapsed())
+            )),
             Some(LiveLine::ConciseTool) => {
                 let tool = self.concise_tool.as_ref()?;
                 Some(format_concise_tool_live(
@@ -1608,6 +1683,9 @@ struct TableBufferLive {
 enum LiveLine {
     Thinking,
     ToolComposition,
+    Compacting {
+        started: Instant,
+    },
     ConciseTool,
     TableBuffering {
         chars: usize,
@@ -4238,6 +4316,28 @@ fn format_turn_summary(
     )
 }
 
+fn format_compaction_result(
+    before_context_tokens: u64,
+    after_context_tokens_estimate: u64,
+    context_window: Option<u64>,
+    elapsed: Duration,
+) -> String {
+    let context = if let Some(context_window) = context_window {
+        format!(
+            "{:.1}% → ~{:.1}%",
+            before_context_tokens as f64 / context_window as f64 * 100.0,
+            after_context_tokens_estimate as f64 / context_window as f64 * 100.0,
+        )
+    } else {
+        format!(
+            "{} → ~{} context tokens",
+            format_number(before_context_tokens),
+            format_number(after_context_tokens_estimate),
+        )
+    };
+    format!("[mu] compacted {context} in {}", format_duration(elapsed))
+}
+
 fn format_number(number: u64) -> String {
     let digits = number.to_string();
     let mut grouped = String::with_capacity(digits.len() + digits.len() / 3);
@@ -5050,17 +5150,26 @@ mod tests {
         // With summary: title extracted, no token count
         let (mut renderer, output, _stderr) =
             Renderer::with_test_output(OutputFormat::Detail, false, false, None);
-        renderer.reasoning_start(ReasoningVisibility::Opaque).unwrap();
-        renderer.reasoning_summary_delta(0, "**Inspecting renderer state**\n\nDetails").unwrap();
+        renderer
+            .reasoning_start(ReasoningVisibility::Opaque)
+            .unwrap();
+        renderer
+            .reasoning_summary_delta(0, "**Inspecting renderer state**\n\nDetails")
+            .unwrap();
         renderer.reasoning_end(Some((20, 7))).unwrap();
         let transcript = output.transcript();
-        assert!(transcript.contains("] Inspecting renderer state\n"), "{transcript:?}");
+        assert!(
+            transcript.contains("] Inspecting renderer state\n"),
+            "{transcript:?}"
+        );
         assert!(!transcript.contains("token"), "{transcript:?}");
 
         // Without summary: timer only, still no token count
         let (mut renderer, output, _stderr) =
             Renderer::with_test_output(OutputFormat::Detail, false, false, None);
-        renderer.reasoning_start(ReasoningVisibility::Opaque).unwrap();
+        renderer
+            .reasoning_start(ReasoningVisibility::Opaque)
+            .unwrap();
         renderer.reasoning_end(Some((20, 7))).unwrap();
         let transcript = output.transcript();
         assert!(transcript.starts_with("[thought "), "{transcript:?}");
@@ -5197,6 +5306,42 @@ mod tests {
         assert!(!raw.contains("[buffering table]"), "{raw:?}");
         assert!(!raw.contains('\r'), "{raw:?}");
         assert!(strip_ansi(&raw).contains("| Name | Value |"), "{raw:?}");
+    }
+
+    #[test]
+    fn compaction_uses_one_mutable_live_line_and_commits_estimated_result() {
+        let (mut renderer, output) =
+            Renderer::with_test_shared_output(OutputFormat::Detail, true, None);
+
+        renderer.compaction_start().unwrap();
+        renderer.compaction_tick().unwrap();
+        renderer
+            .compaction_result(12_826, 10_582, Some(200_000), Duration::from_millis(2_400))
+            .unwrap();
+
+        let raw = output.transcript();
+        assert!(raw.contains("[compacting "), "{raw:?}");
+        assert!(raw.matches("\r\x1b[2K").count() >= 2, "{raw:?}");
+        assert!(
+            strip_ansi(&raw).ends_with("[mu] compacted 6.4% → ~5.3% in 2.4s\n"),
+            "{raw:?}"
+        );
+        assert!(renderer.live_line.is_none());
+    }
+
+    #[test]
+    fn redirected_compaction_result_is_one_plain_status_line() {
+        let (mut renderer, output) =
+            Renderer::with_test_shared_output(OutputFormat::Detail, false, None);
+
+        renderer
+            .compaction_result(12_826, 10_582, None, Duration::from_millis(900))
+            .unwrap();
+
+        assert_eq!(
+            output.transcript(),
+            "[mu] compacted 12,826 → ~10,582 context tokens in 900ms\n"
+        );
     }
 
     #[test]

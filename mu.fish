@@ -234,7 +234,8 @@ function _mu_fish_build_mode_prompt
             (.model.canonical // ""),
             (.context_percent // ""),
             (.project_root // ""),
-            (if has("clean") then (.clean|tostring) else "" end)
+            (if has("clean") then (.clean|tostring) else "" end),
+            (.context_usage_source // "")
         ] | @tsv' 2>/dev/null | string split \t)
     end
 
@@ -246,6 +247,8 @@ function _mu_fish_build_mode_prompt
     set -q fields[3]; and set project_root "$fields[3]"
     set -l clean
     set -q fields[4]; and set clean "$fields[4]"
+    set -l context_source
+    set -q fields[5]; and set context_source "$fields[5]"
 
     set_color "$MU_FISH_PROMPT_MODEL_COLOR"
     printf '%s' "$model"
@@ -256,6 +259,7 @@ function _mu_fish_build_mode_prompt
         if string match -qr '^-?[0-9]+([.][0-9]+)?$' -- "$context_raw"
             set context (printf '%.0f%%' "$context_raw")
         end
+        test "$context_source" = estimated; and set context "~$context"
         printf ' '
         set_color "$MU_FISH_PROMPT_CONTEXT_COLOR"
         printf '%s' "$context"

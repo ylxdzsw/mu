@@ -75,7 +75,9 @@ Type `/` to list prompt-mode commands. The common ones:
 - `/model` selects a configured model for later turns in this shell scope.
 - `/attach <file>` adds an image or audio file to the next turn.
 - `/retry` resumes a turn interrupted by Ctrl-C, a crash, or a lost connection.
-- `/compact` compacts a long session, optionally with a focus instruction.
+- `/compact` compacts older turns in a long session, optionally with a focus
+  instruction. It reports when all history is already inside the configured
+  recent-turn retention window.
 
 Both plugins require `jq` and `mu` on `PATH`, plus their respective shell. The
 Fish integration requires Fish 4 because it records replayable turns with
@@ -290,6 +292,12 @@ compact tool and status rows are ellipsized to it. Setting it to `false` leaves
 prose and table cells for the terminal to wrap, but still caps compact rows at
 80 visible cells. It never changes redirected, final, persisted, or
 model-visible text.
+
+During compaction, interactive output uses one mutable
+`[compacting <duration>]` line. The completed result marks its rebuilt context
+percentage with `~` because it is estimated until the next provider response;
+the shell prompt uses the same marker and returns to an unprefixed percentage
+after that response supplies exact usage.
 
 ## Native installation and portable builds
 

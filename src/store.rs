@@ -1249,6 +1249,7 @@ impl Store {
             "INSERT INTO message (session_id, kind, content, seq, created_at) VALUES (?1, 'summary', ?2, ?3, ?4)",
             params![session_id, content, before_seq, now],
         )?;
+        invalidate_context_tokens_in(&tx, session_id, &now)?;
         tx.commit()?;
         Ok(())
     }
@@ -1261,6 +1262,7 @@ impl Store {
             "INSERT INTO message (session_id, kind, content, seq, created_at) VALUES (?1, 'summary', ?2, ?3, ?4)",
             params![session_id, content, seq, now],
         )?;
+        invalidate_context_tokens_in(&tx, session_id, &now)?;
         tx.commit()?;
         Ok(())
     }
@@ -1850,6 +1852,21 @@ fn next_seq_in(tx: &rusqlite::Transaction<'_>, session_id: &str) -> Result<i64> 
         tx.prepare("SELECT COALESCE(MAX(seq), -1) + 1 FROM message WHERE session_id = ?1")?;
     let seq: i64 = stmt.query_row(params![session_id], |row| row.get::<_, i64>(0))?;
     Ok(seq)
+}
+
+fn invalidate_context_tokens_in(
+    tx: &rusqlite::Transaction<'_>,
+    session_id: &str,
+    now: &str,
+) -> Result<()> {
+    let changed = tx.execute(
+        "UPDATE session SET updated_at = ?1, last_context_tokens = 0 WHERE id = ?2",
+        params![now, session_id],
+    )?;
+    if changed != 1 {
+        bail!("session not found: {session_id}");
+    }
+    Ok(())
 }
 
 fn insert_message_in(

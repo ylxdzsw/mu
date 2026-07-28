@@ -140,7 +140,7 @@ mkdir -p -- "$short_fake_bin"
 cat > "$short_fake_bin/mu" <<'EOF'
 #!/usr/bin/env zsh
 if [[ "$1" == "status" ]]; then
-  print -r -- '{"model":{"provider_id":"test","model_id":"m","effort":null,"canonical":"m"},"context_percent":0.0,"project_root":null}'
+  print -r -- '{"model":{"provider_id":"test","model_id":"m","effort":null,"canonical":"m"},"context_percent":0.0,"context_usage_source":"estimated","project_root":null}'
   exit 0
 fi
 exit 1
@@ -152,7 +152,7 @@ MU_ZSH_BIN=$short_fake_bin/mu
 short_prompt=$(_mu_zsh_build_mode_prompt)
 MU_ZSH_BIN=$prompt_fake_bin/mu
 _mu_zsh_clear_session_state
-[[ "$short_prompt" == *"%F{$MU_ZSH_PROMPT_CONTEXT_COLOR}0%%%f"* ]] || fail "shows 0% for an attached short session"
+[[ "$short_prompt" == *"%F{$MU_ZSH_PROMPT_CONTEXT_COLOR}~0%%%f"* ]] || fail "marks estimated context for an attached short session"
 
 BUFFER="edited in mu"
 CURSOR=3
