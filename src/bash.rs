@@ -72,7 +72,7 @@ pub fn parameters_schema() -> Value {
             "risk": {
                 "type": "string",
                 "enum": ["readonly", "reversible", "destructive"],
-                "description": "Advisory risk label for UI and auditing"
+                "description": "Advisory risk label for UI, auditing, and optional guardrail review. Choose by how reliably and easily the command's effects can be undone, using the highest risk of any part: readonly only when no persistent local or remote state changes; reversible for bounded changes with a known, practical way to restore the prior state; destructive when unique state could be lost, rollback is uncertain, or reversal would be unusually broad or costly. Judge intended material effects; incidental traces of ordinary reads, such as access logs and API usage, do not make them state-changing. Consider the actual target and context rather than the command name, and choose the higher risk when uncertain about recoverability."
             },
             "command": { "type": "string", "description": "Command to run with bash -lc; can be multiline" },
             "cwd": { "type": "string", "description": "Working directory for this invocation; Prefer absolute path; Prefer this argument over `cd`" },
