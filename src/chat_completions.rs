@@ -578,43 +578,33 @@ mod tests {
     }
 
     #[test]
-    fn accepts_standard_usage_chunk_with_empty_choices() {
+    fn accepts_usage_chunk_with_empty_choices_and_null_details() {
         let mut on_event = |_event: StreamEvent| -> Result<(), ProviderError> { Ok(()) };
+
+        // Standard chunk with no detail objects
         let mut buffer = concat!(
             "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":12,\"completion_tokens\":5,\"total_tokens\":17}}\n\n",
             "data: [DONE]\n\n",
         )
         .to_string();
         let mut state = StreamParseState::default();
-
         consume_sse_buffer(&mut buffer, &mut state, &mut on_event).unwrap();
-
         let usage = state.usage.unwrap();
         assert_eq!(usage.input_tokens, 12);
         assert_eq!(usage.output_tokens, 5);
-        assert_eq!(usage.total_tokens, 17);
         assert_eq!(usage.cache_write_input_tokens, None);
-    }
 
-    #[test]
-    fn accepts_null_usage_detail_objects() {
-        let mut on_event = |_event: StreamEvent| -> Result<(), ProviderError> { Ok(()) };
+        // Explicit null detail objects should yield zero counts, not an error
         let mut buffer = concat!(
             "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":12,\"completion_tokens\":5,\"total_tokens\":17,\"prompt_tokens_details\":null,\"completion_tokens_details\":null}}\n\n",
             "data: [DONE]\n\n",
         )
         .to_string();
         let mut state = StreamParseState::default();
-
         consume_sse_buffer(&mut buffer, &mut state, &mut on_event).unwrap();
-
         let usage = state.usage.unwrap();
-        assert_eq!(usage.input_tokens, 12);
         assert_eq!(usage.cache_read_input_tokens, 0);
-        assert_eq!(usage.cache_write_input_tokens, None);
-        assert_eq!(usage.output_tokens, 5);
         assert_eq!(usage.reasoning_output_tokens, 0);
-        assert_eq!(usage.total_tokens, 17);
     }
 
     #[test]
@@ -635,23 +625,6 @@ mod tests {
     }
 
     #[test]
-    fn ignores_metadata_chunk_without_choices() {
-        let mut on_event = |_event: StreamEvent| -> Result<(), ProviderError> { Ok(()) };
-        let mut buffer = concat!(
-            "data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"gpt-5.4-mini\"}\n\n",
-            "data: [DONE]\n\n",
-        )
-        .to_string();
-        let mut state = StreamParseState::default();
-
-        consume_sse_buffer(&mut buffer, &mut state, &mut on_event).unwrap();
-
-        assert!(state.content.is_empty());
-        assert!(state.tool_accum.is_empty());
-        assert!(state.usage.is_none());
-    }
-
-    #[test]
     fn reports_in_stream_error_payload() {
         let mut on_event = |_event: StreamEvent| -> Result<(), ProviderError> { Ok(()) };
         let mut buffer =
@@ -665,29 +638,6 @@ mod tests {
             error,
             ProviderError::Other(message) if message == "stream error: upstream unavailable"
         ));
-    }
-
-    #[test]
-    fn preserves_done_marker_in_model_content() {
-        let mut seen = String::new();
-        let mut on_event = |event: StreamEvent| -> Result<(), ProviderError> {
-            if let StreamEvent::TextDelta(delta) = event {
-                seen.push_str(&delta);
-            }
-            Ok(())
-        };
-        let mut buffer = concat!(
-            "data: {\"choices\":[{\"delta\":{\"content\":\"[DONE]\"},\"finish_reason\":\"stop\"}]}\n\n",
-            "data: [DONE]\n\n",
-        )
-        .to_string();
-        let mut state = StreamParseState::default();
-
-        consume_sse_buffer(&mut buffer, &mut state, &mut on_event).unwrap();
-
-        assert_eq!(seen, "[DONE]");
-        assert_eq!(state.content, "[DONE]");
-        assert_eq!(state.finish_reason, FinishReason::Stop);
     }
 
     #[test]

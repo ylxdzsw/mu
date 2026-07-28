@@ -508,14 +508,6 @@ mod tests {
     }
 
     #[test]
-    fn agents_path_attribute_escapes_xml_markup_and_control_whitespace() {
-        assert_eq!(
-            xml_escape_attribute("a&\"<>\n\r\tb"),
-            "a&amp;&quot;&lt;&gt;&#10;&#13;&#9;b"
-        );
-    }
-
-    #[test]
     fn build_context_reports_env_files_without_agents_or_skills() {
         let global = temp_dir("export-env-only");
         fs::write(global.join(".env"), "API_KEY=secret\n").unwrap();

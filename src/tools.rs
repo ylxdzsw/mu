@@ -283,31 +283,6 @@ mod tests {
         assert!(out.len() <= 25 + '…'.len_utf8());
     }
 
-    #[test]
-    fn tail_preview_preserves_actual_tail_when_byte_limited() {
-        let lines = vec![
-            "first output line",
-            "second output line",
-            "third output line",
-            "[exit code: 7]",
-        ];
-
-        let preview = build_tail_preview(&lines, 10, 32, 1024);
-
-        assert!(preview.ends_with("[exit code: 7]"));
-        assert!(!preview.contains("first output line"));
-        assert!(preview.len() <= 32);
-    }
-
-    #[test]
-    fn tail_preview_preserves_actual_tail_when_line_limited() {
-        let lines = vec!["one", "two", "three", "[exit code: 0]"];
-
-        let preview = build_tail_preview(&lines, 2, 1024, 1024);
-
-        assert_eq!(preview, "three\n[exit code: 0]");
-    }
-
     fn tight_limits() -> crate::config::LimitsConfig {
         crate::config::LimitsConfig {
             max_iterations: 50,

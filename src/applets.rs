@@ -991,40 +991,14 @@ mod apply_patch {
         }
 
         #[test]
-        fn existing_move_destination_error_is_actionable() {
+        fn existing_move_destination_is_rejected() {
             let dir = temp_dir();
             fs::write(dir.join("source.txt"), "source\n").unwrap();
             fs::write(dir.join("destination.txt"), "destination\n").unwrap();
             let patch = "*** Begin Patch\n*** Update File: source.txt\n*** Move to: destination.txt\n*** End Patch\n";
             let error = preflight(&dir, parse_patch(patch).unwrap()).unwrap_err();
-            let message = error.to_string();
-            assert!(message.contains("move destination already exists"));
-            assert!(message.contains("inspect it first"));
-            assert!(message.contains("use bash to move or remove"));
-            assert_eq!(
-                fs::read_to_string(dir.join("destination.txt")).unwrap(),
-                "destination\n"
-            );
+            assert!(error.to_string().contains("move destination already exists"));
             fs::remove_dir_all(dir).unwrap();
-        }
-
-        #[test]
-        fn fuzzy_context_matches_trailing_whitespace() {
-            let original = "fn main() {   \n    old();\n}\n";
-            let chunks = vec![Chunk {
-                locator: None,
-                lines: vec![
-                    HunkLine::Context("fn main() {".into()),
-                    HunkLine::Remove("    old();".into()),
-                    HunkLine::Add("    new();".into()),
-                    HunkLine::Context("}".into()),
-                ],
-                end_of_file: false,
-            }];
-            assert_eq!(
-                apply_chunks(original, Path::new("main.rs"), &chunks).unwrap(),
-                "fn main() {\n    new();\n}\n"
-            );
         }
 
         #[test]

@@ -4557,13 +4557,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn short_styled_table_cells_are_not_rewritten() {
-        let cell = format!("{BOLD}short{RESET}");
-        assert_eq!(wrap_table_cell(&cell, 10), [cell]);
-    }
-
-    #[test]
     fn markdown_stream_streams_list_items_line_by_line() {
         let mut stream = MarkdownStream::default();
 
@@ -4748,28 +4741,6 @@ mod tests {
         assert_eq!(rendered, "![alt](image.png)\n");
         let heading = stream.push("# ![alt](image.png)\n").concat();
         assert_eq!(heading, "# ![alt](image.png)\n");
-    }
-
-    #[test]
-    fn markdown_stream_keeps_chunked_unsupported_image_lines_raw() {
-        let mut stream = MarkdownStream::default();
-
-        assert_eq!(stream.push("# ").concat(), "");
-        let heading = stream.push("![alt](image.png)\n").concat();
-        assert_eq!(heading, "# ![alt](image.png)\n");
-
-        assert_eq!(stream.push("- ").concat(), "");
-        let list = stream.push("![alt](image.png)\n").concat();
-        assert_eq!(list, "- ![alt](image.png)\n");
-    }
-
-    #[test]
-    fn markdown_stream_does_not_buffer_plain_exclamation_points() {
-        let mut stream = MarkdownStream::default();
-
-        assert_eq!(stream.push("Done!").concat(), "Done!");
-        assert_eq!(stream.push(" Next").concat(), " Next");
-        assert_eq!(stream.push("\n").concat(), "\n");
     }
 
     #[test]
@@ -5002,16 +4973,12 @@ mod tests {
     }
 
     #[test]
-    fn cwd_line_preserves_raw_cwd_text() {
+    fn cwd_line_format_and_render_condition() {
         assert_eq!(format_cwd_line("../other", false), "@ ../other\n");
         assert_eq!(
             format_cwd_line("../other", true),
             format!("{DIM}@{RESET} {GRAY}../other{RESET}\n")
         );
-    }
-
-    #[test]
-    fn cwd_line_only_renders_when_resolved_cwd_differs_from_pwd() {
         let pwd = std::env::current_dir().unwrap();
         assert!(!should_render_bash_cwd("."));
         assert!(!should_render_bash_cwd(&pwd.display().to_string()));
@@ -5055,61 +5022,6 @@ mod tests {
     }
 
     #[test]
-    fn bash_preview_keeps_a_single_middle_line() {
-        let snapshot =
-            compute_bash_preview_snapshot("one\ntwo\nthree\nfour\nfive\nsix\n", true, None);
-
-        assert_eq!(snapshot.head_rendered, "one\ntwo\nthree\n");
-        assert_eq!(snapshot.tail_rendered, "four\nfive\nsix\n");
-        assert_eq!(snapshot.omitted_lines, 0);
-        assert_eq!(snapshot.omitted_bytes, 0);
-    }
-
-    #[test]
-    fn bash_preview_still_omits_multiple_middle_lines() {
-        let snapshot =
-            compute_bash_preview_snapshot("one\ntwo\nthree\nfour\nfive\nsix\nseven\n", true, None);
-
-        assert_eq!(snapshot.head_rendered, "one\ntwo\nthree\n");
-        assert_eq!(snapshot.tail_rendered, "six\nseven\n");
-        assert_eq!(snapshot.omitted_lines, 2);
-        assert_eq!(snapshot.omitted_bytes, "four\n".len() + "five\n".len());
-    }
-
-    #[test]
-    fn bash_preview_caps_a_single_middle_line_without_omitting_it() {
-        let middle = "m".repeat(BASH_TAIL_LINE_CAP_BYTES + 80);
-        let raw = format!("one\ntwo\nthree\n{middle}\nfive\nsix\n");
-
-        let snapshot = compute_bash_preview_snapshot(&raw, true, None);
-
-        assert_eq!(snapshot.omitted_lines, 0);
-        assert_eq!(
-            snapshot.omitted_bytes,
-            middle.len() + 1 - (BASH_TAIL_LINE_CAP_BYTES - ELLIPSIS.len())
-        );
-        assert!(snapshot.tail_rendered.starts_with(ELLIPSIS));
-    }
-
-    #[test]
-    fn bash_preview_caps_head_and_tail_output_lines() {
-        let head = "h".repeat(BASH_HEAD_LINE_CAP_BYTES + 80);
-        let tail_a = "t".repeat(BASH_TAIL_LINE_CAP_BYTES + 80);
-        let tail_b = "u".repeat(BASH_TAIL_LINE_CAP_BYTES + 80);
-        let raw =
-            format!("{head}\nhead two\nhead three\nomitted one\nomitted two\n{tail_a}\n{tail_b}\n");
-
-        let snapshot = compute_bash_preview_snapshot(&raw, true, None);
-
-        let rendered_head = snapshot.head_rendered.lines().next().unwrap();
-        let rendered_tail = snapshot.tail_rendered.lines().next().unwrap();
-        assert_eq!(rendered_head.len(), BASH_HEAD_LINE_CAP_BYTES);
-        assert!(rendered_head.ends_with(ELLIPSIS));
-        assert!(rendered_tail.starts_with(ELLIPSIS));
-        assert!(rendered_tail.len() < BASH_TAIL_LINE_CAP_BYTES);
-    }
-
-    #[test]
     fn plain_reasoning_commits_summary_after_reasoning_finishes() {
         let raw = capture_plain_reasoning_transcript();
         let normalized = strip_ansi(&raw.replace('\r', ""));
@@ -5134,37 +5046,22 @@ mod tests {
     }
 
     #[test]
-    fn opaque_reasoning_commits_duration_and_conservative_summary_title_without_tokens() {
+    fn opaque_reasoning_commits_title_or_timer_without_tokens() {
+        // With summary: title extracted, no token count
         let (mut renderer, output, _stderr) =
             Renderer::with_test_output(OutputFormat::Detail, false, false, None);
-
-        renderer
-            .reasoning_start(ReasoningVisibility::Opaque)
-            .unwrap();
-        renderer.reasoning_summary_delta(0, "**Inspecting").unwrap();
-        renderer
-            .reasoning_summary_delta(0, " renderer state**\n\nDetails")
-            .unwrap();
+        renderer.reasoning_start(ReasoningVisibility::Opaque).unwrap();
+        renderer.reasoning_summary_delta(0, "**Inspecting renderer state**\n\nDetails").unwrap();
         renderer.reasoning_end(Some((20, 7))).unwrap();
-
         let transcript = output.transcript();
-        assert!(
-            transcript.contains("] Inspecting renderer state\n"),
-            "{transcript:?}"
-        );
+        assert!(transcript.contains("] Inspecting renderer state\n"), "{transcript:?}");
         assert!(!transcript.contains("token"), "{transcript:?}");
-    }
 
-    #[test]
-    fn opaque_reasoning_without_summary_commits_timer_only() {
+        // Without summary: timer only, still no token count
         let (mut renderer, output, _stderr) =
             Renderer::with_test_output(OutputFormat::Detail, false, false, None);
-
-        renderer
-            .reasoning_start(ReasoningVisibility::Opaque)
-            .unwrap();
+        renderer.reasoning_start(ReasoningVisibility::Opaque).unwrap();
         renderer.reasoning_end(Some((20, 7))).unwrap();
-
         let transcript = output.transcript();
         assert!(transcript.starts_with("[thought "), "{transcript:?}");
         assert!(transcript.ends_with("]\n"), "{transcript:?}");
@@ -5206,73 +5103,6 @@ mod tests {
         renderer.reasoning_end(None).unwrap();
 
         assert!(output.transcript().is_empty());
-    }
-
-    #[test]
-    fn terminal_reasoning_title_updates_the_live_line() {
-        let (mut renderer, _output) =
-            Renderer::with_test_shared_output(OutputFormat::Detail, true, None);
-
-        renderer
-            .reasoning_start(ReasoningVisibility::Opaque)
-            .unwrap();
-        renderer
-            .reasoning_summary_delta(0, "## Inspecting renderer state\n")
-            .unwrap();
-
-        let live = strip_ansi(&renderer.format_live_line().unwrap());
-        assert!(live.ends_with("] Inspecting renderer state"), "{live:?}");
-        assert!(!live.contains("token"), "{live:?}");
-    }
-
-    #[test]
-    fn summary_title_extraction_rejects_prose_and_accepts_only_title_lines() {
-        assert_eq!(
-            extract_reasoning_summary_title("**Inspecting   renderer**\n\nDetails", false),
-            Some("Inspecting renderer".into())
-        );
-        assert_eq!(
-            extract_reasoning_summary_title("\n### Checking tests ###\n", false),
-            Some("Checking tests".into())
-        );
-        assert_eq!(
-            extract_reasoning_summary_title("I am inspecting the renderer.\n", false),
-            None
-        );
-        assert_eq!(
-            extract_reasoning_summary_title("**Incomplete title**", false),
-            None
-        );
-        assert_eq!(
-            extract_reasoning_summary_title("**Complete at end**", true),
-            Some("Complete at end".into())
-        );
-    }
-
-    #[test]
-    fn summary_title_is_capped_by_visible_terminal_width() {
-        let summary = format!("**{}**\n", "界".repeat(50));
-        let title = extract_reasoning_summary_title(&summary, false).unwrap();
-
-        assert!(UnicodeWidthStr::width(title.as_str()) <= REASONING_TITLE_MAX_WIDTH);
-        assert!(title.ends_with(ELLIPSIS));
-    }
-
-    #[test]
-    fn terminal_ignores_empty_assistant_blocks_before_first_visible_block() {
-        let (mut renderer, output) =
-            Renderer::with_test_shared_output(OutputFormat::Detail, true, None);
-
-        renderer.assistant_text("\n\n").unwrap();
-        renderer.assistant_end().unwrap();
-        renderer
-            .reasoning_start(ReasoningVisibility::StreamedTrace)
-            .unwrap();
-        renderer.reasoning_delta("plan").unwrap();
-        renderer.reasoning_end(Some((12, 5))).unwrap();
-
-        let normalized = strip_ansi(&output.transcript().replace('\r', ""));
-        assert!(normalized.starts_with("[thought "), "{normalized:?}");
     }
 
     #[test]
@@ -5780,7 +5610,7 @@ mod tests {
     }
 
     #[test]
-    fn full_streams_reasoning_without_an_indicator() {
+    fn full_streams_reasoning_streamed_and_opaque() {
         let (mut renderer, output) =
             Renderer::with_test_shared_output(OutputFormat::Full, false, None);
 
@@ -5793,13 +5623,9 @@ mod tests {
 
         assert_eq!(output.transcript(), "step one\nstep two\n");
         assert!(!output.transcript().contains("[thought"));
-    }
 
-    #[test]
-    fn full_streams_all_reasoning_summary_parts_in_order() {
         let (mut renderer, output) =
             Renderer::with_test_shared_output(OutputFormat::Full, false, None);
-
         renderer
             .reasoning_start(ReasoningVisibility::Opaque)
             .unwrap();

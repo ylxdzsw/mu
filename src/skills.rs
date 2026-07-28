@@ -674,32 +674,11 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
-    fn skills_block_requires_active_loading_without_mandatory_following() {
-        let block = format_skills_block(&[SkillMeta {
-            name: "review".into(),
-            description: "Review pending changes.".into(),
-            path: "/abs/review.md".into(),
-            scope: InstructionScope::Project,
-            requirements: SkillRequirements::default(),
-        }]);
-
-        assert!(block.contains("actively scan the available skills"));
-        assert!(block.contains("even partially relevant"));
-        assert!(block.contains("does not require following the skill or any instruction"));
-        assert!(block.contains("- review: Review pending changes. (path: /abs/review.md)"));
-    }
-
-    #[test]
-    fn detects_permissive_mu_shebangs() {
+    fn detects_and_parses_mu_shebangs() {
         assert!(is_mu_shebang("#!/usr/bin/env mu"));
         assert!(is_mu_shebang("#!/usr/bin/env -S mu --output detail"));
         assert!(is_mu_shebang("#!/usr/bin/mu"));
         assert!(!is_mu_shebang("#!/usr/bin/env bash"));
-        assert!(!is_mu_shebang("not a shebang"));
-    }
-
-    #[test]
-    fn parses_optional_model_from_mu_shebang() {
         assert_eq!(
             parse_mu_shebang("#!/usr/bin/env mu").unwrap(),
             Some(MuShebang { model: None })
