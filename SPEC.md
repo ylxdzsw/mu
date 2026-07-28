@@ -1817,4 +1817,44 @@ timestamp. The action remains in `bash_call.arguments` rather than being copied.
 sequential (concurrent batches only run `readonly` tools). There is no
 interaction with the concurrent execution path.
 
+**Undecided design — runtime-triggered review.** This is a design note, not
+current behavior or an implementation commitment. A possible extension would
+keep the declared-risk gate above while also running Linux Bash children under
+a seccomp user-notification filter. When a selected syscall is attempted, the
+kernel would block it and notify `mu`; the reviewer would assess the original,
+already-persisted Bash tool call and conversation context, not the syscall or
+its pointer arguments. An allow would approve the whole tool call, resume the
+blocked syscall, and automatically pass later watched syscalls from that call.
+A deny or reviewer failure would stop the running tool call before the
+triggering syscall executes. Effects completed before the first watched
+syscall would remain and must be reported as possible partial effects.
+
+Candidate triggers include destructive filesystem operations, host-control
+operations, and `setsid`. Watching `setsid` would review the supported
+background-task recipe immediately before it detaches. It would not identify
+every possible daemonization technique, and syscall selection remains a
+coverage-versus-false-trigger tradeoff: for example, `connect` cannot
+distinguish a read-only HTTP request from an upload, while unlink and rename
+also occur in benign compiler and atomic-save workflows. Only the first
+watched syscall would invoke the reviewer for a tool call.
+
+Seccomp user notification is Linux-only but does not inherently require root:
+an unprivileged child can install the filter after setting `no_new_privs`.
+That setting prevents later privilege gain through setuid/setgid executables
+and file capabilities, so it can change commands such as `sudo`. Any design
+must be optional, compile to the existing behavior on unsupported platforms,
+and define whether an explicitly enabled but unavailable runtime trigger fails
+open or closed. Detached descendants inherit the filter, so approved
+background calls also require a listener process that remains available to
+pass later notifications after the per-turn `mu` process exits.
+
+Open decisions include the initial syscall set, Linux dependency strategy
+(libseccomp versus direct BPF), behavior for privilege-elevating commands,
+listener lifetime for detached descendants, interaction with concurrent
+readonly calls and command timeouts, audit fields, and whether to begin with a
+non-blocking shadow mode. The estimated implementation size is roughly
+780–1,220 production lines plus 530–890 lines of tests and documentation; a
+narrow proof of concept would be smaller but would not establish the complete
+runtime contract.
+
 ---
