@@ -264,8 +264,11 @@ accepts optional non-terminal stdin as a custom focus). The surface is small:
 - `mu project init [--path <dir>] [--force]` — create minimal `.mu/` project
   metadata in the current directory by default, or in an explicitly chosen
   directory.
-- `mu status --json [--include-models] [--include-commands] [--include-skills]`
-  — machine-readable shell state for prompt rendering and completion.
+- `mu status --json [--include-git] [--include-session-details]
+  [--include-models] [--include-commands] [--include-skills]` —
+  machine-readable shell state for prompt rendering and completion. The default
+  projection omits Git and detailed session metadata because prompt rendering
+  does not consume them; the corresponding `--include-*` flags add them.
 - `mu context [--export]` — introspect the agent context. By default it prints
   the assembled system prompt mu itself would use: the role preamble, the
   `<runtime>` block, the full skills index (built-in, global, and project), and

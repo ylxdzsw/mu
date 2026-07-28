@@ -39,13 +39,17 @@ pub struct StatusReport {
     pub project_root: Option<String>,
     pub context_window: Option<u64>,
     pub supported_effort_levels: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub git: Option<GitStatus>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub session: Option<StatusSession>,
-    pub active: StatusActiveTurn,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub active: Option<StatusActiveTurn>,
     /// Whether the selected session's last turn finished cleanly. `false` means
     /// it was interrupted; the next prompt continues on top of it or `mu retry`
     /// resumes it. `true` when there is no selected session.
     pub clean: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub compaction: Option<CompactionStatus>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub available_models: Option<AvailableModelsPayload>,
@@ -82,6 +86,13 @@ pub struct StatusActiveTurn {
 #[derive(Debug, Clone, Serialize)]
 pub struct CompactionStatus {
     pub latest_summary_seq: Option<i64>,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct StatusIncludes {
+    pub git: bool,
+    pub session_details: bool,
+    pub models: bool,
 }
 
 pub fn resolve_invocation(
@@ -162,39 +173,48 @@ pub fn build_status_report(
     config: &Config,
     overrides: &InvocationOverrides,
     project: Option<&crate::paths::Project>,
-    include_models: bool,
+    includes: StatusIncludes,
     commands: Option<Vec<CommandMeta>>,
     skills: Option<Vec<SkillMeta>>,
 ) -> Result<StatusReport> {
     let resolved = resolve_invocation(store, config, overrides)?;
     let model_info = resolve_model_info(config, &resolved.request.model);
-    let session_summary = resolved
-        .attached_session
-        .as_ref()
-        .map(|session| store.session_summary(&session.id))
-        .transpose()?
-        .flatten();
-    let active = resolved
-        .attached_session
-        .as_ref()
-        .map(|session| store.is_session_busy(&session.id))
-        .transpose()?
-        .unwrap_or(false);
+    let (session_summary, active, compaction) = if includes.session_details {
+        let session_summary = resolved
+            .attached_session
+            .as_ref()
+            .map(|session| store.session_summary(&session.id))
+            .transpose()?
+            .flatten();
+        let active = resolved
+            .attached_session
+            .as_ref()
+            .map(|session| store.is_session_busy(&session.id))
+            .transpose()?
+            .unwrap_or(false);
+        let compaction = resolved
+            .attached_session
+            .as_ref()
+            .map(|session| {
+                store
+                    .latest_summary_sequence(&session.id)
+                    .map(|latest_summary_seq| CompactionStatus { latest_summary_seq })
+            })
+            .transpose()?;
+        (
+            session_summary,
+            Some(StatusActiveTurn { busy: active }),
+            compaction,
+        )
+    } else {
+        (None, None, None)
+    };
     let clean = resolved
         .attached_session
         .as_ref()
         .map(|session| store.is_session_clean(&session.id))
         .transpose()?
         .unwrap_or(true);
-    let compaction = resolved
-        .attached_session
-        .as_ref()
-        .map(|session| {
-            store
-                .latest_summary_sequence(&session.id)
-                .map(|latest_summary_seq| CompactionStatus { latest_summary_seq })
-        })
-        .transpose()?;
     let model = status_model(&resolved.request.model);
 
     Ok(StatusReport {
@@ -207,12 +227,12 @@ pub fn build_status_report(
         project_root: project.map(|project| project.root.display().to_string()),
         context_window: model_info.context_window,
         supported_effort_levels: model_info.supported_effort_levels,
-        git: project.map(git_status),
+        git: includes.git.then(|| project.map(git_status)).flatten(),
         session: session_summary.map(status_session),
-        active: StatusActiveTurn { busy: active },
+        active,
         clean,
         compaction,
-        available_models: include_models.then(|| available_models(config)),
+        available_models: includes.models.then(|| available_models(config)),
         commands,
         skills,
     })
@@ -485,7 +505,7 @@ mod tests {
                 model: None,
             },
             None,
-            false,
+            StatusIncludes::default(),
             None,
             None,
         )
@@ -514,12 +534,58 @@ mod tests {
                 model: None,
             },
             None,
-            false,
+            StatusIncludes::default(),
             None,
             None,
         )
         .unwrap();
         assert!(report.clean);
+    }
+
+    #[test]
+    fn status_report_only_builds_requested_session_details() {
+        let store = Store::open_memory().unwrap();
+        let session = store.create_session("/tmp").unwrap();
+        let overrides = InvocationOverrides {
+            session: Some(session.id),
+            continue_latest: false,
+            model: None,
+        };
+
+        let lean = build_status_report(
+            &store,
+            &test_config(),
+            &overrides,
+            None,
+            StatusIncludes::default(),
+            None,
+            None,
+        )
+        .unwrap();
+        let lean_json = serde_json::to_value(&lean).unwrap();
+        assert!(lean.session.is_none());
+        assert!(lean.active.is_none());
+        assert!(lean.compaction.is_none());
+        assert!(lean_json.get("session").is_none());
+        assert!(lean_json.get("active").is_none());
+        assert!(lean_json.get("compaction").is_none());
+
+        let detailed = build_status_report(
+            &store,
+            &test_config(),
+            &overrides,
+            None,
+            StatusIncludes {
+                session_details: true,
+                ..StatusIncludes::default()
+            },
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(detailed.session.is_some());
+        assert!(detailed.active.is_some());
+        assert!(detailed.compaction.is_some());
     }
 
     #[test]

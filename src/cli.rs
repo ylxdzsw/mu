@@ -107,6 +107,14 @@ pub struct StatusArgs {
     #[arg(long)]
     pub include_models: bool,
 
+    /// Include Git branch and worktree cleanliness
+    #[arg(long)]
+    pub include_git: bool,
+
+    /// Include session counts, activity, and compaction state
+    #[arg(long)]
+    pub include_session_details: bool,
+
     #[arg(long)]
     pub include_commands: bool,
 
@@ -226,11 +234,21 @@ mod tests {
     }
 
     #[test]
-    fn parses_status_include_skills() {
-        let args = Args::try_parse_from(["mu", "status", "--json", "--include-skills"]).unwrap();
+    fn parses_status_include_flags() {
+        let args = Args::try_parse_from([
+            "mu",
+            "status",
+            "--json",
+            "--include-git",
+            "--include-session-details",
+            "--include-skills",
+        ])
+        .unwrap();
         match args.command {
             Some(Command::Status(status)) => {
                 assert!(status.json);
+                assert!(status.include_git);
+                assert!(status.include_session_details);
                 assert!(status.include_skills);
             }
             other => panic!("expected status command, got {other:?}"),

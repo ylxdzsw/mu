@@ -123,8 +123,9 @@ mu -o full prompt.md        # complete reasoning and tool details
 ```
 
 Inspect sessions and resolved state with `mu session list`, `mu session
-transcript --session <id>`, and `mu status --json`. Run `mu --help` for the full
-CLI surface.
+transcript --session <id>`, and `mu status --json`. Add `--include-git` or
+`--include-session-details` when those heavier status sections are needed. Run
+`mu --help` for the full CLI surface.
 
 ## How it works
 

@@ -45,7 +45,7 @@ use provider::{ContentPart, UserContent};
 use provider::{Provider, build_provider};
 use renderer::Renderer;
 use runtime::{
-    InvocationOverrides, StatusReport, build_status_report, resolve_invocation,
+    InvocationOverrides, StatusIncludes, StatusReport, build_status_report, resolve_invocation,
     resolve_retry_model, resolve_session_model,
 };
 
@@ -465,7 +465,11 @@ async fn run() -> Result<()> {
                     model: status_args.selection.model,
                 },
                 scope.project(),
-                status_args.include_models,
+                StatusIncludes {
+                    git: status_args.include_git || !status_args.json,
+                    session_details: status_args.include_session_details || !status_args.json,
+                    models: status_args.include_models,
+                },
                 commands,
                 skills,
             )?;
@@ -982,7 +986,7 @@ fn print_status_report(report: &StatusReport) {
             session.turn_count, session.message_count, session.updated_at
         );
     }
-    if report.active.busy {
+    if report.active.as_ref().is_some_and(|active| active.busy) {
         println!("active: busy");
     }
     if report.session_id.is_some() && !report.clean {
