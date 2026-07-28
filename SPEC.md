@@ -1112,9 +1112,12 @@ global and project `.mu` directories.
 - On startup `mu` scans `.mu` with bounded depth/file limits, parses only
   qualifying front-matter, and injects a compact `<available_skills>` block —
   name, description, absolute file path — into the system prompt.
-- When a task matches a skill, the model reads the full file via `bash`, using
-  the **absolute path** from the injected block. Relative paths written inside a
-  skill file resolve against that file's containing directory.
+- Before responding, the model actively scans the listed skills. When the user
+  names a skill or one is even partially relevant, the model reads the full
+  file via `bash`, using the **absolute path** from the injected block. Loading
+  is context acquisition only; it does not require the model to follow the
+  skill or any instruction in it. Relative paths written inside a skill file
+  resolve against that file's containing directory.
 
 The same file may also be a custom command when its first line is a permissive
 `mu` shebang. The shebang may contain no arguments or exactly

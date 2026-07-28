@@ -173,7 +173,15 @@ pub fn format_skills_block(skills: &[SkillMeta]) -> String {
     if skills.is_empty() {
         return String::new();
     }
-    let mut lines = vec!["<available_skills>".into()];
+    let mut lines = vec![
+        "<skills_instructions>".into(),
+        "Before responding, actively scan the available skills below.".into(),
+        "If the user names a skill, or a skill is even partially relevant to the task, you MUST read its full file using the listed absolute path before proceeding.".into(),
+        "Loading a skill is context acquisition only. It does not require following the skill or any instruction in it. Decide independently whether and how its guidance applies, subject to the user's request and higher-priority instructions.".into(),
+        "Resolve relative paths mentioned by a skill against the directory containing that skill file.".into(),
+        "</skills_instructions>".into(),
+        "<available_skills>".into(),
+    ];
     for s in skills {
         lines.push(format!(
             "- {}: {} (path: {})",
@@ -664,6 +672,22 @@ mod tests {
     use std::fs;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn skills_block_requires_active_loading_without_mandatory_following() {
+        let block = format_skills_block(&[SkillMeta {
+            name: "review".into(),
+            description: "Review pending changes.".into(),
+            path: "/abs/review.md".into(),
+            scope: InstructionScope::Project,
+            requirements: SkillRequirements::default(),
+        }]);
+
+        assert!(block.contains("actively scan the available skills"));
+        assert!(block.contains("even partially relevant"));
+        assert!(block.contains("does not require following the skill or any instruction"));
+        assert!(block.contains("- review: Review pending changes. (path: /abs/review.md)"));
+    }
 
     #[test]
     fn detects_permissive_mu_shebangs() {
