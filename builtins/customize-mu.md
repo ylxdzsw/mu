@@ -79,8 +79,8 @@ Common shape:
   "guardrail": {
     "enabled": true,
     "review_model": "openai/gpt-4o:low",
-    "timeout_ms": 90000,
-    "circuit_breaker": { "consecutive": 3, "window": 50, "window_denials": 10 }
+    "timeout_seconds": 120,
+    "max_denials_per_turn": 3
   }
 }
 ```

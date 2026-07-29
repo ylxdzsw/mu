@@ -213,15 +213,8 @@ pub struct LimitsConfig {
 pub struct GuardrailConfig {
     pub enabled: bool,
     pub review_model: Option<String>,
-    pub timeout_ms: u64,
-    pub circuit_breaker: CircuitBreakerConfig,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct CircuitBreakerConfig {
-    pub consecutive: u32,
-    pub window: usize,
-    pub window_denials: u32,
+    pub timeout_seconds: u64,
+    pub max_denials_per_turn: u32,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -429,6 +422,12 @@ impl Config {
         }
         for selector in &self.redaction.env {
             redaction_suffix(selector)?;
+        }
+        if self.guardrail.max_denials_per_turn == 0 {
+            bail!("`guardrail.max_denials_per_turn` must be greater than zero");
+        }
+        if self.guardrail.timeout_seconds == 0 {
+            bail!("`guardrail.timeout_seconds` must be greater than zero");
         }
         for (provider_id, provider) in &self.providers {
             if provider.endpoint.trim().is_empty() {
@@ -650,13 +649,6 @@ impl Default for GuardrailConfig {
 }
 
 #[cfg(test)]
-impl Default for CircuitBreakerConfig {
-    fn default() -> Self {
-        bundled_test_default("/guardrail/circuit_breaker")
-    }
-}
-
-#[cfg(test)]
 impl Default for TerminalBellConfig {
     fn default() -> Self {
         bundled_test_default("/terminal_bell")
@@ -771,7 +763,7 @@ mod tests {
         assert_eq!(config.compaction.fraction, 0.75);
         assert_eq!(config.compaction.keep_recent_turns, 2);
         assert_eq!(config.limits.max_iterations, 50);
-        assert_eq!(config.guardrail.timeout_ms, 90_000);
+        assert_eq!(config.guardrail.timeout_seconds, 120);
         assert!(config.terminal_bell.enabled);
         assert_eq!(
             config.redaction.env,
@@ -790,7 +782,7 @@ mod tests {
             },
             "limits": {"max_lines": 123},
             "line_wrapping": false,
-            "guardrail": {"circuit_breaker": {"window": 7}}
+            "guardrail": {"max_denials_per_turn": 7}
         });
         let project = serde_json::json!({
             "limits": {"max_bytes": 456},
@@ -805,10 +797,8 @@ mod tests {
         assert_eq!(config.limits.max_line_bytes, 10_240);
         assert!(!config.line_wrapping);
         assert!(!config.guardrail.enabled);
-        assert_eq!(config.guardrail.timeout_ms, 90_000);
-        assert_eq!(config.guardrail.circuit_breaker.consecutive, 3);
-        assert_eq!(config.guardrail.circuit_breaker.window, 7);
-        assert_eq!(config.guardrail.circuit_breaker.window_denials, 10);
+        assert_eq!(config.guardrail.timeout_seconds, 120);
+        assert_eq!(config.guardrail.max_denials_per_turn, 7);
     }
 
     #[test]
@@ -825,6 +815,28 @@ mod tests {
 
         let config = config_from_value(value).unwrap();
         assert!(config.redaction.env.is_empty());
+    }
+
+    #[test]
+    fn guardrail_limits_must_be_positive() {
+        let provider = serde_json::json!({
+            "openai": {
+                "endpoint": "http://localhost/chat/completions",
+                "models": {"gpt-4o": {"context_window": 128000}}
+            }
+        });
+        for guardrail in [
+            serde_json::json!({"timeout_seconds": 0}),
+            serde_json::json!({"max_denials_per_turn": 0}),
+        ] {
+            let error = config_from_value(serde_json::json!({
+                "providers": provider.clone(),
+                "guardrail": guardrail,
+            }))
+            .unwrap_err()
+            .to_string();
+            assert!(error.contains("must be greater than zero"), "{error}");
+        }
     }
 
     #[test]

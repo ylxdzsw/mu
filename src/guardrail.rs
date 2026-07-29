@@ -1,13 +1,14 @@
-use std::collections::VecDeque;
 use std::fmt;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::Deserialize;
-use serde_json::Value;
+use serde_json::{Value, json};
 
 use crate::config::{Config, GuardrailConfig};
 use crate::models::{RequestOptions, ResolvedModelRef};
 use crate::provider::{Message, ProviderError, approx_tokens};
+use crate::store::{ReviewAttemptCompletion, ReviewAttemptStart, Store};
+use crate::tools::BashRisk;
 use crate::{bash, provider};
 
 const MAX_ATTEMPTS: u32 = 3;
@@ -105,19 +106,11 @@ impl Assessment {
     }
 }
 
-pub enum GuardrailOutcome {
-    Allow(Assessment),
-    Deny(Assessment),
-    Failed(anyhow::Error),
-}
-
 pub struct Guardrail {
     config: GuardrailConfig,
     runtime: Config,
     active_model: ResolvedModelRef,
-    consecutive_denials: u32,
-    recent_denials: VecDeque<bool>,
-    interrupt_triggered: bool,
+    denials: u32,
 }
 
 impl Guardrail {
@@ -126,36 +119,41 @@ impl Guardrail {
             config: config.guardrail.clone(),
             runtime: config.clone(),
             active_model: active_model.clone(),
-            consecutive_denials: 0,
-            recent_denials: VecDeque::new(),
-            interrupt_triggered: false,
+            denials: 0,
         }
     }
 
     /// Whether the guardrail should review a bash call with the given risk.
-    pub fn should_review(&self, risk: &str) -> bool {
-        self.config.enabled && risk == "destructive"
+    pub fn should_review(&self, risk: BashRisk) -> bool {
+        risk == BashRisk::Destructive
     }
 
-    /// Assess a planned action. Returns `Allow`, `Deny`, or `Failed` (which
-    /// should abort the turn — re-authorizing would likely fail again since
-    /// the reviewer itself is malfunctioning).
-    pub async fn assess(&mut self, action: &Value, context: &[Message]) -> GuardrailOutcome {
+    /// Assess a planned action. Every provider attempt is durably recorded
+    /// before it starts and completed with its raw response or classified
+    /// error before this method returns.
+    pub async fn assess(
+        &mut self,
+        action: &Value,
+        context: &[Message],
+        store: &Store,
+        bash_call_id: i64,
+    ) -> anyhow::Result<Assessment> {
         bash::install_signal_forwarder();
         let request_model = match self.config.review_model.as_deref() {
-            Some(model_ref) => match crate::models::resolve_model_ref(&self.runtime, model_ref) {
-                Ok(model) => model,
-                Err(error) => return GuardrailOutcome::Failed(error),
-            },
+            Some(model_ref) => crate::models::resolve_model_ref(&self.runtime, model_ref)?,
             None => self.active_model.clone(),
         };
-        let provider = match provider::build_provider(&self.runtime, &request_model.provider_id) {
-            Ok(provider) => provider,
-            Err(error) => return GuardrailOutcome::Failed(error),
-        };
+        let provider = provider::build_provider(&self.runtime, &request_model.provider_id)?;
 
         let system_prompt = POLICY_PROMPT.to_string();
         let user_content = build_reviewer_user_content(context, action);
+        let request_json = serde_json::to_string(&json!({
+            "messages": [
+                {"role": "system", "content": &system_prompt},
+                {"role": "user", "content": &user_content}
+            ],
+            "tools": []
+        }))?;
 
         let msgs = vec![
             Message::System {
@@ -166,14 +164,23 @@ impl Guardrail {
             },
         ];
 
-        let timeout = Duration::from_millis(self.config.timeout_ms);
+        let timeout = Duration::from_secs(self.config.timeout_seconds);
         let mut last_error = String::new();
 
-        for attempt in 0..MAX_ATTEMPTS {
-            if attempt > 0 {
-                let backoff = Duration::from_secs(1 << (attempt - 1));
+        for attempt_index in 0..MAX_ATTEMPTS {
+            if attempt_index > 0 {
+                let backoff = Duration::from_secs(1 << (attempt_index - 1));
                 tokio::time::sleep(backoff).await;
             }
+            let attempt = attempt_index + 1;
+            store.start_review_attempt(ReviewAttemptStart {
+                bash_call_id,
+                attempt,
+                provider_id: &request_model.provider_id,
+                model: &request_model.canonical,
+                request_json: &request_json,
+            })?;
+            let started = Instant::now();
 
             let mut ignore_event = |_event: crate::provider::StreamEvent| Ok(());
             let result = tokio::time::timeout(timeout, async {
@@ -192,16 +199,52 @@ impl Guardrail {
 
             match result {
                 Err(_elapsed) => {
-                    last_error = format!("reviewer timed out after {}ms", self.config.timeout_ms);
+                    last_error =
+                        format!("reviewer timed out after {}s", self.config.timeout_seconds);
+                    finish_review_error(
+                        store,
+                        bash_call_id,
+                        attempt,
+                        ReviewError {
+                            response_text: None,
+                            class: "timeout",
+                            message: &last_error,
+                            elapsed: started.elapsed(),
+                            usage: None,
+                        },
+                    )?;
                     continue;
                 }
                 Ok(Err(ProviderError::ContextLength)) => {
-                    return GuardrailOutcome::Failed(anyhow::anyhow!(
-                        "reviewer context length exceeded"
-                    ));
+                    last_error = "reviewer context length exceeded".to_string();
+                    finish_review_error(
+                        store,
+                        bash_call_id,
+                        attempt,
+                        ReviewError {
+                            response_text: None,
+                            class: "context_length",
+                            message: &last_error,
+                            elapsed: started.elapsed(),
+                            usage: None,
+                        },
+                    )?;
+                    anyhow::bail!("{last_error}");
                 }
                 Ok(Err(error)) => {
                     last_error = error.to_string();
+                    finish_review_error(
+                        store,
+                        bash_call_id,
+                        attempt,
+                        ReviewError {
+                            response_text: None,
+                            class: provider_error_class(&error),
+                            message: &last_error,
+                            elapsed: started.elapsed(),
+                            usage: None,
+                        },
+                    )?;
                     continue;
                 }
                 Ok(Ok(stream_result)) => {
@@ -213,16 +256,40 @@ impl Guardrail {
                     };
                     match parse_assessment(content) {
                         Ok(assessment) => {
-                            if assessment.is_allowed() {
-                                self.record_non_denial();
-                                return GuardrailOutcome::Allow(assessment);
-                            } else {
-                                self.record_denial();
-                                return GuardrailOutcome::Deny(assessment);
+                            let risk_level = assessment.risk_level.to_string();
+                            let user_auth_level = assessment.user_auth_level.to_string();
+                            store.finish_review_attempt(ReviewAttemptCompletion {
+                                bash_call_id,
+                                attempt,
+                                outcome: assessment.outcome(),
+                                response_text: Some(content),
+                                risk_level: Some(&risk_level),
+                                user_auth_level: Some(&user_auth_level),
+                                reason: Some(&assessment.reason),
+                                error_class: None,
+                                error: None,
+                                duration_ms: duration_ms(started.elapsed()),
+                                usage: stream_result.usage.as_ref(),
+                            })?;
+                            if !assessment.is_allowed() {
+                                self.denials = self.denials.saturating_add(1);
                             }
+                            return Ok(assessment);
                         }
                         Err(e) => {
                             last_error = format!("parse error: {e}");
+                            finish_review_error(
+                                store,
+                                bash_call_id,
+                                attempt,
+                                ReviewError {
+                                    response_text: Some(content),
+                                    class: "parse",
+                                    message: &last_error,
+                                    elapsed: started.elapsed(),
+                                    usage: stream_result.usage.as_ref(),
+                                },
+                            )?;
                             continue;
                         }
                     }
@@ -230,44 +297,55 @@ impl Guardrail {
             }
         }
 
-        GuardrailOutcome::Failed(anyhow::anyhow!(
-            "reviewer failed after {MAX_ATTEMPTS} attempts: {last_error}"
-        ))
+        anyhow::bail!("reviewer failed after {MAX_ATTEMPTS} attempts: {last_error}")
     }
 
-    fn record_denial(&mut self) {
-        self.consecutive_denials = self.consecutive_denials.saturating_add(1);
-        self.push_recent(true);
+    pub fn denial_limit_reached(&self) -> Option<u32> {
+        (self.denials >= self.config.max_denials_per_turn).then_some(self.denials)
     }
+}
 
-    fn record_non_denial(&mut self) {
-        self.consecutive_denials = 0;
-        self.push_recent(false);
-    }
+struct ReviewError<'a> {
+    response_text: Option<&'a str>,
+    class: &'a str,
+    message: &'a str,
+    elapsed: Duration,
+    usage: Option<&'a crate::provider::Usage>,
+}
 
-    fn push_recent(&mut self, denied: bool) {
-        self.recent_denials.push_back(denied);
-        if self.recent_denials.len() > self.config.circuit_breaker.window {
-            self.recent_denials.pop_front();
-        }
-    }
+fn finish_review_error(
+    store: &Store,
+    bash_call_id: i64,
+    attempt: u32,
+    error: ReviewError<'_>,
+) -> anyhow::Result<()> {
+    store.finish_review_attempt(ReviewAttemptCompletion {
+        bash_call_id,
+        attempt,
+        outcome: "error",
+        response_text: error.response_text,
+        risk_level: None,
+        user_auth_level: None,
+        reason: None,
+        error_class: Some(error.class),
+        error: Some(error.message),
+        duration_ms: duration_ms(error.elapsed),
+        usage: error.usage,
+    })
+}
 
-    /// Check whether the circuit breaker has tripped after recent denials.
-    /// Returns `Some((consecutive, recent))` with the counts that triggered it,
-    /// or `None` if the breaker has not tripped (or already tripped earlier).
-    pub fn circuit_breaker_tripped(&mut self) -> Option<(u32, u32)> {
-        if self.interrupt_triggered {
-            return None;
-        }
-        let cb = &self.config.circuit_breaker;
-        let recent = self.recent_denials.iter().filter(|d| **d).count() as u32;
+fn duration_ms(elapsed: Duration) -> u64 {
+    elapsed.as_millis().min(u64::MAX as u128) as u64
+}
 
-        if self.consecutive_denials >= cb.consecutive || recent >= cb.window_denials {
-            self.interrupt_triggered = true;
-            Some((self.consecutive_denials, recent))
-        } else {
-            None
-        }
+fn provider_error_class(error: &ProviderError) -> &'static str {
+    match error {
+        ProviderError::ContextLength => "context_length",
+        ProviderError::RateLimit { .. } => "rate_limit",
+        ProviderError::HttpStatus { .. } => "http",
+        ProviderError::Transport(_) => "transport",
+        ProviderError::SseParse(_) => "sse_parse",
+        ProviderError::Other(_) => "provider",
     }
 }
 
@@ -605,25 +683,21 @@ fn parse_assessment(text: &str) -> anyhow::Result<Assessment> {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::VecDeque;
-
     use serde_json::json;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
 
     use super::*;
-    use crate::config::CircuitBreakerConfig;
-    use crate::tools::BashRisk;
+    use crate::config::{ModelConfig, OrderedMap, ProviderConfig};
+    use crate::provider::{FunctionCall, ToolCall};
 
-    fn test_guardrail(consecutive: u32, window_denials: u32) -> Guardrail {
+    fn test_guardrail(max_denials_per_turn: u32) -> Guardrail {
         Guardrail {
             config: GuardrailConfig {
                 enabled: true,
                 review_model: None,
-                timeout_ms: 1000,
-                circuit_breaker: CircuitBreakerConfig {
-                    consecutive,
-                    window: 50,
-                    window_denials,
-                },
+                timeout_seconds: 1,
+                max_denials_per_turn,
             },
             runtime: Config {
                 providers: Default::default(),
@@ -642,20 +716,17 @@ mod tests {
                 model_id: "model".into(),
                 effort: None,
             },
-            consecutive_denials: 0,
-            recent_denials: VecDeque::new(),
-            interrupt_triggered: false,
+            denials: 0,
         }
     }
 
     #[test]
-    fn circuit_breaker_trips_on_consecutive_denials() {
-        let mut g = test_guardrail(3, 10);
-        g.record_denial();
-        g.record_denial();
-        g.record_denial();
-        let trip = g.circuit_breaker_tripped().unwrap();
-        assert_eq!(trip.0, 3);
+    fn denial_limit_counts_all_denials_in_the_turn() {
+        let mut g = test_guardrail(3);
+        g.denials = 2;
+        assert_eq!(g.denial_limit_reached(), None);
+        g.denials += 1;
+        assert_eq!(g.denial_limit_reached(), Some(3));
     }
 
     #[test]
@@ -679,22 +750,12 @@ mod tests {
                 model_id: "model".into(),
                 effort: None,
             },
-            consecutive_denials: 0,
-            recent_denials: VecDeque::new(),
-            interrupt_triggered: false,
+            denials: 0,
         };
 
-        assert!(g.should_review("destructive"));
-        assert!(!g.should_review("reversible"));
-        assert!(!g.should_review("readonly"));
-    }
-
-    #[test]
-    fn should_review_only_destructive_when_enabled() {
-        let g = test_guardrail(3, 10);
-        assert!(g.should_review("destructive"));
-        assert!(!g.should_review("reversible"));
-        assert!(!g.should_review("readonly"));
+        assert!(g.should_review(BashRisk::Destructive));
+        assert!(!g.should_review(BashRisk::Reversible));
+        assert!(!g.should_review(BashRisk::Readonly));
     }
 
     #[test]
@@ -748,5 +809,132 @@ mod tests {
         assert!(content.contains(">>> APPROVAL REQUEST START"));
         assert!(content.contains("rm -rf /data"));
         assert!(content.contains(">>> APPROVAL REQUEST END"));
+    }
+
+    #[tokio::test]
+    async fn assess_persists_exact_request_and_raw_response() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let response_text =
+            r#"{"risk_level":"low","user_auth_level":"explicit","reason":"authorized"}"#;
+        let body = format!(
+            "data: {{\"choices\":[{{\"delta\":{{\"content\":{}}},\"finish_reason\":null}}]}}\n\n\
+             data: {{\"choices\":[{{\"delta\":{{}},\"finish_reason\":\"stop\"}}]}}\n\n\
+             data: [DONE]\n\n",
+            serde_json::to_string(response_text).unwrap()
+        );
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = vec![0u8; 65_536];
+            let _ = socket.read(&mut request).await.unwrap();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+        });
+
+        let tmp = std::env::temp_dir().join(format!("mu-guardrail-audit-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let database = tmp.join("sessions.db");
+        let store = Store::open(&database).unwrap();
+        let session = store
+            .create_session_seeded("/tmp", "system", "environment")
+            .unwrap();
+        let (_, bash_call_ids) = store
+            .append_message_with_bash_calls(
+                &session.id,
+                &Message::Assistant {
+                    content: None,
+                    reasoning_content: None,
+                    tool_calls: Some(vec![ToolCall {
+                        id: "call-reviewed".into(),
+                        function: FunctionCall {
+                            name: "bash".into(),
+                            arguments: r#"{"title":"Remove file","risk":"destructive","command":"rm /tmp/x"}"#.into(),
+                        },
+                    }]),
+                    native_replay: None,
+                },
+            )
+            .unwrap();
+        let model = ResolvedModelRef {
+            canonical: "test/reviewer".into(),
+            provider_id: "test".into(),
+            model_id: "reviewer".into(),
+            effort: None,
+        };
+        let config = Config {
+            providers: OrderedMap::from_iter([(
+                "test".into(),
+                ProviderConfig {
+                    endpoint: format!("http://{address}/chat/completions"),
+                    api_key_env: String::new(),
+                    models: OrderedMap::from_iter([(
+                        "reviewer".into(),
+                        ModelConfig {
+                            context_window: Some(128_000),
+                            supported_efforts: None,
+                        },
+                    )]),
+                },
+            )]),
+            output: Default::default(),
+            line_wrapping: true,
+            compaction: crate::config::CompactionConfig::default(),
+            limits: crate::config::LimitsConfig::default(),
+            guardrail: GuardrailConfig {
+                enabled: true,
+                review_model: None,
+                timeout_seconds: 2,
+                max_denials_per_turn: 3,
+            },
+            terminal_bell: crate::config::TerminalBellConfig::default(),
+            redaction: crate::config::RedactionConfig::default(),
+            env: Default::default(),
+        };
+        let mut guardrail = Guardrail::new(&config, &model);
+        let action = json!({
+            "title": "Remove file",
+            "risk": "destructive",
+            "command": "rm /tmp/x"
+        });
+        let context = vec![Message::User {
+            content: "Remove it.".into(),
+        }];
+
+        let assessment = guardrail
+            .assess(&action, &context, &store, bash_call_ids[0])
+            .await
+            .unwrap();
+        assert!(assessment.is_allowed());
+        server.await.unwrap();
+        drop(store);
+
+        let connection = rusqlite::Connection::open(&database).unwrap();
+        let stored: (String, String, String, String, i64) = connection
+            .query_row(
+                "SELECT request_json, response_text, provider_id, outcome, attempt
+                 FROM bash_review",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert!(stored.0.contains("Remove it."));
+        assert!(stored.0.contains("rm /tmp/x"));
+        assert_eq!(stored.1, response_text);
+        assert_eq!(stored.2, "test");
+        assert_eq!(stored.3, "allow");
+        assert_eq!(stored.4, 1);
+        let _ = std::fs::remove_dir_all(tmp);
     }
 }

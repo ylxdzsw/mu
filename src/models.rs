@@ -226,8 +226,8 @@ mod tests {
 
     use super::*;
     use crate::config::{
-        CircuitBreakerConfig, CompactionConfig, GuardrailConfig, LimitsConfig, ModelConfig,
-        OrderedMap, ProviderConfig, RedactionConfig, TerminalBellConfig,
+        CompactionConfig, GuardrailConfig, LimitsConfig, ModelConfig, OrderedMap, ProviderConfig,
+        RedactionConfig, TerminalBellConfig,
     };
 
     fn test_config() -> Config {
@@ -303,8 +303,8 @@ mod tests {
             guardrail: GuardrailConfig {
                 enabled: false,
                 review_model: Some("alpha/common-model".into()),
-                timeout_ms: 90_000,
-                circuit_breaker: CircuitBreakerConfig::default(),
+                timeout_seconds: 120,
+                max_denials_per_turn: 3,
             },
             terminal_bell: TerminalBellConfig::default(),
             redaction: RedactionConfig::default(),

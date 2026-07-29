@@ -1468,16 +1468,17 @@ Conceptual schema (flat and small):
   message tail (§"Interrupted turns and retry").
 - **turn_usage** — provider usage aggregates for each completed invocation,
   including input/cache/output/reasoning/total token counts.
-- **bash_review** — at most one guardrail decision per Bash claim, containing
-  the assessed risk, authorization level, allow/deny outcome, reason, and time.
-  The raw action is already present in `bash_call.arguments` and is not copied.
+- **bash_review** — one row per guardrail provider attempt, keyed by the Bash
+  claim and attempt number. Each row contains the provider/model, exact
+  semantic request, raw response or classified error, parsed risk and
+  authorization, outcome, reason, usage, duration, and start/end time.
 
 **Compatibility baseline.** Schema version 6 is the durable compatibility
 baseline. Later schema versions retain ordered, transactional migrations from
 that baseline instead of asking the user to delete `sessions.db`; unknown newer
-versions fail with an instruction to upgrade `mu`. Config evolution follows the
-same rule: new fields are optional with defaults, and renamed or removed fields
-must retain an accepted legacy spelling or provide an explicit migration path.
+versions fail with an instruction to upgrade `mu`. Config evolution is
+forward-only: bundled defaults fill omitted current fields, while removed
+fields do not remain as compatibility aliases.
 
 ### Session mapping
 
@@ -1804,19 +1805,28 @@ risk categories, and a strict JSON output contract.
 
 **Outcomes.**
 
-- **Allow** (`auth >= risk`): the bash call executes. A `[guardrail: allow]`
-  line with the reviewer reason is rendered after the streamed command header
-  and before execution output.
-- **Deny** (`auth < risk`): the bash call does not execute. A `[guardrail: deny]`
-  line with the reviewer reason is rendered after the streamed command header,
-  and a tool error is returned to the agent:
+- **Allow** (`auth >= risk`): the bash call executes. Detail/full terminal
+  output renders `✓ guardrail allowed · risk ≤ auth — reason` after the command
+  header and before execution output.
+- **Deny** (`auth < risk`): the bash call does not execute. Detail/full terminal
+  output renders `✗ guardrail denied · risk > auth — reason`, and a tool error
+  is returned to the agent:
   > guardrail: action rejected — risk_level X exceeds user_auth_level Y (reason).
   > Do not work around this; stop and ask the user to authorize, or choose a
   > less destructive approach.
   The agent can then adapt its approach or stop and ask the user.
 - **Reviewer failure** (timeout, malformed JSON, network error after 3 retry
-  attempts): the turn is **aborted** (`bail!`). Re-authorizing would likely
-  fail again since the reviewer itself is malfunctioning.
+  attempts): an explicit Bash error records that execution never began and the
+  turn is **aborted**. Re-authorizing would likely fail again since the reviewer
+  itself is malfunctioning.
+
+In interactive concise output, the completed tool-call live line changes to
+`[guardrail] TITLE…` while review is in progress. An allow restores the normal
+live tool line and adds no permanent review line; completion remains
+`=> TITLE · exit N`. A denial or reviewer failure commits
+`=> TITLE · guardrail denied` or `=> TITLE · guardrail error`. Redirected
+concise output has no mutable live line and emits only the committed outcome.
+Final-only output remains silent about guardrail activity.
 
 **User authorization via history.** There is no dedicated "re-prompt" mechanism.
 When the agent asks the user and the user responds with explicit approval
@@ -1824,11 +1834,10 @@ When the agent asks the user and the user responds with explicit approval
 the next turn, the reviewer sees this in the transcript and can score
 `user_auth_level: "explicit"`, which permits even `critical`-risk actions.
 
-**Circuit breaker.** Per-turn, tracks consecutive denials and a sliding window
-of recent reviews. If consecutive denials reach 3, or denials in the last 50
-reviews reach 10, the turn is aborted with a clear notice. This prevents the
-agent from repeatedly attempting destructive actions that the reviewer keeps
-denying.
+**Denial limit.** The turn counts all guardrail denials and aborts with a clear
+notice when `guardrail.max_denials_per_turn` is reached. The default is 3. This
+prevents repeated destructive attempts without a second sliding-window policy;
+the general iteration limit remains an independent bound.
 
 **Retry.** The reviewer call retries up to 3 times on transient errors (timeout,
 network failure, parse failure) with exponential backoff (1s, 2s). Context-
@@ -1840,14 +1849,22 @@ length errors are not retried.
 "guardrail": {
   "enabled": true,                           // default on; set false to opt out
   "review_model": null,                      // null -> same as active turn model
-  "timeout_ms": 90000,
-  "circuit_breaker": { "consecutive": 3, "window": 50, "window_denials": 10 }
+  "timeout_seconds": 120,
+  "max_denials_per_turn": 3
 }
 ```
 
-**Audit.** Each review is recorded in the `bash_review` table (SQLite), keyed to
-its immutable `bash_call`: risk level, auth level, outcome, reason, and
-timestamp. The action remains in `bash_call.arguments` rather than being copied.
+**Audit.** Before each provider request, Mu inserts a `pending` row in
+`bash_review`, keyed by `(bash_call_id, attempt)`. It then completes the row with
+the raw assistant response or classified error, parsed risk/auth/outcome/reason,
+provider/model, token usage, duration, and completion time. A process
+interruption therefore leaves a visible pending attempt. `bash_call_id` links
+the audit through the immutable Bash claim and assistant message to the session
+and sequence that supplied its context. `request_json` stores the exact
+filtered/truncated system and user messages actually submitted, rather than
+depending on later reconstruction. Legacy decisions migrated to schema v11
+retain their link and verdict but have null request/response metadata because
+those values were not previously stored.
 
 **Concurrency.** Guardrail only targets `destructive` calls, which are always
 sequential (concurrent batches only run `readonly` tools). There is no
@@ -1884,13 +1901,196 @@ open or closed. Detached descendants inherit the filter, so approved
 background calls also require a listener process that remains available to
 pass later notifications after the per-turn `mu` process exits.
 
-Open decisions include the initial syscall set, Linux dependency strategy
-(libseccomp versus direct BPF), behavior for privilege-elevating commands,
-listener lifetime for detached descendants, interaction with concurrent
-readonly calls and command timeouts, audit fields, and whether to begin with a
-non-blocking shadow mode. The estimated implementation size is roughly
-780–1,220 production lines plus 530–890 lines of tests and documentation; a
-narrow proof of concept would be smaller but would not establish the complete
-runtime contract.
+**Candidate review-policy map.** Instead of combining the current
+`guardrail.enabled` switch with a second deferred-review switch, configuration
+could map each declared risk independently to one of three timings:
+
+```jsonc
+"guardrail": {
+  "policy": {
+    "readonly": "skip",
+    "reversible": "skip",
+    "destructive": "immediate"
+  },
+  "review_model": null,
+  "timeout_seconds": 120,
+  "max_denials_per_turn": 3
+}
+```
+
+`skip` means no review or notification filter, `defer` means review only after
+a selected runtime trigger, and `immediate` means review before execution and
+then run without the filter. Setting every class to `skip` could replace the
+global disable switch. Open questions are whether this should replace
+`enabled` outright, what bundled defaults should be, and whether an unavailable
+`defer` policy should promote to `immediate`, fail the call, or weaken to
+`skip`. Promotion preserves protection and cross-platform behavior but can add
+unexpected latency; weakening to `skip` can silently defeat the user's intent.
+
+**Candidate per-call escalation.** Some commands must avoid the deferred path
+even when their declared risk maps to `defer`: privilege-changing commands can
+be broken by `no_new_privs`, and detached processes inherit the filter. One
+candidate is an optional `review_before_execution` Boolean on the Bash call. It
+would default false and only promote `defer` to `immediate`; it could not relax
+an `immediate` policy or override a user-selected `skip`. This keeps the
+declared risk accurate, but adds a niche, platform-motivated field to every Bash
+schema. Its name is also misleading when the configured policy is `skip`,
+because setting it would still not cause review.
+
+Another candidate is a fourth Bash `risk` value such as `needs-review` or
+`review-required`. It would request immediate review and filter-free execution
+without calling the action destructive. This keeps the common call shape to
+one classification field and works independently of deferred-review platform
+support. The tradeoff is semantic impurity: `readonly`, `reversible`, and
+`destructive` describe recoverability, while `needs-review` describes routing
+and loses the agent's recoverability assessment. The reviewer can still record
+the assessed risk. Audit storage could project this as `declared_risk = NULL`
+plus a review-request marker rather than treating it as a fourth risk rank.
+
+If `needs-review` is configurable, its policy should accept only `skip` or
+`immediate`; `defer` contradicts why the value exists. If it is hard-coded to
+`immediate`, an all-`skip` policy no longer fully disables reviews. That
+authority question remains open. `unsandbox` is a poor candidate name: this
+feature is not a sandbox, the term exposes an implementation detail, and it
+frames the value as a general escape hatch rather than a request for review.
+
+**Candidate automatic routing.** Mu could statically match or parse explicit
+commands such as `sudo`, `doas`, `pkexec`, and `setsid` and promote them to
+immediate review. This avoids a tool-schema addition, and false positives only
+cause earlier review. It cannot reliably cover dynamic Bash (`"$runner"`,
+functions, aliases, or nested scripts), adds a shell-analysis subsystem for
+niche cases, and has been identified as an undesirable direction. It must not
+be presented as complete enforcement.
+
+**`sudo` and privilege elevation.** Once an unprivileged child sets
+`no_new_privs`, it cannot clear the flag, and setuid/setgid executables and file
+capabilities cannot elevate it. A deferred command therefore cannot encounter
+`sudo` and then transparently switch to an unfiltered execution path. Candidate
+approaches are:
+
+- route the whole call to immediate review before spawn via a Boolean or
+  `needs-review` sentinel;
+- use best-effort static command detection, accepting missed dynamic cases;
+- let missed cases fail under `no_new_privs` with a targeted diagnostic;
+- introduce an unfiltered execution broker that recreates the command's cwd,
+  environment, stdio, process group, and exit status outside the filtered
+  process tree.
+
+The broker is substantially more complex and creates a deliberate filter escape
+surface. Killing and automatically restarting the whole Bash call after
+discovering `sudo` is also unsafe: effects may already have occurred and would
+be repeated. A privileged helper that installs seccomp without `no_new_privs`
+would be an even larger security and deployment commitment.
+
+**`setsid` and detached descendants.** `setsid` can itself be watched and
+reviewed immediately before detachment, but allow cannot remove an inherited
+seccomp filter. Candidate outcomes are:
+
+- route known background launches to immediate review before spawn;
+- reject a deferred `setsid` call before detachment and require a new
+  immediate-review call;
+- hand the listener to a persistent drainer/broker that outlives the Bash tool
+  call and automatically continues later notifications after the one whole-call
+  approval.
+
+The first two keep listener lifetime bounded but require an explicit routing
+mechanism. The broker supports transparent detachment but adds process
+supervision, cleanup, crash recovery, and shutdown concerns. Watching `setsid`
+does not identify every daemonization technique.
+
+**Candidate observe mode.** A continue-only mode can measure syscall frequency,
+latency, and false-trigger rates without invoking the reviewer. It is not truly
+behavior-neutral: it still installs seccomp, sets `no_new_privs`, exercises the
+supervisor, and can break commands if the implementation is wrong. It could be
+a user-visible `shadow` configuration, but that adds permanent configuration and
+audit surface. A narrower candidate is a standalone spike or development-only
+observe harness that is removed or kept out of the product after measurement.
+
+**Reframed fundamental constraints.** Two constraints define the realistic
+scope of deferred review:
+
+1. An ordinary unprivileged child must set `no_new_privs` before installing a
+   seccomp filter. A caller with `CAP_SYS_ADMIN` in its user namespace can
+   install the filter without that flag, so `no_new_privs` is not an intrinsic
+   seccomp-notification requirement; it is the normal unprivileged deployment
+   requirement. The flag is irreversible and inherited, so it prevents later
+   privilege gain through all setuid/setgid and file-capability programs, not
+   only `sudo` and `pkexec`.
+2. A listener must remain available until every task inheriting the filter has
+   exited. It need not be the original Mu thread or process—the fd can be handed
+   to a broker—but approval does not remove or weaken the filter. Every later
+   watched syscall still needs a response, and listener loss makes it fail with
+   `ENOSYS`.
+
+The second constraint is broader than `setsid`. A descendant can outlive the
+launching shell through ordinary backgrounding with redirected stdio,
+double-forking, process-group changes, or another daemonization technique. A
+tool call can therefore appear complete while a filtered descendant remains
+dependent on the listener.
+
+**Additional kernel and lifecycle edge cases.**
+
+- Only one filter installed with `SECCOMP_FILTER_FLAG_NEW_LISTENER` can exist
+  in a thread's inherited filter tree. A synchronous inner Mu that inherits an
+  outer Mu notification filter cannot simply install its own independent
+  listener; the second installation fails with `EBUSY`. This invalidates the
+  simple stacked-supervisor model. Candidates are to review the whole outer
+  delegation and let that listener drain inner work, route delegation outside
+  deferred review, or design explicit listener handoff/cooperation.
+- Closing the last listener does not cleanly cancel descendants; their later
+  watched syscalls receive `ENOSYS`. Conversely, a blocking notification
+  receive can remain blocked after a target exits, so supervisor shutdown needs
+  pollable cancellation and explicit reaping rather than relying on cross-thread
+  fd close.
+- A signal can interrupt a notified syscall, invalidate the notification, and
+  restart the syscall, producing another notification for the same logical
+  operation. One-review semantics must tolerate `ENOENT`, revalidate ids, and
+  drain duplicate/restarted notifications without reviewing twice.
+- Reviewer latency occurs while the target is suspended. Command deadlines must
+  define whether review time counts, and concurrent triggers can leave several
+  commands blocked while reviews are serialized.
+- Existing container or service-manager seccomp filters can deny installation
+  or return a higher-precedence action for a watched syscall. Capability probing
+  must occur in the actual child execution environment and cannot promise that
+  Mu's notification action wins every filter stack.
+- Syscall coverage remains incomplete independently of these lifecycle issues.
+  `io_uring`, inherited writable descriptors, shared mappings, device `ioctl`s,
+  local IPC, alternate syscall variants, and future interfaces can produce side
+  effects without a selected notification trigger.
+
+**Resulting architecture candidates.**
+
+1. **Scoped in-process deferred review.** Support only non-privilege-changing
+   process trees whose descendants are guaranteed to end with the tool call.
+   Exceptional, detached, and recursive Mu calls use immediate review or skip.
+   This is the smallest design but requires a reliable routing contract and
+   deliberately does not support arbitrary Bash.
+2. **Persistent unprivileged broker.** Transfer listener fds to a process that
+   can outlive tool calls and turns. This solves descendant lifetime, including
+   approved detached work, but does not solve `no_new_privs`, privilege
+   elevation, or the inherited-listener conflict for independently reviewing
+   nested Mu calls.
+3. **Privileged persistent launcher/broker.** A tightly controlled launcher with
+   `CAP_SYS_ADMIN` could install the filter without `no_new_privs`, drop to the
+   invoking user, spawn Bash, and retain the listener. This is the only
+   candidate that addresses both fundamental constraints generally, but it
+   introduces a privileged service/helper, authentication and command-binding
+   requirements, deployment and upgrade concerns, and a substantially larger
+   security boundary than Mu currently has.
+
+The existing size estimate applies only to a scoped in-process design. Either
+broker architecture would require a new estimate and a separate threat model.
+
+Open decisions therefore include the policy-map shape and defaults, whether
+per-call routing uses a Boolean or a `needs-review` sentinel, the authority of an
+all-`skip` configuration, unsupported-platform promotion, the initial syscall
+set, Linux dependency strategy (libseccomp versus direct BPF), `sudo`
+compatibility, listener lifetime for every surviving descendant, nested Mu
+semantics, interaction with concurrent readonly calls and command timeouts,
+audit fields, whether observe mode exists only for development, and whether the
+feature's benefit justifies a persistent or privileged broker. A scoped
+in-process implementation is estimated at roughly 780–1,220 production lines
+plus 530–890 lines of tests and documentation; a narrow proof of concept would
+be smaller but would not establish the complete runtime contract.
 
 ---

@@ -8,14 +8,14 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::compaction;
 use crate::config::Config;
-use crate::guardrail::{Guardrail, GuardrailOutcome};
+use crate::guardrail::Guardrail;
 use crate::models::RequestOptions;
 use crate::provider::{
     FinishReason, Message, Provider, ProviderError, StreamEvent, ToolCall, ToolCallDelta, Usage,
     approx_tokens,
 };
 use crate::renderer::Renderer;
-use crate::store::{BashResultRecord, ReviewRecord, Store, TurnAttemptCompletion};
+use crate::store::{BashResultRecord, Store, TurnAttemptCompletion};
 use crate::tools::{BashRisk, ExecutionMode, ToolContext, ToolResult};
 use crate::{bash, tools};
 use bash::RunningBash;
@@ -381,81 +381,81 @@ impl<'a> AgentLoop<'a> {
                                     cursor += 1;
                                     continue;
                                 }
-                                if g.should_review(
-                                    risk.as_ref().map(|risk| risk.as_str()).unwrap_or(""),
-                                ) {
+                                if g.should_review(risk.expect("risk checked above")) {
                                     let args_for_review = args.clone();
                                     let command = args_for_review
                                         .get("command")
                                         .and_then(|v| v.as_str())
                                         .unwrap_or("");
-                                    match g.assess(&args_for_review, &context).await {
-                                        GuardrailOutcome::Allow(a) => {
-                                            let risk_level = a.risk_level.to_string();
-                                            let user_auth_level = a.user_auth_level.to_string();
-                                            self.renderer.guardrail_verdict(
-                                                true,
-                                                &risk_level,
-                                                &user_auth_level,
-                                                &a.reason,
-                                                command,
-                                            )?;
-                                            self.store.record_review(ReviewRecord {
-                                                bash_call_id: bash_call_ids[cursor],
-                                                risk_level: &risk_level,
-                                                user_auth_level: &user_auth_level,
-                                                outcome: a.outcome(),
-                                                reason: Some(&a.reason),
-                                            })?;
-                                        }
-                                        GuardrailOutcome::Deny(a) => {
-                                            let risk_level = a.risk_level.to_string();
-                                            let user_auth_level = a.user_auth_level.to_string();
-                                            self.renderer.guardrail_verdict(
-                                                false,
-                                                &risk_level,
-                                                &user_auth_level,
-                                                &a.reason,
-                                                command,
-                                            )?;
-                                            self.store.record_review(ReviewRecord {
-                                                bash_call_id: bash_call_ids[cursor],
-                                                risk_level: &risk_level,
-                                                user_auth_level: &user_auth_level,
-                                                outcome: a.outcome(),
-                                                reason: Some(&a.reason),
-                                            })?;
-                                            self.renderer.tool_rejected()?;
-                                            if let Some((consec, recent)) =
-                                                g.circuit_breaker_tripped()
-                                            {
-                                                self.renderer.notice(&format!(
-                                                    "[mu] guardrail: aborting turn — {consec} consecutive denials ({recent} in recent window)"
-                                                ))?;
-                                                bail!("guardrail circuit breaker tripped");
-                                            }
-                                            let deny_err = anyhow::anyhow!(
-                                                "guardrail: action rejected — risk_level {} exceeds user_auth_level {} ({}). \
-                                                 Do not work around this; stop and ask the user to authorize, \
-                                                 or choose a less destructive approach.",
-                                                a.risk_level,
-                                                a.user_auth_level,
-                                                a.reason
-                                            );
+                                    self.renderer.guardrail_start()?;
+                                    let assessment = match g
+                                        .assess(
+                                            &args_for_review,
+                                            &context,
+                                            self.store,
+                                            bash_call_ids[cursor],
+                                        )
+                                        .await
+                                    {
+                                        Ok(assessment) => assessment,
+                                        Err(error) => {
+                                            let message =
+                                                format!("guardrail review failed: {error}");
                                             self.persist_bash_result(
                                                 bash_call_ids[cursor],
                                                 tc,
-                                                Err(deny_err),
+                                                Err(anyhow::anyhow!(message.clone())),
                                                 Duration::ZERO,
                                                 &mut context,
                                                 false,
                                             )?;
-                                            cursor += 1;
-                                            continue;
+                                            self.renderer.guardrail_failed()?;
+                                            bail!("{message}");
                                         }
-                                        GuardrailOutcome::Failed(e) => {
-                                            bail!("guardrail review failed: {e}");
+                                    };
+                                    let risk_level = assessment.risk_level.to_string();
+                                    let user_auth_level = assessment.user_auth_level.to_string();
+                                    if assessment.is_allowed() {
+                                        self.renderer.guardrail_verdict(
+                                            true,
+                                            &risk_level,
+                                            &user_auth_level,
+                                            &assessment.reason,
+                                            command,
+                                        )?;
+                                    } else {
+                                        let deny_err = anyhow::anyhow!(
+                                            "guardrail: action rejected — risk_level {} exceeds user_auth_level {} ({}). \
+                                             Do not work around this; stop and ask the user to authorize, \
+                                             or choose a less destructive approach.",
+                                            assessment.risk_level,
+                                            assessment.user_auth_level,
+                                            assessment.reason
+                                        );
+                                        self.persist_bash_result(
+                                            bash_call_ids[cursor],
+                                            tc,
+                                            Err(deny_err),
+                                            Duration::ZERO,
+                                            &mut context,
+                                            false,
+                                        )?;
+                                        self.renderer.guardrail_verdict(
+                                            false,
+                                            &risk_level,
+                                            &user_auth_level,
+                                            &assessment.reason,
+                                            command,
+                                        )?;
+                                        self.renderer.guardrail_rejected()?;
+                                        if let Some(denials) = g.denial_limit_reached() {
+                                            self.renderer.notice(&format!(
+                                                "[mu] guardrail: aborting turn — {denials} denials in this turn"
+                                            ))?;
+                                            bail!("guardrail denial limit reached");
                                         }
+                                        cursor += 1;
+                                        continue;
                                     }
                                 }
                             }
@@ -1428,7 +1428,7 @@ fn guardrail_review_required(guardrail: Option<&Guardrail>, call: &ToolCall, arg
     let Some(risk) = BashRisk::from_value(args) else {
         return false;
     };
-    guardrail.should_review(risk.as_str())
+    guardrail.should_review(risk)
 }
 
 #[cfg(test)]

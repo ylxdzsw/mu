@@ -72,12 +72,26 @@ pub struct TurnAttemptCompletion<'a> {
     pub context_tokens: u64,
 }
 
-pub struct ReviewRecord<'a> {
+pub struct ReviewAttemptStart<'a> {
     pub bash_call_id: i64,
-    pub risk_level: &'a str,
-    pub user_auth_level: &'a str,
+    pub attempt: u32,
+    pub provider_id: &'a str,
+    pub model: &'a str,
+    pub request_json: &'a str,
+}
+
+pub struct ReviewAttemptCompletion<'a> {
+    pub bash_call_id: i64,
+    pub attempt: u32,
     pub outcome: &'a str,
+    pub response_text: Option<&'a str>,
+    pub risk_level: Option<&'a str>,
+    pub user_auth_level: Option<&'a str>,
     pub reason: Option<&'a str>,
+    pub error_class: Option<&'a str>,
+    pub error: Option<&'a str>,
+    pub duration_ms: u64,
+    pub usage: Option<&'a crate::provider::Usage>,
 }
 
 pub struct Store {
@@ -96,7 +110,7 @@ impl std::fmt::Display for SessionBusy {
 
 impl std::error::Error for SessionBusy {}
 
-const CURRENT_SCHEMA_VERSION: i32 = 10;
+const CURRENT_SCHEMA_VERSION: i32 = 11;
 const COMPATIBLE_SCHEMA_BASELINE: i32 = 6;
 
 fn session_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Session> {
@@ -174,6 +188,7 @@ impl Store {
                 7 => self.migrate_schema_v7_to_v8()?,
                 8 => self.migrate_schema_v8_to_v9()?,
                 9 => self.migrate_schema_v9_to_v10()?,
+                10 => self.migrate_schema_v10_to_v11()?,
                 other => anyhow::bail!("no migration path from schema version {other}"),
             }
             version += 1;
@@ -303,15 +318,31 @@ impl Store {
                 FOREIGN KEY(blob_id) REFERENCES attachment_blob(id)
             );
             CREATE TABLE IF NOT EXISTS bash_review (
-                bash_call_id INTEGER PRIMARY KEY,
-                risk_level TEXT NOT NULL,
-                auth_level TEXT NOT NULL,
-                outcome TEXT NOT NULL CHECK(outcome IN ('allow', 'deny')),
-                reason TEXT NOT NULL,
-                created_at TEXT NOT NULL,
+                bash_call_id INTEGER NOT NULL,
+                attempt INTEGER NOT NULL CHECK(attempt > 0),
+                provider_id TEXT,
+                model TEXT,
+                request_json TEXT,
+                response_text TEXT,
+                outcome TEXT NOT NULL CHECK(outcome IN ('pending', 'allow', 'deny', 'error')),
+                risk_level TEXT,
+                auth_level TEXT,
+                reason TEXT,
+                error_class TEXT,
+                error TEXT,
+                input_tokens INTEGER,
+                cache_read_input_tokens INTEGER,
+                cache_write_input_tokens INTEGER,
+                output_tokens INTEGER,
+                reasoning_output_tokens INTEGER,
+                total_tokens INTEGER,
+                duration_ms INTEGER CHECK(duration_ms IS NULL OR duration_ms >= 0),
+                started_at TEXT NOT NULL,
+                completed_at TEXT,
+                PRIMARY KEY(bash_call_id, attempt),
                 FOREIGN KEY(bash_call_id) REFERENCES bash_call(id)
             );
-            PRAGMA user_version = 10;",
+            PRAGMA user_version = 11;",
         )?;
         Ok(())
     }
@@ -675,6 +706,54 @@ impl Store {
         let tx = self.conn.unchecked_transaction()?;
         tx.execute_batch("ALTER TABLE session DROP COLUMN model; PRAGMA user_version = 10;")
             .context("migrating session database to schema v10")?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// v11 records every guardrail provider attempt, including its exact
+    /// semantic request, raw response or error, model, usage, and duration.
+    /// Legacy decisions remain linked to their Bash call, but request/response
+    /// fields are null because that information was not previously retained.
+    fn migrate_schema_v10_to_v11(&self) -> Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute_batch(
+            "ALTER TABLE bash_review RENAME TO bash_review_v10;
+             CREATE TABLE bash_review (
+                bash_call_id INTEGER NOT NULL,
+                attempt INTEGER NOT NULL CHECK(attempt > 0),
+                provider_id TEXT,
+                model TEXT,
+                request_json TEXT,
+                response_text TEXT,
+                outcome TEXT NOT NULL CHECK(outcome IN ('pending', 'allow', 'deny', 'error')),
+                risk_level TEXT,
+                auth_level TEXT,
+                reason TEXT,
+                error_class TEXT,
+                error TEXT,
+                input_tokens INTEGER,
+                cache_read_input_tokens INTEGER,
+                cache_write_input_tokens INTEGER,
+                output_tokens INTEGER,
+                reasoning_output_tokens INTEGER,
+                total_tokens INTEGER,
+                duration_ms INTEGER CHECK(duration_ms IS NULL OR duration_ms >= 0),
+                started_at TEXT NOT NULL,
+                completed_at TEXT,
+                PRIMARY KEY(bash_call_id, attempt),
+                FOREIGN KEY(bash_call_id) REFERENCES bash_call(id)
+             );
+             INSERT INTO bash_review (
+                bash_call_id, attempt, outcome, risk_level, auth_level, reason,
+                started_at, completed_at
+             ) SELECT
+                bash_call_id, 1, outcome, risk_level, auth_level, reason,
+                created_at, created_at
+             FROM bash_review_v10;
+             DROP TABLE bash_review_v10;
+             PRAGMA user_version = 11;",
+        )
+        .context("migrating session database to schema v11")?;
         tx.commit()?;
         Ok(())
     }
@@ -1364,21 +1443,78 @@ impl Store {
         Ok((message_id, attachments))
     }
 
-    pub fn record_review(&self, record: ReviewRecord<'_>) -> Result<()> {
+    pub fn start_review_attempt(&self, record: ReviewAttemptStart<'_>) -> Result<()> {
         let now = now_rfc3339();
         self.conn.execute(
             "INSERT INTO bash_review (
-                bash_call_id, risk_level, auth_level, outcome, reason, created_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                bash_call_id, attempt, provider_id, model, request_json, outcome, started_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, 'pending', ?6)",
             params![
                 record.bash_call_id,
-                record.risk_level,
-                record.user_auth_level,
-                record.outcome,
-                record.reason.unwrap_or(""),
+                i64::from(record.attempt),
+                record.provider_id,
+                record.model,
+                record.request_json,
                 now
             ],
         )?;
+        Ok(())
+    }
+
+    pub fn finish_review_attempt(&self, record: ReviewAttemptCompletion<'_>) -> Result<()> {
+        let now = now_rfc3339();
+        let usage = record.usage.cloned().unwrap_or_default();
+        let changed = self.conn.execute(
+            "UPDATE bash_review SET
+                response_text = ?1,
+                outcome = ?2,
+                risk_level = ?3,
+                auth_level = ?4,
+                reason = ?5,
+                error_class = ?6,
+                error = ?7,
+                input_tokens = ?8,
+                cache_read_input_tokens = ?9,
+                cache_write_input_tokens = ?10,
+                output_tokens = ?11,
+                reasoning_output_tokens = ?12,
+                total_tokens = ?13,
+                duration_ms = ?14,
+                completed_at = ?15
+             WHERE bash_call_id = ?16 AND attempt = ?17 AND outcome = 'pending'",
+            params![
+                record.response_text,
+                record.outcome,
+                record.risk_level,
+                record.user_auth_level,
+                record.reason,
+                record.error_class,
+                record.error,
+                record.usage.map(|_| u64_to_i64(usage.input_tokens)),
+                record
+                    .usage
+                    .map(|_| u64_to_i64(usage.cache_read_input_tokens)),
+                record
+                    .usage
+                    .and_then(|_| usage.cache_write_input_tokens.map(u64_to_i64)),
+                record.usage.map(|_| u64_to_i64(usage.output_tokens)),
+                record
+                    .usage
+                    .map(|_| u64_to_i64(usage.reasoning_output_tokens)),
+                record.usage.map(|_| u64_to_i64(usage.total_tokens)),
+                u64_to_i64(record.duration_ms),
+                now,
+                record.bash_call_id,
+                i64::from(record.attempt),
+            ],
+        )?;
+        if changed != 1 {
+            bail!(
+                "guardrail attempt {} for Bash call {} is missing or already completed",
+                record.attempt,
+                record.bash_call_id
+            );
+        }
         Ok(())
     }
 
@@ -2146,7 +2282,7 @@ mod tests {
     }
 
     #[test]
-    fn review_records_internal_bash_call_reference() {
+    fn review_attempt_records_input_output_and_bash_call_reference() {
         let (store, tmp) = temp_store();
         let session = create_session_with_system(&store);
         let (_, call_ids) = store
@@ -2161,24 +2297,75 @@ mod tests {
             )
             .unwrap();
         let claim_id = call_ids[0];
+        let usage = crate::provider::Usage {
+            input_tokens: 12,
+            output_tokens: 4,
+            total_tokens: 16,
+            ..Default::default()
+        };
 
         store
-            .record_review(ReviewRecord {
+            .start_review_attempt(ReviewAttemptStart {
                 bash_call_id: claim_id,
-                risk_level: "destructive",
-                user_auth_level: "reversible",
+                attempt: 1,
+                provider_id: "test",
+                model: "test/reviewer",
+                request_json: r#"{"messages":[]}"#,
+            })
+            .unwrap();
+        let pending: (String, Option<String>) = store
+            .conn
+            .query_row(
+                "SELECT outcome, completed_at FROM bash_review
+                 WHERE bash_call_id = ?1 AND attempt = 1",
+                [claim_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(pending, ("pending".into(), None));
+        store
+            .finish_review_attempt(ReviewAttemptCompletion {
+                bash_call_id: claim_id,
+                attempt: 1,
                 outcome: "deny",
+                response_text: Some(r#"{"risk_level":"high"}"#),
+                risk_level: Some("high"),
+                user_auth_level: Some("low"),
                 reason: Some("too risky"),
+                error_class: None,
+                error: None,
+                duration_ms: 25,
+                usage: Some(&usage),
             })
             .unwrap();
 
-        let stored: (i64, String) = store
+        let stored: (i64, String, String, String, i64) = store
             .conn
-            .query_row("SELECT bash_call_id, outcome FROM bash_review", [], |row| {
-                Ok((row.get(0)?, row.get(1)?))
-            })
+            .query_row(
+                "SELECT bash_call_id, request_json, response_text, outcome, total_tokens
+                 FROM bash_review",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
             .unwrap();
-        assert_eq!(stored, (claim_id, "deny".into()));
+        assert_eq!(
+            stored,
+            (
+                claim_id,
+                r#"{"messages":[]}"#.into(),
+                r#"{"risk_level":"high"}"#.into(),
+                "deny".into(),
+                16
+            )
+        );
         let _ = std::fs::remove_dir_all(tmp);
     }
 
@@ -2637,11 +2824,15 @@ mod tests {
             migrated,
             (1, "call-1".into(), "{}".into(), Some("readonly".into()))
         );
-        let review_outcome: String = store
+        let review: (i64, String, Option<String>) = store
             .conn
-            .query_row("SELECT outcome FROM bash_review", [], |row| row.get(0))
+            .query_row(
+                "SELECT attempt, outcome, request_json FROM bash_review",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
             .unwrap();
-        assert_eq!(review_outcome, "allow");
+        assert_eq!(review, (1, "allow".into(), None));
         assert!(
             store
                 .conn
@@ -2678,18 +2869,18 @@ mod tests {
         std::fs::create_dir_all(&tmp).unwrap();
         let db = tmp.join("mu.db");
         let conn = Connection::open(&db).unwrap();
-        conn.execute_batch("PRAGMA user_version = 11;").unwrap();
+        conn.execute_batch("PRAGMA user_version = 12;").unwrap();
         drop(conn);
 
         let error = Store::open(&db).err().unwrap().to_string();
 
-        assert!(error.contains("schema version 11 is newer"));
+        assert!(error.contains("schema version 12 is newer"));
         assert!(error.contains("upgrade mu"));
         let _ = std::fs::remove_dir_all(tmp);
     }
 
     #[test]
-    fn schema_v7_is_migrated_to_v10_preserving_bash_audit_rows_and_model_history() {
+    fn schema_v7_is_migrated_to_v11_preserving_bash_audit_rows_and_model_history() {
         let tmp = std::env::temp_dir().join(format!("mu-store-v7-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&tmp).unwrap();
         let db = tmp.join("mu.db");
