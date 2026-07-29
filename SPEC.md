@@ -694,9 +694,9 @@ Inline links, inline code, emphasis, strong text, and double-tilde
 strikethrough wait for the current span to complete; fenced code starts terminal
 code styling at the opening fence, streams code lines without printing fence
 markers, and resets styling at the closing fence or response boundary. Emphasis
-uses normal-brightness italics, while strong text uses bold. Underscores within
-words remain literal, so identifiers such as `CAP_SYS_ADMIN` are not interpreted
-as emphasis. Markdown
+uses regular cyan, while strong text uses bold. Block quotes use gray italics
+without a visible gutter marker. Underscores within words remain literal, so
+identifiers such as `CAP_SYS_ADMIN` are not interpreted as emphasis. Markdown
 tables are buffered until the table is complete enough to align and commit once,
 so columns never require rewriting prior output. With wrapping enabled, table
 layout counts every border and padding cell, caps any one content column at 80

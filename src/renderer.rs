@@ -2206,10 +2206,11 @@ fn classify_streaming_line(line: &str) -> Option<(LineStreamState, usize, String
         return Some((LineStreamState::Heading { level }, prefix_len, prefix));
     }
 
-    if let Some((depth, prefix_len)) = parse_streaming_quote_prefix(line) {
+    if let Some((_depth, prefix_len)) = parse_streaming_quote_prefix(line) {
         let mut prefix = String::new();
-        prefix.push_str(DIM);
-        prefix.push_str(&"│ ".repeat(depth));
+        for style in block_quote_styles() {
+            prefix.push_str(style.ansi());
+        }
         return Some((LineStreamState::Quote, prefix_len, prefix));
     }
 
@@ -2228,7 +2229,7 @@ fn line_stream_base_styles(state: LineStreamState) -> &'static [MdStyle] {
     match state {
         LineStreamState::Prose | LineStreamState::List => &[],
         LineStreamState::Heading { level } => heading_styles(level),
-        LineStreamState::Quote => &[MdStyle::Dim],
+        LineStreamState::Quote => block_quote_styles(),
     }
 }
 
@@ -2522,8 +2523,9 @@ fn render_block_quote_line(line: &str, complete: bool) -> Option<String> {
 
     let rendered = render_inline_markdown(rest)?;
     let mut out = String::new();
-    out.push_str(DIM);
-    out.push_str(&"│ ".repeat(depth));
+    for style in block_quote_styles() {
+        out.push_str(style.ansi());
+    }
     out.push_str(&rendered);
     out.push_str(RESET);
     if complete {
@@ -2869,11 +2871,10 @@ fn render_markdown(markdown: &str, max_width: Option<usize>) -> String {
                     );
                 }
                 Tag::BlockQuote(_) => {
-                    current_render_target(&mut out, &mut table_state).push_str("│ ");
-                    push_style(
+                    push_styles(
                         current_render_target(&mut out, &mut table_state),
                         &mut styles,
-                        MdStyle::Dim,
+                        block_quote_styles(),
                     );
                 }
                 Tag::CodeBlock(_) => {
@@ -2961,7 +2962,15 @@ fn render_markdown(markdown: &str, max_width: Option<usize>) -> String {
                     );
                     current_render_target(&mut out, &mut table_state).push_str("\n\n");
                 }
-                TagEnd::BlockQuote(_) | TagEnd::CodeBlock => {
+                TagEnd::BlockQuote(_) => {
+                    pop_styles(
+                        current_render_target(&mut out, &mut table_state),
+                        &mut styles,
+                        block_quote_styles().len(),
+                    );
+                    current_render_target(&mut out, &mut table_state).push_str("\n\n");
+                }
+                TagEnd::CodeBlock => {
                     pop_styles(
                         current_render_target(&mut out, &mut table_state),
                         &mut styles,
@@ -3570,11 +3579,15 @@ fn heading_styles(level: HeadingLevel) -> &'static [MdStyle] {
 }
 
 fn emphasis_styles() -> &'static [MdStyle] {
-    &[MdStyle::Italic]
+    &[MdStyle::Cyan]
 }
 
 fn strong_styles() -> &'static [MdStyle] {
     &[MdStyle::Bold]
+}
+
+fn block_quote_styles() -> &'static [MdStyle] {
+    &[MdStyle::Dim, MdStyle::Italic]
 }
 
 fn link_styles() -> &'static [MdStyle] {
@@ -4797,8 +4810,40 @@ mod tests {
         assert_eq!(strip_ansi(&heading_title), "Title");
         assert_eq!(strip_ansi(&stream.push("\n").concat()), "\n");
 
-        assert_eq!(strip_ansi(&stream.push("> quoted").concat()), "\n│ quoted");
+        let quote = stream.push("> quoted").concat();
+        assert_eq!(strip_ansi(&quote), "\nquoted");
+        assert!(quote.contains(DIM), "{quote:?}");
+        assert!(quote.contains(ITALIC), "{quote:?}");
+        assert!(!quote.contains('│'), "{quote:?}");
         assert_eq!(strip_ansi(&stream.push("\n").concat()), "\n");
+    }
+
+    #[test]
+    fn block_quotes_wrap_and_render_without_a_visible_gutter() {
+        let mut stream = MarkdownStream::new(MarkdownLayout {
+            prose_width: Some(12),
+            table_width: Some(12),
+        });
+        let rendered = stream.push("> alpha wonderful world\n").concat();
+        let plain = strip_ansi(&rendered);
+
+        assert_visible_lines_fit(&plain, 12);
+        assert!(!plain.contains('│'), "{plain:?}");
+        assert!(rendered.contains(DIM), "{rendered:?}");
+        assert!(rendered.contains(ITALIC), "{rendered:?}");
+        assert_eq!(
+            plain
+                .chars()
+                .filter(|ch| !ch.is_whitespace())
+                .collect::<String>(),
+            "alphawonderfulworld"
+        );
+
+        let nested = render_markdown(">> nested\n", None);
+        assert!(strip_ansi(&nested).contains("nested"), "{nested:?}");
+        assert!(!nested.contains('│'), "{nested:?}");
+        assert!(nested.contains(DIM), "{nested:?}");
+        assert!(nested.contains(ITALIC), "{nested:?}");
     }
 
     #[test]
@@ -4982,11 +5027,12 @@ mod tests {
             assert_eq!(strip_ansi(&rendered), "CAP_SYS_ADMIN\n");
             assert!(!rendered.contains(ITALIC), "{rendered:?}");
             assert!(!rendered.contains(BOLD), "{rendered:?}");
+            assert!(!rendered.contains(CYAN), "{rendered:?}");
         }
     }
 
     #[test]
-    fn markdown_stream_styles_valid_underscore_spans_without_dimming() {
+    fn markdown_stream_styles_valid_underscore_spans_in_cyan() {
         let mut stream = MarkdownStream::default();
         let rendered = [
             stream.push("Use _em").concat(),
@@ -4996,8 +5042,9 @@ mod tests {
         .concat();
 
         assert_eq!(strip_ansi(&rendered), "Use emphasis and strong.\n");
-        assert!(rendered.contains(ITALIC), "{rendered:?}");
+        assert!(rendered.contains(CYAN), "{rendered:?}");
         assert!(rendered.contains(BOLD), "{rendered:?}");
+        assert!(!rendered.contains(ITALIC), "{rendered:?}");
         assert!(!rendered.contains(DIM), "{rendered:?}");
     }
 
