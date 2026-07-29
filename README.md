@@ -13,10 +13,10 @@ cargo build --release --features portable
 export PATH="$PWD/target/release:$PATH"
 ```
 
-The `portable` feature bundles SQLite and embeds Mu's built-in skills, so this
-source-tree binary can run without being installed. On its first normal
-invocation it writes the built-ins and three applet symlinks into your user
-cache.
+The `portable` feature bundles SQLite, uses vendored OpenSSL where OpenSSL is
+the platform TLS backend, and embeds Mu's built-in skills, so this source-tree
+binary can run without being installed. On its first normal invocation it
+writes the built-ins and three applet symlinks into your user cache.
 
 Now ask it something:
 
@@ -301,7 +301,9 @@ after that response supplies exact usage.
 
 ## Native installation and portable builds
 
-The default Cargo build is for a native installation and uses system SQLite:
+The default Cargo build is for a native installation and uses system SQLite
+plus the platform TLS backend: system OpenSSL on Linux and Apple Security on
+macOS.
 
 ```sh
 cargo build --release
@@ -320,11 +322,13 @@ Add `portable` for a standalone Unix binary:
 cargo build --release --features portable
 ```
 
-Portable builds bundle SQLite and embed every shipped built-in. When the binary
-is under a `bin/` directory, each resource is resolved independently: an
-existing `<prefix>/share/mu/` wins for built-ins and an existing
-`<prefix>/libexec/mu/` wins for applets. Any resource without that installed
-directory falls back to the cache:
+Portable builds bundle SQLite, enable vendored OpenSSL on platforms whose
+native TLS backend is OpenSSL, and embed every shipped built-in. On macOS,
+native TLS continues to use the Apple Security framework. When the binary is
+under a `bin/` directory, each resource is resolved independently: an existing
+`<prefix>/share/mu/` wins for built-ins and an existing `<prefix>/libexec/mu/`
+wins for applets. Any resource without that installed directory falls back to
+the cache:
 
 - absolute `$XDG_CACHE_HOME/mu` when `XDG_CACHE_HOME` is set;
 - `$HOME/Library/Caches/mu` on macOS;
@@ -341,9 +345,11 @@ Moving or upgrading the binary does not update either cache: remove the
 applicable cache subdirectory manually to regenerate it.
 
 Version tags publish portable Linux x86-64 musl and macOS ARM64/Intel archives
-with SHA-256 checksum files. Built-ins are embedded, so those archives do not
-contain a separate `builtins/` directory. Releases continue to include the
-unchanged Windows MSYS2 UCRT64 package and archive.
+with SHA-256 checksum files. The Linux archive statically links musl, SQLite,
+and vendored OpenSSL. The macOS archives retain only Apple system-library
+linkage. Built-ins are embedded, so those archives do not contain a separate
+`builtins/` directory. Releases continue to include the unchanged Windows
+MSYS2 UCRT64 package and archive.
 
 ## Reference
 

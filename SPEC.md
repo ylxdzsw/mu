@@ -103,17 +103,20 @@ This single-binary shape is the central decision (see §3 for the full rationale
 recap). It keeps the agent semantics small and scriptable while leaving the
 shell responsible for interaction.
 
-The default Cargo build is native and uses system SQLite. For an executable at
+The default Cargo build is native and uses system SQLite plus `native-tls`:
+system OpenSSL on Linux and Apple Security on macOS. For an executable at
 `<prefix>/bin/mu`, built-ins are always `<prefix>/share/mu/` and applets are
 always `<prefix>/libexec/mu/`. Native startup derives those paths without
 checking, creating, or modifying package-owned resources.
 
-The single additive `portable` feature enables `rusqlite/bundled` and embeds
-every shipped built-in with compile-time `include_str!` entries. Portable
-resolution treats built-ins and applets independently. If the executable is
-under `bin/` and the corresponding native directory exists, that directory
-wins. Otherwise the resource uses a fixed directory under one selected cache
-root:
+The single additive `portable` feature enables `rusqlite/bundled`,
+`reqwest/native-tls-vendored`, and compile-time `include_str!` entries for every
+shipped built-in. On OpenSSL platforms this replaces the system OpenSSL linkage
+with a vendored build; on macOS native TLS continues to use Apple Security.
+Portable resolution treats built-ins and applets independently. If the
+executable is under `bin/` and the corresponding native directory exists, that
+directory wins. Otherwise the resource uses a fixed directory under one
+selected cache root:
 
 - absolute `$XDG_CACHE_HOME/mu` when `XDG_CACHE_HOME` is set;
 - `$HOME/Library/Caches/mu` on macOS;
@@ -134,9 +137,10 @@ initialization.
 
 Version-tag artifacts add portable Linux x86-64 musl and macOS ARM64/Intel
 archives with SHA-256 checksums. The archives omit external built-ins because
-they are embedded. Linux has no dynamic libc or SQLite dependency; macOS
-retains Apple system-library linkage. The existing Windows MSYS2 UCRT64 package
-and release archive remain unchanged and are published alongside them.
+they are embedded. Linux statically links musl, SQLite, and vendored OpenSSL
+with no dynamic library dependency; macOS retains only Apple system-library
+linkage. The existing Windows MSYS2 UCRT64 package and release archive remain
+unchanged and are published alongside them.
 
 ### 2.3 Interactive mode lives in shell surfaces
 

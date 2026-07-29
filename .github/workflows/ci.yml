@@ -35,7 +35,8 @@ jobs:
       - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install --yes bsdextrautils fish zsh jq sqlite3
+          sudo apt-get install --yes \
+            bsdextrautils fish jq libssl-dev pkg-config sqlite3 zsh
 
       - name: Check formatting
         run: cargo fmt --check
@@ -59,6 +60,11 @@ jobs:
           env -u HOME -u XDG_CACHE_HOME "$smoke/bin/mu" --help >/dev/null
           test ! -e "$smoke/share"
           test ! -e "$smoke/libexec"
+          cargo tree -i openssl-sys >/dev/null
+          if cargo tree -i aws-lc-rs >/dev/null 2>&1; then
+            echo "native build unexpectedly includes AWS-LC" >&2
+            exit 1
+          fi
           cargo build --bins --features portable
 
       - name: Test shell integrations
@@ -83,7 +89,8 @@ jobs:
       - name: Install package dependencies
         run: |
           pacman -Syu --noconfirm
-          pacman -S --needed --noconfirm fish git jq perl rust sqlite util-linux zsh
+          pacman -S --needed --noconfirm \
+            fish git jq openssl perl pkgconf rust sqlite util-linux zsh
 
       - uses: actions/checkout@v6
         with:
@@ -128,6 +135,8 @@ jobs:
           before=$(find /usr/libexec/mu /usr/share/mu -type f -print0 \
             | sort -z | xargs -0 sha256sum)
           /usr/bin/mu --help >/dev/null
+          readelf -d /usr/bin/mu | grep -F 'Shared library: [libssl.so'
+          readelf -d /usr/bin/mu | grep -F 'Shared library: [libcrypto.so'
           after=$(find /usr/libexec/mu /usr/share/mu -type f -print0 \
             | sort -z | xargs -0 sha256sum)
           test "$before" = "$after"
@@ -155,7 +164,7 @@ jobs:
       - name: Install the musl target
         run: |
           sudo apt-get update
-          sudo apt-get install --yes musl-tools
+          sudo apt-get install --yes make musl-tools perl
           rustup target add x86_64-unknown-linux-musl
 
       - name: Build the portable binary
@@ -196,11 +205,17 @@ jobs:
             echo "portable Linux binary has a dynamic interpreter" >&2
             exit 1
           fi
-          if readelf -d "$binary" 2>/dev/null \
-            | grep -E 'NEEDED.*(libc\.so|libsqlite3)'; then
-            echo "portable Linux binary depends on dynamic libc or SQLite" >&2
+          if readelf -d "$binary" 2>/dev/null | grep -F '(NEEDED)'; then
+            echo "portable Linux binary has a dynamic library dependency" >&2
             exit 1
           fi
+          if cargo tree --target x86_64-unknown-linux-musl \
+            --features portable -i aws-lc-rs >/dev/null 2>&1; then
+            echo "portable Linux binary unexpectedly includes AWS-LC" >&2
+            exit 1
+          fi
+          cargo tree --target x86_64-unknown-linux-musl \
+            --features portable -i openssl-src >/dev/null
 
       - name: Assemble the portable archive
         run: |
@@ -275,6 +290,15 @@ jobs:
           grep -qx new "$smoke/edit.txt"
           "$smoke/cache/mu/applets/view_image" --help >/dev/null
           file target/release/mu | grep -F '${{ matrix.file_arch }}'
+          if cargo tree --features portable -i aws-lc-rs >/dev/null 2>&1; then
+            echo "portable macOS binary unexpectedly includes AWS-LC" >&2
+            exit 1
+          fi
+          if otool -L target/release/mu | tail -n +2 | awk '{ print $1 }' \
+            | grep -Ev '^(/System/Library/|/usr/lib/)'; then
+            echo "portable macOS binary has a non-system library dependency" >&2
+            exit 1
+          fi
 
       - name: Assemble the portable archive
         run: |
