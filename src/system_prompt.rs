@@ -286,7 +286,7 @@ mod tests {
     use super::{
         EXPORT_PREAMBLE, assemble_context, assemble_prompt, build_context, cwd_changed_context,
         export_preamble, initial_environment_context, json_string_for_html_comment,
-        linux_distribution, role_preamble, xml_escape_attribute,
+        linux_distribution, role_preamble,
     };
     use crate::paths::{Project, ProjectMarker};
     use crate::skills::{InstructionScope, SkillMeta, SkillRequirements};

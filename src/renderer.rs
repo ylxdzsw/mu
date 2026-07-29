@@ -4657,19 +4657,6 @@ mod tests {
         }
     }
 
-    fn markdown_stream_streams_list_items_line_by_line() {
-        let mut stream = MarkdownStream::default();
-
-        let first = stream.push("- one\n").concat();
-        assert_eq!(strip_ansi(&first), "• one\n");
-        let second = stream.push("  - two\n").concat();
-        assert_eq!(strip_ansi(&second), "  • two\n");
-        let task = stream.push("- [x] done\n").concat();
-        assert_eq!(strip_ansi(&task), "• [✓] done\n");
-        let pipe = stream.push("- a | b\n").concat();
-        assert_eq!(strip_ansi(&pipe), "• a | b\n");
-    }
-
     #[test]
     fn markdown_stream_streams_prose_list_heading_and_quote_before_newline() {
         let mut stream = MarkdownStream::default();

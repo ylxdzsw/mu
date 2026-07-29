@@ -245,7 +245,7 @@ mod tests {
 
     use serde_json::json;
 
-    use super::{build_tail_preview, tool_definitions, truncate_line};
+    use super::{tool_definitions, truncate_line};
 
     #[test]
     fn tool_definitions_expose_only_bash() {

@@ -997,7 +997,11 @@ mod apply_patch {
             fs::write(dir.join("destination.txt"), "destination\n").unwrap();
             let patch = "*** Begin Patch\n*** Update File: source.txt\n*** Move to: destination.txt\n*** End Patch\n";
             let error = preflight(&dir, parse_patch(patch).unwrap()).unwrap_err();
-            assert!(error.to_string().contains("move destination already exists"));
+            assert!(
+                error
+                    .to_string()
+                    .contains("move destination already exists")
+            );
             fs::remove_dir_all(dir).unwrap();
         }
 
