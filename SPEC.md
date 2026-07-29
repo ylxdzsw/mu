@@ -693,7 +693,10 @@ not special-cased and are rendered literally.
 Inline links, inline code, emphasis, strong text, and double-tilde
 strikethrough wait for the current span to complete; fenced code starts terminal
 code styling at the opening fence, streams code lines without printing fence
-markers, and resets styling at the closing fence or response boundary. Markdown
+markers, and resets styling at the closing fence or response boundary. Emphasis
+uses normal-brightness italics, while strong text uses bold. Underscores within
+words remain literal, so identifiers such as `CAP_SYS_ADMIN` are not interpreted
+as emphasis. Markdown
 tables are buffered until the table is complete enough to align and commit once,
 so columns never require rewriting prior output. With wrapping enabled, table
 layout counts every border and padding cell, caps any one content column at 80
@@ -736,6 +739,9 @@ subsequent renderer-to-renderer block transitions.
 - The *next* top-level block owns that separator. Committed block formatters
   should end with exactly one newline; they must not rely on trailing blank
   lines baked into their own text.
+- Starting a tool-call block first finishes the current assistant Markdown
+  stream, including any cells retained for wrapping, before reserving or
+  committing tool-call presentation.
 - Live status lines such as the updating `[thought ...]` line or the
   `[preparing toolcall]` indicator may reserve the top separator on first
   render, but subsequent ticks only redraw that one mutable trailing line. A

@@ -530,7 +530,7 @@ impl Renderer {
         if self.final_only {
             return Ok(true);
         }
-        self.assistant_block_open = false;
+        self.assistant_end()?;
         self.reasoning_end(None)?;
         self.concise_tool = None;
         if self.styled {
@@ -1704,6 +1704,7 @@ struct LineStreamPrefix {
 struct InlineStream {
     pending: String,
     base_styles: Vec<MdStyle>,
+    previous_source_char: Option<char>,
 }
 
 #[derive(Clone, Copy)]
@@ -2612,23 +2613,33 @@ impl InlineStream {
             out.push(std::mem::take(&mut self.pending));
         }
         self.base_styles.clear();
+        self.previous_source_char = None;
     }
 
     fn flush_available(&mut self, out: &mut Vec<String>) {
         loop {
             let Some(marker) = earliest_inline_marker(&self.pending) else {
                 if !self.pending.is_empty() {
-                    out.push(std::mem::take(&mut self.pending));
+                    let text = std::mem::take(&mut self.pending);
+                    self.previous_source_char =
+                        text.chars().next_back().or(self.previous_source_char);
+                    out.push(text);
                 }
                 return;
             };
             if marker > 0 {
-                out.push(self.pending[..marker].to_string());
+                let text = self.pending[..marker].to_string();
+                self.previous_source_char = text.chars().next_back().or(self.previous_source_char);
+                out.push(text);
                 self.pending.replace_range(..marker, "");
             }
             let Some((rendered, consumed)) = self.render_span_at_start() else {
                 return;
             };
+            self.previous_source_char = self.pending[..consumed]
+                .chars()
+                .next_back()
+                .or(self.previous_source_char);
             out.push(rendered);
             self.pending.replace_range(..consumed, "");
         }
@@ -2642,7 +2653,7 @@ impl InlineStream {
             return self.render_delimited("**", strong_styles());
         }
         if self.pending.starts_with("__") {
-            return self.render_delimited("__", strong_styles());
+            return self.render_underscore_delimited("__", strong_styles());
         }
         if self.pending.starts_with("~~") {
             return self.render_delimited("~~", &[MdStyle::Strike]);
@@ -2651,7 +2662,7 @@ impl InlineStream {
             return self.render_delimited("*", emphasis_styles());
         }
         if self.pending.starts_with('_') {
-            return self.render_delimited("_", emphasis_styles());
+            return self.render_underscore_delimited("_", emphasis_styles());
         }
         if self.pending.starts_with('`') {
             return self.render_delimited("`", inline_code_styles());
@@ -2665,6 +2676,40 @@ impl InlineStream {
     fn render_delimited(&self, delimiter: &str, styles: &[MdStyle]) -> Option<(String, usize)> {
         let rest = &self.pending[delimiter.len()..];
         let end = rest.find(delimiter)?;
+        Some(self.render_delimited_until(delimiter, end, styles))
+    }
+
+    fn render_underscore_delimited(
+        &self,
+        delimiter: &str,
+        styles: &[MdStyle],
+    ) -> Option<(String, usize)> {
+        let rest = &self.pending[delimiter.len()..];
+        let after_open = rest.chars().next()?;
+        if !underscore_can_open(self.previous_source_char, after_open) {
+            return Some((delimiter.to_string(), delimiter.len()));
+        }
+
+        let mut search_start = 0;
+        while let Some(relative_end) = rest[search_start..].find(delimiter) {
+            let end = search_start + relative_end;
+            let before_close = rest[..end].chars().next_back();
+            let after_close = rest[end + delimiter.len()..].chars().next();
+            if underscore_can_close(before_close, after_close) {
+                return Some(self.render_delimited_until(delimiter, end, styles));
+            }
+            search_start = end + delimiter.len();
+        }
+        None
+    }
+
+    fn render_delimited_until(
+        &self,
+        delimiter: &str,
+        end: usize,
+        styles: &[MdStyle],
+    ) -> (String, usize) {
+        let rest = &self.pending[delimiter.len()..];
         let body = &rest[..end];
         let mut out = String::new();
         for style in styles {
@@ -2673,7 +2718,7 @@ impl InlineStream {
         out.push_str(body);
         out.push_str(RESET);
         self.reapply_base(&mut out);
-        Some((out, delimiter.len() + end + delimiter.len()))
+        (out, delimiter.len() + end + delimiter.len())
     }
 
     fn render_link(&self) -> Option<(String, usize)> {
@@ -2706,6 +2751,18 @@ impl InlineStream {
             out.push_str(style.ansi());
         }
     }
+}
+
+fn underscore_can_open(before: Option<char>, after: char) -> bool {
+    !after.is_whitespace() && !chars_are_intraword(before, Some(after))
+}
+
+fn underscore_can_close(before: Option<char>, after: Option<char>) -> bool {
+    before.is_some_and(|ch| !ch.is_whitespace()) && !chars_are_intraword(before, after)
+}
+
+fn chars_are_intraword(before: Option<char>, after: Option<char>) -> bool {
+    before.is_some_and(char::is_alphanumeric) && after.is_some_and(char::is_alphanumeric)
 }
 
 fn earliest_inline_marker(text: &str) -> Option<usize> {
@@ -3513,7 +3570,7 @@ fn heading_styles(level: HeadingLevel) -> &'static [MdStyle] {
 }
 
 fn emphasis_styles() -> &'static [MdStyle] {
-    &[MdStyle::Italic, MdStyle::Dim]
+    &[MdStyle::Italic]
 }
 
 fn strong_styles() -> &'static [MdStyle] {
@@ -4909,6 +4966,42 @@ mod tests {
     }
 
     #[test]
+    fn markdown_stream_keeps_intraword_underscores_literal_across_chunks() {
+        for chunks in [
+            vec!["CAP_SYS_ADMIN"],
+            vec!["CAP_", "SYS_", "ADMIN"],
+            vec!["CAP", "_", "SYS", "_", "ADMIN"],
+        ] {
+            let mut stream = MarkdownStream::default();
+            let mut rendered = String::new();
+            for chunk in chunks {
+                rendered.push_str(&stream.push(chunk).concat());
+            }
+            rendered.push_str(&stream.finish().concat());
+
+            assert_eq!(strip_ansi(&rendered), "CAP_SYS_ADMIN\n");
+            assert!(!rendered.contains(ITALIC), "{rendered:?}");
+            assert!(!rendered.contains(BOLD), "{rendered:?}");
+        }
+    }
+
+    #[test]
+    fn markdown_stream_styles_valid_underscore_spans_without_dimming() {
+        let mut stream = MarkdownStream::default();
+        let rendered = [
+            stream.push("Use _em").concat(),
+            stream.push("phasis_ and __strong").concat(),
+            stream.push("__.\n").concat(),
+        ]
+        .concat();
+
+        assert_eq!(strip_ansi(&rendered), "Use emphasis and strong.\n");
+        assert!(rendered.contains(ITALIC), "{rendered:?}");
+        assert!(rendered.contains(BOLD), "{rendered:?}");
+        assert!(!rendered.contains(DIM), "{rendered:?}");
+    }
+
+    #[test]
     fn markdown_stream_only_closes_fences_with_plain_closing_markers() {
         let mut stream = MarkdownStream::default();
 
@@ -5092,6 +5185,33 @@ mod tests {
             output.transcript(),
             format!("{GRAY}[preparing toolcall]{RESET}\r\x1b[2K{BOLD}# Inspect{RESET}\n")
         );
+    }
+
+    #[test]
+    fn tool_header_flushes_wrapping_lookbehind_before_starting_its_block() {
+        let (mut renderer, output) = Renderer::with_test_shared_output_layout(
+            OutputFormat::Detail,
+            true,
+            true,
+            Some(80),
+            None,
+        );
+
+        renderer
+            .assistant_text("An explanation ending in tail")
+            .unwrap();
+        renderer.bash_header_start(Some("call_1")).unwrap();
+        renderer.bash_header_title_start().unwrap();
+        renderer.bash_header_title_delta("Inspect").unwrap();
+        renderer.bash_header_title_end().unwrap();
+        renderer.assistant_end().unwrap();
+
+        let normalized = strip_ansi(&output.transcript().replace('\r', ""));
+        assert!(
+            normalized.contains("An explanation ending in tail\n\n[preparing toolcall]# Inspect\n"),
+            "{normalized:?}"
+        );
+        assert_eq!(normalized.matches("tail").count(), 1, "{normalized:?}");
     }
 
     #[test]
