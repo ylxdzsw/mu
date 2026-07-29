@@ -931,7 +931,7 @@ impl CommandHeaderDisplay {
                     crate::renderer::BASH_TITLE_PREVIEW_BYTES,
                     renderer.bash_header_preview_width(),
                     &mut self.title_displayed_bytes,
-                    |text| renderer.bash_header_title_delta(text),
+                    |text| renderer.bash_header_delta(text),
                 )?;
                 if done {
                     renderer.bash_header_title_end()?;
@@ -964,7 +964,7 @@ impl CommandHeaderDisplay {
                 crate::renderer::BASH_COMMAND_PREVIEW_BYTES,
                 renderer.bash_header_preview_width(),
                 &mut self.command_displayed_bytes,
-                |text| renderer.bash_header_command_delta(text),
+                |text| renderer.bash_header_delta(text),
             )?;
             if done {
                 renderer.bash_header_command_end()?;
@@ -1022,7 +1022,7 @@ impl CommandHeaderDisplay {
                     crate::renderer::BASH_TITLE_PREVIEW_BYTES,
                     renderer.bash_header_preview_width(),
                     &mut self.title_displayed_bytes,
-                    |text| renderer.bash_header_title_delta(text),
+                    |text| renderer.bash_header_delta(text),
                 )?;
                 if done {
                     renderer.bash_header_title_end()?;
@@ -1050,7 +1050,7 @@ impl CommandHeaderDisplay {
                     value,
                     command.is_complete(),
                     &mut self.command_displayed_bytes,
-                    |text| renderer.bash_header_command_delta(text),
+                    |text| renderer.bash_header_delta(text),
                 )?;
                 if done {
                     renderer.bash_header_command_end()?;
@@ -1081,7 +1081,7 @@ impl CommandHeaderDisplay {
                     value,
                     stdin.is_complete(),
                     &mut self.stdin_displayed_bytes,
-                    |text| renderer.bash_header_stdin_full_delta(text),
+                    |text| renderer.bash_header_delta(text),
                 )?;
                 if done {
                     renderer.bash_header_stdin_full_end()?;

@@ -1,7 +1,7 @@
 use std::io::{self, IsTerminal, Write};
 #[cfg(unix)]
 use std::os::fd::AsRawFd;
-use std::path::{Component, Path, PathBuf};
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use pulldown_cmark::{Alignment, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
@@ -66,7 +66,6 @@ pub struct Renderer {
     last_committed_block: Option<CommittedBlock>,
     turn_done_bell_min_duration: Option<Duration>,
     format: OutputFormat,
-    final_only: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -175,14 +174,32 @@ impl Renderer {
         let terminal_layout = styled.then(|| TerminalLayout::new(line_wrapping, detected_width));
         let stderr = io::stderr();
         let stderr_is_terminal = stderr.is_terminal();
+        Self::with_outputs(
+            format,
+            Box::new(stdout),
+            Box::new(stderr),
+            stderr_is_terminal,
+            terminal_layout,
+            turn_done_bell_min_duration,
+        )
+    }
+
+    fn with_outputs(
+        format: OutputFormat,
+        stdout: Box<dyn Write + Send>,
+        stderr: Box<dyn Write + Send>,
+        stderr_is_terminal: bool,
+        terminal_layout: Option<TerminalLayout>,
+        turn_done_bell_min_duration: Option<Duration>,
+    ) -> Self {
         Self {
-            stdout: Box::new(stdout),
-            stderr: Box::new(stderr),
+            stdout,
+            stderr,
             stderr_is_terminal,
             stdout_at_line_start: true,
             trailing_newlines: 0,
             has_committed_stdout: false,
-            styled,
+            styled: terminal_layout.is_some(),
             terminal_layout,
             markdown: MarkdownStream::new(
                 terminal_layout
@@ -198,16 +215,7 @@ impl Renderer {
             last_committed_block: None,
             turn_done_bell_min_duration,
             format,
-            final_only: format == OutputFormat::Final,
         }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn force_styled_for_test(&mut self) {
-        self.styled = true;
-        let layout = TerminalLayout::new(true, Some(DEFAULT_TERMINAL_WIDTH));
-        self.terminal_layout = Some(layout);
-        self.markdown.set_layout(layout.markdown());
     }
 
     #[cfg(test)]
@@ -221,35 +229,15 @@ impl Renderer {
         let stderr = SharedOutput::default();
         let terminal_layout = (format != OutputFormat::Final && stdout_is_terminal)
             .then(|| TerminalLayout::new(true, Some(DEFAULT_TERMINAL_WIDTH)));
-        (
-            Self {
-                stdout: Box::new(stdout.clone()),
-                stderr: Box::new(stderr.clone()),
-                stderr_is_terminal,
-                stdout_at_line_start: true,
-                trailing_newlines: 0,
-                has_committed_stdout: false,
-                styled: format != OutputFormat::Final && stdout_is_terminal,
-                terminal_layout,
-                markdown: MarkdownStream::new(
-                    terminal_layout
-                        .map(TerminalLayout::markdown)
-                        .unwrap_or_default(),
-                ),
-                assistant_block_open: false,
-                live_line: None,
-                live_line_rendered: false,
-                reasoning: None,
-                bash_preview: None,
-                concise_tool: None,
-                last_committed_block: None,
-                turn_done_bell_min_duration,
-                format,
-                final_only: format == OutputFormat::Final,
-            },
-            stdout,
-            stderr,
-        )
+        let renderer = Self::with_outputs(
+            format,
+            Box::new(stdout.clone()),
+            Box::new(stderr.clone()),
+            stderr_is_terminal,
+            terminal_layout,
+            turn_done_bell_min_duration,
+        );
+        (renderer, stdout, stderr)
     }
 
     #[cfg(test)]
@@ -278,34 +266,15 @@ impl Renderer {
         let output = SharedOutput::default();
         let terminal_layout = (format != OutputFormat::Final && output_is_terminal)
             .then(|| TerminalLayout::new(line_wrapping, detected_width));
-        (
-            Self {
-                stdout: Box::new(output.clone()),
-                stderr: Box::new(output.clone()),
-                stderr_is_terminal: output_is_terminal,
-                stdout_at_line_start: true,
-                trailing_newlines: 0,
-                has_committed_stdout: false,
-                styled: format != OutputFormat::Final && output_is_terminal,
-                terminal_layout,
-                markdown: MarkdownStream::new(
-                    terminal_layout
-                        .map(TerminalLayout::markdown)
-                        .unwrap_or_default(),
-                ),
-                assistant_block_open: false,
-                live_line: None,
-                live_line_rendered: false,
-                reasoning: None,
-                bash_preview: None,
-                concise_tool: None,
-                last_committed_block: None,
-                turn_done_bell_min_duration,
-                format,
-                final_only: format == OutputFormat::Final,
-            },
-            output,
-        )
+        let renderer = Self::with_outputs(
+            format,
+            Box::new(output.clone()),
+            Box::new(output.clone()),
+            output_is_terminal,
+            terminal_layout,
+            turn_done_bell_min_duration,
+        );
+        (renderer, output)
     }
 
     pub fn markdown_document(&mut self, provenance: &str, text: &str) -> io::Result<()> {
@@ -324,7 +293,7 @@ impl Renderer {
     }
 
     pub fn assistant_text(&mut self, text: &str) -> io::Result<()> {
-        if self.final_only {
+        if self.format == OutputFormat::Final {
             return Ok(());
         }
         if text.is_empty() {
@@ -351,7 +320,7 @@ impl Renderer {
     }
 
     pub fn assistant_end(&mut self) -> io::Result<()> {
-        if self.final_only {
+        if self.format == OutputFormat::Final {
             return Ok(());
         }
         if !self.styled {
@@ -387,7 +356,7 @@ impl Renderer {
     }
 
     pub fn reasoning_start(&mut self, visibility: ReasoningVisibility) -> io::Result<()> {
-        if self.final_only {
+        if self.format == OutputFormat::Final {
             return Ok(());
         }
         self.assistant_block_open = false;
@@ -409,7 +378,7 @@ impl Renderer {
     }
 
     pub fn reasoning_delta(&mut self, text: &str) -> io::Result<()> {
-        if self.final_only {
+        if self.format == OutputFormat::Final {
             return Ok(());
         }
         if text.is_empty() {
@@ -435,7 +404,7 @@ impl Renderer {
     }
 
     pub fn reasoning_summary_delta(&mut self, part_index: usize, text: &str) -> io::Result<()> {
-        if self.final_only || text.is_empty() {
+        if self.format == OutputFormat::Final || text.is_empty() {
             return Ok(());
         }
         if self.format == OutputFormat::Full {
@@ -462,7 +431,7 @@ impl Renderer {
     }
 
     pub fn thinking_tick(&mut self) -> io::Result<()> {
-        if self.final_only {
+        if self.format == OutputFormat::Final {
             return Ok(());
         }
         if !matches!(self.live_line, Some(LiveLine::Thinking)) {
@@ -472,7 +441,7 @@ impl Renderer {
     }
 
     pub fn reasoning_end(&mut self, usage: Option<(u64, u64)>) -> io::Result<()> {
-        if self.final_only {
+        if self.format == OutputFormat::Final {
             return Ok(());
         }
         let one_line_width = self.one_line_width();
@@ -527,7 +496,7 @@ impl Renderer {
     }
 
     pub fn bash_header_start(&mut self, _tool_call_id: Option<&str>) -> io::Result<bool> {
-        if self.final_only {
+        if self.format == OutputFormat::Final {
             return Ok(true);
         }
         self.assistant_end()?;
@@ -541,7 +510,7 @@ impl Renderer {
     }
 
     pub fn bash_header_title_start(&mut self) -> io::Result<()> {
-        if self.final_only {
+        if self.format == OutputFormat::Final {
             return Ok(());
         }
         self.clear_live_line()?;
@@ -554,18 +523,8 @@ impl Renderer {
         }
     }
 
-    pub fn bash_header_title_delta(&mut self, text: &str) -> io::Result<()> {
-        if self.final_only {
-            return Ok(());
-        }
-        if text.is_empty() {
-            return Ok(());
-        }
-        self.write_committed(text)
-    }
-
     pub fn bash_header_title_end(&mut self) -> io::Result<()> {
-        if self.final_only {
+        if self.format == OutputFormat::Final {
             return Ok(());
         }
         if self.styled {
@@ -576,7 +535,7 @@ impl Renderer {
     }
 
     pub fn bash_header_command_start(&mut self, risk: Option<&str>) -> io::Result<()> {
-        if self.final_only {
+        if self.format == OutputFormat::Final {
             return Ok(());
         }
         if self.styled {
@@ -591,18 +550,8 @@ impl Renderer {
         }
     }
 
-    pub fn bash_header_command_delta(&mut self, text: &str) -> io::Result<()> {
-        if self.final_only {
-            return Ok(());
-        }
-        if text.is_empty() {
-            return Ok(());
-        }
-        self.write_committed(text)
-    }
-
     pub fn bash_header_command_end(&mut self) -> io::Result<()> {
-        if self.final_only {
+        if self.format == OutputFormat::Final {
             return Ok(());
         }
         if self.styled {
@@ -620,7 +569,7 @@ impl Renderer {
     }
 
     pub fn bash_header_stdin_full_start(&mut self) -> io::Result<()> {
-        if self.final_only {
+        if self.format == OutputFormat::Final {
             return Ok(());
         }
         if self.styled {
@@ -630,15 +579,15 @@ impl Renderer {
         }
     }
 
-    pub fn bash_header_stdin_full_delta(&mut self, text: &str) -> io::Result<()> {
-        if self.final_only || text.is_empty() {
+    pub fn bash_header_delta(&mut self, text: &str) -> io::Result<()> {
+        if self.format == OutputFormat::Final || text.is_empty() {
             return Ok(());
         }
         self.write_committed(text)
     }
 
     pub fn bash_header_stdin_full_end(&mut self) -> io::Result<()> {
-        if self.final_only || self.stdout_at_line_start {
+        if self.format == OutputFormat::Final || self.stdout_at_line_start {
             return Ok(());
         }
         self.write_committed("\n")
@@ -649,7 +598,7 @@ impl Renderer {
         title: Option<&str>,
         risk: Option<&str>,
     ) -> io::Result<()> {
-        if self.final_only || self.format != OutputFormat::Concise {
+        if self.format != OutputFormat::Concise {
             return Ok(());
         }
         self.concise_tool = Some(ConciseToolState {
@@ -667,7 +616,7 @@ impl Renderer {
     }
 
     pub fn bash_header_stdin_summary(&mut self, bytes: usize, complete: bool) -> io::Result<()> {
-        if self.final_only {
+        if self.format == OutputFormat::Final {
             return Ok(());
         }
         if self.styled && !complete {
@@ -681,7 +630,7 @@ impl Renderer {
             self.clear_live_line()?;
             self.live_line = None;
         }
-        self.write_stdout_committed(&format_stdin_summary_line(bytes, self.styled))
+        self.write_stdout_committed(&format!("{}\n", format_stdin_summary(bytes, self.styled)))
     }
 
     pub fn bash_header_full(
@@ -689,7 +638,7 @@ impl Renderer {
         tool_call_id: Option<&str>,
         args: &serde_json::Value,
     ) -> io::Result<bool> {
-        if self.final_only {
+        if self.format == OutputFormat::Final {
             return Ok(true);
         }
         let title = args
@@ -712,18 +661,18 @@ impl Renderer {
             BASH_TITLE_PREVIEW_BYTES,
             self.bash_header_preview_width(),
         );
-        self.bash_header_title_delta(&preview)?;
+        self.bash_header_delta(&preview)?;
         self.bash_header_title_end()?;
         self.bash_header_command_start(risk)?;
         if self.format == OutputFormat::Full {
-            self.bash_header_command_delta(command)?;
+            self.bash_header_delta(command)?;
         } else {
             let preview = preview_first_line_for_width(
                 command,
                 BASH_COMMAND_PREVIEW_BYTES,
                 self.bash_header_preview_width(),
             );
-            self.bash_header_command_delta(&preview)?;
+            self.bash_header_delta(&preview)?;
         }
         self.bash_header_command_end()?;
         if let Some(cwd) = args.get("cwd").and_then(|value| value.as_str()) {
@@ -732,7 +681,7 @@ impl Renderer {
         if let Some(stdin) = args.get("stdin").and_then(|value| value.as_str()) {
             if self.format == OutputFormat::Full {
                 self.bash_header_stdin_full_start()?;
-                self.bash_header_stdin_full_delta(stdin)?;
+                self.bash_header_delta(stdin)?;
                 self.bash_header_stdin_full_end()?;
             } else {
                 self.bash_header_stdin_summary(stdin.len(), true)?;
@@ -742,7 +691,7 @@ impl Renderer {
     }
 
     pub fn bash_header_cwd_line(&mut self, raw_cwd: &str) -> io::Result<()> {
-        if self.final_only || !should_render_bash_cwd(raw_cwd) {
+        if self.format == OutputFormat::Final || !should_render_bash_cwd(raw_cwd) {
             return Ok(());
         }
         let line = self.fit_one_line(&format_cwd_line(raw_cwd, self.styled));
@@ -750,7 +699,7 @@ impl Renderer {
     }
 
     pub fn cancel_live_state(&mut self) -> io::Result<()> {
-        if self.final_only {
+        if self.format == OutputFormat::Final {
             return Ok(());
         }
         self.clear_live_line()?;
@@ -770,7 +719,7 @@ impl Renderer {
         args: &serde_json::Value,
         header_already_rendered: bool,
     ) -> io::Result<()> {
-        if self.final_only {
+        if self.format == OutputFormat::Final {
             return Ok(());
         }
         if name != "bash" {
@@ -792,7 +741,7 @@ impl Renderer {
         _tool: &str,
         text: &str,
     ) -> io::Result<()> {
-        if self.final_only {
+        if self.format == OutputFormat::Final {
             return Ok(());
         }
         if self.format == OutputFormat::Concise {
@@ -829,7 +778,7 @@ impl Renderer {
     }
 
     pub fn tool_finished(&mut self, exit_code: i32, elapsed: Duration) -> io::Result<()> {
-        if self.final_only {
+        if self.format == OutputFormat::Final {
             return Ok(());
         }
         if self.format == OutputFormat::Concise {
@@ -848,7 +797,7 @@ impl Renderer {
         error: &str,
         elapsed: Duration,
     ) -> io::Result<()> {
-        if self.final_only {
+        if self.format == OutputFormat::Final {
             return Ok(());
         }
         if self.format == OutputFormat::Concise {
@@ -875,7 +824,7 @@ impl Renderer {
     }
 
     pub fn guardrail_start(&mut self) -> io::Result<()> {
-        if self.final_only || self.format != OutputFormat::Concise || !self.styled {
+        if self.format != OutputFormat::Concise || !self.styled {
             return Ok(());
         }
         self.live_line = Some(LiveLine::Guardrail);
@@ -904,7 +853,7 @@ impl Renderer {
         reason: &str,
         _command: &str,
     ) -> io::Result<()> {
-        if self.final_only {
+        if self.format == OutputFormat::Final {
             return Ok(());
         }
         if self.format == OutputFormat::Concise {
@@ -946,7 +895,7 @@ impl Renderer {
     }
 
     pub fn notice(&mut self, msg: &str) -> io::Result<()> {
-        if self.final_only {
+        if self.format == OutputFormat::Final {
             return Ok(());
         }
         self.assistant_block_open = false;
@@ -957,7 +906,7 @@ impl Renderer {
     }
 
     pub fn compaction_start(&mut self) -> io::Result<()> {
-        if self.final_only {
+        if self.format == OutputFormat::Final {
             return Ok(());
         }
         self.assistant_block_open = false;
@@ -1059,7 +1008,7 @@ impl Renderer {
     /// glue onto the final line of assistant output. Interactive concise output
     /// also keeps the usual blank line before that prompt without a summary.
     pub fn finish_turn(&mut self) -> io::Result<()> {
-        if self.final_only {
+        if self.format == OutputFormat::Final {
             return Ok(());
         }
         self.assistant_end()?;
@@ -1107,7 +1056,7 @@ impl Renderer {
     }
 
     pub fn turn_done_bell(&mut self, elapsed: Duration) -> io::Result<()> {
-        if self.final_only {
+        if self.format == OutputFormat::Final {
             return Ok(());
         }
         let Some(min_duration) = self.turn_done_bell_min_duration else {
@@ -1317,10 +1266,10 @@ impl Renderer {
         Some(self.fit_one_line(&line))
     }
 
-    fn sync_table_live_line(&mut self, live: Option<TableBufferLive>) -> io::Result<()> {
-        match live {
-            Some(live) => {
-                self.live_line = Some(LiveLine::TableBuffering { chars: live.chars });
+    fn sync_table_live_line(&mut self, chars: Option<usize>) -> io::Result<()> {
+        match chars {
+            Some(chars) => {
+                self.live_line = Some(LiveLine::TableBuffering { chars });
                 Ok(())
             }
             None => {
@@ -1708,11 +1657,6 @@ struct InlineStream {
 }
 
 #[derive(Clone, Copy)]
-struct TableBufferLive {
-    chars: usize,
-}
-
-#[derive(Clone, Copy)]
 enum LiveLine {
     Thinking,
     ToolComposition,
@@ -1793,12 +1737,6 @@ impl MarkdownStream {
         }
     }
 
-    #[cfg(test)]
-    fn set_layout(&mut self, layout: MarkdownLayout) {
-        self.layout = layout;
-        self.line_wrapper = layout.prose_width.map(TerminalLineWrapper::new);
-    }
-
     fn emit_wrappable(&mut self, text: &str, out: &mut Vec<String>) {
         if text.is_empty() {
             return;
@@ -1869,10 +1807,10 @@ impl MarkdownStream {
         out
     }
 
-    fn table_live(&self) -> Option<TableBufferLive> {
-        self.table_buffer.as_ref().map(|table| TableBufferLive {
-            chars: table.chars().count(),
-        })
+    fn table_live(&self) -> Option<usize> {
+        self.table_buffer
+            .as_ref()
+            .map(|table| table.chars().count())
     }
 
     fn push_complete_line(&mut self, line: &str, out: &mut Vec<String>) {
@@ -3698,45 +3636,6 @@ fn format_guardrail_live(title: &str, styled: bool, max_width: Option<usize>) ->
     }
 }
 
-#[cfg(test)]
-fn format_bash_header(title: &str, command: &str, risk: Option<&str>, styled: bool) -> String {
-    let command = preview_first_line(command, BASH_COMMAND_PREVIEW_BYTES);
-    if !styled {
-        let mut out = String::new();
-        if !title.is_empty() {
-            out.push_str("# ");
-            out.push_str(title);
-            out.push('\n');
-        }
-        out.push('$');
-        out.push(' ');
-        if let Some(risk) = risk {
-            out.push_str(&format_risk_label(risk, false));
-            out.push(' ');
-        }
-        out.push_str(&command);
-        out.push('\n');
-        return out;
-    }
-
-    let mut out = String::new();
-    if !title.is_empty() {
-        out.push_str(BOLD);
-        out.push_str("# ");
-        out.push_str(title);
-        out.push_str(RESET);
-        out.push('\n');
-    }
-    out.push_str(bash_risk_color(risk));
-    out.push_str(BOLD);
-    out.push('$');
-    out.push(' ');
-    out.push_str(&command);
-    out.push_str(RESET);
-    out.push('\n');
-    out
-}
-
 fn format_risk_label(risk: &str, styled: bool) -> String {
     if !styled {
         return format!("[{risk}]");
@@ -3795,10 +3694,6 @@ fn format_stdin_summary(bytes: usize, styled: bool) -> String {
     }
 }
 
-fn format_stdin_summary_line(bytes: usize, styled: bool) -> String {
-    format!("{}\n", format_stdin_summary(bytes, styled))
-}
-
 fn format_cwd_line(raw_cwd: &str, styled: bool) -> String {
     if styled {
         format!("{DIM}@{RESET} {GRAY}{raw_cwd}{RESET}\n")
@@ -3815,25 +3710,7 @@ fn should_render_bash_cwd(raw_cwd: &str) -> bool {
     } else {
         pwd.join(raw_path)
     };
-    lexical_normalize_path(&resolved) != lexical_normalize_path(&pwd)
-}
-
-fn lexical_normalize_path(path: &Path) -> PathBuf {
-    let mut normalized = PathBuf::new();
-    for component in path.components() {
-        match component {
-            Component::CurDir => {}
-            Component::ParentDir => {
-                if !normalized.pop() {
-                    normalized.push(component.as_os_str());
-                }
-            }
-            Component::Normal(_) | Component::RootDir | Component::Prefix(_) => {
-                normalized.push(component.as_os_str());
-            }
-        }
-    }
-    normalized
+    crate::paths::lexical_normalize(&resolved) != crate::paths::lexical_normalize(&pwd)
 }
 
 fn format_thought_line(
@@ -4494,41 +4371,9 @@ struct LinePreview {
 mod tests {
     use std::time::Duration;
 
+    use super::*;
     use serde_json::json;
     use unicode_width::UnicodeWidthChar;
-
-    use super::*;
-
-    #[test]
-    fn markdown_renderer_handles_lists_and_tables() {
-        let rendered = render_markdown(
-            "- one\n  - two\n\n| Name | Value |\n| --- | --- |\n| a | b |\n",
-            Some(DEFAULT_TERMINAL_WIDTH),
-        );
-        let plain = strip_ansi(&rendered);
-        assert!(rendered.contains("• one"));
-        assert!(rendered.contains("• two"));
-        assert!(plain.contains("| Name | Value |"));
-        assert_table_grid_aligned(&plain);
-    }
-
-    #[test]
-    fn markdown_renderer_keeps_nested_list_items_on_separate_lines() {
-        let rendered = render_markdown("- parent\n  - child\n", Some(DEFAULT_TERMINAL_WIDTH));
-        let plain = strip_ansi(&rendered);
-
-        assert!(plain.contains("• parent\n  • child\n"), "{plain:?}");
-        assert!(!plain.contains("• parent  • child"), "{plain:?}");
-    }
-
-    #[test]
-    fn markdown_renderer_aligns_wide_table_cells() {
-        let rendered = render_markdown(
-            "| Name | Value |\n| --- | ---: |\n| 字 | 10 |\n| ascii | 2 |\n",
-            Some(DEFAULT_TERMINAL_WIDTH),
-        );
-        assert_table_grid_aligned(&strip_ansi(&rendered));
-    }
 
     #[test]
     fn markdown_renderer_bounds_complete_grid_to_terminal_width() {
@@ -4563,33 +4408,6 @@ mod tests {
     }
 
     #[test]
-    fn table_rows_wrap_words_and_pad_shorter_cells() {
-        let rendered = render_table_row(
-            &["alpha beta gamma".into(), "x".into()],
-            &[10, 3],
-            &[Alignment::Left, Alignment::Left],
-        );
-
-        assert_eq!(
-            strip_ansi(&rendered),
-            "| alpha beta | x   |\n| gamma      |     |\n"
-        );
-    }
-
-    #[test]
-    fn five_cell_heuristic_prefers_nearby_whitespace_then_hard_splits() {
-        assert_eq!(
-            wrap_table_cell("alpha beta gamma", 10),
-            ["alpha beta", "gamma"]
-        );
-        assert_eq!(
-            wrap_table_cell("hello wonderful", 10),
-            ["hello", "wonderful"]
-        );
-        assert_eq!(wrap_table_cell("abc defghij", 10), ["abc defghi", "j"]);
-    }
-
-    #[test]
     fn streaming_wrapper_is_chunk_partition_invariant() {
         let text = "alpha wonderful world, then abcdefghijkl and done";
         let whole = wrap_terminal_chunks(&[text], 12);
@@ -4610,21 +4428,6 @@ mod tests {
     }
 
     #[test]
-    fn streaming_wrapper_keeps_unicode_graphemes_intact() {
-        for text in [
-            "漢字仮名交じり文",
-            "👩‍💻👩‍💻👩‍💻👩‍💻",
-            "e\u{301}e\u{301}e\u{301}e\u{301}e\u{301}",
-        ] {
-            let chunks = text.chars().map(|ch| ch.to_string()).collect::<Vec<_>>();
-            let refs = chunks.iter().map(String::as_str).collect::<Vec<_>>();
-            let wrapped = wrap_terminal_chunks(&refs, 6);
-            assert_visible_lines_fit(&wrapped, 6);
-            assert_eq!(wrapped.replace('\n', ""), text);
-        }
-    }
-
-    #[test]
     fn streaming_wrapper_preserves_ansi_and_hyperlink_sequences() {
         let open = open_hyperlink("https://example.com");
         let styled = format!("{BOLD}alpha wonderful{RESET} {open}linked text{OSC8_CLOSE}");
@@ -4642,132 +4445,6 @@ mod tests {
                 .collect::<String>(),
             "alphawonderfullinkedtext"
         );
-    }
-
-    #[test]
-    fn narrow_horizontal_rule_stays_on_one_row() {
-        let mut stream = MarkdownStream::new(MarkdownLayout {
-            prose_width: Some(12),
-            table_width: Some(12),
-        });
-
-        let rendered = strip_ansi(&stream.push("---\n").concat());
-        let visible = rendered
-            .lines()
-            .filter(|line| !line.is_empty())
-            .collect::<Vec<_>>();
-
-        assert_eq!(visible, ["────────────"]);
-    }
-
-    #[test]
-    fn narrow_multi_column_tables_fall_back_to_stacked_rows() {
-        let markdown = "\
-| Name | Role | Region | Notes |
-| --- | --- | --- | --- |
-| Ada | Engineer | Europe | Designs distributed systems |
-| Lin | Reviewer | Asia | Checks release artifacts |
-";
-        let plain = strip_ansi(&render_markdown(markdown, Some(20)));
-
-        assert_visible_lines_fit(&plain, 20);
-        assert!(plain.contains("Name"), "{plain:?}");
-        assert!(plain.contains("Ada"), "{plain:?}");
-        assert!(plain.contains("Notes"), "{plain:?}");
-        assert!(plain.contains("distrib"), "{plain:?}");
-        assert!(plain.contains("uted"), "{plain:?}");
-        assert!(plain.lines().any(|line| line.matches('|').count() == 3));
-    }
-
-    #[test]
-    fn extremely_narrow_tables_use_linear_rows() {
-        let markdown = "\
-| Name | Notes |
-| --- | --- |
-| Ada | abcdefghijkl |
-";
-        let plain = strip_ansi(&render_markdown(markdown, Some(9)));
-
-        assert_visible_lines_fit(&plain, 9);
-        assert!(plain.contains("Name:"), "{plain:?}");
-        assert!(plain.contains("Ada"), "{plain:?}");
-        assert!(plain.contains("abcdefghi\njkl"), "{plain:?}");
-    }
-
-    #[test]
-    fn unbounded_tables_keep_cells_on_one_renderer_row() {
-        let long = "x".repeat(100);
-        let markdown = format!("| Name |\n| --- |\n| {long} |\n");
-        let plain = strip_ansi(&render_markdown(&markdown, None));
-        let table_lines = plain
-            .lines()
-            .filter(|line| line.starts_with('|'))
-            .collect::<Vec<_>>();
-
-        assert_eq!(table_lines.len(), 3, "{plain:?}");
-        assert!(table_lines[2].contains(&long), "{plain:?}");
-        assert!(UnicodeWidthStr::width(table_lines[2]) > DEFAULT_TERMINAL_WIDTH);
-    }
-
-    #[test]
-    fn responsive_tables_respect_every_ascii_ruler_width() {
-        for max_width in 1..=80 {
-            for columns in 1..=12 {
-                let header = (1..=columns)
-                    .map(|idx| format!("Heading {idx}"))
-                    .collect::<Vec<_>>();
-                let separator = vec!["---"; columns];
-                let row = (1..=columns)
-                    .map(|idx| format!("value-{idx}-abcdefghijkl"))
-                    .collect::<Vec<_>>();
-                let markdown = format!(
-                    "| {} |\n| {} |\n| {} |\n",
-                    header.join(" | "),
-                    separator.join(" | "),
-                    row.join(" | ")
-                );
-                let plain = strip_ansi(&render_markdown(&markdown, Some(max_width)));
-
-                assert_visible_lines_fit(&plain, max_width);
-            }
-        }
-    }
-
-    #[test]
-    fn wrapped_table_fragments_keep_column_alignment() {
-        let row = vec!["alpha beta gamma".into()];
-
-        assert_eq!(
-            strip_ansi(&render_table_row(&row, &[10], &[Alignment::Right])),
-            "| alpha beta |\n|      gamma |\n"
-        );
-        assert_eq!(
-            strip_ansi(&render_table_row(&row, &[10], &[Alignment::Center])),
-            "| alpha beta |\n|   gamma    |\n"
-        );
-    }
-
-    #[test]
-    fn table_cell_wrapping_keeps_unicode_graphemes_intact() {
-        let wide = wrap_table_cell("界界界", 4)
-            .into_iter()
-            .map(|line| strip_ansi(&line))
-            .collect::<Vec<_>>();
-        let emoji = wrap_table_cell("👩‍💻👩‍💻👩‍💻", 4)
-            .into_iter()
-            .map(|line| strip_ansi(&line))
-            .collect::<Vec<_>>();
-        let combining = wrap_table_cell("e\u{301}e\u{301}e\u{301}", 2)
-            .into_iter()
-            .map(|line| strip_ansi(&line))
-            .collect::<Vec<_>>();
-
-        assert_eq!(wide, ["界界", "界"]);
-        assert_eq!(emoji, ["👩‍💻👩‍💻", "👩‍💻"]);
-        assert_eq!(combining, ["e\u{301}e\u{301}", "e\u{301}"]);
-        for line in wide.iter().chain(&emoji).chain(&combining) {
-            assert!(UnicodeWidthStr::width(line.as_str()) <= 4, "{line:?}");
-        }
     }
 
     #[test]
@@ -4819,56 +4496,6 @@ mod tests {
     }
 
     #[test]
-    fn block_quotes_wrap_and_render_without_a_visible_gutter() {
-        let mut stream = MarkdownStream::new(MarkdownLayout {
-            prose_width: Some(12),
-            table_width: Some(12),
-        });
-        let rendered = stream.push("> alpha wonderful world\n").concat();
-        let plain = strip_ansi(&rendered);
-
-        assert_visible_lines_fit(&plain, 12);
-        assert!(!plain.contains('│'), "{plain:?}");
-        assert!(rendered.contains(DIM), "{rendered:?}");
-        assert!(rendered.contains(ITALIC), "{rendered:?}");
-        assert_eq!(
-            plain
-                .chars()
-                .filter(|ch| !ch.is_whitespace())
-                .collect::<String>(),
-            "alphawonderfulworld"
-        );
-
-        let nested = render_markdown(">> nested\n", None);
-        assert!(strip_ansi(&nested).contains("nested"), "{nested:?}");
-        assert!(!nested.contains('│'), "{nested:?}");
-        assert!(nested.contains(DIM), "{nested:?}");
-        assert!(nested.contains(ITALIC), "{nested:?}");
-    }
-
-    #[test]
-    fn markdown_stream_waits_for_stable_heading_depth() {
-        let mut stream = MarkdownStream::default();
-
-        assert_eq!(stream.push("##").concat(), "");
-        let rendered = stream.push("# Title").concat();
-        assert_eq!(strip_ansi(&rendered), "Title");
-        assert!(rendered.contains(BOLD), "{rendered:?}");
-    }
-
-    #[test]
-    fn markdown_stream_renders_heading_closing_hashes_literally() {
-        let mut stream = MarkdownStream::default();
-
-        let rendered = [
-            stream.push("# title #\n").concat(),
-            stream.finish().concat(),
-        ]
-        .concat();
-        assert_eq!(strip_ansi(&rendered), "title #\n\n");
-    }
-
-    #[test]
     fn markdown_stream_keeps_exactly_one_empty_line_after_headings() {
         let mut stream = MarkdownStream::default();
 
@@ -4887,20 +4514,6 @@ mod tests {
         ]
         .concat();
         assert_eq!(strip_ansi(&rendered), "Heading\n\nbody\n");
-    }
-
-    #[test]
-    fn markdown_stream_streams_fenced_code_without_fence_markers() {
-        let mut stream = MarkdownStream::default();
-
-        let open = stream.push("```sh\n").concat();
-        assert!(open.contains(CODE), "{open:?}");
-        assert!(!open.contains("```"), "{open:?}");
-        let body = stream.push("echo hi\n").concat();
-        assert_eq!(strip_ansi(&body), "echo hi\n");
-        let close = stream.push("```\n").concat();
-        assert_eq!(strip_ansi(&close), "");
-        assert!(!close.contains("```"), "{close:?}");
     }
 
     #[test]
@@ -4926,65 +4539,15 @@ mod tests {
         assert!(stream.table_live().is_none());
         assert_eq!(stream.push("| --- | ---: |\n").concat(), "");
         let live = stream.table_live().expect("confirmed table should be live");
-        assert!(approx_tokens_from_chars(live.chars) > 0);
+        assert!(approx_tokens_from_chars(live) > 0);
         assert_eq!(stream.push("| a | 1 |\n").concat(), "");
-        assert!(stream.table_live().unwrap().chars > live.chars);
+        assert!(stream.table_live().unwrap() > live);
         let rendered = stream.push("\n").concat();
         assert!(stream.table_live().is_none());
         let plain = strip_ansi(&rendered);
         assert!(plain.contains("| Name | Value |"), "{plain:?}");
         assert!(plain.contains("| a    |     1 |"), "{plain:?}");
         assert_table_grid_aligned(&plain);
-    }
-
-    #[test]
-    fn markdown_stream_wraps_long_table_headers_and_cells_on_commit() {
-        let mut stream = MarkdownStream::new(MarkdownLayout {
-            prose_width: None,
-            table_width: Some(DEFAULT_TERMINAL_WIDTH),
-        });
-        let header = "heading ".repeat(12);
-        let body = "x".repeat(MAX_TABLE_COLUMN_WIDTH + 1);
-
-        assert!(stream.push(&format!("| {header} | Side |\n")).is_empty());
-        assert!(stream.push("| --- | --- |\n").is_empty());
-        assert!(stream.push(&format!("| {body} | y |\n")).is_empty());
-        assert!(stream.table_live().is_some());
-        let rendered = stream.push("\n").concat();
-        assert!(stream.table_live().is_none());
-
-        let plain = strip_ansi(&rendered);
-        let table_lines = plain
-            .lines()
-            .filter(|line| line.starts_with('|') && line.ends_with('|'))
-            .collect::<Vec<_>>();
-        let separator = table_lines
-            .iter()
-            .position(|line| line.contains("---"))
-            .expect("table separator missing");
-        assert_eq!(separator, 2, "{plain:?}");
-        assert_eq!(table_lines.len(), 5, "{plain:?}");
-        assert_table_grid_aligned(&plain);
-    }
-
-    #[test]
-    fn markdown_stream_releases_non_table_pipe_lines_as_raw_markdown() {
-        let mut stream = MarkdownStream::default();
-
-        assert_eq!(stream.push("a | b\n").concat(), "");
-        let rendered = stream.push("next\n").concat();
-        assert_eq!(strip_ansi(&rendered), "a | b\nnext\n");
-    }
-
-    #[test]
-    fn markdown_stream_buffers_inline_links_until_line_is_complete() {
-        let mut stream = MarkdownStream::default();
-
-        assert_eq!(stream.push("[docs](").concat(), "");
-        let rendered = stream.push("https://example.com)\n").concat();
-        assert!(rendered.contains(&open_hyperlink("https://example.com")));
-        assert!(rendered.contains("docs"));
-        assert!(rendered.contains("https://example.com"));
     }
 
     #[test]
@@ -4995,19 +4558,6 @@ mod tests {
         assert_eq!(rendered, "![alt](image.png)\n");
         let heading = stream.push("# ![alt](image.png)\n").concat();
         assert_eq!(heading, "# ![alt](image.png)\n");
-    }
-
-    #[test]
-    fn markdown_stream_keeps_single_tildes_literal_but_styles_double_tilde_strike() {
-        let mut stream = MarkdownStream::default();
-
-        let single = stream.push("about ~2 tokens\n").concat();
-        assert_eq!(strip_ansi(&single), "about ~2 tokens\n");
-        assert!(!single.contains(STRIKE), "{single:?}");
-
-        let double = stream.push("keep ~~struck~~ text\n").concat();
-        assert_eq!(strip_ansi(&double), "keep struck text\n");
-        assert!(double.contains(STRIKE), "{double:?}");
     }
 
     #[test]
@@ -5029,38 +4579,6 @@ mod tests {
             assert!(!rendered.contains(BOLD), "{rendered:?}");
             assert!(!rendered.contains(CYAN), "{rendered:?}");
         }
-    }
-
-    #[test]
-    fn markdown_stream_styles_valid_underscore_spans_in_cyan() {
-        let mut stream = MarkdownStream::default();
-        let rendered = [
-            stream.push("Use _em").concat(),
-            stream.push("phasis_ and __strong").concat(),
-            stream.push("__.\n").concat(),
-        ]
-        .concat();
-
-        assert_eq!(strip_ansi(&rendered), "Use emphasis and strong.\n");
-        assert!(rendered.contains(CYAN), "{rendered:?}");
-        assert!(rendered.contains(BOLD), "{rendered:?}");
-        assert!(!rendered.contains(ITALIC), "{rendered:?}");
-        assert!(!rendered.contains(DIM), "{rendered:?}");
-    }
-
-    #[test]
-    fn markdown_stream_only_closes_fences_with_plain_closing_markers() {
-        let mut stream = MarkdownStream::default();
-
-        let rendered = [
-            stream.push("```rust\n").concat(),
-            stream.push("```not-a-close\n").concat(),
-            stream.push("```\n").concat(),
-        ]
-        .concat();
-        let plain = strip_ansi(&rendered);
-        assert!(plain.contains("```not-a-close\n"), "{plain:?}");
-        assert!(!plain.contains("```rust"), "{plain:?}");
     }
 
     #[test]
@@ -5092,8 +4610,8 @@ mod tests {
     #[test]
     fn table_buffer_indicator_is_live_only_until_table_finishes() {
         let mut stream = MarkdownStream::default();
-        let mut renderer = Renderer::with_format(OutputFormat::Detail);
-        renderer.force_styled_for_test();
+        let (mut renderer, _output) =
+            Renderer::with_test_shared_output(OutputFormat::Detail, true, None);
 
         assert_eq!(stream.push("| Name | Value |\n").concat(), "");
         renderer.sync_table_live_line(stream.table_live()).unwrap();
@@ -5172,40 +4690,8 @@ mod tests {
 
     fn assert_visible_lines_fit(text: &str, width: usize) {
         for line in text.lines() {
-            assert!(
-                UnicodeWidthStr::width(line) <= width,
-                "line exceeds {width} cells: {line:?} in {text:?}"
-            );
+            assert!(UnicodeWidthStr::width(line) <= width, "{line:?}");
         }
-    }
-
-    fn simulated_terminal_rows(transcript: &str) -> Vec<String> {
-        let transcript = transcript.replace("\r\x1b[2K", "\r");
-        let mut rows = Vec::new();
-        let mut current = String::new();
-        for ch in transcript.chars() {
-            match ch {
-                '\r' => current.clear(),
-                '\n' => {
-                    rows.push(strip_ansi(&current));
-                    current.clear();
-                }
-                _ => current.push(ch),
-            }
-        }
-        if !current.is_empty() {
-            rows.push(strip_ansi(&current));
-        }
-        rows
-    }
-
-    #[test]
-    fn bash_header_renders_title_and_risk_colored_script_without_risk_label() {
-        let header = format_bash_header("List files", "printf 'a'\npwd", Some("readonly"), true);
-        assert!(header.starts_with(&format!("{BOLD}# List files{RESET}\n")));
-        assert!(header.contains(&format!("{CYAN}{BOLD}$ printf 'a'…{RESET}\n")));
-        assert!(!header.contains("  pwd\n"));
-        assert!(!header.contains("[readonly]"));
     }
 
     #[test]
@@ -5224,7 +4710,7 @@ mod tests {
         ));
 
         renderer.bash_header_title_start().unwrap();
-        renderer.bash_header_title_delta("Inspect").unwrap();
+        renderer.bash_header_delta("Inspect").unwrap();
         renderer.bash_header_title_end().unwrap();
 
         assert!(renderer.live_line.is_none());
@@ -5249,7 +4735,7 @@ mod tests {
             .unwrap();
         renderer.bash_header_start(Some("call_1")).unwrap();
         renderer.bash_header_title_start().unwrap();
-        renderer.bash_header_title_delta("Inspect").unwrap();
+        renderer.bash_header_delta("Inspect").unwrap();
         renderer.bash_header_title_end().unwrap();
         renderer.assistant_end().unwrap();
 
@@ -5259,49 +4745,6 @@ mod tests {
             "{normalized:?}"
         );
         assert_eq!(normalized.matches("tail").count(), 1, "{normalized:?}");
-    }
-
-    #[test]
-    fn plain_tool_header_omits_composition_indicator() {
-        let (mut renderer, output) =
-            Renderer::with_test_shared_output(OutputFormat::Detail, false, None);
-
-        renderer.bash_header_start(Some("call_1")).unwrap();
-        assert_eq!(output.transcript(), "");
-
-        renderer.bash_header_title_start().unwrap();
-        renderer.bash_header_title_delta("Inspect").unwrap();
-        renderer.bash_header_title_end().unwrap();
-        renderer
-            .bash_header_command_start(Some("readonly"))
-            .unwrap();
-        renderer.bash_header_command_delta("pwd").unwrap();
-        renderer.bash_header_command_end().unwrap();
-
-        assert_eq!(output.transcript(), "# Inspect\n$ [readonly] pwd\n");
-    }
-
-    #[test]
-    fn stdin_summary_uses_bracketed_byte_count() {
-        assert_eq!(format_stdin_summary_line(0, false), "< [stdin 0 bytes]\n");
-        assert_eq!(format_stdin_summary_line(1, false), "< [stdin 1 byte]\n");
-        assert_eq!(
-            format_stdin_summary_line(12, true),
-            format!("{BLUE}< [stdin 12 bytes]{RESET}\n")
-        );
-    }
-
-    #[test]
-    fn cwd_line_format_and_render_condition() {
-        assert_eq!(format_cwd_line("../other", false), "@ ../other\n");
-        assert_eq!(
-            format_cwd_line("../other", true),
-            format!("{DIM}@{RESET} {GRAY}../other{RESET}\n")
-        );
-        let pwd = std::env::current_dir().unwrap();
-        assert!(!should_render_bash_cwd("."));
-        assert!(!should_render_bash_cwd(&pwd.display().to_string()));
-        assert!(should_render_bash_cwd("__mu_cwd_display_probe__"));
     }
 
     #[test]
@@ -5319,49 +4762,6 @@ mod tests {
             .unwrap();
         renderer.bash_output(Some("call_1"), "bash", "a\n").unwrap();
         renderer.tool_finished(0, Duration::from_millis(1)).unwrap();
-    }
-
-    #[test]
-    fn terminal_trimming_only_removes_committed_line_suffixes() {
-        assert_eq!(
-            terminal_trim_committed_text("a  \n b\t\t\nc  "),
-            "a\n b\nc  "
-        );
-        assert_eq!(trim_final_tail_fragment("tail \t\n\n"), "tail");
-    }
-
-    #[test]
-    fn bash_preview_does_not_duplicate_short_unterminated_output_on_finish() {
-        let snapshot = compute_bash_preview_snapshot("first", true, None);
-
-        assert_eq!(snapshot.head_rendered, "first");
-        assert_eq!(snapshot.tail_rendered, "");
-        assert_eq!(snapshot.omitted_lines, 0);
-        assert_eq!(snapshot.omitted_bytes, 0);
-    }
-
-    #[test]
-    fn plain_reasoning_commits_summary_after_reasoning_finishes() {
-        let raw = capture_plain_reasoning_transcript();
-        let normalized = strip_ansi(&raw.replace('\r', ""));
-
-        assert!(normalized.starts_with("[thought "));
-        assert!(normalized.contains(", ~2 tokens]\n"));
-    }
-
-    #[test]
-    fn streamed_trace_commits_even_without_reasoning_text_and_keeps_tokens() {
-        let (mut renderer, output, _stderr) =
-            Renderer::with_test_output(OutputFormat::Detail, false, false, None);
-
-        renderer
-            .reasoning_start(ReasoningVisibility::StreamedTrace)
-            .unwrap();
-        renderer.reasoning_end(None).unwrap();
-
-        let transcript = output.transcript();
-        assert!(transcript.starts_with("[thought "), "{transcript:?}");
-        assert!(transcript.contains(", ~0 tokens]\n"), "{transcript:?}");
     }
 
     #[test]
@@ -5397,43 +4797,6 @@ mod tests {
     }
 
     #[test]
-    fn multiple_opaque_reasoning_items_commit_separate_titles() {
-        let (mut renderer, output, _stderr) =
-            Renderer::with_test_output(OutputFormat::Detail, false, false, None);
-
-        for title in ["First pass", "Second pass"] {
-            renderer
-                .reasoning_start(ReasoningVisibility::Opaque)
-                .unwrap();
-            renderer
-                .reasoning_summary_delta(0, &format!("**{title}**\n"))
-                .unwrap();
-            renderer.reasoning_end(None).unwrap();
-        }
-
-        let transcript = output.transcript();
-        assert_eq!(transcript.matches("[thought ").count(), 2, "{transcript:?}");
-        assert!(transcript.contains("] First pass\n"), "{transcript:?}");
-        assert!(transcript.contains("] Second pass\n"), "{transcript:?}");
-    }
-
-    #[test]
-    fn final_output_suppresses_opaque_reasoning_and_summary() {
-        let (mut renderer, output, _stderr) =
-            Renderer::with_test_output(OutputFormat::Final, false, false, None);
-
-        renderer
-            .reasoning_start(ReasoningVisibility::Opaque)
-            .unwrap();
-        renderer
-            .reasoning_summary_delta(0, "**Hidden title**\n")
-            .unwrap();
-        renderer.reasoning_end(None).unwrap();
-
-        assert!(output.transcript().is_empty());
-    }
-
-    #[test]
     fn first_visible_renderer_blocks_have_no_leading_separator() {
         let (mut assistant, assistant_output) =
             Renderer::with_test_shared_output(OutputFormat::Detail, true, None);
@@ -5449,7 +4812,7 @@ mod tests {
             Renderer::with_test_shared_output(OutputFormat::Detail, true, None);
         tool.bash_header_start(None).unwrap();
         tool.bash_header_title_start().unwrap();
-        tool.bash_header_title_delta("Inspect").unwrap();
+        tool.bash_header_delta("Inspect").unwrap();
         tool.bash_header_title_end().unwrap();
         assert!(
             tool_output
@@ -5474,60 +4837,6 @@ mod tests {
     }
 
     #[test]
-    fn markdown_document_renders_terminal_provenance_and_finishes_the_line() {
-        let (mut renderer, output) =
-            Renderer::with_test_shared_output(OutputFormat::Detail, true, None);
-
-        renderer
-            .markdown_document(
-                "[project command] /tmp/review.md",
-                "# Review\n\nUse **care**.",
-            )
-            .unwrap();
-
-        let raw = output.transcript();
-        let plain = strip_ansi(&raw);
-        assert!(
-            plain.starts_with("[project command] /tmp/review.md\n\nReview\n\n"),
-            "{plain:?}"
-        );
-        assert!(plain.contains("Use care."), "{plain:?}");
-        assert!(plain.ends_with('\n'), "{plain:?}");
-        assert!(!plain.contains("[mu]"), "{plain:?}");
-    }
-
-    #[test]
-    fn markdown_document_redirected_output_is_exact_and_header_free() {
-        let (mut renderer, output) =
-            Renderer::with_test_shared_output(OutputFormat::Detail, false, None);
-        let prompt = "# Review\n\nBase\n---\n\nFocus on auth.\n";
-
-        renderer
-            .markdown_document("[project command] /tmp/review.md", prompt)
-            .unwrap();
-
-        assert_eq!(output.transcript(), prompt);
-    }
-
-    #[test]
-    fn markdown_document_does_not_show_a_table_buffering_live_line() {
-        let (mut renderer, output) =
-            Renderer::with_test_shared_output(OutputFormat::Detail, true, None);
-
-        renderer
-            .markdown_document(
-                "[prompt file] /tmp/table.md",
-                "| Name | Value |\n| --- | --- |\n| a | b |",
-            )
-            .unwrap();
-
-        let raw = output.transcript();
-        assert!(!raw.contains("[buffering table]"), "{raw:?}");
-        assert!(!raw.contains('\r'), "{raw:?}");
-        assert!(strip_ansi(&raw).contains("| Name | Value |"), "{raw:?}");
-    }
-
-    #[test]
     fn compaction_uses_one_mutable_live_line_and_commits_estimated_result() {
         let (mut renderer, output) =
             Renderer::with_test_shared_output(OutputFormat::Detail, true, None);
@@ -5546,52 +4855,6 @@ mod tests {
             "{raw:?}"
         );
         assert!(renderer.live_line.is_none());
-    }
-
-    #[test]
-    fn redirected_compaction_result_is_one_plain_status_line() {
-        let (mut renderer, output) =
-            Renderer::with_test_shared_output(OutputFormat::Detail, false, None);
-
-        renderer
-            .compaction_result(12_826, 10_582, None, Duration::from_millis(900))
-            .unwrap();
-
-        assert_eq!(
-            output.transcript(),
-            "[mu] compacted 12,826 → ~10,582 context tokens in 900ms\n"
-        );
-    }
-
-    #[test]
-    fn terminal_summary_leaves_a_blank_line_before_the_next_prompt() {
-        let raw = capture_renderer_transcript(Duration::from_secs(12), Some("mu> "));
-        let normalized = strip_ansi(&raw.replace('\r', ""));
-
-        assert!(raw.contains(&format!(
-            "{GRAY}[mu] tokens: 12 in / 5 out  context: 25%  time: 12.0s{RESET}"
-        )));
-
-        assert!(normalized.contains(
-            "$ printf 'line01\\nline02\\nline03\\n'\n✓ guardrail allowed · low ≤ explicit"
-        ));
-        assert!(normalized.contains("reason is acceptable\nline01\n"));
-        assert!(!normalized.contains("reason is acceptable\n\nline01\n"));
-        assert!(
-            normalized.contains(
-                ", 5 tokens]\n\n[preparing toolcall]# Stream demo\n$ printf 'line01\\nline02\\nline03\\n'"
-            ),
-            "{normalized:?}"
-        );
-        assert!(raw.contains(&format!(
-            "{GRAY}[preparing toolcall]{RESET}\r\x1b[2K{BOLD}# Stream demo{RESET}\n"
-        )));
-        assert!(normalized.contains(
-            "✓ exit 0 · 250ms\n\nDone.\n\n[mu] tokens: 12 in / 5 out  context: 25%  time: 12.0s\n\nmu> "
-        ));
-        assert!(
-            !normalized.contains("[mu] tokens: 12 in / 5 out  context: 25%  time: 12.0s\n\n\nmu> ")
-        );
     }
 
     #[test]
@@ -5615,35 +4878,6 @@ mod tests {
             format_turn_summary(600, 0, None, 456, Some(12.0), Duration::from_millis(1100),),
             "[mu] tokens: 600 in / 456 out  context: 12%  time: 1.1s"
         );
-    }
-
-    #[test]
-    fn concise_and_final_output_omit_turn_summary() {
-        for format in [OutputFormat::Concise, OutputFormat::Final] {
-            let (mut renderer, _stdout, stderr) =
-                Renderer::with_test_output(format, true, true, None);
-
-            renderer
-                .turn_summary(12, 0, None, 5, Some(25.0), Duration::from_secs(1))
-                .unwrap();
-
-            assert!(stderr.transcript().is_empty(), "{format:?}");
-        }
-    }
-
-    #[test]
-    fn concise_terminal_keeps_blank_line_before_next_prompt_without_summary() {
-        let (mut renderer, output) =
-            Renderer::with_test_shared_output(OutputFormat::Concise, true, None);
-
-        renderer.assistant_text("Done.").unwrap();
-        renderer.finish_turn().unwrap();
-        renderer
-            .turn_summary(12, 0, None, 5, Some(25.0), Duration::from_secs(1))
-            .unwrap();
-        output.write_raw("mu> ");
-
-        assert_eq!(output.transcript(), "Done.\n\nmu> ");
     }
 
     #[test]
@@ -5672,289 +4906,6 @@ mod tests {
     }
 
     #[test]
-    fn interactive_prose_wraps_to_detected_width() {
-        let (mut renderer, output) = Renderer::with_test_shared_output_layout(
-            OutputFormat::Detail,
-            true,
-            true,
-            Some(12),
-            None,
-        );
-        let text = "alpha wonderful world and 漢字仮名";
-
-        for chunk in ["alpha won", "derful world", " and 漢", "字仮名"] {
-            renderer.assistant_text(chunk).unwrap();
-        }
-        renderer.assistant_end().unwrap();
-
-        let plain = strip_ansi(&output.transcript());
-        assert_visible_lines_fit(&plain, 12);
-        assert_eq!(
-            plain
-                .chars()
-                .filter(|ch| !ch.is_whitespace())
-                .collect::<String>(),
-            text.chars()
-                .filter(|ch| !ch.is_whitespace())
-                .collect::<String>()
-        );
-    }
-
-    #[test]
-    fn wrapping_column_resets_between_assistant_messages() {
-        let (mut renderer, output) = Renderer::with_test_shared_output_layout(
-            OutputFormat::Detail,
-            true,
-            true,
-            Some(10),
-            None,
-        );
-
-        renderer.assistant_text("1234567").unwrap();
-        renderer.assistant_end().unwrap();
-        renderer.assistant_text("abcdefghij").unwrap();
-        renderer.assistant_end().unwrap();
-
-        let plain = strip_ansi(&output.transcript());
-        assert!(plain.contains("1234567\n\nabcdefghij"), "{plain:?}");
-    }
-
-    #[test]
-    fn disabled_interactive_wrapping_leaves_prose_and_table_cells_unbounded() {
-        let (mut renderer, output) = Renderer::with_test_shared_output_layout(
-            OutputFormat::Detail,
-            true,
-            false,
-            Some(12),
-            None,
-        );
-        let prose = "alpha wonderful world without renderer wrapping";
-        renderer.assistant_text(prose).unwrap();
-        renderer.assistant_text("\n\n").unwrap();
-        let long = "x".repeat(100);
-        renderer
-            .assistant_text(&format!("| Name |\n| --- |\n| {long} |\n\n"))
-            .unwrap();
-        renderer.assistant_end().unwrap();
-
-        let plain = strip_ansi(&output.transcript());
-        assert!(plain.lines().any(|line| line == prose), "{plain:?}");
-        assert!(plain.lines().any(|line| line.contains(&long)), "{plain:?}");
-    }
-
-    #[test]
-    fn interactive_tool_rows_use_dynamic_or_fixed_eighty_cell_limits() {
-        let args = json!({
-            "title": "Inspect an intentionally very long collection of generated artifacts",
-            "risk": "readonly",
-            "command": "printf 'this command is intentionally much too long for the ruler'",
-        });
-        let (mut wrapped, wrapped_output) = Renderer::with_test_shared_output_layout(
-            OutputFormat::Detail,
-            true,
-            true,
-            Some(24),
-            None,
-        );
-        wrapped.bash_header_full(Some("call_1"), &args).unwrap();
-        for row in simulated_terminal_rows(&wrapped_output.transcript()) {
-            assert!(UnicodeWidthStr::width(row.as_str()) <= 24, "{row:?}");
-        }
-
-        let (mut disabled, disabled_output) = Renderer::with_test_shared_output_layout(
-            OutputFormat::Detail,
-            true,
-            false,
-            Some(24),
-            None,
-        );
-        disabled.bash_header_full(Some("call_1"), &args).unwrap();
-        let rows = simulated_terminal_rows(&disabled_output.transcript());
-        assert!(
-            rows.iter()
-                .any(|row| UnicodeWidthStr::width(row.as_str()) > 24),
-            "{rows:?}"
-        );
-        assert!(
-            rows.iter()
-                .all(|row| UnicodeWidthStr::width(row.as_str()) <= 80),
-            "{rows:?}"
-        );
-    }
-
-    #[test]
-    fn concise_tool_truncation_preserves_completion_suffix() {
-        let (mut renderer, output) = Renderer::with_test_shared_output_layout(
-            OutputFormat::Concise,
-            true,
-            true,
-            Some(24),
-            None,
-        );
-        renderer.bash_header_start(Some("call_1")).unwrap();
-        renderer
-            .concise_tool_ready(
-                Some("Inspect an intentionally long generated artifact name"),
-                Some("readonly"),
-            )
-            .unwrap();
-        renderer.tool_finished(7, Duration::from_millis(1)).unwrap();
-
-        let rows = simulated_terminal_rows(&output.transcript());
-        let completed = rows.last().expect("completed concise row");
-        assert!(completed.ends_with(" · exit 7"), "{rows:?}");
-        assert!(UnicodeWidthStr::width(completed.as_str()) <= 24);
-    }
-
-    #[test]
-    fn interactive_full_command_remains_unwrapped() {
-        let (mut renderer, output) = Renderer::with_test_shared_output_layout(
-            OutputFormat::Full,
-            true,
-            true,
-            Some(20),
-            None,
-        );
-        let command = "printf 'a command that remains complete in full output'";
-        renderer
-            .bash_header_full(
-                Some("call_1"),
-                &json!({
-                    "title": "Run a long command",
-                    "risk": "readonly",
-                    "command": command,
-                }),
-            )
-            .unwrap();
-
-        let rows = simulated_terminal_rows(&output.transcript());
-        assert!(rows.iter().any(|row| row.contains(command)), "{rows:?}");
-        assert!(
-            rows.iter()
-                .any(|row| UnicodeWidthStr::width(row.as_str()) > 20),
-            "{rows:?}"
-        );
-    }
-
-    #[test]
-    fn concise_interactive_tool_replaces_preparing_line_and_uses_risk_color() {
-        let (mut renderer, output) =
-            Renderer::with_test_shared_output(OutputFormat::Concise, true, None);
-
-        renderer.bash_header_start(Some("call_1")).unwrap();
-        renderer
-            .concise_tool_ready(Some("Apply patch"), Some("reversible"))
-            .unwrap();
-        renderer.tool_finished(0, Duration::from_secs(9)).unwrap();
-
-        assert_eq!(
-            output.transcript(),
-            format!(
-                "{GRAY}[preparing toolcall]{RESET}\r\x1b[2K{BRIGHT_YELLOW}=> Apply patch{RESET}\r\x1b[2K{BRIGHT_YELLOW}=> Apply patch · exit 0{RESET}\n"
-            )
-        );
-    }
-
-    #[test]
-    fn concise_consecutive_tools_and_following_thought_have_no_empty_lines() {
-        let (mut renderer, output) =
-            Renderer::with_test_shared_output(OutputFormat::Concise, true, None);
-
-        for title in ["First", "Second"] {
-            renderer.bash_header_start(None).unwrap();
-            renderer
-                .concise_tool_ready(Some(title), Some("readonly"))
-                .unwrap();
-            renderer.tool_finished(0, Duration::from_millis(1)).unwrap();
-            renderer
-                .reasoning_start(ReasoningVisibility::StreamedTrace)
-                .unwrap();
-            renderer.reasoning_delta("plan").unwrap();
-            renderer.reasoning_end(None).unwrap();
-        }
-
-        let transcript = output.transcript();
-        assert!(!strip_ansi(&transcript).contains("\n\n"), "{transcript:?}");
-        assert!(transcript.contains(&format!("{CYAN}=> First · exit 0{RESET}\n{GRAY}[thought ")));
-        assert!(transcript.contains(&format!("{CYAN}=> Second · exit 0{RESET}\n{GRAY}[thought ")));
-    }
-
-    #[test]
-    fn concise_reasoning_is_ephemeral_and_noninteractive_reasoning_is_silent() {
-        let (mut interactive, interactive_output) =
-            Renderer::with_test_shared_output(OutputFormat::Concise, true, None);
-        interactive
-            .reasoning_start(ReasoningVisibility::Opaque)
-            .unwrap();
-        let before_summary = interactive_output.transcript();
-        interactive
-            .reasoning_summary_delta(0, "**Inspecting**\n")
-            .unwrap();
-        assert_eq!(interactive_output.transcript(), before_summary);
-        interactive.reasoning_end(None).unwrap();
-        assert!(!interactive_output.transcript().contains("Inspecting"));
-        assert!(interactive_output.transcript().ends_with("\r\x1b[2K"));
-
-        let (mut redirected, redirected_output) =
-            Renderer::with_test_shared_output(OutputFormat::Concise, false, None);
-        redirected
-            .reasoning_start(ReasoningVisibility::StreamedTrace)
-            .unwrap();
-        redirected.reasoning_delta("private trace").unwrap();
-        redirected.reasoning_end(None).unwrap();
-        assert!(redirected_output.transcript().is_empty());
-    }
-
-    #[test]
-    fn concise_reasoning_title_appears_on_ticks_without_resetting_timer() {
-        let (mut renderer, output) =
-            Renderer::with_test_shared_output(OutputFormat::Concise, true, None);
-        renderer
-            .reasoning_start(ReasoningVisibility::Opaque)
-            .unwrap();
-        let started = renderer.reasoning.as_ref().unwrap().started;
-
-        renderer
-            .reasoning_summary_delta(0, "**Inspecting**\n")
-            .unwrap();
-        assert_eq!(renderer.reasoning.as_ref().unwrap().started, started);
-        assert!(!output.transcript().contains("Inspecting"));
-
-        renderer.thinking_tick().unwrap();
-        renderer.thinking_tick().unwrap();
-        assert_eq!(
-            strip_ansi(&output.transcript())
-                .matches("] Inspecting")
-                .count(),
-            2
-        );
-        assert_eq!(renderer.reasoning.as_ref().unwrap().started, started);
-
-        renderer.reasoning_end(None).unwrap();
-        renderer
-            .reasoning_start(ReasoningVisibility::Opaque)
-            .unwrap();
-        let live = strip_ansi(&renderer.format_live_line().unwrap());
-        assert!(!live.contains("Inspecting"), "{live:?}");
-    }
-
-    #[test]
-    fn concise_interruption_closes_a_pending_tool_line_as_error() {
-        let (mut renderer, output) =
-            Renderer::with_test_shared_output(OutputFormat::Concise, false, None);
-        renderer.bash_header_start(Some("call_1")).unwrap();
-        renderer
-            .concise_tool_ready(Some("Review action"), Some("destructive"))
-            .unwrap();
-
-        renderer.turn_interrupted("review failed").unwrap();
-
-        let transcript = output.transcript();
-        assert!(transcript.starts_with("=> Review action · error\n\n"));
-        assert!(transcript.contains("[mu] interrupted: review failed\n"));
-    }
-
-    #[test]
     fn concise_guardrail_status_replaces_the_live_tool_and_commits_denial() {
         let (mut renderer, output) =
             Renderer::with_test_shared_output(OutputFormat::Concise, true, None);
@@ -5978,60 +4929,6 @@ mod tests {
         assert!(
             strip_ansi(&output.transcript()).ends_with("=> Review action · guardrail denied\n")
         );
-    }
-
-    #[test]
-    fn concise_allowed_guardrail_returns_to_the_live_tool_line() {
-        let (mut renderer, _output) =
-            Renderer::with_test_shared_output(OutputFormat::Concise, true, None);
-        renderer
-            .bash_header_full(
-                Some("call_1"),
-                &json!({
-                    "title": "Review action",
-                    "risk": "destructive",
-                    "command": "do something",
-                }),
-            )
-            .unwrap();
-
-        renderer.guardrail_start().unwrap();
-        renderer
-            .guardrail_verdict(true, "high", "explicit", "authorized", "do something")
-            .unwrap();
-
-        assert_eq!(
-            strip_ansi(&renderer.format_live_line().unwrap()),
-            "=> Review action"
-        );
-    }
-
-    #[test]
-    fn full_streams_reasoning_streamed_and_opaque() {
-        let (mut renderer, output) =
-            Renderer::with_test_shared_output(OutputFormat::Full, false, None);
-
-        renderer
-            .reasoning_start(ReasoningVisibility::StreamedTrace)
-            .unwrap();
-        renderer.reasoning_delta("step one\n").unwrap();
-        renderer.reasoning_delta("step two").unwrap();
-        renderer.reasoning_end(Some((10, 4))).unwrap();
-
-        assert_eq!(output.transcript(), "step one\nstep two\n");
-        assert!(!output.transcript().contains("[thought"));
-
-        let (mut renderer, output) =
-            Renderer::with_test_shared_output(OutputFormat::Full, false, None);
-        renderer
-            .reasoning_start(ReasoningVisibility::Opaque)
-            .unwrap();
-        renderer.reasoning_summary_delta(0, "first ").unwrap();
-        renderer.reasoning_summary_delta(0, "part").unwrap();
-        renderer.reasoning_summary_delta(1, "second part").unwrap();
-        renderer.reasoning_end(None).unwrap();
-
-        assert_eq!(output.transcript(), "first part\n\nsecond part\n");
     }
 
     #[test]
@@ -6063,71 +4960,5 @@ mod tests {
         assert!(transcript.contains("line1\nline2\nline3\nline4\nline5\nline6\nline7\nline8\n"));
         assert!(!transcript.contains("omitted"));
         assert!(transcript.ends_with("✓ exit 0 · 5ms\n"));
-    }
-
-    fn capture_renderer_transcript(
-        turn_elapsed: Duration,
-        trailing_prompt: Option<&str>,
-    ) -> String {
-        let (mut renderer, output) =
-            Renderer::with_test_shared_output(OutputFormat::Detail, true, None);
-
-        renderer
-            .reasoning_start(ReasoningVisibility::StreamedTrace)
-            .unwrap();
-        renderer.reasoning_delta("plan").unwrap();
-        std::thread::sleep(Duration::from_millis(40));
-        renderer.reasoning_end(Some((12, 5))).unwrap();
-        renderer
-            .tool_start(
-                None,
-                "bash",
-                &json!({
-                    "title": "Stream demo",
-                    "risk": "readonly",
-                    "command": "printf 'line01\\nline02\\nline03\\n'",
-                }),
-                false,
-            )
-            .unwrap();
-        renderer
-            .guardrail_verdict(
-                true,
-                "low",
-                "explicit",
-                "reason is acceptable",
-                "printf 'line01\\nline02\\nline03\\n'",
-            )
-            .unwrap();
-        renderer
-            .bash_output(None, "bash", "line01\nline02\nline03\n")
-            .unwrap();
-        renderer
-            .tool_finished(0, Duration::from_millis(250))
-            .unwrap();
-        renderer.assistant_text("Done.\n").unwrap();
-        renderer.assistant_end().unwrap();
-        renderer.finish_turn().unwrap();
-        renderer
-            .turn_summary(12, 0, None, 5, Some(25.0), turn_elapsed)
-            .unwrap();
-        renderer.turn_done_bell(turn_elapsed).unwrap();
-        if let Some(prompt) = trailing_prompt {
-            output.write_raw(prompt);
-        }
-        output.transcript()
-    }
-
-    fn capture_plain_reasoning_transcript() -> String {
-        let (mut renderer, output, _stderr) =
-            Renderer::with_test_output(OutputFormat::Detail, false, false, None);
-
-        renderer
-            .reasoning_start(ReasoningVisibility::StreamedTrace)
-            .unwrap();
-        renderer.reasoning_delta("reason").unwrap();
-        renderer.reasoning_end(None).unwrap();
-
-        output.transcript()
     }
 }
