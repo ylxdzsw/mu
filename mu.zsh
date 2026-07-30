@@ -42,34 +42,20 @@ typeset -ga MU_ZSH_SAVED_HIGHLIGHTERS
 typeset -ga MU_ZSH_ENTER_HOOKS
 typeset -ga MU_ZSH_EXIT_HOOKS
 
-_mu_zsh_widget_for_key() {
-  local key=$1
-  local binding
-  binding=${${(z)$(bindkey "$key" 2>/dev/null)}[2]}
-  [[ -n "$binding" ]] && print -r -- "$binding"
-}
-
 _mu_zsh_save_widget_bindings() {
-  [[ -z "$MU_ZSH_ORIGINAL_TAB_WIDGET" ]] && MU_ZSH_ORIGINAL_TAB_WIDGET=$(_mu_zsh_widget_for_key '^I')
-  [[ "$MU_ZSH_ORIGINAL_TAB_WIDGET" == _mu_zsh_tab ]] && MU_ZSH_ORIGINAL_TAB_WIDGET=
-
+  local binding
+  if [[ -z "$MU_ZSH_ORIGINAL_TAB_WIDGET" ]]; then
+    binding=${${(z)$(bindkey '^I' 2>/dev/null)}[2]}
+    [[ "$binding" != _mu_zsh_tab ]] && MU_ZSH_ORIGINAL_TAB_WIDGET=$binding
+  fi
   [[ -z "$MU_ZSH_ORIGINAL_TAB_WIDGET" ]] && MU_ZSH_ORIGINAL_TAB_WIDGET=expand-or-complete
 
-  [[ -z "$MU_ZSH_ORIGINAL_SLASH_WIDGET" ]] && MU_ZSH_ORIGINAL_SLASH_WIDGET=$(_mu_zsh_widget_for_key '/')
-  [[ "$MU_ZSH_ORIGINAL_SLASH_WIDGET" == _mu_zsh_slash ]] && MU_ZSH_ORIGINAL_SLASH_WIDGET=
+  if [[ -z "$MU_ZSH_ORIGINAL_SLASH_WIDGET" ]]; then
+    binding=${${(z)$(bindkey '/' 2>/dev/null)}[2]}
+    [[ "$binding" != _mu_zsh_slash ]] && MU_ZSH_ORIGINAL_SLASH_WIDGET=$binding
+  fi
   [[ -z "$MU_ZSH_ORIGINAL_SLASH_WIDGET" ]] && MU_ZSH_ORIGINAL_SLASH_WIDGET=.self-insert
   return 0
-}
-
-_mu_zsh_call_original_widget() {
-  local widget=$1
-  if [[ -n "$widget" && "$widget" != _mu_zsh_tab ]]; then
-    zle "$widget"
-  fi
-}
-
-_mu_zsh_quote_prompt() {
-  print -r -- "${(qqq)1}"
 }
 
 _mu_zsh_linked_project_root() {
@@ -128,19 +114,10 @@ _mu_zsh_set_scope_key_for_dir() {
   REPLY=global
 }
 
-_mu_zsh_set_current_scope_key() {
-  _mu_zsh_set_scope_key_for_dir "$PWD"
-}
-
-_mu_zsh_current_scope_key() {
-  _mu_zsh_set_current_scope_key
-  print -r -- "$REPLY"
-}
-
 _mu_zsh_sync_state() {
   local scope=${1:-}
   [[ -n "$scope" ]] || {
-    _mu_zsh_set_current_scope_key
+    _mu_zsh_set_scope_key_for_dir "$PWD"
     scope=$REPLY
   }
 
@@ -188,28 +165,12 @@ _mu_zsh_activate_scope() {
   _mu_zsh_sync_state "$scope"
 }
 
-_mu_zsh_remember_session_for_scope() {
-  local id=$1
-  local scope=${2:-}
-
-  [[ -n "$scope" ]] || {
-    _mu_zsh_set_current_scope_key
-    scope=$REPLY
-  }
-
-  [[ -n "$id" ]] || return 0
-  _mu_zsh_activate_scope "$scope"
-  MU_ZSH_SESSION_ID=$id
-  MU_ZSH_EFFECTIVE_SESSION_ID=$id
-}
-
 _mu_zsh_record_history() {
   local input=$1
   local scope=${2:-}
-  local quoted
   local session_id
   local model
-  quoted=$(_mu_zsh_quote_prompt "$input")
+  local quoted=${(qqq)input}
   _mu_zsh_sync_state "$scope"
   session_id=$MU_ZSH_EFFECTIVE_SESSION_ID
   model=$MU_ZSH_EFFECTIVE_MODEL
@@ -251,13 +212,15 @@ _mu_zsh_create_session_for_scope() {
     print -u2 -- "mu: session new returned an invalid session id"
     return 1
   }
-  _mu_zsh_remember_session_for_scope "$id" "$scope"
+  _mu_zsh_activate_scope "$scope"
+  MU_ZSH_SESSION_ID=$id
+  MU_ZSH_EFFECTIVE_SESSION_ID=$id
 }
 
 _mu_zsh_base_command_reply() {
   local scope=${1:-}
   [[ -n "$scope" ]] || {
-    _mu_zsh_set_current_scope_key
+    _mu_zsh_set_scope_key_for_dir "$PWD"
     scope=$REPLY
   }
 
@@ -269,39 +232,13 @@ _mu_zsh_base_command_reply() {
   return 0
 }
 
-_mu_zsh_status_command_reply() {
-  local -a flags
-  flags=("$@")
-
-  _mu_zsh_sync_state
-  MU_ZSH_COMMAND_REPLY=("$MU_ZSH_BIN" status --json "${flags[@]}")
-  [[ -n "$MU_ZSH_EFFECTIVE_SESSION_ID" ]] && MU_ZSH_COMMAND_REPLY+=(-s "$MU_ZSH_EFFECTIVE_SESSION_ID")
-  [[ -n "$MU_ZSH_EFFECTIVE_MODEL" ]] && MU_ZSH_COMMAND_REPLY+=(--model "$MU_ZSH_EFFECTIVE_MODEL")
-  return 0
-}
-
-_mu_zsh_escape_prompt_text() {
-  local text=$1
-  text=${text//\%/%%}
-  print -r -- "$text"
-}
-
 _mu_zsh_status_json() {
   local -a command
-  _mu_zsh_status_command_reply "$@"
-  command=("${MU_ZSH_COMMAND_REPLY[@]}")
+  _mu_zsh_sync_state
+  command=("$MU_ZSH_BIN" status --json "$@")
+  [[ -n "$MU_ZSH_EFFECTIVE_SESSION_ID" ]] && command+=(-s "$MU_ZSH_EFFECTIVE_SESSION_ID")
+  [[ -n "$MU_ZSH_EFFECTIVE_MODEL" ]] && command+=(--model "$MU_ZSH_EFFECTIVE_MODEL")
   "${command[@]}" 2>/dev/null
-}
-
-_mu_zsh_json_value_reply() {
-  local json=$1
-  local filter=$2
-  local value
-
-  command -v jq >/dev/null 2>&1 || return 1
-  value=$(jq -r "$filter" <<< "$json" 2>/dev/null) || return 1
-  [[ -n "$value" && "$value" != null ]] || return 1
-  REPLY=$value
 }
 
 _mu_zsh_build_mode_prompt() {
@@ -431,18 +368,12 @@ _mu_zsh_reset_mode_prompt() {
   zle -K mumode 2>/dev/null || true
 }
 
-_mu_zsh_has_effective_session() {
-  _mu_zsh_sync_state
-  [[ -n "$MU_ZSH_EFFECTIVE_SESSION_ID" ]]
-}
-
 _mu_zsh_slash_command_candidates() {
   local -a commands
 
   commands=(/attach /model)
-  if _mu_zsh_has_effective_session; then
-    commands+=(/new /retry /compact)
-  fi
+  _mu_zsh_sync_state
+  [[ -n "$MU_ZSH_EFFECTIVE_SESSION_ID" ]] && commands+=(/new /retry /compact)
   commands+=("${(@f)$(_mu_zsh_custom_slash_commands 2>/dev/null || true)}")
 
   local command
@@ -468,110 +399,38 @@ _mu_zsh_has_custom_slash_command() {
   return 1
 }
 
-_mu_zsh_model_records() {
+_mu_zsh_model_completion_candidates() {
+  local fragment=$1
+  local suffix_only=${2:-0}
   local json
   json=$(_mu_zsh_status_json --include-models) || return 1
   command -v jq >/dev/null 2>&1 || return 1
-  jq -r '
-    .available_models.providers[]? as $provider
-    | $provider.models[]?
-    | [(.id // ""), (.model_id // ""), ((.supported_efforts // []) | join(","))]
-    | @tsv
+  jq -r --arg fragment "$fragment" --arg suffix_only "$suffix_only" '
+    [.available_models.providers[]?.models[]? | {
+      canonical: (.id // ""),
+      short: (.model_id // ""),
+      efforts: (.supported_efforts // [])
+    }] as $models
+    | (reduce $models[] as $model ({}; .[$model.short] += 1)) as $counts
+    | [
+        if $suffix_only == "1" then
+          $models[] as $model
+          | select(
+              $fragment == $model.canonical
+              or ($fragment == $model.short and $counts[$model.short] == 1)
+            )
+          | $model.efforts[]? | ":" + .
+        elif ($fragment | contains(":")) then
+          $models[] as $model | $model.efforts[]? as $effort
+          | "\($model.canonical):\($effort)",
+            (if $counts[$model.short] == 1 then "\($model.short):\($effort)" else empty end)
+        else
+          $models[]
+          | .canonical, (if $counts[.short] == 1 then .short else empty end)
+        end
+      ]
+    | unique[]
   ' <<< "$json"
-}
-
-# Count how many providers expose each bare model_id, so a model_id that is
-# unique across providers can be offered as a shorthand alongside its canonical.
-_mu_zsh_count_model_ids() {
-  local counts_var=$1
-  shift
-  local -A counts
-  local record model_id
-  for record in "$@"; do
-    model_id=${${(ps:\t:)record}[2]}
-    [[ -n "$model_id" ]] && counts[$model_id]=$(( ${counts[$model_id]:-0} + 1 ))
-  done
-  set -A "$counts_var" "${(kv)counts[@]}"
-}
-
-_mu_zsh_model_completion_candidates() {
-  local fragment=$1
-  local -a records matches
-  local -A model_counts
-  local record canonical model_id efforts count
-
-  records=("${(@f)$(_mu_zsh_model_records 2>/dev/null || true)}")
-  (( ${#records[@]} )) || return 0
-
-  _mu_zsh_count_model_ids model_counts "${records[@]}"
-
-  if [[ "$fragment" == *:* ]]; then
-    local effort
-
-    for record in "${records[@]}"; do
-      canonical=${${(ps:\t:)record}[1]}
-      model_id=${${(ps:\t:)record}[2]}
-      efforts=${${(ps:\t:)record}[3]-}
-      count=0
-      [[ -n "$model_id" ]] && count=${model_counts[$model_id]:-0}
-      for effort in "${(@s:,:)efforts}"; do
-        [[ -n "$effort" ]] || continue
-        matches+=("${canonical}:${effort}")
-        [[ -n "$model_id" && $count -eq 1 ]] && matches+=("${model_id}:${effort}")
-      done
-    done
-  else
-    for record in "${records[@]}"; do
-      canonical=${${(ps:\t:)record}[1]}
-      model_id=${${(ps:\t:)record}[2]}
-      [[ -n "$canonical" ]] && matches+=("$canonical")
-      count=0
-      [[ -n "$model_id" ]] && count=${model_counts[$model_id]:-0}
-      if [[ -n "$model_id" && $count -eq 1 ]]; then
-        matches+=("$model_id")
-      fi
-    done
-  fi
-
-  matches=("${(@u)matches}")
-  local match
-  for match in "${matches[@]}"; do
-    print -r -- "$match"
-  done
-  return 0
-}
-
-_mu_zsh_model_effort_suffixes() {
-  local fragment=$1
-  local -a records suffixes
-  local -A model_counts
-  local record canonical model_id efforts count effort
-
-  [[ -n "$fragment" && "$fragment" != *:* ]] || return 0
-  records=("${(@f)$(_mu_zsh_model_records 2>/dev/null || true)}")
-  (( ${#records[@]} )) || return 0
-
-  _mu_zsh_count_model_ids model_counts "${records[@]}"
-
-  for record in "${records[@]}"; do
-    canonical=${${(ps:\t:)record}[1]}
-    model_id=${${(ps:\t:)record}[2]}
-    efforts=${${(ps:\t:)record}[3]-}
-    count=0
-    [[ -n "$model_id" ]] && count=${model_counts[$model_id]:-0}
-    if [[ "$fragment" != "$canonical" && ( "$fragment" != "$model_id" || $count -ne 1 ) ]]; then
-      continue
-    fi
-    for effort in "${(@s:,:)efforts}"; do
-      [[ -n "$effort" ]] && suffixes+=(":$effort")
-    done
-    break
-  done
-
-  for effort in "${suffixes[@]}"; do
-    print -r -- "$effort"
-  done
-  return 0
 }
 
 _mu_zsh_slash_completion_context() {
@@ -618,7 +477,7 @@ _mu_zsh_fallback_completion() {
   left=${BUFFER[1,$CURSOR]}
   if [[ "$left" == "/model "* ]]; then
     arg=${left#"/model "}
-    effort_suffixes=("${(@f)$(_mu_zsh_model_effort_suffixes "$arg")}")
+    effort_suffixes=("${(@f)$(_mu_zsh_model_completion_candidates "$arg" 1)}")
     effort_suffixes=("${(@)effort_suffixes:#}")
     if (( ${#effort_suffixes[@]} )); then
       compset -P "${(b)arg}"
@@ -650,7 +509,7 @@ _mu_zsh_completion_system() {
 
   if [[ "$left" == "/model "* ]]; then
     arg=${left#"/model "}
-    effort_suffixes=("${(@f)$(_mu_zsh_model_effort_suffixes "$arg")}")
+    effort_suffixes=("${(@f)$(_mu_zsh_model_completion_candidates "$arg" 1)}")
     effort_suffixes=("${(@)effort_suffixes:#}")
     if (( ${#effort_suffixes[@]} )); then
       compset -P "${(b)arg}"
@@ -705,18 +564,6 @@ _mu_zsh_list_slash_choices() {
   zle _mu_zsh_list_widget 2>/dev/null || true
 }
 
-_mu_zsh_is_known_slash_command() {
-  local command=$1
-
-  case "$command" in
-    /attach|/model|/new|/retry|/compact)
-      return 0
-      ;;
-  esac
-
-  _mu_zsh_has_custom_slash_command "$command"
-}
-
 _mu_zsh_require_effective_session() {
   local command=$1
   _mu_zsh_sync_state
@@ -740,12 +587,13 @@ _mu_zsh_validate_no_args() {
 _mu_zsh_validate_model_ref() {
   local model=$1
   local -a command
-  local status_json
+  local status_json resolved
   _mu_zsh_sync_state
   command=("$MU_ZSH_BIN" status --json --model "$model")
   [[ -n "$MU_ZSH_EFFECTIVE_SESSION_ID" ]] && command+=(-s "$MU_ZSH_EFFECTIVE_SESSION_ID")
   status_json=$("${command[@]}" 2>/dev/null) || return 1
-  _mu_zsh_json_value_reply "$status_json" '.model.canonical // empty' 2>/dev/null || REPLY=$model
+  resolved=$(jq -r '.model.canonical // empty' <<< "$status_json" 2>/dev/null) || resolved=
+  REPLY=${resolved:-$model}
   return 0
 }
 
@@ -756,7 +604,7 @@ _mu_zsh_run_custom_slash_command() {
   local exit_status scope session_id
   local -a command
 
-  _mu_zsh_set_current_scope_key
+  _mu_zsh_set_scope_key_for_dir "$PWD"
   scope=$REPLY
   _mu_zsh_activate_scope "$scope"
   [[ -n "$MU_ZSH_EFFECTIVE_SESSION_ID" ]] ||
@@ -807,7 +655,7 @@ _mu_zsh_run_slash_command() {
   fi
 
   print -sr -- "$line"
-  _mu_zsh_set_current_scope_key
+  _mu_zsh_set_scope_key_for_dir "$PWD"
   scope=$REPLY
   case "$command" in
     /attach)
@@ -943,11 +791,6 @@ _mu_zsh_exit_mode() {
   _mu_zsh_run_hooks "${MU_ZSH_EXIT_HOOKS[@]}"
 }
 
-_mu_zsh_clear_prompt() {
-  BUFFER=
-  CURSOR=0
-}
-
 _mu_zsh_insert_newline() {
   [[ "$MU_ZSH_MODE" == mu ]] || {
     zle self-insert
@@ -964,7 +807,7 @@ _mu_zsh_submit_prompt() {
   local scope session_id
   local -a command
 
-  _mu_zsh_set_current_scope_key
+  _mu_zsh_set_scope_key_for_dir "$PWD"
   scope=$REPLY
   _mu_zsh_activate_scope "$scope"
   [[ -n "$MU_ZSH_EFFECTIVE_SESSION_ID" ]] ||
@@ -1012,7 +855,7 @@ _mu_zsh_tab() {
     return
   fi
 
-  _mu_zsh_call_original_widget "$MU_ZSH_ORIGINAL_TAB_WIDGET"
+  [[ -n "$MU_ZSH_ORIGINAL_TAB_WIDGET" ]] && zle "$MU_ZSH_ORIGINAL_TAB_WIDGET"
 }
 
 _mu_zsh_slash() {

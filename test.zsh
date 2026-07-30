@@ -9,6 +9,11 @@ fail() {
   exit 1
 }
 
+current_scope_key() {
+  _mu_zsh_set_scope_key_for_dir "$PWD"
+  print -r -- "$REPLY"
+}
+
 submitted_display_before_response() {
   local transcript=$1 stream
   stream=$(perl -pe 's/\e\[[0-?]*[ -\/]*[@-~]//g' "$transcript" | col -b)
@@ -147,7 +152,7 @@ exit 1
 EOF
 chmod +x "$short_fake_bin/mu"
 MU_ZSH_SESSION_ID=short-session
-MU_ZSH_TRACKED_SCOPE=$(_mu_zsh_current_scope_key)
+MU_ZSH_TRACKED_SCOPE=$(current_scope_key)
 MU_ZSH_BIN=$short_fake_bin/mu
 short_prompt=$(_mu_zsh_build_mode_prompt)
 MU_ZSH_BIN=$prompt_fake_bin/mu
@@ -186,12 +191,6 @@ _mu_zsh_exit_mode
 [[ "${(j:,:)mu_test_hooks}" == "enter:mu,exit:shell" ]] || fail "runs exit hooks after restoring shell mode"
 MU_ZSH_ENTER_HOOKS=()
 MU_ZSH_EXIT_HOOKS=()
-
-BUFFER="draft prompt"
-CURSOR=${#BUFFER}
-_mu_zsh_clear_prompt
-[[ "$BUFFER" == "" ]] || fail "clears prompt buffer"
-[[ "$CURSOR" -eq 0 ]] || fail "resets prompt cursor"
 
 MU_ZSH_MODE=mu
 BUFFER="first second"
@@ -292,9 +291,9 @@ saved_pwd=$PWD
 saved_home=${HOME:-}
 HOME=$tmpdir
 builtin cd "$scope_discovery_dir"
-[[ "$(_mu_zsh_current_scope_key)" == "global" ]] || fail "starts uncached global"
+[[ "$(current_scope_key)" == "global" ]] || fail "starts uncached global"
 mkdir -p -- .mu
-[[ "$(_mu_zsh_current_scope_key)" == "project:$scope_discovery_dir" ]] || fail "scope detection refreshes project markers"
+[[ "$(current_scope_key)" == "project:$scope_discovery_dir" ]] || fail "scope detection refreshes project markers"
 primary_scope_dir=$tmpdir/scope-repo
 worktree_scope_dir=$tmpdir/scope-worktree
 mkdir -p -- "$primary_scope_dir/.mu" "$primary_scope_dir/.git/worktrees/feature"
@@ -302,12 +301,12 @@ mkdir -p -- "$worktree_scope_dir/src"
 print -r -- "gitdir: $primary_scope_dir/.git/worktrees/feature" > "$worktree_scope_dir/.git"
 print -r -- '../..' > "$primary_scope_dir/.git/worktrees/feature/commondir"
 builtin cd "$primary_scope_dir"
-primary_scope_key=$(_mu_zsh_current_scope_key)
+primary_scope_key=$(current_scope_key)
 MU_ZSH_SESSION_ID=session-primary
 MU_ZSH_MODEL=model-primary
 MU_ZSH_TRACKED_SCOPE=$primary_scope_key
 builtin cd "$worktree_scope_dir/src"
-[[ "$(_mu_zsh_current_scope_key)" == "$primary_scope_key" ]] || fail "linked worktree shares the primary project scope"
+[[ "$(current_scope_key)" == "$primary_scope_key" ]] || fail "linked worktree shares the primary project scope"
 _mu_zsh_sync_state
 [[ "$MU_ZSH_EFFECTIVE_SESSION_ID" == session-primary ]] || fail "linked worktree reuses the primary project session"
 [[ "$MU_ZSH_EFFECTIVE_MODEL" == model-primary ]] || fail "linked worktree reuses the primary project model"
@@ -315,7 +314,7 @@ _mu_zsh_clear_session_state
 _mu_zsh_clear_model_state
 MU_ZSH_TRACKED_SCOPE=
 mkdir -p -- "$worktree_scope_dir/.mu"
-[[ "$(_mu_zsh_current_scope_key)" == "project:$worktree_scope_dir" ]] || fail "worktree-local .mu creates an independent scope"
+[[ "$(current_scope_key)" == "project:$worktree_scope_dir" ]] || fail "worktree-local .mu creates an independent scope"
 builtin cd "$saved_pwd"
 HOME=$saved_home
 
@@ -328,7 +327,7 @@ assert_command_reply "inherits configured output by default" mu
 
 MU_ZSH_OUTPUT=detail
 MU_ZSH_SESSION_ID=abc123
-MU_ZSH_TRACKED_SCOPE=$(_mu_zsh_current_scope_key)
+MU_ZSH_TRACKED_SCOPE=$(current_scope_key)
 _mu_zsh_base_command_reply
 assert_command_reply "builds attached command" mu --output detail -s abc123
 
@@ -339,7 +338,7 @@ assert_command_reply "builds new-session command" mu --output detail
 MU_ZSH_BIN=$prompt_fake_bin/mu
 
 MU_ZSH_MODEL=openai/gpt
-MU_ZSH_TRACKED_SCOPE=$(_mu_zsh_current_scope_key)
+MU_ZSH_TRACKED_SCOPE=$(current_scope_key)
 _mu_zsh_base_command_reply
 assert_command_reply "builds pending-model command" "$prompt_fake_bin/mu" --output detail --model openai/gpt
 status_json=$(_mu_zsh_status_json)
@@ -349,10 +348,6 @@ _mu_zsh_base_command_reply
 assert_command_reply "builds attached pending-model command" "$prompt_fake_bin/mu" --output detail -s abc123 --model openai/gpt
 _mu_zsh_clear_model_state
 _mu_zsh_clear_session_state
-
-quoted=$(_mu_zsh_quote_prompt $'quote " dollar $ backslash \\ newline\nnext')
-eval "roundtrip=$quoted"
-[[ "$roundtrip" == $'quote " dollar $ backslash \\ newline\nnext' ]] || fail "quoted prompt roundtrips"
 
 export MU_ZSH_FAKE_LOG=${TMPDIR:-/tmp}/mu-zsh-test-${$}.log
 rm -f "$MU_ZSH_FAKE_LOG"
@@ -376,7 +371,7 @@ MU_ZSH_TRACKED_SCOPE=
 command_candidates=("${(@f)$(_mu_zsh_slash_command_candidates)}")
 [[ "${(j:,:)command_candidates}" == "/attach,/model,/review.md" ]] || fail "hides session commands without a valid session"
 MU_ZSH_SESSION_ID=tracked-session
-MU_ZSH_TRACKED_SCOPE=$(_mu_zsh_current_scope_key)
+MU_ZSH_TRACKED_SCOPE=$(current_scope_key)
 command_candidates=("${(@f)$(_mu_zsh_slash_command_candidates)}")
 [[ "${(j:,:)command_candidates}" == "/attach,/model,/new,/retry,/compact,/review.md" ]] || fail "shows session commands with a valid session: ${(j:,:)command_candidates}"
 BUFFER="/ret"
@@ -391,13 +386,6 @@ BUFFER="/unknown"
 CURSOR=${#BUFFER}
 completion_candidates=("${(@f)$(_mu_zsh_completion_candidates)}")
 [[ "${(j:,:)completion_candidates}" == "/attach,/model,/new,/retry,/compact,/review.md" ]] || fail "keeps freeform slash input advisory: ${(j:,:)completion_candidates}"
-_mu_zsh_is_known_slash_command /attach || fail "recognizes attach slash command"
-_mu_zsh_is_known_slash_command /model || fail "recognizes built-in slash command"
-_mu_zsh_is_known_slash_command /review.md || fail "recognizes custom slash command"
-if _mu_zsh_is_known_slash_command /unknown; then
-  fail "unknown slash text should not dispatch as a command"
-fi
-
 model_candidates=("${(@f)$(_mu_zsh_model_completion_candidates "")}")
 [[ " ${(j: :)model_candidates} " == *" openai/gpt "* ]] || fail "offers provider-qualified model"
 [[ " ${(j: :)model_candidates} " == *" gpt "* ]] || fail "offers unique unqualified model"
@@ -506,7 +494,7 @@ if _mu_zsh_run_slash_command "/unknown"; then
 fi
 _mu_zsh_run_slash_command "/model gpt"
 [[ "$MU_ZSH_MODEL" == openai/gpt ]] || fail "model slash command records canonical model"
-[[ "$MU_ZSH_TRACKED_SCOPE" == "$(_mu_zsh_current_scope_key)" ]] || fail "model slash command records scope"
+[[ "$MU_ZSH_TRACKED_SCOPE" == "$(current_scope_key)" ]] || fail "model slash command records scope"
 if _mu_zsh_run_slash_command "/model invalid/model"; then
   fail "model slash command should validate model refs"
 fi
@@ -891,7 +879,7 @@ after_model_switch=${normalized#*$'[mu] next turns in this scope will use openai
 new_session_transcript=$tmpdir/new-session-transcript
 rm -f -- "$interactive_capture_args" "$interactive_capture_stdin" "$interactive_capture_calls"
 interactive_status=0
-new_session_setup="$interactive_setup; MU_ZSH_SESSION_ID=tracked-session; MU_ZSH_TRACKED_SCOPE=\$(_mu_zsh_current_scope_key); _mu_zsh_sync_state"
+new_session_setup="$interactive_setup; MU_ZSH_SESSION_ID=tracked-session; _mu_zsh_set_scope_key_for_dir \"\$PWD\"; MU_ZSH_TRACKED_SCOPE=\$REPLY; _mu_zsh_sync_state"
 {
   send_interactive_setup "$new_session_setup"
   print -rn -- $'\t'"/new"$'\r'
@@ -944,7 +932,7 @@ normalized=$(perl -pe 's/\e\[[0-?]*[ -\/]*[@-~]//g' "$slash_completion_transcrip
 [[ ! -e "$interactive_capture_calls" || ! -s "$interactive_capture_calls" ]] || fail "completed model slash command should not submit a prompt"
 
 common_prefix_transcript=$tmpdir/common-prefix-transcript
-common_prefix_setup="$interactive_setup; export TEST_EXTRA_COMMAND=model-helper.md; _mu_test_common_prefix_completion() { BUFFER='/mod'; CURSOR=\${#BUFFER}; _mu_zsh_complete_slash; zle -I; print -r -- \"[completion-buffer=\$BUFFER cursor=\$CURSOR]\"; _mu_zsh_clear_prompt; _mu_zsh_reset_mode_prompt; }; zle -N _mu_test_common_prefix_completion; bindkey -M mumode '^T' _mu_test_common_prefix_completion"
+common_prefix_setup="$interactive_setup; export TEST_EXTRA_COMMAND=model-helper.md; _mu_test_common_prefix_completion() { BUFFER='/mod'; CURSOR=\${#BUFFER}; _mu_zsh_complete_slash; zle -I; print -r -- \"[completion-buffer=\$BUFFER cursor=\$CURSOR]\"; BUFFER=; CURSOR=0; _mu_zsh_reset_mode_prompt; }; zle -N _mu_test_common_prefix_completion; bindkey -M mumode '^T' _mu_test_common_prefix_completion"
 rm -f -- "$interactive_capture_args" "$interactive_capture_stdin" "$interactive_capture_calls"
 interactive_status=0
 {
@@ -960,7 +948,7 @@ normalized=$(perl -pe 's/\e\[[0-?]*[ -\/]*[@-~]//g' "$common_prefix_transcript" 
 [[ ! -e "$interactive_capture_calls" || ! -s "$interactive_capture_calls" ]] || fail "common-prefix completion should not submit a prompt"
 
 model_effort_transcript=$tmpdir/model-effort-transcript
-model_effort_setup="$interactive_setup; _mu_test_model_effort_completion() { BUFFER='/model gp'; CURSOR=\${#BUFFER}; _mu_zsh_complete_slash; first_buffer=\$BUFFER; first_cursor=\$CURSOR; _mu_zsh_complete_slash; zle -I; print -r -- \"[first-buffer=\$first_buffer first-cursor=\$first_cursor second-buffer=\$BUFFER second-cursor=\$CURSOR]\"; _mu_zsh_clear_prompt; _mu_zsh_reset_mode_prompt; }; zle -N _mu_test_model_effort_completion; bindkey -M mumode '^T' _mu_test_model_effort_completion"
+model_effort_setup="$interactive_setup; _mu_test_model_effort_completion() { BUFFER='/model gp'; CURSOR=\${#BUFFER}; _mu_zsh_complete_slash; first_buffer=\$BUFFER; first_cursor=\$CURSOR; _mu_zsh_complete_slash; zle -I; print -r -- \"[first-buffer=\$first_buffer first-cursor=\$first_cursor second-buffer=\$BUFFER second-cursor=\$CURSOR]\"; BUFFER=; CURSOR=0; _mu_zsh_reset_mode_prompt; }; zle -N _mu_test_model_effort_completion; bindkey -M mumode '^T' _mu_test_model_effort_completion"
 rm -f -- "$interactive_capture_args" "$interactive_capture_stdin" "$interactive_capture_calls"
 interactive_status=0
 {
@@ -977,7 +965,7 @@ normalized=$(perl -pe 's/\e\[[0-?]*[ -\/]*[@-~]//g' "$model_effort_transcript" |
 [[ ! -e "$interactive_capture_calls" || ! -s "$interactive_capture_calls" ]] || fail "model effort completion should not submit a prompt"
 
 delete_slash_transcript=$tmpdir/delete-slash-transcript
-delete_slash_setup="$interactive_setup; _mu_test_delete_slash_completion() { BUFFER='/'; CURSOR=1; _mu_zsh_list_slash_choices; zle backward-delete-char; if _mu_zsh_slash_completion_context; then back_state=active; else back_state=inactive; fi; back_buffer=\$BUFFER; back_cursor=\$CURSOR; BUFFER='/'; CURSOR=0; _mu_zsh_list_slash_choices; zle delete-char; if _mu_zsh_slash_completion_context; then forward_state=active; else forward_state=inactive; fi; zle -I; print -r -- \"[back-buffer=\$back_buffer back-cursor=\$back_cursor back-context=\$back_state forward-buffer=\$BUFFER forward-cursor=\$CURSOR forward-context=\$forward_state]\"; _mu_zsh_clear_prompt; _mu_zsh_reset_mode_prompt; }; zle -N _mu_test_delete_slash_completion; bindkey -M mumode '^Y' _mu_test_delete_slash_completion"
+delete_slash_setup="$interactive_setup; _mu_test_delete_slash_completion() { BUFFER='/'; CURSOR=1; _mu_zsh_list_slash_choices; zle backward-delete-char; if _mu_zsh_slash_completion_context; then back_state=active; else back_state=inactive; fi; back_buffer=\$BUFFER; back_cursor=\$CURSOR; BUFFER='/'; CURSOR=0; _mu_zsh_list_slash_choices; zle delete-char; if _mu_zsh_slash_completion_context; then forward_state=active; else forward_state=inactive; fi; zle -I; print -r -- \"[back-buffer=\$back_buffer back-cursor=\$back_cursor back-context=\$back_state forward-buffer=\$BUFFER forward-cursor=\$CURSOR forward-context=\$forward_state]\"; BUFFER=; CURSOR=0; _mu_zsh_reset_mode_prompt; }; zle -N _mu_test_delete_slash_completion; bindkey -M mumode '^Y' _mu_test_delete_slash_completion"
 rm -f -- "$interactive_capture_args" "$interactive_capture_stdin" "$interactive_capture_calls"
 interactive_status=0
 {
