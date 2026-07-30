@@ -32,9 +32,9 @@ pub(crate) async fn stream(
         on_event(StreamEvent::ReasoningEnd)?;
     }
     if !state.terminal {
-        return Err(ProviderError::Other(state.failure.unwrap_or_else(|| {
-            "Responses stream ended before response.completed".into()
-        })));
+        return Err(ProviderError::Other(
+            "Responses stream ended before response.completed".into(),
+        ));
     }
 
     let output = state.output;
@@ -221,7 +221,6 @@ pub(crate) struct ResponsesStreamState {
     pub(crate) terminal: bool,
     pub(crate) replayable: bool,
     pub(crate) finish_reason: Option<FinishReason>,
-    pub(crate) failure: Option<String>,
     pub(crate) reasoning_active: bool,
     pub(crate) reasoning_output_index: Option<usize>,
     pub(crate) tool_indexes: BTreeMap<usize, usize>,
@@ -333,15 +332,25 @@ pub(crate) fn consume_responses_sse_buffer(
                     .unwrap_or("incomplete");
                 state.finish_reason = Some(FinishReason::Other(reason.to_string()));
             }
-            "response.failed" | "error" => {
-                state.failure = Some(stream_error_message(
-                    value.get("error").unwrap_or(&value["response"]["error"]),
-                ));
-            }
+            "response.failed" => return Err(responses_stream_error(&value["response"]["error"])),
+            "error" => return Err(responses_stream_error(&value)),
             _ => {}
         }
     }
     Ok(())
+}
+
+fn responses_stream_error(error: &Value) -> ProviderError {
+    let message = stream_error_message(error);
+    match error.get("code").and_then(Value::as_str) {
+        Some("server_error") => ProviderError::HttpStatus {
+            status: 500,
+            body: message,
+        },
+        Some("rate_limit_exceeded") => ProviderError::RateLimit { message },
+        Some(code) => ProviderError::Other(format!("{code}: {message}")),
+        None => ProviderError::Other(message),
+    }
 }
 
 fn responses_usage(value: &Value) -> Option<Usage> {
@@ -387,4 +396,206 @@ fn responses_output_text(output: &[Value]) -> Option<String> {
         })
         .collect::<String>();
     (!text.is_empty()).then_some(text)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn consume(
+        state: &mut ResponsesStreamState,
+        events: &mut Vec<StreamEvent>,
+        buffer: &mut String,
+    ) -> Result<(), ProviderError> {
+        consume_responses_sse_buffer(buffer, state, &mut |event| {
+            events.push(event);
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn waits_for_complete_crlf_frames_and_preserves_the_remainder() {
+        let mut state = ResponsesStreamState::default();
+        let mut events = Vec::new();
+        let mut buffer =
+            "data: {\"type\":\"response.output_text.delta\",\r\ndata: \"delta\":\"hel\"}\r\n"
+                .to_string();
+
+        consume(&mut state, &mut events, &mut buffer).unwrap();
+        assert!(events.is_empty());
+        assert!(!buffer.is_empty());
+
+        buffer.push_str(
+            "\r\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"lo\"}\n\n\
+             data: {\"type\":\"response.output_text.delta\"",
+        );
+        consume(&mut state, &mut events, &mut buffer).unwrap();
+
+        assert_eq!(state.content, "hello");
+        assert_eq!(events.len(), 2);
+        assert!(matches!(
+            events.first(),
+            Some(StreamEvent::TextDelta(text)) if text == "hel"
+        ));
+        assert!(matches!(
+            events.get(1),
+            Some(StreamEvent::TextDelta(text)) if text == "lo"
+        ));
+        assert_eq!(buffer, "data: {\"type\":\"response.output_text.delta\"");
+    }
+
+    #[test]
+    fn accumulates_text_and_refusal_deltas_with_usage_defaults() {
+        let mut state = ResponsesStreamState::default();
+        let mut events = Vec::new();
+        let mut buffer = concat!(
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"hello\"}\n\n",
+            "data: {\"type\":\"response.refusal.delta\",\"delta\":\" no\"}\n\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"output\":[],\"usage\":{\"input_tokens\":12,\"input_tokens_details\":null,\"output_tokens\":5,\"output_tokens_details\":null,\"total_tokens\":17}}}\n\n",
+        )
+        .to_string();
+
+        consume(&mut state, &mut events, &mut buffer).unwrap();
+
+        assert_eq!(state.content, "hello no");
+        assert!(state.terminal);
+        assert!(state.replayable);
+        let usage = state.usage.unwrap();
+        assert_eq!(usage.input_tokens, 12);
+        assert_eq!(usage.cache_read_input_tokens, 0);
+        assert_eq!(usage.cache_write_input_tokens, None);
+        assert_eq!(usage.output_tokens, 5);
+        assert_eq!(usage.reasoning_output_tokens, 0);
+        assert_eq!(usage.total_tokens, 17);
+    }
+
+    #[test]
+    fn keeps_dense_indexes_for_interleaved_tool_calls() {
+        let mut state = ResponsesStreamState::default();
+        let mut events = Vec::new();
+        let mut buffer = concat!(
+            "data: {\"type\":\"response.output_item.added\",\"output_index\":5,\"item\":{\"type\":\"function_call\",\"call_id\":\"call_a\",\"name\":\"bash\",\"arguments\":\"\"}}\n\n",
+            "data: {\"type\":\"response.output_item.added\",\"output_index\":2,\"item\":{\"type\":\"function_call\",\"call_id\":\"call_b\",\"name\":\"bash\",\"arguments\":\"\"}}\n\n",
+            "data: {\"type\":\"response.function_call_arguments.delta\",\"output_index\":2,\"delta\":\"second\"}\n\n",
+            "data: {\"type\":\"response.function_call_arguments.delta\",\"output_index\":5,\"delta\":\"first\"}\n\n",
+        )
+        .to_string();
+
+        consume(&mut state, &mut events, &mut buffer).unwrap();
+
+        let deltas = events
+            .iter()
+            .filter_map(|event| match event {
+                StreamEvent::ToolCallDelta(delta) => Some(delta),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(deltas.len(), 4);
+        assert_eq!(deltas[0].index, 0);
+        assert_eq!(deltas[0].id.as_deref(), Some("call_a"));
+        assert_eq!(deltas[1].index, 1);
+        assert_eq!(deltas[1].id.as_deref(), Some("call_b"));
+        assert_eq!(deltas[2].index, 1);
+        assert_eq!(deltas[2].arguments_delta, "second");
+        assert_eq!(deltas[3].index, 0);
+        assert_eq!(deltas[3].arguments_delta, "first");
+    }
+
+    #[test]
+    fn falls_back_to_completed_output_text_and_refusals() {
+        let output = serde_json::json!([
+            {
+                "type": "message",
+                "content": [
+                    {"type": "output_text", "text": "first"},
+                    {"type": "refusal", "refusal": " second"},
+                    {"type": "other", "text": "ignored"}
+                ]
+            },
+            {"type": "reasoning", "content": [{"type": "output_text", "text": "private"}]},
+            {"type": "message", "content": [{"type": "output_text", "text": " third"}]}
+        ]);
+
+        assert_eq!(
+            responses_output_text(output.as_array().unwrap()).as_deref(),
+            Some("first second third")
+        );
+        assert_eq!(responses_output_text(&[]), None);
+    }
+
+    #[test]
+    fn response_failed_server_error_is_retryable_and_preserves_message() {
+        let mut state = ResponsesStreamState::default();
+        let mut events = Vec::new();
+        let mut buffer = concat!(
+            "data: {\"type\":\"response.failed\",\"response\":{\"error\":",
+            "{\"code\":\"server_error\",\"message\":\"generation failed\"}}}\n\n",
+        )
+        .to_string();
+
+        let error = consume(&mut state, &mut events, &mut buffer).unwrap_err();
+
+        assert!(matches!(
+            error,
+            ProviderError::HttpStatus {
+                status: 500,
+                ref body
+            } if body == "generation failed"
+        ));
+        assert!(error.retryable_for_live_turn());
+    }
+
+    #[test]
+    fn top_level_rate_limit_error_is_retryable_and_preserves_message() {
+        let mut state = ResponsesStreamState::default();
+        let mut events = Vec::new();
+        let mut buffer = concat!(
+            "data: {\"type\":\"error\",\"code\":\"rate_limit_exceeded\",",
+            "\"message\":\"slow down\",\"param\":null,\"sequence_number\":1}\n\n",
+        )
+        .to_string();
+
+        let error = consume(&mut state, &mut events, &mut buffer).unwrap_err();
+
+        assert!(matches!(
+            error,
+            ProviderError::RateLimit { ref message } if message == "slow down"
+        ));
+        assert!(error.retryable_for_live_turn());
+    }
+
+    #[test]
+    fn invalid_prompt_error_remains_fatal_and_keeps_its_code() {
+        let mut state = ResponsesStreamState::default();
+        let mut events = Vec::new();
+        let mut buffer = concat!(
+            "data: {\"type\":\"error\",\"code\":\"invalid_prompt\",",
+            "\"message\":\"unsupported input\",\"param\":\"input\",\"sequence_number\":1}\n\n",
+        )
+        .to_string();
+
+        let error = consume(&mut state, &mut events, &mut buffer).unwrap_err();
+
+        assert!(matches!(
+            error,
+            ProviderError::Other(ref message)
+                if message == "invalid_prompt: unsupported input"
+        ));
+        assert!(!error.retryable_for_live_turn());
+    }
+
+    #[test]
+    fn malformed_json_is_a_parse_error_without_partial_state() {
+        let mut state = ResponsesStreamState::default();
+        let mut events = Vec::new();
+        let mut buffer =
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":}\n\n".to_string();
+
+        let error = consume(&mut state, &mut events, &mut buffer).unwrap_err();
+
+        assert!(matches!(error, ProviderError::SseParse(_)));
+        assert!(state.content.is_empty());
+        assert!(!state.terminal);
+        assert!(events.is_empty());
+    }
 }
