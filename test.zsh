@@ -84,7 +84,7 @@ if [[ "$1" == "status" ]]; then
   [[ "$provider" == "$model" ]] && provider=test
   model_json="\"model\":{\"provider_id\":\"$provider\",\"model_id\":\"$model_id\",\"effort\":null,\"canonical\":\"$model\"}"
   if (( include_models )); then
-    print -r -- "{$model_json,\"context_percent\":25.0,\"project_root\":\"$MU_ZSH_TEST_PROJECT_ROOT\",\"available_models\":{\"providers\":[{\"id\":\"local\",\"models\":[{\"id\":\"local/solo\",\"model_id\":\"solo\",\"supported_efforts\":[\"max\"]},{\"id\":\"local/shared\",\"model_id\":\"shared\",\"supported_efforts\":[]}]},{\"id\":\"openai\",\"models\":[{\"id\":\"openai/gpt\",\"model_id\":\"gpt\",\"supported_efforts\":[\"low\",\"high\",\"provider-custom\"]},{\"id\":\"openai/shared\",\"model_id\":\"shared\",\"supported_efforts\":[\"medium\"]}]}]}}"
+    print -r -- "{$model_json,\"context_percent\":25.0,\"project_root\":\"$MU_ZSH_TEST_PROJECT_ROOT\",\"available_models\":{\"providers\":[{\"id\":\"local\",\"models\":[{\"id\":\"local/solo\",\"model_id\":\"solo\",\"supported_efforts\":[\"max\"]},{\"id\":\"local/shared\",\"model_id\":\"shared\",\"supported_efforts\":[]}]},{\"id\":\"openai\",\"models\":[{\"id\":\"openai/gpt\",\"model_id\":\"gpt\",\"supported_efforts\":[\"low\",\"high\",\"provider-custom\"]},{\"id\":\"openai/gpt-5.6-luna\",\"model_id\":\"gpt-5.6-luna\",\"supported_efforts\":[\"none\",\"max\"]},{\"id\":\"openai/shared\",\"model_id\":\"shared\",\"supported_efforts\":[\"medium\"]}]}]}}"
   elif (( include_commands )); then
     print -r -- "{$model_json,\"context_percent\":25.0,\"project_root\":\"$MU_ZSH_TEST_PROJECT_ROOT\",\"commands\":[{\"name\":\"review.md\",\"path\":\"$MU_ZSH_TEST_PROJECT_ROOT/.mu/review.md\",\"scope\":\"project\"}]}"
   else
@@ -653,7 +653,7 @@ if [ "$1" = "status" ]; then
   [ "$provider" = "$model" ] && provider=test
   model_json="\"model\":{\"provider_id\":\"$provider\",\"model_id\":\"$model_id\",\"effort\":null,\"canonical\":\"$model\"}"
   if [ "$include_models" -eq 1 ]; then
-    printf '%s\n' "{$model_json,\"context_percent\":25.0,\"project_root\":\"$MU_ZSH_TEST_PROJECT_ROOT\",\"available_models\":{\"providers\":[{\"id\":\"local\",\"models\":[{\"id\":\"local/solo\",\"model_id\":\"solo\",\"supported_efforts\":[\"max\"]},{\"id\":\"local/shared\",\"model_id\":\"shared\",\"supported_efforts\":[]}]},{\"id\":\"openai\",\"models\":[{\"id\":\"openai/gpt\",\"model_id\":\"gpt\",\"supported_efforts\":[\"low\",\"high\"]},{\"id\":\"openai/shared\",\"model_id\":\"shared\",\"supported_efforts\":[\"medium\"]}]}]}}"
+    printf '%s\n' "{$model_json,\"context_percent\":25.0,\"project_root\":\"$MU_ZSH_TEST_PROJECT_ROOT\",\"available_models\":{\"providers\":[{\"id\":\"local\",\"models\":[{\"id\":\"local/solo\",\"model_id\":\"solo\",\"supported_efforts\":[\"max\"]},{\"id\":\"local/shared\",\"model_id\":\"shared\",\"supported_efforts\":[]}]},{\"id\":\"openai\",\"models\":[{\"id\":\"openai/gpt\",\"model_id\":\"gpt\",\"supported_efforts\":[\"low\",\"high\"]},{\"id\":\"openai/gpt-5.6-luna\",\"model_id\":\"gpt-5.6-luna\",\"supported_efforts\":[\"none\",\"max\"]},{\"id\":\"openai/shared\",\"model_id\":\"shared\",\"supported_efforts\":[\"medium\"]}]}]}}"
   elif [ "$include_commands" -eq 1 ] && [ -n "$TEST_EXTRA_COMMAND" ]; then
     printf '%s\n' "{$model_json,\"context_percent\":25.0,\"project_root\":\"$MU_ZSH_TEST_PROJECT_ROOT\",\"commands\":[{\"name\":\"$TEST_EXTRA_COMMAND\",\"path\":\"$MU_ZSH_TEST_PROJECT_ROOT/.mu/$TEST_EXTRA_COMMAND\",\"scope\":\"project\"}]}"
   else
@@ -948,7 +948,7 @@ normalized=$(perl -pe 's/\e\[[0-?]*[ -\/]*[@-~]//g' "$common_prefix_transcript" 
 [[ ! -e "$interactive_capture_calls" || ! -s "$interactive_capture_calls" ]] || fail "common-prefix completion should not submit a prompt"
 
 model_effort_transcript=$tmpdir/model-effort-transcript
-model_effort_setup="$interactive_setup; _mu_test_model_effort_completion() { BUFFER='/model gp'; CURSOR=\${#BUFFER}; _mu_zsh_complete_slash; first_buffer=\$BUFFER; first_cursor=\$CURSOR; _mu_zsh_complete_slash; zle -I; print -r -- \"[first-buffer=\$first_buffer first-cursor=\$first_cursor second-buffer=\$BUFFER second-cursor=\$CURSOR]\"; BUFFER=; CURSOR=0; _mu_zsh_reset_mode_prompt; }; zle -N _mu_test_model_effort_completion; bindkey -M mumode '^T' _mu_test_model_effort_completion"
+model_effort_setup="$interactive_setup; zstyle ':completion:*' matcher-list 'm:{a-zA-Z-_}={A-Za-z_-}' 'r:|=*' 'l:|=* r:|=*'; _mu_test_model_effort_completion() { BUFFER='/model luna'; CURSOR=\${#BUFFER}; _mu_zsh_complete_slash; zle -I; print -r -- \"[first-buffer=\$BUFFER first-cursor=\$CURSOR]\"; BUFFER=; CURSOR=0; _mu_zsh_reset_mode_prompt; }; zle -N _mu_test_model_effort_completion; bindkey -M mumode '^T' _mu_test_model_effort_completion"
 rm -f -- "$interactive_capture_args" "$interactive_capture_stdin" "$interactive_capture_calls"
 interactive_status=0
 {
@@ -960,8 +960,8 @@ interactive_status=0
 (( interactive_status == 0 )) || fail "model effort completion transcript exited with status $interactive_status"
 
 normalized=$(perl -pe 's/\e\[[0-?]*[ -\/]*[@-~]//g' "$model_effort_transcript" | col -b)
-[[ "$normalized" == *'[first-buffer=/model gpt first-cursor=10 second-buffer=/model gpt:high second-cursor=15]'* ]] || fail "model completion should leave the cursor at the model, then let zsh select an effort suffix"
-[[ "$normalized" == *':low'* && "$normalized" == *':high'* ]] || fail "model completion should list supported effort suffixes"
+[[ "$normalized" == *'[first-buffer=/model gpt-5.6-luna first-cursor=19]'* ]] || fail "infix model completion should leave the cursor at the completed model"
+[[ "$normalized" == *':none'* && "$normalized" == *':max'* ]] || fail "one model completion should immediately list supported effort suffixes"
 [[ ! -e "$interactive_capture_calls" || ! -s "$interactive_capture_calls" ]] || fail "model effort completion should not submit a prompt"
 
 delete_slash_transcript=$tmpdir/delete-slash-transcript

@@ -550,7 +550,10 @@ _mu_zsh_complete_slash() {
   if [[ "${before_buffer[1,$before_cursor]}" == "/model "* ]] &&
     [[ "$BUFFER" != "$before_buffer" || $CURSOR -ne $before_cursor ]] &&
     [[ "${BUFFER[1,$CURSOR]}" == "/model "* && "${BUFFER[1,$CURSOR]}" != *:* ]]; then
-    _mu_zsh_list_slash_choices
+    # Generate a fresh effort list directly. Going back through the user's
+    # completion system can retain the model list (notably after infix
+    # matching) instead of recomputing candidates for the completed model.
+    zle _mu_zsh_list_widget 2>/dev/null || true
   fi
 }
 

@@ -945,6 +945,10 @@ Consequences:
 - `/model <model>` validates and stores a shell-only sticky override in the
   tracked bundle. It is forwarded as `--model` to later turns and `/retry`; it
   does not mutate persisted session state.
+- Completing a model that supports effort levels leaves the bare model in the
+  buffer and immediately opens the shell's effort candidates. Completion does
+  not append `:` or choose an effort until the user continues through the
+  shell's native completion UI.
 - Ctrl-D is the normal terminal EOT key (`^D`). xterm-style and browser-terminal
   input paths forward it as input when the browser or OS has
   not intercepted the key before the terminal receives it.

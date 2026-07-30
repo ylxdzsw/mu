@@ -385,7 +385,9 @@ function _mu_fish_model_records
 end
 
 function _mu_fish_model_candidates --argument-names fragment
-    set -l records (_mu_fish_model_records 2>/dev/null)
+    set -e argv[1]
+    set -l records $argv
+    test (count $records) -gt 0; or set records (_mu_fish_model_records 2>/dev/null)
     test (count $records) -gt 0; or return 0
 
     set -l model_ids
@@ -420,10 +422,12 @@ function _mu_fish_model_candidates --argument-names fragment
 end
 
 function _mu_fish_model_effort_suffixes --argument-names fragment
+    set -e argv[1]
     test -n "$fragment"; or return 0
     string match -q '*:*' -- "$fragment"; and return 0
 
-    set -l records (_mu_fish_model_records 2>/dev/null)
+    set -l records $argv
+    test (count $records) -gt 0; or set records (_mu_fish_model_records 2>/dev/null)
     set -l model_ids
     for record in $records
         set -l fields (string split \t -- "$record")
@@ -448,6 +452,21 @@ function _mu_fish_model_effort_suffixes --argument-names fragment
         end
         return 0
     end
+end
+
+function _mu_fish_native_model_candidates
+    set -l records (_mu_fish_model_records 2>/dev/null)
+    _mu_fish_model_candidates '' $records
+    _mu_fish_model_candidates : $records
+end
+
+function _mu_fish_install_model_completion
+    complete -e -p /model
+    complete -k -f -p /model -a '(_mu_fish_native_model_candidates)'
+end
+
+function _mu_fish_remove_model_completion
+    complete -e -p /model
 end
 
 function _mu_fish_require_effective_session --argument-names slash_command
@@ -704,14 +723,7 @@ function _mu_fish_complete_slash
     end
 
     if string match -q '/model *' -- "$left"
-        set -l fragment (string replace -r '^/model ' '' -- "$left")
-        set -l suffixes (_mu_fish_model_effort_suffixes "$fragment")
-        if test (count $suffixes) -gt 0
-            _mu_fish_complete_values "/model $fragment" '' '' $suffixes
-            return
-        end
-        set -l candidates (_mu_fish_model_candidates "$fragment")
-        _mu_fish_complete_values '/model ' "$fragment" '' $candidates
+        commandline -f complete
         return
     end
 
@@ -730,6 +742,7 @@ function _mu_fish_enter_mode
     set -g MU_FISH_SAVED_BIND_MODE $fish_bind_mode
     test -n "$MU_FISH_SAVED_BIND_MODE"; or set -g MU_FISH_SAVED_BIND_MODE default
     set fish_bind_mode mumode
+    _mu_fish_install_model_completion
     _mu_fish_run_hooks $MU_FISH_ENTER_HOOKS
 end
 
@@ -737,6 +750,7 @@ function _mu_fish_exit_mode
     test "$MU_FISH_MODE" = shell; and return 0
     set -g MU_FISH_MODE shell
     set fish_bind_mode "$MU_FISH_SAVED_BIND_MODE"
+    _mu_fish_remove_model_completion
     _mu_fish_run_hooks $MU_FISH_EXIT_HOOKS
 end
 
@@ -894,4 +908,9 @@ function fish_mode_prompt
 end
 
 _mu_fish_sync_state
+if test "$MU_FISH_MODE" = mu
+    _mu_fish_install_model_completion
+else
+    _mu_fish_remove_model_completion
+end
 status is-interactive; and _mu_fish_configure_keymap

@@ -375,6 +375,28 @@ assert_contains "$normalized" 'next turns in this scope will use openai/gpt' 'Ta
 assert_contains "$normalized" 'Hello from Fish.' 'interactive output streams'
 assert_contains "$normalized" 'mu>' 'Mu prompt redraws after the turn'
 
+set model_effort_transcript "$TEST_TMPDIR/model-effort-transcript"
+rm -f "$capture_args" "$capture_stdin" "$capture_calls" "$interactive_ready"
+begin
+    sleep 0.2
+    send_interactive_setup "$interactive_setup" "$interactive_ready"
+    printf '\t/model gp\t'
+    sleep 0.5
+    printf '\r'
+    sleep 0.3
+    printf '\x04'
+end | timeout 10 script -qfec \
+    'env fish_features=no-query-term,no-keyboard-protocols,no-mark-prompt TERM=xterm-256color fish --no-config' \
+    "$model_effort_transcript" >/dev/null
+set interactive_status $pipestatus[2]
+test $interactive_status -eq 0; or fail "model effort completion transcript exited with status $interactive_status"
+
+set raw_transcript (string collect <"$model_effort_transcript")
+assert_contains "$raw_transcript" '/model gpt' 'one Tab completes the Fish model'
+assert_contains "$raw_transcript" 'gpt:low' 'one Fish model completion immediately lists low effort'
+assert_contains "$raw_transcript" 'gpt:high' 'one Fish model completion immediately lists high effort'
+not test -s "$capture_calls"; or fail 'model effort completion should not submit a prompt'
+
 set shift_transcript "$TEST_TMPDIR/shift-transcript"
 rm -f "$capture_args" "$capture_stdin" "$capture_calls" "$interactive_ready"
 begin
