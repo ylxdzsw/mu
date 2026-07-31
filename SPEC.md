@@ -273,9 +273,10 @@ accepts optional non-terminal stdin as a custom focus). The surface is small:
   machine-readable shell state for prompt rendering and completion. The default
   projection omits Git and detailed session metadata because prompt rendering
   does not consume them; the corresponding `--include-*` flags add them.
-  `context_usage_source` is `reported` when `context_percent` comes from the
-  latest provider response and `estimated` when it is the bytes÷4 projection
-  used before a first turn or immediately after compaction.
+  `context_tokens` is the latest provider-reported context size when
+  `context_usage_source` is `reported`, or the bytes÷4 projection when it is
+  `estimated` before a first turn or immediately after compaction. Consumers
+  derive a percentage from `context_tokens / context_window`.
 - `mu context [--export]` — introspect the agent context. By default it prints
   the assembled system prompt mu itself would use: the role preamble, the
   `<runtime>` block, the full skills index (built-in, global, and project), and
@@ -776,7 +777,9 @@ stderr TTY detection suppresses the summary when redirected.
   matching exit line. Headers already streamed are not duplicated at execution.
 - **Concise tool presentation.** Interactive output replaces
   `[preparing toolcall]` once both title and risk are complete with a risk-colored
-  live `=> <title>`. Completion clears it and commits exactly
+  live `=> <title>`, except that a call awaiting guardrail review transitions
+  directly from `[preparing toolcall]` to `[guardrail] <title>…`. Completion
+  clears it and commits exactly
   `=> <title> · exit <code>` or `=> <title> · error`, without duration.
   Redirected output emits only the completed ANSI-free line and does not add a
   risk label. Risk colors are cyan for readonly, yellow for reversible, red for
@@ -1830,9 +1833,10 @@ risk categories, and a strict JSON output contract.
   turn is **aborted**. Re-authorizing would likely fail again since the reviewer
   itself is malfunctioning.
 
-In interactive concise output, the completed tool-call live line changes to
-`[guardrail] TITLE…` while review is in progress. An allow restores the normal
-live tool line and adds no permanent review line; completion remains
+In interactive concise output, a call awaiting review changes directly from
+`[preparing toolcall]` to `[guardrail] TITLE…` while review is in progress,
+without briefly displaying the destructive tool line. An allow restores the
+normal live tool line and adds no permanent review line; completion remains
 `=> TITLE · exit N`. A denial or reviewer failure commits
 `=> TITLE · guardrail denied` or `=> TITLE · guardrail error`. Redirected
 concise output has no mutable live line and emits only the committed outcome.

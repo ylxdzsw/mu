@@ -84,11 +84,11 @@ if [[ "$1" == "status" ]]; then
   [[ "$provider" == "$model" ]] && provider=test
   model_json="\"model\":{\"provider_id\":\"$provider\",\"model_id\":\"$model_id\",\"effort\":null,\"canonical\":\"$model\"}"
   if (( include_models )); then
-    print -r -- "{$model_json,\"context_percent\":25.0,\"project_root\":\"$MU_ZSH_TEST_PROJECT_ROOT\",\"available_models\":{\"providers\":[{\"id\":\"local\",\"models\":[{\"id\":\"local/solo\",\"model_id\":\"solo\",\"supported_efforts\":[\"max\"]},{\"id\":\"local/shared\",\"model_id\":\"shared\",\"supported_efforts\":[]}]},{\"id\":\"openai\",\"models\":[{\"id\":\"openai/gpt\",\"model_id\":\"gpt\",\"supported_efforts\":[\"low\",\"high\",\"provider-custom\"]},{\"id\":\"openai/gpt-5.6-luna\",\"model_id\":\"gpt-5.6-luna\",\"supported_efforts\":[\"none\",\"max\"]},{\"id\":\"openai/shared\",\"model_id\":\"shared\",\"supported_efforts\":[\"medium\"]}]}]}}"
+    print -r -- "{$model_json,\"context_tokens\":25,\"context_window\":100,\"project_root\":\"$MU_ZSH_TEST_PROJECT_ROOT\",\"available_models\":{\"providers\":[{\"id\":\"local\",\"models\":[{\"id\":\"local/solo\",\"model_id\":\"solo\",\"supported_efforts\":[\"max\"]},{\"id\":\"local/shared\",\"model_id\":\"shared\",\"supported_efforts\":[]}]},{\"id\":\"openai\",\"models\":[{\"id\":\"openai/gpt\",\"model_id\":\"gpt\",\"supported_efforts\":[\"low\",\"high\",\"provider-custom\"]},{\"id\":\"openai/gpt-5.6-luna\",\"model_id\":\"gpt-5.6-luna\",\"supported_efforts\":[\"none\",\"max\"]},{\"id\":\"openai/shared\",\"model_id\":\"shared\",\"supported_efforts\":[\"medium\"]}]}]}}"
   elif (( include_commands )); then
-    print -r -- "{$model_json,\"context_percent\":25.0,\"project_root\":\"$MU_ZSH_TEST_PROJECT_ROOT\",\"commands\":[{\"name\":\"review.md\",\"path\":\"$MU_ZSH_TEST_PROJECT_ROOT/.mu/review.md\",\"scope\":\"project\"}]}"
+    print -r -- "{$model_json,\"context_tokens\":25,\"context_window\":100,\"project_root\":\"$MU_ZSH_TEST_PROJECT_ROOT\",\"commands\":[{\"name\":\"review.md\",\"path\":\"$MU_ZSH_TEST_PROJECT_ROOT/.mu/review.md\",\"scope\":\"project\"}]}"
   else
-    print -r -- "{$model_json,\"context_percent\":25.0,\"project_root\":\"$MU_ZSH_TEST_PROJECT_ROOT\"}"
+    print -r -- "{$model_json,\"context_tokens\":25,\"context_window\":100,\"project_root\":\"$MU_ZSH_TEST_PROJECT_ROOT\"}"
   fi
   exit 0
 fi
@@ -145,7 +145,7 @@ mkdir -p -- "$short_fake_bin"
 cat > "$short_fake_bin/mu" <<'EOF'
 #!/usr/bin/env zsh
 if [[ "$1" == "status" ]]; then
-  print -r -- '{"model":{"provider_id":"test","model_id":"m","effort":null,"canonical":"m"},"context_percent":0.0,"context_usage_source":"estimated","project_root":null}'
+  print -r -- '{"model":{"provider_id":"test","model_id":"m","effort":null,"canonical":"m"},"context_tokens":0,"context_window":100,"context_usage_source":"estimated","project_root":null}'
   exit 0
 fi
 exit 1
@@ -230,7 +230,7 @@ mkdir -p -- "$global_fake_bin"
 cat > "$global_fake_bin/mu" <<'EOF'
 #!/usr/bin/env zsh
 if [[ "$1" == "status" ]]; then
-  print -r -- '{"model":{"provider_id":"test","model_id":"global-model","effort":null,"canonical":"global-model"},"context_percent":5.0,"project_root":null}'
+  print -r -- '{"model":{"provider_id":"test","model_id":"global-model","effort":null,"canonical":"global-model"},"context_tokens":5,"context_window":100,"project_root":null}'
   exit 0
 fi
 exit 1
@@ -252,7 +252,7 @@ mkdir -p -- "$unclean_fake_bin"
 cat > "$unclean_fake_bin/mu" <<'EOF'
 #!/usr/bin/env zsh
 if [[ "$1" == "status" ]]; then
-  print -r -- '{"model":{"provider_id":"test","model_id":"m","effort":null,"canonical":"m"},"context_percent":25.0,"project_root":null,"clean":false}'
+  print -r -- '{"model":{"provider_id":"test","model_id":"m","effort":null,"canonical":"m"},"context_tokens":25,"context_window":100,"project_root":null,"clean":false}'
   exit 0
 fi
 exit 1
@@ -269,7 +269,7 @@ mkdir -p -- "$clean_fake_bin"
 cat > "$clean_fake_bin/mu" <<'EOF'
 #!/usr/bin/env zsh
 if [[ "$1" == "status" ]]; then
-  print -r -- '{"model":{"provider_id":"test","model_id":"m","effort":null,"canonical":"m"},"context_percent":25.0,"project_root":null,"clean":true}'
+  print -r -- '{"model":{"provider_id":"test","model_id":"m","effort":null,"canonical":"m"},"context_tokens":25,"context_window":100,"project_root":null,"clean":true}'
   exit 0
 fi
 exit 1
@@ -526,7 +526,7 @@ if [[ "$1" == "status" ]]; then
     shift
   done
   [[ "$model" == invalid/* ]] && exit 1
-  print -r -- "{\"model\":{\"provider_id\":\"test\",\"model_id\":\"$model\",\"effort\":null,\"canonical\":\"$model\"},\"context_percent\":10.0,\"project_root\":\"$scope_root\"}"
+  print -r -- "{\"model\":{\"provider_id\":\"test\",\"model_id\":\"$model\",\"effort\":null,\"canonical\":\"$model\"},\"context_tokens\":10,\"context_window\":100,\"project_root\":\"$scope_root\"}"
   exit 0
 fi
 if [[ "$1" == "session" && "$2" == "new" ]]; then
@@ -653,11 +653,11 @@ if [ "$1" = "status" ]; then
   [ "$provider" = "$model" ] && provider=test
   model_json="\"model\":{\"provider_id\":\"$provider\",\"model_id\":\"$model_id\",\"effort\":null,\"canonical\":\"$model\"}"
   if [ "$include_models" -eq 1 ]; then
-    printf '%s\n' "{$model_json,\"context_percent\":25.0,\"project_root\":\"$MU_ZSH_TEST_PROJECT_ROOT\",\"available_models\":{\"providers\":[{\"id\":\"local\",\"models\":[{\"id\":\"local/solo\",\"model_id\":\"solo\",\"supported_efforts\":[\"max\"]},{\"id\":\"local/shared\",\"model_id\":\"shared\",\"supported_efforts\":[]}]},{\"id\":\"openai\",\"models\":[{\"id\":\"openai/gpt\",\"model_id\":\"gpt\",\"supported_efforts\":[\"low\",\"high\"]},{\"id\":\"openai/gpt-5.6-luna\",\"model_id\":\"gpt-5.6-luna\",\"supported_efforts\":[\"none\",\"max\"]},{\"id\":\"openai/shared\",\"model_id\":\"shared\",\"supported_efforts\":[\"medium\"]}]}]}}"
+    printf '%s\n' "{$model_json,\"context_tokens\":25,\"context_window\":100,\"project_root\":\"$MU_ZSH_TEST_PROJECT_ROOT\",\"available_models\":{\"providers\":[{\"id\":\"local\",\"models\":[{\"id\":\"local/solo\",\"model_id\":\"solo\",\"supported_efforts\":[\"max\"]},{\"id\":\"local/shared\",\"model_id\":\"shared\",\"supported_efforts\":[]}]},{\"id\":\"openai\",\"models\":[{\"id\":\"openai/gpt\",\"model_id\":\"gpt\",\"supported_efforts\":[\"low\",\"high\"]},{\"id\":\"openai/gpt-5.6-luna\",\"model_id\":\"gpt-5.6-luna\",\"supported_efforts\":[\"none\",\"max\"]},{\"id\":\"openai/shared\",\"model_id\":\"shared\",\"supported_efforts\":[\"medium\"]}]}]}}"
   elif [ "$include_commands" -eq 1 ] && [ -n "$TEST_EXTRA_COMMAND" ]; then
-    printf '%s\n' "{$model_json,\"context_percent\":25.0,\"project_root\":\"$MU_ZSH_TEST_PROJECT_ROOT\",\"commands\":[{\"name\":\"$TEST_EXTRA_COMMAND\",\"path\":\"$MU_ZSH_TEST_PROJECT_ROOT/.mu/$TEST_EXTRA_COMMAND\",\"scope\":\"project\"}]}"
+    printf '%s\n' "{$model_json,\"context_tokens\":25,\"context_window\":100,\"project_root\":\"$MU_ZSH_TEST_PROJECT_ROOT\",\"commands\":[{\"name\":\"$TEST_EXTRA_COMMAND\",\"path\":\"$MU_ZSH_TEST_PROJECT_ROOT/.mu/$TEST_EXTRA_COMMAND\",\"scope\":\"project\"}]}"
   else
-    printf '%s\n' "{$model_json,\"context_percent\":25.0,\"project_root\":\"$MU_ZSH_TEST_PROJECT_ROOT\"}"
+    printf '%s\n' "{$model_json,\"context_tokens\":25,\"context_window\":100,\"project_root\":\"$MU_ZSH_TEST_PROJECT_ROOT\"}"
   fi
   exit 0
 fi

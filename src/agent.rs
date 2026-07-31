@@ -220,6 +220,9 @@ impl<'a> AgentLoop<'a> {
             let mut command_headers = StreamingCommandHeaders::default();
             let stream_result = loop {
                 audit.begin_provider_request();
+                let reviews_destructive = guardrail
+                    .as_ref()
+                    .is_some_and(|guardrail| guardrail.should_review(BashRisk::Destructive));
                 let mut on_stream_event = |event: StreamEvent| -> Result<(), ProviderError> {
                     let result = match event {
                         StreamEvent::TextDelta(text) => {
@@ -234,9 +237,12 @@ impl<'a> AgentLoop<'a> {
                             self.renderer.reasoning_summary_delta(part_index, &text)
                         }
                         StreamEvent::ReasoningEnd => self.renderer.reasoning_end(None),
-                        StreamEvent::ToolCallDelta(delta) => {
-                            handle_tool_call_delta(self.renderer, &mut command_headers, delta)
-                        }
+                        StreamEvent::ToolCallDelta(delta) => handle_tool_call_delta(
+                            self.renderer,
+                            &mut command_headers,
+                            reviews_destructive,
+                            delta,
+                        ),
                         StreamEvent::Tick => self.renderer.thinking_tick(),
                     };
                     result.map_err(|e| ProviderError::Other(e.to_string()))
@@ -350,6 +356,8 @@ impl<'a> AgentLoop<'a> {
 
                         if !concurrent {
                             let tc = &tool_calls[cursor];
+                            let guardrail_pending =
+                                guardrail_review_required(guardrail.as_ref(), tc, &args);
 
                             let header_already_rendered = finish_command_header(
                                 self.renderer,
@@ -357,6 +365,7 @@ impl<'a> AgentLoop<'a> {
                                 cursor,
                                 tc,
                                 &args,
+                                guardrail_pending,
                             )?;
 
                             // Guardrail: review destructive bash calls before execution.
@@ -664,6 +673,7 @@ impl<'a> AgentLoop<'a> {
                 header_start_index + index,
                 exec.call,
                 &exec.args,
+                false,
             )?;
             if let Some(running) = exec.running.as_ref() {
                 for warning in running.warnings() {
@@ -788,6 +798,7 @@ fn approx_context_tokens(context: &[Message]) -> u64 {
 fn handle_tool_call_delta(
     renderer: &mut Renderer,
     headers: &mut StreamingCommandHeaders,
+    reviews_destructive: bool,
     delta: ToolCallDelta,
 ) -> std::io::Result<()> {
     if delta.index >= headers.entries.len() {
@@ -816,6 +827,11 @@ fn handle_tool_call_delta(
                 cwd: string_field_state(&header.arguments, "cwd"),
                 stdin: string_field_state(&header.arguments, "stdin"),
                 arguments_complete: arguments_json_complete(&header.arguments),
+                guardrail_pending: reviews_destructive
+                    && matches!(
+                        string_field_state(&header.arguments, "risk").complete_value(),
+                        Some("destructive")
+                    ),
             },
         )?;
         if header.display.is_done() {
@@ -832,6 +848,7 @@ fn finish_command_header(
     index: usize,
     call: &ToolCall,
     args: &Value,
+    guardrail_pending: bool,
 ) -> std::io::Result<bool> {
     if index >= headers.entries.len() {
         headers
@@ -842,11 +859,16 @@ fn finish_command_header(
     if header.id.is_none() {
         header.id = Some(call.id.clone());
     }
-    header.finish(renderer, args)
+    header.finish(renderer, args, guardrail_pending)
 }
 
 impl StreamingCommandHeader {
-    fn finish(&mut self, renderer: &mut Renderer, args: &Value) -> std::io::Result<bool> {
+    fn finish(
+        &mut self,
+        renderer: &mut Renderer,
+        args: &Value,
+        guardrail_pending: bool,
+    ) -> std::io::Result<bool> {
         let title = args.get("title").and_then(|value| value.as_str());
         let risk = args.get("risk").and_then(|value| value.as_str());
         let command = args.get("command").and_then(|value| value.as_str());
@@ -861,6 +883,7 @@ impl StreamingCommandHeader {
                 cwd: StringFieldState::from_final(args.get("cwd").and_then(|value| value.as_str())),
                 stdin: StringFieldState::from_final(stdin),
                 arguments_complete: true,
+                guardrail_pending,
             },
         )?;
         Ok(self.display.started)
@@ -888,6 +911,7 @@ impl CommandHeaderDisplay {
             cwd,
             stdin,
             arguments_complete,
+            guardrail_pending,
         } = update;
         if !self.started {
             self.started = renderer.bash_header_start(tool_call_id)?;
@@ -896,7 +920,11 @@ impl CommandHeaderDisplay {
         if renderer.output_format() == crate::cli::OutputFormat::Concise {
             let ready = title.complete_value().is_some() && risk.complete_value().is_some();
             if ready || arguments_complete {
-                renderer.concise_tool_ready(title.complete_value(), risk.complete_value())?;
+                renderer.concise_tool_ready(
+                    title.complete_value(),
+                    risk.complete_value(),
+                    guardrail_pending,
+                )?;
                 self.title_line_done = true;
                 self.command_line_done = true;
                 self.cwd_line_done = true;
@@ -1103,6 +1131,7 @@ struct CommandHeaderUpdate<'a> {
     cwd: StringFieldState,
     stdin: StringFieldState,
     arguments_complete: bool,
+    guardrail_pending: bool,
 }
 
 struct FullCommandHeaderUpdate {

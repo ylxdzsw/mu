@@ -1009,14 +1009,15 @@ fn print_status_report(report: &StatusReport) {
         .session_id
         .clone()
         .unwrap_or_else(|| "(new session)".into());
-    let context = match (report.context_percent, report.context_window) {
-        (Some(percent), Some(window)) => format!(
-            "{}{percent:.2}% of {window}",
+    let context = match (report.context_tokens, report.context_window) {
+        (Some(tokens), Some(window)) => format!(
+            "{}{tokens} / {window} ({:.2}%)",
             if report.context_usage_source == Some(runtime::ContextUsageSource::Estimated) {
                 "~"
             } else {
                 ""
-            }
+            },
+            tokens as f64 / window as f64 * 100.0,
         ),
         _ => "n/a".into(),
     };

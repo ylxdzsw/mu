@@ -232,7 +232,7 @@ function _mu_fish_build_mode_prompt
     if test -n "$status_json"; and command -q jq
         set fields (printf '%s' "$status_json" | jq -r '[
             (.model.canonical // ""),
-            (.context_percent // ""),
+            (if ((.context_tokens | type) == "number" and (.context_window | type) == "number" and .context_window > 0) then (.context_tokens * 100 / .context_window) else "" end),
             (.project_root // ""),
             (if has("clean") then (.clean|tostring) else "" end),
             (.context_usage_source // "")

@@ -253,7 +253,7 @@ _mu_zsh_build_mode_prompt() {
   _mu_zsh_sync_state
   status_json=$(_mu_zsh_status_json) || status_json=
   if [[ -n "$status_json" ]] && command -v jq >/dev/null 2>&1; then
-    tsv=$(jq -r '[(.model.canonical // ""), (.context_percent // ""), (.project_root // ""), (if has("clean") then (.clean|tostring) else "" end), (.context_usage_source // "")] | @tsv' <<< "$status_json" 2>/dev/null) || tsv=
+    tsv=$(jq -r '[(.model.canonical // ""), (if ((.context_tokens | type) == "number" and (.context_window | type) == "number" and .context_window > 0) then (.context_tokens * 100 / .context_window) else "" end), (.project_root // ""), (if has("clean") then (.clean|tostring) else "" end), (.context_usage_source // "")] | @tsv' <<< "$status_json" 2>/dev/null) || tsv=
   fi
   fields=("${(@ps:\t:)tsv}")
   model=${fields[1]:-}

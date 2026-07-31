@@ -597,6 +597,7 @@ impl Renderer {
         &mut self,
         title: Option<&str>,
         risk: Option<&str>,
+        guardrail_pending: bool,
     ) -> io::Result<()> {
         if self.format != OutputFormat::Concise {
             return Ok(());
@@ -608,7 +609,7 @@ impl Renderer {
                 .to_string(),
             risk: risk.map(str::to_string),
         });
-        if self.styled {
+        if self.styled && !guardrail_pending {
             self.live_line = Some(LiveLine::ConciseTool);
             self.render_live_line()?;
         }
@@ -652,7 +653,7 @@ impl Renderer {
         let risk = args.get("risk").and_then(|value| value.as_str());
         self.bash_header_start(tool_call_id)?;
         if self.format == OutputFormat::Concise {
-            self.concise_tool_ready(Some(title), risk)?;
+            self.concise_tool_ready(Some(title), risk, false)?;
             return Ok(true);
         }
         self.bash_header_title_start()?;
@@ -4906,20 +4907,28 @@ mod tests {
     }
 
     #[test]
-    fn concise_guardrail_status_replaces_the_live_tool_and_commits_denial() {
+    fn concise_guardrail_status_replaces_preparation_without_tool_flash() {
         let (mut renderer, output) =
             Renderer::with_test_shared_output(OutputFormat::Concise, true, None);
-        let args = json!({
-            "title": "Review action",
-            "risk": "destructive",
-            "command": "do something",
-        });
 
-        renderer.bash_header_full(Some("call_1"), &args).unwrap();
+        renderer.bash_header_start(Some("call_1")).unwrap();
+        renderer
+            .concise_tool_ready(Some("Review action"), Some("destructive"), true)
+            .unwrap();
+        assert_eq!(
+            strip_ansi(&output.transcript()),
+            "[preparing toolcall]",
+            "the destructive tool line must stay deferred while review is pending"
+        );
+
         renderer.guardrail_start().unwrap();
         assert_eq!(
             strip_ansi(&renderer.format_live_line().unwrap()),
             "[guardrail] Review action…"
+        );
+        assert!(
+            !strip_ansi(&output.transcript()).contains("=> Review action"),
+            "the guardrail transition must not flash the destructive tool line"
         );
         renderer
             .guardrail_verdict(false, "high", "low", "not authorized", "do something")

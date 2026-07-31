@@ -4,8 +4,8 @@ use std::process::Command;
 
 use crate::config::Config;
 use crate::models::{
-    AvailableModelsPayload, RequestOptions, ResolvedModelInfo, ResolvedModelRef, available_models,
-    first_model_ref, resolve_model_info, resolve_model_ref,
+    AvailableModelsPayload, RequestOptions, ResolvedModelRef, available_models, first_model_ref,
+    resolve_model_info, resolve_model_ref,
 };
 use crate::skills::{CommandMeta, SkillMeta};
 use crate::store::{Session, Store};
@@ -35,7 +35,7 @@ pub struct StatusModel {
 pub struct StatusReport {
     pub model: StatusModel,
     pub session_id: Option<String>,
-    pub context_percent: Option<f64>,
+    pub context_tokens: Option<u64>,
     pub context_usage_source: Option<ContextUsageSource>,
     pub project_root: Option<String>,
     pub context_window: Option<u64>,
@@ -224,7 +224,7 @@ pub fn build_status_report(
         .transpose()?
         .unwrap_or(true);
     let model = status_model(&resolved.request.model);
-    let context_usage = context_usage(store, resolved.attached_session.as_ref(), &model_info);
+    let context_usage = context_usage(store, resolved.attached_session.as_ref());
 
     Ok(StatusReport {
         model,
@@ -232,7 +232,7 @@ pub fn build_status_report(
             .attached_session
             .as_ref()
             .map(|session| session.id.clone()),
-        context_percent: context_usage.map(|(percent, _)| percent),
+        context_tokens: context_usage.map(|(tokens, _)| tokens),
         context_usage_source: context_usage.map(|(_, source)| source),
         project_root: project.map(|project| project.root.display().to_string()),
         context_window: model_info.context_window,
@@ -257,13 +257,8 @@ fn status_model(model: &ResolvedModelRef) -> StatusModel {
     }
 }
 
-fn context_usage(
-    store: &Store,
-    session: Option<&Session>,
-    model_info: &ResolvedModelInfo,
-) -> Option<(f64, ContextUsageSource)> {
+fn context_usage(store: &Store, session: Option<&Session>) -> Option<(u64, ContextUsageSource)> {
     let session = session?;
-    let context_window = model_info.context_window?;
     let (tokens, source) = if session.last_context_tokens > 0 {
         (session.last_context_tokens, ContextUsageSource::Reported)
     } else {
@@ -272,7 +267,7 @@ fn context_usage(
             ContextUsageSource::Estimated,
         )
     };
-    Some(((tokens as f64 / context_window as f64) * 100.0, source))
+    Some((tokens, source))
 }
 
 fn status_session(summary: crate::store::SessionSummary) -> StatusSession {
@@ -601,7 +596,7 @@ mod tests {
             None,
         )
         .unwrap();
-        assert_eq!(reported.context_percent, Some(25.0));
+        assert_eq!(reported.context_tokens, Some(25));
         assert_eq!(
             reported.context_usage_source,
             Some(ContextUsageSource::Reported)
@@ -622,7 +617,7 @@ mod tests {
             estimated.context_usage_source,
             Some(ContextUsageSource::Estimated)
         );
-        assert_ne!(estimated.context_percent, Some(25.0));
+        assert_ne!(estimated.context_tokens, Some(25));
     }
 
     #[test]
