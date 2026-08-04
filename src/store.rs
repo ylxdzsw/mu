@@ -515,17 +515,44 @@ impl Store {
     }
 
     pub fn latest_attempt_model(&self, session_id: &str) -> Result<Option<String>> {
-        let journal = self.load(session_id)?;
-        Ok(journal
-            .events
-            .iter()
-            .rev()
-            .find_map(|line| match &line.event {
-                Event::ProviderRequested {
-                    purpose, origin, ..
-                } if purpose == "agent" => Some(origin.canonical_model_ref.clone()),
-                _ => None,
+        self.with_journal(session_id, |journal| {
+            Ok(journal
+                .events
+                .iter()
+                .rev()
+                .find_map(|line| match &line.event {
+                    Event::ProviderRequested {
+                        purpose, origin, ..
+                    } if purpose == "agent" || purpose == "compaction" => {
+                        Some(origin.canonical_model_ref.clone())
+                    }
+                    _ => None,
+                }))
+        })
+    }
+
+    pub fn latest_floating_provider(
+        &self,
+        session_id: &str,
+        model_id: &str,
+        mut provider_has_model: impl FnMut(&str) -> bool,
+    ) -> Result<Option<String>> {
+        self.with_journal(session_id, |journal| {
+            Ok(journal.events.iter().rev().find_map(|line| {
+                let Event::ProviderRequested { origin, .. } = &line.event else {
+                    return None;
+                };
+                let floating_provider = origin
+                    .canonical_model_ref
+                    .strip_prefix('(')
+                    .and_then(|reference| reference.split_once(")/"))
+                    .map(|(provider_id, _)| provider_id);
+                (floating_provider == Some(origin.provider_id.as_str())
+                    && origin.wire_model == model_id
+                    && provider_has_model(&origin.provider_id))
+                .then(|| origin.provider_id.clone())
             }))
+        })
     }
 
     #[cfg(test)]
@@ -541,6 +568,10 @@ impl Store {
             Err(_) => self.start_turn(session_id, "/tmp", None, &"test".into())?,
         };
         let (provider_id, wire_model) = model.split_once('/').unwrap_or(("test", model));
+        let provider_id = provider_id
+            .strip_prefix('(')
+            .and_then(|provider_id| provider_id.strip_suffix(')'))
+            .unwrap_or(provider_id);
         let (wire_model, effort) = wire_model
             .rsplit_once(':')
             .map_or((wire_model, None), |(model, effort)| (model, Some(effort)));
@@ -852,6 +883,12 @@ impl Store {
         turn_id: &str,
         purpose: &str,
     ) -> Result<String> {
+        let canonical_model_ref = if purpose == "compaction" {
+            self.latest_attempt_model(session_id)?
+                .unwrap_or_else(|| "test/model".into())
+        } else {
+            "test/model".into()
+        };
         let native_request = serde_json::json!({"model":"test"});
         let recipe = self.request_recipe(
             "test.v1",
@@ -864,7 +901,7 @@ impl Store {
             turn_id,
             purpose,
             ProviderOrigin {
-                canonical_model_ref: "test/model".into(),
+                canonical_model_ref,
                 provider_id: "test".into(),
                 api: "test".into(),
                 endpoint: String::new(),
@@ -1356,7 +1393,9 @@ impl Store {
             .find_map(|line| match &line.event {
                 Event::ProviderRequested {
                     purpose, origin, ..
-                } if purpose == "agent" => Some(origin.canonical_model_ref.clone()),
+                } if purpose == "agent" || purpose == "compaction" => {
+                    Some(origin.canonical_model_ref.clone())
+                }
                 _ => None,
             });
         Ok(Session {

@@ -406,30 +406,31 @@ _mu_zsh_model_completion_candidates() {
   json=$(_mu_zsh_status_json --include-models) || return 1
   command -v jq >/dev/null 2>&1 || return 1
   jq -r --arg fragment "$fragment" --arg suffix_only "$suffix_only" '
+    def dedup:
+      reduce .[] as $item ([]; if index($item) then . else . + [$item] end);
     [.available_models.providers[]?.models[]? | {
       canonical: (.id // ""),
       short: (.model_id // ""),
       efforts: (.supported_efforts // [])
     }] as $models
-    | (reduce $models[] as $model ({}; .[$model.short] += 1)) as $counts
     | [
         if $suffix_only == "1" then
           $models[] as $model
           | select(
               $fragment == $model.canonical
-              or ($fragment == $model.short and $counts[$model.short] == 1)
+              or $fragment == $model.short
             )
           | $model.efforts[]? | ":" + .
         elif ($fragment | contains(":")) then
           $models[] as $model | $model.efforts[]? as $effort
           | "\($model.canonical):\($effort)",
-            (if $counts[$model.short] == 1 then "\($model.short):\($effort)" else empty end)
+            "\($model.short):\($effort)"
         else
           $models[]
-          | .canonical, (if $counts[.short] == 1 then .short else empty end)
+          | .canonical, .short
         end
       ]
-    | unique[]
+    | dedup[]
   ' <<< "$json"
 }
 

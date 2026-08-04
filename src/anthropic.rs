@@ -28,7 +28,7 @@ pub(crate) async fn stream(
         .await?;
 
     if !state.terminal {
-        return Err(ProviderError::Other(
+        return Err(ProviderError::Transport(
             "Anthropic stream ended before message_stop".into(),
         ));
     }
@@ -65,6 +65,7 @@ pub(crate) async fn stream(
             reasoning_content: None,
             tool_calls: (!tool_calls.is_empty()).then_some(tool_calls),
             native_replay: Some(NativeReplay {
+                provider_id: request.model.provider_id.clone(),
                 endpoint: provider.endpoint.clone(),
                 model: request.model.model_id.clone(),
                 payload: NativeReplayPayload::AnthropicContent(blocks),
@@ -111,6 +112,7 @@ pub(crate) fn build_request_body(
                     content.as_deref(),
                     tool_calls.as_deref(),
                     native_replay.as_ref(),
+                    &request.model.provider_id,
                     endpoint,
                     &request.model.model_id,
                 )?;
@@ -263,13 +265,14 @@ fn assistant_blocks(
     content: Option<&str>,
     tool_calls: Option<&[ToolCall]>,
     native_replay: Option<&NativeReplay>,
+    provider_id: &str,
     endpoint: &str,
     model: &str,
 ) -> Result<Vec<Value>, ProviderError> {
     if let Some(NativeReplay {
         payload: NativeReplayPayload::AnthropicContent(blocks),
         ..
-    }) = native_replay.filter(|native| native.matches(endpoint, model))
+    }) = native_replay.filter(|native| native.matches(provider_id, endpoint, model))
     {
         return Ok(blocks.clone());
     }
@@ -583,6 +586,12 @@ fn stream_error(error: &Value) -> ProviderError {
             body: message,
         },
         "rate_limit_error" => ProviderError::RateLimit { message },
+        "authentication_error" | "not_found_error" | "permission_error" => {
+            ProviderError::Unavailable(format!(
+                "{}: {message}",
+                error["type"].as_str().unwrap_or("provider unavailable")
+            ))
+        }
         _ => ProviderError::Other(format!("Anthropic stream error: {message}")),
     }
 }
@@ -817,6 +826,7 @@ mod tests {
                 },
             }]),
             native_replay: Some(NativeReplay {
+                provider_id: "anthropic".into(),
                 endpoint: ENDPOINT.into(),
                 model: "claude-opus-5".into(),
                 payload: NativeReplayPayload::AnthropicContent(native_blocks.clone()),

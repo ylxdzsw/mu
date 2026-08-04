@@ -4,8 +4,8 @@ use std::process::Command;
 
 use crate::config::Config;
 use crate::models::{
-    AvailableModelsPayload, RequestOptions, ResolvedModelRef, available_models, first_model_ref,
-    resolve_model_info, resolve_model_ref,
+    AvailableModelsPayload, ResolvedModelChoice, ResolvedModelRef, available_models,
+    first_model_choice, resolve_model_choice, resolve_model_info,
 };
 use crate::skills::{CommandMeta, SkillMeta};
 use crate::store::{Session, Store};
@@ -20,7 +20,7 @@ pub struct InvocationOverrides {
 #[derive(Debug, Clone)]
 pub struct ResolvedInvocation {
     pub attached_session: Option<Session>,
-    pub request: RequestOptions,
+    pub model: ResolvedModelChoice,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -123,31 +123,37 @@ pub fn resolve_invocation(
         None
     };
 
-    let model = if let Some(model_ref) = overrides.model.as_deref() {
-        resolve_model_ref(config, model_ref)?
+    let mut model = if let Some(model_ref) = overrides.model.as_deref() {
+        resolve_model_choice(config, model_ref)?
     } else if let Some(session) = attached_session.as_ref() {
         resolve_session_model(store, config, session)?
     } else {
         resolve_scope_model(store, config)?
     };
+    if attached_session.is_none() {
+        model.reset();
+    } else if overrides.model.is_some()
+        && let Some(session) = attached_session.as_ref()
+    {
+        resume_session_fallback(store, config, &session.id, &mut model)?;
+    }
 
     Ok(ResolvedInvocation {
         attached_session,
-        request: RequestOptions { model },
+        model,
     })
 }
 
-pub fn resolve_scope_model(
-    store: &Store,
-    config: &Config,
-) -> Result<crate::models::ResolvedModelRef> {
+pub fn resolve_scope_model(store: &Store, config: &Config) -> Result<ResolvedModelChoice> {
     if let Some(model) = store
         .current_session()?
         .and_then(|session| session.last_model)
     {
-        resolve_model_ref(config, &model)
+        let mut choice = resolve_model_choice(config, &model)?;
+        choice.reset();
+        Ok(choice)
     } else {
-        first_model_ref(config)
+        first_model_choice(config)
     }
 }
 
@@ -155,12 +161,14 @@ pub fn resolve_session_model(
     store: &Store,
     config: &Config,
     session: &Session,
-) -> Result<crate::models::ResolvedModelRef> {
-    if let Some(model) = session.last_model.as_deref() {
-        resolve_model_ref(config, model)
+) -> Result<ResolvedModelChoice> {
+    let mut choice = if let Some(model) = session.last_model.as_deref() {
+        resolve_model_choice(config, model)
     } else {
         resolve_scope_model(store, config)
-    }
+    }?;
+    resume_session_fallback(store, config, &session.id, &mut choice)?;
+    Ok(choice)
 }
 
 pub fn resolve_retry_model(
@@ -168,14 +176,40 @@ pub fn resolve_retry_model(
     config: &Config,
     session: &Session,
     override_ref: Option<&str>,
-) -> Result<crate::models::ResolvedModelRef> {
+) -> Result<ResolvedModelChoice> {
     if let Some(model) = override_ref {
-        return resolve_model_ref(config, model);
+        let mut choice = resolve_model_choice(config, model)?;
+        resume_session_fallback(store, config, &session.id, &mut choice)?;
+        return Ok(choice);
     }
     if let Some(model) = store.latest_attempt_model(&session.id)? {
-        return resolve_model_ref(config, &model);
+        let mut choice = resolve_model_choice(config, &model)?;
+        resume_session_fallback(store, config, &session.id, &mut choice)?;
+        return Ok(choice);
     }
     resolve_session_model(store, config, session)
+}
+
+pub fn resume_session_fallback(
+    store: &Store,
+    config: &Config,
+    session_id: &str,
+    choice: &mut ResolvedModelChoice,
+) -> Result<()> {
+    if !choice.is_floating() {
+        return Ok(());
+    }
+
+    choice.reset();
+    let model_id = choice.active_model().model_id.clone();
+    if let Some(provider_id) =
+        store.latest_floating_provider(session_id, &model_id, |provider_id| {
+            config.model_config(provider_id, &model_id).is_some()
+        })?
+    {
+        choice.resume_provider(&model_id, &provider_id);
+    }
+    Ok(())
 }
 
 pub fn build_status_report(
@@ -188,7 +222,7 @@ pub fn build_status_report(
     skills: Option<Vec<SkillMeta>>,
 ) -> Result<StatusReport> {
     let resolved = resolve_invocation(store, config, overrides)?;
-    let model_info = resolve_model_info(config, &resolved.request.model);
+    let model_info = resolve_model_info(config, resolved.model.active_model());
     let (session_summary, active, compaction) = if includes.session_details {
         let session_summary = resolved
             .attached_session
@@ -225,7 +259,7 @@ pub fn build_status_report(
         .map(|session| store.is_session_clean(&session.id))
         .transpose()?
         .unwrap_or(true);
-    let model = status_model(&resolved.request.model);
+    let model = status_model(resolved.model.active_model());
     let context_usage = context_usage(store, resolved.attached_session.as_ref())?;
 
     Ok(StatusReport {
@@ -355,20 +389,77 @@ mod tests {
 
     fn test_config() -> Config {
         Config {
-            providers: OrderedMap::from_iter([(
-                "alpha".into(),
-                ProviderConfig {
-                    endpoint: "http://localhost/chat/completions".into(),
-                    api_key_env: "MU_TEST_KEY".into(),
-                    models: OrderedMap::from_iter([(
-                        "default-model".into(),
-                        ModelConfig {
-                            context_window: Some(100),
-                            supported_efforts: Some(vec!["low".into(), "high".into()]),
-                        },
-                    )]),
-                },
-            )]),
+            providers: OrderedMap::from_iter([
+                (
+                    "alpha".into(),
+                    ProviderConfig {
+                        endpoint: "http://localhost/chat/completions".into(),
+                        api_key_env: "MU_TEST_KEY".into(),
+                        models: OrderedMap::from_iter([
+                            (
+                                "default-model".into(),
+                                ModelConfig {
+                                    context_window: Some(100),
+                                    supported_efforts: Some(vec!["low".into(), "high".into()]),
+                                },
+                            ),
+                            (
+                                "other-model".into(),
+                                ModelConfig {
+                                    context_window: Some(100),
+                                    supported_efforts: None,
+                                },
+                            ),
+                        ]),
+                    },
+                ),
+                (
+                    "beta".into(),
+                    ProviderConfig {
+                        endpoint: "http://localhost/responses".into(),
+                        api_key_env: String::new(),
+                        models: OrderedMap::from_iter([
+                            (
+                                "default-model".into(),
+                                ModelConfig {
+                                    context_window: Some(200),
+                                    supported_efforts: None,
+                                },
+                            ),
+                            (
+                                "other-model".into(),
+                                ModelConfig {
+                                    context_window: Some(200),
+                                    supported_efforts: None,
+                                },
+                            ),
+                        ]),
+                    },
+                ),
+                (
+                    "gamma".into(),
+                    ProviderConfig {
+                        endpoint: "http://localhost/chat/completions".into(),
+                        api_key_env: String::new(),
+                        models: OrderedMap::from_iter([
+                            (
+                                "default-model".into(),
+                                ModelConfig {
+                                    context_window: Some(300),
+                                    supported_efforts: None,
+                                },
+                            ),
+                            (
+                                "other-model".into(),
+                                ModelConfig {
+                                    context_window: Some(300),
+                                    supported_efforts: None,
+                                },
+                            ),
+                        ]),
+                    },
+                ),
+            ]),
             output: Default::default(),
             line_wrapping: true,
             compaction: CompactionConfig::default(),
@@ -386,6 +477,83 @@ mod tests {
             .unwrap();
     }
 
+    fn finish_guardrail_attempt(store: &Store, config: &Config, session_id: &str, model: &str) {
+        let turn_id = store
+            .start_turn(session_id, "/tmp", None, &"test guardrail".into())
+            .unwrap();
+        let call = crate::provider::ToolCall {
+            id: uuid::Uuid::new_v4().to_string(),
+            function: crate::provider::FunctionCall {
+                name: "bash".into(),
+                arguments: r#"{"title":"Test","risk":"destructive","command":"true"}"#.into(),
+            },
+        };
+        let (_, call_ids) = store
+            .append_message_with_bash_calls(
+                session_id,
+                &crate::provider::Message::Assistant {
+                    content: None,
+                    reasoning_content: None,
+                    native_replay: None,
+                    tool_calls: Some(vec![call]),
+                },
+            )
+            .unwrap();
+        let resolved = resolve_model_choice(config, model).unwrap();
+        let request_model = resolved.active_model();
+        let native = serde_json::json!({"model":request_model.model_id});
+        let exchange_id = store
+            .start_provider_request(
+                session_id,
+                &turn_id,
+                "guardrail",
+                crate::store::ProviderOrigin {
+                    canonical_model_ref: model.into(),
+                    provider_id: request_model.provider_id.clone(),
+                    api: "test".into(),
+                    endpoint: String::new(),
+                    wire_model: request_model.model_id.clone(),
+                    effort: request_model.effort.clone(),
+                },
+                store
+                    .request_recipe(
+                        "test.v1",
+                        &native,
+                        serde_json::json!({"kind":"guardrail"}),
+                        &[],
+                    )
+                    .unwrap(),
+                Some(crate::store::RequestSubject {
+                    call_id: call_ids[0],
+                    attempt: 1,
+                }),
+            )
+            .unwrap();
+        store
+            .fail_provider_exchange(
+                session_id,
+                &exchange_id,
+                "test",
+                serde_json::json!({"message":"test failure"}),
+                None,
+                None,
+            )
+            .unwrap();
+        store
+            .persist_bash_result(
+                session_id,
+                crate::store::BashResultRecord {
+                    bash_call_id: call_ids[0],
+                    outcome: "error",
+                    exit_code: None,
+                    duration_ms: None,
+                },
+                "test",
+                &[],
+            )
+            .unwrap();
+    }
+
     #[test]
     fn new_scope_uses_first_configured_model() {
         let store = Store::open_memory().unwrap();
@@ -393,7 +561,10 @@ mod tests {
         let resolved =
             resolve_invocation(&store, &test_config(), &InvocationOverrides::default()).unwrap();
 
-        assert_eq!(resolved.request.model.canonical, "alpha/default-model");
+        assert_eq!(
+            resolved.model.active_model().canonical,
+            "alpha/default-model"
+        );
     }
 
     #[test]
@@ -411,7 +582,10 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(resolved.request.model.canonical, "alpha/default-model:low");
+        assert_eq!(
+            resolved.model.active_model().canonical,
+            "alpha/default-model:low"
+        );
     }
 
     #[test]
@@ -437,7 +611,10 @@ mod tests {
             },
         )
         .unwrap();
-        assert_eq!(attached.request.model.canonical, "alpha/default-model:high");
+        assert_eq!(
+            attached.model.active_model().canonical,
+            "alpha/default-model:high"
+        );
 
         let empty = resolve_invocation(
             &store,
@@ -448,7 +625,7 @@ mod tests {
             },
         )
         .unwrap();
-        assert_eq!(empty.request.model.canonical, "alpha/default-model");
+        assert_eq!(empty.model.active_model().canonical, "alpha/default-model");
     }
 
     #[test]
@@ -469,9 +646,169 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(normal.canonical, "alpha/default-model:low");
-        assert_eq!(retry.canonical, "alpha/default-model:low");
-        assert_eq!(overridden.canonical, "alpha/default-model");
+        assert_eq!(normal.active_model().canonical, "alpha/default-model:low");
+        assert_eq!(retry.active_model().canonical, "alpha/default-model:low");
+        assert_eq!(overridden.active_model().canonical, "alpha/default-model");
+    }
+
+    #[test]
+    fn floating_provider_position_is_session_local_and_effort_independent() {
+        let store = Store::open_memory().unwrap();
+        let session = store.create_session("/tmp").unwrap();
+        finish_attempt(&store, &session.id, "(beta)/default-model:low", "completed");
+        let session = store.get_session(&session.id).unwrap().unwrap();
+
+        let attached = resolve_session_model(&store, &test_config(), &session).unwrap();
+        assert_eq!(
+            attached.active_model().canonical,
+            "(beta)/default-model:low"
+        );
+
+        let changed_effort = resolve_invocation(
+            &store,
+            &test_config(),
+            &InvocationOverrides {
+                session: Some(session.id.clone()),
+                model: Some("default-model:high".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            changed_effort.model.active_model().canonical,
+            "(beta)/default-model:high"
+        );
+
+        let new_session = store.create_session("/tmp").unwrap();
+        store.select_session(&session.id).unwrap();
+        let inherited = resolve_invocation(
+            &store,
+            &test_config(),
+            &InvocationOverrides {
+                session: Some(new_session.id.clone()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            inherited.model.active_model().canonical,
+            "(alpha)/default-model:low"
+        );
+        assert_eq!(inherited.attached_session.unwrap().id, new_session.id);
+
+        let explicit_new = resolve_invocation(
+            &store,
+            &test_config(),
+            &InvocationOverrides {
+                model: Some("(beta)/default-model:high".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            explicit_new.model.active_model().canonical,
+            "(alpha)/default-model:high"
+        );
+    }
+
+    #[test]
+    fn floating_provider_position_is_remembered_by_model_across_intervening_choices() {
+        let store = Store::open_memory().unwrap();
+        let config = test_config();
+        let session = store.create_session("/tmp").unwrap();
+        finish_attempt(&store, &session.id, "(beta)/default-model:low", "completed");
+        finish_attempt(&store, &session.id, "(alpha)/other-model", "completed");
+        finish_attempt(&store, &session.id, "alpha/default-model:high", "completed");
+
+        let resumed = resolve_retry_model(
+            &store,
+            &config,
+            &store.get_session(&session.id).unwrap().unwrap(),
+            Some("default-model:high"),
+        )
+        .unwrap();
+        assert_eq!(
+            resumed.active_model().canonical,
+            "(beta)/default-model:high"
+        );
+
+        finish_guardrail_attempt(&store, &config, &session.id, "alpha/default-model");
+        let after_fixed_guardrail = resolve_retry_model(
+            &store,
+            &config,
+            &store.get_session(&session.id).unwrap().unwrap(),
+            Some("default-model"),
+        )
+        .unwrap();
+        assert_eq!(
+            after_fixed_guardrail.active_model().canonical,
+            "(beta)/default-model"
+        );
+    }
+
+    #[test]
+    fn floating_guardrail_attempt_advances_the_sessions_same_model_cursor() {
+        let store = Store::open_memory().unwrap();
+        let config = test_config();
+        let session = store.create_session("/tmp").unwrap();
+        finish_attempt(&store, &session.id, "(alpha)/default-model", "completed");
+        finish_guardrail_attempt(&store, &config, &session.id, "(beta)/default-model");
+
+        let resumed = resolve_retry_model(
+            &store,
+            &config,
+            &store.get_session(&session.id).unwrap().unwrap(),
+            Some("default-model:high"),
+        )
+        .unwrap();
+        assert_eq!(
+            resumed.active_model().canonical,
+            "(beta)/default-model:high"
+        );
+    }
+
+    #[test]
+    fn missing_floating_provider_is_skipped_before_defaulting_or_erroring() {
+        let store = Store::open_memory().unwrap();
+        let session = store.create_session("/tmp").unwrap();
+        finish_attempt(
+            &store,
+            &session.id,
+            "(gamma)/default-model:low",
+            "completed",
+        );
+        finish_attempt(&store, &session.id, "(beta)/default-model:low", "completed");
+        let session = store.get_session(&session.id).unwrap().unwrap();
+
+        let mut config = test_config();
+        config
+            .providers
+            .iter_mut()
+            .find(|(id, _)| id.as_str() == "beta")
+            .unwrap()
+            .1
+            .models = OrderedMap::default();
+        let resumed = resolve_session_model(&store, &config, &session).unwrap();
+        assert_eq!(
+            resumed.active_model().canonical,
+            "(gamma)/default-model:low"
+        );
+
+        config
+            .providers
+            .iter_mut()
+            .find(|(id, _)| id.as_str() == "alpha")
+            .unwrap()
+            .1
+            .models = OrderedMap::default();
+        config
+            .providers
+            .iter_mut()
+            .find(|(id, _)| id.as_str() == "gamma")
+            .unwrap()
+            .1
+            .models = OrderedMap::default();
+        assert!(resolve_session_model(&store, &config, &session).is_err());
     }
 
     #[test]

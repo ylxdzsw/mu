@@ -169,8 +169,8 @@ messages, and exits. A few ideas follow from that:
 ## Key features
 
 - OpenAI-compatible Chat Completions, OpenAI Responses, and Anthropic Messages
-  providers, with strict full-endpoint selection, ordered model selection, and
-  per-turn model and reasoning-effort overrides.
+  providers, with fixed `provider/model[:effort]` selection or per-session
+  provider fallback from a bare `model[:effort]` in configured provider order.
 - Persistent global or project-scoped sessions, continuation, transcripts,
   automatic context compaction, and interrupted-turn recovery.
 - Four output densities with automatic interactive-terminal rendering.
@@ -259,10 +259,20 @@ file if needed):
 OPENAI_API_KEY=...
 ```
 
-Then select it per turn with `mu -m openai/gpt-4o` (`--model` also works), or reorder the
-providers in `config.jsonc` so yours comes first and becomes the default. Any
-OpenAI-compatible endpoint works; edit the endpoint, API-key environment
-variable, and model list to match your provider.
+Then select it per turn with `mu -m openai/gpt-4o` (`--model` also works), or
+use a bare model such as `mu -m gpt-4o` to let that session fall forward through
+every provider configuring the model. Status displays a floating choice as
+`(openai)/gpt-4o`, naming the provider the session will use next; an
+unparenthesized `openai/gpt-4o` remains fixed. Changing effort does not reset
+the provider. Each session remembers a separate provider position for every
+floating model it has used, so switching models and returning resumes that
+model's prior provider. Fixed choices do not change floating positions. A new
+session always starts a floating choice from its first configured provider,
+even when it inherits the choice from the current session.
+
+Reorder providers in `config.jsonc` to change fallback order or the fixed
+default. Any OpenAI-compatible endpoint works; edit the endpoint, API-key
+environment variable, and model list to match your provider.
 
 ## Configuration and project scope
 

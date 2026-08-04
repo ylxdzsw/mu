@@ -357,9 +357,11 @@ This is the exact sequence the binary follows for one turn invocation:
      if the pointer is absent or broken.
    - Otherwise create `sessions/<id>.jsonl` atomically, retrying a fresh short
      random ID on collision, then sync its meta and system-prompt records.
-   Resolve the effective model from an explicit `--model`, else the attached
-   session's latest provider request, else the old `current-session` target's
-   latest provider request, else the first configured model.
+   Resolve the model choice from an explicit `--model`, else the attached
+   session's latest agent/compaction provider request, else the old
+   `current-session` target's latest choice, else the first configured model.
+   An attached session restores its own floating provider position. A new
+   session inherits only the choice and starts at candidate zero.
 5. **Acquire session ownership** (§11) with nonblocking exclusive `flock` on
    the journal. If it is already held, print `session busy` and exit non-zero.
 6. **Normalize any interrupted tail, then build the context list.** If the
@@ -1036,7 +1038,7 @@ and compaction remain protocol-neutral.
 `delta.tool_calls`, assistant text, and optional `reasoning_content`. A resolved
 effort is sent as top-level `reasoning_effort`. Complete reasoning attached to
 an assistant tool-call response is persisted and replayed verbatim only when
-the current endpoint and wire model id match its origin. This supports
+the current provider, endpoint, and wire model id match its origin. This supports
 DeepSeek thinking tool loops without model-name heuristics.
 
 **Responses.** Mu posts directly to the configured endpoint with `stream:true`,
@@ -1053,7 +1055,7 @@ by `output_index` with the terminal response snapshot. Terminal fields win
 when both forms provide a field, while stream-only fields such as
 `encrypted_content` are retained. This assembled successful `response.output`
 array is stored in the native response object and replayed as input only for
-the same endpoint and wire model. Semantic tool results become
+the same provider, endpoint, and wire model. Semantic tool results become
 `function_call_output` items connected by `call_id`.
 
 **Anthropic Messages.** Mu posts directly to the configured endpoint using
@@ -1071,7 +1073,7 @@ Anthropic text, thinking summaries, signatures, citations, tool input, usage,
 and stop reasons are accumulated from indexed SSE content-block events.
 Complete successful assistant content arrays are stored unchanged, including
 `thinking`, `redacted_thinking`, signatures, text, citations, and `tool_use`,
-and replayed only for the same endpoint and wire model. The adapter assumes
+and replayed only for the same provider, endpoint, and wire model. The adapter assumes
 current adaptive-thinking models; it has no manual thinking-budget mode,
 old-model compatibility matrix, or model-name heuristics.
 
@@ -1102,16 +1104,32 @@ global config file is missing, `mu` creates a starter `~/.mu/config.jsonc`
 automatically before loading configuration. The starter's first provider is a
 keyless OpenCode Zen free model (`api_key_env: ""`), so a freshly built `mu`
 runs a turn with no additional setup; it also ships a commented keyed provider
-example. Without an explicit override, model selection follows the attached
-session's latest provider request, then the `current-session` target's latest
-provider request, then the first configured model. API keys are read from
-environment variables and are never persisted.
+example.
+
+`provider/model[:effort]` is fixed. A bare `model[:effort]` expands to every
+configured provider containing that model in literal merged config order.
+Fallback is forward-only and per-session. Provider-request history derives one
+remembered position per floating model id across agent, compaction, and
+guardrail calls. Effort is request metadata and does not reset the provider;
+switching models and returning resumes that model's position, while fixed
+references neither update nor erase floating positions. A new session starts
+each floating model at candidate zero. If a remembered provider disappears,
+that history entry is ignored and the next older valid position for the model
+is used; if none exists, the rebuilt chain starts at candidate zero. If the
+model has no candidates, resolution fails. Status and provider origins render
+floating choices as `(provider)/model[:effort]`.
+
+Without an explicit override, model selection follows the attached session's
+latest eligible choice, then the `current-session` target's choice without its
+floating position, then the first configured fixed model. API keys are read
+from environment variables and are never persisted.
 
 **No provider, hard fail.** If no provider is configured, a provider has no
 valid supported endpoint, or a non-empty configured key env var is unset, a *turn* invocation
 exits immediately with a non-zero status and a clear message pointing at
 `config.jsonc`. `mu compact` follows the same rule because it calls the
-provider. There is no silent fallback once configuration has been loaded.
+provider. Valid runtime provider-availability failures may use a floating
+choice's next candidate; deterministic configuration errors never do.
 
 Because the semantic message history is stored separately from origin-bound
 native replay (§11), swapping endpoint/model across turns is supported.
@@ -1143,7 +1161,7 @@ global and project `.mu` directories.
 
 The same file may also be a custom command when its first line is a permissive
 `mu` shebang. The shebang may contain no arguments or exactly
-`--model <provider/model[:effort]>`; all other arguments are rejected when the
+`--model <model[:effort]|provider/model[:effort]>`; all other arguments are rejected when the
 file is invoked. An explicit invocation `--model` overrides the shebang model,
 which otherwise overrides the attached session or configured default for that
 turn without rewriting stored session state. Progressive disclosure remains:
@@ -1319,7 +1337,8 @@ are not visible in another.
   explicit CLI `--output` overrides it. `line_wrapping` is a boolean and has no
   CLI override. Provider and model order is meaningful:
   project config entries are listed before inherited global entries, and model
-  suggestions follow that order. `supported_efforts` contains arbitrary
+  suggestions and bare-model fallback candidates follow that order.
+  `supported_efforts` contains arbitrary
   provider-defined strings and is advisory: it drives status output and shell
   completion but does not restrict manually entered effort suffixes. If global
   `config.jsonc` is missing, `mu` creates a starter file automatically. `mu`
@@ -1568,10 +1587,13 @@ retained recent turns are themselves oversized), mu stops re-compacting for the
 rest of that turn and lets Tier 3 handle the true overflow, so it never loops on
 summarize calls.
 
-**Tier 3 — hard-stop on API overflow error.** If the provider still returns a
-context-length error during a turn, mu catches it, compacts immediately, and
-retries (up to 3 times). If it still overflows, the turn is aborted with a clear
-message. Overflow is recognized from an HTTP `413`, a structured error
+**Tier 3 — one reactive compaction on API overflow.** If the provider returns a
+context-length error and the current semantic context has not already been
+compacted, mu compacts once and retries. If compaction cannot remove history,
+the compaction request itself overflows, or the unchanged post-compaction
+request still overflows, the turn aborts without provider fallback. New
+assistant/tool content permits a later recovery cycle. Overflow is recognized
+from an HTTP `413`, a structured error
 `code`/`type` of `context_length_exceeded`, or a known overflow phrase in a 4xx
 body (e.g. "prompt is too long", "maximum context length", "context window") —
 message matching is gated to client errors so an unrelated 5xx body is not
@@ -1746,9 +1768,13 @@ notice when `guardrail.max_denials_per_turn` is reached. The default is 3. This
 prevents repeated destructive attempts without a second sliding-window policy;
 the general iteration limit remains an independent bound.
 
-**Retry.** The reviewer call retries up to 3 times on transient errors (timeout,
-network failure, parse failure) with exponential backoff (1s, 2s). Context-
-length errors are not retried.
+**Retry.** Reviewer provider calls use the same availability policy as agent
+calls: one initial request plus three transient retries per candidate, then
+forward fallback for a bare review model. Parse failures retain a separate
+three-attempt semantic budget. Context-length errors are not retried. A
+floating guardrail request reads and advances the same per-session, per-model
+position as agent and compaction requests; a fixed review model leaves every
+floating position unchanged.
 
 **Config.**
 

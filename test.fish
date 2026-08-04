@@ -162,10 +162,12 @@ _mu_fish_run_slash_command '/model unknown'; and fail '/model should reject unkn
 set models (_mu_fish_model_candidates gp)
 contains gpt $models; or fail 'model candidates include unique shorthand'
 contains openai/gpt $models; or fail 'model candidates include canonical id'
-not contains shared $models; or fail 'model candidates omit ambiguous shorthand'
+contains shared $models; or fail 'model candidates include shared floating choice'
 set efforts (_mu_fish_model_effort_suffixes gpt)
 contains :low $efforts; or fail 'effort candidates include low'
 contains :high $efforts; or fail 'effort candidates include high'
+set shared_efforts (_mu_fish_model_effort_suffixes shared)
+contains :medium $shared_efforts; or fail 'floating effort candidates merge provider suggestions'
 assert_equal (_mu_fish_common_prefix 'file*one' 'file*two') 'file*' 'common prefix treats wildcard characters literally'
 set literal_matches (_mu_fish_matching_candidates 'file*' 'file*star' file-other)
 assert_equal (string join \x1e -- $literal_matches) 'file*star' 'candidate matching treats wildcard characters literally'

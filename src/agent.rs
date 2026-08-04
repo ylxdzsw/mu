@@ -11,12 +11,13 @@ use crate::bash::{BashRisk, ExecutionMode, ToolContext, ToolResult};
 use crate::compaction;
 use crate::config::Config;
 use crate::guardrail::Guardrail;
-use crate::models::RequestOptions;
+use crate::models::{RequestOptions, ResolvedModelChoice, resolve_model_info};
 use crate::provider::{
     FinishReason, Message, Provider, ProviderError, StreamEvent, ToolCall, ToolCallDelta, Usage,
-    approx_tokens,
+    advance_provider, approx_tokens,
 };
 use crate::renderer::Renderer;
+use crate::runtime::resume_session_fallback;
 use crate::store::{BashResultRecord, ProviderOrigin, Store};
 use bash::RunningBash;
 
@@ -27,6 +28,7 @@ pub struct TurnResult {
     /// cumulative across every call in the turn. Drives the context-fullness
     /// gauge; unlike cumulative turn usage, this is the latest request size.
     pub context_tokens: u64,
+    pub context_window: Option<u64>,
     pub final_assistant: Option<String>,
 }
 
@@ -87,6 +89,7 @@ struct CommandHeaderDisplay {
 
 pub struct AgentLoop<'a> {
     pub config: &'a Config,
+    pub model: ResolvedModelChoice,
     pub provider: Box<dyn Provider>,
     pub store: &'a Store,
     pub session_id: &'a str,
@@ -104,16 +107,20 @@ impl<'a> AgentLoop<'a> {
     async fn run_turn_inner(&mut self, audit: &mut TurnAudit) -> Result<TurnResult> {
         bash::reset_cancellation_state();
         bash::install_signal_forwarder();
-        compaction::maybe_compact(
+        let mut live_provider_retries: u32 = 0;
+        let pre_turn_compaction = compaction::maybe_compact_routed(
             self.store,
             self.config,
             self.session_id,
-            &self.request,
+            &mut self.model,
+            &mut self.provider,
             self.model_context_window,
-            self.provider.as_ref(),
+            &mut live_provider_retries,
             self.renderer,
         )
         .await?;
+        self.sync_effective_model();
+        let mut context_compacted_since_change = pre_turn_compaction.is_some();
 
         let mut guardrail = if self.config.guardrail.enabled {
             Some(Guardrail::new(self.config, &self.request.model))
@@ -128,11 +135,8 @@ impl<'a> AgentLoop<'a> {
 
         let mut total_usage = Usage::default();
         let mut context_tokens = 0;
-        let mut overflow_retries: u32 = 0;
-        let mut live_provider_retries: u32 = 0;
         let mut proactive_compaction_exhausted = false;
         let mut final_assistant = None;
-        const MAX_OVERFLOW_RETRIES: u32 = 3;
         const MAX_LIVE_PROVIDER_RETRIES: u32 = 3;
 
         for iteration in 0..max_iter {
@@ -148,23 +152,31 @@ impl<'a> AgentLoop<'a> {
             {
                 let threshold = (context_window as f64 * self.config.compaction.fraction) as u64;
                 if approx_context_tokens(&context) > threshold {
-                    compaction::run_compaction(
+                    let outcome = compaction::maybe_compact_routed(
                         self.store,
                         self.config,
                         self.session_id,
-                        &self.request,
-                        self.provider.as_ref(),
-                        None,
-                        Some(self.renderer),
+                        &mut self.model,
+                        &mut self.provider,
+                        self.model_context_window,
+                        &mut live_provider_retries,
+                        self.renderer,
                     )
                     .await?;
+                    self.sync_effective_model();
                     context = self.load_context()?;
+                    context_compacted_since_change = outcome.is_some();
                     // If compaction could not get us back under the threshold
                     // (e.g. the retained recent turns alone are huge), stop
                     // retrying proactively this turn to avoid repeated
                     // summarize calls; the reactive guard still covers a true
                     // hard overflow.
-                    if approx_context_tokens(&context) > threshold {
+                    let active_threshold = self
+                        .model_context_window
+                        .map(|window| (window as f64 * self.config.compaction.fraction) as u64);
+                    if active_threshold
+                        .is_some_and(|threshold| approx_context_tokens(&context) > threshold)
+                    {
                         proactive_compaction_exhausted = true;
                     }
                 }
@@ -249,9 +261,7 @@ impl<'a> AgentLoop<'a> {
                 }
                 match result {
                     Ok(r) => break (exchange_id, r),
-                    Err(ProviderError::ContextLength)
-                        if overflow_retries < MAX_OVERFLOW_RETRIES =>
-                    {
+                    Err(ProviderError::ContextLength) if !context_compacted_since_change => {
                         self.store.fail_provider_exchange(
                             self.session_id,
                             &exchange_id,
@@ -261,18 +271,23 @@ impl<'a> AgentLoop<'a> {
                             None,
                         )?;
                         audit.abandon_provider_request();
-                        overflow_retries += 1;
-                        compaction::run_compaction(
+                        let outcome = compaction::run_compaction_routed(
                             self.store,
                             self.config,
                             self.session_id,
-                            &self.request,
-                            self.provider.as_ref(),
+                            &mut self.model,
+                            &mut self.provider,
+                            &mut live_provider_retries,
                             None,
                             Some(self.renderer),
                         )
                         .await?;
+                        if matches!(outcome, compaction::CompactionOutcome::NotNeeded { .. }) {
+                            bail!("context length exceeded and no history can be compacted");
+                        }
+                        self.sync_effective_model();
                         context = self.load_context()?;
+                        context_compacted_since_change = true;
                     }
                     Err(ProviderError::ContextLength) => {
                         self.store.fail_provider_exchange(
@@ -283,7 +298,7 @@ impl<'a> AgentLoop<'a> {
                             partial_response(&audit.current_partial_output).as_ref(),
                             None,
                         )?;
-                        bail!("context length exceeded even after compaction");
+                        bail!("context length exceeded immediately after compaction");
                     }
                     Err(error)
                         if error.retryable_for_live_turn()
@@ -299,6 +314,7 @@ impl<'a> AgentLoop<'a> {
                         )?;
                         audit.abandon_provider_request();
                         live_provider_retries += 1;
+                        command_headers = StreamingCommandHeaders::default();
                         self.renderer.turn_retry(
                             live_provider_retries as u64,
                             MAX_LIVE_PROVIDER_RETRIES as u64,
@@ -315,6 +331,16 @@ impl<'a> AgentLoop<'a> {
                             partial_response(&audit.current_partial_output).as_ref(),
                             None,
                         )?;
+                        audit.abandon_provider_request();
+                        let should_advance =
+                            error.retryable_for_live_turn() || error.fallback_immediately();
+                        if should_advance && self.advance_provider(&error.to_string())? {
+                            live_provider_retries = 0;
+                            command_headers = StreamingCommandHeaders::default();
+                            proactive_compaction_exhausted = false;
+                            context = self.load_context()?;
+                            continue;
+                        }
                         bail!("provider error: {error}")
                     }
                 }
@@ -357,6 +383,7 @@ impl<'a> AgentLoop<'a> {
             )?;
             audit.commit_provider_response();
             context.push(accepted_message.clone());
+            context_compacted_since_change = false;
 
             match stream_result.finish_reason {
                 FinishReason::Stop => {
@@ -428,7 +455,7 @@ impl<'a> AgentLoop<'a> {
                                         .and_then(|v| v.as_str())
                                         .unwrap_or("");
                                     self.renderer.guardrail_start()?;
-                                    let assessment = match g
+                                    let assessment_result = g
                                         .assess(
                                             &args_for_review,
                                             &context,
@@ -436,8 +463,9 @@ impl<'a> AgentLoop<'a> {
                                             self.session_id,
                                             bash_call_ids[cursor],
                                         )
-                                        .await
-                                    {
+                                        .await;
+                                    self.sync_model_from_history()?;
+                                    let assessment = match assessment_result {
                                         Ok(assessment) => assessment,
                                         Err(error) => {
                                             let message =
@@ -593,6 +621,7 @@ impl<'a> AgentLoop<'a> {
         Ok(TurnResult {
             usage: total_usage,
             context_tokens,
+            context_window: self.model_context_window,
             final_assistant,
         })
     }
@@ -603,6 +632,42 @@ impl<'a> AgentLoop<'a> {
     /// interrupted tail (synthesizing missing tool results) before the turn.
     fn load_context(&self) -> Result<Vec<Message>> {
         self.store.load_context_messages(self.session_id)
+    }
+
+    fn sync_effective_model(&mut self) {
+        let model = self.model.active_model().clone();
+        let provider_changed = self.request.model.provider_id != model.provider_id;
+        if provider_changed {
+            self.model_context_window = resolve_model_info(self.config, &model).context_window;
+        }
+        self.request.model = model;
+    }
+
+    fn sync_model_from_history(&mut self) -> Result<()> {
+        let previous_provider = self.model.active_model().provider_id.clone();
+        resume_session_fallback(self.store, self.config, self.session_id, &mut self.model)?;
+        if self.model.active_model().provider_id != previous_provider {
+            self.provider = crate::provider::build_provider(
+                self.config,
+                &self.model.active_model().provider_id,
+            )?;
+        }
+        self.sync_effective_model();
+        Ok(())
+    }
+
+    fn advance_provider(&mut self, reason: &str) -> Result<bool> {
+        let Some((previous, next_provider)) =
+            advance_provider(self.config, &mut self.model, &mut self.provider)?
+        else {
+            return Ok(false);
+        };
+        self.renderer.cancel_live_state()?;
+        self.renderer.notice(&format!(
+            "[mu] switching provider {previous} -> {next_provider} after {reason}"
+        ))?;
+        self.sync_effective_model();
+        Ok(true)
     }
 
     fn persist_bash_result(
@@ -1485,7 +1550,7 @@ fn guardrail_review_required(guardrail: Option<&Guardrail>, call: &ToolCall, arg
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
-    use std::sync::Mutex;
+    use std::sync::{Arc, Mutex};
 
     use async_trait::async_trait;
     use serde_json::Value;
@@ -1503,6 +1568,39 @@ mod tests {
     }
 
     struct PartialFailureProvider;
+
+    struct ContextAfterCompactionProvider {
+        counts: Arc<Mutex<(u32, u32)>>,
+    }
+
+    #[async_trait(?Send)]
+    impl Provider for ContextAfterCompactionProvider {
+        async fn stream_chat(
+            &self,
+            _request: &RequestOptions,
+            _messages: &[Message],
+            tools: &[Value],
+            _on_event: &mut dyn FnMut(crate::provider::StreamEvent) -> Result<(), ProviderError>,
+        ) -> Result<StreamResult, ProviderError> {
+            let mut counts = self.counts.lock().unwrap();
+            if tools.is_empty() {
+                counts.1 += 1;
+                return Ok(StreamResult {
+                    message: Message::Assistant {
+                        content: Some("summary".into()),
+                        reasoning_content: None,
+                        native_replay: None,
+                        tool_calls: None,
+                    },
+                    finish_reason: FinishReason::Stop,
+                    usage: None,
+                    native_response: None,
+                });
+            }
+            counts.0 += 1;
+            Err(ProviderError::ContextLength)
+        }
+    }
 
     #[async_trait(?Send)]
     impl Provider for PartialFailureProvider {
@@ -1704,6 +1802,7 @@ mod tests {
         let mut renderer = Renderer::with_format(OutputFormat::Detail);
         let mut agent = AgentLoop {
             config: &config,
+            model: ResolvedModelChoice::fixed(request_model.clone()),
             provider,
             store: &store,
             session_id: &session.id,
@@ -1764,6 +1863,71 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn repeated_context_error_after_compaction_is_fatal() {
+        let store = Store::open_memory().unwrap();
+        let session = store.create_session_seeded("system").unwrap();
+        for index in 0..3 {
+            store
+                .append_message(
+                    &session.id,
+                    &Message::User {
+                        content: UserContent::Text(format!("user {index}")),
+                    },
+                )
+                .unwrap();
+            store
+                .append_message(
+                    &session.id,
+                    &Message::Assistant {
+                        content: Some(format!("assistant {index}")),
+                        reasoning_content: None,
+                        native_replay: None,
+                        tool_calls: None,
+                    },
+                )
+                .unwrap();
+        }
+        store
+            .append_message(
+                &session.id,
+                &Message::User {
+                    content: UserContent::Text("current".into()),
+                },
+            )
+            .unwrap();
+        let config = test_config();
+        let request_model = crate::models::resolve_model_ref(&config, "test/fake-model").unwrap();
+        let counts = Arc::new(Mutex::new((0, 0)));
+        let mut renderer = Renderer::with_format(OutputFormat::Detail);
+        let mut agent = AgentLoop {
+            config: &config,
+            model: ResolvedModelChoice::fixed(request_model.clone()),
+            provider: Box::new(ContextAfterCompactionProvider {
+                counts: counts.clone(),
+            }),
+            store: &store,
+            session_id: &session.id,
+            request: RequestOptions {
+                model: request_model,
+            },
+            model_context_window: None,
+            renderer: &mut renderer,
+        };
+
+        let error = match agent.run_turn().await {
+            Ok(_) => panic!("expected repeated context error"),
+            Err(error) => error,
+        };
+
+        assert!(
+            error
+                .to_string()
+                .contains("context length exceeded immediately after compaction")
+        );
+        assert_eq!(*counts.lock().unwrap(), (2, 1));
+    }
+
+    #[tokio::test]
     async fn failed_partial_output_is_audited_but_excluded_from_history() {
         let tmp = std::env::temp_dir().join(format!("mu-agent-partial-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&tmp).unwrap();
@@ -1790,6 +1954,7 @@ mod tests {
         let mut renderer = Renderer::with_format(OutputFormat::Detail);
         let mut agent = AgentLoop {
             config: &config,
+            model: ResolvedModelChoice::fixed(request_model.clone()),
             provider: Box::new(PartialFailureProvider),
             store: &store,
             session_id: &session.id,
@@ -1860,6 +2025,7 @@ mod tests {
         let mut renderer = Renderer::with_format(OutputFormat::Detail);
         let mut agent = AgentLoop {
             config: &config,
+            model: ResolvedModelChoice::fixed(request_model.clone()),
             provider,
             store: &store,
             session_id: &session.id,
@@ -2051,6 +2217,7 @@ mod tests {
         let mut renderer = Renderer::with_format(OutputFormat::Detail);
         let mut agent = AgentLoop {
             config: &config,
+            model: ResolvedModelChoice::fixed(request_model.clone()),
             provider,
             store: &store,
             session_id: &session.id,
@@ -2183,6 +2350,7 @@ mod tests {
         let mut renderer = Renderer::with_format(OutputFormat::Detail);
         let mut agent = AgentLoop {
             config: &config,
+            model: ResolvedModelChoice::fixed(request_model.clone()),
             provider,
             store: &store,
             session_id: &session.id,
@@ -2279,6 +2447,7 @@ mod tests {
         let mut renderer = Renderer::with_format(OutputFormat::Detail);
         let mut agent = AgentLoop {
             config: &config,
+            model: ResolvedModelChoice::fixed(request_model.clone()),
             provider,
             store: &store,
             session_id: &session.id,

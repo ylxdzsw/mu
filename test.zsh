@@ -393,7 +393,7 @@ model_candidates=("${(@f)$(_mu_zsh_model_completion_candidates "")}")
 [[ " ${(j: :)model_candidates} " == *" solo "* ]] || fail "offers second unique unqualified model"
 [[ " ${(j: :)model_candidates} " == *" openai/shared "* ]] || fail "offers ambiguous model qualified"
 [[ " ${(j: :)model_candidates} " == *" local/shared "* ]] || fail "offers other ambiguous model qualified"
-[[ " ${(j: :)model_candidates} " != *" shared "* ]] || fail "does not offer ambiguous unqualified model"
+[[ " ${(j: :)model_candidates} " == *" shared "* ]] || fail "offers shared model as floating choice"
 [[ " ${(j: :)model_candidates} " != *":low "* ]] || fail "does not show variants before colon"
 model_candidates=("${(@f)$(_mu_zsh_model_completion_candidates "gpt")}")
 [[ " ${(j: :)model_candidates} " == *" gpt "* ]] || fail "keeps all base models available for zsh matching"
@@ -402,6 +402,7 @@ model_candidates=("${(@f)$(_mu_zsh_model_completion_candidates "gpt:")}")
 [[ " ${(j: :)model_candidates} " == *" gpt:low "* ]] || fail "shows unqualified variants after colon"
 [[ " ${(j: :)model_candidates} " == *" openai/gpt:high "* ]] || fail "shows provider-qualified variants after colon"
 [[ " ${(j: :)model_candidates} " == *" gpt:provider-custom "* ]] || fail "shows provider-defined effort strings"
+[[ " ${(j: :)model_candidates} " == *" shared:medium "* ]] || fail "merges floating-model effort suggestions"
 BUFFER="/model openai/gpt:h"
 CURSOR=${#BUFFER}
 completion_candidates=("${(@f)$(_mu_zsh_completion_candidates)}")

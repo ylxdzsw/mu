@@ -39,9 +39,9 @@ use attachment::MAX_ATTACHMENT_BYTES;
 use attachment::load_attachments;
 use cli::{Args, Command, ProjectSub, SessionSub};
 use config::Config;
-use models::RequestOptions;
+use models::{RequestOptions, ResolvedModelChoice};
+use provider::build_provider;
 use provider::{ContentPart, UserContent};
-use provider::{Provider, build_provider};
 use renderer::Renderer;
 use runtime::{
     InvocationOverrides, StatusIncludes, StatusReport, build_status_report, resolve_invocation,
@@ -102,11 +102,9 @@ struct LoadedPrompt {
 
 struct RunTurnArgs<'a> {
     config: &'a Config,
-    provider: Box<dyn Provider>,
     store: &'a store::Store,
     session_id: &'a str,
-    request: &'a RequestOptions,
-    model_context_window: Option<u64>,
+    model: ResolvedModelChoice,
     output: cli::OutputFormat,
     /// A short notice rendered before the turn (e.g. "resuming interrupted turn").
     preamble_notice: Option<&'a str>,
@@ -535,24 +533,18 @@ async fn run() -> Result<()> {
                 )
             })?;
 
-            let request = RequestOptions {
-                model: resolve_retry_model(
-                    &store,
-                    &config,
-                    &session,
-                    retry_args.selection.model.as_deref(),
-                )?,
-            };
-            let model_info = models::resolve_model_info(&config, &request.model);
-            let provider = build_provider(&config, &request.model.provider_id)?;
+            let model = resolve_retry_model(
+                &store,
+                &config,
+                &session,
+                retry_args.selection.model.as_deref(),
+            )?;
 
             run_turn(RunTurnArgs {
                 config: &config,
-                provider,
                 store: &store,
                 session_id: &session.id,
-                request: &request,
-                model_context_window: model_info.context_window,
+                model,
                 output,
                 preamble_notice: Some("[mu] resuming interrupted turn"),
             })
@@ -571,26 +563,29 @@ async fn run() -> Result<()> {
             let session_state = store
                 .get_session(&session)?
                 .ok_or_else(|| ExitError::session_not_found(&session))?;
+            let mut model = resolve_session_model(&store, &config, &session_state)?;
             let request = RequestOptions {
-                model: resolve_session_model(&store, &config, &session_state)?,
+                model: model.active_model().clone(),
             };
-            let model_info = models::resolve_model_info(&config, &request.model);
-            let provider = build_provider(&config, &request.model.provider_id)?;
+            let mut provider = build_provider(&config, &request.model.provider_id)?;
             let _lock = acquire_session_lock_or_exit(&store, &session, cli::OutputFormat::Detail)?;
             store.normalize_interrupted_tail(&session)?;
             let mut renderer =
                 Renderer::with_terminal_bell(cli::OutputFormat::Detail, None, config.line_wrapping);
             let started = Instant::now();
-            let outcome = compaction::run_compaction(
+            let mut retry_count = 0;
+            let outcome = compaction::run_compaction_routed(
                 &store,
                 &config,
                 &session,
-                &request,
-                provider.as_ref(),
+                &mut model,
+                &mut provider,
+                &mut retry_count,
                 custom_focus.as_deref(),
                 Some(&mut renderer),
             )
             .await?;
+            let model_info = models::resolve_model_info(&config, model.active_model());
             match outcome {
                 compaction::CompactionOutcome::Applied {
                     before_context_tokens,
@@ -655,9 +650,6 @@ async fn run_turn_from_source(
             model: model_override(turn.selection.model.clone(), loaded_prompt.model),
         },
     )?;
-    let model_info = models::resolve_model_info(config, &resolved.request.model);
-    let provider = build_provider(config, &resolved.request.model.provider_id)?;
-
     let session = if let Some(session) = resolved.attached_session.clone() {
         session
     } else {
@@ -690,11 +682,9 @@ async fn run_turn_from_source(
 
     run_turn(RunTurnArgs {
         config,
-        provider,
         store: &store,
         session_id: &session_id,
-        request: &resolved.request,
-        model_context_window: model_info.context_window,
+        model: resolved.model,
         output,
         preamble_notice: None,
     })
@@ -870,14 +860,17 @@ fn trim_trailing_newlines(text: &str) -> &str {
 async fn run_turn(args: RunTurnArgs<'_>) -> Result<()> {
     let RunTurnArgs {
         config,
-        provider,
         store,
         session_id,
-        request,
-        model_context_window,
+        model,
         output,
         preamble_notice,
     } = args;
+    let request = RequestOptions {
+        model: model.active_model().clone(),
+    };
+    let model_context_window = models::resolve_model_info(config, &request.model).context_window;
+    let provider = build_provider(config, &request.model.provider_id)?;
 
     let turn_done_bell_min_duration = config
         .terminal_bell
@@ -891,10 +884,11 @@ async fn run_turn(args: RunTurnArgs<'_>) -> Result<()> {
     }
     let mut agent = agent::AgentLoop {
         config,
+        model,
         provider,
         store,
         session_id,
-        request: request.clone(),
+        request,
         model_context_window,
         renderer: &mut renderer,
     };
@@ -903,8 +897,9 @@ async fn run_turn(args: RunTurnArgs<'_>) -> Result<()> {
 
     match &result {
         Ok(r) => {
-            let ctx_pct =
-                model_context_window.map(|cw| (r.context_tokens as f64 / cw as f64) * 100.0);
+            let ctx_pct = r
+                .context_window
+                .map(|cw| (r.context_tokens as f64 / cw as f64) * 100.0);
             renderer.finish_turn()?;
             if output == cli::OutputFormat::Final {
                 write_final_stdout(r.final_assistant.as_deref())?;

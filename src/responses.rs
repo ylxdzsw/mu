@@ -32,7 +32,7 @@ pub(crate) async fn stream(
         on_event(StreamEvent::ReasoningEnd)?;
     }
     if !state.terminal {
-        return Err(ProviderError::Other(
+        return Err(ProviderError::Transport(
             "Responses stream ended before response.completed".into(),
         ));
     }
@@ -58,6 +58,7 @@ pub(crate) async fn stream(
             reasoning_content: None,
             tool_calls: (!tool_calls.is_empty()).then_some(tool_calls),
             native_replay: state.replayable.then(|| NativeReplay {
+                provider_id: request.model.provider_id.clone(),
                 endpoint: provider.endpoint.clone(),
                 model: request.model.model_id.clone(),
                 payload: NativeReplayPayload::ResponsesOutput(output),
@@ -77,7 +78,13 @@ pub(crate) fn build_responses_request_body(
 ) -> Result<Value, ProviderError> {
     let mut input = Vec::new();
     for message in messages {
-        responses_input_items(message, endpoint, &request.model.model_id, &mut input)?;
+        responses_input_items(
+            message,
+            &request.model.provider_id,
+            endpoint,
+            &request.model.model_id,
+            &mut input,
+        )?;
     }
     let response_tools = tools
         .iter()
@@ -112,6 +119,7 @@ pub(crate) fn build_responses_request_body(
 
 fn responses_input_items(
     message: &Message,
+    provider_id: &str,
     endpoint: &str,
     model: &str,
     input: &mut Vec<Value>,
@@ -134,7 +142,7 @@ fn responses_input_items(
                 ..
             }) = native_replay
                 .as_ref()
-                .filter(|native| native.matches(endpoint, model))
+                .filter(|native| native.matches(provider_id, endpoint, model))
             {
                 input.extend(items.iter().cloned());
             } else {
@@ -391,6 +399,12 @@ fn responses_stream_error(error: &Value) -> ProviderError {
             body: message,
         },
         Some("rate_limit_exceeded") => ProviderError::RateLimit { message },
+        Some("authentication_error" | "invalid_api_key" | "model_not_found") => {
+            ProviderError::Unavailable(format!(
+                "{}: {message}",
+                error["code"].as_str().unwrap_or("provider unavailable")
+            ))
+        }
         Some(code) => ProviderError::Other(format!("{code}: {message}")),
         None => ProviderError::Other(message),
     }

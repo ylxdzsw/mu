@@ -8,7 +8,7 @@ use serde_json::Value;
 use tokio::time::{self, MissedTickBehavior};
 
 use crate::config::Config;
-use crate::models::RequestOptions;
+use crate::models::{RequestOptions, ResolvedModelChoice};
 
 #[derive(Debug, Clone)]
 pub enum Message {
@@ -25,7 +25,7 @@ pub enum Message {
         reasoning_content: Option<String>,
         tool_calls: Option<Vec<ToolCall>>,
         /// Exact protocol-native continuation state, replayed only when its
-        /// endpoint and wire model still match the current request.
+        /// provider, endpoint, and wire model still match the current request.
         native_replay: Option<NativeReplay>,
     },
     Tool {
@@ -37,6 +37,8 @@ pub enum Message {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct NativeReplay {
+    #[serde(default)]
+    pub provider_id: String,
     pub endpoint: String,
     pub model: String,
     pub payload: NativeReplayPayload,
@@ -51,8 +53,8 @@ pub enum NativeReplayPayload {
 }
 
 impl NativeReplay {
-    pub fn matches(&self, endpoint: &str, model: &str) -> bool {
-        self.endpoint == endpoint && self.model == model
+    pub fn matches(&self, provider_id: &str, endpoint: &str, model: &str) -> bool {
+        self.provider_id == provider_id && self.endpoint == endpoint && self.model == model
     }
 }
 
@@ -374,6 +376,7 @@ pub enum FinishReason {
 pub enum ProviderError {
     ContextLength,
     RateLimit { message: String },
+    Unavailable(String),
     HttpStatus { status: u16, body: String },
     Transport(String),
     SseParse(String),
@@ -385,6 +388,7 @@ impl fmt::Display for ProviderError {
         match self {
             Self::ContextLength => formatter.write_str("context length exceeded"),
             Self::RateLimit { message } => write!(formatter, "HTTP 429: {message}"),
+            Self::Unavailable(message) => formatter.write_str(message),
             Self::HttpStatus { status, body } => write!(formatter, "HTTP {status}: {body}"),
             Self::Transport(message) => write!(formatter, "transport error: {message}"),
             Self::SseParse(message) => write!(formatter, "SSE parse: {message}"),
@@ -400,6 +404,7 @@ impl ProviderError {
         match self {
             Self::ContextLength => "context_length",
             Self::RateLimit { .. } => "rate_limit",
+            Self::Unavailable(_) => "unavailable",
             Self::HttpStatus { .. } => "http",
             Self::Transport(_) => "transport",
             Self::SseParse(_) => "protocol",
@@ -412,9 +417,39 @@ impl ProviderError {
             ProviderError::RateLimit { .. } => true,
             ProviderError::HttpStatus { status, .. } => *status >= 500,
             ProviderError::Transport(_) => true,
-            ProviderError::ContextLength | ProviderError::SseParse(_) | ProviderError::Other(_) => {
-                false
+            ProviderError::ContextLength
+            | ProviderError::Unavailable(_)
+            | ProviderError::SseParse(_)
+            | ProviderError::Other(_) => false,
+        }
+    }
+
+    pub fn fallback_immediately(&self) -> bool {
+        match self {
+            ProviderError::Unavailable(_) => true,
+            ProviderError::HttpStatus {
+                status: 401 | 404, ..
+            } => true,
+            ProviderError::HttpStatus { status: 403, body } => {
+                let body = body.to_ascii_lowercase();
+                [
+                    "authentication",
+                    "authorization",
+                    "api key",
+                    "access denied",
+                    "permission",
+                    "model access",
+                    "model_not_found",
+                ]
+                .iter()
+                .any(|marker| body.contains(marker))
             }
+            ProviderError::ContextLength
+            | ProviderError::RateLimit { .. }
+            | ProviderError::HttpStatus { .. }
+            | ProviderError::Transport(_)
+            | ProviderError::SseParse(_)
+            | ProviderError::Other(_) => false,
         }
     }
 }
@@ -534,6 +569,20 @@ pub fn build_provider(config: &Config, provider_id: &str) -> anyhow::Result<Box<
         provider.endpoint.clone(),
         api_key,
     )?))
+}
+
+pub fn advance_provider(
+    config: &Config,
+    model: &mut ResolvedModelChoice,
+    provider: &mut Box<dyn Provider>,
+) -> anyhow::Result<Option<(String, String)>> {
+    let previous = model.active_model().provider_id.clone();
+    if !model.advance() {
+        return Ok(None);
+    }
+    let next = model.active_model().provider_id.clone();
+    *provider = build_provider(config, &next)?;
+    Ok(Some((previous, next)))
 }
 
 pub(crate) fn classify_http_error(status: u16, body: String) -> ProviderError {
@@ -669,5 +718,39 @@ mod tests {
         assert_eq!(request.headers()["x-api-key"], "test-key");
         assert_eq!(request.headers()["anthropic-version"], "2023-06-01");
         assert!(request.headers().get("authorization").is_none());
+    }
+
+    #[test]
+    fn fallback_policy_distinguishes_availability_from_request_errors() {
+        assert!(
+            ProviderError::HttpStatus {
+                status: 401,
+                body: "unauthorized".into(),
+            }
+            .fallback_immediately()
+        );
+        assert!(
+            ProviderError::HttpStatus {
+                status: 403,
+                body: r#"{"error":{"code":"model_not_found"}}"#.into(),
+            }
+            .fallback_immediately()
+        );
+        assert!(
+            !ProviderError::HttpStatus {
+                status: 403,
+                body: "content policy rejected the request".into(),
+            }
+            .fallback_immediately()
+        );
+        assert!(
+            !ProviderError::HttpStatus {
+                status: 400,
+                body: "unsupported reasoning effort".into(),
+            }
+            .fallback_immediately()
+        );
+        assert!(ProviderError::Transport("stream ended".into()).retryable_for_live_turn());
+        assert!(!ProviderError::SseParse("bad JSON".into()).retryable_for_live_turn());
     }
 }

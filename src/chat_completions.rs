@@ -143,6 +143,7 @@ pub(crate) async fn stream(
         tool_calls,
         native_replay: (!state.reasoning_content.is_empty() && has_tool_calls).then(|| {
             NativeReplay {
+                provider_id: request.model.provider_id.clone(),
                 endpoint: provider.endpoint.clone(),
                 model: request.model.model_id.clone(),
                 payload: NativeReplayPayload::ChatReasoning(state.reasoning_content),
@@ -207,7 +208,12 @@ pub(crate) fn build_chat_request_body(
 ) -> Value {
     let mut body = serde_json::json!({
         "model": request.model.model_id.as_str(),
-        "messages": chat_messages_json(messages, endpoint, &request.model.model_id),
+        "messages": chat_messages_json(
+            messages,
+            &request.model.provider_id,
+            endpoint,
+            &request.model.model_id
+        ),
         "tools": tools,
         "stream": true,
         "stream_options": { "include_usage": true }
@@ -221,11 +227,16 @@ pub(crate) fn build_chat_request_body(
     body
 }
 
-fn chat_messages_json(messages: &[Message], endpoint: &str, model: &str) -> Vec<Value> {
+fn chat_messages_json(
+    messages: &[Message],
+    provider_id: &str,
+    endpoint: &str,
+    model: &str,
+) -> Vec<Value> {
     let mut serialized = Vec::new();
     let mut pending_tool_attachments = Vec::new();
     for message in messages {
-        let mut values = chat_message_json(message, endpoint, model);
+        let mut values = chat_message_json(message, provider_id, endpoint, model);
         if matches!(message, Message::Tool { .. }) {
             serialized.push(values.remove(0));
             pending_tool_attachments.extend(values);
@@ -238,7 +249,12 @@ fn chat_messages_json(messages: &[Message], endpoint: &str, model: &str) -> Vec<
     serialized
 }
 
-fn chat_message_json(message: &Message, endpoint: &str, model: &str) -> Vec<Value> {
+fn chat_message_json(
+    message: &Message,
+    provider_id: &str,
+    endpoint: &str,
+    model: &str,
+) -> Vec<Value> {
     match message {
         Message::System { content } => vec![serde_json::json!({
             "role": "system",
@@ -263,7 +279,7 @@ fn chat_message_json(message: &Message, endpoint: &str, model: &str) -> Vec<Valu
                 ..
             }) = native_replay
                 .as_ref()
-                .filter(|native| native.matches(endpoint, model))
+                .filter(|native| native.matches(provider_id, endpoint, model))
             {
                 value["reasoning_content"] = Value::String(reasoning.clone());
             }
@@ -384,10 +400,24 @@ fn consume_sse_buffer(
                 serde_json::from_str(data).map_err(|e| ProviderError::SseParse(e.to_string()))?;
 
             if let Some(error) = parsed.error {
-                return Err(ProviderError::Other(format!(
-                    "stream error: {}",
-                    stream_error_message(&error)
-                )));
+                let message = stream_error_message(&error);
+                let code = error["code"]
+                    .as_str()
+                    .or_else(|| error["type"].as_str())
+                    .unwrap_or("");
+                return Err(match code {
+                    "server_error" => ProviderError::HttpStatus {
+                        status: 500,
+                        body: message,
+                    },
+                    "rate_limit_exceeded" | "rate_limit_error" => {
+                        ProviderError::RateLimit { message }
+                    }
+                    "authentication_error" | "invalid_api_key" | "model_not_found" => {
+                        ProviderError::Unavailable(format!("{code}: {message}"))
+                    }
+                    _ => ProviderError::Other(format!("stream error: {message}")),
+                });
             }
 
             if let Some(u) = parsed.usage {
@@ -668,19 +698,47 @@ mod tests {
     }
 
     #[test]
-    fn reports_in_stream_error_payload() {
+    fn classifies_in_stream_error_payloads() {
         let mut on_event = |_event: StreamEvent| -> Result<(), ProviderError> { Ok(()) };
-        let mut buffer =
-            "data: {\"error\":{\"message\":\"upstream unavailable\",\"type\":\"server_error\"}}\n\n"
-                .to_string();
-        let mut state = StreamParseState::default();
-
-        let error = consume_sse_buffer(&mut buffer, &mut state, &mut on_event).unwrap_err();
-
-        assert!(matches!(
-            error,
-            ProviderError::Other(message) if message == "stream error: upstream unavailable"
-        ));
+        for (frame, expected) in [
+            (
+                "data: {\"error\":{\"message\":\"upstream unavailable\",\"type\":\"server_error\"}}\n\n",
+                "server",
+            ),
+            (
+                "data: {\"error\":{\"message\":\"slow down\",\"code\":\"rate_limit_exceeded\"}}\n\n",
+                "rate_limit",
+            ),
+            (
+                "data: {\"error\":{\"message\":\"bad prompt\",\"code\":\"invalid_request_error\"}}\n\n",
+                "request",
+            ),
+        ] {
+            let error = consume_sse_buffer(
+                &mut frame.to_string(),
+                &mut StreamParseState::default(),
+                &mut on_event,
+            )
+            .unwrap_err();
+            match expected {
+                "server" => assert!(matches!(
+                    error,
+                    ProviderError::HttpStatus {
+                        status: 500,
+                        body
+                    } if body == "upstream unavailable"
+                )),
+                "rate_limit" => assert!(matches!(
+                    error,
+                    ProviderError::RateLimit { message } if message == "slow down"
+                )),
+                "request" => assert!(matches!(
+                    error,
+                    ProviderError::Other(message) if message == "stream error: bad prompt"
+                )),
+                _ => unreachable!(),
+            }
+        }
     }
 
     #[test]
@@ -893,6 +951,7 @@ mod tests {
                 },
             }]),
             native_replay: Some(NativeReplay {
+                provider_id: "test".into(),
                 endpoint: "https://api.test/v1/responses".into(),
                 model: "gpt-test".into(),
                 payload: NativeReplayPayload::ResponsesOutput(native_items.clone()),
@@ -1029,6 +1088,7 @@ mod tests {
             reasoning_content: Some("private chat reasoning".into()),
             tool_calls: Some(vec![call.clone()]),
             native_replay: Some(NativeReplay {
+                provider_id: "test".into(),
                 endpoint: CHAT_ENDPOINT.into(),
                 model: "gpt-test".into(),
                 payload: NativeReplayPayload::ChatReasoning("private chat reasoning".into()),
@@ -1051,6 +1111,7 @@ mod tests {
             reasoning_content: None,
             tool_calls: Some(vec![call]),
             native_replay: Some(NativeReplay {
+                provider_id: "test".into(),
                 endpoint: "https://api.test/v1/responses".into(),
                 model: "gpt-test".into(),
                 payload: NativeReplayPayload::ResponsesOutput(vec![serde_json::json!({
@@ -1202,6 +1263,7 @@ mod tests {
             reasoning_content: Some("  exact\\ntrace  ".into()),
             tool_calls: None,
             native_replay: Some(NativeReplay {
+                provider_id: "test".into(),
                 endpoint: CHAT_ENDPOINT.into(),
                 model: "gpt-test".into(),
                 payload: NativeReplayPayload::ChatReasoning("  exact\\ntrace  ".into()),
@@ -1229,6 +1291,21 @@ mod tests {
             &[],
         );
         assert!(mismatched["messages"][0].get("reasoning_content").is_none());
+        let mut other_provider = test_model(None);
+        other_provider.provider_id = "fallback".into();
+        let mismatched_provider = build_chat_request_body(
+            &RequestOptions {
+                model: other_provider,
+            },
+            CHAT_ENDPOINT,
+            &messages,
+            &[],
+        );
+        assert!(
+            mismatched_provider["messages"][0]
+                .get("reasoning_content")
+                .is_none()
+        );
     }
 
     #[test]

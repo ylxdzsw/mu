@@ -2,8 +2,8 @@ use anyhow::Result;
 
 use crate::bash;
 use crate::config::Config;
-use crate::models::RequestOptions;
-use crate::provider::{Message, Provider, StreamEvent};
+use crate::models::{RequestOptions, ResolvedModelChoice, resolve_model_info};
+use crate::provider::{Message, Provider, ProviderError, StreamEvent, advance_provider};
 use crate::renderer::Renderer;
 use crate::store::{CompactionCompletion, ProviderOrigin, Store};
 
@@ -21,6 +21,7 @@ material to the work.";
 /// text handed to the summarizer.
 const MAX_SUMMARY_ENTRY_CHARS: usize = 4000;
 const MAX_SUMMARY_TOOL_CHARS: usize = 2000;
+const MAX_PROVIDER_RETRIES: u32 = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CompactionOutcome {
@@ -50,6 +51,7 @@ fn clamp_for_summary(content: &str, max_chars: usize) -> String {
     format!("{head_str}\n…[{omitted} chars elided for summary]…\n{tail_str}")
 }
 
+#[cfg(test)]
 pub async fn maybe_compact(
     store: &Store,
     config: &Config,
@@ -59,21 +61,7 @@ pub async fn maybe_compact(
     provider: &dyn Provider,
     renderer: &mut Renderer,
 ) -> Result<()> {
-    let session = store
-        .get_session(session_id)?
-        .ok_or_else(|| anyhow::anyhow!("session not found"))?;
-
-    let threshold = config.compaction.fraction;
-
-    let tokens = if let Some(tokens) = session.reported_context_tokens {
-        tokens
-    } else {
-        store.estimate_context_tokens(session_id)?
-    };
-
-    let should_compact = context_window.is_some_and(|cw| (tokens as f64) > (cw as f64 * threshold));
-
-    if should_compact {
+    if compaction_needed(store, config, session_id, context_window)? {
         run_compaction(
             store,
             config,
@@ -86,6 +74,159 @@ pub async fn maybe_compact(
         .await?;
     }
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn maybe_compact_routed(
+    store: &Store,
+    config: &Config,
+    session_id: &str,
+    model: &mut ResolvedModelChoice,
+    provider: &mut Box<dyn Provider>,
+    context_window: Option<u64>,
+    retry_count: &mut u32,
+    renderer: &mut Renderer,
+) -> Result<Option<CompactionOutcome>> {
+    if !compaction_needed(store, config, session_id, context_window)? {
+        return Ok(None);
+    }
+    run_compaction_routed_inner(
+        store,
+        config,
+        session_id,
+        model,
+        provider,
+        retry_count,
+        None,
+        Some(renderer),
+        true,
+    )
+    .await
+    .map(|(outcome, attempted)| attempted.then_some(outcome))
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn run_compaction_routed(
+    store: &Store,
+    config: &Config,
+    session_id: &str,
+    model: &mut ResolvedModelChoice,
+    provider: &mut Box<dyn Provider>,
+    retry_count: &mut u32,
+    custom_focus: Option<&str>,
+    renderer: Option<&mut Renderer>,
+) -> Result<CompactionOutcome> {
+    run_compaction_routed_inner(
+        store,
+        config,
+        session_id,
+        model,
+        provider,
+        retry_count,
+        custom_focus,
+        renderer,
+        false,
+    )
+    .await
+    .map(|(outcome, _)| outcome)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_compaction_routed_inner(
+    store: &Store,
+    config: &Config,
+    session_id: &str,
+    model: &mut ResolvedModelChoice,
+    provider: &mut Box<dyn Provider>,
+    retry_count: &mut u32,
+    custom_focus: Option<&str>,
+    mut renderer: Option<&mut Renderer>,
+    recheck_after_switch: bool,
+) -> Result<(CompactionOutcome, bool)> {
+    let mut switched = false;
+    loop {
+        let context_window = resolve_model_info(config, model.active_model()).context_window;
+        if switched
+            && recheck_after_switch
+            && !compaction_needed(store, config, session_id, context_window)?
+        {
+            return Ok((
+                CompactionOutcome::NotNeeded {
+                    keep_recent_turns: config.compaction.keep_recent_turns,
+                },
+                false,
+            ));
+        }
+        switched = false;
+        let request = RequestOptions {
+            model: model.active_model().clone(),
+        };
+        match run_compaction(
+            store,
+            config,
+            session_id,
+            &request,
+            provider.as_ref(),
+            custom_focus,
+            renderer.as_deref_mut(),
+        )
+        .await
+        {
+            Ok(outcome) => return Ok((outcome, true)),
+            Err(error) => {
+                let Some(provider_error) = error.downcast_ref::<ProviderError>() else {
+                    return Err(error);
+                };
+                if matches!(provider_error, ProviderError::ContextLength) {
+                    return Err(error);
+                }
+                let reason = provider_error.to_string();
+                if provider_error.retryable_for_live_turn() && *retry_count < MAX_PROVIDER_RETRIES {
+                    *retry_count += 1;
+                    if let Some(renderer) = renderer.as_deref_mut() {
+                        renderer.turn_retry(
+                            *retry_count as u64,
+                            MAX_PROVIDER_RETRIES as u64,
+                            &reason,
+                        )?;
+                    }
+                    continue;
+                }
+                if (provider_error.retryable_for_live_turn()
+                    || provider_error.fallback_immediately())
+                    && let Some((previous, next)) = advance_provider(config, model, provider)?
+                {
+                    *retry_count = 0;
+                    switched = true;
+                    if let Some(renderer) = renderer.as_deref_mut() {
+                        renderer.notice(&format!(
+                            "[mu] switching provider {previous} -> {next} after {reason}"
+                        ))?;
+                    }
+                    continue;
+                }
+                return Err(error);
+            }
+        }
+    }
+}
+
+fn compaction_needed(
+    store: &Store,
+    config: &Config,
+    session_id: &str,
+    context_window: Option<u64>,
+) -> Result<bool> {
+    let session = store
+        .get_session(session_id)?
+        .ok_or_else(|| anyhow::anyhow!("session not found"))?;
+    let tokens = if let Some(tokens) = session.reported_context_tokens {
+        tokens
+    } else {
+        store.estimate_context_tokens(session_id)?
+    };
+    Ok(context_window
+        .is_some_and(|window| (tokens as f64) > (window as f64 * config.compaction.fraction)))
 }
 
 pub async fn run_compaction(
@@ -258,7 +399,7 @@ pub async fn run_compaction(
                 None,
                 None,
             )?;
-            return Err(anyhow::anyhow!("compaction failed: {error}"));
+            return Err(anyhow::Error::new(error).context("compaction failed"));
         }
     };
     let content = match &result.message {
@@ -800,6 +941,10 @@ mod tests {
         .unwrap_err();
 
         assert!(error.to_string().contains("compaction failed"));
+        assert!(matches!(
+            error.downcast_ref::<ProviderError>(),
+            Some(ProviderError::ContextLength)
+        ));
         assert_eq!(store.latest_summary_sequence(&session.id).unwrap(), None);
     }
 }

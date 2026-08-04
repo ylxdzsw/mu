@@ -390,12 +390,6 @@ function _mu_fish_model_candidates --argument-names fragment
     test (count $records) -gt 0; or set records (_mu_fish_model_records 2>/dev/null)
     test (count $records) -gt 0; or return 0
 
-    set -l model_ids
-    for record in $records
-        set -l fields (string split \t -- "$record")
-        set -q fields[2]; and test -n "$fields[2]"; and set -a model_ids "$fields[2]"
-    end
-
     set -l matches
     for record in $records
         set -l fields (string split \t -- "$record")
@@ -403,22 +397,20 @@ function _mu_fish_model_candidates --argument-names fragment
         set -l model_id "$fields[2]"
         set -l efforts
         set -q fields[3]; and set efforts (string split , -- "$fields[3]")
-        set -l id_count 0
-        test -n "$model_id"; and set id_count (count (string match -- "$model_id" $model_ids))
 
         if string match -q '*:*' -- "$fragment"
             for effort in $efforts
                 test -n "$effort"; or continue
-                set -a matches "$canonical:$effort"
-                test -n "$model_id"; and test $id_count -eq 1; and set -a matches "$model_id:$effort"
+                test -n "$canonical"; and not contains -- "$canonical:$effort" $matches; and set -a matches "$canonical:$effort"
+                test -n "$model_id"; and not contains -- "$model_id:$effort" $matches; and set -a matches "$model_id:$effort"
             end
         else
-            test -n "$canonical"; and set -a matches "$canonical"
-            test -n "$model_id"; and test $id_count -eq 1; and set -a matches "$model_id"
+            test -n "$canonical"; and not contains -- "$canonical" $matches; and set -a matches "$canonical"
+            test -n "$model_id"; and not contains -- "$model_id" $matches; and set -a matches "$model_id"
         end
     end
 
-    printf '%s\n' $matches | sort -u
+    printf '%s\n' $matches
 end
 
 function _mu_fish_model_effort_suffixes --argument-names fragment
@@ -428,30 +420,21 @@ function _mu_fish_model_effort_suffixes --argument-names fragment
 
     set -l records $argv
     test (count $records) -gt 0; or set records (_mu_fish_model_records 2>/dev/null)
-    set -l model_ids
-    for record in $records
-        set -l fields (string split \t -- "$record")
-        set -q fields[2]; and test -n "$fields[2]"; and set -a model_ids "$fields[2]"
-    end
-
+    set -l matches
     for record in $records
         set -l fields (string split \t -- "$record")
         set -l canonical "$fields[1]"
         set -l model_id "$fields[2]"
-        set -l id_count 0
-        test -n "$model_id"; and set id_count (count (string match -- "$model_id" $model_ids))
-        if test "$fragment" != "$canonical"
-            and begin
-                test "$fragment" != "$model_id"; or test $id_count -ne 1
-            end
+        if test "$fragment" != "$canonical"; and test "$fragment" != "$model_id"
             continue
         end
-        set -q fields[3]; or return 0
+        set -q fields[3]; or continue
         for effort in (string split , -- "$fields[3]")
-            test -n "$effort"; and printf ':%s\n' "$effort"
+            test -n "$effort"; or continue
+            not contains -- ":$effort" $matches; and set -a matches ":$effort"
         end
-        return 0
     end
+    printf '%s\n' $matches
 end
 
 function _mu_fish_native_model_candidates

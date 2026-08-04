@@ -6,8 +6,9 @@ use serde_json::{Value, json};
 
 use crate::bash::BashRisk;
 use crate::config::{Config, GuardrailConfig};
-use crate::models::{RequestOptions, ResolvedModelRef};
+use crate::models::{RequestOptions, ResolvedModelRef, resolve_model_choice};
 use crate::provider::{Message, ProviderError, approx_tokens};
+use crate::runtime::resume_session_fallback;
 use crate::store::{GuardrailCompletion, ProviderOrigin, RequestSubject, Store};
 use crate::{bash, provider};
 
@@ -140,11 +141,13 @@ impl Guardrail {
         bash_call_id: i64,
     ) -> anyhow::Result<Assessment> {
         bash::install_signal_forwarder();
-        let request_model = match self.config.review_model.as_deref() {
-            Some(model_ref) => crate::models::resolve_model_ref(&self.runtime, model_ref)?,
-            None => self.active_model.clone(),
+        let mut model = match self.config.review_model.as_deref() {
+            Some(model_ref) => resolve_model_choice(&self.runtime, model_ref)?,
+            None => resolve_model_choice(&self.runtime, &self.active_model.canonical)?,
         };
-        let provider = provider::build_provider(&self.runtime, &request_model.provider_id)?;
+        resume_session_fallback(store, &self.runtime, session_id, &mut model)?;
+        let mut provider =
+            provider::build_provider(&self.runtime, &model.active_model().provider_id)?;
         let system_prompt = POLICY_PROMPT.to_string();
         let user_content = build_reviewer_user_content(context, action);
         let msgs = vec![
@@ -155,20 +158,19 @@ impl Guardrail {
                 content: user_content.into(),
             },
         ];
-        let request = RequestOptions {
-            model: request_model.clone(),
-        };
         let tools = Vec::new();
-        let native_request = provider.native_request(&request, &msgs, &tools)?;
         let timeout = Duration::from_secs(self.config.timeout_seconds);
-        let mut last_error = String::new();
+        let mut attempt = 0;
+        let mut parse_attempts = 0;
+        let mut provider_retries = 0;
 
-        for attempt_index in 0..MAX_ATTEMPTS {
-            if attempt_index > 0 {
-                let backoff = Duration::from_secs(1 << (attempt_index - 1));
-                tokio::time::sleep(backoff).await;
-            }
-            let attempt = attempt_index + 1;
+        loop {
+            attempt += 1;
+            let request_model = model.active_model().clone();
+            let request = RequestOptions {
+                model: request_model.clone(),
+            };
+            let native_request = provider.native_request(&request, &msgs, &tools)?;
             let recipe = store.request_recipe(
                 provider.request_format(),
                 &native_request,
@@ -209,7 +211,7 @@ impl Guardrail {
 
             match result {
                 Err(_elapsed) => {
-                    last_error =
+                    let last_error =
                         format!("reviewer timed out after {}s", self.config.timeout_seconds);
                     store.fail_provider_exchange(
                         session_id,
@@ -219,10 +221,23 @@ impl Guardrail {
                         None,
                         None,
                     )?;
-                    continue;
+                    if provider_retries < MAX_ATTEMPTS {
+                        provider_retries += 1;
+                        tokio::time::sleep(Duration::from_secs(1 << (provider_retries - 1))).await;
+                        continue;
+                    }
+                    if provider::advance_provider(&self.runtime, &mut model, &mut provider)?
+                        .is_some()
+                    {
+                        provider_retries = 0;
+                        continue;
+                    }
+                    anyhow::bail!(
+                        "reviewer failed after provider retries were exhausted: {last_error}"
+                    );
                 }
                 Ok(Err(ProviderError::ContextLength)) => {
-                    last_error = "reviewer context length exceeded".to_string();
+                    let last_error = "reviewer context length exceeded".to_string();
                     store.fail_provider_exchange(
                         session_id,
                         &exchange_id,
@@ -234,7 +249,7 @@ impl Guardrail {
                     anyhow::bail!("{last_error}");
                 }
                 Ok(Err(error)) => {
-                    last_error = error.to_string();
+                    let last_error = error.to_string();
                     store.fail_provider_exchange(
                         session_id,
                         &exchange_id,
@@ -243,7 +258,19 @@ impl Guardrail {
                         None,
                         None,
                     )?;
-                    continue;
+                    if error.retryable_for_live_turn() && provider_retries < MAX_ATTEMPTS {
+                        provider_retries += 1;
+                        tokio::time::sleep(Duration::from_secs(1 << (provider_retries - 1))).await;
+                        continue;
+                    }
+                    if (error.retryable_for_live_turn() || error.fallback_immediately())
+                        && provider::advance_provider(&self.runtime, &mut model, &mut provider)?
+                            .is_some()
+                    {
+                        provider_retries = 0;
+                        continue;
+                    }
+                    anyhow::bail!("reviewer provider error: {last_error}");
                 }
                 Ok(Ok(stream_result)) => {
                     let content = match &stream_result.message {
@@ -276,7 +303,8 @@ impl Guardrail {
                             return Ok(assessment);
                         }
                         Err(e) => {
-                            last_error = format!("parse error: {e}");
+                            parse_attempts += 1;
+                            let last_error = format!("parse error: {e}");
                             store.fail_provider_exchange(
                                 session_id,
                                 &exchange_id,
@@ -285,14 +313,19 @@ impl Guardrail {
                                 stream_result.native_response.as_ref(),
                                 stream_result.usage.as_ref(),
                             )?;
+                            if parse_attempts >= MAX_ATTEMPTS {
+                                anyhow::bail!(
+                                    "reviewer failed after {MAX_ATTEMPTS} parse attempts: {last_error}"
+                                );
+                            }
+                            tokio::time::sleep(Duration::from_secs(1 << (parse_attempts - 1)))
+                                .await;
                             continue;
                         }
                     }
                 }
             }
         }
-
-        anyhow::bail!("reviewer failed after {MAX_ATTEMPTS} attempts: {last_error}")
     }
 
     pub fn denial_limit_reached(&self) -> Option<u32> {
