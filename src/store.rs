@@ -1676,10 +1676,6 @@ impl Store {
                 event,
             };
             Arc::make_mut(&mut locked.journal.events).push(line.clone());
-            if let Err(error) = validate_events(&locked.journal.events) {
-                Arc::make_mut(&mut locked.journal.events).pop();
-                return Err(error);
-            }
             let offset = locked.file.seek(SeekFrom::End(0))?;
             if let Err(error) = write_json_line(&mut locked.file, &line)
                 .and_then(|()| locked.file.sync_data().map_err(Into::into))
@@ -2876,6 +2872,28 @@ mod tests {
                 .matches("\"seq\":2")
                 .count(),
             1
+        );
+    }
+
+    #[test]
+    fn reopening_validates_events_written_by_the_typed_append_path() {
+        let store = Store::open_memory().unwrap();
+        let session = store.create_session_seeded("system").unwrap();
+        store
+            .append(
+                &session.id,
+                Event::ProviderInterrupted {
+                    exchange_id: "unknown".into(),
+                },
+            )
+            .unwrap();
+
+        let reopened = Store::open(&store.root).unwrap();
+        let error = reopened.get_session(&session.id).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("provider terminal event references unknown exchange")
         );
     }
 
