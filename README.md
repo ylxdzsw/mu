@@ -277,6 +277,13 @@ Reorder providers in `config.jsonc` to change fallback order or the fixed
 default. Any OpenAI-compatible endpoint works; edit the endpoint, API-key
 environment variable, and model list to match your provider.
 
+Native reasoning and continuation state is replayed only between models using
+the same API and effective `replay_key`. A model entry defaults to its literal
+`provider/model`; set the same non-secret `replay_key` on explicitly compatible
+provider/model entries to carry native replay across fallback or model changes.
+Keys are resolved from the current config for every request, so changing one
+immediately changes how retained session history is sent.
+
 ## Configuration and project scope
 
 Global configuration and state live in `~/.mu`. Inside a project—the nearest

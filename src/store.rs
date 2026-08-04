@@ -1332,6 +1332,20 @@ impl Store {
                 .as_i64()
                 .context("agent request recipe has no context boundary")?;
             let messages = self.context_until(&journal, through_seq)?;
+            let messages = if let Some(origins) = recipe.input.get("native_replay_origins") {
+                let origins: Vec<crate::provider::ReplayOrigin> =
+                    serde_json::from_value(origins.clone())
+                        .context("invalid native replay origins in request recipe")?;
+                crate::provider::filter_native_replay_for_origins(&messages, &origin.api, &origins)
+            } else {
+                crate::provider::filter_native_replay_for_legacy_origin(
+                    &messages,
+                    &origin.api,
+                    &origin.provider_id,
+                    &origin.endpoint,
+                    &origin.wire_model,
+                )
+            };
             let tools = self.read_object(&recipe.toolset)?;
             let tools: Vec<Value> = serde_json::from_slice(&tools)?;
             let options = RequestOptions {
@@ -1429,6 +1443,18 @@ impl Store {
             _ => None,
         });
         let mut messages = vec![Message::System { content: system }];
+        let exchange_origins = journal
+            .events
+            .iter()
+            .filter_map(|line| match &line.event {
+                Event::ProviderRequested {
+                    exchange_id,
+                    origin,
+                    ..
+                } => Some((exchange_id.as_str(), origin)),
+                _ => None,
+            })
+            .collect::<HashMap<_, _>>();
         if let Some(line) = compaction
             && let Event::ProviderCompleted {
                 projection: Projection::Compaction { summary, .. },
@@ -1469,6 +1495,7 @@ impl Store {
                     });
                 }
                 Event::ProviderCompleted {
+                    exchange_id,
                     projection:
                         Projection::Assistant {
                             text,
@@ -1478,23 +1505,32 @@ impl Store {
                             ..
                         },
                     ..
-                } => messages.push(Message::Assistant {
-                    content: text.clone(),
-                    reasoning_content: reasoning_content.clone(),
-                    tool_calls: (!bash_calls.is_empty()).then(|| {
-                        bash_calls
-                            .iter()
-                            .map(|call| ToolCall {
-                                id: call.provider_call_id.clone(),
-                                function: crate::provider::FunctionCall {
-                                    name: call.name.clone(),
-                                    arguments: call.arguments.clone(),
-                                },
-                            })
-                            .collect()
-                    }),
-                    native_replay: native_replay.clone(),
-                }),
+                } => {
+                    let mut native_replay = native_replay.clone();
+                    if let Some(native) = &mut native_replay
+                        && native.provider_id.is_empty()
+                        && let Some(origin) = exchange_origins.get(exchange_id.as_str())
+                    {
+                        native.provider_id = origin.provider_id.clone();
+                    }
+                    messages.push(Message::Assistant {
+                        content: text.clone(),
+                        reasoning_content: reasoning_content.clone(),
+                        tool_calls: (!bash_calls.is_empty()).then(|| {
+                            bash_calls
+                                .iter()
+                                .map(|call| ToolCall {
+                                    id: call.provider_call_id.clone(),
+                                    function: crate::provider::FunctionCall {
+                                        name: call.name.clone(),
+                                        arguments: call.arguments.clone(),
+                                    },
+                                })
+                                .collect()
+                        }),
+                        native_replay,
+                    });
+                }
                 Event::BashCompleted {
                     call_id,
                     output,
@@ -2817,6 +2853,121 @@ mod tests {
                     endpoint: endpoint.into(),
                     wire_model: options.model.model_id.clone(),
                     effort: options.model.effort.clone(),
+                },
+                recipe,
+                None,
+            )
+            .unwrap();
+
+        assert_eq!(
+            store
+                .reconstruct_provider_request(&session.id, &exchange)
+                .unwrap(),
+            native
+        );
+    }
+
+    #[test]
+    fn legacy_replay_origin_and_recorded_selection_reconstruct_exactly() {
+        let store = Store::open_memory().unwrap();
+        let session = store.create_session_seeded("system").unwrap();
+        store
+            .start_turn(&session.id, "/tmp", None, &"run".into())
+            .unwrap();
+        let (_, call_ids) = store
+            .append_message_with_bash_calls(
+                &session.id,
+                &Message::Assistant {
+                    content: None,
+                    reasoning_content: Some("trace".into()),
+                    tool_calls: Some(vec![ToolCall {
+                        id: "provider-call".into(),
+                        function: FunctionCall {
+                            name: "bash".into(),
+                            arguments: r#"{"risk":"readonly","command":"pwd"}"#.into(),
+                        },
+                    }]),
+                    native_replay: Some(NativeReplay {
+                        provider_id: String::new(),
+                        endpoint: String::new(),
+                        model: "model".into(),
+                        payload: crate::provider::NativeReplayPayload::ChatReasoning(
+                            "trace".into(),
+                        ),
+                    }),
+                },
+            )
+            .unwrap();
+        store
+            .persist_bash_result(
+                &session.id,
+                BashResultRecord {
+                    bash_call_id: call_ids[0],
+                    outcome: "completed",
+                    exit_code: Some(0),
+                    duration_ms: Some(1),
+                },
+                "/tmp",
+                &[],
+            )
+            .unwrap();
+
+        let messages = store.load_context_messages(&session.id).unwrap();
+        let replay = messages.iter().find_map(|message| match message {
+            Message::Assistant {
+                native_replay: Some(native),
+                ..
+            } => Some(native),
+            _ => None,
+        });
+        assert_eq!(replay.unwrap().provider_id, "test");
+
+        let replay_origins = crate::provider::native_replay_origins(&messages);
+        let request_messages = crate::provider::filter_native_replay_for_origins(
+            &messages,
+            "chat_completions",
+            &replay_origins,
+        );
+        let options = RequestOptions {
+            model: ResolvedModelRef {
+                canonical: "target/other-model".into(),
+                provider_id: "target".into(),
+                model_id: "other-model".into(),
+                effort: None,
+            },
+        };
+        let endpoint = "https://target.test/v1/chat/completions";
+        let tools = vec![serde_json::json!({"type":"function","function":{"name":"bash"}})];
+        let native = crate::chat_completions::build_chat_request_body(
+            &options,
+            endpoint,
+            &request_messages,
+            &tools,
+        );
+        let recipe = store
+            .request_recipe(
+                "openai.chat_completions.v1",
+                &native,
+                serde_json::json!({
+                    "kind": "agent",
+                    "context_through_seq": store.current_context_seq(&session.id).unwrap(),
+                    "native_replay_origins": replay_origins,
+                }),
+                &tools,
+            )
+            .unwrap();
+        let exchange = store
+            .start_provider_request(
+                &session.id,
+                &store.current_turn_id(&session.id).unwrap(),
+                "agent",
+                ProviderOrigin {
+                    canonical_model_ref: options.model.canonical.clone(),
+                    provider_id: options.model.provider_id.clone(),
+                    api: "chat_completions".into(),
+                    endpoint: endpoint.into(),
+                    wire_model: options.model.model_id.clone(),
+                    effort: None,
                 },
                 recipe,
                 None,

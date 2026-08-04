@@ -861,6 +861,7 @@ mod tests {
                         ModelConfig {
                             context_window: Some(128_000),
                             supported_efforts: None,
+                            replay_key: None,
                         },
                     )]),
                 },

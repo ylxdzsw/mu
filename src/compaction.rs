@@ -544,6 +544,7 @@ mod tests {
                         crate::config::ModelConfig {
                             context_window: None,
                             supported_efforts: None,
+                            replay_key: None,
                         },
                     )]),
                 },

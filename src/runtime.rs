@@ -29,6 +29,7 @@ pub struct StatusModel {
     pub model_id: String,
     pub effort: Option<String>,
     pub canonical: String,
+    pub replay_key: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -259,7 +260,7 @@ pub fn build_status_report(
         .map(|session| store.is_session_clean(&session.id))
         .transpose()?
         .unwrap_or(true);
-    let model = status_model(resolved.model.active_model());
+    let model = status_model(config, resolved.model.active_model());
     let context_usage = context_usage(store, resolved.attached_session.as_ref())?;
 
     Ok(StatusReport {
@@ -284,12 +285,13 @@ pub fn build_status_report(
     })
 }
 
-fn status_model(model: &ResolvedModelRef) -> StatusModel {
+fn status_model(config: &Config, model: &ResolvedModelRef) -> StatusModel {
     StatusModel {
         provider_id: model.provider_id.clone(),
         model_id: model.model_id.clone(),
         effort: model.effort.clone(),
         canonical: model.canonical.clone(),
+        replay_key: config.replay_key(&model.provider_id, &model.model_id),
     }
 }
 
@@ -401,6 +403,7 @@ mod tests {
                                 ModelConfig {
                                     context_window: Some(100),
                                     supported_efforts: Some(vec!["low".into(), "high".into()]),
+                                    replay_key: None,
                                 },
                             ),
                             (
@@ -408,6 +411,7 @@ mod tests {
                                 ModelConfig {
                                     context_window: Some(100),
                                     supported_efforts: None,
+                                    replay_key: None,
                                 },
                             ),
                         ]),
@@ -424,6 +428,7 @@ mod tests {
                                 ModelConfig {
                                     context_window: Some(200),
                                     supported_efforts: None,
+                                    replay_key: None,
                                 },
                             ),
                             (
@@ -431,6 +436,7 @@ mod tests {
                                 ModelConfig {
                                     context_window: Some(200),
                                     supported_efforts: None,
+                                    replay_key: None,
                                 },
                             ),
                         ]),
@@ -447,6 +453,7 @@ mod tests {
                                 ModelConfig {
                                     context_window: Some(300),
                                     supported_efforts: None,
+                                    replay_key: None,
                                 },
                             ),
                             (
@@ -454,6 +461,7 @@ mod tests {
                                 ModelConfig {
                                     context_window: Some(300),
                                     supported_efforts: None,
+                                    replay_key: None,
                                 },
                             ),
                         ]),

@@ -185,15 +185,25 @@ impl<'a> AgentLoop<'a> {
             let mut command_headers = StreamingCommandHeaders::default();
             let (exchange_id, stream_result) = loop {
                 audit.begin_provider_request();
-                let native_request =
-                    self.provider
-                        .native_request(&self.request, &context, &tool_definitions)?;
+                let request_context = crate::provider::filter_native_replay_for_config(
+                    &context,
+                    self.config,
+                    &self.request.model,
+                    self.provider.api_name(),
+                );
+                let native_request = self.provider.native_request(
+                    &self.request,
+                    &request_context,
+                    &tool_definitions,
+                )?;
                 let recipe = self.store.request_recipe(
                     self.provider.request_format(),
                     &native_request,
                     serde_json::json!({
                         "kind": "agent",
-                        "context_through_seq": self.store.current_context_seq(self.session_id)?
+                        "context_through_seq": self.store.current_context_seq(self.session_id)?,
+                        "native_replay_origins":
+                            crate::provider::native_replay_origins(&request_context),
                     }),
                     &tool_definitions,
                 )?;
@@ -243,7 +253,7 @@ impl<'a> AgentLoop<'a> {
                     .provider
                     .stream_chat(
                         &self.request,
-                        &context,
+                        &request_context,
                         &tool_definitions,
                         &mut on_stream_event,
                     )
@@ -1757,6 +1767,7 @@ mod tests {
                         crate::config::ModelConfig {
                             context_window: None,
                             supported_efforts: None,
+                            replay_key: None,
                         },
                     )]),
                 },

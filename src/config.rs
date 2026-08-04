@@ -193,6 +193,8 @@ pub struct ModelConfig {
     pub context_window: Option<u64>,
     #[serde(default)]
     pub supported_efforts: Option<Vec<String>>,
+    #[serde(default)]
+    pub replay_key: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -438,6 +440,17 @@ impl Config {
             crate::provider::classify_endpoint(&provider.endpoint).map_err(|error| {
                 anyhow::anyhow!("invalid provider `{provider_id}` in config.jsonc: {error}")
             })?;
+            for (model_id, model) in &provider.models {
+                if model
+                    .replay_key
+                    .as_deref()
+                    .is_some_and(|key| key.trim().is_empty())
+                {
+                    bail!(
+                        "model `{provider_id}/{model_id}` has an empty `replay_key` in config.jsonc"
+                    );
+                }
+            }
         }
         Ok(())
     }
@@ -445,6 +458,12 @@ impl Config {
     pub fn validate_runtime(&self) -> Result<()> {
         self.validate_structure()?;
         crate::models::validate_config(self)
+    }
+
+    pub fn replay_key(&self, provider_id: &str, model_id: &str) -> String {
+        self.model_config(provider_id, model_id)
+            .and_then(|model| model.replay_key.clone())
+            .unwrap_or_else(|| format!("{provider_id}/{model_id}"))
     }
 }
 
@@ -879,6 +898,47 @@ mod tests {
             .as_ref()
             .unwrap();
         assert_eq!(efforts, &["none", "minimal", "provider-custom"]);
+    }
+
+    #[test]
+    fn replay_key_is_optional_dynamic_model_metadata() {
+        let config = config_from_value(serde_json::json!({
+            "providers": {
+                "alpha": {
+                    "endpoint": "https://alpha.test/chat/completions",
+                    "models": {
+                        "shared": {
+                            "context_window": 128000,
+                            "replay_key": "compatible-family"
+                        },
+                        "defaulted": {
+                            "context_window": 128000
+                        }
+                    }
+                }
+            }
+        }))
+        .unwrap();
+
+        assert_eq!(config.replay_key("alpha", "shared"), "compatible-family");
+        assert_eq!(config.replay_key("alpha", "defaulted"), "alpha/defaulted");
+
+        let error = config_from_value(serde_json::json!({
+            "providers": {
+                "alpha": {
+                    "endpoint": "https://alpha.test/chat/completions",
+                    "models": {
+                        "invalid": {
+                            "context_window": 128000,
+                            "replay_key": " "
+                        }
+                    }
+                }
+            }
+        }))
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("empty `replay_key`"), "{error}");
     }
 
     #[test]

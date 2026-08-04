@@ -88,6 +88,7 @@ pub struct RequestOptions {
 pub struct ResolvedModelInfo {
     pub context_window: Option<u64>,
     pub supported_effort_levels: Vec<String>,
+    pub replay_key: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -108,6 +109,7 @@ pub struct AvailableModel {
     pub supported_efforts: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub context_window: Option<u64>,
+    pub replay_key: String,
 }
 
 pub fn validate_config(config: &Config) -> Result<()> {
@@ -177,6 +179,7 @@ pub fn resolve_model_info(config: &Config, model: &ResolvedModelRef) -> Resolved
         supported_effort_levels: cfg
             .and_then(|item| item.supported_efforts.clone())
             .unwrap_or_default(),
+        replay_key: config.replay_key(&model.provider_id, &model.model_id),
     }
 }
 
@@ -193,6 +196,7 @@ pub fn available_models(config: &Config) -> AvailableModelsPayload {
                     model_id: model_id.clone(),
                     supported_efforts: model.supported_efforts.clone().unwrap_or_default(),
                     context_window: model.context_window,
+                    replay_key: config.replay_key(provider_id, model_id),
                 })
                 .collect::<Vec<_>>();
             AvailableProvider {
@@ -368,6 +372,7 @@ mod tests {
                                         "medium".into(),
                                         "high".into(),
                                     ]),
+                                    replay_key: None,
                                 },
                             ),
                             (
@@ -375,6 +380,7 @@ mod tests {
                                 ModelConfig {
                                     context_window: Some(200),
                                     supported_efforts: None,
+                                    replay_key: None,
                                 },
                             ),
                             (
@@ -382,6 +388,7 @@ mod tests {
                                 ModelConfig {
                                     context_window: Some(200),
                                     supported_efforts: None,
+                                    replay_key: None,
                                 },
                             ),
                             (
@@ -389,6 +396,7 @@ mod tests {
                                 ModelConfig {
                                     context_window: Some(300),
                                     supported_efforts: None,
+                                    replay_key: None,
                                 },
                             ),
                             (
@@ -396,6 +404,7 @@ mod tests {
                                 ModelConfig {
                                     context_window: Some(300),
                                     supported_efforts: None,
+                                    replay_key: None,
                                 },
                             ),
                         ]),
@@ -411,6 +420,7 @@ mod tests {
                             ModelConfig {
                                 context_window: Some(300),
                                 supported_efforts: Some(vec!["max".into()]),
+                                replay_key: None,
                             },
                         )]),
                     },
@@ -543,6 +553,7 @@ mod tests {
                         ModelConfig {
                             context_window: None,
                             supported_efforts: None,
+                            replay_key: None,
                         },
                     )]),
                 },

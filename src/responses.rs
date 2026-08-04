@@ -72,19 +72,13 @@ pub(crate) async fn stream(
 
 pub(crate) fn build_responses_request_body(
     request: &RequestOptions,
-    endpoint: &str,
+    _endpoint: &str,
     messages: &[Message],
     tools: &[Value],
 ) -> Result<Value, ProviderError> {
     let mut input = Vec::new();
     for message in messages {
-        responses_input_items(
-            message,
-            &request.model.provider_id,
-            endpoint,
-            &request.model.model_id,
-            &mut input,
-        )?;
+        responses_input_items(message, &mut input)?;
     }
     let response_tools = tools
         .iter()
@@ -117,13 +111,7 @@ pub(crate) fn build_responses_request_body(
     Ok(body)
 }
 
-fn responses_input_items(
-    message: &Message,
-    provider_id: &str,
-    endpoint: &str,
-    model: &str,
-    input: &mut Vec<Value>,
-) -> Result<(), ProviderError> {
+fn responses_input_items(message: &Message, input: &mut Vec<Value>) -> Result<(), ProviderError> {
     match message {
         Message::System { content } => input.push(serde_json::json!({
             "role": "system", "content": content
@@ -140,9 +128,7 @@ fn responses_input_items(
             if let Some(NativeReplay {
                 payload: NativeReplayPayload::ResponsesOutput(items),
                 ..
-            }) = native_replay
-                .as_ref()
-                .filter(|native| native.matches(provider_id, endpoint, model))
+            }) = native_replay.as_ref()
             {
                 input.extend(items.iter().cloned());
             } else {

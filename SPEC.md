@@ -275,7 +275,9 @@ accepts optional non-terminal stdin as a custom focus). The surface is small:
   `context_tokens` is the latest provider-reported context size when
   `context_usage_source` is `reported`, or the bytes÷4 projection when it is
   `estimated` before a first turn or immediately after compaction. Consumers
-  derive a percentage from `context_tokens / context_window`.
+  derive a percentage from `context_tokens / context_window`. The resolved
+  model object includes its current effective `replay_key`; `--include-models`
+  adds the effective key for every configured model.
 - `mu context [--export]` — introspect the agent context. By default it prints
   the assembled system prompt mu itself would use: the role preamble, the
   `<runtime>` block, the full skills index (built-in, global, and project), and
@@ -1043,9 +1045,10 @@ and compaction remain protocol-neutral.
 `stream_options:{include_usage:true}`. It accumulates indexed
 `delta.tool_calls`, assistant text, and optional `reasoning_content`. A resolved
 effort is sent as top-level `reasoning_effort`. Complete reasoning attached to
-an assistant tool-call response is persisted and replayed verbatim only when
-the current provider, endpoint, and wire model id match its origin. This supports
-DeepSeek thinking tool loops without model-name heuristics.
+an assistant tool-call response is persisted and replayed verbatim when the
+current Chat Completions model has the same effective `replay_key` as its
+origin. This supports explicitly compatible DeepSeek thinking tool loops across
+provider fallback and model switches without model-name heuristics.
 
 **Responses.** Mu posts directly to the configured endpoint with `stream:true`,
 `store:false`, `include:["reasoning.encrypted_content"]`, locally reconstructed
@@ -1060,9 +1063,10 @@ function-call argument deltas. Mu accumulates complete output items from
 by `output_index` with the terminal response snapshot. Terminal fields win
 when both forms provide a field, while stream-only fields such as
 `encrypted_content` are retained. This assembled successful `response.output`
-array is stored in the native response object and replayed as input only for
-the same provider, endpoint, and wire model. Semantic tool results become
-`function_call_output` items connected by `call_id`.
+array is stored in the native response object and replayed as input when the
+current Responses model has the same effective `replay_key` as its origin.
+Semantic tool results become `function_call_output` items connected by
+`call_id`.
 
 **Anthropic Messages.** Mu posts directly to the configured endpoint using
 `x-api-key` and `anthropic-version:2023-06-01`, with `stream:true`,
@@ -1079,16 +1083,22 @@ Anthropic text, thinking summaries, signatures, citations, tool input, usage,
 and stop reasons are accumulated from indexed SSE content-block events.
 Complete successful assistant content arrays are stored unchanged, including
 `thinking`, `redacted_thinking`, signatures, text, citations, and `tool_use`,
-and replayed only for the same provider, endpoint, and wire model. The adapter assumes
-current adaptive-thinking models; it has no manual thinking-budget mode,
-old-model compatibility matrix, or model-name heuristics.
+and replayed when the current Anthropic Messages model has the same effective
+`replay_key` as its origin. The adapter assumes current adaptive-thinking
+models; it has no manual thinking-budget mode, old-model compatibility matrix,
+or model-name heuristics.
 
 The semantic transcript remains authoritative for display, compaction, and
-cross-model continuation. Switching model or protocol inside a session keeps
-semantic messages and reconstructs function calls/results, but omits native
-state whose endpoint or model origin does not match. Changing only effort does
-not invalidate native replay. Compaction excludes native state before the
-active summary boundary and retains it with the recent semantic suffix.
+cross-model continuation. Native replay requires both the same API and equal
+effective replay keys. A model's optional configured `replay_key` is resolved
+from the latest effective config for every request; omission means the literal
+`provider/model`, excluding effort. Changing config therefore changes how all
+retained history is interpreted without rewriting the session. Request recipes
+record the replay origins actually included, rather than keys, so historical
+request reconstruction remains exact. Switching protocols keeps semantic
+messages and reconstructs function calls/results, but omits incompatible native
+payload variants. Compaction excludes native state before the active summary
+boundary and retains it with the recent semantic suffix.
 
 Text and images are supported by all adapters. Images serialize as Chat
 `image_url`, Responses `input_image`, or Anthropic `image` blocks. Existing
@@ -1137,8 +1147,8 @@ exits immediately with a non-zero status and a clear message pointing at
 provider. Valid runtime provider-availability failures may use a floating
 choice's next candidate; deterministic configuration errors never do.
 
-Because the semantic message history is stored separately from origin-bound
-native replay (§11), swapping endpoint/model across turns is supported.
+Because semantic message history is stored separately from API-specific native
+replay (§11), swapping endpoint/model across turns is supported.
 
 ---
 
@@ -1321,7 +1331,10 @@ are not visible in another.
           "gpt-5.6-terra": {
             "context_window": 1050000,           // needed for Tier-1 compaction & context%
             // Optional ordered suggestions for status output and shell completion.
-            "supported_efforts": ["none", "low", "medium", "high", "xhigh", "max"]
+            "supported_efforts": ["none", "low", "medium", "high", "xhigh", "max"],
+            // Optional non-secret native-replay compatibility group.
+            // Defaults to "openai/gpt-5.6-terra".
+            "replay_key": "openai-gpt-5.6"
           }
         }
       }
@@ -1346,7 +1359,11 @@ are not visible in another.
   suggestions and bare-model fallback candidates follow that order.
   `supported_efforts` contains arbitrary
   provider-defined strings and is advisory: it drives status output and shell
-  completion but does not restrict manually entered effort suffixes. If global
+  completion but does not restrict manually entered effort suffixes.
+  `replay_key` is an optional, non-empty, non-secret compatibility label for
+  protocol-native replay. Models share native replay only when their APIs and
+  current effective keys match; omission defaults to the literal
+  `provider/model`. If global
   `config.jsonc` is missing, `mu` creates a starter file automatically. `mu`
   hard-fails on a turn if the required fields are missing or the API-key env var
   is unset (§7). Effective configuration is a recursive overlay of bundled

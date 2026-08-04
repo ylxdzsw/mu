@@ -1018,6 +1018,7 @@ fn print_status_report(report: &StatusReport) {
     };
 
     println!("model: {}", report.model.canonical);
+    println!("replay key: {}", report.model.replay_key);
     println!("session: {session}");
     println!("context: {context}");
     println!("project: {project}");

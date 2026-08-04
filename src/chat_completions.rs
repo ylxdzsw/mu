@@ -202,18 +202,13 @@ pub(crate) async fn stream(
 
 pub(crate) fn build_chat_request_body(
     request: &RequestOptions,
-    endpoint: &str,
+    _endpoint: &str,
     messages: &[Message],
     tools: &[Value],
 ) -> Value {
     let mut body = serde_json::json!({
         "model": request.model.model_id.as_str(),
-        "messages": chat_messages_json(
-            messages,
-            &request.model.provider_id,
-            endpoint,
-            &request.model.model_id
-        ),
+        "messages": chat_messages_json(messages),
         "tools": tools,
         "stream": true,
         "stream_options": { "include_usage": true }
@@ -227,16 +222,11 @@ pub(crate) fn build_chat_request_body(
     body
 }
 
-fn chat_messages_json(
-    messages: &[Message],
-    provider_id: &str,
-    endpoint: &str,
-    model: &str,
-) -> Vec<Value> {
+fn chat_messages_json(messages: &[Message]) -> Vec<Value> {
     let mut serialized = Vec::new();
     let mut pending_tool_attachments = Vec::new();
     for message in messages {
-        let mut values = chat_message_json(message, provider_id, endpoint, model);
+        let mut values = chat_message_json(message);
         if matches!(message, Message::Tool { .. }) {
             serialized.push(values.remove(0));
             pending_tool_attachments.extend(values);
@@ -249,12 +239,7 @@ fn chat_messages_json(
     serialized
 }
 
-fn chat_message_json(
-    message: &Message,
-    provider_id: &str,
-    endpoint: &str,
-    model: &str,
-) -> Vec<Value> {
+fn chat_message_json(message: &Message) -> Vec<Value> {
     match message {
         Message::System { content } => vec![serde_json::json!({
             "role": "system",
@@ -277,9 +262,7 @@ fn chat_message_json(
             if let Some(NativeReplay {
                 payload: NativeReplayPayload::ChatReasoning(reasoning),
                 ..
-            }) = native_replay
-                .as_ref()
-                .filter(|native| native.matches(provider_id, endpoint, model))
+            }) = native_replay.as_ref()
             {
                 value["reasoning_content"] = Value::String(reasoning.clone());
             }
@@ -935,7 +918,7 @@ mod tests {
     }
 
     #[test]
-    fn responses_replays_matching_items_and_projects_mismatched_semantics() {
+    fn responses_replays_native_items_across_origins() {
         let native_items = vec![
             serde_json::json!({"type":"reasoning","id":"rs_1","encrypted_content":"opaque"}),
             serde_json::json!({"type":"function_call","call_id":"call_1","name":"bash","arguments":"{}"}),
@@ -978,17 +961,20 @@ mod tests {
         assert_eq!(matching["input"][1], native_items[1]);
         assert_eq!(matching["input"][2]["type"], "function_call_output");
 
+        let mut switched_model = test_model(None);
+        switched_model.provider_id = "fallback".into();
+        switched_model.model_id = "other-model".into();
         let switched = build_responses_request_body(
             &RequestOptions {
-                model: test_model(None),
+                model: switched_model,
             },
             "https://other.test/responses",
             &messages,
             &[],
         )
         .unwrap();
-        assert_eq!(switched["input"][0]["type"], "function_call");
-        assert!(switched.to_string().find("opaque").is_none());
+        assert_eq!(switched["input"][0], native_items[0]);
+        assert_eq!(switched["input"][1], native_items[1]);
     }
 
     #[test]
@@ -1257,7 +1243,7 @@ mod tests {
     }
 
     #[test]
-    fn replays_chat_reasoning_only_for_matching_origin() {
+    fn replays_chat_reasoning_across_origins() {
         let messages = vec![Message::Assistant {
             content: None,
             reasoning_content: Some("  exact\\ntrace  ".into()),
@@ -1282,7 +1268,7 @@ mod tests {
             matching["messages"][0]["reasoning_content"],
             "  exact\\ntrace  "
         );
-        let mismatched = build_chat_request_body(
+        let switched_endpoint = build_chat_request_body(
             &RequestOptions {
                 model: test_model(None),
             },
@@ -1290,10 +1276,14 @@ mod tests {
             &messages,
             &[],
         );
-        assert!(mismatched["messages"][0].get("reasoning_content").is_none());
+        assert_eq!(
+            switched_endpoint["messages"][0]["reasoning_content"],
+            "  exact\\ntrace  "
+        );
         let mut other_provider = test_model(None);
         other_provider.provider_id = "fallback".into();
-        let mismatched_provider = build_chat_request_body(
+        other_provider.model_id = "other-model".into();
+        let switched_provider_and_model = build_chat_request_body(
             &RequestOptions {
                 model: other_provider,
             },
@@ -1301,10 +1291,9 @@ mod tests {
             &messages,
             &[],
         );
-        assert!(
-            mismatched_provider["messages"][0]
-                .get("reasoning_content")
-                .is_none()
+        assert_eq!(
+            switched_provider_and_model["messages"][0]["reasoning_content"],
+            "  exact\\ntrace  "
         );
     }
 

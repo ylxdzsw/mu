@@ -79,7 +79,7 @@ pub(crate) async fn stream(
 
 pub(crate) fn build_request_body(
     request: &RequestOptions,
-    endpoint: &str,
+    _endpoint: &str,
     messages: &[Message],
     tools: &[Value],
 ) -> Result<Value, ProviderError> {
@@ -112,9 +112,6 @@ pub(crate) fn build_request_body(
                     content.as_deref(),
                     tool_calls.as_deref(),
                     native_replay.as_ref(),
-                    &request.model.provider_id,
-                    endpoint,
-                    &request.model.model_id,
                 )?;
                 if !blocks.is_empty() {
                     append_message(&mut wire_messages, "assistant", blocks)?;
@@ -265,14 +262,11 @@ fn assistant_blocks(
     content: Option<&str>,
     tool_calls: Option<&[ToolCall]>,
     native_replay: Option<&NativeReplay>,
-    provider_id: &str,
-    endpoint: &str,
-    model: &str,
 ) -> Result<Vec<Value>, ProviderError> {
     if let Some(NativeReplay {
         payload: NativeReplayPayload::AnthropicContent(blocks),
         ..
-    }) = native_replay.filter(|native| native.matches(provider_id, endpoint, model))
+    }) = native_replay
     {
         return Ok(blocks.clone());
     }
@@ -801,7 +795,7 @@ mod tests {
     }
 
     #[test]
-    fn replays_exact_native_blocks_only_for_their_origin() {
+    fn replays_exact_native_blocks_across_origins() {
         let native_blocks = vec![
             serde_json::json!({
                 "type": "thinking",
@@ -848,8 +842,10 @@ mod tests {
             &[],
         )
         .unwrap();
-        assert_eq!(foreign["messages"][0]["content"][0]["type"], "text");
-        assert_eq!(foreign["messages"][0]["content"][1]["type"], "tool_use");
+        assert_eq!(
+            foreign["messages"][0]["content"],
+            matching["messages"][0]["content"]
+        );
     }
 
     #[test]

@@ -8,7 +8,7 @@ use serde_json::Value;
 use tokio::time::{self, MissedTickBehavior};
 
 use crate::config::Config;
-use crate::models::{RequestOptions, ResolvedModelChoice};
+use crate::models::{RequestOptions, ResolvedModelChoice, ResolvedModelRef};
 
 #[derive(Debug, Clone)]
 pub enum Message {
@@ -24,8 +24,8 @@ pub enum Message {
         /// only for models that require it (for example DeepSeek thinking mode).
         reasoning_content: Option<String>,
         tool_calls: Option<Vec<ToolCall>>,
-        /// Exact protocol-native continuation state, replayed only when its
-        /// provider, endpoint, and wire model still match the current request.
+        /// Exact protocol-native continuation state. Request assembly filters
+        /// this by current replay key and API before the adapter serializes it.
         native_replay: Option<NativeReplay>,
     },
     Tool {
@@ -44,6 +44,14 @@ pub struct NativeReplay {
     pub payload: NativeReplayPayload,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub struct ReplayOrigin {
+    pub api: String,
+    pub provider_id: String,
+    pub endpoint: String,
+    pub model: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "api", content = "data", rename_all = "snake_case")]
 pub enum NativeReplayPayload {
@@ -53,9 +61,92 @@ pub enum NativeReplayPayload {
 }
 
 impl NativeReplay {
-    pub fn matches(&self, provider_id: &str, endpoint: &str, model: &str) -> bool {
-        self.provider_id == provider_id && self.endpoint == endpoint && self.model == model
+    fn api_name(&self) -> &'static str {
+        match &self.payload {
+            NativeReplayPayload::ChatReasoning(_) => "chat_completions",
+            NativeReplayPayload::ResponsesOutput(_) => "responses",
+            NativeReplayPayload::AnthropicContent(_) => "anthropic_messages",
+        }
     }
+
+    fn origin(&self) -> ReplayOrigin {
+        ReplayOrigin {
+            api: self.api_name().to_string(),
+            provider_id: self.provider_id.clone(),
+            endpoint: self.endpoint.clone(),
+            model: self.model.clone(),
+        }
+    }
+}
+
+fn filter_native_replay(
+    messages: &[Message],
+    mut keep: impl FnMut(&NativeReplay) -> bool,
+) -> Vec<Message> {
+    let mut messages = messages.to_vec();
+    for message in &mut messages {
+        if let Message::Assistant { native_replay, .. } = message
+            && native_replay.as_ref().is_some_and(|native| !keep(native))
+        {
+            *native_replay = None;
+        }
+    }
+    messages
+}
+
+pub fn filter_native_replay_for_config(
+    messages: &[Message],
+    config: &Config,
+    target: &ResolvedModelRef,
+    target_api: &str,
+) -> Vec<Message> {
+    let target_key = config.replay_key(&target.provider_id, &target.model_id);
+    filter_native_replay(messages, |native| {
+        native.api_name() == target_api
+            && config.replay_key(&native.provider_id, &native.model) == target_key
+    })
+}
+
+pub fn filter_native_replay_for_origins(
+    messages: &[Message],
+    target_api: &str,
+    origins: &[ReplayOrigin],
+) -> Vec<Message> {
+    filter_native_replay(messages, |native| {
+        native.api_name() == target_api && origins.contains(&native.origin())
+    })
+}
+
+pub fn filter_native_replay_for_legacy_origin(
+    messages: &[Message],
+    target_api: &str,
+    provider_id: &str,
+    endpoint: &str,
+    model: &str,
+) -> Vec<Message> {
+    filter_native_replay(messages, |native| {
+        native.api_name() == target_api
+            && native.provider_id == provider_id
+            && native.endpoint == endpoint
+            && native.model == model
+    })
+}
+
+pub fn native_replay_origins(messages: &[Message]) -> Vec<ReplayOrigin> {
+    let mut origins = Vec::new();
+    for message in messages {
+        if let Message::Assistant {
+            native_replay: Some(native),
+            ..
+        } = message
+        {
+            let origin = native.origin();
+            if !origins.contains(&origin) {
+                origins.push(origin);
+            }
+        }
+    }
+    origins
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -677,7 +768,82 @@ pub(crate) fn next_event_boundary(buffer: &str) -> Option<(usize, usize)> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use super::*;
+    use crate::config::{
+        CompactionConfig, GuardrailConfig, LimitsConfig, ModelConfig, OrderedMap, ProviderConfig,
+        RedactionConfig, TerminalBellConfig,
+    };
+    use crate::models::ResolvedModelRef;
+
+    fn replay_config(source_key: Option<&str>, target_key: Option<&str>) -> Config {
+        Config {
+            providers: OrderedMap::from_iter([
+                (
+                    "source".into(),
+                    ProviderConfig {
+                        endpoint: "https://source.test/v1/chat/completions".into(),
+                        api_key_env: String::new(),
+                        models: OrderedMap::from_iter([(
+                            "source-model".into(),
+                            ModelConfig {
+                                context_window: None,
+                                supported_efforts: None,
+                                replay_key: source_key.map(str::to_string),
+                            },
+                        )]),
+                    },
+                ),
+                (
+                    "target".into(),
+                    ProviderConfig {
+                        endpoint: "https://target.test/v1/chat/completions".into(),
+                        api_key_env: String::new(),
+                        models: OrderedMap::from_iter([(
+                            "target-model".into(),
+                            ModelConfig {
+                                context_window: None,
+                                supported_efforts: None,
+                                replay_key: target_key.map(str::to_string),
+                            },
+                        )]),
+                    },
+                ),
+            ]),
+            output: Default::default(),
+            line_wrapping: true,
+            compaction: CompactionConfig::default(),
+            limits: LimitsConfig::default(),
+            guardrail: GuardrailConfig::default(),
+            terminal_bell: TerminalBellConfig::default(),
+            redaction: RedactionConfig::default(),
+            env: HashMap::new(),
+        }
+    }
+
+    fn replay_message(payload: NativeReplayPayload) -> Message {
+        Message::Assistant {
+            content: Some("semantic".into()),
+            reasoning_content: None,
+            tool_calls: None,
+            native_replay: Some(NativeReplay {
+                provider_id: "source".into(),
+                endpoint: "https://source.test/v1/chat/completions".into(),
+                model: "source-model".into(),
+                payload,
+            }),
+        }
+    }
+
+    fn target_model() -> ResolvedModelRef {
+        ResolvedModelRef {
+            canonical: "target/target-model".into(),
+            provider_id: "target".into(),
+            model_id: "target-model".into(),
+            effort: None,
+        }
+    }
 
     #[test]
     fn classifies_only_supported_endpoint_paths() {
@@ -752,5 +918,67 @@ mod tests {
         );
         assert!(ProviderError::Transport("stream ended".into()).retryable_for_live_turn());
         assert!(!ProviderError::SseParse("bad JSON".into()).retryable_for_live_turn());
+    }
+
+    #[test]
+    fn current_replay_keys_reinterpret_existing_history_within_one_api() {
+        let messages = vec![replay_message(NativeReplayPayload::ChatReasoning(
+            "trace".into(),
+        ))];
+        let target = target_model();
+
+        let separate = replay_config(None, None);
+        let filtered =
+            filter_native_replay_for_config(&messages, &separate, &target, "chat_completions");
+        assert!(matches!(
+            &filtered[0],
+            Message::Assistant {
+                native_replay: None,
+                ..
+            }
+        ));
+
+        let shared = replay_config(Some("compatible"), Some("compatible"));
+        let filtered =
+            filter_native_replay_for_config(&messages, &shared, &target, "chat_completions");
+        assert!(matches!(
+            &filtered[0],
+            Message::Assistant {
+                native_replay: Some(_),
+                ..
+            }
+        ));
+
+        let changed = replay_config(Some("compatible"), Some("replacement"));
+        let filtered =
+            filter_native_replay_for_config(&messages, &changed, &target, "chat_completions");
+        assert!(matches!(
+            &filtered[0],
+            Message::Assistant {
+                native_replay: None,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn replay_key_never_crosses_api_variants() {
+        let config = replay_config(Some("compatible"), Some("compatible"));
+        let messages = vec![replay_message(NativeReplayPayload::ResponsesOutput(vec![
+            serde_json::json!({"type":"reasoning","encrypted_content":"opaque"}),
+        ]))];
+        let filtered = filter_native_replay_for_config(
+            &messages,
+            &config,
+            &target_model(),
+            "chat_completions",
+        );
+        assert!(matches!(
+            &filtered[0],
+            Message::Assistant {
+                native_replay: None,
+                ..
+            }
+        ));
     }
 }
