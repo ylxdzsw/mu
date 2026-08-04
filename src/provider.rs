@@ -100,6 +100,9 @@ pub fn filter_native_replay_for_config(
     target: &ResolvedModelRef,
     target_api: &str,
 ) -> Vec<Message> {
+    if target_api == "chat_completions" {
+        return filter_native_replay(messages, |native| native.api_name() == target_api);
+    }
     let target_key = config.replay_key(&target.provider_id, &target.model_id);
     filter_native_replay(messages, |native| {
         native.api_name() == target_api
@@ -922,14 +925,13 @@ mod tests {
 
     #[test]
     fn current_replay_keys_reinterpret_existing_history_within_one_api() {
-        let messages = vec![replay_message(NativeReplayPayload::ChatReasoning(
-            "trace".into(),
-        ))];
+        let messages = vec![replay_message(NativeReplayPayload::ResponsesOutput(vec![
+            serde_json::json!({"type":"reasoning","encrypted_content":"opaque"}),
+        ]))];
         let target = target_model();
 
         let separate = replay_config(None, None);
-        let filtered =
-            filter_native_replay_for_config(&messages, &separate, &target, "chat_completions");
+        let filtered = filter_native_replay_for_config(&messages, &separate, &target, "responses");
         assert!(matches!(
             &filtered[0],
             Message::Assistant {
@@ -939,8 +941,7 @@ mod tests {
         ));
 
         let shared = replay_config(Some("compatible"), Some("compatible"));
-        let filtered =
-            filter_native_replay_for_config(&messages, &shared, &target, "chat_completions");
+        let filtered = filter_native_replay_for_config(&messages, &shared, &target, "responses");
         assert!(matches!(
             &filtered[0],
             Message::Assistant {
@@ -950,12 +951,32 @@ mod tests {
         ));
 
         let changed = replay_config(Some("compatible"), Some("replacement"));
-        let filtered =
-            filter_native_replay_for_config(&messages, &changed, &target, "chat_completions");
+        let filtered = filter_native_replay_for_config(&messages, &changed, &target, "responses");
         assert!(matches!(
             &filtered[0],
             Message::Assistant {
                 native_replay: None,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn chat_reasoning_replays_across_keys_within_chat_completions() {
+        let config = replay_config(Some("source"), Some("target"));
+        let messages = vec![replay_message(NativeReplayPayload::ChatReasoning(
+            "trace".into(),
+        ))];
+        let filtered = filter_native_replay_for_config(
+            &messages,
+            &config,
+            &target_model(),
+            "chat_completions",
+        );
+        assert!(matches!(
+            &filtered[0],
+            Message::Assistant {
+                native_replay: Some(_),
                 ..
             }
         ));

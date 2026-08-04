@@ -1045,10 +1045,12 @@ and compaction remain protocol-neutral.
 `stream_options:{include_usage:true}`. It accumulates indexed
 `delta.tool_calls`, assistant text, and optional `reasoning_content`. A resolved
 effort is sent as top-level `reasoning_effort`. Complete reasoning attached to
-an assistant tool-call response is persisted and replayed verbatim when the
-current Chat Completions model has the same effective `replay_key` as its
-origin. This supports explicitly compatible DeepSeek thinking tool loops across
-provider fallback and model switches without model-name heuristics.
+an assistant tool-call response is persisted and replayed verbatim on every
+Chat Completions request, regardless of provider, model, endpoint, or
+`replay_key`. Chat reasoning is the open `reasoning_content` string, not an
+encrypted or signed continuation object. This supports DeepSeek thinking tool
+loops across provider fallback and model switches without model-name
+heuristics.
 
 **Responses.** Mu posts directly to the configured endpoint with `stream:true`,
 `store:false`, `include:["reasoning.encrypted_content"]`, locally reconstructed
@@ -1089,16 +1091,18 @@ models; it has no manual thinking-budget mode, old-model compatibility matrix,
 or model-name heuristics.
 
 The semantic transcript remains authoritative for display, compaction, and
-cross-model continuation. Native replay requires both the same API and equal
-effective replay keys. A model's optional configured `replay_key` is resolved
-from the latest effective config for every request; omission means the literal
-`provider/model`, excluding effort. Changing config therefore changes how all
-retained history is interpreted without rewriting the session. Request recipes
-record the replay origins actually included, rather than keys, so historical
-request reconstruction remains exact. Switching protocols keeps semantic
-messages and reconstructs function calls/results, but omits incompatible native
-payload variants. Compaction excludes native state before the active summary
-boundary and retains it with the recent semantic suffix.
+cross-model continuation. Native replay requires the same API. Responses and
+Anthropic replay additionally require equal effective replay keys; Chat
+Completions ignores replay keys. A model's optional configured `replay_key` is
+resolved from the latest effective config for every request; omission means the
+literal `provider/model`, excluding effort. Changing config therefore changes
+how retained Responses and Anthropic history is interpreted without rewriting
+the session. Request recipes record the replay origins actually included,
+rather than keys, so historical request reconstruction remains exact. Switching
+protocols keeps semantic messages and reconstructs function calls/results, but
+omits incompatible native payload variants. Compaction excludes native state
+before the active summary boundary and retains it with the recent semantic
+suffix.
 
 Text and images are supported by all adapters. Images serialize as Chat
 `image_url`, Responses `input_image`, or Anthropic `image` blocks. Existing
@@ -1361,9 +1365,10 @@ are not visible in another.
   provider-defined strings and is advisory: it drives status output and shell
   completion but does not restrict manually entered effort suffixes.
   `replay_key` is an optional, non-empty, non-secret compatibility label for
-  protocol-native replay. Models share native replay only when their APIs and
-  current effective keys match; omission defaults to the literal
-  `provider/model`. If global
+  opaque or signed protocol-native replay. Responses and Anthropic models share
+  native replay only when their APIs and current effective keys match; Chat
+  Completions ignores the key and always replays Chat `reasoning_content`.
+  Omission defaults to the literal `provider/model`. If global
   `config.jsonc` is missing, `mu` creates a starter file automatically. `mu`
   hard-fails on a turn if the required fields are missing or the API-key env var
   is unset (§7). Effective configuration is a recursive overlay of bundled
