@@ -13,12 +13,12 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
+use crate::bash::BashRisk;
 use crate::models::{RequestOptions, ResolvedModelRef};
 use crate::provider::{
     Attachment, ContentPart, ImageDetail, Message, NativeReplay, ToolAttachment, ToolCall, Usage,
     UserContent, approx_tokens,
 };
-use crate::tools::BashRisk;
 
 pub const BASH_CALL_ID_ENV: &str = "MU_BASH_CALL_ID";
 pub const ATTACHMENT_MANIFEST_ENV: &str = "MU_ATTACHMENT_MANIFEST";
@@ -545,7 +545,7 @@ impl Store {
             .rsplit_once(':')
             .map_or((wire_model, None), |(model, effort)| (model, Some(effort)));
         let native = serde_json::json!({"model":wire_model});
-        let tools = crate::tools::tool_definitions();
+        let tools = crate::bash::tool_definitions();
         let exchange_id = self.start_provider_request(
             session_id,
             &turn_id,
@@ -2353,7 +2353,7 @@ fn is_semantic(event: &Event) -> bool {
 }
 
 fn reported_context_tokens(journal: &Journal) -> Option<u64> {
-    let current_toolset = Value::Array(crate::tools::tool_definitions());
+    let current_toolset = Value::Array(crate::bash::tool_definitions());
     let current_toolset = hex(Sha256::digest(
         serde_json::to_vec(&current_toolset).expect("serializing tool definitions cannot fail"),
     ));

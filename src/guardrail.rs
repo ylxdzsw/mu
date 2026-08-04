@@ -4,11 +4,11 @@ use std::time::Duration;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
+use crate::bash::BashRisk;
 use crate::config::{Config, GuardrailConfig};
 use crate::models::{RequestOptions, ResolvedModelRef};
 use crate::provider::{Message, ProviderError, approx_tokens};
 use crate::store::{GuardrailCompletion, ProviderOrigin, RequestSubject, Store};
-use crate::tools::BashRisk;
 use crate::{bash, provider};
 
 const MAX_ATTEMPTS: u32 = 3;

@@ -6,6 +6,8 @@ use tokio::time::sleep;
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
+use crate::bash;
+use crate::bash::{BashRisk, ExecutionMode, ToolContext, ToolResult};
 use crate::compaction;
 use crate::config::Config;
 use crate::guardrail::Guardrail;
@@ -16,8 +18,6 @@ use crate::provider::{
 };
 use crate::renderer::Renderer;
 use crate::store::{BashResultRecord, ProviderOrigin, Store};
-use crate::tools::{BashRisk, ExecutionMode, ToolContext, ToolResult};
-use crate::{bash, tools};
 use bash::RunningBash;
 
 pub struct TurnResult {
@@ -123,7 +123,7 @@ impl<'a> AgentLoop<'a> {
 
         let mut context = self.load_context()?;
 
-        let tool_definitions = tools::tool_definitions();
+        let tool_definitions = bash::tool_definitions();
         let max_iter = self.config.limits.max_iterations;
 
         let mut total_usage = Usage::default();
@@ -686,7 +686,7 @@ impl<'a> AgentLoop<'a> {
         let (manifest, objects_dir) = self.store.attachment_paths(self.session_id)?;
         for (call, bash_call_id) in batch.iter().zip(bash_call_ids) {
             let args = parse_tool_args(call);
-            let bash_args = tools::parse_args(&args)?;
+            let bash_args = bash::parse_args(&args)?;
             executions.push(ConcurrentBashExecution {
                 call,
                 args,

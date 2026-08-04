@@ -33,7 +33,6 @@ mod runtime;
 mod skills;
 mod store;
 mod system_prompt;
-mod tools;
 
 #[cfg(test)]
 use attachment::MAX_ATTACHMENT_BYTES;
@@ -424,7 +423,7 @@ async fn run() -> Result<()> {
                         // Surface the tool schema together with the system message
                         if r.kind == "system"
                             && let Ok(schema) =
-                                serde_json::to_string_pretty(&crate::tools::tool_definitions())
+                                serde_json::to_string_pretty(&crate::bash::tool_definitions())
                         {
                             println!("[{}:system:toolschema]\n{}", r.seq, schema);
                         }
