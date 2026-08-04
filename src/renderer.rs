@@ -989,6 +989,9 @@ impl Renderer {
     /// is now "unclean"; the next prompt continues on top of it, or `mu retry`
     /// resumes it.
     pub fn turn_interrupted(&mut self, reason: &str) -> io::Result<()> {
+        // Capture this before emitting the interruption notices. The notices
+        // themselves must not make the unsaved-history warning appear.
+        let had_committed_output = self.has_committed_stdout;
         if self.format == OutputFormat::Concise
             && (self.concise_tool.is_some()
                 || matches!(
@@ -999,6 +1002,9 @@ impl Renderer {
             self.commit_concise_tool(ConciseToolOutcome::ToolError)?;
         }
         self.notice(&format!("[mu] interrupted: {reason}"))?;
+        if !had_committed_output {
+            return Ok(());
+        }
         self.notice(
             "[mu] partial output above is not saved to session history; \
              run `mu retry` to resume or just send another prompt",
@@ -4904,6 +4910,32 @@ mod tests {
             .unwrap();
 
         assert_eq!(output.transcript(), "=> Inspect files · exit 7\n");
+    }
+
+    #[test]
+    fn interruption_without_output_omits_unsaved_history_notice() {
+        let (mut renderer, output) =
+            Renderer::with_test_shared_output(OutputFormat::Detail, false, None);
+
+        renderer.turn_interrupted("cancelled").unwrap();
+
+        assert_eq!(output.transcript(), "[mu] interrupted: cancelled\n");
+    }
+
+    #[test]
+    fn interruption_after_output_keeps_unsaved_history_notice() {
+        let (mut renderer, output) =
+            Renderer::with_test_shared_output(OutputFormat::Detail, false, None);
+
+        renderer.assistant_text("partial output\n").unwrap();
+        renderer.turn_interrupted("cancelled").unwrap();
+
+        let transcript = output.transcript();
+        assert!(transcript.contains("partial output\n"), "{transcript:?}");
+        assert!(
+            transcript.contains("partial output above is not saved to session history"),
+            "{transcript:?}"
+        );
     }
 
     #[test]
