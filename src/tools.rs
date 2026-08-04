@@ -20,9 +20,9 @@ pub struct ToolResult {
 pub struct ToolContext<'a> {
     pub config: &'a Config,
     pub renderer: &'a mut Renderer,
-    pub database_path: Option<&'a Path>,
+    pub attachment_manifest: Option<&'a Path>,
+    pub objects_dir: Option<&'a Path>,
     pub bash_call_id: i64,
-    pub owner_pid: i64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

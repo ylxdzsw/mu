@@ -69,8 +69,8 @@ impl Scope {
         }
     }
 
-    pub fn session_db_path(&self) -> PathBuf {
-        self.state_dir().join("sessions.db")
+    pub fn session_store_path(&self) -> PathBuf {
+        self.state_dir()
     }
 
     pub fn project(&self) -> Option<&Project> {
@@ -258,9 +258,47 @@ fn ensure_state_layout(dir: &Path, layout: StateLayout) -> Result<Vec<&'static s
         if !gitignore.exists() {
             std::fs::write(&gitignore, STATE_GITIGNORE)?;
             created_files.push(".mu/.gitignore");
+        } else {
+            reconcile_state_gitignore(&gitignore)?;
         }
     }
     Ok(created_files)
+}
+
+fn reconcile_state_gitignore(path: &Path) -> Result<()> {
+    let existing = std::fs::read_to_string(path)?;
+    let present = existing.lines().collect::<std::collections::HashSet<_>>();
+    let missing = STATE_GITIGNORE_LINES
+        .iter()
+        .copied()
+        .filter(|line| !present.contains(line))
+        .collect::<Vec<_>>();
+    if missing.is_empty() {
+        return Ok(());
+    }
+    let mut updated = existing.clone();
+    if !existing.is_empty() && !existing.ends_with('\n') {
+        updated.push('\n');
+    }
+    for line in missing {
+        updated.push_str(line);
+        updated.push('\n');
+    }
+    let suffix = crate::random::random_bytes::<8>()?
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let temporary = path.with_file_name(format!(".gitignore.{suffix}"));
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temporary)?;
+    use std::io::Write;
+    file.write_all(updated.as_bytes())?;
+    file.sync_all()?;
+    std::fs::rename(&temporary, path)?;
+    std::fs::File::open(path.parent().context(".gitignore has no parent")?)?.sync_all()?;
+    Ok(())
 }
 
 pub fn validate_project_init_root(root: &Path, force: bool) -> Result<()> {
@@ -307,7 +345,16 @@ fn project_marker_name(marker: ProjectMarker) -> &'static str {
 const PROJECT_CONFIG_TEMPLATE: &str =
     "{\n  // Optional project-local overrides merged over ~/.mu/config.jsonc.\n}\n";
 
-const STATE_GITIGNORE: &str = ".gitignore\n.env\nsessions.db\nsessions.db-*\n";
+const STATE_GITIGNORE_LINES: &[&str] = &[
+    ".gitignore",
+    ".env",
+    "sessions/",
+    "objects/",
+    "current-session",
+    ".current-session.*",
+];
+const STATE_GITIGNORE: &str =
+    ".gitignore\n.env\nsessions/\nobjects/\ncurrent-session\n.current-session.*\n";
 
 fn git_worktree_info(root: &Path) -> Option<GitWorktreeInfo> {
     let dot_git = root.join(".git");
@@ -397,8 +444,8 @@ mod tests {
             })
         );
         assert_eq!(
-            Scope::Project(project).session_db_path(),
-            repository.join(".mu/sessions.db")
+            Scope::Project(project).session_store_path(),
+            repository.join(".mu")
         );
         assert!(validate_project_init_root(&worktree, false).is_err());
         assert!(validate_project_init_root(&worktree, true).is_ok());
@@ -502,6 +549,31 @@ mod tests {
             STATE_GITIGNORE
         );
 
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn existing_state_gitignore_keeps_old_entries_and_adds_current_paths() {
+        let root = std::env::temp_dir().join(format!("mu-layout-{}", uuid::Uuid::new_v4()));
+        let state = root.join(".mu");
+        std::fs::create_dir_all(&state).unwrap();
+        std::fs::write(
+            state.join(".gitignore"),
+            ".gitignore\nsessions.db\ncustom\n",
+        )
+        .unwrap();
+        let scope = Scope::Project(Project {
+            root: root.clone(),
+            marker: ProjectMarker::Git,
+            worktree: None,
+        });
+
+        ensure_project_layout(&scope).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(state.join(".gitignore")).unwrap(),
+            ".gitignore\nsessions.db\ncustom\n.env\nsessions/\nobjects/\ncurrent-session\n.current-session.*\n"
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 

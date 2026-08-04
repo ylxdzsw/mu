@@ -37,6 +37,7 @@ pub(crate) async fn stream(
         ));
     }
 
+    let native_response = state.native_response;
     let output = state.output;
     let tool_calls = responses_tool_calls(&output);
     let content = if state.content.is_empty() {
@@ -64,6 +65,7 @@ pub(crate) async fn stream(
         },
         finish_reason,
         usage: state.usage,
+        native_response,
     })
 }
 
@@ -217,7 +219,9 @@ fn responses_user_content(content: &UserContent) -> Result<Value, ProviderError>
 pub(crate) struct ResponsesStreamState {
     pub(crate) content: String,
     pub(crate) output: Vec<Value>,
+    pub(crate) streamed_output: BTreeMap<usize, Value>,
     pub(crate) usage: Option<Usage>,
+    pub(crate) native_response: Option<Value>,
     pub(crate) terminal: bool,
     pub(crate) replayable: bool,
     pub(crate) finish_reason: Option<FinishReason>,
@@ -249,13 +253,13 @@ pub(crate) fn consume_responses_sse_buffer(
         match event_type {
             "response.output_item.added" => {
                 let item = &value["item"];
+                let output_index = value["output_index"].as_u64().unwrap_or(0) as usize;
+                merge_output_item(&mut state.streamed_output, output_index, item);
                 if item["type"] == "reasoning" && !state.reasoning_active {
                     state.reasoning_active = true;
-                    let output_index = value["output_index"].as_u64().unwrap_or(0) as usize;
                     state.reasoning_output_index = Some(output_index);
                     on_event(StreamEvent::ReasoningStart(ReasoningVisibility::Opaque))?;
                 } else if item["type"] == "function_call" {
-                    let output_index = value["output_index"].as_u64().unwrap_or(0) as usize;
                     let tool_index = state.tool_indexes.len();
                     state.tool_indexes.insert(output_index, tool_index);
                     on_event(StreamEvent::ToolCallDelta(ProviderToolCallDelta {
@@ -268,6 +272,7 @@ pub(crate) fn consume_responses_sse_buffer(
             }
             "response.output_item.done" => {
                 let output_index = value["output_index"].as_u64().unwrap_or(0) as usize;
+                merge_output_item(&mut state.streamed_output, output_index, &value["item"]);
                 if value["item"]["type"] == "reasoning"
                     && state.reasoning_active
                     && state.reasoning_output_index == Some(output_index)
@@ -314,18 +319,12 @@ pub(crate) fn consume_responses_sse_buffer(
             "response.completed" => {
                 state.terminal = true;
                 state.replayable = true;
-                state.output = value["response"]["output"]
-                    .as_array()
-                    .cloned()
-                    .unwrap_or_default();
+                retain_native_response(state, &value["response"]);
                 state.usage = responses_usage(&value["response"]["usage"]);
             }
             "response.incomplete" => {
                 state.terminal = true;
-                state.output = value["response"]["output"]
-                    .as_array()
-                    .cloned()
-                    .unwrap_or_default();
+                retain_native_response(state, &value["response"]);
                 state.usage = responses_usage(&value["response"]["usage"]);
                 let reason = value["response"]["incomplete_details"]["reason"]
                     .as_str()
@@ -338,6 +337,50 @@ pub(crate) fn consume_responses_sse_buffer(
         }
     }
     Ok(())
+}
+
+fn merge_output_item(output: &mut BTreeMap<usize, Value>, index: usize, item: &Value) {
+    match output.get_mut(&index) {
+        Some(existing) => merge_json(existing, item),
+        None => {
+            output.insert(index, item.clone());
+        }
+    }
+}
+
+fn merge_json(target: &mut Value, source: &Value) {
+    match (target, source) {
+        (Value::Object(target), Value::Object(source)) => {
+            for (key, value) in source {
+                match target.get_mut(key) {
+                    Some(existing) => merge_json(existing, value),
+                    None => {
+                        target.insert(key.clone(), value.clone());
+                    }
+                }
+            }
+        }
+        (target, source) => *target = source.clone(),
+    }
+}
+
+fn retain_native_response(state: &mut ResponsesStreamState, response: &Value) {
+    let mut output = state.streamed_output.clone();
+    for (index, item) in response["output"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .enumerate()
+    {
+        merge_output_item(&mut output, index, &item);
+    }
+    state.output = output.into_values().collect();
+    let mut native_response = response.clone();
+    if let Some(object) = native_response.as_object_mut() {
+        object.insert("output".into(), Value::Array(state.output.clone()));
+    }
+    state.native_response = Some(native_response);
 }
 
 fn responses_stream_error(error: &Value) -> ProviderError {
@@ -467,6 +510,27 @@ mod tests {
         assert_eq!(usage.output_tokens, 5);
         assert_eq!(usage.reasoning_output_tokens, 0);
         assert_eq!(usage.total_tokens, 17);
+    }
+
+    #[test]
+    fn retains_streamed_encrypted_reasoning_missing_from_terminal_snapshot() {
+        let mut state = ResponsesStreamState::default();
+        let mut events = Vec::new();
+        let mut buffer = concat!(
+            "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"reasoning\",\"summary\":[]}}\n\n",
+            "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"reasoning\",\"summary\":[],\"encrypted_content\":\"opaque-state\"}}\n\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"output\":[{\"type\":\"reasoning\",\"summary\":[{\"type\":\"summary_text\",\"text\":\"visible\"}]}],\"usage\":{}}}\n\n",
+        )
+        .to_string();
+
+        consume(&mut state, &mut events, &mut buffer).unwrap();
+
+        assert_eq!(state.output[0]["encrypted_content"], "opaque-state");
+        assert_eq!(state.output[0]["summary"][0]["text"], "visible");
+        assert_eq!(
+            state.native_response.as_ref().unwrap()["output"][0]["encrypted_content"],
+            "opaque-state"
+        );
     }
 
     #[test]

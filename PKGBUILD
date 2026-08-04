@@ -5,7 +5,7 @@ pkgdesc='Small composable agent runtime for the terminal'
 arch=('x86_64')
 url='https://github.com/ylxdzsw/mu'
 license=('MIT')
-depends=('bash' 'jq' 'openssl' 'sqlite')
+depends=('bash' 'jq' 'openssl')
 optdepends=('fish>=4: Fish prompt mode' 'zsh: zsh prompt mode')
 makedepends=('cargo' 'git' 'pkgconf')
 options=('!lto')

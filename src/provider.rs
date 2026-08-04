@@ -292,6 +292,7 @@ impl std::fmt::Display for ImageDetail {
 pub struct ToolAttachment {
     pub attachment: Attachment,
     pub detail: ImageDetail,
+    pub(crate) object_sha256: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -306,7 +307,7 @@ pub struct FunctionCall {
     pub arguments: String,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Usage {
     pub input_tokens: u64,
     pub cache_read_input_tokens: u64,
@@ -334,6 +335,7 @@ pub struct StreamResult {
     pub message: Message,
     pub finish_reason: FinishReason,
     pub usage: Option<Usage>,
+    pub native_response: Option<Value>,
 }
 
 #[derive(Debug, Clone)]
@@ -394,6 +396,17 @@ impl fmt::Display for ProviderError {
 impl std::error::Error for ProviderError {}
 
 impl ProviderError {
+    pub fn class(&self) -> &'static str {
+        match self {
+            Self::ContextLength => "context_length",
+            Self::RateLimit { .. } => "rate_limit",
+            Self::HttpStatus { .. } => "http",
+            Self::Transport(_) => "transport",
+            Self::SseParse(_) => "protocol",
+            Self::Other(_) => "provider",
+        }
+    }
+
     pub fn retryable_for_live_turn(&self) -> bool {
         match self {
             ProviderError::RateLimit { .. } => true,
@@ -408,6 +421,31 @@ impl ProviderError {
 
 #[async_trait(?Send)]
 pub trait Provider: Send + Sync {
+    fn request_format(&self) -> &'static str {
+        "test.v1"
+    }
+
+    fn endpoint(&self) -> &str {
+        ""
+    }
+
+    fn api_name(&self) -> &'static str {
+        "test"
+    }
+
+    fn native_request(
+        &self,
+        request: &RequestOptions,
+        messages: &[Message],
+        tools: &[Value],
+    ) -> Result<Value, ProviderError> {
+        Ok(serde_json::json!({
+            "model": request.model.model_id,
+            "message_count": messages.len(),
+            "tools": tools,
+        }))
+    }
+
     async fn stream_chat(
         &self,
         request: &RequestOptions,
@@ -419,6 +457,51 @@ pub trait Provider: Send + Sync {
 
 #[async_trait(?Send)]
 impl Provider for HttpProvider {
+    fn request_format(&self) -> &'static str {
+        match self.api {
+            ModelApi::ChatCompletions => "openai.chat_completions.v1",
+            ModelApi::Responses => "openai.responses.v1",
+            ModelApi::AnthropicMessages => "anthropic.messages.v1",
+        }
+    }
+
+    fn endpoint(&self) -> &str {
+        &self.endpoint
+    }
+
+    fn api_name(&self) -> &'static str {
+        match self.api {
+            ModelApi::ChatCompletions => "chat_completions",
+            ModelApi::Responses => "responses",
+            ModelApi::AnthropicMessages => "anthropic_messages",
+        }
+    }
+
+    fn native_request(
+        &self,
+        request: &RequestOptions,
+        messages: &[Message],
+        tools: &[Value],
+    ) -> Result<Value, ProviderError> {
+        match self.api {
+            ModelApi::ChatCompletions => Ok(crate::chat_completions::build_chat_request_body(
+                request,
+                &self.endpoint,
+                messages,
+                tools,
+            )),
+            ModelApi::Responses => crate::responses::build_responses_request_body(
+                request,
+                &self.endpoint,
+                messages,
+                tools,
+            ),
+            ModelApi::AnthropicMessages => {
+                crate::anthropic::build_request_body(request, &self.endpoint, messages, tools)
+            }
+        }
+    }
+
     async fn stream_chat(
         &self,
         request: &RequestOptions,

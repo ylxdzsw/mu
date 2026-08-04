@@ -627,7 +627,15 @@ fn is_reserved_entry(relative_dir: &Path, name: &str) -> bool {
     if relative_dir.as_os_str().is_empty() {
         return matches!(
             name,
-            "cache" | "locks" | "config.jsonc" | ".env" | ".gitignore" | "AGENTS.md"
+            "cache"
+                | "locks"
+                | "sessions"
+                | "objects"
+                | "current-session"
+                | "config.jsonc"
+                | ".env"
+                | ".gitignore"
+                | "AGENTS.md"
         ) || name == "sessions.db"
             || name.starts_with("sessions.db-");
     }

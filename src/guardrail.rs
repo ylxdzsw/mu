@@ -1,5 +1,5 @@
 use std::fmt;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -7,7 +7,7 @@ use serde_json::{Value, json};
 use crate::config::{Config, GuardrailConfig};
 use crate::models::{RequestOptions, ResolvedModelRef};
 use crate::provider::{Message, ProviderError, approx_tokens};
-use crate::store::{ReviewAttemptCompletion, ReviewAttemptStart, Store};
+use crate::store::{GuardrailCompletion, ProviderOrigin, RequestSubject, Store};
 use crate::tools::BashRisk;
 use crate::{bash, provider};
 
@@ -136,6 +136,7 @@ impl Guardrail {
         action: &Value,
         context: &[Message],
         store: &Store,
+        session_id: &str,
         bash_call_id: i64,
     ) -> anyhow::Result<Assessment> {
         bash::install_signal_forwarder();
@@ -144,17 +145,8 @@ impl Guardrail {
             None => self.active_model.clone(),
         };
         let provider = provider::build_provider(&self.runtime, &request_model.provider_id)?;
-
         let system_prompt = POLICY_PROMPT.to_string();
         let user_content = build_reviewer_user_content(context, action);
-        let request_json = serde_json::to_string(&json!({
-            "messages": [
-                {"role": "system", "content": &system_prompt},
-                {"role": "user", "content": &user_content}
-            ],
-            "tools": []
-        }))?;
-
         let msgs = vec![
             Message::System {
                 content: system_prompt,
@@ -163,7 +155,11 @@ impl Guardrail {
                 content: user_content.into(),
             },
         ];
-
+        let request = RequestOptions {
+            model: request_model.clone(),
+        };
+        let tools = Vec::new();
+        let native_request = provider.native_request(&request, &msgs, &tools)?;
         let timeout = Duration::from_secs(self.config.timeout_seconds);
         let mut last_error = String::new();
 
@@ -173,26 +169,40 @@ impl Guardrail {
                 tokio::time::sleep(backoff).await;
             }
             let attempt = attempt_index + 1;
-            store.start_review_attempt(ReviewAttemptStart {
-                bash_call_id,
-                attempt,
-                provider_id: &request_model.provider_id,
-                model: &request_model.canonical,
-                request_json: &request_json,
-            })?;
-            let started = Instant::now();
-
+            let recipe = store.request_recipe(
+                provider.request_format(),
+                &native_request,
+                json!({
+                    "kind": "guardrail",
+                    "call_id": bash_call_id,
+                    "attempt": attempt,
+                    "context_through_seq": store.current_context_seq(session_id)?,
+                    "policy_version": 1,
+                }),
+                &tools,
+            )?;
+            let exchange_id = store.start_provider_request(
+                session_id,
+                &store.current_turn_id(session_id)?,
+                "guardrail",
+                ProviderOrigin {
+                    canonical_model_ref: request_model.canonical.clone(),
+                    provider_id: request_model.provider_id.clone(),
+                    api: provider.api_name().to_string(),
+                    endpoint: provider.endpoint().to_string(),
+                    wire_model: request_model.model_id.clone(),
+                    effort: request_model.effort.clone(),
+                },
+                recipe,
+                Some(RequestSubject {
+                    call_id: bash_call_id,
+                    attempt,
+                }),
+            )?;
             let mut ignore_event = |_event: crate::provider::StreamEvent| Ok(());
             let result = tokio::time::timeout(timeout, async {
                 provider
-                    .stream_chat(
-                        &RequestOptions {
-                            model: request_model.clone(),
-                        },
-                        &msgs,
-                        &[],
-                        &mut ignore_event,
-                    )
+                    .stream_chat(&request, &msgs, &tools, &mut ignore_event)
                     .await
             })
             .await;
@@ -201,49 +211,37 @@ impl Guardrail {
                 Err(_elapsed) => {
                     last_error =
                         format!("reviewer timed out after {}s", self.config.timeout_seconds);
-                    finish_review_error(
-                        store,
-                        bash_call_id,
-                        attempt,
-                        ReviewError {
-                            response_text: None,
-                            class: "timeout",
-                            message: &last_error,
-                            elapsed: started.elapsed(),
-                            usage: None,
-                        },
+                    store.fail_provider_exchange(
+                        session_id,
+                        &exchange_id,
+                        "timeout",
+                        json!({"message":last_error}),
+                        None,
+                        None,
                     )?;
                     continue;
                 }
                 Ok(Err(ProviderError::ContextLength)) => {
                     last_error = "reviewer context length exceeded".to_string();
-                    finish_review_error(
-                        store,
-                        bash_call_id,
-                        attempt,
-                        ReviewError {
-                            response_text: None,
-                            class: "context_length",
-                            message: &last_error,
-                            elapsed: started.elapsed(),
-                            usage: None,
-                        },
+                    store.fail_provider_exchange(
+                        session_id,
+                        &exchange_id,
+                        "context_length",
+                        json!({"message":last_error}),
+                        None,
+                        None,
                     )?;
                     anyhow::bail!("{last_error}");
                 }
                 Ok(Err(error)) => {
                     last_error = error.to_string();
-                    finish_review_error(
-                        store,
-                        bash_call_id,
-                        attempt,
-                        ReviewError {
-                            response_text: None,
-                            class: provider_error_class(&error),
-                            message: &last_error,
-                            elapsed: started.elapsed(),
-                            usage: None,
-                        },
+                    store.fail_provider_exchange(
+                        session_id,
+                        &exchange_id,
+                        error.class(),
+                        json!({"message":last_error}),
+                        None,
+                        None,
                     )?;
                     continue;
                 }
@@ -258,19 +256,20 @@ impl Guardrail {
                         Ok(assessment) => {
                             let risk_level = assessment.risk_level.to_string();
                             let user_auth_level = assessment.user_auth_level.to_string();
-                            store.finish_review_attempt(ReviewAttemptCompletion {
-                                bash_call_id,
-                                attempt,
-                                outcome: assessment.outcome(),
-                                response_text: Some(content),
-                                risk_level: Some(&risk_level),
-                                user_auth_level: Some(&user_auth_level),
-                                reason: Some(&assessment.reason),
-                                error_class: None,
-                                error: None,
-                                duration_ms: duration_ms(started.elapsed()),
-                                usage: stream_result.usage.as_ref(),
-                            })?;
+                            store.complete_guardrail_exchange(
+                                session_id,
+                                &exchange_id,
+                                GuardrailCompletion {
+                                    call_id: bash_call_id,
+                                    attempt,
+                                    outcome: assessment.outcome(),
+                                    risk_level: Some(&risk_level),
+                                    auth_level: Some(&user_auth_level),
+                                    reason: Some(&assessment.reason),
+                                    native_response: stream_result.native_response.as_ref(),
+                                    usage: stream_result.usage.as_ref(),
+                                },
+                            )?;
                             if !assessment.is_allowed() {
                                 self.denials = self.denials.saturating_add(1);
                             }
@@ -278,17 +277,13 @@ impl Guardrail {
                         }
                         Err(e) => {
                             last_error = format!("parse error: {e}");
-                            finish_review_error(
-                                store,
-                                bash_call_id,
-                                attempt,
-                                ReviewError {
-                                    response_text: Some(content),
-                                    class: "parse",
-                                    message: &last_error,
-                                    elapsed: started.elapsed(),
-                                    usage: stream_result.usage.as_ref(),
-                                },
+                            store.fail_provider_exchange(
+                                session_id,
+                                &exchange_id,
+                                "parse",
+                                json!({"message":last_error,"response_text":content}),
+                                stream_result.native_response.as_ref(),
+                                stream_result.usage.as_ref(),
                             )?;
                             continue;
                         }
@@ -302,50 +297,6 @@ impl Guardrail {
 
     pub fn denial_limit_reached(&self) -> Option<u32> {
         (self.denials >= self.config.max_denials_per_turn).then_some(self.denials)
-    }
-}
-
-struct ReviewError<'a> {
-    response_text: Option<&'a str>,
-    class: &'a str,
-    message: &'a str,
-    elapsed: Duration,
-    usage: Option<&'a crate::provider::Usage>,
-}
-
-fn finish_review_error(
-    store: &Store,
-    bash_call_id: i64,
-    attempt: u32,
-    error: ReviewError<'_>,
-) -> anyhow::Result<()> {
-    store.finish_review_attempt(ReviewAttemptCompletion {
-        bash_call_id,
-        attempt,
-        outcome: "error",
-        response_text: error.response_text,
-        risk_level: None,
-        user_auth_level: None,
-        reason: None,
-        error_class: Some(error.class),
-        error: Some(error.message),
-        duration_ms: duration_ms(error.elapsed),
-        usage: error.usage,
-    })
-}
-
-fn duration_ms(elapsed: Duration) -> u64 {
-    elapsed.as_millis().min(u64::MAX as u128) as u64
-}
-
-fn provider_error_class(error: &ProviderError) -> &'static str {
-    match error {
-        ProviderError::ContextLength => "context_length",
-        ProviderError::RateLimit { .. } => "rate_limit",
-        ProviderError::HttpStatus { .. } => "http",
-        ProviderError::Transport(_) => "transport",
-        ProviderError::SseParse(_) => "sse_parse",
-        ProviderError::Other(_) => "provider",
     }
 }
 
@@ -837,10 +788,11 @@ mod tests {
 
         let tmp = std::env::temp_dir().join(format!("mu-guardrail-audit-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&tmp).unwrap();
-        let database = tmp.join("sessions.db");
+        let database = tmp.join("state");
         let store = Store::open(&database).unwrap();
-        let session = store
-            .create_session_seeded("/tmp", "system", "environment")
+        let session = store.create_session_seeded("system").unwrap();
+        store
+            .start_turn(&session.id, "/tmp", None, &"Remove it.".into())
             .unwrap();
         let (_, bash_call_ids) = store
             .append_message_with_bash_calls(
@@ -905,36 +857,33 @@ mod tests {
         }];
 
         let assessment = guardrail
-            .assess(&action, &context, &store, bash_call_ids[0])
+            .assess(&action, &context, &store, &session.id, bash_call_ids[0])
             .await
             .unwrap();
         assert!(assessment.is_allowed());
         server.await.unwrap();
-        drop(store);
-
-        let connection = rusqlite::Connection::open(&database).unwrap();
-        let stored: (String, String, String, String, i64) = connection
-            .query_row(
-                "SELECT request_json, response_text, provider_id, outcome, attempt
-                 FROM bash_review",
-                [],
-                |row| {
-                    Ok((
-                        row.get(0)?,
-                        row.get(1)?,
-                        row.get(2)?,
-                        row.get(3)?,
-                        row.get(4)?,
-                    ))
-                },
-            )
+        let audit = store.audit_events(&session.id).unwrap();
+        let request = audit
+            .iter()
+            .find(|event| event["type"] == "provider_requested" && event["purpose"] == "guardrail")
             .unwrap();
-        assert!(stored.0.contains("Remove it."));
-        assert!(stored.0.contains("rm /tmp/x"));
-        assert_eq!(stored.1, response_text);
-        assert_eq!(stored.2, "test");
-        assert_eq!(stored.3, "allow");
-        assert_eq!(stored.4, 1);
+        assert_eq!(request["origin"]["provider_id"], "test");
+        assert_eq!(request["subject"]["call_id"], bash_call_ids[0]);
+        assert_eq!(request["subject"]["attempt"], 1);
+        let reconstructed = store
+            .reconstruct_provider_request(&session.id, request["exchange_id"].as_str().unwrap())
+            .unwrap()
+            .to_string();
+        assert!(reconstructed.contains("Remove it."));
+        assert!(reconstructed.contains("rm /tmp/x"));
+        let completed = audit
+            .iter()
+            .find(|event| {
+                event["type"] == "provider_completed" && event["projection"]["kind"] == "guardrail"
+            })
+            .unwrap();
+        assert_eq!(completed["projection"]["outcome"], "allow");
+        assert!(completed["response_json"].is_object());
         let _ = std::fs::remove_dir_all(tmp);
     }
 }

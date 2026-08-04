@@ -43,6 +43,21 @@ pub(crate) async fn stream(
         return Err(ProviderError::ContextLength);
     }
     let finish_reason = finish_reason(state.stop_reason.as_deref(), &tool_calls);
+    let usage = state.usage.finish();
+    let native_response = Some(serde_json::json!({
+        "type": "message",
+        "role": "assistant",
+        "model": request.model.model_id,
+        "content": &blocks,
+        "stop_reason": &state.stop_reason,
+        "stop_sequence": null,
+        "usage": usage.as_ref().map(|usage| serde_json::json!({
+            "input_tokens": usage.input_tokens,
+            "output_tokens": usage.output_tokens,
+            "cache_read_input_tokens": usage.cache_read_input_tokens,
+            "cache_creation_input_tokens": usage.cache_write_input_tokens,
+        })),
+    }));
 
     Ok(StreamResult {
         message: Message::Assistant {
@@ -56,11 +71,12 @@ pub(crate) async fn stream(
             }),
         },
         finish_reason,
-        usage: state.usage.finish(),
+        usage,
+        native_response,
     })
 }
 
-fn build_request_body(
+pub(crate) fn build_request_body(
     request: &RequestOptions,
     endpoint: &str,
     messages: &[Message],
@@ -733,6 +749,7 @@ mod tests {
                     attachments: vec![ToolAttachment {
                         attachment: image,
                         detail: ImageDetail::Original,
+                        object_sha256: None,
                     }],
                     tool_call_id: "toolu_1".into(),
                 },

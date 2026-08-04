@@ -149,14 +149,57 @@ pub(crate) async fn stream(
             }
         }),
     };
+    let native_response = match &message {
+        Message::Assistant {
+            content,
+            reasoning_content,
+            tool_calls,
+            ..
+        } => Some(serde_json::json!({
+            "object": "chat.completion",
+            "model": request.model.model_id,
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": content,
+                    "reasoning_content": reasoning_content,
+                    "tool_calls": tool_calls.as_ref().map(|calls| calls.iter().map(|call| serde_json::json!({
+                        "id": &call.id,
+                        "type": "function",
+                        "function": &call.function,
+                    })).collect::<Vec<_>>()),
+                },
+                "finish_reason": match &state.finish_reason {
+                    FinishReason::Stop => "stop",
+                    FinishReason::ToolCalls => "tool_calls",
+                    FinishReason::Other(reason) => reason,
+                },
+            }],
+            "usage": state.usage.as_ref().map(|usage| serde_json::json!({
+                "prompt_tokens": usage.input_tokens,
+                "completion_tokens": usage.output_tokens,
+                "total_tokens": usage.total_tokens,
+                "prompt_tokens_details": {
+                    "cached_tokens": usage.cache_read_input_tokens,
+                    "cache_creation_tokens": usage.cache_write_input_tokens,
+                },
+                "completion_tokens_details": {
+                    "reasoning_tokens": usage.reasoning_output_tokens,
+                },
+            })),
+        })),
+        _ => None,
+    };
     Ok(StreamResult {
         message,
         finish_reason: state.finish_reason,
         usage: state.usage,
+        native_response,
     })
 }
 
-fn build_chat_request_body(
+pub(crate) fn build_chat_request_body(
     request: &RequestOptions,
     endpoint: &str,
     messages: &[Message],
@@ -898,6 +941,7 @@ mod tests {
                 data: b"png".to_vec(),
             },
             detail: crate::provider::ImageDetail::Original,
+            object_sha256: None,
         };
         let messages = vec![Message::Tool {
             content: "Viewed image".into(),
@@ -943,6 +987,7 @@ mod tests {
                 data: b"png".to_vec(),
             },
             detail: crate::provider::ImageDetail::Auto,
+            object_sha256: None,
         };
         let messages = vec![
             Message::Tool {

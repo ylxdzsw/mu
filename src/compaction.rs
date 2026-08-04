@@ -5,7 +5,7 @@ use crate::config::Config;
 use crate::models::RequestOptions;
 use crate::provider::{Message, Provider, StreamEvent};
 use crate::renderer::Renderer;
-use crate::store::Store;
+use crate::store::{CompactionCompletion, ProviderOrigin, Store};
 
 const SUMMARIZER_SYSTEM_PROMPT: &str = "\
 You compact an existing conversation into durable context for a future model. \
@@ -65,10 +65,10 @@ pub async fn maybe_compact(
 
     let threshold = config.compaction.fraction;
 
-    let tokens = if session.last_context_tokens > 0 {
-        session.last_context_tokens
+    let tokens = if let Some(tokens) = session.reported_context_tokens {
+        tokens
     } else {
-        store.estimate_context_tokens(session_id)
+        store.estimate_context_tokens(session_id)?
     };
 
     let should_compact = context_window.is_some_and(|cw| (tokens as f64) > (cw as f64 * threshold));
@@ -103,22 +103,21 @@ pub async fn run_compaction(
     let before_context_tokens = store
         .get_session(session_id)?
         .ok_or_else(|| anyhow::anyhow!("session not found"))?
-        .last_context_tokens;
-    let before_context_tokens = if before_context_tokens > 0 {
-        before_context_tokens
+        .reported_context_tokens;
+    let before_context_tokens = if let Some(tokens) = before_context_tokens {
+        tokens
     } else {
-        store.estimate_context_tokens(session_id)
+        store.estimate_context_tokens(session_id)?
     };
 
     let prior_summary = records.iter().rfind(|m| m.kind == "summary");
     let prior_summary_seq = prior_summary.map(|m| m.seq).unwrap_or(-1);
 
-    // Count submitted turns from the active context. Environment seeds and
-    // cwd-change reminders are user-role context, but they are not turns and
-    // must not consume the recent-turn retention budget.
+    // Records project only submitted turns as `user`; derived location context
+    // therefore cannot consume the retention budget.
     let mut user_turn_starts: Vec<i64> = Vec::new();
     for rec in records.iter().rev() {
-        if rec.seq > prior_summary_seq && is_submitted_user_turn(rec) {
+        if rec.seq > prior_summary_seq && rec.kind == "user" {
             user_turn_starts.push(rec.seq);
             if user_turn_starts.len() > keep {
                 break;
@@ -133,8 +132,12 @@ pub async fn run_compaction(
         });
     }
 
-    let cut_seq = if keep == 0 {
-        i64::MAX
+    let cut_seq = if keep == 0 && store.is_session_clean(session_id)? {
+        store.current_context_seq(session_id)?.saturating_add(1)
+    } else if keep == 0 {
+        *user_turn_starts
+            .last()
+            .expect("a turn exists when compaction is needed")
     } else {
         user_turn_starts[user_turn_starts.len() - keep]
     };
@@ -195,6 +198,36 @@ pub async fn run_compaction(
     ];
 
     let tools: Vec<serde_json::Value> = vec![];
+    let native_request = provider.native_request(request, &msgs, &tools)?;
+    let summarize_through_seq = cut_seq.saturating_sub(1);
+    let recipe = store.request_recipe(
+        provider.request_format(),
+        &native_request,
+        serde_json::json!({
+            "kind": "compaction",
+            "previous_summary_seq": (prior_summary_seq >= 0).then_some(prior_summary_seq),
+            "summarize_through_seq": summarize_through_seq,
+            "retained_turn_ids": store.turn_ids_after(session_id, summarize_through_seq)?,
+            "focus": custom_focus,
+            "prompt_version": 1,
+        }),
+        &tools,
+    )?;
+    let exchange_id = store.start_provider_request(
+        session_id,
+        &store.current_turn_id(session_id)?,
+        "compaction",
+        ProviderOrigin {
+            canonical_model_ref: request.model.canonical.clone(),
+            provider_id: request.model.provider_id.clone(),
+            api: provider.api_name().to_string(),
+            endpoint: provider.endpoint().to_string(),
+            wire_model: request.model.model_id.clone(),
+            effort: request.model.effort.clone(),
+        },
+        recipe,
+        None,
+    )?;
     if let Some(renderer) = renderer.as_deref_mut() {
         renderer.compaction_start()?;
     }
@@ -214,35 +247,55 @@ pub async fn run_compaction(
     if let Some(renderer) = renderer {
         renderer.compaction_end()?;
     }
-    let result = result.map_err(|error| anyhow::anyhow!("compaction failed: {error}"))?;
-    let content = match result.message {
+    let result = match result {
+        Ok(result) => result,
+        Err(error) => {
+            store.fail_provider_exchange(
+                session_id,
+                &exchange_id,
+                error.class(),
+                serde_json::json!({"message":error.to_string()}),
+                None,
+                None,
+            )?;
+            return Err(anyhow::anyhow!("compaction failed: {error}"));
+        }
+    };
+    let content = match &result.message {
         Message::Assistant {
             content: Some(content),
             ..
-        } if !content.trim().is_empty() => content,
+        } if !content.trim().is_empty() => content.clone(),
         _ => {
+            store.fail_provider_exchange(
+                session_id,
+                &exchange_id,
+                "invalid_response",
+                serde_json::json!({"message":"provider returned an empty summary"}),
+                result.native_response.as_ref(),
+                result.usage.as_ref(),
+            )?;
             return Err(anyhow::anyhow!(
                 "compaction failed: provider returned an empty summary"
             ));
         }
     };
-    if keep == 0 || cut_seq == i64::MAX {
-        store.append_summary(session_id, &content)?;
-    } else {
-        store.insert_summary_before(session_id, &content, cut_seq)?;
-    }
+    let retained_turn_ids = store.turn_ids_after(session_id, summarize_through_seq)?;
+    store.complete_compaction_exchange(
+        session_id,
+        &exchange_id,
+        CompactionCompletion {
+            summary: &content,
+            through_seq: summarize_through_seq,
+            retained_turn_ids,
+            native_response: result.native_response.as_ref(),
+            usage: result.usage.as_ref(),
+        },
+    )?;
     Ok(CompactionOutcome::Applied {
         before_context_tokens,
-        after_context_tokens_estimate: store.estimate_context_tokens(session_id),
+        after_context_tokens_estimate: store.estimate_context_tokens(session_id)?,
     })
-}
-
-fn is_submitted_user_turn(record: &crate::store::MessageRecord) -> bool {
-    record.kind == "user"
-        && !record.content.starts_with("[environment]\n")
-        && record.content != "[environment]"
-        && !(record.content.starts_with("<system-reminder>\n")
-            && record.content.ends_with("\n</system-reminder>"))
 }
 
 fn build_summarize_prompt(
@@ -318,6 +371,7 @@ mod tests {
                     total_tokens: 2,
                     ..Usage::default()
                 }),
+                native_response: None,
             })
         }
     }
@@ -462,6 +516,7 @@ mod tests {
             visible_users,
             vec![
                 "[summary of earlier conversation]\nsummary".to_string(),
+                "[environment]\ncurrent working directory: /tmp".to_string(),
                 "user 3".to_string(),
                 "user 4".to_string()
             ]
@@ -471,14 +526,80 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn zero_retention_still_keeps_the_current_dirty_turn() {
+        let store = Store::open_memory().unwrap();
+        let session = store.create_session("/tmp").unwrap();
+        for n in 1..=2 {
+            store
+                .append_message(
+                    &session.id,
+                    &Message::User {
+                        content: format!("complete {n}").into(),
+                    },
+                )
+                .unwrap();
+            store
+                .append_message(
+                    &session.id,
+                    &Message::Assistant {
+                        content: Some("done".into()),
+                        reasoning_content: None,
+                        native_replay: None,
+                        tool_calls: None,
+                    },
+                )
+                .unwrap();
+        }
+        store
+            .append_message(
+                &session.id,
+                &Message::User {
+                    content: "current dirty turn".into(),
+                },
+            )
+            .unwrap();
+        let mut config = test_config();
+        config.compaction.keep_recent_turns = 0;
+        let request_model = crate::models::resolve_model_ref(&config, "test/fake-model").unwrap();
+
+        run_compaction(
+            &store,
+            &config,
+            &session.id,
+            &RequestOptions {
+                model: request_model,
+            },
+            &FakeProvider,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let users = store
+            .load_context_messages(&session.id)
+            .unwrap()
+            .into_iter()
+            .filter_map(|message| match message {
+                Message::User { content } => Some(content.text()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            users,
+            [
+                "[summary of earlier conversation]\nsummary",
+                "[environment]\ncurrent working directory: /tmp",
+                "current dirty turn"
+            ]
+        );
+    }
+
+    #[tokio::test]
     async fn compaction_ignores_context_only_user_rows_and_invalidates_reported_usage() {
         let store = Store::open_memory().unwrap();
         let session = store
-            .create_session_seeded(
-                "/tmp",
-                "session system prompt",
-                "[environment]\ncurrent cwd",
-            )
+            .create_session_seeded("session system prompt")
             .unwrap();
         let request_model =
             crate::models::resolve_model_ref(&test_config(), "test/fake-model").unwrap();
@@ -515,16 +636,7 @@ mod tests {
                 .unwrap();
         }
         store
-            .update_session(
-                &session.id,
-                &Usage {
-                    total_tokens: 100_000,
-                    ..Usage::default()
-                },
-                100_000,
-                None,
-                "test/fake-model",
-            )
+            .append_test_agent_exchange(&session.id, "test/fake-model", "completed", 100_000)
             .unwrap();
 
         let outcome = run_compaction(
@@ -553,8 +665,8 @@ mod tests {
                 .get_session(&session.id)
                 .unwrap()
                 .unwrap()
-                .last_context_tokens,
-            0
+                .reported_context_tokens,
+            None
         );
         let messages = store.load_context_messages(&session.id).unwrap();
         let users: Vec<_> = messages
@@ -568,6 +680,7 @@ mod tests {
             users,
             vec![
                 "[summary of earlier conversation]\nsummary",
+                "[environment]\ncurrent working directory: /tmp",
                 "user 2",
                 "user 3"
             ]
@@ -593,11 +706,7 @@ mod tests {
     async fn compaction_is_a_noop_when_only_retained_real_turns_exist() {
         let store = Store::open_memory().unwrap();
         let session = store
-            .create_session_seeded(
-                "/tmp",
-                "session system prompt",
-                "[environment]\ncurrent cwd",
-            )
+            .create_session_seeded("session system prompt")
             .unwrap();
         let request_model =
             crate::models::resolve_model_ref(&test_config(), "test/fake-model").unwrap();
@@ -650,11 +759,7 @@ mod tests {
     async fn compaction_failure_does_not_claim_success_or_insert_a_summary() {
         let store = Store::open_memory().unwrap();
         let session = store
-            .create_session_seeded(
-                "/tmp",
-                "session system prompt",
-                "[environment]\ncurrent cwd",
-            )
+            .create_session_seeded("session system prompt")
             .unwrap();
         let request_model =
             crate::models::resolve_model_ref(&test_config(), "test/fake-model").unwrap();

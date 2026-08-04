@@ -13,9 +13,9 @@ cargo build --release --features portable
 export PATH="$PWD/target/release:$PATH"
 ```
 
-The `portable` feature bundles SQLite, uses vendored OpenSSL where OpenSSL is
-the platform TLS backend, and embeds Mu's built-in skills, so this source-tree
-binary can run without being installed. On its first normal invocation it
+The `portable` feature uses vendored OpenSSL where OpenSSL is the platform TLS
+backend and embeds Mu's built-in skills, so this source-tree binary can run
+without being installed. On its first normal invocation it
 writes the built-ins and three applet symlinks into your user cache.
 
 Now ask it something:
@@ -29,7 +29,7 @@ from [OpenCode Zen](https://opencode.ai/zen/), so you can try it immediately
 after building. Bring your own provider whenever you want (see
 [Using your own provider](#using-your-own-provider)).
 
-Continue the latest session for another turn:
+Continue the last selected session for another turn:
 
 ```sh
 mu -c <<< 'Now identify the riskiest change.'
@@ -158,7 +158,8 @@ messages, and exits. A few ideas follow from that:
 - **One universal tool.** The model sees `bash`; existing command-line tools
   provide search, editing, testing, web access, and specialized workflows.
 - **Streaming, durable sessions.** Output appears as it is produced, while
-  completed messages are persisted in SQLite and survive separate invocations.
+  completed events are appended to per-session journals and survive separate
+  invocations.
 - **Progressive customization.** Markdown instructions, commands, and skills
   extend behavior without a plugin SDK or additional model-visible tools.
 - **Project-aware, working-directory faithful.** Configuration and sessions can
@@ -275,12 +276,12 @@ runtime state it needs. Use `mu project init` when you explicitly want a local
 configuration scaffold, and keep project-specific guidance in `AGENTS.md` or
 `.mu` instruction files.
 
-Mu keeps one SQLite database per active scope: `<project>/.mu/sessions.db` in a
-project, or `~/.mu/sessions.db` globally (with the usual SQLite WAL/SHM
-sidecars). `.mu` contains that database family and authored files only. Session
-ownership lives in the database; ephemeral oversized-output spills use
-exclusive random files in the private OS temporary directory `$TMPDIR/mu`, and
-submitted image and audio attachments are stored directly in SQLite.
+Mu keeps one append-only JSONL journal per session under
+`<scope>/.mu/sessions/`, with content-addressed attachment and provider objects
+under `<scope>/.mu/objects/`. `current-session` points to the last session
+selected in that scope, so `-c/--continue` and bare `mu retry` do not scan every
+session. Each active session journal is guarded by a nonblocking advisory lock;
+different sessions remain independent.
 
 Setting `"output": "concise"` in global or project `config.jsonc` changes the
 default output density; an explicit `-o`/`--output` always wins. Output density
@@ -301,9 +302,8 @@ after that response supplies exact usage.
 
 ## Native installation and portable builds
 
-The default Cargo build is for a native installation and uses system SQLite
-plus the platform TLS backend: system OpenSSL on Linux and Apple Security on
-macOS.
+The default Cargo build uses the platform TLS backend: system OpenSSL on Linux
+and Apple Security on macOS.
 
 ```sh
 cargo build --release
@@ -322,8 +322,8 @@ Add `portable` for a standalone Unix binary:
 cargo build --release --features portable
 ```
 
-Portable builds bundle SQLite, enable vendored OpenSSL on platforms whose
-native TLS backend is OpenSSL, and embed every shipped built-in. On macOS,
+Portable builds enable vendored OpenSSL on platforms whose native TLS backend
+is OpenSSL and embed every shipped built-in. On macOS,
 native TLS continues to use the Apple Security framework. When the binary is
 under a `bin/` directory, each resource is resolved independently: an existing
 `<prefix>/share/mu/` wins for built-ins and an existing `<prefix>/libexec/mu/`
@@ -345,8 +345,8 @@ Moving or upgrading the binary does not update either cache: remove the
 applicable cache subdirectory manually to regenerate it.
 
 Version tags publish portable Linux x86-64 musl and macOS ARM64/Intel archives
-with SHA-256 checksum files. The Linux archive statically links musl, SQLite,
-and vendored OpenSSL. The macOS archives retain only Apple system-library
+with SHA-256 checksum files. The Linux archive statically links musl and
+vendored OpenSSL. The macOS archives retain only Apple system-library
 linkage. Built-ins are embedded, so those archives do not contain a separate
 `builtins/` directory. Releases continue to include the unchanged Windows
 MSYS2 UCRT64 package and archive.

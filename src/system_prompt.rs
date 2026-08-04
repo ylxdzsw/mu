@@ -2,7 +2,6 @@ use std::path::Path;
 
 use chrono::Local;
 
-use crate::paths::Project;
 use crate::skills::{
     InstructionScope, SkillMeta, format_skills_block, read_agents_md, scan_instruction_index,
 };
@@ -48,10 +47,11 @@ pub fn assemble_prompt(
     let date = Local::now().format("%Y-%m-%d").to_string();
     let user = std::env::var("USER").unwrap_or_else(|_| "unknown".to_string());
     let uid = unsafe { libc::geteuid() };
-    parts.push(format!(
-        "<runtime>\nos: {}\ndate: {}\nuser: {} (uid {})\n</runtime>",
-        os, date, user, uid
-    ));
+    let mut runtime = format!("os: {os}\ndate: {date}\nuser: {user} (uid {uid})");
+    if let Some(project_root) = project_config_dir.and_then(Path::parent) {
+        runtime.push_str(&format!("\nmu project root: {}", project_root.display()));
+    }
+    parts.push(format!("<runtime>\n{runtime}\n</runtime>"));
 
     let skills_block = format_skills_block(skills);
     if !skills_block.is_empty() {
@@ -249,33 +249,6 @@ fn os_release_value(os_release: &str, key: &str) -> Option<String> {
     })
 }
 
-pub fn initial_environment_context(cwd: &Path, project: Option<&Project>) -> String {
-    let mut lines = vec!["[environment]".to_string()];
-
-    if let Some(project) = project {
-        lines.push(format!("mu project root: {}", project.root.display()));
-        if let Some(worktree) = &project.worktree {
-            if let Some(main_root) = worktree.main_worktree_root() {
-                lines.push(format!("git worktree root: {}", worktree.root.display()));
-                lines.push(format!("git main worktree root: {}", main_root.display()));
-            } else {
-                lines.push(format!("git root: {}", worktree.root.display()));
-            }
-        }
-    }
-
-    lines.push(format!("current working directory: {}", cwd.display()));
-
-    lines.join("\n")
-}
-
-pub fn cwd_changed_context(cwd: &Path) -> String {
-    format!(
-        "<system-reminder>\ncurrent working directory changed to: {}\n</system-reminder>",
-        cwd.display()
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use std::path::{Path, PathBuf};
@@ -284,11 +257,9 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::{
-        EXPORT_PREAMBLE, assemble_context, assemble_prompt, build_context, cwd_changed_context,
-        export_preamble, initial_environment_context, json_string_for_html_comment,
-        linux_distribution, role_preamble,
+        EXPORT_PREAMBLE, assemble_context, assemble_prompt, build_context, export_preamble,
+        json_string_for_html_comment, linux_distribution, role_preamble,
     };
-    use crate::paths::{Project, ProjectMarker};
     use crate::skills::{InstructionScope, SkillMeta, SkillRequirements};
 
     fn temp_dir(name: &str) -> PathBuf {
@@ -332,62 +303,6 @@ mod tests {
             Some("Alpine Linux".into())
         );
         assert_eq!(linux_distribution("ID=arch"), Some("arch".into()));
-    }
-
-    #[test]
-    fn initial_environment_context_reports_project_and_worktree_metadata() {
-        let context = initial_environment_context(
-            Path::new("/tmp/work/subdir"),
-            Some(&Project {
-                root: PathBuf::from("/tmp/work"),
-                marker: ProjectMarker::Git,
-                worktree: Some(crate::paths::GitWorktreeInfo {
-                    root: PathBuf::from("/tmp/worktree"),
-                    git_dir: PathBuf::from("/tmp/repo/.git/worktrees/feature"),
-                    common_dir: Some(PathBuf::from("/tmp/repo/.git")),
-                }),
-            }),
-        );
-        assert_eq!(
-            context,
-            "[environment]\nmu project root: /tmp/work\ngit worktree root: /tmp/worktree\ngit main worktree root: /tmp/repo\ncurrent working directory: /tmp/work/subdir"
-        );
-    }
-
-    #[test]
-    fn initial_environment_context_uses_git_root_for_a_regular_checkout() {
-        let context = initial_environment_context(
-            Path::new("/tmp/repo/src"),
-            Some(&Project {
-                root: PathBuf::from("/tmp/repo"),
-                marker: ProjectMarker::Git,
-                worktree: Some(crate::paths::GitWorktreeInfo {
-                    root: PathBuf::from("/tmp/repo"),
-                    git_dir: PathBuf::from("/tmp/repo/.git"),
-                    common_dir: None,
-                }),
-            }),
-        );
-        assert_eq!(
-            context,
-            "[environment]\nmu project root: /tmp/repo\ngit root: /tmp/repo\ncurrent working directory: /tmp/repo/src"
-        );
-    }
-
-    #[test]
-    fn initial_environment_context_omits_git_for_a_non_git_project() {
-        let context = initial_environment_context(
-            Path::new("/tmp/project/src"),
-            Some(&Project {
-                root: PathBuf::from("/tmp/project"),
-                marker: ProjectMarker::Mu,
-                worktree: None,
-            }),
-        );
-        assert_eq!(
-            context,
-            "[environment]\nmu project root: /tmp/project\ncurrent working directory: /tmp/project/src"
-        );
     }
 
     #[test]
@@ -550,14 +465,5 @@ mod tests {
         // `subagent` is a built-in skill; only the preamble's customize-mu
         // pointer may mention a built-in path, never the skills index.
         assert!(!context.contains("subagent"));
-    }
-
-    #[test]
-    fn cwd_changed_context_is_wrapped_in_system_reminder() {
-        let context = cwd_changed_context(Path::new("/tmp/next"));
-        assert_eq!(
-            context,
-            "<system-reminder>\ncurrent working directory changed to: /tmp/next\n</system-reminder>"
-        );
     }
 }

@@ -13,7 +13,7 @@ use crate::store::{Session, Store};
 #[derive(Debug, Clone, Default)]
 pub struct InvocationOverrides {
     pub session: Option<String>,
-    pub continue_latest: bool,
+    pub continue_current: bool,
     pub model: Option<String>,
 }
 
@@ -83,7 +83,6 @@ pub struct StatusSession {
     pub updated_at: String,
     pub message_count: u64,
     pub turn_count: u64,
-    pub last_context_tokens: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Default)]
@@ -108,8 +107,8 @@ pub fn resolve_invocation(
     config: &Config,
     overrides: &InvocationOverrides,
 ) -> Result<ResolvedInvocation> {
-    if overrides.session.is_some() && overrides.continue_latest {
-        bail!("use either -s/--session or -c/--continue-latest, not both");
+    if overrides.session.is_some() && overrides.continue_current {
+        bail!("use either -s/--session or -c/--continue, not both");
     }
 
     let attached_session = if let Some(id) = overrides.session.as_deref() {
@@ -118,8 +117,8 @@ pub fn resolve_invocation(
                 .get_session(id)?
                 .ok_or_else(|| crate::ExitError::session_not_found(id))?,
         )
-    } else if overrides.continue_latest {
-        store.latest_session()?
+    } else if overrides.continue_current {
+        store.current_session()?
     } else {
         None
     };
@@ -142,7 +141,10 @@ pub fn resolve_scope_model(
     store: &Store,
     config: &Config,
 ) -> Result<crate::models::ResolvedModelRef> {
-    if let Some(model) = store.latest_completed_model()? {
+    if let Some(model) = store
+        .current_session()?
+        .and_then(|session| session.last_model)
+    {
         resolve_model_ref(config, &model)
     } else {
         first_model_ref(config)
@@ -224,7 +226,7 @@ pub fn build_status_report(
         .transpose()?
         .unwrap_or(true);
     let model = status_model(&resolved.request.model);
-    let context_usage = context_usage(store, resolved.attached_session.as_ref());
+    let context_usage = context_usage(store, resolved.attached_session.as_ref())?;
 
     Ok(StatusReport {
         model,
@@ -257,17 +259,22 @@ fn status_model(model: &ResolvedModelRef) -> StatusModel {
     }
 }
 
-fn context_usage(store: &Store, session: Option<&Session>) -> Option<(u64, ContextUsageSource)> {
-    let session = session?;
-    let (tokens, source) = if session.last_context_tokens > 0 {
-        (session.last_context_tokens, ContextUsageSource::Reported)
+fn context_usage(
+    store: &Store,
+    session: Option<&Session>,
+) -> Result<Option<(u64, ContextUsageSource)>> {
+    let Some(session) = session else {
+        return Ok(None);
+    };
+    let (tokens, source) = if let Some(tokens) = session.reported_context_tokens {
+        (tokens, ContextUsageSource::Reported)
     } else {
         (
-            store.estimate_context_tokens(&session.id),
+            store.estimate_context_tokens(&session.id)?,
             ContextUsageSource::Estimated,
         )
     };
-    Some((tokens, source))
+    Ok(Some((tokens, source)))
 }
 
 fn status_session(summary: crate::store::SessionSummary) -> StatusSession {
@@ -279,7 +286,6 @@ fn status_session(summary: crate::store::SessionSummary) -> StatusSession {
         updated_at: summary.updated_at,
         message_count: summary.message_count,
         turn_count: summary.turn_count,
-        last_context_tokens: summary.last_context_tokens,
     }
 }
 
@@ -375,22 +381,8 @@ mod tests {
     }
 
     fn finish_attempt(store: &Store, session_id: &str, model: &str, outcome: &str) {
-        let attempt = store.start_turn_attempt(session_id, "turn", model).unwrap();
         store
-            .finish_turn_attempt(
-                attempt,
-                crate::store::TurnAttemptCompletion {
-                    outcome,
-                    error_class: None,
-                    error: None,
-                    partial_output: None,
-                    provider_request_count: 1,
-                    iteration_count: 1,
-                    retry_count: 0,
-                    duration_ms: 1,
-                    context_tokens: 1,
-                },
-            )
+            .append_test_agent_exchange(session_id, model, outcome, 1)
             .unwrap();
     }
 
@@ -413,7 +405,7 @@ mod tests {
             &test_config(),
             &InvocationOverrides {
                 session: None,
-                continue_latest: false,
+                continue_current: false,
                 model: Some("alpha/default-model:low".into()),
             },
         )
@@ -423,7 +415,7 @@ mod tests {
     }
 
     #[test]
-    fn completed_attempts_supply_session_and_scope_models() {
+    fn session_attempts_do_not_leak_models_across_sessions() {
         let store = Store::open_memory().unwrap();
         let completed = store.create_session("/tmp").unwrap();
         finish_attempt(
@@ -456,11 +448,11 @@ mod tests {
             },
         )
         .unwrap();
-        assert_eq!(empty.request.model.canonical, "alpha/default-model:low");
+        assert_eq!(empty.request.model.canonical, "alpha/default-model");
     }
 
     #[test]
-    fn retry_prefers_latest_attempt_but_normal_turn_uses_latest_completed() {
+    fn normal_and_retry_use_the_sessions_latest_requested_model() {
         let store = Store::open_memory().unwrap();
         let session = store.create_session("/tmp").unwrap();
         finish_attempt(&store, &session.id, "alpha/default-model:high", "completed");
@@ -477,7 +469,7 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(normal.canonical, "alpha/default-model:high");
+        assert_eq!(normal.canonical, "alpha/default-model:low");
         assert_eq!(retry.canonical, "alpha/default-model:low");
         assert_eq!(overridden.canonical, "alpha/default-model");
     }
@@ -509,8 +501,8 @@ mod tests {
             &test_config(),
             &InvocationOverrides {
                 session: Some(session.id.clone()),
-                continue_latest: false,
-                model: None,
+                continue_current: false,
+                model: Some("alpha/default-model".into()),
             },
             None,
             StatusIncludes::default(),
@@ -538,8 +530,8 @@ mod tests {
             &test_config(),
             &InvocationOverrides {
                 session: Some(session.id),
-                continue_latest: false,
-                model: None,
+                continue_current: false,
+                model: Some("alpha/default-model".into()),
             },
             None,
             StatusIncludes::default(),
@@ -553,12 +545,10 @@ mod tests {
     #[test]
     fn context_usage_reports_when_exact_and_marks_post_compaction_estimates() {
         let store = Store::open_memory().unwrap();
-        let session = store
-            .create_session_seeded("/tmp", "system prompt", "[environment]\ncurrent cwd")
-            .unwrap();
+        let session = store.create_session_seeded("system prompt").unwrap();
         let overrides = InvocationOverrides {
             session: Some(session.id.clone()),
-            continue_latest: false,
+            continue_current: false,
             model: None,
         };
 
@@ -578,13 +568,7 @@ mod tests {
         );
 
         store
-            .update_session(
-                &session.id,
-                &crate::provider::Usage::default(),
-                25,
-                None,
-                "alpha/default-model",
-            )
+            .append_test_agent_exchange(&session.id, "alpha/default-model", "completed", 25)
             .unwrap();
         let reported = build_status_report(
             &store,
@@ -626,7 +610,7 @@ mod tests {
         let session = store.create_session("/tmp").unwrap();
         let overrides = InvocationOverrides {
             session: Some(session.id),
-            continue_latest: false,
+            continue_current: false,
             model: None,
         };
 

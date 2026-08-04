@@ -89,7 +89,7 @@ mod tests {
             assert!(id[4..].bytes().all(|byte| CROCKFORD.contains(&byte)));
             seen.insert(id);
         }
-        // Collision handling belongs to the database insert. This only guards
+        // Collision handling belongs to exclusive journal creation. This only guards
         // against a broken source that returns one constant formatted value.
         assert!(seen.len() > 120);
     }

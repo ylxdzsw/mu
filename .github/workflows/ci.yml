@@ -36,7 +36,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install --yes \
-            bsdextrautils fish jq libssl-dev pkg-config sqlite3 zsh
+            bsdextrautils fish jq libssl-dev pkg-config zsh
 
       - name: Check formatting
         run: cargo fmt --check
@@ -90,7 +90,7 @@ jobs:
         run: |
           pacman -Syu --noconfirm
           pacman -S --needed --noconfirm \
-            fish git jq openssl perl pkgconf rust sqlite util-linux zsh
+            fish git jq openssl perl pkgconf rust util-linux zsh
 
       - uses: actions/checkout@v6
         with:
@@ -353,7 +353,6 @@ jobs:
             mingw-w64-ucrt-x86_64-python
             mingw-w64-ucrt-x86_64-ripgrep
             mingw-w64-ucrt-x86_64-rust
-            mingw-w64-ucrt-x86_64-sqlite3
 
       - name: Rebase the Windows patch onto the tagged master
         if: github.ref_type == 'tag'

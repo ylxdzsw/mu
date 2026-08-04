@@ -204,8 +204,9 @@ the Bash tool's `stdin` argument. Keep it out of the command string and omit
 - `.mu/config.jsonc`
 - `.mu/.gitignore`
 
-It intentionally does not create `.env`, `AGENTS.md`, or `sessions.db`. By default
-it refuses to create a nested `mu` project inside another discovered project; use
+It intentionally does not create `.env`, `AGENTS.md`, `sessions/`, or
+`objects/`; runtime state appears only when Mu needs it. By default it refuses
+to create a nested `mu` project inside another discovered project; use
 `--force` only when the user explicitly wants a nested project.
 
 ## Verification

@@ -15,7 +15,7 @@ use crate::provider::{
     approx_tokens,
 };
 use crate::renderer::Renderer;
-use crate::store::{BashResultRecord, Store, TurnAttemptCompletion};
+use crate::store::{BashResultRecord, ProviderOrigin, Store};
 use crate::tools::{BashRisk, ExecutionMode, ToolContext, ToolResult};
 use crate::{bash, tools};
 use bash::RunningBash;
@@ -25,7 +25,7 @@ pub struct TurnResult {
     /// Total tokens reported by the *last* model call of the turn — i.e. the
     /// current context size. Distinct from `usage.total_tokens`, which is
     /// cumulative across every call in the turn. Drives the context-fullness
-    /// gauge and `session.last_context_tokens`.
+    /// gauge; unlike cumulative turn usage, this is the latest request size.
     pub context_tokens: u64,
     pub final_assistant: Option<String>,
 }
@@ -33,36 +33,19 @@ pub struct TurnResult {
 #[derive(Default)]
 struct TurnAudit {
     current_partial_output: String,
-    abandoned_partial_output: String,
-    provider_request_count: u32,
-    iteration_count: u32,
-    retry_count: u32,
-    context_tokens: u64,
 }
 
 impl TurnAudit {
     fn begin_provider_request(&mut self) {
-        self.provider_request_count = self.provider_request_count.saturating_add(1);
         self.current_partial_output.clear();
     }
 
     fn abandon_provider_request(&mut self) {
-        self.abandoned_partial_output
-            .push_str(&self.current_partial_output);
         self.current_partial_output.clear();
     }
 
     fn commit_provider_response(&mut self) {
         self.current_partial_output.clear();
-    }
-
-    fn partial_output(&self) -> Option<String> {
-        if self.abandoned_partial_output.is_empty() && self.current_partial_output.is_empty() {
-            return None;
-        }
-        let mut output = self.abandoned_partial_output.clone();
-        output.push_str(&self.current_partial_output);
-        Some(output)
     }
 }
 
@@ -108,43 +91,14 @@ pub struct AgentLoop<'a> {
     pub store: &'a Store,
     pub session_id: &'a str,
     pub request: RequestOptions,
-    pub attempt_kind: &'a str,
     pub model_context_window: Option<u64>,
     pub renderer: &'a mut Renderer,
 }
 
 impl<'a> AgentLoop<'a> {
     pub async fn run_turn(&mut self) -> Result<TurnResult> {
-        let attempt_id = self.store.start_turn_attempt(
-            self.session_id,
-            self.attempt_kind,
-            &self.request.model.canonical,
-        )?;
-        let started = Instant::now();
         let mut audit = TurnAudit::default();
-        let result = self.run_turn_inner(&mut audit).await;
-        let partial_output = audit.partial_output();
-        let error_text = result.as_ref().err().map(|error| error.to_string());
-        let (outcome, error_class) = result
-            .as_ref()
-            .err()
-            .map(classify_turn_error)
-            .unwrap_or(("completed", None));
-        self.store.finish_turn_attempt(
-            attempt_id,
-            TurnAttemptCompletion {
-                outcome,
-                error_class,
-                error: error_text.as_deref(),
-                partial_output: partial_output.as_deref(),
-                provider_request_count: audit.provider_request_count,
-                iteration_count: audit.iteration_count,
-                retry_count: audit.retry_count,
-                duration_ms: started.elapsed().as_millis().min(u64::MAX as u128) as u64,
-                context_tokens: audit.context_tokens,
-            },
-        )?;
-        result
+        self.run_turn_inner(&mut audit).await
     }
 
     async fn run_turn_inner(&mut self, audit: &mut TurnAudit) -> Result<TurnResult> {
@@ -182,7 +136,6 @@ impl<'a> AgentLoop<'a> {
         const MAX_LIVE_PROVIDER_RETRIES: u32 = 3;
 
         for iteration in 0..max_iter {
-            audit.iteration_count = (iteration + 1).min(u32::MAX as usize) as u32;
             // Proactive compaction (SPEC §11 Tier 2): `maybe_compact` only runs
             // once before the turn, but a single turn can add many large tool
             // results. Re-check the growing context before each subsequent model
@@ -218,8 +171,35 @@ impl<'a> AgentLoop<'a> {
             }
 
             let mut command_headers = StreamingCommandHeaders::default();
-            let stream_result = loop {
+            let (exchange_id, stream_result) = loop {
                 audit.begin_provider_request();
+                let native_request =
+                    self.provider
+                        .native_request(&self.request, &context, &tool_definitions)?;
+                let recipe = self.store.request_recipe(
+                    self.provider.request_format(),
+                    &native_request,
+                    serde_json::json!({
+                        "kind": "agent",
+                        "context_through_seq": self.store.current_context_seq(self.session_id)?
+                    }),
+                    &tool_definitions,
+                )?;
+                let exchange_id = self.store.start_provider_request(
+                    self.session_id,
+                    &self.store.current_turn_id(self.session_id)?,
+                    "agent",
+                    ProviderOrigin {
+                        canonical_model_ref: self.request.model.canonical.clone(),
+                        provider_id: self.request.model.provider_id.clone(),
+                        api: self.provider.api_name().to_string(),
+                        endpoint: self.provider.endpoint().to_string(),
+                        wire_model: self.request.model.model_id.clone(),
+                        effort: self.request.model.effort.clone(),
+                    },
+                    recipe,
+                    None,
+                )?;
                 let reviews_destructive = guardrail
                     .as_ref()
                     .is_some_and(|guardrail| guardrail.should_review(BashRisk::Destructive));
@@ -268,12 +248,19 @@ impl<'a> AgentLoop<'a> {
                     Err(_) => self.renderer.cancel_live_state()?,
                 }
                 match result {
-                    Ok(r) => break r,
+                    Ok(r) => break (exchange_id, r),
                     Err(ProviderError::ContextLength)
                         if overflow_retries < MAX_OVERFLOW_RETRIES =>
                     {
+                        self.store.fail_provider_exchange(
+                            self.session_id,
+                            &exchange_id,
+                            "context_length",
+                            serde_json::json!({"message":"context length exceeded"}),
+                            partial_response(&audit.current_partial_output).as_ref(),
+                            None,
+                        )?;
                         audit.abandon_provider_request();
-                        audit.retry_count = audit.retry_count.saturating_add(1);
                         overflow_retries += 1;
                         compaction::run_compaction(
                             self.store,
@@ -288,14 +275,29 @@ impl<'a> AgentLoop<'a> {
                         context = self.load_context()?;
                     }
                     Err(ProviderError::ContextLength) => {
+                        self.store.fail_provider_exchange(
+                            self.session_id,
+                            &exchange_id,
+                            "context_length",
+                            serde_json::json!({"message":"context length exceeded"}),
+                            partial_response(&audit.current_partial_output).as_ref(),
+                            None,
+                        )?;
                         bail!("context length exceeded even after compaction");
                     }
                     Err(error)
                         if error.retryable_for_live_turn()
                             && live_provider_retries < MAX_LIVE_PROVIDER_RETRIES =>
                     {
+                        self.store.fail_provider_exchange(
+                            self.session_id,
+                            &exchange_id,
+                            error.class(),
+                            serde_json::json!({"message":error.to_string()}),
+                            partial_response(&audit.current_partial_output).as_ref(),
+                            None,
+                        )?;
                         audit.abandon_provider_request();
-                        audit.retry_count = audit.retry_count.saturating_add(1);
                         live_provider_retries += 1;
                         self.renderer.turn_retry(
                             live_provider_retries as u64,
@@ -304,7 +306,17 @@ impl<'a> AgentLoop<'a> {
                         )?;
                         context = self.load_context()?;
                     }
-                    Err(e) => bail!("provider error: {e}"),
+                    Err(error) => {
+                        self.store.fail_provider_exchange(
+                            self.session_id,
+                            &exchange_id,
+                            error.class(),
+                            serde_json::json!({"message":error.to_string()}),
+                            partial_response(&audit.current_partial_output).as_ref(),
+                            None,
+                        )?;
+                        bail!("provider error: {error}")
+                    }
                 }
             };
 
@@ -318,24 +330,43 @@ impl<'a> AgentLoop<'a> {
                 total_usage.reasoning_output_tokens += u.reasoning_output_tokens;
                 total_usage.total_tokens += u.total_tokens;
                 context_tokens = u.total_tokens;
-                audit.context_tokens = context_tokens;
             }
 
-            let (_message_id, bash_call_ids) = self
-                .store
-                .append_message_with_bash_calls(self.session_id, &stream_result.message)?;
+            // Only a provider-declared tool-call completion makes streamed calls
+            // executable. A length/content-filter stop can contain an incomplete
+            // accumulated call; retain its native response for audit, but do not
+            // turn that partial call into semantic history or execution authority.
+            let mut accepted_message = stream_result.message.clone();
+            if !matches!(stream_result.finish_reason, FinishReason::ToolCalls)
+                && let Message::Assistant {
+                    tool_calls,
+                    native_replay,
+                    ..
+                } = &mut accepted_message
+                && tool_calls.as_ref().is_some_and(|calls| !calls.is_empty())
+            {
+                *tool_calls = None;
+                *native_replay = None;
+            }
+            let (_message_id, bash_call_ids) = self.store.complete_assistant_exchange(
+                self.session_id,
+                &exchange_id,
+                &accepted_message,
+                stream_result.native_response.as_ref(),
+                stream_result.usage.as_ref(),
+            )?;
             audit.commit_provider_response();
-            context.push(stream_result.message.clone());
+            context.push(accepted_message.clone());
 
             match stream_result.finish_reason {
                 FinishReason::Stop => {
-                    if let Message::Assistant { content, .. } = &stream_result.message {
+                    if let Message::Assistant { content, .. } = &accepted_message {
                         final_assistant = content.clone();
                     }
                     break;
                 }
                 FinishReason::ToolCalls => {
-                    let tool_calls = match &stream_result.message {
+                    let tool_calls = match &accepted_message {
                         Message::Assistant { tool_calls, .. } => tool_calls
                             .as_ref()
                             .ok_or_else(|| anyhow::anyhow!("missing tool_calls"))?,
@@ -402,6 +433,7 @@ impl<'a> AgentLoop<'a> {
                                             &args_for_review,
                                             &context,
                                             self.store,
+                                            self.session_id,
                                             bash_call_ids[cursor],
                                         )
                                         .await
@@ -478,12 +510,14 @@ impl<'a> AgentLoop<'a> {
                             let started = Instant::now();
 
                             let tool_result = if tc.function.name == "bash" {
+                                let (manifest, objects_dir) =
+                                    self.store.attachment_paths(self.session_id)?;
                                 let mut ctx = ToolContext {
                                     config: self.config,
                                     renderer: self.renderer,
-                                    database_path: self.store.database_path(),
+                                    attachment_manifest: Some(&manifest),
+                                    objects_dir: Some(&objects_dir),
                                     bash_call_id: bash_call_ids[cursor],
-                                    owner_pid: i64::from(std::process::id()),
                                 };
                                 bash::execute(args, &mut ctx).await
                             } else {
@@ -540,7 +574,7 @@ impl<'a> AgentLoop<'a> {
                     }
                 }
                 FinishReason::Other(reason) => {
-                    if let Message::Assistant { content, .. } = &stream_result.message {
+                    if let Message::Assistant { content, .. } = &accepted_message {
                         final_assistant = content.clone();
                     }
                     self.renderer
@@ -649,6 +683,7 @@ impl<'a> AgentLoop<'a> {
         header_start_index: usize,
     ) -> Result<()> {
         let mut executions = Vec::new();
+        let (manifest, objects_dir) = self.store.attachment_paths(self.session_id)?;
         for (call, bash_call_id) in batch.iter().zip(bash_call_ids) {
             let args = parse_tool_args(call);
             let bash_args = tools::parse_args(&args)?;
@@ -658,9 +693,9 @@ impl<'a> AgentLoop<'a> {
                 running: Some(bash::start_bash_task(
                     bash_args,
                     self.config,
-                    self.store.database_path(),
+                    Some(&manifest),
+                    Some(&objects_dir),
                     *bash_call_id,
-                    i64::from(std::process::id()),
                 )?),
                 streamed_len: 0,
             });
@@ -739,21 +774,8 @@ impl<'a> AgentLoop<'a> {
     }
 }
 
-fn classify_turn_error(error: &anyhow::Error) -> (&'static str, Option<&'static str>) {
-    let message = format!("{error:#}").to_ascii_lowercase();
-    if bash::cancellation_requested() || message.contains("turn interrupted") {
-        ("interrupted", Some("interrupted"))
-    } else if message.contains("provider error") || message.contains("transport error") {
-        ("error", Some("provider"))
-    } else if message.contains("context length") {
-        ("error", Some("context_length"))
-    } else if message.contains("max iterations") {
-        ("error", Some("max_iterations"))
-    } else if message.contains("guardrail") {
-        ("error", Some("guardrail"))
-    } else {
-        ("error", Some("internal"))
-    }
+fn partial_response(text: &str) -> Option<Value> {
+    (!text.is_empty()).then(|| serde_json::json!({"output_text":text}))
 }
 
 fn parse_tool_args(call: &ToolCall) -> Value {
@@ -1529,6 +1551,7 @@ mod tests {
                         total_tokens: 2,
                         ..Usage::default()
                     }),
+                    native_response: None,
                 }),
                 other => panic!("unexpected retry provider step {other}"),
             }
@@ -1600,6 +1623,7 @@ mod tests {
                             total_tokens: 2,
                             ..Usage::default()
                         }),
+                        native_response: None,
                     })
                 }
                 1 => Ok(StreamResult {
@@ -1616,6 +1640,7 @@ mod tests {
                         total_tokens: 2,
                         ..Usage::default()
                     }),
+                    native_response: None,
                 }),
                 other => panic!("unexpected two-tool provider step {other}"),
             }
@@ -1685,7 +1710,6 @@ mod tests {
             request: RequestOptions {
                 model: request_model,
             },
-            attempt_kind: "turn",
             model_context_window: None,
             renderer: &mut renderer,
         };
@@ -1698,9 +1722,11 @@ mod tests {
         assert!(store.is_session_clean(&session.id).unwrap());
         let messages = store.load_context_messages(&session.id).unwrap();
         assert_eq!(
-            messages
+            store
+                .audit_events(&session.id)
+                .unwrap()
                 .iter()
-                .filter(|message| matches!(message, Message::User { .. }))
+                .filter(|event| event["type"] == "turn_started")
                 .count(),
             1
         );
@@ -1720,29 +1746,20 @@ mod tests {
                 _ => false,
             }
         }));
-        let audit = rusqlite::Connection::open(tmp.join("mu.db"))
-            .unwrap()
-            .query_row(
-                "SELECT kind, outcome, partial_output, provider_request_count,
-                        iteration_count, retry_count
-                 FROM turn_attempt WHERE session_id = ?1 ORDER BY id DESC LIMIT 1",
-                rusqlite::params![session.id],
-                |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, Option<String>>(2)?,
-                        row.get::<_, i64>(3)?,
-                        row.get::<_, i64>(4)?,
-                        row.get::<_, i64>(5)?,
-                    ))
-                },
-            )
+        let audit = store.audit_events(&session.id).unwrap();
+        assert_eq!(
+            audit
+                .iter()
+                .filter(|event| event["type"] == "provider_requested")
+                .count(),
+            2
+        );
+        let failed = audit
+            .iter()
+            .find(|event| event["type"] == "provider_failed")
             .unwrap();
-        assert_eq!(audit.0, "turn");
-        assert_eq!(audit.1, "completed");
-        assert_eq!(audit.2.as_deref(), Some("discarded partial"));
-        assert_eq!((audit.3, audit.4, audit.5), (2, 1, 1));
+        assert_eq!(failed["error_class"], "rate_limit");
+        assert!(failed["partial_response_json"].is_object());
         let _ = std::fs::remove_dir_all(tmp);
     }
 
@@ -1779,7 +1796,6 @@ mod tests {
             request: RequestOptions {
                 model: request_model,
             },
-            attempt_kind: "retry",
             model_context_window: None,
             renderer: &mut renderer,
         };
@@ -1800,31 +1816,13 @@ mod tests {
                 _ => false,
             }
         }));
-        let audit = rusqlite::Connection::open(tmp.join("mu.db"))
-            .unwrap()
-            .query_row(
-                "SELECT kind, outcome, error_class, partial_output,
-                        provider_request_count, iteration_count, retry_count
-                 FROM turn_attempt WHERE session_id = ?1 ORDER BY id DESC LIMIT 1",
-                rusqlite::params![session.id],
-                |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, Option<String>>(2)?,
-                        row.get::<_, Option<String>>(3)?,
-                        row.get::<_, i64>(4)?,
-                        row.get::<_, i64>(5)?,
-                        row.get::<_, i64>(6)?,
-                    ))
-                },
-            )
+        let audit = store.audit_events(&session.id).unwrap();
+        let failed = audit
+            .iter()
+            .find(|event| event["type"] == "provider_failed")
             .unwrap();
-        assert_eq!(audit.0, "retry");
-        assert_eq!(audit.1, "error");
-        assert_eq!(audit.2.as_deref(), Some("provider"));
-        assert_eq!(audit.3.as_deref(), Some("unfinished answer"));
-        assert_eq!((audit.4, audit.5, audit.6), (1, 1, 0));
+        assert_eq!(failed["error_class"], "provider");
+        assert!(failed["partial_response_json"].is_object());
         let _ = std::fs::remove_dir_all(tmp);
     }
 
@@ -1868,7 +1866,6 @@ mod tests {
             request: RequestOptions {
                 model: request_model,
             },
-            attempt_kind: "turn",
             model_context_window: None,
             renderer: &mut renderer,
         };
@@ -1936,6 +1933,7 @@ mod tests {
                         total_tokens: 2,
                         ..Usage::default()
                     }),
+                    native_response: None,
                 });
             }
 
@@ -1968,6 +1966,7 @@ mod tests {
                         total_tokens: 15,
                         ..Usage::default()
                     }),
+                    native_response: None,
                 }),
                 _ => Ok(StreamResult {
                     message: Message::Assistant {
@@ -1983,6 +1982,7 @@ mod tests {
                         total_tokens: 15,
                         ..Usage::default()
                     }),
+                    native_response: None,
                 }),
             }
         }
@@ -2057,7 +2057,6 @@ mod tests {
             request: RequestOptions {
                 model: request_model,
             },
-            attempt_kind: "turn",
             // Tiny window: threshold = 200 * 0.75 = 150 tokens (~600 bytes).
             // The ~3KB tool result blows past it, forcing an in-loop compaction.
             model_context_window: Some(200),
@@ -2132,6 +2131,7 @@ mod tests {
                         total_tokens: 120,
                         ..Usage::default()
                     }),
+                    native_response: None,
                 }),
                 _ => Ok(StreamResult {
                     message: Message::Assistant {
@@ -2147,6 +2147,7 @@ mod tests {
                         total_tokens: 140,
                         ..Usage::default()
                     }),
+                    native_response: None,
                 }),
             }
         }
@@ -2188,7 +2189,6 @@ mod tests {
             request: RequestOptions {
                 model: request_model,
             },
-            attempt_kind: "turn",
             model_context_window: None,
             renderer: &mut renderer,
         };
@@ -2208,7 +2208,8 @@ mod tests {
     }
 
     /// A single model call that ends on a non-`stop`, non-`tool_calls` finish
-    /// reason (e.g. `length`) while still carrying assistant content.
+    /// reason (e.g. `length`) while carrying assistant content and a partially
+    /// accumulated tool call.
     struct LengthFinishProvider;
 
     #[async_trait(?Send)]
@@ -2225,7 +2226,18 @@ mod tests {
                     content: Some("partial answer".into()),
                     reasoning_content: None,
                     native_replay: None,
-                    tool_calls: None,
+                    tool_calls: Some(vec![ToolCall {
+                        id: "truncated".into(),
+                        function: crate::provider::FunctionCall {
+                            name: "bash".into(),
+                            arguments: serde_json::json!({
+                                "title": "must not run",
+                                "risk": "readonly",
+                                "command": "false",
+                            })
+                            .to_string(),
+                        },
+                    }]),
                 },
                 finish_reason: FinishReason::Other("length".into()),
                 usage: Some(Usage {
@@ -2234,6 +2246,7 @@ mod tests {
                     total_tokens: 8,
                     ..Usage::default()
                 }),
+                native_response: None,
             })
         }
     }
@@ -2272,7 +2285,6 @@ mod tests {
             request: RequestOptions {
                 model: request_model,
             },
-            attempt_kind: "turn",
             model_context_window: None,
             renderer: &mut renderer,
         };
@@ -2282,6 +2294,14 @@ mod tests {
         // A `length` finish still surfaces the streamed assistant text to
         // `--output final`, rather than emitting nothing.
         assert_eq!(result.final_assistant.as_deref(), Some("partial answer"));
+        assert!(store.is_session_clean(&session.id).unwrap());
+        assert!(matches!(
+            store.load_context_messages(&session.id).unwrap().last(),
+            Some(Message::Assistant {
+                tool_calls: None,
+                ..
+            })
+        ));
 
         let _ = std::fs::remove_dir_all(tmp);
     }

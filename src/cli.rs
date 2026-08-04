@@ -22,8 +22,9 @@ pub struct SelectionArgs {
     #[arg(short = 's', long)]
     pub session: Option<String>,
 
-    #[arg(short = 'c', long)]
-    pub continue_latest: bool,
+    /// Continue the last selected session in this scope
+    #[arg(short = 'c', long = "continue")]
+    pub continue_current: bool,
 
     #[arg(short = 'm', long)]
     pub model: Option<String>,
@@ -318,5 +319,12 @@ mod tests {
             }
             other => panic!("expected retry command, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn continue_means_current_session_and_old_name_is_rejected() {
+        let args = Args::try_parse_from(["mu", "--continue"]).unwrap();
+        assert!(args.turn.selection.continue_current);
+        assert!(Args::try_parse_from(["mu", "--continue-latest"]).is_err());
     }
 }

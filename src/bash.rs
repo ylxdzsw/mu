@@ -97,11 +97,14 @@ pub async fn execute(args: Value, ctx: &mut ToolContext<'_>) -> Result<ToolResul
         ctx.renderer.notice(&format!("[redaction] {warning}"))?;
     }
 
-    let attachment_context = ctx.database_path.map(|database_path| AttachmentContext {
-        database_path: database_path.to_path_buf(),
-        bash_call_id: ctx.bash_call_id,
-        owner_pid: ctx.owner_pid,
-    });
+    let attachment_context =
+        ctx.attachment_manifest
+            .zip(ctx.objects_dir)
+            .map(|(manifest, objects_dir)| AttachmentContext {
+                manifest: manifest.to_path_buf(),
+                objects_dir: objects_dir.to_path_buf(),
+                bash_call_id: ctx.bash_call_id,
+            });
     let result = run_bash(
         args,
         timeout,
@@ -233,18 +236,20 @@ impl BashOutputTarget for BufferedBashTarget {
 pub fn start_bash_task(
     args: BashArgs,
     config: &Config,
-    database_path: Option<&Path>,
+    attachment_manifest: Option<&Path>,
+    objects_dir: Option<&Path>,
     bash_call_id: i64,
-    owner_pid: i64,
 ) -> Result<RunningBash> {
     let redactor = SecretRedactor::from_config(config)?;
     let warnings = redactor.warnings().to_vec();
     let config = config.clone();
-    let attachment_context = database_path.map(|database_path| AttachmentContext {
-        database_path: database_path.to_path_buf(),
-        bash_call_id,
-        owner_pid,
-    });
+    let attachment_context = attachment_manifest
+        .zip(objects_dir)
+        .map(|(manifest, objects_dir)| AttachmentContext {
+            manifest: manifest.to_path_buf(),
+            objects_dir: objects_dir.to_path_buf(),
+            bash_call_id,
+        });
     let shared = Arc::new(SharedBashState::default());
     let shared_for_task = Arc::clone(&shared);
     let task = tokio::task::spawn_blocking(move || {
@@ -286,9 +291,9 @@ fn run_bash(
 
 #[derive(Debug, Clone)]
 struct AttachmentContext {
-    database_path: PathBuf,
+    manifest: PathBuf,
+    objects_dir: PathBuf,
     bash_call_id: i64,
-    owner_pid: i64,
 }
 
 fn execute_bash_task(
@@ -365,16 +370,16 @@ fn run_bash_inner(
     if let Some(attachment_context) = attachment_context {
         command
             .env(
-                crate::store::SESSION_DB_ENV,
-                &attachment_context.database_path,
+                crate::store::ATTACHMENT_MANIFEST_ENV,
+                &attachment_context.manifest,
             )
             .env(
                 crate::store::BASH_CALL_ID_ENV,
                 attachment_context.bash_call_id.to_string(),
             )
             .env(
-                crate::store::SESSION_OWNER_PID_ENV,
-                attachment_context.owner_pid.to_string(),
+                crate::store::OBJECTS_DIR_ENV,
+                &attachment_context.objects_dir,
             );
     }
     configure_process_group(&mut command);
@@ -521,7 +526,16 @@ fn run_bash_inner(
         output: output.trim_end_matches('\n').to_string(),
         exit_code: status.code().unwrap_or(1),
         redacted: redactor.did_redact(),
-        attachments: Vec::new(),
+        attachments: attachment_context.map_or_else(
+            || Ok(Vec::new()),
+            |context| {
+                crate::store::read_bash_attachments(
+                    &context.manifest,
+                    &context.objects_dir,
+                    context.bash_call_id,
+                )
+            },
+        )?,
     })
 }
 
@@ -867,7 +881,7 @@ mod tests {
     #[test]
     fn bash_without_attachment_context_exports_no_sink_identity() {
         let mut renderer = Renderer::new();
-        let command = "test -z \"${MU_SESSION_DB+x}\" && test -z \"${MU_BASH_CALL_ID+x}\" && test -z \"${MU_SESSION_OWNER_PID+x}\"; printf 'visible'";
+        let command = "test -z \"${MU_ATTACHMENT_MANIFEST+x}\" && test -z \"${MU_BASH_CALL_ID+x}\" && test -z \"${MU_OBJECTS_DIR+x}\"; printf 'visible'";
         let result = run_bash(
             args(command),
             5,
@@ -882,15 +896,15 @@ mod tests {
     }
 
     #[test]
-    fn bash_attachment_context_exports_database_call_and_owner_identity() {
+    fn bash_attachment_context_exports_manifest_call_and_object_paths() {
         let mut renderer = Renderer::new();
         let context = AttachmentContext {
-            database_path: PathBuf::from("/tmp/session.db"),
+            manifest: PathBuf::from("/tmp/attachments.jsonl"),
+            objects_dir: PathBuf::from("/tmp/objects"),
             bash_call_id: 42,
-            owner_pid: 99,
         };
         let result = run_bash(
-            args("printf '%s|%s|%s' \"$MU_SESSION_DB\" \"$MU_BASH_CALL_ID\" \"$MU_SESSION_OWNER_PID\""),
+            args("printf '%s|%s|%s' \"$MU_ATTACHMENT_MANIFEST\" \"$MU_BASH_CALL_ID\" \"$MU_OBJECTS_DIR\""),
             5,
             &mut renderer,
             &empty_env(),
@@ -898,7 +912,7 @@ mod tests {
             Some(&context),
         )
         .unwrap();
-        assert_eq!(result.output, "/tmp/session.db|42|99");
+        assert_eq!(result.output, "/tmp/attachments.jsonl|42|/tmp/objects");
     }
 
     #[tokio::test]
@@ -914,9 +928,9 @@ mod tests {
         let mut ctx = ToolContext {
             config: &config,
             renderer: &mut renderer,
-            database_path: None,
+            attachment_manifest: None,
+            objects_dir: None,
             bash_call_id: 0,
-            owner_pid: i64::from(std::process::id()),
         };
         let args = serde_json::json!({
             "title": "redact",

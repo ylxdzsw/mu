@@ -107,11 +107,7 @@ struct RunTurnArgs<'a> {
     store: &'a store::Store,
     session_id: &'a str,
     request: &'a RequestOptions,
-    attempt_kind: &'a str,
     model_context_window: Option<u64>,
-    /// Display title source (first ~60 chars). `None` on retry, which continues
-    /// an existing turn and must not overwrite the stored title.
-    title: Option<&'a str>,
     output: cli::OutputFormat,
     /// A short notice rendered before the turn (e.g. "resuming interrupted turn").
     preamble_notice: Option<&'a str>,
@@ -342,11 +338,11 @@ fn print_project_init_info(info: &ProjectInitInfo) {
     }
 }
 
-fn open_store_with_session(db_path: &Path, session: &str) -> Result<store::Store> {
-    if !db_path.exists() {
+fn open_store_with_session(store_path: &Path, session: &str) -> Result<store::Store> {
+    if !store_path.exists() {
         return Err(ExitError::session_not_found(session));
     }
-    let store = store::Store::open(db_path)?;
+    let store = store::Store::open(store_path)?;
     if store.get_session(session)?.is_none() {
         return Err(ExitError::session_not_found(session));
     }
@@ -383,29 +379,26 @@ async fn run() -> Result<()> {
             return Ok(());
         }
         Some(Command::Session { sub }) => {
-            let db_path = scope.session_db_path();
+            let store_path = scope.session_store_path();
             match sub {
                 SessionSub::New => {
                     if default_turn.selection.model.is_some() {
                         bail!("--model does not apply to `session new`; pass it to the first turn");
                     }
                     paths::ensure_project_layout(&scope)?;
-                    let store = store::Store::open(&db_path)?;
-                    let session = store.create_session_seeded(
-                        &cwd.display().to_string(),
-                        &system_prompt::build_system_prompt(
+                    let store = store::Store::open(&store_path)?;
+                    let session =
+                        store.create_session_seeded(&system_prompt::build_system_prompt(
                             &paths::global_dir(),
                             project_config_dir.as_deref(),
-                        )?,
-                        &system_prompt::initial_environment_context(&cwd, scope.project()),
-                    )?;
+                        )?)?;
                     println!("{}", session.id);
                 }
                 SessionSub::List { limit } => {
-                    if !db_path.exists() {
+                    if !store_path.join("sessions").exists() {
                         return Ok(());
                     }
-                    let store = store::Store::open(&db_path)?;
+                    let store = store::Store::open(&store_path)?;
                     let sessions = store.list_sessions(limit)?;
                     for (s, updated) in sessions {
                         let title = s.title.unwrap_or_else(|| "(untitled)".into());
@@ -414,7 +407,7 @@ async fn run() -> Result<()> {
                     }
                 }
                 SessionSub::Transcript { session } => {
-                    let store = open_store_with_session(&db_path, &session)?;
+                    let store = open_store_with_session(&store_path, &session)?;
                     for r in store.message_records_from_seq(&session, 0)? {
                         println!("[{}:{}] {}", r.seq, r.kind, r.content);
 
@@ -442,7 +435,7 @@ async fn run() -> Result<()> {
         }
         Some(Command::Status(status_args)) => {
             let config = Config::load_for_scope(project_config_dir.as_deref())?;
-            let store = open_status_store(scope.session_db_path().as_path())?;
+            let store = open_status_store(scope.session_store_path().as_path())?;
             let index = if status_args.include_commands || status_args.include_skills {
                 Some(skills::scan_instruction_index_with_env(
                     &paths::global_dir(),
@@ -465,7 +458,7 @@ async fn run() -> Result<()> {
                 &config,
                 &InvocationOverrides {
                     session: status_args.selection.session,
-                    continue_latest: status_args.selection.continue_latest,
+                    continue_current: status_args.selection.continue_current,
                     model: status_args.selection.model,
                 },
                 scope.project(),
@@ -520,11 +513,12 @@ async fn run() -> Result<()> {
             let state_dir = scope.state_dir();
             paths::ensure_dir(&state_dir)?;
 
-            let db_path = scope.session_db_path();
-            let store = store::Store::open(&db_path)?;
+            let store_path = scope.session_store_path();
+            let store = store::Store::open(&store_path)?;
             let session = resolve_retry_session(&store, &retry_args)?
                 .ok_or_else(|| anyhow::anyhow!("no sessions found in active scope"))?;
             let _lock = acquire_session_lock_or_exit(&store, &session.id, output)?;
+            store.normalize_interrupted_tail(&session.id)?;
 
             // Nothing to resume on a session whose last turn already finished.
             if store.is_session_clean(&session.id)? {
@@ -534,9 +528,13 @@ async fn run() -> Result<()> {
                 return Ok(());
             }
 
-            // Make the interrupted tail valid (synthesize results for any
-            // dangling tool calls), then continue the loop with no new prompt.
-            store.normalize_interrupted_tail(&session.id)?;
+            store.select_session(&session.id)?;
+            std::env::set_current_dir(&session.cwd).with_context(|| {
+                format!(
+                    "restoring submitted working directory for retry: {}",
+                    session.cwd
+                )
+            })?;
 
             let request = RequestOptions {
                 model: resolve_retry_model(
@@ -555,9 +553,7 @@ async fn run() -> Result<()> {
                 store: &store,
                 session_id: &session.id,
                 request: &request,
-                attempt_kind: "retry",
                 model_context_window: model_info.context_window,
-                title: None,
                 output,
                 preamble_notice: Some("[mu] resuming interrupted turn"),
             })
@@ -568,11 +564,11 @@ async fn run() -> Result<()> {
         Some(Command::Compact { session }) => {
             let custom_focus = load_optional_stdin_instruction()?;
             let config = Config::load_for_scope(project_config_dir.as_deref())?;
-            let db_path = scope.session_db_path();
-            if !db_path.exists() {
+            let store_path = scope.session_store_path();
+            if !store_path.join("sessions").exists() {
                 return Err(ExitError::session_not_found(&session));
             }
-            let store = store::Store::open(&db_path)?;
+            let store = store::Store::open(&store_path)?;
             let session_state = store
                 .get_session(&session)?
                 .ok_or_else(|| ExitError::session_not_found(&session))?;
@@ -582,6 +578,7 @@ async fn run() -> Result<()> {
             let model_info = models::resolve_model_info(&config, &request.model);
             let provider = build_provider(&config, &request.model.provider_id)?;
             let _lock = acquire_session_lock_or_exit(&store, &session, cli::OutputFormat::Detail)?;
+            store.normalize_interrupted_tail(&session)?;
             let mut renderer =
                 Renderer::with_terminal_bell(cli::OutputFormat::Detail, None, config.line_wrapping);
             let started = Instant::now();
@@ -648,24 +645,24 @@ async fn run_turn_from_source(
     let state_dir = scope.state_dir();
     paths::ensure_dir(&state_dir)?;
 
-    let db_path = scope.session_db_path();
-    let store = store::Store::open(&db_path)?;
+    let store_path = scope.session_store_path();
+    let store = store::Store::open(&store_path)?;
     let resolved = resolve_invocation(
         &store,
         config,
         &InvocationOverrides {
             session: turn.selection.session.clone(),
-            continue_latest: turn.selection.continue_latest,
+            continue_current: turn.selection.continue_current,
             model: model_override(turn.selection.model.clone(), loaded_prompt.model),
         },
     )?;
     let model_info = models::resolve_model_info(config, &resolved.request.model);
     let provider = build_provider(config, &resolved.request.model.provider_id)?;
 
-    let (session, created) = if let Some(session) = resolved.attached_session.clone() {
-        (session, false)
+    let session = if let Some(session) = resolved.attached_session.clone() {
+        session
     } else {
-        create_seeded_session(&store, cwd, scope.project(), project_config_dir)?
+        create_seeded_session(&store, project_config_dir)?
     };
     let session_id = session.id.clone();
 
@@ -677,34 +674,28 @@ async fn run_turn_from_source(
     // redirect after a Ctrl-C without being forced to `mu retry` first.
     store.normalize_interrupted_tail(&session_id)?;
 
-    if !created && session.cwd != cwd.display().to_string() {
-        store.append_message(
-            &session_id,
-            &provider::Message::User {
-                content: system_prompt::cwd_changed_context(cwd).into(),
-            },
-        )?;
-        store.update_session_cwd(&session_id, &cwd.display().to_string())?;
-    }
-
     let prompt_content = build_prompt_content(&prompt, attachments);
-    store.append_message(
+    let git_worktree_root = scope
+        .project()
+        .and_then(|project| project.worktree.as_ref())
+        .map(|worktree| worktree.root.display().to_string());
+    store.start_turn(
         &session_id,
-        &provider::Message::User {
-            content: prompt_content,
-        },
+        &cwd.display().to_string(),
+        git_worktree_root.as_deref(),
+        &prompt_content,
     )?;
+    // Publish the session only after its journal lock is held and its first
+    // turn is durable. Standalone `session new` deliberately does not select.
+    store.select_session(&session_id)?;
 
-    let title: String = prompt.chars().take(60).collect();
     run_turn(RunTurnArgs {
         config,
         provider,
         store: &store,
         session_id: &session_id,
         request: &resolved.request,
-        attempt_kind: "turn",
         model_context_window: model_info.context_window,
-        title: Some(&title),
         output,
         preamble_notice: None,
     })
@@ -884,9 +875,7 @@ async fn run_turn(args: RunTurnArgs<'_>) -> Result<()> {
         store,
         session_id,
         request,
-        attempt_kind,
         model_context_window,
-        title,
         output,
         preamble_notice,
     } = args;
@@ -907,7 +896,6 @@ async fn run_turn(args: RunTurnArgs<'_>) -> Result<()> {
         store,
         session_id,
         request: request.clone(),
-        attempt_kind,
         model_context_window,
         renderer: &mut renderer,
     };
@@ -918,13 +906,6 @@ async fn run_turn(args: RunTurnArgs<'_>) -> Result<()> {
         Ok(r) => {
             let ctx_pct =
                 model_context_window.map(|cw| (r.context_tokens as f64 / cw as f64) * 100.0);
-            store.update_session(
-                session_id,
-                &r.usage,
-                r.context_tokens,
-                title,
-                &request.model.canonical,
-            )?;
             renderer.finish_turn()?;
             if output == cli::OutputFormat::Final {
                 write_final_stdout(r.final_assistant.as_deref())?;
@@ -956,16 +937,12 @@ async fn run_turn(args: RunTurnArgs<'_>) -> Result<()> {
 
 fn create_seeded_session(
     store: &store::Store,
-    cwd: &std::path::Path,
-    project: Option<&paths::Project>,
     project_config_dir: Option<&std::path::Path>,
-) -> Result<(store::Session, bool)> {
-    let session = store.create_session_seeded(
-        &cwd.display().to_string(),
-        &system_prompt::build_system_prompt(&paths::global_dir(), project_config_dir)?,
-        &system_prompt::initial_environment_context(cwd, project),
-    )?;
-    Ok((session, true))
+) -> Result<store::Session> {
+    store.create_session_seeded(&system_prompt::build_system_prompt(
+        &paths::global_dir(),
+        project_config_dir,
+    )?)
 }
 
 fn build_prompt_content(prompt: &str, attachments: Vec<ContentPart>) -> UserContent {
@@ -983,8 +960,8 @@ fn resolve_retry_session(
     store: &store::Store,
     retry: &cli::RetryArgs,
 ) -> Result<Option<store::Session>> {
-    if retry.selection.session.is_some() && retry.selection.continue_latest {
-        bail!("use either -s/--session or -c/--continue-latest, not both");
+    if retry.selection.session.is_some() && retry.selection.continue_current {
+        bail!("use either -s/--session or -c/--continue, not both");
     }
     if let Some(id) = retry.selection.session.as_deref() {
         return Ok(Some(
@@ -993,7 +970,7 @@ fn resolve_retry_session(
                 .ok_or_else(|| ExitError::session_not_found(id))?,
         ));
     }
-    store.latest_session()
+    store.current_session()
 }
 
 fn open_status_store(path: &std::path::Path) -> Result<store::Store> {
