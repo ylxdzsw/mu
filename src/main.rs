@@ -335,15 +335,18 @@ fn print_project_init_info(info: &ProjectInitInfo) {
     }
 }
 
-fn open_store_with_session(store_path: &Path, session: &str) -> Result<store::Store> {
-    if !store_path.exists() {
-        return Err(ExitError::session_not_found(session));
+fn resolve_transcript_session(
+    store: &store::Store,
+    session: Option<&str>,
+) -> Result<store::Session> {
+    if let Some(id) = session {
+        return store
+            .get_session(id)?
+            .ok_or_else(|| ExitError::session_not_found(id));
     }
-    let store = store::Store::open(store_path)?;
-    if store.get_session(session)?.is_none() {
-        return Err(ExitError::session_not_found(session));
-    }
-    Ok(store)
+    store
+        .current_session()?
+        .ok_or_else(|| anyhow::anyhow!("no sessions found in active scope"))
 }
 
 async fn run() -> Result<()> {
@@ -404,8 +407,15 @@ async fn run() -> Result<()> {
                     }
                 }
                 SessionSub::Transcript { session } => {
-                    let store = open_store_with_session(&store_path, &session)?;
-                    for r in store.message_records_from_seq(&session, 0)? {
+                    if !store_path.exists() {
+                        return Err(session.as_deref().map_or_else(
+                            || anyhow::anyhow!("no sessions found in active scope"),
+                            ExitError::session_not_found,
+                        ));
+                    }
+                    let store = store::Store::open(&store_path)?;
+                    let session = resolve_transcript_session(&store, session.as_deref())?;
+                    for r in store.message_records_from_seq(&session.id, 0)? {
                         println!("[{}:{}] {}", r.seq, r.kind, r.content);
 
                         // Emit toolcall requests immediately under their assistant message
@@ -1293,6 +1303,26 @@ mod tests {
         assert!(
             err.to_string()
                 .contains("session not found in active scope: abc123")
+        );
+    }
+
+    #[test]
+    fn transcript_defaults_to_current_session() {
+        let store = store::Store::open_memory().unwrap();
+        let first = store.create_session("/tmp").unwrap();
+        let second = store.create_session("/tmp").unwrap();
+
+        assert!(resolve_transcript_session(&store, None).is_err());
+        store.select_session(&second.id).unwrap();
+        assert_eq!(
+            resolve_transcript_session(&store, None).unwrap().id,
+            second.id
+        );
+        assert_eq!(
+            resolve_transcript_session(&store, Some(&first.id))
+                .unwrap()
+                .id,
+            first.id
         );
     }
 

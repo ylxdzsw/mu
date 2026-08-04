@@ -220,8 +220,10 @@ pub fn parse_mu_shebang(line: &str) -> Result<Option<MuShebang>> {
 
     match args.as_slice() {
         [] => Ok(Some(MuShebang { model: None })),
-        ["--model"] => anyhow::bail!("mu shebang --model requires a value"),
-        ["--model", model] => Ok(Some(MuShebang {
+        [flag] if matches!(*flag, "-m" | "--model") => {
+            anyhow::bail!("mu shebang {flag} requires a value")
+        }
+        [flag, model] if matches!(*flag, "-m" | "--model") => Ok(Some(MuShebang {
             model: Some((*model).to_string()),
         })),
         _ => anyhow::bail!("unsupported mu shebang arguments: {}", args.join(" ")),
@@ -697,6 +699,12 @@ mod tests {
                 model: Some("openai/gpt-5:high".into())
             })
         );
+        assert_eq!(
+            parse_mu_shebang("#!/usr/bin/env -S mu -m openai/gpt-5:high").unwrap(),
+            Some(MuShebang {
+                model: Some("openai/gpt-5:high".into())
+            })
+        );
         assert_eq!(parse_mu_shebang("#!/usr/bin/env bash").unwrap(), None);
     }
 
@@ -704,6 +712,7 @@ mod tests {
     fn rejects_other_mu_shebang_arguments() {
         for line in [
             "#!/usr/bin/env -S mu --model",
+            "#!/usr/bin/env -S mu -m",
             "#!/usr/bin/env -S mu --output detail",
             "#!/usr/bin/env -S mu --model=openai/gpt-5",
             "#!/usr/bin/env -S mu --model openai/gpt-5 extra",

@@ -251,7 +251,7 @@ accepts optional non-terminal stdin as a custom focus). The surface is small:
 - `mu [-s <id>] [-c] [-m|--model <id>] [-a <file>] [-o|--output final|concise|detail|full] <prompt-file>`
   — run one turn from a prompt file; if the first line starts with `#!`, drop
   it before sending the prompt. A `mu` shebang may contain exactly
-  `--model <id>` as a turn-local default. Non-terminal stdin is appended as a
+  `-m|--model <id>` as a turn-local default. Non-terminal stdin is appended as a
   custom instruction. `-a/--attach` is repeatable.
 - `mu [-s <id>] [-c] [-m|--model <id>] [-o|--output final|concise|detail|full] <custom-command>`
   — run a discovered shebang command from the active project/global `.mu`
@@ -307,8 +307,8 @@ accepts optional non-terminal stdin as a custom focus). The surface is small:
   rejected; model selection belongs to an actual turn. Creation does not update
   `current-session`.
 - `mu session list` — list recent sessions.
-- `mu session transcript --session <id>` — print a persisted session
-  transcript.
+- `mu session transcript [--session <id>]` — print a persisted session
+  transcript, defaulting to the last selected session in the active scope.
 - `mu compact --session <id>` — force compaction. Terminal stdin is not read;
   non-terminal stdin is an optional verbatim custom focus instruction.
 - `mu retry [-s <id>] [-c] [-m|--model <id>] [-o|--output final|concise|detail|full]`
@@ -1167,7 +1167,7 @@ global and project `.mu` directories.
 
 The same file may also be a custom command when its first line is a permissive
 `mu` shebang. The shebang may contain no arguments or exactly
-`--model <model[:effort]|provider/model[:effort]>`; all other arguments are rejected when the
+`-m|--model <model[:effort]|provider/model[:effort]>`; all other arguments are rejected when the
 file is invoked. An explicit invocation `--model` overrides the shebang model,
 which otherwise overrides the attached session or configured default for that
 turn without rewriting stored session state. Progressive disclosure remains:

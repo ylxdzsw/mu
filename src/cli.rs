@@ -140,7 +140,7 @@ pub enum SessionSub {
     /// Print a session transcript
     Transcript {
         #[arg(long)]
-        session: String,
+        session: Option<String>,
     },
 }
 
@@ -318,6 +318,26 @@ mod tests {
                 assert_eq!(retry.output, Some(OutputFormat::Detail));
             }
             other => panic!("expected retry command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_transcript_with_optional_session() {
+        let args = Args::try_parse_from(["mu", "session", "transcript"]).unwrap();
+        match args.command {
+            Some(Command::Session {
+                sub: SessionSub::Transcript { session },
+            }) => assert_eq!(session, None),
+            other => panic!("expected transcript command, got {other:?}"),
+        }
+
+        let args = Args::try_parse_from(["mu", "session", "transcript", "--session", "session-1"])
+            .unwrap();
+        match args.command {
+            Some(Command::Session {
+                sub: SessionSub::Transcript { session },
+            }) => assert_eq!(session.as_deref(), Some("session-1")),
+            other => panic!("expected transcript command, got {other:?}"),
         }
     }
 
