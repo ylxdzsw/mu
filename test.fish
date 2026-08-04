@@ -44,6 +44,11 @@ source "$TEST_ROOT/mu.fish"
 
 assert_equal "$MU_FISH_MODE" shell 'starts in shell mode'
 assert_equal (_mu_fish_current_scope) "project:$TEST_ROOT" 'discovers repository scope'
+set history_input (printf 'first line\nsecond $HOME `tick` "quoted"' | string collect)
+_mu_fish_history_entry "$history_input"
+_mu_fish_decode_history "$_MU_FISH_HISTORY_ENTRY; printf replay"; or fail 'decodes tagged Fish history'
+assert_equal "$_MU_FISH_DECODED_HISTORY" "$history_input" 'tagged Fish history preserves multiline shell-special input'
+_mu_fish_decode_history 'mu status'; and fail 'ordinary shell history must not decode as Mu input'
 
 set project_a "$TEST_TMPDIR/project-a"
 set project_b "$TEST_TMPDIR/project-b"
@@ -142,8 +147,11 @@ assert_equal (string join \x1e -- $submitted_args) (string join \x1e -- --output
 not set -q MU_FISH_PENDING_ATTACHMENTS[1]; or fail 'submission clears attachments'
 
 set replay (builtin history search --max 1 | string collect)
+assert_contains "$replay" 'true mu-history-v1 ' 'tags Fish Mu history'
 assert_contains "$replay" "printf '%s\\n'" 'records replayable Fish history'
 assert_contains "$replay" 'inspect this' 'history preserves submitted prompt'
+_mu_fish_decode_history "$replay"; or fail 'decodes recorded Fish turn history'
+assert_equal "$_MU_FISH_DECODED_HISTORY" 'inspect this' 'recorded Fish turn decodes to its original prompt'
 fish -n -c "$replay"; or fail 'recorded Fish history is not valid Fish syntax'
 builtin history save
 set expected_history_file "$XDG_DATA_HOME/fish/$fish_history"_history
@@ -351,7 +359,6 @@ begin
     printf 'gpt\r'
     sleep 0.3
     printf hello
-    printf '\e[A\e[B'
     sleep 0.2
     printf '\r'
     sleep 0.5
@@ -376,6 +383,46 @@ Hello from Fish.' 'submitted prompt remains visible before streamed output'
 assert_contains "$normalized" 'next turns in this scope will use openai/gpt' 'Tab completes slash command before model selection'
 assert_contains "$normalized" 'Hello from Fish.' 'interactive output streams'
 assert_contains "$normalized" 'mu>' 'Mu prompt redraws after the turn'
+
+set history_recalled_prompt 'recalled Mu prompt'
+_mu_fish_history_entry "$history_recalled_prompt"
+set history_marker "$_MU_FISH_HISTORY_ENTRY"
+set history_setup (string join '; ' -- \
+    "$interactive_setup" \
+    "builtin history append "(string escape "$history_marker") \
+    "builtin history append "(string escape 'echo shell-only'))
+
+set history_recall_transcript "$TEST_TMPDIR/history-recall-transcript"
+rm -f "$capture_args" "$capture_stdin" "$capture_calls" "$interactive_ready"
+begin
+    sleep 0.2
+    send_interactive_setup "$history_setup" "$interactive_ready"
+    printf '\t\e[A\r'
+    sleep 0.5
+    printf '\x04'
+end | timeout 10 script -qfec \
+    'env fish_features=no-query-term,no-keyboard-protocols,no-mark-prompt TERM=xterm-256color fish --no-config' \
+    "$history_recall_transcript" >/dev/null
+set interactive_status $pipestatus[2]
+test $interactive_status -eq 0; or fail "history recall transcript exited with status $interactive_status"
+assert_equal (cat "$capture_calls") x 'recalled Fish history submits exactly one Mu prompt'
+assert_equal (cat "$capture_stdin") "$history_recalled_prompt" 'Fish Up skips shell entries and recalls Mu input'
+
+set history_restore_transcript "$TEST_TMPDIR/history-restore-transcript"
+set history_draft 'keep this draft'
+rm -f "$capture_args" "$capture_stdin" "$capture_calls" "$interactive_ready"
+begin
+    sleep 0.2
+    send_interactive_setup "$history_setup" "$interactive_ready"
+    printf '\t%s\e[A\e[B\r' "$history_draft"
+    sleep 0.5
+    printf '\x04'
+end | timeout 10 script -qfec \
+    'env fish_features=no-query-term,no-keyboard-protocols,no-mark-prompt TERM=xterm-256color fish --no-config' \
+    "$history_restore_transcript" >/dev/null
+set interactive_status $pipestatus[2]
+test $interactive_status -eq 0; or fail "history restore transcript exited with status $interactive_status"
+assert_equal (cat "$capture_stdin") "$history_draft" 'Fish Down restores the pre-history Mu draft'
 
 set model_effort_transcript "$TEST_TMPDIR/model-effort-transcript"
 rm -f "$capture_args" "$capture_stdin" "$capture_calls" "$interactive_ready"

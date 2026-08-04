@@ -4,8 +4,8 @@
 # press Tab at cursor position 0 to toggle "mu>" mode while preserving the
 # current buffer, Enter to submit one non-blank mu turn, Ctrl+C to cancel the
 # current mu prompt while leaving the typed line in scrollback, Ctrl+D to keep
-# normal shell EOF behavior even from "mu>" mode, and Up/Down to stay within
-# the current buffer instead of browsing shell history.
+# normal shell EOF behavior even from "mu>" mode, and Up/Down to move through
+# multiline input before browsing earlier Mu submissions.
 
 typeset -g MU_ZSH_MODE=${MU_ZSH_MODE:-shell}
 typeset -g MU_ZSH_TRACKED_SCOPE=${MU_ZSH_TRACKED_SCOPE:-}
@@ -35,6 +35,11 @@ typeset -g MU_ZSH_ORIGINAL_RPROMPT=${MU_ZSH_ORIGINAL_RPROMPT:-}
 typeset -g MU_ZSH_SAVED_KEYMAP=${MU_ZSH_SAVED_KEYMAP:-main}
 typeset -g MU_ZSH_ORIGINAL_TAB_WIDGET=${MU_ZSH_ORIGINAL_TAB_WIDGET:-}
 typeset -g MU_ZSH_ORIGINAL_SLASH_WIDGET=${MU_ZSH_ORIGINAL_SLASH_WIDGET:-}
+typeset -gi MU_ZSH_HISTORY_ACTIVE=0
+typeset -gi MU_ZSH_HISTORY_EVENT=0
+typeset -gi MU_ZSH_HISTORY_LATEST_EVENT=0
+typeset -g MU_ZSH_HISTORY_DRAFT=
+typeset -gi MU_ZSH_HISTORY_DRAFT_CURSOR=0
 typeset -gi MU_ZSH_HAD_HIGHLIGHTERS=${MU_ZSH_HAD_HIGHLIGHTERS:-0}
 typeset -gi MU_ZSH_DISABLED_AUTOSUGGESTIONS=${MU_ZSH_DISABLED_AUTOSUGGESTIONS:-0}
 typeset -ga MU_ZSH_COMMAND_REPLY
@@ -165,6 +170,31 @@ _mu_zsh_activate_scope() {
   _mu_zsh_sync_state "$scope"
 }
 
+_mu_zsh_append_history() {
+  local input=$1
+  local replay=${2:-}
+  local entry="true mu-history-v1 ${(qqq)input}"
+  [[ -n "$replay" ]] && entry+="; $replay"
+  print -sr -- "$entry"
+}
+
+_mu_zsh_decode_history() {
+  local entry=$1
+  local -a words
+  words=("${(z)entry}")
+  (( ${#words[@]} >= 3 )) || return 1
+  [[ "${words[1]}" == true && "${words[2]}" == mu-history-v1 ]] || return 1
+  REPLY=${(Q)words[3]}
+}
+
+_mu_zsh_reset_history_navigation() {
+  MU_ZSH_HISTORY_ACTIVE=0
+  MU_ZSH_HISTORY_EVENT=0
+  MU_ZSH_HISTORY_LATEST_EVENT=0
+  MU_ZSH_HISTORY_DRAFT=
+  MU_ZSH_HISTORY_DRAFT_CURSOR=0
+}
+
 _mu_zsh_record_history() {
   local input=$1
   local scope=${2:-}
@@ -177,6 +207,7 @@ _mu_zsh_record_history() {
 
   local attachments=
   local output=
+  local replay
   local attachment
   for attachment in "${MU_ZSH_PENDING_ATTACHMENTS[@]}"; do
     attachments+=" -a ${(q)attachment}"
@@ -185,15 +216,16 @@ _mu_zsh_record_history() {
 
   if [[ -n "$session_id" ]]; then
     if [[ -n "$model" ]]; then
-      print -sr -- "$MU_ZSH_BIN -s ${(q)session_id} --model ${(q)model}${attachments}${output} <<< $quoted"
+      replay="$MU_ZSH_BIN -s ${(q)session_id} --model ${(q)model}${attachments}${output} <<< $quoted"
     else
-      print -sr -- "$MU_ZSH_BIN -s ${(q)session_id}${attachments}${output} <<< $quoted"
+      replay="$MU_ZSH_BIN -s ${(q)session_id}${attachments}${output} <<< $quoted"
     fi
   elif [[ -n "$model" ]]; then
-    print -sr -- "$MU_ZSH_BIN --model ${(q)model}${attachments}${output} <<< $quoted"
+    replay="$MU_ZSH_BIN --model ${(q)model}${attachments}${output} <<< $quoted"
   else
-    print -sr -- "$MU_ZSH_BIN${attachments}${output} <<< $quoted"
+    replay="$MU_ZSH_BIN${attachments}${output} <<< $quoted"
   fi
+  _mu_zsh_append_history "$input" "$replay"
 }
 
 _mu_zsh_print_block_message() {
@@ -658,7 +690,7 @@ _mu_zsh_run_slash_command() {
     done
   fi
 
-  print -sr -- "$line"
+  _mu_zsh_append_history "$line"
   _mu_zsh_set_scope_key_for_dir "$PWD"
   scope=$REPLY
   case "$command" in
@@ -787,6 +819,7 @@ _mu_zsh_enter_mode() {
 _mu_zsh_exit_mode() {
   [[ "$MU_ZSH_MODE" == shell ]] && return 0
 
+  _mu_zsh_reset_history_navigation
   MU_ZSH_MODE=shell
   zle -K "${MU_ZSH_SAVED_KEYMAP:-main}" 2>/dev/null || zle -K main 2>/dev/null || true
   PROMPT=$MU_ZSH_ORIGINAL_PROMPT
@@ -803,6 +836,77 @@ _mu_zsh_insert_newline() {
 
   BUFFER="${BUFFER[1,CURSOR]}"$'\n'"${BUFFER[CURSOR+1,-1]}"
   (( CURSOR += 1 ))
+}
+
+_mu_zsh_history_up() {
+  if [[ "${BUFFER[1,CURSOR]}" == *$'\n'* ]]; then
+    zle up-line
+    return
+  fi
+
+  local origin_event=$MU_ZSH_HISTORY_EVENT
+  local origin_histno=$HISTNO
+  local origin_buffer=$BUFFER
+  local origin_cursor=$CURSOR
+  local candidate entry
+
+  if (( ! MU_ZSH_HISTORY_ACTIVE )); then
+    MU_ZSH_HISTORY_ACTIVE=1
+    MU_ZSH_HISTORY_LATEST_EVENT=$HISTNO
+    MU_ZSH_HISTORY_EVENT=$HISTNO
+    MU_ZSH_HISTORY_DRAFT=$BUFFER
+    MU_ZSH_HISTORY_DRAFT_CURSOR=$CURSOR
+  elif (( MU_ZSH_HISTORY_EVENT == MU_ZSH_HISTORY_LATEST_EVENT )); then
+    MU_ZSH_HISTORY_DRAFT=$BUFFER
+    MU_ZSH_HISTORY_DRAFT_CURSOR=$CURSOR
+  fi
+
+  candidate=$(( MU_ZSH_HISTORY_EVENT - 1 ))
+  while (( candidate > 0 )); do
+    HISTNO=$candidate
+    entry=$BUFFER
+    if _mu_zsh_decode_history "$entry"; then
+      MU_ZSH_HISTORY_EVENT=$candidate
+      BUFFER=$REPLY
+      CURSOR=${#BUFFER}
+      return
+    fi
+    (( candidate-- ))
+  done
+
+  HISTNO=$origin_histno
+  BUFFER=$origin_buffer
+  CURSOR=$origin_cursor
+  if (( ! origin_event )); then
+    _mu_zsh_reset_history_navigation
+  fi
+}
+
+_mu_zsh_history_down() {
+  if [[ "${BUFFER[CURSOR+1,-1]}" == *$'\n'* ]]; then
+    zle down-line
+    return
+  fi
+  (( MU_ZSH_HISTORY_ACTIVE )) || return 0
+  (( MU_ZSH_HISTORY_EVENT < MU_ZSH_HISTORY_LATEST_EVENT )) || return 0
+
+  local candidate entry
+  candidate=$(( MU_ZSH_HISTORY_EVENT + 1 ))
+  while (( candidate < MU_ZSH_HISTORY_LATEST_EVENT )); do
+    HISTNO=$candidate
+    entry=$BUFFER
+    if _mu_zsh_decode_history "$entry"; then
+      MU_ZSH_HISTORY_EVENT=$candidate
+      BUFFER=$REPLY
+      CURSOR=${#BUFFER}
+      return
+    fi
+    (( candidate++ ))
+  done
+
+  MU_ZSH_HISTORY_EVENT=$MU_ZSH_HISTORY_LATEST_EVENT
+  BUFFER=$MU_ZSH_HISTORY_DRAFT
+  CURSOR=$MU_ZSH_HISTORY_DRAFT_CURSOR
 }
 
 _mu_zsh_submit_prompt() {
@@ -885,6 +989,7 @@ _mu_zsh_accept() {
   fi
 
   local input=$BUFFER
+  _mu_zsh_reset_history_navigation
   if [[ -z "${input//[[:space:]]/}" ]]; then
     zle .accept-line
     return
@@ -924,6 +1029,7 @@ _mu_zsh_dispatch_pending() {
 }
 
 _mu_zsh_line_init() {
+  _mu_zsh_reset_history_navigation
   [[ "$MU_ZSH_MODE" == mu ]] && _mu_zsh_refresh_prompt
   if [[ "$MU_ZSH_MODE" == mu ]]; then
     zle -K mumode 2>/dev/null || true
@@ -947,10 +1053,10 @@ _mu_zsh_configure_keymap() {
   bindkey -M mumode $'\e[13;2u' _mu_zsh_insert_newline
   bindkey -M mumode '^I' _mu_zsh_tab
   bindkey -M mumode '/' _mu_zsh_slash
-  bindkey -M mumode $'\e[A' up-line
-  bindkey -M mumode $'\eOA' up-line
-  bindkey -M mumode $'\e[B' down-line
-  bindkey -M mumode $'\eOB' down-line
+  bindkey -M mumode $'\e[A' _mu_zsh_history_up
+  bindkey -M mumode $'\eOA' _mu_zsh_history_up
+  bindkey -M mumode $'\e[B' _mu_zsh_history_down
+  bindkey -M mumode $'\eOB' _mu_zsh_history_down
   # Ctrl-C is intentionally left inherited from the main keymap: real terminals
   # deliver it as SIGINT (the tty intercepts it before ZLE), which the shell
   # already handles by cancelling the draft and redrawing a fresh mu> prompt.
@@ -970,6 +1076,8 @@ if [[ -o zle ]]; then
   zle -N _mu_zsh_slash
   zle -N _mu_zsh_accept
   zle -N _mu_zsh_insert_newline
+  zle -N _mu_zsh_history_up
+  zle -N _mu_zsh_history_down
   zle -N _mu_zsh_finish_pending
   zle -N _mu_zsh_line_init
   zle -N mu-zsh-mode

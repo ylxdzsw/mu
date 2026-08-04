@@ -846,10 +846,12 @@ the current buffer. Enter submits the current buffer as one `mu` turn when it
 contains non-whitespace text and otherwise just draws a fresh `mu>` prompt;
 Ctrl-C cancels the `mu>` draft but leaves the cancelled line in scrollback;
 Backspace remains an ordinary delete key; and Ctrl-D keeps normal shell EOF
-behavior even while `mu>` mode is active. Up and Down stay within the current
-`mu>` buffer and do not browse shell history; the user leaves `mu>` mode first
-if they want normal shell history navigation. A plugin must not duplicate
-agent-loop, provider, store, or tool semantics.
+behavior even while `mu>` mode is active. Up and Down first move within the
+current multiline buffer, then browse tagged Mu submissions from shell history
+while skipping ordinary shell commands. Mu history is not project-scoped;
+recalled input runs against the current shell-managed session, model, and
+attachments. A plugin must not duplicate agent-loop, provider, store, or tool
+semantics.
 
 The zsh plugin requires zsh, `jq`, and the `mu` binary on `PATH`. Setting
 `MU_ZSH_BIN` to a specific executable overrides the binary name/path used by
@@ -912,8 +914,11 @@ Consequences:
 - Ctrl-D should keep normal shell EOF semantics even inside `mu>` mode, so an
   empty `mu>` prompt exits the shell rather than merely leaving prompt mode.
 - Press Up or Down while editing in `mu>` mode to move within the current
-  buffer only. They must not recall shell history; leave `mu>` mode first if
-  shell history navigation is desired.
+  multiline buffer. At its first or last line, respectively, browse only
+  version-tagged Mu submissions in shell history, skipping ordinary commands.
+  The first Up preserves the live draft and cursor; Down past the newest Mu
+  entry restores them. History recall is unscoped and does not change the
+  current session, model, or pending attachments.
 - Shift+Enter inserts a newline without submitting when the terminal sends the
   CSI-u sequence `Esc [ 13 ; 2 u`. Terminals that send ordinary Enter for this
   key combination cannot be distinguished by the shell and require a matching
@@ -979,8 +984,9 @@ Consequences:
 - Slash/model completion uses Mu's status candidates and Fish filename
   completion. Multiple candidates are listed with Fish repaint semantics;
   completion does not promise zsh `zstyle` behavior.
-- Each accepted prompt is added to Fish history as a directly replayable
-  `printf ... | mu ...` command. Slash commands are recorded verbatim.
+- Each accepted prompt is added to shell history as a version-tagged entry whose
+  trailing `printf ... | mu ...` command remains directly replayable. Slash
+  commands use the same tag so prompt-mode history can recall them.
 - `MU_FISH_SESSION_ID=<id>` seeds an existing session. Session, model,
   attachment, prompt color, hook, executable, and output state otherwise use
   `MU_FISH_*` variables corresponding to the zsh variables.

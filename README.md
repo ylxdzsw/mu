@@ -67,7 +67,10 @@ mu> what changed in the last three commits?
 Each submission runs one foreground `mu` turn while the plugin keeps the session
 connected. Press Tab again to return to the normal shell without losing your
 input, so `mu` and your usual commands share one prompt. The shell keeps owning
-line editing, history, and job control.
+line editing, history, and job control. Within `mu>` mode, Up and Down move
+through multiline input and then browse prior Mu submissions, skipping ordinary
+shell commands. This Mu history is shared across directories and recalled text
+runs against the current Mu session and shell state.
 
 Type `/` to list prompt-mode commands. The common ones:
 

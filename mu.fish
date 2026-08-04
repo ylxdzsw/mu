@@ -3,7 +3,8 @@
 # Source this file near the end of config.fish. Press Tab at cursor position 0
 # to toggle Mu prompt mode while preserving the current buffer. Enter submits a
 # non-blank turn, Ctrl-C cancels the draft, Ctrl-D keeps Fish's normal EOF
-# behavior, and Up/Down move within the current multiline buffer.
+# behavior, and Up/Down move through multiline input before browsing earlier
+# Mu submissions.
 
 set -l _mu_fish_version_major (string split -m1 . "$version")[1]
 if not string match -qr '^[0-9]+$' -- "$_mu_fish_version_major"; or test "$_mu_fish_version_major" -lt 4
@@ -28,6 +29,11 @@ set -q MU_FISH_EXIT_HOOKS; or set -g MU_FISH_EXIT_HOOKS
 set -q _MU_FISH_DEFAULT_TAB_BINDING; or set -g _MU_FISH_DEFAULT_TAB_BINDING
 set -q _MU_FISH_INSERT_TAB_BINDING; or set -g _MU_FISH_INSERT_TAB_BINDING
 set -q _MU_FISH_INPUT_FUNCTIONS; or set -g _MU_FISH_INPUT_FUNCTIONS
+set -q MU_FISH_HISTORY_ACTIVE; or set -g MU_FISH_HISTORY_ACTIVE 0
+set -q MU_FISH_HISTORY_INDEX; or set -g MU_FISH_HISTORY_INDEX 0
+set -q MU_FISH_HISTORY_DRAFT; or set -g MU_FISH_HISTORY_DRAFT
+set -q MU_FISH_HISTORY_DRAFT_CURSOR; or set -g MU_FISH_HISTORY_DRAFT_CURSOR 0
+set -q MU_FISH_HISTORY_ENTRIES; or set -g MU_FISH_HISTORY_ENTRIES
 
 set -q MU_FISH_PROMPT_MODEL_COLOR; or set -g MU_FISH_PROMPT_MODEL_COLOR cyan
 set -q MU_FISH_PROMPT_CONTEXT_COLOR; or set -g MU_FISH_PROMPT_CONTEXT_COLOR magenta
@@ -213,6 +219,35 @@ function _mu_fish_append_history --argument-names entry
     builtin history append "$entry"
 end
 
+function _mu_fish_history_entry --argument-names input
+    set -g _MU_FISH_HISTORY_ENTRY (string join ' ' -- true mu-history-v1 (string escape -- "$input"))
+end
+
+function _mu_fish_decode_history --argument-names entry
+    set -g _MU_FISH_DECODED_HISTORY
+    printf '%s\n' "$entry" | read --tokenize -a words
+    test (count $words) -ge 3; or return 1
+    test "$words[1]" = true; and test "$words[2]" = mu-history-v1; or return 1
+    set -g _MU_FISH_DECODED_HISTORY "$words[3]"
+end
+
+function _mu_fish_reset_history_navigation
+    set -g MU_FISH_HISTORY_ACTIVE 0
+    set -g MU_FISH_HISTORY_INDEX 0
+    set -g MU_FISH_HISTORY_DRAFT
+    set -g MU_FISH_HISTORY_DRAFT_CURSOR 0
+    set -g MU_FISH_HISTORY_ENTRIES
+end
+
+function _mu_fish_load_history
+    set -g MU_FISH_HISTORY_ENTRIES
+    set -l entries (builtin history search --null --case-sensitive --prefix 'true mu-history-v1 ' | string split0)
+    for entry in $entries
+        _mu_fish_decode_history "$entry"; or continue
+        set -a MU_FISH_HISTORY_ENTRIES "$_MU_FISH_DECODED_HISTORY"
+    end
+end
+
 function _mu_fish_record_turn_history --argument-names input
     set -e argv[1]
     set -l command $argv
@@ -222,7 +257,8 @@ function _mu_fish_record_turn_history --argument-names input
     end
     set -l escaped_input (string escape -- "$input")
     set -l replay "printf '%s\\n' $escaped_input | "(string join ' ' -- $escaped_command)
-    _mu_fish_append_history "$replay"
+    _mu_fish_history_entry "$input"
+    _mu_fish_append_history "$_MU_FISH_HISTORY_ENTRY; $replay"
 end
 
 function _mu_fish_build_mode_prompt
@@ -503,7 +539,8 @@ function _mu_fish_run_slash_command --argument-names line
     set -l rest (string trim -- "$instruction")
     set -l exit_status 0
 
-    _mu_fish_append_history "$line"
+    _mu_fish_history_entry "$line"
+    _mu_fish_append_history "$_MU_FISH_HISTORY_ENTRY"
     set -l scope (_mu_fish_current_scope)
 
     switch "$slash_command"
@@ -721,6 +758,7 @@ end
 
 function _mu_fish_enter_mode
     test "$MU_FISH_MODE" = mu; and return 0
+    _mu_fish_reset_history_navigation
     set -g MU_FISH_MODE mu
     set -g MU_FISH_SAVED_BIND_MODE $fish_bind_mode
     test -n "$MU_FISH_SAVED_BIND_MODE"; or set -g MU_FISH_SAVED_BIND_MODE default
@@ -731,6 +769,7 @@ end
 
 function _mu_fish_exit_mode
     test "$MU_FISH_MODE" = shell; and return 0
+    _mu_fish_reset_history_navigation
     set -g MU_FISH_MODE shell
     set fish_bind_mode "$MU_FISH_SAVED_BIND_MODE"
     _mu_fish_remove_model_completion
@@ -777,8 +816,53 @@ function _mu_fish_insert_newline
     commandline -i \n
 end
 
+function _mu_fish_history_up
+    if test (commandline -L) -gt 1
+        commandline -f up-line
+        return
+    end
+
+    if test "$MU_FISH_HISTORY_ACTIVE" -eq 0
+        _mu_fish_load_history
+        set -q MU_FISH_HISTORY_ENTRIES[1]; or return
+        set -g MU_FISH_HISTORY_ACTIVE 1
+        set -g MU_FISH_HISTORY_INDEX 0
+        set -g MU_FISH_HISTORY_DRAFT (commandline | string collect)
+        set -g MU_FISH_HISTORY_DRAFT_CURSOR (commandline -C)
+    else if test "$MU_FISH_HISTORY_INDEX" -eq 0
+        set -g MU_FISH_HISTORY_DRAFT (commandline | string collect)
+        set -g MU_FISH_HISTORY_DRAFT_CURSOR (commandline -C)
+    end
+
+    set -l next_index (math "$MU_FISH_HISTORY_INDEX + 1")
+    set -q MU_FISH_HISTORY_ENTRIES[$next_index]; or return
+    set -g MU_FISH_HISTORY_INDEX $next_index
+    commandline -r -- "$MU_FISH_HISTORY_ENTRIES[$next_index]"
+    commandline -C (string length -- "$MU_FISH_HISTORY_ENTRIES[$next_index]")
+end
+
+function _mu_fish_history_down
+    set -l lines (string split \n -- (commandline | string collect))
+    if test (commandline -L) -lt (count $lines)
+        commandline -f down-line
+        return
+    end
+    test "$MU_FISH_HISTORY_ACTIVE" -eq 1; or return
+    test "$MU_FISH_HISTORY_INDEX" -gt 0; or return
+
+    set -g MU_FISH_HISTORY_INDEX (math "$MU_FISH_HISTORY_INDEX - 1")
+    if test "$MU_FISH_HISTORY_INDEX" -eq 0
+        commandline -r -- "$MU_FISH_HISTORY_DRAFT"
+        commandline -C "$MU_FISH_HISTORY_DRAFT_CURSOR"
+        return
+    end
+    commandline -r -- "$MU_FISH_HISTORY_ENTRIES[$MU_FISH_HISTORY_INDEX]"
+    commandline -C (string length -- "$MU_FISH_HISTORY_ENTRIES[$MU_FISH_HISTORY_INDEX]")
+end
+
 function _mu_fish_accept
     set -l input (commandline | string collect)
+    _mu_fish_reset_history_navigation
     if string match -qr '^[[:space:]]*$' -- "$input"
         commandline -f execute
         return
@@ -820,10 +904,10 @@ function _mu_fish_configure_keymap
     bind -M mumode enter _mu_fish_accept
     bind -M mumode tab _mu_fish_tab
     bind -M mumode / _mu_fish_slash
-    bind -M mumode ctrl-c cancel-commandline
+    bind -M mumode ctrl-c _mu_fish_reset_history_navigation cancel-commandline
     bind -M mumode ctrl-d delete-or-exit
-    bind -M mumode up up-line
-    bind -M mumode down down-line
+    bind -M mumode up _mu_fish_history_up
+    bind -M mumode down _mu_fish_history_down
     bind -M mumode \e\[13\;2u _mu_fish_insert_newline
 
     # Fish uses default for Emacs and vi command mode, and insert for vi insert

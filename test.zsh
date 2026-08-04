@@ -126,6 +126,12 @@ MU_ZSH_BIN=$prompt_fake_bin/mu
 
 [[ "$MU_ZSH_MODE" == shell ]] || fail "starts in shell mode"
 
+history_input=$'first line\nsecond $HOME `tick` "quoted"'
+history_entry="true mu-history-v1 ${(qqq)history_input}; print replay"
+_mu_zsh_decode_history "$history_entry" || fail "decodes tagged zsh history"
+[[ "$REPLY" == "$history_input" ]] || fail "tagged zsh history preserves multiline shell-special input"
+_mu_zsh_decode_history "mu status" && fail "ordinary shell history must not decode as Mu input"
+
 BUFFER="echo hello"
 CURSOR=0
 PROMPT="%# "
@@ -1014,27 +1020,42 @@ normalized=$(perl -pe 's/\e\[[0-?]*[ -\/]*[@-~]//g' "$toggle_transcript" | col -
 [[ "$normalized" == *$'\ntoggled\n'* ]] || fail "Tab at cursor start should preserve the buffer when returning to shell mode"
 [[ ! -e "$interactive_capture_calls" || ! -s "$interactive_capture_calls" ]] || fail "Tab toggle transcript should not call fake mu"
 
-history_disabled_replay=$tmpdir/history-disabled-replay
-history_disabled_file=$tmpdir/history-disabled
-history_disabled_transcript=$tmpdir/history-disabled-transcript
-history_disabled_prompt='agent ignores arrows'
-print -r -- "print -rn -- shell-history > ${(q)history_disabled_replay}" > "$history_disabled_file"
-rm -f -- "$history_disabled_replay" "$interactive_capture_args" "$interactive_capture_stdin" "$interactive_capture_calls"
+history_replay=$tmpdir/history-replay
+history_file=$tmpdir/history
+history_recall_transcript=$tmpdir/history-recall-transcript
+history_recalled_prompt='recalled Mu prompt'
+history_tagged_entry="true mu-history-v1 ${(qqq)history_recalled_prompt}; print -rn -- recalled > ${(q)history_replay}"
+print -r -- "$history_tagged_entry" > "$history_file"
+print -r -- "print -rn -- shell-history > ${(q)history_replay}" >> "$history_file"
+rm -f -- "$history_replay" "$interactive_capture_args" "$interactive_capture_stdin" "$interactive_capture_calls"
 
-history_disabled_setup=" setopt HIST_IGNORE_SPACE; PS1='> '; PATH=${(q)interactive_fake_bin}:\$PATH; export TEST_CAPTURE_ARGS=${(q)interactive_capture_args} TEST_CAPTURE_STDIN=${(q)interactive_capture_stdin} TEST_CAPTURE_CALLS=${(q)interactive_capture_calls}; HISTFILE=${(q)history_disabled_file}; HISTSIZE=100; SAVEHIST=100; fc -R ${(q)history_disabled_file}; source ${(q)root}/mu.zsh"
+history_setup=" setopt HIST_IGNORE_SPACE; PS1='> '; PATH=${(q)interactive_fake_bin}:\$PATH; export TEST_CAPTURE_ARGS=${(q)interactive_capture_args} TEST_CAPTURE_STDIN=${(q)interactive_capture_stdin} TEST_CAPTURE_CALLS=${(q)interactive_capture_calls}; HISTFILE=${(q)history_file}; HISTSIZE=100; SAVEHIST=100; fc -R ${(q)history_file}; source ${(q)root}/mu.zsh"
 interactive_status=0
 {
-  send_interactive_setup "$history_disabled_setup"
-  print -rn -- $'\t'"$history_disabled_prompt"$'\e[A\e[B\r'
+  send_interactive_setup "$history_setup"
+  print -rn -- $'\t\e[A\r'
   sleep 0.4
   print -rn -- $'\x04'
-} | timeout 10 script -qfec 'TERM=xterm-256color zsh -df' "$history_disabled_transcript" >/dev/null || interactive_status=$?
-(( interactive_status == 0 )) || fail "history-disabled transcript exited with status $interactive_status"
-[[ ! -e "$history_disabled_replay" ]] || fail "mu-mode arrows should not execute the recalled shell history entry"
-[[ $(<"$interactive_capture_calls") == x ]] || fail "mu-mode arrows should still submit exactly one mu prompt"
+} | timeout 10 script -qfec 'TERM=xterm-256color zsh -df' "$history_recall_transcript" >/dev/null || interactive_status=$?
+(( interactive_status == 0 )) || fail "history recall transcript exited with status $interactive_status"
+[[ ! -e "$history_replay" ]] || fail "Mu history recall should skip and not execute shell history"
+[[ $(<"$interactive_capture_calls") == x ]] || fail "recalled Mu history should submit exactly one prompt"
+print -rn -- "$history_recalled_prompt"$'\n' > "$interactive_expected_stdin"
+cmp -- "$interactive_expected_stdin" "$interactive_capture_stdin" || fail "Up should recall the prior Mu prompt"
 
-[[ "$(<"$interactive_capture_args")" == $'-s\nses_01234567' ]] || fail "default zsh invocation should inherit config output: $(<"$interactive_capture_args")"
-print -rn -- "$history_disabled_prompt"$'\n' > "$interactive_expected_stdin"
-cmp -- "$interactive_expected_stdin" "$interactive_capture_stdin" || fail "mu-mode arrows should leave the draft unchanged before submit"
+history_restore_transcript=$tmpdir/history-restore-transcript
+history_draft='keep this draft'
+rm -f -- "$history_replay" "$interactive_capture_args" "$interactive_capture_stdin" "$interactive_capture_calls"
+interactive_status=0
+{
+  send_interactive_setup "$history_setup"
+  print -rn -- $'\t'"$history_draft"$'\e[A\e[B\r'
+  sleep 0.4
+  print -rn -- $'\x04'
+} | timeout 10 script -qfec 'TERM=xterm-256color zsh -df' "$history_restore_transcript" >/dev/null || interactive_status=$?
+(( interactive_status == 0 )) || fail "history restore transcript exited with status $interactive_status"
+[[ ! -e "$history_replay" ]] || fail "Mu history navigation should not execute shell history"
+print -rn -- "$history_draft"$'\n' > "$interactive_expected_stdin"
+cmp -- "$interactive_expected_stdin" "$interactive_capture_stdin" || fail "Down should restore the pre-history Mu draft"
 
 print -- "ok"
