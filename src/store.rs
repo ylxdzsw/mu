@@ -2155,7 +2155,7 @@ fn validate_events(events: &[EventLine]) -> Result<()> {
                                 bail!("noncontiguous Bash claim position: {}", call.position)
                             }
                             if let Some(risk) = &call.declared_risk
-                                && !matches!(risk.as_str(), "readonly" | "destructive")
+                                && risk.parse::<BashRisk>().is_err()
                             {
                                 bail!("invalid declared Bash risk: {risk}")
                             }
