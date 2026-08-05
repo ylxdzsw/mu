@@ -24,7 +24,7 @@ material to the work.";
 /// text handed to the summarizer.
 const MAX_SUMMARY_ENTRY_CHARS: usize = 4000;
 const MAX_SUMMARY_TOOL_CHARS: usize = 2000;
-pub const KEEP_RECENT_TURNS: usize = 2;
+const MIN_RETAINED_REQUESTS: usize = 5;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CompactionThreshold {
@@ -107,12 +107,8 @@ pub async fn run_compaction_routed(
         renderer,
         None,
     )
-    .await
-    .map(|outcome| {
-        outcome.unwrap_or(CompactionOutcome::Inapplicable {
-            keep_recent_turns: KEEP_RECENT_TURNS,
-        })
-    })
+    .await?
+    .ok_or_else(|| anyhow::anyhow!("manual compaction did not produce an outcome"))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -288,7 +284,6 @@ pub async fn run_compaction(
 ) -> Result<CompactionOutcome> {
     bash::install_signal_forwarder();
     let records = store.message_records_from_seq(session_id, 0)?;
-    let keep = KEEP_RECENT_TURNS;
     let before_context_tokens = store
         .get_session(session_id)?
         .ok_or_else(|| anyhow::anyhow!("session not found"))?
@@ -301,40 +296,49 @@ pub async fn run_compaction(
 
     let prior_summary = records.iter().rfind(|m| m.kind == "summary");
     let prior_summary_seq = prior_summary.map(|m| m.seq).unwrap_or(-1);
+    let prior_summary_through_seq = store
+        .latest_compaction_through_seq(session_id)?
+        .unwrap_or(-1);
 
-    // Records project only submitted turns as `user`; derived location context
-    // therefore cannot consume the retention budget.
-    let mut user_turn_starts: Vec<i64> = Vec::new();
-    for rec in records.iter().rev() {
-        if rec.seq > prior_summary_seq && rec.kind == "user" {
-            user_turn_starts.push(rec.seq);
-            if user_turn_starts.len() > keep {
-                break;
+    // Each submitted prompt and Bash tool call counts as one request. Retain
+    // the smallest suffix of whole turns that satisfies the request budget.
+    let mut turns: Vec<(i64, usize)> = Vec::new();
+    for rec in records
+        .iter()
+        .filter(|rec| rec.seq > prior_summary_through_seq)
+    {
+        match rec.kind.as_str() {
+            "user" => turns.push((rec.seq, 1)),
+            "assistant" => {
+                if let Some((_, request_count)) = turns.last_mut() {
+                    *request_count += rec.bash_calls.len();
+                }
             }
+            _ => {}
         }
     }
-    user_turn_starts.reverse();
+    let mut retained_request_count = 0;
+    let mut retained_turn_count = 0;
+    for (_, request_count) in turns.iter().rev() {
+        retained_request_count += request_count;
+        retained_turn_count += 1;
+        if retained_request_count >= MIN_RETAINED_REQUESTS {
+            break;
+        }
+    }
 
-    if user_turn_starts.len() <= keep {
+    if turns.len() <= retained_turn_count {
         return Ok(CompactionOutcome::Inapplicable {
-            keep_recent_turns: keep,
+            keep_recent_turns: retained_turn_count,
         });
     }
 
-    let cut_seq = if keep == 0 && store.is_session_clean(session_id)? {
-        store.current_context_seq(session_id)?.saturating_add(1)
-    } else if keep == 0 {
-        *user_turn_starts
-            .last()
-            .expect("a turn exists when compaction is needed")
-    } else {
-        user_turn_starts[user_turn_starts.len() - keep]
-    };
+    let cut_seq = turns[turns.len() - retained_turn_count].0;
 
     let to_summarize: Vec<String> = records
         .iter()
         .filter(|m| {
-            m.seq > prior_summary_seq
+            m.seq > prior_summary_through_seq
                 && m.seq < cut_seq
                 && m.kind != "summary"
                 && m.kind != "system"
@@ -367,7 +371,7 @@ pub async fn run_compaction(
 
     if to_summarize.is_empty() {
         return Ok(CompactionOutcome::Inapplicable {
-            keep_recent_turns: keep,
+            keep_recent_turns: retained_turn_count,
         });
     }
 
@@ -540,7 +544,10 @@ mod tests {
 
     use super::*;
     use crate::models::RequestOptions;
-    use crate::provider::{FinishReason, ProviderError, StreamResult, Usage};
+    use crate::provider::{
+        FinishReason, FunctionCall, ProviderError, StreamResult, ToolCall, Usage,
+    };
+    use crate::store::BashResultRecord;
 
     struct FakeProvider;
 
@@ -667,7 +674,7 @@ mod tests {
             )
             .unwrap();
 
-        for n in 1..=4 {
+        for n in 1..=7 {
             store
                 .append_message(
                     &session.id,
@@ -719,7 +726,10 @@ mod tests {
                 "[summary of earlier conversation]\nsummary".to_string(),
                 "[environment]\ncurrent working directory: /tmp".to_string(),
                 "user 3".to_string(),
-                "user 4".to_string()
+                "user 4".to_string(),
+                "user 5".to_string(),
+                "user 6".to_string(),
+                "user 7".to_string()
             ]
         );
 
@@ -727,10 +737,110 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fixed_retention_keeps_the_current_and_previous_turn() {
+    async fn repeated_compaction_reapplies_budget_to_previously_retained_turns() {
         let store = Store::open_memory().unwrap();
         let session = store.create_session("/tmp").unwrap();
-        for n in 1..=2 {
+        let config = test_config();
+        let request_model = crate::models::resolve_model_ref(&config, "test/fake-model").unwrap();
+
+        for n in 1..=7 {
+            store
+                .append_message(
+                    &session.id,
+                    &Message::User {
+                        content: format!("user {n}").into(),
+                    },
+                )
+                .unwrap();
+            store
+                .append_message(
+                    &session.id,
+                    &Message::Assistant {
+                        content: Some(format!("assistant {n}")),
+                        reasoning_content: None,
+                        native_replay: None,
+                        tool_calls: None,
+                    },
+                )
+                .unwrap();
+        }
+        run_compaction(
+            &store,
+            &config,
+            &session.id,
+            &RequestOptions {
+                model: request_model.clone(),
+            },
+            &FakeProvider,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        store
+            .append_message(
+                &session.id,
+                &Message::User {
+                    content: "user 8".into(),
+                },
+            )
+            .unwrap();
+        store
+            .append_message(
+                &session.id,
+                &Message::Assistant {
+                    content: Some("assistant 8".into()),
+                    reasoning_content: None,
+                    native_replay: None,
+                    tool_calls: None,
+                },
+            )
+            .unwrap();
+
+        let outcome = run_compaction(
+            &store,
+            &config,
+            &session.id,
+            &RequestOptions {
+                model: request_model,
+            },
+            &FakeProvider,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(outcome, CompactionOutcome::Applied { .. }));
+
+        let users = store
+            .load_context_messages(&session.id)
+            .unwrap()
+            .into_iter()
+            .filter_map(|message| match message {
+                Message::User { content } => Some(content.text()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            users,
+            [
+                "[summary of earlier conversation]\nsummary",
+                "[environment]\ncurrent working directory: /tmp",
+                "user 4",
+                "user 5",
+                "user 6",
+                "user 7",
+                "user 8"
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn tool_heavy_current_turn_can_satisfy_the_retention_budget_alone() {
+        let store = Store::open_memory().unwrap();
+        let session = store.create_session("/tmp").unwrap();
+        for n in 1..=3 {
             store
                 .append_message(
                     &session.id,
@@ -755,10 +865,46 @@ mod tests {
             .append_message(
                 &session.id,
                 &Message::User {
-                    content: "current dirty turn".into(),
+                    content: "tool-heavy current turn".into(),
                 },
             )
             .unwrap();
+        let (_, call_ids) = store
+            .append_message_with_bash_calls(
+                &session.id,
+                &Message::Assistant {
+                    content: None,
+                    reasoning_content: None,
+                    native_replay: None,
+                    tool_calls: Some(
+                        (1..=5)
+                            .map(|n| ToolCall {
+                                id: format!("call-{n}"),
+                                function: FunctionCall {
+                                    name: "bash".into(),
+                                    arguments: r#"{"risk":"readonly","command":"true"}"#.into(),
+                                },
+                            })
+                            .collect(),
+                    ),
+                },
+            )
+            .unwrap();
+        for call_id in call_ids {
+            store
+                .persist_bash_result(
+                    &session.id,
+                    BashResultRecord {
+                        bash_call_id: call_id,
+                        outcome: "completed",
+                        exit_code: Some(0),
+                        duration_ms: Some(1),
+                    },
+                    "done",
+                    &[],
+                )
+                .unwrap();
+        }
         let config = test_config();
         let request_model = crate::models::resolve_model_ref(&config, "test/fake-model").unwrap();
 
@@ -790,8 +936,7 @@ mod tests {
             [
                 "[summary of earlier conversation]\nsummary",
                 "[environment]\ncurrent working directory: /tmp",
-                "complete 2",
-                "current dirty turn"
+                "tool-heavy current turn"
             ]
         );
     }
@@ -805,7 +950,7 @@ mod tests {
         let request_model =
             crate::models::resolve_model_ref(&test_config(), "test/fake-model").unwrap();
 
-        for n in 1..=3 {
+        for n in 1..=6 {
             if n == 2 {
                 store
                     .append_message(
@@ -883,7 +1028,10 @@ mod tests {
                 "[summary of earlier conversation]\nsummary",
                 "[environment]\ncurrent working directory: /tmp",
                 "user 2",
-                "user 3"
+                "user 3",
+                "user 4",
+                "user 5",
+                "user 6"
             ]
         );
 
@@ -907,7 +1055,7 @@ mod tests {
             .unwrap();
         let request_model =
             crate::models::resolve_model_ref(&test_config(), "test/fake-model").unwrap();
-        for n in 1..=2 {
+        for n in 1..=5 {
             store
                 .append_message(
                     &session.id,
@@ -946,7 +1094,7 @@ mod tests {
         assert_eq!(
             outcome,
             CompactionOutcome::Inapplicable {
-                keep_recent_turns: 2
+                keep_recent_turns: 5
             }
         );
         assert_eq!(store.latest_summary_sequence(&session.id).unwrap(), None);
@@ -960,7 +1108,7 @@ mod tests {
             .unwrap();
         let request_model =
             crate::models::resolve_model_ref(&test_config(), "test/fake-model").unwrap();
-        for n in 1..=3 {
+        for n in 1..=6 {
             store
                 .append_message(
                     &session.id,

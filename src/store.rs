@@ -964,6 +964,19 @@ impl Store {
         Ok(latest_compaction(&journal).map(|line| line.seq))
     }
 
+    pub fn latest_compaction_through_seq(&self, session_id: &str) -> Result<Option<i64>> {
+        let journal = self.load(session_id)?;
+        Ok(
+            latest_compaction(&journal).and_then(|line| match &line.event {
+                Event::ProviderCompleted {
+                    projection: Projection::Compaction { through_seq, .. },
+                    ..
+                } => Some(*through_seq),
+                _ => None,
+            }),
+        )
+    }
+
     pub fn estimate_context_tokens(&self, session_id: &str) -> Result<u64> {
         Ok(self
             .load_context_messages(session_id)?

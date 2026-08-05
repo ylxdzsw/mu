@@ -1696,13 +1696,16 @@ result is tracked until semantic context changes: `Inapplicable` reports
 attempt; `Applied` followed by another overflow reports `context length
 exceeded immediately after compaction`.
 
-**Compaction algorithm** (same in all tiers): summarize everything up to a
-cut point into one compaction projection, keeping the two most recent
-`turn_started` events verbatim after it. Derived location reminders do not
-consume the retention budget. If there is no history before those two retained
-turns, the outcome is `Inapplicable`; only `Applied` changes context. The cut is
-always immediately before a turn, so a prompt/location pair or tool
-claim/result pair is never split.
+**Compaction algorithm** (same in all tiers): summarize everything up to a cut
+point into one compaction projection, keeping the smallest suffix of whole
+turns containing at least five requests. Each submitted turn prompt and each
+Bash tool call counts as one request. Five turns without tool calls are
+therefore retained, while a current turn with five tool calls satisfies the
+budget by itself. Derived location reminders do not consume the retention
+budget. If there is no history before the retained turns, the outcome is
+`Inapplicable`; only `Applied` changes context. The cut is always immediately
+before a turn, so a prompt/location pair or tool claim/result pair is never
+split.
 
 The summarizer uses a small compaction-specific system prompt rather than the
 session's agent system prompt, so tool, skill, runtime, and service inventories
@@ -1729,7 +1732,8 @@ reported pre-compaction percentage, estimated post-compaction percentage, and
 elapsed time. Redirected output emits one plain status line. Provider failure
 or an empty summary exits non-zero and never reports success. An inapplicable
 manual request reports `compaction inapplicable: no history exists before the
-2 retained turns`.
+N retained turns`, where `N` is the retained suffix size selected by the
+request budget.
 
 ### Agent-loop bounds
 

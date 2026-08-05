@@ -1915,7 +1915,7 @@ mod tests {
     async fn repeated_context_error_after_compaction_is_fatal() {
         let store = Store::open_memory().unwrap();
         let session = store.create_session_seeded("system").unwrap();
-        for index in 0..3 {
+        for index in 0..5 {
             store
                 .append_message(
                     &session.id,
@@ -2262,7 +2262,7 @@ mod tests {
 
         // Small prior history so the soft turn-boundary check does NOT compact; the huge
         // tool result produced mid-turn is what should push us over.
-        for turn in ["one", "two"] {
+        for turn in ["one", "two", "three", "four"] {
             store
                 .append_message(
                     &session.id,
@@ -2287,7 +2287,7 @@ mod tests {
             .append_message(
                 &session.id,
                 &Message::User {
-                    content: UserContent::Text("turn three".into()),
+                    content: UserContent::Text("turn five".into()),
                 },
             )
             .unwrap();
@@ -2349,6 +2349,9 @@ mod tests {
                 ("x".repeat(10_000), "reply one"),
                 ("turn two".into(), "reply two"),
                 ("turn three".into(), "reply three"),
+                ("turn four".into(), "reply four"),
+                ("turn five".into(), "reply five"),
+                ("turn six".into(), "reply six"),
             ] {
                 store
                     .append_message(

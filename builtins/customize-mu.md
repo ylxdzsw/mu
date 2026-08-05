@@ -104,8 +104,11 @@ provider request, `compaction.soft_fraction` sets the graceful threshold to
 `floor(context_window * soft_fraction)`. Before each semantic request within a
 turn, the hard threshold is the lower of
 `floor(context_window * hard_fraction)` and
-`context_window.saturating_sub(hard_headroom_tokens)`. Mu always keeps the two
-most recent turns outside the summary.
+`context_window.saturating_sub(hard_headroom_tokens)`. Compaction keeps the
+smallest suffix of whole turns containing at least five requests, counting each
+submitted prompt and each Bash tool call as one request. This retains five
+tool-free turns, while a current turn with five tool calls satisfies the budget
+by itself.
 `limits.max_iterations` caps one agent turn; the other limits bound the
 model-visible preview of bash output by lines, total bytes, and bytes per line.
 The bell sounds only for turns lasting at least `min_duration_ms`. The guardrail
