@@ -504,8 +504,8 @@ _mu_zsh_completion_candidates() {
 }
 
 _mu_zsh_fallback_completion() {
-  local left arg suffix
-  local -a candidates effort_suffixes
+  local left arg suffix effort_suffix
+  local -a candidates effort_suffixes effort_candidates
 
   left=${BUFFER[1,$CURSOR]}
   if [[ "$left" == "/model "* ]]; then
@@ -513,8 +513,11 @@ _mu_zsh_fallback_completion() {
     effort_suffixes=("${(@f)$(_mu_zsh_model_completion_candidates "$arg" 1)}")
     effort_suffixes=("${(@)effort_suffixes:#}")
     if (( ${#effort_suffixes[@]} )); then
-      compset -P "${(b)arg}"
-      compadd -Q -S '' -- "${effort_suffixes[@]}"
+      effort_candidates=("$arg")
+      for effort_suffix in "${effort_suffixes[@]}"; do
+        effort_candidates+=("$arg$effort_suffix")
+      done
+      compadd -Q -S '' -- "${effort_candidates[@]}"
       return
     fi
   fi
@@ -529,8 +532,8 @@ _mu_zsh_fallback_completion() {
 }
 
 _mu_zsh_completion_system() {
-  local left arg suffix
-  local -a candidates effort_suffixes
+  local left arg suffix effort_suffix
+  local -a candidates effort_suffixes effort_candidates
   local expl
 
   left=${BUFFER[1,$CURSOR]}
@@ -545,9 +548,12 @@ _mu_zsh_completion_system() {
     effort_suffixes=("${(@f)$(_mu_zsh_model_completion_candidates "$arg" 1)}")
     effort_suffixes=("${(@)effort_suffixes:#}")
     if (( ${#effort_suffixes[@]} )); then
-      compset -P "${(b)arg}"
+      effort_candidates=("$arg")
+      for effort_suffix in "${effort_suffixes[@]}"; do
+        effort_candidates+=("$arg$effort_suffix")
+      done
       _wanted mu-model-effort expl 'model effort' \
-        compadd -Q -S '' -- "${effort_suffixes[@]}"
+        compadd -Q -S '' -- "${effort_candidates[@]}"
       return
     fi
   fi

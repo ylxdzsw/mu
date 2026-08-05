@@ -84,7 +84,7 @@ if [[ "$1" == "status" ]]; then
   [[ "$provider" == "$model" ]] && provider=test
   model_json="\"model\":{\"provider_id\":\"$provider\",\"model_id\":\"$model_id\",\"effort\":null,\"canonical\":\"$model\"}"
   if (( include_models )); then
-    print -r -- "{$model_json,\"context_tokens\":25,\"context_window\":100,\"project_root\":\"$MU_ZSH_TEST_PROJECT_ROOT\",\"available_models\":{\"providers\":[{\"id\":\"local\",\"models\":[{\"id\":\"local/solo\",\"model_id\":\"solo\",\"supported_efforts\":[\"max\"]},{\"id\":\"local/shared\",\"model_id\":\"shared\",\"supported_efforts\":[]}]},{\"id\":\"openai\",\"models\":[{\"id\":\"openai/gpt\",\"model_id\":\"gpt\",\"supported_efforts\":[\"low\",\"high\",\"provider-custom\"]},{\"id\":\"openai/gpt-5.6-luna\",\"model_id\":\"gpt-5.6-luna\",\"supported_efforts\":[\"none\",\"max\"]},{\"id\":\"openai/shared\",\"model_id\":\"shared\",\"supported_efforts\":[\"medium\"]}]}]}}"
+    print -r -- "{$model_json,\"context_tokens\":25,\"context_window\":100,\"project_root\":\"$MU_ZSH_TEST_PROJECT_ROOT\",\"available_models\":{\"providers\":[{\"id\":\"local\",\"models\":[{\"id\":\"local/solo\",\"model_id\":\"solo\",\"supported_efforts\":[\"max\"]},{\"id\":\"local/shared\",\"model_id\":\"shared\",\"supported_efforts\":[\"low\"]}]},{\"id\":\"openai\",\"models\":[{\"id\":\"openai/gpt\",\"model_id\":\"gpt\",\"supported_efforts\":[\"low\",\"high\",\"provider-custom\"]},{\"id\":\"openai/gpt-5.6-luna\",\"model_id\":\"gpt-5.6-luna\",\"supported_efforts\":[\"none\",\"max\"]},{\"id\":\"openai/shared\",\"model_id\":\"shared\",\"supported_efforts\":[\"medium\"]}]}]}}"
   elif (( include_commands )); then
     print -r -- "{$model_json,\"context_tokens\":25,\"context_window\":100,\"project_root\":\"$MU_ZSH_TEST_PROJECT_ROOT\",\"commands\":[{\"name\":\"review.md\",\"path\":\"$MU_ZSH_TEST_PROJECT_ROOT/.mu/review.md\",\"scope\":\"project\"}]}"
   else
@@ -408,6 +408,7 @@ model_candidates=("${(@f)$(_mu_zsh_model_completion_candidates "gpt:")}")
 [[ " ${(j: :)model_candidates} " == *" gpt:low "* ]] || fail "shows unqualified variants after colon"
 [[ " ${(j: :)model_candidates} " == *" openai/gpt:high "* ]] || fail "shows provider-qualified variants after colon"
 [[ " ${(j: :)model_candidates} " == *" gpt:provider-custom "* ]] || fail "shows provider-defined effort strings"
+[[ " ${(j: :)model_candidates} " == *" shared:low "* ]] || fail "merges first floating-model provider efforts"
 [[ " ${(j: :)model_candidates} " == *" shared:medium "* ]] || fail "merges floating-model effort suggestions"
 BUFFER="/model openai/gpt:h"
 CURSOR=${#BUFFER}
@@ -660,7 +661,7 @@ if [ "$1" = "status" ]; then
   [ "$provider" = "$model" ] && provider=test
   model_json="\"model\":{\"provider_id\":\"$provider\",\"model_id\":\"$model_id\",\"effort\":null,\"canonical\":\"$model\"}"
   if [ "$include_models" -eq 1 ]; then
-    printf '%s\n' "{$model_json,\"context_tokens\":25,\"context_window\":100,\"project_root\":\"$MU_ZSH_TEST_PROJECT_ROOT\",\"available_models\":{\"providers\":[{\"id\":\"local\",\"models\":[{\"id\":\"local/solo\",\"model_id\":\"solo\",\"supported_efforts\":[\"max\"]},{\"id\":\"local/shared\",\"model_id\":\"shared\",\"supported_efforts\":[]}]},{\"id\":\"openai\",\"models\":[{\"id\":\"openai/gpt\",\"model_id\":\"gpt\",\"supported_efforts\":[\"low\",\"high\"]},{\"id\":\"openai/gpt-5.6-luna\",\"model_id\":\"gpt-5.6-luna\",\"supported_efforts\":[\"none\",\"max\"]},{\"id\":\"openai/shared\",\"model_id\":\"shared\",\"supported_efforts\":[\"medium\"]}]}]}}"
+    printf '%s\n' "{$model_json,\"context_tokens\":25,\"context_window\":100,\"project_root\":\"$MU_ZSH_TEST_PROJECT_ROOT\",\"available_models\":{\"providers\":[{\"id\":\"local\",\"models\":[{\"id\":\"local/solo\",\"model_id\":\"solo\",\"supported_efforts\":[\"max\"]},{\"id\":\"local/shared\",\"model_id\":\"shared\",\"supported_efforts\":[\"low\"]}]},{\"id\":\"openai\",\"models\":[{\"id\":\"openai/gpt\",\"model_id\":\"gpt\",\"supported_efforts\":[\"low\",\"high\"]},{\"id\":\"openai/gpt-5.6-luna\",\"model_id\":\"gpt-5.6-luna\",\"supported_efforts\":[\"none\",\"max\"]},{\"id\":\"openai/shared\",\"model_id\":\"shared\",\"supported_efforts\":[\"medium\"]}]}]}}"
   elif [ "$include_commands" -eq 1 ] && [ -n "$TEST_EXTRA_COMMAND" ]; then
     printf '%s\n' "{$model_json,\"context_tokens\":25,\"context_window\":100,\"project_root\":\"$MU_ZSH_TEST_PROJECT_ROOT\",\"commands\":[{\"name\":\"$TEST_EXTRA_COMMAND\",\"path\":\"$MU_ZSH_TEST_PROJECT_ROOT/.mu/$TEST_EXTRA_COMMAND\",\"scope\":\"project\"}]}"
   else
@@ -970,6 +971,42 @@ normalized=$(perl -pe 's/\e\[[0-?]*[ -\/]*[@-~]//g' "$model_effort_transcript" |
 [[ "$normalized" == *'[first-buffer=/model gpt-5.6-luna first-cursor=19]'* ]] || fail "infix model completion should leave the cursor at the completed model"
 [[ "$normalized" == *':none'* && "$normalized" == *':max'* ]] || fail "one model completion should immediately list supported effort suffixes"
 [[ ! -e "$interactive_capture_calls" || ! -s "$interactive_capture_calls" ]] || fail "model effort completion should not submit a prompt"
+
+floating_effort_transcript=$tmpdir/floating-effort-transcript
+floating_effort_setup="$interactive_setup; zstyle ':completion:*' menu select; _mu_test_floating_effort_completion() { BUFFER='/model shared'; CURSOR=\${#BUFFER}; _mu_zsh_complete_slash; zle -I; print -r -- \"[floating-buffer=\$BUFFER cursor=\$CURSOR]\"; BUFFER=; CURSOR=0; _mu_zsh_reset_mode_prompt; }; zle -N _mu_test_floating_effort_completion; bindkey -M mumode '^T' _mu_test_floating_effort_completion"
+rm -f -- "$interactive_capture_args" "$interactive_capture_stdin" "$interactive_capture_calls"
+interactive_status=0
+{
+  send_interactive_setup "$floating_effort_setup"
+  print -rn -- $'\t\x14'
+  sleep 0.4
+  print -rn -- $'\x04'
+} | timeout 10 script -qfec 'TERM=xterm-256color zsh -df' "$floating_effort_transcript" >/dev/null || interactive_status=$?
+(( interactive_status == 0 )) || fail "floating effort completion transcript exited with status $interactive_status"
+
+normalized=$(perl -pe 's/\e\[[0-?]*[ -\/]*[@-~]//g' "$floating_effort_transcript" | col -b)
+[[ "$normalized" == *'[floating-buffer=/model shared cursor=13]'* ]] || fail "floating model effort listing should not modify the bare model"
+[[ "$normalized" == *':low'* && "$normalized" == *':medium'* ]] || fail "floating model completion should list merged provider efforts"
+[[ ! -e "$interactive_capture_calls" || ! -s "$interactive_capture_calls" ]] || fail "floating model effort completion should not submit a prompt"
+
+floating_menu_transcript=$tmpdir/floating-menu-transcript
+floating_menu_setup="$interactive_setup; zstyle ':completion:*' menu select; _mu_test_floating_menu_state() { zle -I; print -r -- \"[cancelled-buffer=\$BUFFER cursor=\$CURSOR]\"; }; _mu_test_floating_menu_selection() { zle -I; print -r -- \"[selected-buffer=\$BUFFER cursor=\$CURSOR]\"; BUFFER=; CURSOR=0; _mu_zsh_reset_mode_prompt; }; zle -N _mu_test_floating_menu_state; zle -N _mu_test_floating_menu_selection; bindkey -M mumode '^T' _mu_test_floating_menu_state; bindkey -M mumode '^Y' _mu_test_floating_menu_selection"
+rm -f -- "$interactive_capture_args" "$interactive_capture_stdin" "$interactive_capture_calls"
+interactive_status=0
+{
+  send_interactive_setup "$floating_menu_setup"
+  print -rn -- $'\t/model shared\t\t'
+  sleep 0.3
+  print -rn -- $'\x03\x14\t\t\e[C\r\x19'
+  sleep 0.4
+  print -rn -- $'\x04'
+} | timeout 10 script -qfec 'TERM=xterm-256color zsh -df' "$floating_menu_transcript" >/dev/null || interactive_status=$?
+(( interactive_status == 0 )) || fail "floating model menu transcript exited with status $interactive_status"
+
+normalized=$(perl -pe 's/\e\[[0-?]*[ -\/]*[@-~]//g' "$floating_menu_transcript" | col -b)
+[[ "$normalized" == *'[cancelled-buffer=/model shared cursor=13]'* ]] || fail "Ctrl-C should cancel model menu selection and restore the bare model"
+[[ "$normalized" == *'[selected-buffer=/model shared:low cursor=17]'* ]] || fail "floating model effort should remain selectable through the native zsh menu"
+[[ ! -e "$interactive_capture_calls" || ! -s "$interactive_capture_calls" ]] || fail "floating model menu completion should not submit a prompt"
 
 delete_slash_transcript=$tmpdir/delete-slash-transcript
 delete_slash_setup="$interactive_setup; _mu_test_delete_slash_completion() { BUFFER='/'; CURSOR=1; _mu_zsh_list_slash_choices; zle backward-delete-char; if _mu_zsh_slash_completion_context; then back_state=active; else back_state=inactive; fi; back_buffer=\$BUFFER; back_cursor=\$CURSOR; BUFFER='/'; CURSOR=0; _mu_zsh_list_slash_choices; zle delete-char; if _mu_zsh_slash_completion_context; then forward_state=active; else forward_state=inactive; fi; zle -I; print -r -- \"[back-buffer=\$back_buffer back-cursor=\$back_cursor back-context=\$back_state forward-buffer=\$BUFFER forward-cursor=\$CURSOR forward-context=\$forward_state]\"; BUFFER=; CURSOR=0; _mu_zsh_reset_mode_prompt; }; zle -N _mu_test_delete_slash_completion; bindkey -M mumode '^Y' _mu_test_delete_slash_completion"
