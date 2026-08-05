@@ -108,6 +108,7 @@ struct RunTurnArgs<'a> {
     output: cli::OutputFormat,
     /// A short notice rendered before the turn (e.g. "resuming interrupted turn").
     preamble_notice: Option<&'a str>,
+    compact_at_turn_boundary: bool,
 }
 
 fn main() {
@@ -557,6 +558,7 @@ async fn run() -> Result<()> {
                 model,
                 output,
                 preamble_notice: Some("[mu] resuming interrupted turn"),
+                compact_at_turn_boundary: false,
             })
             .await?;
 
@@ -695,6 +697,7 @@ async fn run_turn_from_source(
         model: resolved.model,
         output,
         preamble_notice: None,
+        compact_at_turn_boundary: true,
     })
     .await?;
 
@@ -873,6 +876,7 @@ async fn run_turn(args: RunTurnArgs<'_>) -> Result<()> {
         model,
         output,
         preamble_notice,
+        compact_at_turn_boundary,
     } = args;
     let request = RequestOptions {
         model: model.active_model().clone(),
@@ -901,7 +905,11 @@ async fn run_turn(args: RunTurnArgs<'_>) -> Result<()> {
         renderer: &mut renderer,
     };
 
-    let result = agent.run_turn().await;
+    let result = if compact_at_turn_boundary {
+        agent.run_turn().await
+    } else {
+        agent.resume_turn().await
+    };
 
     match &result {
         Ok(r) => {

@@ -275,9 +275,11 @@ accepts optional non-terminal stdin as a custom focus). The surface is small:
   `context_tokens` is the latest provider-reported context size when
   `context_usage_source` is `reported`, or the bytes÷4 projection when it is
   `estimated` before a first turn or immediately after compaction. Consumers
-  derive a percentage from `context_tokens / context_window`. The resolved
-  model object includes its current effective `replay_key`; `--include-models`
-  adds the effective key for every configured model.
+  derive a percentage from `context_tokens / context_window` and compare the
+  raw count with `compaction_soft_threshold_tokens` to render pending
+  compaction. The resolved model object includes its current effective
+  `replay_key`; `--include-models` adds the effective key for every configured
+  model.
 - `mu context [--export]` — introspect the agent context. By default it prints
   the assembled system prompt mu itself would use: the role preamble, the
   `<runtime>` block, the full skills index (built-in, global, and project), and
@@ -378,9 +380,10 @@ This is the exact sequence the binary follows for one turn invocation:
    durable.
    (`mu retry` skips this step, restores the original turn cwd, and resumes the
    same turn.)
-8. **Pre-turn compaction check** (§11): use the latest still-current reported
-   usage, otherwise estimate the projected context. If it exceeds the shared
-   fraction/headroom threshold, compact and rebuild.
+8. **New-turn soft compaction check** (§11): use the latest still-current
+   reported usage, otherwise estimate the projected context including the new
+   prompt. If it exceeds the soft threshold, compact and rebuild. `mu retry`
+   resumes the same turn and skips this boundary check.
 9. **Agent loop** — repeat until the model returns `finish_reason: "stop"` or the
    max-iterations cap is hit:
    a. Persist and sync a reconstructible `provider_requested` recipe, then send
@@ -1164,17 +1167,17 @@ the retry ordinal, budget, effective delay, and semantic error.
 **Model context window.** Compaction thresholds need the model's max context size.
 Source it from `config.jsonc`: each configured model entry carries a
 `context_window` integer. mu does not fetch model cards. If a model has no
-configured `context_window`, the threshold-based tiers (Tier 1 pre-turn and Tier
-2 in-loop) are skipped for it and the Tier 3 API-error fallback is the only
-guard.
+configured `context_window`, the threshold-based tiers (Tier 1 new-turn and
+Tier 2 request-level) are skipped for it and the Tier 3 API-error fallback is
+the only guard.
 
 Model and provider selection come from `config.jsonc`: a complete `endpoint`, optional
 env var holding the API key, and ordered provider/model definitions. If the
 global config file is missing, `mu` creates a starter `~/.mu/config.jsonc`
-automatically before loading configuration. The starter's first provider is a
-keyless OpenCode Zen free model (`api_key_env: ""`), so a freshly built `mu`
-runs a turn with no additional setup; it also ships a commented keyed provider
-example.
+automatically before loading configuration. The starter's first provider
+contains keyless 200K-context OpenCode Zen DeepSeek and Mimo models
+(`api_key_env: ""`), so a freshly built `mu` runs a turn with no additional
+setup; it also ships a commented keyed provider example.
 
 `provider/model[:effort]` is fixed. A bare `model[:effort]` expands to every
 configured provider containing that model in literal merged config order.
@@ -1397,7 +1400,7 @@ are not visible in another.
       "enabled": true,
       "min_duration_ms": 10000
     },
-    "compaction": { "fraction": 0.75 },  // optional
+    "compaction": { "soft_fraction": 0.70 },  // optional
     "limits": { "max_iterations": 50, "max_lines": 2000, "max_bytes": 51200, "max_line_bytes": 10240 },
     "redaction": {
       "env": ["*_API_KEY", "*_API_TOKEN", "*_AUTH_TOKEN"] // optional; these are the defaults
@@ -1647,23 +1650,32 @@ used only where no API figure exists yet:
 Context management then uses a **three-tier strategy**, from most to least
 graceful:
 
-**Tier 1 — graceful pre-turn compaction.** At the start of each turn, Mu
-compares current reported usage or the projected bytes÷4 estimate against:
+**Tier 1 — graceful new-turn compaction.** After a new prompt is durably
+appended but before its first provider request, Mu compares current reported
+usage or the projected bytes÷4 estimate against:
 
 ```text
-min(floor(context_window * configured_fraction),
-    context_window.saturating_sub(64_000))
+floor(context_window * configured_soft_fraction)
 ```
 
 Compaction runs only when context tokens are strictly greater than this
-threshold. At the default 75%, a 1,000,000-token window triggers above 750,000
-and a 200,000-token window above 136,000. This reserves at least 64K tokens of
-headroom.
+threshold. At the default 70%, a 1,000,000-token window triggers above 700,000
+and a 200,000-token window above 140,000. `mu retry` resumes an existing turn
+and does not run this soft boundary check. While an idle attached session is
+over the soft threshold, the zsh and Fish prompts append `[to compact]`; sending
+the next prompt performs the compaction.
 
-**Tier 2 — proactive in-loop compaction.** A single turn can add many large tool
-results, so the pre-turn figure goes stale *within* a turn. Every new semantic
-agent request passes the same threshold gate: the first request, each request
-after tool results changed context, and the first request after candidate
+**Tier 2 — hard request-level compaction.** A single turn can add many large
+tool results, so every new semantic agent request also checks:
+
+```text
+min(floor(context_window * 0.85),
+    context_window.saturating_sub(48_000))
+```
+
+At a 1,000,000-token window this hard threshold is 850,000; at 200,000 it is
+152,000. It applies to the first request, each request after tool results or
+assistant content changed context, and the first request after candidate
 advancement changed the active context window. An unchanged retry on the same
 candidate bypasses the gate. Provider advancement returns to this gate rather
 than contacting the next candidate directly.

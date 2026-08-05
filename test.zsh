@@ -165,6 +165,25 @@ MU_ZSH_BIN=$prompt_fake_bin/mu
 _mu_zsh_clear_session_state
 [[ "$short_prompt" == *"%F{$MU_ZSH_PROMPT_CONTEXT_COLOR}~0%%%f"* ]] || fail "marks estimated context for an attached short session"
 
+compact_fake_bin=$tmpdir/compact-bin
+mkdir -p -- "$compact_fake_bin"
+cat > "$compact_fake_bin/mu" <<'EOF'
+#!/usr/bin/env zsh
+if [[ "$1" == "status" ]]; then
+  print -r -- '{"model":{"provider_id":"test","model_id":"m","effort":null,"canonical":"m"},"context_tokens":140001,"context_window":200000,"compaction_soft_threshold_tokens":140000,"project_root":null}'
+  exit 0
+fi
+exit 1
+EOF
+chmod +x "$compact_fake_bin/mu"
+MU_ZSH_SESSION_ID=compact-session
+MU_ZSH_TRACKED_SCOPE=$(current_scope_key)
+MU_ZSH_BIN=$compact_fake_bin/mu
+compact_prompt=$(_mu_zsh_build_mode_prompt)
+MU_ZSH_BIN=$prompt_fake_bin/mu
+_mu_zsh_clear_session_state
+[[ "$compact_prompt" == *"%F{$MU_ZSH_PROMPT_CONTEXT_COLOR}[to compact]%f"* ]] || fail "marks sessions above the soft compaction threshold"
+
 BUFFER="edited in mu"
 CURSOR=3
 _mu_zsh_exit_mode

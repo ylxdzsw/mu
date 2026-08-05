@@ -2,15 +2,18 @@
   "output": "detail",
   "line_wrapping": true,
   "providers": {
-    // Default provider: OpenCode Zen's free DeepSeek model. It needs no API
-    // key, so mu works out of the box. Other free models include
-    // "big-pickle", "mimo-v2.5-free", and "north-mini-code-free".
+    // Default provider: OpenCode Zen's free DeepSeek and Mimo models. They need
+    // no API key, so mu works out of the box. Other free models include
+    // "big-pickle" and "north-mini-code-free".
     "opencode": {
       "endpoint": "https://opencode.ai/zen/v1/chat/completions",
       "api_key_env": "",
       "models": {
         "deepseek-v4-flash-free": {
-          "context_window": 128000
+          "context_window": 200000
+        },
+        "mimo-v2.5-free": {
+          "context_window": 200000
         }
       }
     },
@@ -31,7 +34,7 @@
     "enabled": true,
     "min_duration_ms": 10000
   },
-  "compaction": { "fraction": 0.75 },
+  "compaction": { "soft_fraction": 0.70 },
   "limits": {
     "max_iterations": 50,
     "max_lines": 2000,

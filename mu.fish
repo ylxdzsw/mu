@@ -271,7 +271,8 @@ function _mu_fish_build_mode_prompt
             (if ((.context_tokens | type) == "number" and (.context_window | type) == "number" and .context_window > 0) then (.context_tokens * 100 / .context_window) else "" end),
             (.project_root // ""),
             (if has("clean") then (.clean|tostring) else "" end),
-            (.context_usage_source // "")
+            (.context_usage_source // ""),
+            (if ((.context_tokens | type) == "number" and (.compaction_soft_threshold_tokens | type) == "number") then (.context_tokens > .compaction_soft_threshold_tokens) else false end)
         ] | @tsv' 2>/dev/null | string split \t)
     end
 
@@ -285,6 +286,8 @@ function _mu_fish_build_mode_prompt
     set -q fields[4]; and set clean "$fields[4]"
     set -l context_source
     set -q fields[5]; and set context_source "$fields[5]"
+    set -l to_compact false
+    set -q fields[6]; and set to_compact "$fields[6]"
 
     set_color "$MU_FISH_PROMPT_MODEL_COLOR"
     printf '%s' "$model"
@@ -300,6 +303,12 @@ function _mu_fish_build_mode_prompt
         set_color "$MU_FISH_PROMPT_CONTEXT_COLOR"
         printf '%s' "$context"
         set_color normal
+        if test "$to_compact" = true
+            printf ' '
+            set_color "$MU_FISH_PROMPT_CONTEXT_COLOR"
+            printf '[to compact]'
+            set_color normal
+        end
     end
 
     printf ' '

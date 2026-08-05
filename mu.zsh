@@ -274,7 +274,7 @@ _mu_zsh_status_json() {
 }
 
 _mu_zsh_build_mode_prompt() {
-  local status_json model context_raw context context_source context_segment cwd project_root project_segment attachment_segment
+  local status_json model context_raw context context_source context_segment to_compact compaction_segment cwd project_root project_segment attachment_segment
   local clean unclean_segment
   local escaped_model escaped_context escaped_project_root escaped_unclean_text
 
@@ -285,7 +285,7 @@ _mu_zsh_build_mode_prompt() {
   _mu_zsh_sync_state
   status_json=$(_mu_zsh_status_json) || status_json=
   if [[ -n "$status_json" ]] && command -v jq >/dev/null 2>&1; then
-    tsv=$(jq -r '[(.model.canonical // ""), (if ((.context_tokens | type) == "number" and (.context_window | type) == "number" and .context_window > 0) then (.context_tokens * 100 / .context_window) else "" end), (.project_root // ""), (if has("clean") then (.clean|tostring) else "" end), (.context_usage_source // "")] | @tsv' <<< "$status_json" 2>/dev/null) || tsv=
+    tsv=$(jq -r '[(.model.canonical // ""), (if ((.context_tokens | type) == "number" and (.context_window | type) == "number" and .context_window > 0) then (.context_tokens * 100 / .context_window) else "" end), (.project_root // ""), (if has("clean") then (.clean|tostring) else "" end), (.context_usage_source // ""), (if ((.context_tokens | type) == "number" and (.compaction_soft_threshold_tokens | type) == "number") then (.context_tokens > .compaction_soft_threshold_tokens) else false end)] | @tsv' <<< "$status_json" 2>/dev/null) || tsv=
   fi
   fields=("${(@ps:\t:)tsv}")
   model=${fields[1]:-}
@@ -294,6 +294,7 @@ _mu_zsh_build_mode_prompt() {
   project_root=${fields[3]:-}
   clean=${fields[4]:-}
   context_source=${fields[5]:-}
+  to_compact=${fields[6]:-false}
   if [[ -n "$MU_ZSH_EFFECTIVE_SESSION_ID" ]]; then
     if [[ -z "$context_raw" || "$context_raw" == null ]]; then
       context=0%
@@ -306,6 +307,11 @@ _mu_zsh_build_mode_prompt() {
     context_segment=" %F{$MU_ZSH_PROMPT_CONTEXT_COLOR}${escaped_context}%f"
   else
     context_segment=
+  fi
+  if [[ -n "$MU_ZSH_EFFECTIVE_SESSION_ID" && "$to_compact" == true ]]; then
+    compaction_segment=" %F{$MU_ZSH_PROMPT_CONTEXT_COLOR}[to compact]%f"
+  else
+    compaction_segment=
   fi
   cwd=$PWD
   cwd=${cwd//\%/%%}
@@ -337,7 +343,7 @@ _mu_zsh_build_mode_prompt() {
     unclean_segment=
   fi
 
-  print -r -- "%F{$MU_ZSH_PROMPT_MODEL_COLOR}${escaped_model}%f${context_segment} %F{$MU_ZSH_PROMPT_PWD_COLOR}${cwd}%f${project_segment}${unclean_segment}${attachment_segment}
+  print -r -- "%F{$MU_ZSH_PROMPT_MODEL_COLOR}${escaped_model}%f${context_segment}${compaction_segment} %F{$MU_ZSH_PROMPT_PWD_COLOR}${cwd}%f${project_segment}${unclean_segment}${attachment_segment}
 ${MU_ZSH_PROMPT_INPUT}"
 }
 

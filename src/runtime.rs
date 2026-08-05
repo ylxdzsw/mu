@@ -2,6 +2,7 @@ use anyhow::{Result, bail};
 use serde::Serialize;
 use std::process::Command;
 
+use crate::compaction::soft_compaction_threshold;
 use crate::config::Config;
 use crate::models::{
     AvailableModelsPayload, ResolvedModelChoice, ResolvedModelRef, available_models,
@@ -40,6 +41,7 @@ pub struct StatusReport {
     pub context_usage_source: Option<ContextUsageSource>,
     pub project_root: Option<String>,
     pub context_window: Option<u64>,
+    pub compaction_soft_threshold_tokens: Option<u64>,
     pub supported_effort_levels: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub git: Option<GitStatus>,
@@ -273,6 +275,9 @@ pub fn build_status_report(
         context_usage_source: context_usage.map(|(_, source)| source),
         project_root: project.map(|project| project.root.display().to_string()),
         context_window: model_info.context_window,
+        compaction_soft_threshold_tokens: model_info
+            .context_window
+            .map(|window| soft_compaction_threshold(window, config.compaction.soft_fraction)),
         supported_effort_levels: model_info.supported_effort_levels,
         git: includes.git.then(|| project.map(git_status)).flatten(),
         session: session_summary.map(status_session),
@@ -955,6 +960,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(reported.context_tokens, Some(25));
+        assert_eq!(reported.compaction_soft_threshold_tokens, Some(70));
         assert_eq!(
             reported.context_usage_source,
             Some(ContextUsageSource::Reported)

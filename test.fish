@@ -96,7 +96,7 @@ begin
     printf '%s\n' '  elif [ "$include_commands" -eq 1 ]; then'
     printf '%s\n' '    printf "%s\n" "{\"model\":{\"canonical\":\"$model\"},\"context_tokens\":25,\"context_window\":100,\"project_root\":\"$TEST_PROJECT_ROOT\",\"clean\":true,\"commands\":[{\"name\":\"review.md\"}]}"'
     printf '%s\n' '  else'
-    printf '%s\n' '    printf "%s\n" "{\"model\":{\"canonical\":\"$model\"},\"context_tokens\":25,\"context_window\":100,\"context_usage_source\":\"estimated\",\"project_root\":\"$TEST_PROJECT_ROOT\",\"clean\":true}"'
+    printf '%s\n' '    printf "%s\n" "{\"model\":{\"canonical\":\"$model\"},\"context_tokens\":75,\"context_window\":100,\"compaction_soft_threshold_tokens\":70,\"context_usage_source\":\"estimated\",\"project_root\":\"$TEST_PROJECT_ROOT\",\"clean\":true}"'
     printf '%s\n' '  fi'
     printf '%s\n' '  exit 0'
     printf '%s\n' fi
@@ -124,13 +124,15 @@ set prompt (_mu_fish_build_mode_prompt | string collect)
 assert_contains "$prompt" local/test 'prompt shows model'
 assert_contains "$prompt" "$TEST_ROOT" 'prompt shows cwd'
 assert_contains "$prompt" 'mu> ' 'prompt shows input marker'
-string match -q '*25%*' -- "$prompt"; and fail 'fresh prompt should omit context'
+string match -q '*75%*' -- "$prompt"; and fail 'fresh prompt should omit context'
+string replace -q '[to compact]' '' -- "$prompt"; and fail 'fresh prompt should omit compaction marker'
 
 set -g MU_FISH_SESSION_ID ses_0000000a
 set -g MU_FISH_TRACKED_SCOPE (_mu_fish_current_scope)
 _mu_fish_sync_state
 set prompt (_mu_fish_build_mode_prompt | string collect)
-assert_contains "$prompt" '~25%' 'session prompt marks estimated context'
+assert_contains "$prompt" '~75%' 'session prompt marks estimated context'
+string replace -q '[to compact]' '' -- "$prompt"; or fail 'session prompt marks pending compaction'
 
 set command (_mu_fish_base_command)
 assert_equal (string join \x1e -- $command) (string join \x1e -- "$fake_bin/mu" --output detail -s ses_0000000a) 'builds active turn command'

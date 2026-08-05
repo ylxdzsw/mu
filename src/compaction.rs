@@ -25,7 +25,14 @@ material to the work.";
 const MAX_SUMMARY_ENTRY_CHARS: usize = 4000;
 const MAX_SUMMARY_TOOL_CHARS: usize = 2000;
 pub const KEEP_RECENT_TURNS: usize = 2;
-const FIXED_HEADROOM_TOKENS: u64 = 64_000;
+const HARD_COMPACTION_FRACTION: f64 = 0.85;
+const HARD_HEADROOM_TOKENS: u64 = 48_000;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompactionThreshold {
+    Soft,
+    Hard,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CompactionOutcome {
@@ -56,16 +63,18 @@ fn clamp_for_summary(content: &str, max_chars: usize) -> String {
 }
 
 #[cfg(test)]
+#[allow(clippy::too_many_arguments)]
 pub async fn maybe_compact(
     store: &Store,
     config: &Config,
     session_id: &str,
     request: &RequestOptions,
     context_window: Option<u64>,
+    threshold: CompactionThreshold,
     provider: &dyn Provider,
     renderer: &mut Renderer,
 ) -> Result<()> {
-    if compaction_needed(store, config, session_id, context_window)? {
+    if compaction_needed(store, config, session_id, context_window, threshold)? {
         run_compaction(
             store,
             config,
@@ -88,9 +97,10 @@ pub async fn maybe_compact_routed(
     model: &mut ResolvedModelChoice,
     provider: &mut Box<dyn Provider>,
     context_window: Option<u64>,
+    threshold: CompactionThreshold,
     renderer: &mut Renderer,
 ) -> Result<Option<CompactionOutcome>> {
-    if !compaction_needed(store, config, session_id, context_window)? {
+    if !compaction_needed(store, config, session_id, context_window, threshold)? {
         return Ok(None);
     }
     run_compaction_routed_inner(
@@ -101,7 +111,7 @@ pub async fn maybe_compact_routed(
         provider,
         None,
         Some(renderer),
-        true,
+        Some(threshold),
     )
     .await
 }
@@ -124,7 +134,7 @@ pub async fn run_compaction_routed(
         provider,
         custom_focus,
         renderer,
-        false,
+        None,
     )
     .await
     .map(|outcome| {
@@ -143,15 +153,15 @@ async fn run_compaction_routed_inner(
     provider: &mut Box<dyn Provider>,
     custom_focus: Option<&str>,
     mut renderer: Option<&mut Renderer>,
-    recheck_after_switch: bool,
+    recheck_after_switch: Option<CompactionThreshold>,
 ) -> Result<Option<CompactionOutcome>> {
     let mut switched = false;
     let mut retry_count = 0;
     loop {
         let context_window = resolve_model_info(config, model.active_model()).context_window;
         if switched
-            && recheck_after_switch
-            && !compaction_needed(store, config, session_id, context_window)?
+            && let Some(threshold) = recheck_after_switch
+            && !compaction_needed(store, config, session_id, context_window, threshold)?
         {
             return Ok(None);
         }
@@ -238,18 +248,26 @@ async fn run_compaction_routed_inner(
     }
 }
 
-pub fn compaction_threshold(context_window: u64, configured_fraction: f64) -> u64 {
-    let fraction_threshold = (context_window as f64 * configured_fraction).floor() as u64;
-    let fixed_headroom_threshold = context_window.saturating_sub(FIXED_HEADROOM_TOKENS);
+pub fn soft_compaction_threshold(context_window: u64, soft_fraction: f64) -> u64 {
+    (context_window as f64 * soft_fraction).floor() as u64
+}
+
+pub fn hard_compaction_threshold(context_window: u64) -> u64 {
+    let fraction_threshold = (context_window as f64 * HARD_COMPACTION_FRACTION).floor() as u64;
+    let fixed_headroom_threshold = context_window.saturating_sub(HARD_HEADROOM_TOKENS);
     fraction_threshold.min(fixed_headroom_threshold)
 }
 
-pub fn exceeds_compaction_threshold(
+pub fn exceeds_soft_compaction_threshold(
     context_tokens: u64,
     context_window: u64,
-    configured_fraction: f64,
+    soft_fraction: f64,
 ) -> bool {
-    context_tokens > compaction_threshold(context_window, configured_fraction)
+    context_tokens > soft_compaction_threshold(context_window, soft_fraction)
+}
+
+pub fn exceeds_hard_compaction_threshold(context_tokens: u64, context_window: u64) -> bool {
+    context_tokens > hard_compaction_threshold(context_window)
 }
 
 fn compaction_needed(
@@ -257,17 +275,20 @@ fn compaction_needed(
     config: &Config,
     session_id: &str,
     context_window: Option<u64>,
+    threshold: CompactionThreshold,
 ) -> Result<bool> {
     let session = store
         .get_session(session_id)?
         .ok_or_else(|| anyhow::anyhow!("session not found"))?;
-    let tokens = if let Some(tokens) = session.reported_context_tokens {
-        tokens
-    } else {
-        store.estimate_context_tokens(session_id)?
-    };
-    Ok(context_window.is_some_and(|window| {
-        exceeds_compaction_threshold(tokens, window, config.compaction.fraction)
+    let estimated_tokens = store.estimate_context_tokens(session_id)?;
+    let tokens = session
+        .reported_context_tokens
+        .map_or(estimated_tokens, |reported| reported.max(estimated_tokens));
+    Ok(context_window.is_some_and(|window| match threshold {
+        CompactionThreshold::Soft => {
+            exceeds_soft_compaction_threshold(tokens, window, config.compaction.soft_fraction)
+        }
+        CompactionThreshold::Hard => exceeds_hard_compaction_threshold(tokens, window),
     }))
 }
 
@@ -607,7 +628,9 @@ mod tests {
             )]),
             output: Default::default(),
             line_wrapping: true,
-            compaction: crate::config::CompactionConfig { fraction: 0.75 },
+            compaction: crate::config::CompactionConfig {
+                soft_fraction: 0.70,
+            },
             limits: crate::config::LimitsConfig::default(),
             guardrail: crate::config::GuardrailConfig::default(),
             terminal_bell: crate::config::TerminalBellConfig::default(),
@@ -890,6 +913,7 @@ mod tests {
                 model: request_model,
             },
             Some(100_000),
+            CompactionThreshold::Soft,
             &FailingProvider,
             &mut renderer,
         )
@@ -1003,13 +1027,15 @@ mod tests {
     }
 
     #[test]
-    fn threshold_reserves_fractional_or_fixed_headroom() {
-        assert_eq!(compaction_threshold(1_000_000, 0.75), 750_000);
-        assert_eq!(compaction_threshold(200_000, 0.75), 136_000);
-        assert_eq!(compaction_threshold(64_000, 0.75), 0);
-        assert_eq!(compaction_threshold(32_000, 0.75), 0);
+    fn soft_and_hard_thresholds_are_distinct_at_supported_windows() {
+        assert_eq!(soft_compaction_threshold(200_000, 0.70), 140_000);
+        assert_eq!(hard_compaction_threshold(200_000), 152_000);
+        assert_eq!(soft_compaction_threshold(1_000_000, 0.70), 700_000);
+        assert_eq!(hard_compaction_threshold(1_000_000), 850_000);
 
-        assert!(!exceeds_compaction_threshold(136_000, 200_000, 0.75));
-        assert!(exceeds_compaction_threshold(136_001, 200_000, 0.75));
+        assert!(!exceeds_soft_compaction_threshold(140_000, 200_000, 0.70));
+        assert!(exceeds_soft_compaction_threshold(140_001, 200_000, 0.70));
+        assert!(!exceeds_hard_compaction_threshold(152_000, 200_000));
+        assert!(exceeds_hard_compaction_threshold(152_001, 200_000));
     }
 }

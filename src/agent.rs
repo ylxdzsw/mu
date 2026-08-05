@@ -102,22 +102,36 @@ pub struct AgentLoop<'a> {
 impl<'a> AgentLoop<'a> {
     pub async fn run_turn(&mut self) -> Result<TurnResult> {
         let mut audit = TurnAudit::default();
-        self.run_turn_inner(&mut audit).await
+        self.run_turn_inner(&mut audit, true).await
     }
 
-    async fn run_turn_inner(&mut self, audit: &mut TurnAudit) -> Result<TurnResult> {
+    pub async fn resume_turn(&mut self) -> Result<TurnResult> {
+        let mut audit = TurnAudit::default();
+        self.run_turn_inner(&mut audit, false).await
+    }
+
+    async fn run_turn_inner(
+        &mut self,
+        audit: &mut TurnAudit,
+        compact_at_turn_boundary: bool,
+    ) -> Result<TurnResult> {
         bash::reset_cancellation_state();
         bash::install_signal_forwarder();
-        let pre_turn_compaction = compaction::maybe_compact_routed(
-            self.store,
-            self.config,
-            self.session_id,
-            &mut self.model,
-            &mut self.provider,
-            self.model_context_window,
-            self.renderer,
-        )
-        .await?;
+        let pre_turn_compaction = if compact_at_turn_boundary {
+            compaction::maybe_compact_routed(
+                self.store,
+                self.config,
+                self.session_id,
+                &mut self.model,
+                &mut self.provider,
+                self.model_context_window,
+                compaction::CompactionThreshold::Soft,
+                self.renderer,
+            )
+            .await?
+        } else {
+            None
+        };
         self.sync_effective_model();
         let mut latest_compaction_since_change = pre_turn_compaction;
 
@@ -141,10 +155,9 @@ impl<'a> AgentLoop<'a> {
             let (exchange_id, stream_result, mut command_headers) = 'request_gate: loop {
                 if latest_compaction_since_change.is_none()
                     && let Some(context_window) = self.model_context_window
-                    && compaction::exceeds_compaction_threshold(
+                    && compaction::exceeds_hard_compaction_threshold(
                         approx_context_tokens(&context),
                         context_window,
-                        self.config.compaction.fraction,
                     )
                 {
                     let outcome = compaction::maybe_compact_routed(
@@ -154,6 +167,7 @@ impl<'a> AgentLoop<'a> {
                         &mut self.model,
                         &mut self.provider,
                         self.model_context_window,
+                        compaction::CompactionThreshold::Hard,
                         self.renderer,
                     )
                     .await?;
@@ -908,7 +922,7 @@ fn parse_tool_args(call: &ToolCall) -> Result<Value> {
 }
 
 /// Cheap char/4 estimate of the in-memory context size, mirroring the fallback
-/// estimator used elsewhere. Used for the in-loop proactive compaction check so
+/// estimator used elsewhere. Used for the hard request-level compaction check so
 /// growing tool output is caught before it forces a hard API overflow.
 fn approx_context_tokens(context: &[Message]) -> u64 {
     context
@@ -2126,9 +2140,47 @@ mod tests {
 
     /// A provider that grows the context with one large tool result, then
     /// stops. Any summarization request (the compaction call) is answered with
-    /// a short summary so the in-loop proactive compaction path can complete.
+    /// a short summary so the hard request-level compaction path can complete.
     struct GrowThenStopProvider {
         turn_step: Mutex<usize>,
+    }
+
+    struct BoundaryCompactionProvider;
+
+    #[async_trait(?Send)]
+    impl Provider for BoundaryCompactionProvider {
+        async fn stream_chat(
+            &self,
+            _request: &RequestOptions,
+            messages: &[Message],
+            _tools: &[Value],
+            _on_event: &mut dyn FnMut(crate::provider::StreamEvent) -> Result<(), ProviderError>,
+        ) -> Result<StreamResult, ProviderError> {
+            let summarizing = messages.iter().any(|message| {
+                matches!(
+                    message,
+                    Message::User { content }
+                        if content.text().contains("Summarize this conversation")
+                            || content.text().contains("Update this conversation summary")
+                )
+            });
+            Ok(StreamResult {
+                message: Message::Assistant {
+                    content: Some(if summarizing { "summary" } else { "done" }.into()),
+                    reasoning_content: None,
+                    native_replay: None,
+                    tool_calls: None,
+                },
+                finish_reason: FinishReason::Stop,
+                usage: Some(Usage {
+                    input_tokens: 1,
+                    output_tokens: 1,
+                    total_tokens: 2,
+                    ..Usage::default()
+                }),
+                native_response: None,
+            })
+        }
     }
 
     #[async_trait(?Send)]
@@ -2183,7 +2235,7 @@ mod tests {
                                 arguments: serde_json::json!({
                                     "title": "grow context",
                                     "risk": "readonly",
-                                    "command": "printf 'x%.0s' {1..3000}",
+                                    "command": "head -c 620000 /dev/zero | tr '\\0' x",
                                 })
                                 .to_string(),
                             },
@@ -2224,7 +2276,9 @@ mod tests {
         std::fs::create_dir_all(&tmp).unwrap();
         let store = Store::open(&tmp.join("mu.db")).unwrap();
         let session = store.create_session("/tmp").unwrap();
-        let config = test_config();
+        let mut config = test_config();
+        config.limits.max_bytes = 700_000;
+        config.limits.max_line_bytes = 700_000;
         let request_model = crate::models::resolve_model_ref(&config, "test/fake-model").unwrap();
         store
             .append_message(
@@ -2235,7 +2289,7 @@ mod tests {
             )
             .unwrap();
 
-        // Small prior history so the pre-turn check does NOT compact; the huge
+        // Small prior history so the soft turn-boundary check does NOT compact; the huge
         // tool result produced mid-turn is what should push us over.
         for turn in ["one", "two"] {
             store
@@ -2288,9 +2342,9 @@ mod tests {
             request: RequestOptions {
                 model: request_model,
             },
-            // Tiny window: threshold = 200 * 0.75 = 150 tokens (~600 bytes).
-            // The ~3KB tool result blows past it, forcing an in-loop compaction.
-            model_context_window: Some(200),
+            // At 200K, the hard threshold is 152K tokens. The ~620KB tool result
+            // pushes the bytes/4 estimate past it without crossing soft at the boundary.
+            model_context_window: Some(200_000),
             renderer: &mut renderer,
         };
 
@@ -2315,6 +2369,86 @@ mod tests {
         ));
 
         let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    #[tokio::test]
+    async fn soft_compaction_runs_for_new_turns_but_not_retries() {
+        fn seed_history(store: &Store, session_id: &str) {
+            for (user, assistant) in [
+                ("x".repeat(10_000), "reply one"),
+                ("turn two".into(), "reply two"),
+                ("turn three".into(), "reply three"),
+            ] {
+                store
+                    .append_message(
+                        session_id,
+                        &Message::User {
+                            content: UserContent::Text(user),
+                        },
+                    )
+                    .unwrap();
+                store
+                    .append_message(
+                        session_id,
+                        &Message::Assistant {
+                            content: Some(assistant.into()),
+                            reasoning_content: None,
+                            native_replay: None,
+                            tool_calls: None,
+                        },
+                    )
+                    .unwrap();
+            }
+        }
+
+        let store = Store::open_memory().unwrap();
+        let mut config = test_config();
+        config.compaction.soft_fraction = 0.01;
+        let request_model = crate::models::resolve_model_ref(&config, "test/fake-model").unwrap();
+
+        let new_turn_session = store.create_session_seeded("system").unwrap();
+        seed_history(&store, &new_turn_session.id);
+        let mut renderer = Renderer::with_format(OutputFormat::Final);
+        let mut new_turn_agent = AgentLoop {
+            config: &config,
+            model: ResolvedModelChoice::fixed(request_model.clone()),
+            provider: Box::new(BoundaryCompactionProvider),
+            store: &store,
+            session_id: &new_turn_session.id,
+            request: RequestOptions {
+                model: request_model.clone(),
+            },
+            model_context_window: Some(200_000),
+            renderer: &mut renderer,
+        };
+        new_turn_agent.run_turn().await.unwrap();
+        assert!(
+            store
+                .latest_summary_sequence(&new_turn_session.id)
+                .unwrap()
+                .is_some()
+        );
+
+        let retry_session = store.create_session_seeded("system").unwrap();
+        seed_history(&store, &retry_session.id);
+        let mut renderer = Renderer::with_format(OutputFormat::Final);
+        let mut retry_agent = AgentLoop {
+            config: &config,
+            model: ResolvedModelChoice::fixed(request_model.clone()),
+            provider: Box::new(BoundaryCompactionProvider),
+            store: &store,
+            session_id: &retry_session.id,
+            request: RequestOptions {
+                model: request_model,
+            },
+            model_context_window: Some(200_000),
+            renderer: &mut renderer,
+        };
+        retry_agent.resume_turn().await.unwrap();
+        assert_eq!(
+            store.latest_summary_sequence(&retry_session.id).unwrap(),
+            None
+        );
     }
 
     /// Two model calls in one turn: a `readonly` bash call, then a stop. Each
