@@ -200,6 +200,8 @@ pub struct ModelConfig {
 #[derive(Debug, Clone, Deserialize)]
 pub struct CompactionConfig {
     pub soft_fraction: f64,
+    pub hard_fraction: f64,
+    pub hard_headroom_tokens: u64,
 }
 
 #[derive(Debug, Clone, Deserialize)]

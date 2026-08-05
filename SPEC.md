@@ -1400,7 +1400,11 @@ are not visible in another.
       "enabled": true,
       "min_duration_ms": 10000
     },
-    "compaction": { "soft_fraction": 0.70 },  // optional
+    "compaction": {                         // optional
+      "soft_fraction": 0.70,
+      "hard_fraction": 0.85,
+      "hard_headroom_tokens": 48000
+    },
     "limits": { "max_iterations": 50, "max_lines": 2000, "max_bytes": 51200, "max_line_bytes": 10240 },
     "redaction": {
       "env": ["*_API_KEY", "*_API_TOKEN", "*_AUTH_TOKEN"] // optional; these are the defaults
@@ -1669,16 +1673,17 @@ the next prompt performs the compaction.
 tool results, so every new semantic agent request also checks:
 
 ```text
-min(floor(context_window * 0.85),
-    context_window.saturating_sub(48_000))
+min(floor(context_window * configured_hard_fraction),
+    context_window.saturating_sub(configured_hard_headroom_tokens))
 ```
 
-At a 1,000,000-token window this hard threshold is 850,000; at 200,000 it is
-152,000. It applies to the first request, each request after tool results or
-assistant content changed context, and the first request after candidate
-advancement changed the active context window. An unchanged retry on the same
-candidate bypasses the gate. Provider advancement returns to this gate rather
-than contacting the next candidate directly.
+With the defaults of 85% and 48,000 tokens, a 1,000,000-token window has a hard
+threshold of 850,000 and a 200,000-token window has a threshold of 152,000. It
+applies to the first request, each request after tool results or assistant
+content changed context, and the first request after candidate advancement
+changed the active context window. An unchanged retry on the same candidate
+bypasses the gate. Provider advancement returns to this gate rather than
+contacting the next candidate directly.
 
 **Tier 3 — one reactive compaction on API overflow.** If the provider returns a
 context-length error and the current semantic context has not already been

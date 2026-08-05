@@ -72,7 +72,11 @@ Complete shape, with default values where applicable:
     }
   },
   "terminal_bell": { "enabled": true, "min_duration_ms": 10000 },
-  "compaction": { "soft_fraction": 0.70 },
+  "compaction": {
+    "soft_fraction": 0.70,
+    "hard_fraction": 0.85,
+    "hard_headroom_tokens": 48000
+  },
   "limits": {
     "max_iterations": 50,
     "max_lines": 2000,
@@ -94,8 +98,14 @@ At least one provider and model are required. Endpoint paths must end in
 `endpoint` is required; `api_key_env` and all model metadata are optional.
 Without `context_window`, percentage reporting and proactive compaction are
 unavailable. `output` is overridden by CLI `--output`.
-`compaction.soft_fraction` is the graceful new-turn threshold; Mu always keeps
-the two most recent turns outside the summary.
+Compaction requires a model `context_window` and runs only when context tokens
+are strictly greater than the applicable threshold. Before a new turn's first
+provider request, `compaction.soft_fraction` sets the graceful threshold to
+`floor(context_window * soft_fraction)`. Before each semantic request within a
+turn, the hard threshold is the lower of
+`floor(context_window * hard_fraction)` and
+`context_window.saturating_sub(hard_headroom_tokens)`. Mu always keeps the two
+most recent turns outside the summary.
 `limits.max_iterations` caps one agent turn; the other limits bound the
 model-visible preview of bash output by lines, total bytes, and bytes per line.
 The bell sounds only for turns lasting at least `min_duration_ms`. The guardrail

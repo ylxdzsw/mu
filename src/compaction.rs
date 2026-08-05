@@ -25,8 +25,6 @@ material to the work.";
 const MAX_SUMMARY_ENTRY_CHARS: usize = 4000;
 const MAX_SUMMARY_TOOL_CHARS: usize = 2000;
 pub const KEEP_RECENT_TURNS: usize = 2;
-const HARD_COMPACTION_FRACTION: f64 = 0.85;
-const HARD_HEADROOM_TOKENS: u64 = 48_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CompactionThreshold {
@@ -225,9 +223,13 @@ pub fn soft_compaction_threshold(context_window: u64, soft_fraction: f64) -> u64
     (context_window as f64 * soft_fraction).floor() as u64
 }
 
-pub fn hard_compaction_threshold(context_window: u64) -> u64 {
-    let fraction_threshold = (context_window as f64 * HARD_COMPACTION_FRACTION).floor() as u64;
-    let fixed_headroom_threshold = context_window.saturating_sub(HARD_HEADROOM_TOKENS);
+pub fn hard_compaction_threshold(
+    context_window: u64,
+    hard_fraction: f64,
+    hard_headroom_tokens: u64,
+) -> u64 {
+    let fraction_threshold = (context_window as f64 * hard_fraction).floor() as u64;
+    let fixed_headroom_threshold = context_window.saturating_sub(hard_headroom_tokens);
     fraction_threshold.min(fixed_headroom_threshold)
 }
 
@@ -239,8 +241,13 @@ pub fn exceeds_soft_compaction_threshold(
     context_tokens > soft_compaction_threshold(context_window, soft_fraction)
 }
 
-pub fn exceeds_hard_compaction_threshold(context_tokens: u64, context_window: u64) -> bool {
-    context_tokens > hard_compaction_threshold(context_window)
+pub fn exceeds_hard_compaction_threshold(
+    context_tokens: u64,
+    context_window: u64,
+    hard_fraction: f64,
+    hard_headroom_tokens: u64,
+) -> bool {
+    context_tokens > hard_compaction_threshold(context_window, hard_fraction, hard_headroom_tokens)
 }
 
 fn compaction_needed(
@@ -261,7 +268,12 @@ fn compaction_needed(
         CompactionThreshold::Soft => {
             exceeds_soft_compaction_threshold(tokens, window, config.compaction.soft_fraction)
         }
-        CompactionThreshold::Hard => exceeds_hard_compaction_threshold(tokens, window),
+        CompactionThreshold::Hard => exceeds_hard_compaction_threshold(
+            tokens,
+            window,
+            config.compaction.hard_fraction,
+            config.compaction.hard_headroom_tokens,
+        ),
     }))
 }
 
@@ -601,9 +613,7 @@ mod tests {
             )]),
             output: Default::default(),
             line_wrapping: true,
-            compaction: crate::config::CompactionConfig {
-                soft_fraction: 0.70,
-            },
+            compaction: crate::config::CompactionConfig::default(),
             limits: crate::config::LimitsConfig::default(),
             guardrail: crate::config::GuardrailConfig::default(),
             terminal_bell: crate::config::TerminalBellConfig::default(),
@@ -996,14 +1006,43 @@ mod tests {
 
     #[test]
     fn soft_and_hard_thresholds_are_distinct_at_supported_windows() {
-        assert_eq!(soft_compaction_threshold(200_000, 0.70), 140_000);
-        assert_eq!(hard_compaction_threshold(200_000), 152_000);
-        assert_eq!(soft_compaction_threshold(1_000_000, 0.70), 700_000);
-        assert_eq!(hard_compaction_threshold(1_000_000), 850_000);
+        let config = crate::config::CompactionConfig::default();
+        for context_window in [200_000, 1_000_000] {
+            let soft_threshold = soft_compaction_threshold(context_window, config.soft_fraction);
+            let hard_threshold = hard_compaction_threshold(
+                context_window,
+                config.hard_fraction,
+                config.hard_headroom_tokens,
+            );
+            assert!(soft_threshold < hard_threshold);
+            assert!(!exceeds_soft_compaction_threshold(
+                soft_threshold,
+                context_window,
+                config.soft_fraction,
+            ));
+            assert!(exceeds_soft_compaction_threshold(
+                soft_threshold + 1,
+                context_window,
+                config.soft_fraction,
+            ));
+            assert!(!exceeds_hard_compaction_threshold(
+                hard_threshold,
+                context_window,
+                config.hard_fraction,
+                config.hard_headroom_tokens,
+            ));
+            assert!(exceeds_hard_compaction_threshold(
+                hard_threshold + 1,
+                context_window,
+                config.hard_fraction,
+                config.hard_headroom_tokens,
+            ));
+        }
+    }
 
-        assert!(!exceeds_soft_compaction_threshold(140_000, 200_000, 0.70));
-        assert!(exceeds_soft_compaction_threshold(140_001, 200_000, 0.70));
-        assert!(!exceeds_hard_compaction_threshold(152_000, 200_000));
-        assert!(exceeds_hard_compaction_threshold(152_001, 200_000));
+    #[test]
+    fn hard_threshold_uses_configured_fraction_and_headroom() {
+        assert_eq!(hard_compaction_threshold(200_000, 0.90, 10_000), 180_000);
+        assert_eq!(hard_compaction_threshold(200_000, 0.99, 30_000), 170_000);
     }
 }

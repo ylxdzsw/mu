@@ -156,6 +156,8 @@ impl<'a> AgentLoop<'a> {
                     && compaction::exceeds_hard_compaction_threshold(
                         approx_context_tokens(&context),
                         context_window,
+                        self.config.compaction.hard_fraction,
+                        self.config.compaction.hard_headroom_tokens,
                     )
                 {
                     let outcome = compaction::maybe_compact_routed(

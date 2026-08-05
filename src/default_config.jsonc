@@ -34,7 +34,11 @@
     "enabled": true,
     "min_duration_ms": 10000
   },
-  "compaction": { "soft_fraction": 0.70 },
+  "compaction": {
+    "soft_fraction": 0.70,
+    "hard_fraction": 0.85,
+    "hard_headroom_tokens": 48000
+  },
   "limits": {
     "max_iterations": 50,
     "max_lines": 2000,
