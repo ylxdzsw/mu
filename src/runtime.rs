@@ -720,6 +720,35 @@ mod tests {
     }
 
     #[test]
+    fn exhausted_floating_choice_sticks_to_last_provider_and_remains_retryable() {
+        let store = Store::open_memory().unwrap();
+        let session = store.create_session("/tmp").unwrap();
+        finish_attempt(&store, &session.id, "(alpha)/default-model:max", "error");
+        finish_attempt(&store, &session.id, "(beta)/default-model:max", "error");
+        let session = store.get_session(&session.id).unwrap().unwrap();
+
+        let report = build_status_report(
+            &store,
+            &test_config(),
+            &InvocationOverrides {
+                session: Some(session.id.clone()),
+                model: Some("(alpha)/default-model:max".into()),
+                ..Default::default()
+            },
+            None,
+            StatusIncludes::default(),
+            None,
+            None,
+        )
+        .unwrap();
+        let retry = resolve_retry_model(&store, &test_config(), &session, None).unwrap();
+
+        assert_eq!(report.model.canonical, "(beta)/default-model:max");
+        assert!(!report.clean);
+        assert_eq!(retry.active_model().canonical, "(beta)/default-model:max");
+    }
+
+    #[test]
     fn floating_provider_position_is_remembered_by_model_across_intervening_choices() {
         let store = Store::open_memory().unwrap();
         let config = test_config();

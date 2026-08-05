@@ -367,7 +367,18 @@ fn retain_native_response(state: &mut ResponsesStreamState, response: &Value) {
         .into_iter()
         .enumerate()
     {
-        merge_output_item(&mut output, index, &item);
+        let matching_index = output
+            .iter()
+            .find_map(|(index, existing)| same_output_item(existing, &item).then_some(*index));
+        let target = matching_index
+            .or_else(|| {
+                output
+                    .get(&index)
+                    .is_none_or(|existing| existing["type"] == item["type"])
+                    .then_some(index)
+            })
+            .unwrap_or_else(|| output.keys().next_back().map_or(0, |index| index + 1));
+        merge_output_item(&mut output, target, &item);
     }
     state.output = output.into_values().collect();
     let mut native_response = response.clone();
@@ -375,6 +386,15 @@ fn retain_native_response(state: &mut ResponsesStreamState, response: &Value) {
         object.insert("output".into(), Value::Array(state.output.clone()));
     }
     state.native_response = Some(native_response);
+}
+
+fn same_output_item(left: &Value, right: &Value) -> bool {
+    ["id", "call_id"].into_iter().any(|key| {
+        left[key]
+            .as_str()
+            .zip(right[key].as_str())
+            .is_some_and(|(left, right)| !left.is_empty() && left == right)
+    })
 }
 
 fn responses_stream_error(error: &Value) -> ProviderError {
@@ -531,6 +551,24 @@ mod tests {
             state.native_response.as_ref().unwrap()["output"][0]["encrypted_content"],
             "opaque-state"
         );
+    }
+
+    #[test]
+    fn terminal_subset_merges_with_streamed_output_by_item_identity() {
+        let mut state = ResponsesStreamState::default();
+        let mut events = Vec::new();
+        let mut buffer = concat!(
+            "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"reasoning\",\"id\":\"rs_1\"}}\n\n",
+            "data: {\"type\":\"response.output_item.added\",\"output_index\":1,\"item\":{\"type\":\"function_call\",\"id\":\"fc_1\",\"call_id\":\"call_1\",\"name\":\"bash\",\"arguments\":\"\"}}\n\n",
+            "data: {\"type\":\"response.function_call_arguments.delta\",\"output_index\":1,\"delta\":\"{\\\"command\\\":\\\"pwd\\\"}\"}\n\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"output\":[{\"type\":\"function_call\",\"id\":\"fc_1\",\"call_id\":\"call_1\",\"name\":\"bash\",\"arguments\":\"{\\\"command\\\":\\\"pwd\\\"}\"}]}}\n\n"
+        )
+        .to_string();
+
+        consume(&mut state, &mut events, &mut buffer).unwrap();
+
+        assert_eq!(responses_tool_calls(&state.output).len(), 1);
+        assert!(state.output.iter().any(|item| item["id"] == "rs_1"));
     }
 
     #[test]

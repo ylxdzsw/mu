@@ -1114,6 +1114,25 @@ impl Store {
             )?;
             bail!("unknown tool: {}", call.function.name)
         }
+        let mut provider_call_ids = HashSet::new();
+        if let Some(call) = tool_calls
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .find(|call| !provider_call_ids.insert(call.id.as_str()))
+        {
+            self.fail_provider_exchange(
+                session_id,
+                exchange_id,
+                "invalid_response",
+                serde_json::json!({
+                    "message": format!("duplicate provider tool call id: {}", call.id)
+                }),
+                native_response,
+                usage,
+            )?;
+            bail!("duplicate provider tool call id: {}", call.id)
+        }
         let mut next_call = self.with_journal(session_id, |journal| Ok(next_call_id(journal)))?;
         let bash_calls = tool_calls
             .as_deref()
@@ -3035,6 +3054,72 @@ mod tests {
                 .reported_context_tokens,
             None
         );
+    }
+
+    #[test]
+    fn duplicate_provider_tool_call_ids_are_rejected_before_persistence() {
+        let store = Store::open_memory().unwrap();
+        let session = store.create_session_seeded("system").unwrap();
+        let turn = store
+            .start_turn(&session.id, "/tmp", None, &"hello".into())
+            .unwrap();
+        let native = serde_json::json!({"model":"model"});
+        let exchange = store
+            .start_provider_request(
+                &session.id,
+                &turn,
+                "agent",
+                ProviderOrigin {
+                    canonical_model_ref: "test/model".into(),
+                    provider_id: "test".into(),
+                    api: "test".into(),
+                    endpoint: String::new(),
+                    wire_model: "model".into(),
+                    effort: None,
+                },
+                store
+                    .request_recipe("test.v1", &native, serde_json::json!({"kind":"agent"}), &[])
+                    .unwrap(),
+                None,
+            )
+            .unwrap();
+        let call = ToolCall {
+            id: "call_1".into(),
+            function: FunctionCall {
+                name: "bash".into(),
+                arguments: r#"{"risk":"readonly","command":"pwd"}"#.into(),
+            },
+        };
+
+        let error = store
+            .complete_assistant_exchange(
+                &session.id,
+                &exchange,
+                &Message::Assistant {
+                    content: None,
+                    reasoning_content: None,
+                    tool_calls: Some(vec![call.clone(), call]),
+                    native_replay: None,
+                },
+                None,
+                None,
+            )
+            .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("duplicate provider tool call id")
+        );
+        assert!(store.load_context_messages(&session.id).is_ok());
+        assert!(!store.is_session_clean(&session.id).unwrap());
+        let events = store.audit_events(&session.id).unwrap();
+        assert!(events.iter().any(|event| {
+            event["type"] == "provider_failed" && event["error_class"] == "invalid_response"
+        }));
+        assert!(!events.iter().any(|event| {
+            event["type"] == "provider_completed" && event["exchange_id"] == exchange
+        }));
     }
 
     #[test]
