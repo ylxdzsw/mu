@@ -15,7 +15,7 @@ also changing `mu` setup files.
 Before editing, inspect the active setup instead of guessing:
 
 ```bash
-mu status --json --include-models --include-commands
+mu status --json --include-models --include-commands --include-skills
 ```
 
 Then read the relevant files from the active scopes:
@@ -31,9 +31,9 @@ before filesystem root. If no project is found, `mu` uses global scope.
 
 ## Precedence
 
-- Config: `~/.mu/config.jsonc`, then project `.mu/config.jsonc` as a deep
+- Config: global `config.jsonc`, then project `.mu/config.jsonc` as a deep
   overlay.
-- Environment: process environment, then `~/.mu/.env`, then project `.mu/.env`.
+- Environment: process environment, then global `.env`, then project `.mu/.env`.
 - Instruction index: built-ins, then global `.mu`, then project `.mu`; later
   scopes shadow earlier skills or commands with the same name.
 - Prompt guidance: role preamble and runtime context, then available skill
@@ -47,22 +47,26 @@ the installed `mu` package or this repository's shipped defaults.
 
 `config.jsonc` accepts comments and trailing commas. Global config is created
 automatically with a starter provider if it does not exist. Project config from
-`mu project init` is only an overlay stub.
-Other omitted fields inherit from mu's bundled `default_config.jsonc`; its
-provider entries are used only when creating a missing global config.
+`mu project init` is only an overlay stub. Omitted non-provider fields inherit
+from bundled defaults; bundled providers are used only to create a missing
+global config. Objects merge recursively across scopes; scalars and arrays
+replace inherited values.
 
-Common shape:
+Complete shape, with default values where applicable:
 
 ```jsonc
 {
+  "output": "detail",             // final | concise | detail | full
+  "line_wrapping": true,          // interactive output; no CLI override
   "providers": {
     "openai": {
-      "endpoint": "https://api.openai.com/v1/responses",
-      "api_key_env": "OPENAI_API_KEY",
+      "endpoint": "https://api.openai.com/v1/responses", // complete POST URL
+      "api_key_env": "OPENAI_API_KEY",                   // empty means no key
       "models": {
         "gpt-5.6-terra": {
-          "context_window": 1050000,
-          "supported_efforts": ["none", "low", "medium", "high", "xhigh", "max"]
+          "context_window": 1050000, // compaction and status denominator
+          "supported_efforts": ["none", "low", "medium", "high", "xhigh", "max"],
+          "replay_key": "openai-gpt-5.6" // optional native-replay group
         }
       }
     }
@@ -78,24 +82,62 @@ Common shape:
   "redaction": { "env": ["*_API_KEY", "*_API_TOKEN", "*_AUTH_TOKEN"] },
   "guardrail": {
     "enabled": true,
-    "review_model": "openai/gpt-4o:low",
+    "review_model": "openai/gpt-5.6-terra:low", // optional; active model if omitted
     "timeout_seconds": 120,
     "max_denials_per_turn": 3
   }
 }
 ```
 
-Model references use `provider/model[:effort]`. Bare `model[:effort]` is valid
-only when exactly one configured provider has that model id. Supported effort
-values are `low`, `medium`, `high`, `xhigh`, and `max`.
+At least one provider and model are required. Endpoint paths must end in
+`/chat/completions`, `/responses`, or `/messages`; the suffix selects the API.
+`endpoint` is required; `api_key_env` and all model metadata are optional.
+Without `context_window`, percentage reporting and proactive compaction are
+unavailable. `output` is overridden by CLI `--output`. `compaction.fraction` is
+the context threshold and `keep_recent_turns` is the unsummarized suffix.
+`limits.max_iterations` caps one agent turn; the other limits bound the
+model-visible preview of bash output by lines, total bytes, and bytes per line.
+The bell sounds only for turns lasting at least `min_duration_ms`. The guardrail
+reviews destructive bash calls; `timeout_seconds` and `max_denials_per_turn`
+must be positive.
 
-Provider and model object order matters. In a scope with no existing sessions,
-`mu` uses the first configured model after project order is merged over global
-order.
+Model references use `provider/model[:effort]` for a fixed provider or
+`model[:effort]` for ordered provider fallback. A bare model includes every
+provider defining that model id; a session remembers its position per model.
+Provider and model object order controls the default model, fallback, status,
+and completion order, with project entries before inherited global entries.
+Effort strings are provider-defined and unrestricted; `supported_efforts` is
+only an ordered status/completion hint. An exact model id containing `:` wins
+before effort-suffix parsing.
 
-Use `.env` for secrets and environment-specific values. Provider API key values
-and exact values of names listed in `redaction.env` are redacted from bash tool
-output before storage and before the model sees them.
+`replay_key` is a non-empty, non-secret compatibility label, defaulting to
+`provider/model`. Responses and Anthropic native state is shared only within
+the same API and effective key; Chat Completions replay is API-wide.
+
+## Environment
+
+Use `.env` for secrets and host-specific values. Mu parses it as data, never as
+shell code:
+
+```text
+("export" whitespace)? NAME "=" VALUE
+NAME  = [A-Za-z_][A-Za-z0-9_]*
+VALUE = bare [A-Za-z0-9_./:@%+,=-]*, single-quoted, or double-quoted
+```
+
+Blank lines and full-line comments are accepted; assignments cannot be
+indented or contain spacing around `=`, inline comments, or trailing syntax.
+Single quotes are literal. Double quotes allow only `\"`, `\\`, `\$`, and
+escaped backticks; expansion, concatenated quoting, multiline values, and other
+shell syntax are rejected. LF/CRLF and a final line without newline are valid.
+Invalid UTF-8, NUL, and lone carriage returns are rejected. Each file is applied
+atomically and its last duplicate wins.
+
+The effective environment is passed to bash and used for API keys and skill
+requirements. Values named by `api_key_env` or `redaction.env` are redacted
+before bash output is stored or shown to the model. Redaction selectors are
+case-sensitive exact names or one leading `*` plus a non-empty suffix; `[]`
+disables the defaults, and empty selected values are ignored.
 
 ## AGENTS.md
 
@@ -108,21 +150,29 @@ Keep `AGENTS.md` short. Put reusable task workflows in skills instead.
 
 ## Commands
 
-A custom command is any valid instruction file whose first line is a common variant
-of `mu` shebang:
+A custom command is a regular instruction file whose first line contains a
+common `mu` shebang:
 
 ```markdown
 #!/usr/bin/env -S mu --model openai/gpt-5:high
 Summarize the current checkout and suggest the next release note.
 ```
 
-The shebang accepts no arguments or exactly `--model <model-ref>`. Other
-arguments are rejected. An explicit invocation `--model` wins over the
-shebang, and `env -S` is the recommended form when passing the model option.
+The shebang accepts no arguments or exactly `-m|--model <model-ref>` as separate
+tokens; other arguments and `--model=value` are rejected on invocation. Use
+`env -S` with a model. An invocation `--model` overrides the shebang, which
+otherwise overrides the attached session or configured default for that turn
+without rewriting session model state.
 
 Commands are invoked by their relative `.mu` path, including extension, for
-example `mu review.md` or `/review.md` in the zsh prompt mode. Built-in
-subcommands and explicit prompt paths such as `./status` win over command names.
+example `mu review.md` or `/review.md` in zsh or Fish prompt mode. They accept
+the normal turn options for session, model, attachments, and output. Built-in
+subcommands win exact name collisions. Absolute, `./`, and `../` targets are
+explicit prompt files and bypass command lookup.
+
+Use `mu cat review.md` to inspect the resolved command or prompt without a
+provider or session mutation. Interactive output includes provenance; redirected
+output is the exact composed prompt.
 
 Every prompt file can take an optional custom instruction from non-terminal
 stdin. When calling it through the Bash tool, prefer the tool's `stdin` argument
@@ -141,21 +191,21 @@ For a human invoking `mu` directly from a terminal, a quoted heredoc remains
 appropriate for multiline input.
 
 For file-backed turns, terminal stdin is not read, and an empty pipe leaves the
-file prompt unchanged. Non-empty stdin is appended after `---`. In zsh prompt
-mode, `/review.md Focus on authentication` passes the text after the command as
-that custom instruction; Shift+Enter may add more lines.
+file prompt unchanged. Non-empty stdin is appended verbatim after
+`\n---\n\n`. In shell prompt mode, `/review.md Focus on authentication` passes
+the trailing text as that instruction; Shift+Enter may add lines. Pending shell
+attachments are forwarded and consumed by a custom command.
 
 Prompt-file mode strips the shebang before sending the prompt. A `mu` shebang's
 model default applies equally to an explicit prompt path and a discovered
-command. If a command also has skill frontmatter, `mu` strips both the shebang
-and frontmatter for command execution.
+command. A file may be both command and skill; command execution strips both
+headers. Command files need not have executable permission.
 
 ## Skills
 
-A skill is an instruction file with YAML frontmatter containing `name` and
-`description`. `mu` injects only skill metadata into the system prompt. There is
-no skill tool; the agent reads the skill file on demand with normal `bash`
-commands such as `sed`, `cat`, or `rg`.
+A skill is a regular instruction file with optional `mu` shebang followed by
+YAML-style frontmatter. The parser supports single-line `name`, `description`,
+`requires_env`, and `requires_commands` scalars; it is not general YAML.
 
 Prefer a flat file when the skill consists only of instructions:
 
@@ -177,8 +227,11 @@ Workflow instructions.
 Use `requires_env` when a skill only works with specific environment variables,
 and `requires_commands` when it needs CLIs on `PATH`. Each key is optional and
 comma-separated; every listed env var must be non-empty and every listed command
-must resolve before `mu` lists the skill. Do not use requirements to replace a
-clear trigger description.
+must be an executable regular file on the effective `PATH`. Environment names
+use shell identifier syntax; command names allow ASCII letters, digits, `_`,
+`-`, and `.`, but no `/`. Requirements are AND-only and gate only the skill
+role: a command in the same file remains callable. An inactive higher-scope
+skill does not shadow an active lower-scope skill.
 
 Use the folder form when the skill bundles supporting scripts, references,
 examples, or assets, or when external Open Skills compatibility is an explicit
@@ -189,8 +242,23 @@ goal. Do not create a directory merely to hold one `SKILL.md`:
 ```
 
 The skill name must match the flat file stem or the parent directory of
-`SKILL.md`. Names are lowercase ASCII letters or digits plus `_` and `-`.
-Descriptions should say both what the skill does and when it should trigger.
+`SKILL.md`. It is 1-64 bytes, starts with a lowercase ASCII letter or digit, and
+otherwise allows those characters plus `_` and `-`. Description is 1-256 bytes
+and should say what the skill does and when it triggers.
+
+Mu injects only active skill name, description, and absolute path. Before
+responding, the agent scans that list and must read a named or even partially
+relevant skill in full. Loading is context acquisition, not mandatory
+obedience; the agent decides whether its instructions apply. Relative paths in
+a skill resolve from the skill file's directory.
+
+Discovery scans built-in, global, then project roots; later active entries
+shadow the same skill name or command path. Paths are ASCII alphanumeric plus
+`_`, `-`, and `.`, with no component starting `.` or `-`; symlinks are not
+followed. Reserved root entries are `cache`, `locks`, `sessions`, `objects`,
+`current-session`, `sessions.db*`, `config.jsonc`, `.env`, `.gitignore`, and
+`AGENTS.md`. Each root scans at depth 4 and at most 512 files; the merged
+alphabetical index exposes at most 64 skills and 256 commands.
 
 In skill examples, pass multiline or escaping-sensitive command input through
 the Bash tool's `stdin` argument. Keep it out of the command string and omit
@@ -214,6 +282,7 @@ to create a nested `mu` project inside another discovered project; use
 After editing `mu` setup, prefer cheap structured checks:
 
 ```bash
-mu status --json --include-models --include-commands
-mu status --json --include-skills
+mu status --json --include-models --include-commands --include-skills
+mu context
+mu cat <prompt-file-or-command>
 ```
