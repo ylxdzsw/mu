@@ -1281,6 +1281,16 @@ impl Store {
         Ok(())
     }
 
+    pub fn interrupt_provider_exchange(&self, session_id: &str, exchange_id: &str) -> Result<()> {
+        self.append(
+            session_id,
+            Event::ProviderInterrupted {
+                exchange_id: exchange_id.to_string(),
+            },
+        )?;
+        Ok(())
+    }
+
     pub fn write_json_object(&self, value: &Value) -> Result<ObjectRef> {
         self.write_object(&serde_json::to_vec(value)?)
     }

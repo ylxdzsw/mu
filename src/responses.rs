@@ -7,7 +7,7 @@ use crate::provider::{
     ContentPart, FinishReason, FunctionCall, HttpProvider, Message, NativeReplay,
     NativeReplayPayload, ProviderError, ReasoningVisibility, SseEvent, StreamEvent, StreamResult,
     ToolCall, ToolCallDelta as ProviderToolCallDelta, Usage, UserContent, base64_encode,
-    next_event_boundary, stream_error_message,
+    classify_stream_error, next_event_boundary,
 };
 
 pub(crate) async fn stream(
@@ -39,7 +39,7 @@ pub(crate) async fn stream(
 
     let native_response = state.native_response;
     let output = state.output;
-    let tool_calls = responses_tool_calls(&output);
+    let tool_calls = responses_tool_calls(&output)?;
     let content = if state.content.is_empty() {
         responses_output_text(&output)
     } else {
@@ -199,7 +199,7 @@ fn responses_user_content(content: &UserContent) -> Result<Value, ProviderError>
                         )
                     }))
                 }
-                ContentPart::Attachment { attachment } => Err(ProviderError::Other(format!(
+                ContentPart::Attachment { attachment } => Err(ProviderError::Protocol(format!(
                     "Responses endpoints do not support audio attachment `{}` ({})",
                     attachment.filename, attachment.media_type
                 ))),
@@ -242,7 +242,7 @@ pub(crate) fn consume_responses_sse_buffer(
             continue;
         }
         let value: Value = serde_json::from_str(&data)
-            .map_err(|error| ProviderError::SseParse(error.to_string()))?;
+            .map_err(|error| ProviderError::Protocol(error.to_string()))?;
         let event_type = value.get("type").and_then(Value::as_str).unwrap_or("");
         match event_type {
             "response.output_item.added" => {
@@ -398,22 +398,7 @@ fn same_output_item(left: &Value, right: &Value) -> bool {
 }
 
 fn responses_stream_error(error: &Value) -> ProviderError {
-    let message = stream_error_message(error);
-    match error.get("code").and_then(Value::as_str) {
-        Some("server_error") => ProviderError::HttpStatus {
-            status: 500,
-            body: message,
-        },
-        Some("rate_limit_exceeded") => ProviderError::RateLimit { message },
-        Some("authentication_error" | "invalid_api_key" | "model_not_found") => {
-            ProviderError::Unavailable(format!(
-                "{}: {message}",
-                error["code"].as_str().unwrap_or("provider unavailable")
-            ))
-        }
-        Some(code) => ProviderError::Other(format!("{code}: {message}")),
-        None => ProviderError::Other(message),
-    }
+    classify_stream_error(error)
 }
 
 fn responses_usage(value: &Value) -> Option<Usage> {
@@ -433,16 +418,35 @@ fn responses_usage(value: &Value) -> Option<Usage> {
     })
 }
 
-pub(crate) fn responses_tool_calls(output: &[Value]) -> Vec<ToolCall> {
+pub(crate) fn responses_tool_calls(output: &[Value]) -> Result<Vec<ToolCall>, ProviderError> {
     output
         .iter()
         .filter(|item| item["type"] == "function_call")
-        .map(|item| ToolCall {
-            id: item["call_id"].as_str().unwrap_or("call").to_string(),
-            function: FunctionCall {
-                name: item["name"].as_str().unwrap_or("").to_string(),
-                arguments: item["arguments"].as_str().unwrap_or("").to_string(),
-            },
+        .map(|item| {
+            let id = item["call_id"].as_str().unwrap_or("call");
+            let arguments = item["arguments"].as_str().unwrap_or("");
+            let arguments = if arguments.trim().is_empty() {
+                "{}".into()
+            } else {
+                let value: Value = serde_json::from_str(arguments).map_err(|error| {
+                    ProviderError::Protocol(format!(
+                        "invalid completed Responses tool arguments for `{id}`: {error}"
+                    ))
+                })?;
+                if !value.is_object() {
+                    return Err(ProviderError::Protocol(format!(
+                        "completed Responses tool arguments for `{id}` must be a JSON object"
+                    )));
+                }
+                arguments.to_string()
+            };
+            Ok(ToolCall {
+                id: id.to_string(),
+                function: FunctionCall {
+                    name: item["name"].as_str().unwrap_or("").to_string(),
+                    arguments,
+                },
+            })
         })
         .collect()
 }
@@ -464,6 +468,7 @@ fn responses_output_text(output: &[Value]) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::provider::ProviderDisposition;
 
     fn consume(
         state: &mut ResponsesStreamState,
@@ -567,7 +572,7 @@ mod tests {
 
         consume(&mut state, &mut events, &mut buffer).unwrap();
 
-        assert_eq!(responses_tool_calls(&state.output).len(), 1);
+        assert_eq!(responses_tool_calls(&state.output).unwrap().len(), 1);
         assert!(state.output.iter().any(|item| item["id"] == "rs_1"));
     }
 
@@ -639,12 +644,13 @@ mod tests {
 
         assert!(matches!(
             error,
-            ProviderError::HttpStatus {
-                status: 500,
-                ref body
-            } if body == "generation failed"
+            ProviderError::Overloaded {
+                status: None,
+                ref detail,
+                ..
+            } if detail == "generation failed"
         ));
-        assert!(error.retryable_for_live_turn());
+        assert_eq!(error.disposition(), ProviderDisposition::Retry);
     }
 
     #[test]
@@ -661,9 +667,9 @@ mod tests {
 
         assert!(matches!(
             error,
-            ProviderError::RateLimit { ref message } if message == "slow down"
+            ProviderError::RateLimit { ref detail, .. } if detail == "slow down"
         ));
-        assert!(error.retryable_for_live_turn());
+        assert_eq!(error.disposition(), ProviderDisposition::Retry);
     }
 
     #[test]
@@ -680,10 +686,10 @@ mod tests {
 
         assert!(matches!(
             error,
-            ProviderError::Other(ref message)
-                if message == "invalid_prompt: unsupported input"
+            ProviderError::BadRequestPermanent { ref detail, .. }
+                if detail == "unsupported input"
         ));
-        assert!(!error.retryable_for_live_turn());
+        assert_eq!(error.disposition(), ProviderDisposition::Fail);
     }
 
     #[test]
@@ -695,9 +701,34 @@ mod tests {
 
         let error = consume(&mut state, &mut events, &mut buffer).unwrap_err();
 
-        assert!(matches!(error, ProviderError::SseParse(_)));
+        assert!(matches!(error, ProviderError::Protocol(_)));
         assert!(state.content.is_empty());
         assert!(!state.terminal);
         assert!(events.is_empty());
+    }
+
+    #[test]
+    fn completed_tool_arguments_must_be_json_objects() {
+        let output = |arguments: &str| {
+            vec![serde_json::json!({
+                "type": "function_call",
+                "call_id": "call_1",
+                "name": "bash",
+                "arguments": arguments,
+            })]
+        };
+
+        assert_eq!(
+            responses_tool_calls(&output(" \n")).unwrap()[0]
+                .function
+                .arguments,
+            "{}"
+        );
+        for invalid in ["{", "[]", "\"text\"", "1", "true", "null"] {
+            assert!(matches!(
+                responses_tool_calls(&output(invalid)),
+                Err(ProviderError::Protocol(_))
+            ));
+        }
     }
 }

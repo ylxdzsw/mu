@@ -1,6 +1,10 @@
-use std::{fmt, time::Duration};
+use std::{
+    fmt,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 
 use async_trait::async_trait;
+use chrono::{DateTime, NaiveDateTime};
 use clap::ValueEnum;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -207,8 +211,12 @@ impl HttpProvider {
             .map_err(|error| ProviderError::Transport(error.to_string()))?;
         if !response.status().is_success() {
             let status = response.status().as_u16();
+            let retry_after = parse_retry_after(
+                response.headers().get(reqwest::header::RETRY_AFTER),
+                SystemTime::now(),
+            );
             let body = response.text().await.unwrap_or_default();
-            return Err(classify_http_error(status, body));
+            return Err(classify_http_error(status, body, retry_after));
         }
 
         let mut response = response;
@@ -466,27 +474,76 @@ pub enum FinishReason {
     Other(String),
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProviderError {
-    ContextLength,
-    RateLimit { message: String },
-    Unavailable(String),
-    HttpStatus { status: u16, body: String },
+    ContextLength {
+        detail: String,
+    },
+    RequestTooLarge {
+        status: Option<u16>,
+        detail: String,
+    },
+    ModelUnavailable {
+        detail: String,
+    },
+    AuthFailed {
+        detail: String,
+    },
+    Overloaded {
+        status: Option<u16>,
+        retry_after: Option<Duration>,
+        detail: String,
+    },
+    RateLimit {
+        retry_after: Option<Duration>,
+        detail: String,
+    },
+    BadRequestPermanent {
+        status: Option<u16>,
+        detail: String,
+    },
     Transport(String),
-    SseParse(String),
-    Other(String),
+    Protocol(String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProviderDisposition {
+    ContextRecovery,
+    Advance,
+    Retry,
+    Fail,
 }
 
 impl fmt::Display for ProviderError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::ContextLength => formatter.write_str("context length exceeded"),
-            Self::RateLimit { message } => write!(formatter, "HTTP 429: {message}"),
-            Self::Unavailable(message) => formatter.write_str(message),
-            Self::HttpStatus { status, body } => write!(formatter, "HTTP {status}: {body}"),
+            Self::ContextLength { detail } => {
+                write!(formatter, "context length exceeded: {detail}")
+            }
+            Self::RequestTooLarge { status, detail }
+            | Self::BadRequestPermanent { status, detail } => {
+                write_status_detail(formatter, *status, detail)
+            }
+            Self::ModelUnavailable { detail } | Self::AuthFailed { detail } => {
+                formatter.write_str(detail)
+            }
+            Self::Overloaded {
+                status,
+                retry_after,
+                detail,
+            } => {
+                write_status_detail(formatter, *status, detail)?;
+                write_retry_after(formatter, *retry_after)
+            }
+            Self::RateLimit {
+                retry_after,
+                detail,
+            } => {
+                write!(formatter, "HTTP 429: {detail}")?;
+                write_retry_after(formatter, *retry_after)
+            }
             Self::Transport(message) => write!(formatter, "transport error: {message}"),
-            Self::SseParse(message) => write!(formatter, "SSE parse: {message}"),
-            Self::Other(message) => formatter.write_str(message),
+            Self::Protocol(message) => write!(formatter, "protocol error: {message}"),
         }
     }
 }
@@ -496,55 +553,81 @@ impl std::error::Error for ProviderError {}
 impl ProviderError {
     pub fn class(&self) -> &'static str {
         match self {
-            Self::ContextLength => "context_length",
+            Self::ContextLength { .. } => "context_length",
+            Self::RequestTooLarge { .. } => "request_too_large",
+            Self::ModelUnavailable { .. } => "unavailable",
+            Self::AuthFailed { .. } => "auth",
+            Self::Overloaded { .. } => "overloaded",
             Self::RateLimit { .. } => "rate_limit",
-            Self::Unavailable(_) => "unavailable",
-            Self::HttpStatus { .. } => "http",
+            Self::BadRequestPermanent { .. } => "bad_request",
             Self::Transport(_) => "transport",
-            Self::SseParse(_) => "protocol",
-            Self::Other(_) => "provider",
+            Self::Protocol(_) => "protocol",
         }
     }
 
-    pub fn retryable_for_live_turn(&self) -> bool {
+    pub fn disposition(&self) -> ProviderDisposition {
         match self {
-            ProviderError::RateLimit { .. } => true,
-            ProviderError::HttpStatus { status, .. } => *status >= 500,
-            ProviderError::Transport(_) => true,
-            ProviderError::ContextLength
-            | ProviderError::Unavailable(_)
-            | ProviderError::SseParse(_)
-            | ProviderError::Other(_) => false,
-        }
-    }
-
-    pub fn fallback_immediately(&self) -> bool {
-        match self {
-            ProviderError::Unavailable(_) => true,
-            ProviderError::HttpStatus {
-                status: 401 | 404, ..
-            } => true,
-            ProviderError::HttpStatus { status: 403, body } => {
-                let body = body.to_ascii_lowercase();
-                [
-                    "authentication",
-                    "authorization",
-                    "api key",
-                    "access denied",
-                    "permission",
-                    "model access",
-                    "model_not_found",
-                ]
-                .iter()
-                .any(|marker| body.contains(marker))
+            Self::ContextLength { .. } => ProviderDisposition::ContextRecovery,
+            Self::ModelUnavailable { .. } | Self::AuthFailed { .. } => ProviderDisposition::Advance,
+            Self::Overloaded { .. } | Self::RateLimit { .. } | Self::Transport(_) => {
+                ProviderDisposition::Retry
             }
-            ProviderError::ContextLength
-            | ProviderError::RateLimit { .. }
-            | ProviderError::HttpStatus { .. }
-            | ProviderError::Transport(_)
-            | ProviderError::SseParse(_)
-            | ProviderError::Other(_) => false,
+            Self::RequestTooLarge { .. } | Self::BadRequestPermanent { .. } | Self::Protocol(_) => {
+                ProviderDisposition::Fail
+            }
         }
+    }
+
+    pub fn retry_after(&self) -> Option<Duration> {
+        match self {
+            Self::Overloaded { retry_after, .. } | Self::RateLimit { retry_after, .. } => {
+                *retry_after
+            }
+            _ => None,
+        }
+    }
+
+    pub fn diagnostic(&self) -> Value {
+        let mut diagnostic = serde_json::json!({"message": self.to_string()});
+        if let Some(status) = self.status() {
+            diagnostic["status"] = Value::from(status);
+        }
+        if let Some(retry_after) = self.retry_after() {
+            diagnostic["retry_after_ms"] =
+                Value::from(u64::try_from(retry_after.as_millis()).unwrap_or(u64::MAX));
+        }
+        diagnostic
+    }
+
+    fn status(&self) -> Option<u16> {
+        match self {
+            Self::RequestTooLarge { status, .. }
+            | Self::Overloaded { status, .. }
+            | Self::BadRequestPermanent { status, .. } => *status,
+            Self::RateLimit { .. } => Some(429),
+            _ => None,
+        }
+    }
+}
+
+fn write_retry_after(
+    formatter: &mut fmt::Formatter<'_>,
+    retry_after: Option<Duration>,
+) -> fmt::Result {
+    if let Some(retry_after) = retry_after {
+        write!(formatter, " (Retry-After: {}s)", retry_after.as_secs())?;
+    }
+    Ok(())
+}
+
+fn write_status_detail(
+    formatter: &mut fmt::Formatter<'_>,
+    status: Option<u16>,
+    detail: &str,
+) -> fmt::Result {
+    match status {
+        Some(status) => write!(formatter, "HTTP {status}: {detail}"),
+        None => formatter.write_str(detail),
     }
 }
 
@@ -679,14 +762,38 @@ pub fn advance_provider(
     Ok(Some((previous, next)))
 }
 
-pub(crate) fn classify_http_error(status: u16, body: String) -> ProviderError {
-    if is_context_length_error(status, &body) {
-        ProviderError::ContextLength
-    } else if status == 429 {
-        ProviderError::RateLimit { message: body }
-    } else {
-        ProviderError::HttpStatus { status, body }
-    }
+pub const MAX_PROVIDER_RETRY_AFTER: Duration = Duration::from_secs(60);
+
+pub fn provider_retry_limit(model: &ResolvedModelChoice) -> u32 {
+    if model.is_floating() { 3 } else { 5 }
+}
+
+pub fn provider_retry_delay(retry_ordinal: u32) -> Duration {
+    Duration::from_secs(match retry_ordinal {
+        0 | 1 => 1,
+        2 => 2,
+        _ => 4,
+    })
+}
+
+pub fn effective_retry_delay(error: &ProviderError, retry_ordinal: u32) -> Duration {
+    provider_retry_delay(retry_ordinal).max(error.retry_after().unwrap_or_default())
+}
+
+pub(crate) fn classify_http_error(
+    status: u16,
+    body: String,
+    retry_after: Option<Duration>,
+) -> ProviderError {
+    let parsed = serde_json::from_str::<Value>(&body).unwrap_or(Value::Null);
+    let error = parsed.get("error").unwrap_or(&parsed);
+    classify_provider_error(Some(status), error, &body, retry_after)
+}
+
+pub(crate) fn classify_stream_error(error: &Value) -> ProviderError {
+    let message = stream_error_message(error);
+    let status = embedded_status(error).or_else(|| bracketed_status(&message));
+    classify_provider_error(status, error, &error.to_string(), None)
 }
 
 pub(crate) fn stream_error_message(error: &Value) -> String {
@@ -697,41 +804,225 @@ pub(crate) fn stream_error_message(error: &Value) -> String {
         .unwrap_or_else(|| error.to_string())
 }
 
-pub(crate) fn is_context_length_error(status: u16, body: &str) -> bool {
-    if status == 413 {
+fn classify_provider_error(
+    status: Option<u16>,
+    error: &Value,
+    raw: &str,
+    retry_after: Option<Duration>,
+) -> ProviderError {
+    if let Some(nested) = nested_gateway_error(error) {
+        let nested_status = embedded_status(&nested).or(status);
+        return classify_provider_error(
+            nested_status,
+            nested.get("error").unwrap_or(&nested),
+            &nested.to_string(),
+            retry_after,
+        );
+    }
+
+    let code = error.get("code").and_then(Value::as_str).unwrap_or("");
+    let error_type = error.get("type").and_then(Value::as_str).unwrap_or("");
+    let message = error
+        .get("message")
+        .and_then(Value::as_str)
+        .unwrap_or(raw)
+        .trim();
+    let detail = if message.is_empty() {
+        raw.trim()
+    } else {
+        message
+    }
+    .to_string();
+    let code_is = |expected: &str| {
+        code.eq_ignore_ascii_case(expected) || error_type.eq_ignore_ascii_case(expected)
+    };
+
+    if code_is("context_length_exceeded") || code_is("string_above_max_length") {
+        return ProviderError::ContextLength { detail };
+    }
+    if code_is("model_not_found") || code_is("not_found_error") || code_is("Router.Unavailable") {
+        return ProviderError::ModelUnavailable { detail };
+    }
+    if code_is("authentication_error") || code_is("invalid_api_key") || code_is("permission_error")
+    {
+        return ProviderError::AuthFailed { detail };
+    }
+    if code_is("rate_limit_exceeded") || code_is("rate_limit_error") {
+        return ProviderError::RateLimit {
+            retry_after,
+            detail,
+        };
+    }
+    if code_is("server_error") || code_is("overloaded_error") {
+        return ProviderError::Overloaded {
+            status,
+            retry_after,
+            detail,
+        };
+    }
+
+    match status {
+        Some(401) => return ProviderError::AuthFailed { detail },
+        Some(404) => return ProviderError::ModelUnavailable { detail },
+        Some(403) if has_auth_evidence(message) => {
+            return ProviderError::AuthFailed { detail };
+        }
+        Some(429) => {
+            return ProviderError::RateLimit {
+                retry_after,
+                detail,
+            };
+        }
+        _ => {}
+    }
+
+    let request_error = status.is_none_or(|status| (400..500).contains(&status));
+    if request_error && has_context_evidence(message) {
+        return ProviderError::ContextLength { detail };
+    }
+
+    let lower = message.to_ascii_lowercase();
+    if lower.contains("rate limit")
+        || lower.contains("tokens per min")
+        || contains_word(&lower, "tpm")
+    {
+        return ProviderError::RateLimit {
+            retry_after,
+            detail,
+        };
+    }
+    if lower.contains("no available channel") {
+        return ProviderError::ModelUnavailable { detail };
+    }
+    if lower.contains("upstream authentication failed") || has_explicit_auth_marker(&lower) {
+        return ProviderError::AuthFailed { detail };
+    }
+    if lower.contains("queue is full")
+        || lower.contains("cpu overloaded")
+        || lower.contains("bad gateway")
+    {
+        return ProviderError::Overloaded {
+            status,
+            retry_after,
+            detail,
+        };
+    }
+
+    match status {
+        Some(413) => ProviderError::RequestTooLarge { status, detail },
+        Some(408 | 425 | 500 | 502 | 503 | 504 | 529) => ProviderError::Overloaded {
+            status,
+            retry_after,
+            detail,
+        },
+        Some(status @ 500..=599) => ProviderError::Overloaded {
+            status: Some(status),
+            retry_after,
+            detail,
+        },
+        Some(status @ 400..=499) => ProviderError::BadRequestPermanent {
+            status: Some(status),
+            detail,
+        },
+        _ => ProviderError::BadRequestPermanent { status, detail },
+    }
+}
+
+fn nested_gateway_error(error: &Value) -> Option<Value> {
+    let raw = error
+        .pointer("/metadata/raw")
+        .or_else(|| error.pointer("/error/metadata/raw"))?
+        .as_str()?;
+    serde_json::from_str(raw).ok()
+}
+
+fn embedded_status(error: &Value) -> Option<u16> {
+    ["status", "status_code", "http_status"]
+        .into_iter()
+        .find_map(|key| {
+            error
+                .get(key)
+                .and_then(|value| value.as_u64().or_else(|| value.as_str()?.parse().ok()))
+                .and_then(|status| u16::try_from(status).ok())
+                .filter(|status| (100..=599).contains(status))
+        })
+}
+
+fn bracketed_status(message: &str) -> Option<u16> {
+    let bytes = message.as_bytes();
+    bytes.windows(5).find_map(|window| {
+        (window[0] == b'[' && window[4] == b']' && window[1..4].iter().all(u8::is_ascii_digit))
+            .then(|| std::str::from_utf8(&window[1..4]).ok()?.parse().ok())
+            .flatten()
+    })
+}
+
+fn has_context_evidence(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    if lower.contains("range of input length") {
         return true;
     }
-    let is_client_error = (400..500).contains(&status);
-    if let Ok(value) = serde_json::from_str::<Value>(body) {
-        let code = value["error"]["code"]
-            .as_str()
-            .or_else(|| value["error"]["type"].as_str())
-            .unwrap_or("");
-        if code.eq_ignore_ascii_case("context_length_exceeded")
-            || code.eq_ignore_ascii_case("string_above_max_length")
-        {
-            return true;
-        }
+    let subject =
+        lower.contains("context") || lower.contains("prompt") || lower.contains("input length");
+    let overflow = lower.contains("overflow")
+        || lower.contains("exceed")
+        || lower.contains("above max")
+        || lower.contains("maximum")
+        || lower.contains("too long");
+    subject && overflow
+}
+
+fn has_auth_evidence(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    has_explicit_auth_marker(&lower)
+        || lower.contains("model access")
+        || lower.contains("model_not_found")
+}
+
+fn has_explicit_auth_marker(lower: &str) -> bool {
+    [
+        "authentication",
+        "authorization",
+        "api key",
+        "api-key",
+        "access denied",
+        "permission",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker))
+}
+
+fn contains_word(haystack: &str, needle: &str) -> bool {
+    haystack.match_indices(needle).any(|(index, matched)| {
+        let before = haystack[..index].chars().next_back();
+        let after = haystack[index + matched.len()..].chars().next();
+        before.is_none_or(|c| !c.is_ascii_alphanumeric())
+            && after.is_none_or(|c| !c.is_ascii_alphanumeric())
+    })
+}
+
+fn parse_retry_after(
+    value: Option<&reqwest::header::HeaderValue>,
+    now: SystemTime,
+) -> Option<Duration> {
+    let value = value?.to_str().ok()?.trim();
+    if let Ok(seconds) = value.parse::<u64>() {
+        return Some(Duration::from_secs(seconds));
     }
-    if !is_client_error {
-        return false;
-    }
-    const PATTERNS: &[&str] = &[
-        "context_length_exceeded",
-        "context length",
-        "maximum context length",
-        "context window",
-        "exceeds the context",
-        "exceed the context",
-        "prompt is too long",
-        "input is too long",
-        "too many tokens",
-        "maximum number of tokens",
-        "reduce the length",
-        "reduce the amount",
-    ];
-    let lower = body.to_ascii_lowercase();
-    PATTERNS.iter().any(|pattern| lower.contains(pattern))
+    let timestamp = DateTime::parse_from_rfc2822(value)
+        .map(|date| date.timestamp())
+        .or_else(|_| {
+            NaiveDateTime::parse_from_str(value, "%A, %d-%b-%y %H:%M:%S GMT")
+                .map(|date| date.and_utc().timestamp())
+        })
+        .or_else(|_| {
+            NaiveDateTime::parse_from_str(value, "%a %b %e %H:%M:%S %Y")
+                .map(|date| date.and_utc().timestamp())
+        })
+        .ok()?;
+    let timestamp = u64::try_from(timestamp).ok()?;
+    let target = UNIX_EPOCH.checked_add(Duration::from_secs(timestamp))?;
+    Some(target.duration_since(now).unwrap_or_default())
 }
 
 pub(crate) fn base64_encode(bytes: &[u8]) -> String {
@@ -891,36 +1182,182 @@ mod tests {
 
     #[test]
     fn fallback_policy_distinguishes_availability_from_request_errors() {
-        assert!(
-            ProviderError::HttpStatus {
-                status: 401,
-                body: "unauthorized".into(),
-            }
-            .fallback_immediately()
+        assert_eq!(
+            classify_http_error(401, "unauthorized".into(), None).disposition(),
+            ProviderDisposition::Advance
         );
-        assert!(
-            ProviderError::HttpStatus {
-                status: 403,
-                body: r#"{"error":{"code":"model_not_found"}}"#.into(),
-            }
-            .fallback_immediately()
+        assert_eq!(
+            classify_http_error(403, r#"{"error":{"code":"model_not_found"}}"#.into(), None)
+                .disposition(),
+            ProviderDisposition::Advance
         );
-        assert!(
-            !ProviderError::HttpStatus {
-                status: 403,
-                body: "content policy rejected the request".into(),
-            }
-            .fallback_immediately()
+        assert_eq!(
+            classify_http_error(403, "content policy rejected the request".into(), None)
+                .disposition(),
+            ProviderDisposition::Fail
         );
-        assert!(
-            !ProviderError::HttpStatus {
-                status: 400,
-                body: "unsupported reasoning effort".into(),
-            }
-            .fallback_immediately()
+        assert_eq!(
+            classify_http_error(400, "unsupported reasoning effort".into(), None).disposition(),
+            ProviderDisposition::Fail
         );
-        assert!(ProviderError::Transport("stream ended".into()).retryable_for_live_turn());
-        assert!(!ProviderError::SseParse("bad JSON".into()).retryable_for_live_turn());
+        assert_eq!(
+            ProviderError::Transport("stream ended".into()).disposition(),
+            ProviderDisposition::Retry
+        );
+        assert_eq!(
+            ProviderError::Protocol("bad JSON".into()).disposition(),
+            ProviderDisposition::Fail
+        );
+    }
+
+    #[test]
+    fn http_and_stream_errors_share_semantic_classification() {
+        let cases = [
+            (
+                429,
+                serde_json::json!({
+                    "code": "rate_limit_exceeded",
+                    "message": "TPM rate limit exceeded; reduce the amount"
+                }),
+                "rate_limit",
+                ProviderDisposition::Retry,
+            ),
+            (
+                400,
+                serde_json::json!({
+                    "code": "invalid_request_error",
+                    "message": "tool schema has too many tokens"
+                }),
+                "bad_request",
+                ProviderDisposition::Fail,
+            ),
+            (
+                400,
+                serde_json::json!({
+                    "type": "invalid_request_error",
+                    "message": "input must be within the range of input length [1, 32768]"
+                }),
+                "context_length",
+                ProviderDisposition::ContextRecovery,
+            ),
+            (
+                404,
+                serde_json::json!({
+                    "code": "model_not_found",
+                    "message": "model missing"
+                }),
+                "unavailable",
+                ProviderDisposition::Advance,
+            ),
+            (
+                503,
+                serde_json::json!({
+                    "type": "server_error",
+                    "message": "[503] queue is full"
+                }),
+                "overloaded",
+                ProviderDisposition::Retry,
+            ),
+        ];
+
+        for (status, error, class, disposition) in cases {
+            let http = classify_http_error(
+                status,
+                serde_json::json!({"error": &error}).to_string(),
+                None,
+            );
+            let stream = classify_stream_error(&error);
+            assert_eq!(http.class(), class);
+            assert_eq!(stream.class(), class);
+            assert_eq!(http.disposition(), disposition);
+            assert_eq!(stream.disposition(), disposition);
+        }
+    }
+
+    #[test]
+    fn classifies_gateway_wrappers_and_rejects_weak_context_phrases() {
+        let wrapped_auth = serde_json::json!({
+            "error": {
+                "message": "Upstream request failed",
+                "metadata": {
+                    "raw": "{\"error\":{\"type\":\"authentication_error\",\"message\":\"Upstream authentication failed\"}}"
+                }
+            }
+        });
+        assert!(matches!(
+            classify_http_error(502, wrapped_auth.to_string(), None),
+            ProviderError::AuthFailed { .. }
+        ));
+        assert!(matches!(
+            classify_http_error(
+                400,
+                r#"{"error":{"message":"Upstream request failed"}}"#.into(),
+                None
+            ),
+            ProviderError::BadRequestPermanent { .. }
+        ));
+        assert!(matches!(
+            classify_http_error(413, "Payload Too Large".into(), None),
+            ProviderError::RequestTooLarge { .. }
+        ));
+        assert!(matches!(
+            classify_http_error(
+                400,
+                r#"{"error":{"message":"reduce the length of this tool schema"}}"#.into(),
+                None
+            ),
+            ProviderError::BadRequestPermanent { .. }
+        ));
+    }
+
+    #[test]
+    fn retry_helpers_are_deterministic_and_retry_after_is_bounded() {
+        assert_eq!(
+            (1..=5)
+                .map(|ordinal| provider_retry_delay(ordinal).as_secs())
+                .collect::<Vec<_>>(),
+            [1, 2, 4, 4, 4]
+        );
+        let error = ProviderError::Overloaded {
+            status: Some(503),
+            retry_after: Some(Duration::from_secs(20)),
+            detail: "busy".into(),
+        };
+        assert_eq!(effective_retry_delay(&error, 2), Duration::from_secs(20));
+
+        let now = UNIX_EPOCH + Duration::from_secs(1_784_000_000);
+        let seconds = reqwest::header::HeaderValue::from_static("20");
+        assert_eq!(
+            parse_retry_after(Some(&seconds), now),
+            Some(Duration::from_secs(20))
+        );
+        let malformed = reqwest::header::HeaderValue::from_static("later");
+        assert_eq!(parse_retry_after(Some(&malformed), now), None);
+        let date = reqwest::header::HeaderValue::from_static("Thu, 01 Jan 1970 00:01:00 GMT");
+        assert_eq!(
+            parse_retry_after(Some(&date), UNIX_EPOCH),
+            Some(Duration::from_secs(60))
+        );
+        assert_eq!(
+            parse_retry_after(Some(&date), UNIX_EPOCH + Duration::from_secs(120)),
+            Some(Duration::ZERO)
+        );
+
+        let mut config = replay_config(None, None);
+        for (_, provider) in config.providers.iter_mut() {
+            provider.models = OrderedMap::from_iter([(
+                "shared-model".into(),
+                ModelConfig {
+                    context_window: None,
+                    supported_efforts: None,
+                    replay_key: None,
+                },
+            )]);
+        }
+        let fixed = crate::models::resolve_model_choice(&config, "source/shared-model").unwrap();
+        let floating = crate::models::resolve_model_choice(&config, "shared-model").unwrap();
+        assert_eq!(provider_retry_limit(&fixed), 5);
+        assert_eq!(provider_retry_limit(&floating), 3);
     }
 
     #[test]

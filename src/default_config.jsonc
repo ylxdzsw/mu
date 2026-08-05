@@ -31,7 +31,7 @@
     "enabled": true,
     "min_duration_ms": 10000
   },
-  "compaction": { "fraction": 0.75, "keep_recent_turns": 2 },
+  "compaction": { "fraction": 0.75 },
   "limits": {
     "max_iterations": 50,
     "max_lines": 2000,

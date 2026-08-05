@@ -583,14 +583,12 @@ async fn run() -> Result<()> {
             let mut renderer =
                 Renderer::with_terminal_bell(cli::OutputFormat::Detail, None, config.line_wrapping);
             let started = Instant::now();
-            let mut retry_count = 0;
             let outcome = compaction::run_compaction_routed(
                 &store,
                 &config,
                 &session,
                 &mut model,
                 &mut provider,
-                &mut retry_count,
                 custom_focus.as_deref(),
                 Some(&mut renderer),
             )
@@ -606,8 +604,8 @@ async fn run() -> Result<()> {
                     model_info.context_window,
                     started.elapsed(),
                 )?,
-                compaction::CompactionOutcome::NotNeeded { keep_recent_turns } => {
-                    renderer.compaction_not_needed(keep_recent_turns)?
+                compaction::CompactionOutcome::Inapplicable { keep_recent_turns } => {
+                    renderer.compaction_inapplicable(keep_recent_turns)?
                 }
             }
             return Ok(());

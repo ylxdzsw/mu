@@ -3,7 +3,10 @@ use anyhow::Result;
 use crate::bash;
 use crate::config::Config;
 use crate::models::{RequestOptions, ResolvedModelChoice, resolve_model_info};
-use crate::provider::{Message, Provider, ProviderError, StreamEvent, advance_provider};
+use crate::provider::{
+    MAX_PROVIDER_RETRY_AFTER, Message, Provider, ProviderDisposition, ProviderError, StreamEvent,
+    advance_provider, effective_retry_delay, provider_retry_limit,
+};
 use crate::renderer::Renderer;
 use crate::store::{CompactionCompletion, ProviderOrigin, Store};
 
@@ -21,7 +24,8 @@ material to the work.";
 /// text handed to the summarizer.
 const MAX_SUMMARY_ENTRY_CHARS: usize = 4000;
 const MAX_SUMMARY_TOOL_CHARS: usize = 2000;
-const MAX_PROVIDER_RETRIES: u32 = 3;
+pub const KEEP_RECENT_TURNS: usize = 2;
+const FIXED_HEADROOM_TOKENS: u64 = 64_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CompactionOutcome {
@@ -29,7 +33,7 @@ pub enum CompactionOutcome {
         before_context_tokens: u64,
         after_context_tokens_estimate: u64,
     },
-    NotNeeded {
+    Inapplicable {
         keep_recent_turns: usize,
     },
 }
@@ -84,7 +88,6 @@ pub async fn maybe_compact_routed(
     model: &mut ResolvedModelChoice,
     provider: &mut Box<dyn Provider>,
     context_window: Option<u64>,
-    retry_count: &mut u32,
     renderer: &mut Renderer,
 ) -> Result<Option<CompactionOutcome>> {
     if !compaction_needed(store, config, session_id, context_window)? {
@@ -96,13 +99,11 @@ pub async fn maybe_compact_routed(
         session_id,
         model,
         provider,
-        retry_count,
         None,
         Some(renderer),
         true,
     )
     .await
-    .map(|(outcome, attempted)| attempted.then_some(outcome))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -112,7 +113,6 @@ pub async fn run_compaction_routed(
     session_id: &str,
     model: &mut ResolvedModelChoice,
     provider: &mut Box<dyn Provider>,
-    retry_count: &mut u32,
     custom_focus: Option<&str>,
     renderer: Option<&mut Renderer>,
 ) -> Result<CompactionOutcome> {
@@ -122,13 +122,16 @@ pub async fn run_compaction_routed(
         session_id,
         model,
         provider,
-        retry_count,
         custom_focus,
         renderer,
         false,
     )
     .await
-    .map(|(outcome, _)| outcome)
+    .map(|outcome| {
+        outcome.unwrap_or(CompactionOutcome::Inapplicable {
+            keep_recent_turns: KEEP_RECENT_TURNS,
+        })
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -138,24 +141,19 @@ async fn run_compaction_routed_inner(
     session_id: &str,
     model: &mut ResolvedModelChoice,
     provider: &mut Box<dyn Provider>,
-    retry_count: &mut u32,
     custom_focus: Option<&str>,
     mut renderer: Option<&mut Renderer>,
     recheck_after_switch: bool,
-) -> Result<(CompactionOutcome, bool)> {
+) -> Result<Option<CompactionOutcome>> {
     let mut switched = false;
+    let mut retry_count = 0;
     loop {
         let context_window = resolve_model_info(config, model.active_model()).context_window;
         if switched
             && recheck_after_switch
             && !compaction_needed(store, config, session_id, context_window)?
         {
-            return Ok((
-                CompactionOutcome::NotNeeded {
-                    keep_recent_turns: config.compaction.keep_recent_turns,
-                },
-                false,
-            ));
+            return Ok(None);
         }
         switched = false;
         let request = RequestOptions {
@@ -172,31 +170,60 @@ async fn run_compaction_routed_inner(
         )
         .await
         {
-            Ok(outcome) => return Ok((outcome, true)),
+            Ok(outcome) => return Ok(Some(outcome)),
             Err(error) => {
                 let Some(provider_error) = error.downcast_ref::<ProviderError>() else {
                     return Err(error);
                 };
-                if matches!(provider_error, ProviderError::ContextLength) {
+                if matches!(
+                    provider_error.disposition(),
+                    ProviderDisposition::ContextRecovery | ProviderDisposition::Fail
+                ) {
                     return Err(error);
                 }
                 let reason = provider_error.to_string();
-                if provider_error.retryable_for_live_turn() && *retry_count < MAX_PROVIDER_RETRIES {
-                    *retry_count += 1;
+                let retry_limit = provider_retry_limit(model);
+                if provider_error.disposition() == ProviderDisposition::Retry
+                    && provider_error
+                        .retry_after()
+                        .is_some_and(|wait| wait > MAX_PROVIDER_RETRY_AFTER)
+                {
+                    if model.is_floating()
+                        && let Some((previous, next)) = advance_provider(config, model, provider)?
+                    {
+                        retry_count = 0;
+                        switched = true;
+                        if let Some(renderer) = renderer.as_deref_mut() {
+                            renderer.notice(&format!(
+                                "[mu] switching provider {previous} -> {next} after {reason}"
+                            ))?;
+                        }
+                        continue;
+                    }
+                    return Err(error);
+                }
+                if provider_error.disposition() == ProviderDisposition::Retry
+                    && retry_count < retry_limit
+                {
+                    retry_count += 1;
+                    let delay = effective_retry_delay(provider_error, retry_count);
                     if let Some(renderer) = renderer.as_deref_mut() {
                         renderer.turn_retry(
-                            *retry_count as u64,
-                            MAX_PROVIDER_RETRIES as u64,
+                            retry_count as u64,
+                            retry_limit as u64,
+                            delay,
                             &reason,
                         )?;
                     }
+                    tokio::time::sleep(delay).await;
                     continue;
                 }
-                if (provider_error.retryable_for_live_turn()
-                    || provider_error.fallback_immediately())
-                    && let Some((previous, next)) = advance_provider(config, model, provider)?
+                if matches!(
+                    provider_error.disposition(),
+                    ProviderDisposition::Retry | ProviderDisposition::Advance
+                ) && let Some((previous, next)) = advance_provider(config, model, provider)?
                 {
-                    *retry_count = 0;
+                    retry_count = 0;
                     switched = true;
                     if let Some(renderer) = renderer.as_deref_mut() {
                         renderer.notice(&format!(
@@ -209,6 +236,20 @@ async fn run_compaction_routed_inner(
             }
         }
     }
+}
+
+pub fn compaction_threshold(context_window: u64, configured_fraction: f64) -> u64 {
+    let fraction_threshold = (context_window as f64 * configured_fraction).floor() as u64;
+    let fixed_headroom_threshold = context_window.saturating_sub(FIXED_HEADROOM_TOKENS);
+    fraction_threshold.min(fixed_headroom_threshold)
+}
+
+pub fn exceeds_compaction_threshold(
+    context_tokens: u64,
+    context_window: u64,
+    configured_fraction: f64,
+) -> bool {
+    context_tokens > compaction_threshold(context_window, configured_fraction)
 }
 
 fn compaction_needed(
@@ -225,13 +266,14 @@ fn compaction_needed(
     } else {
         store.estimate_context_tokens(session_id)?
     };
-    Ok(context_window
-        .is_some_and(|window| (tokens as f64) > (window as f64 * config.compaction.fraction)))
+    Ok(context_window.is_some_and(|window| {
+        exceeds_compaction_threshold(tokens, window, config.compaction.fraction)
+    }))
 }
 
 pub async fn run_compaction(
     store: &Store,
-    config: &Config,
+    _config: &Config,
     session_id: &str,
     request: &RequestOptions,
     provider: &dyn Provider,
@@ -240,7 +282,7 @@ pub async fn run_compaction(
 ) -> Result<CompactionOutcome> {
     bash::install_signal_forwarder();
     let records = store.message_records_from_seq(session_id, 0)?;
-    let keep = config.compaction.keep_recent_turns;
+    let keep = KEEP_RECENT_TURNS;
     let before_context_tokens = store
         .get_session(session_id)?
         .ok_or_else(|| anyhow::anyhow!("session not found"))?
@@ -268,7 +310,7 @@ pub async fn run_compaction(
     user_turn_starts.reverse();
 
     if user_turn_starts.len() <= keep {
-        return Ok(CompactionOutcome::NotNeeded {
+        return Ok(CompactionOutcome::Inapplicable {
             keep_recent_turns: keep,
         });
     }
@@ -318,7 +360,7 @@ pub async fn run_compaction(
         .collect();
 
     if to_summarize.is_empty() {
-        return Ok(CompactionOutcome::NotNeeded {
+        return Ok(CompactionOutcome::Inapplicable {
             keep_recent_turns: keep,
         });
     }
@@ -369,24 +411,36 @@ pub async fn run_compaction(
         recipe,
         None,
     )?;
-    if let Some(renderer) = renderer.as_deref_mut() {
-        renderer.compaction_start()?;
+    if let Some(renderer) = renderer.as_deref_mut()
+        && let Err(error) = renderer.compaction_start()
+    {
+        store.interrupt_provider_exchange(session_id, &exchange_id)?;
+        return Err(error.into());
     }
-    let mut report_event = |event: StreamEvent| {
-        if matches!(event, StreamEvent::Tick)
-            && let Some(renderer) = renderer.as_deref_mut()
-        {
-            renderer
-                .compaction_tick()
-                .map_err(|error| crate::provider::ProviderError::Other(error.to_string()))?;
-        }
-        Ok(())
+    let mut renderer_error = None;
+    let result = {
+        let mut report_event = |event: StreamEvent| {
+            if matches!(event, StreamEvent::Tick)
+                && let Some(renderer) = renderer.as_deref_mut()
+                && let Err(error) = renderer.compaction_tick()
+            {
+                renderer_error = Some(error);
+            }
+            Ok(())
+        };
+        provider
+            .stream_chat(request, &msgs, &tools, &mut report_event)
+            .await
     };
-    let result = provider
-        .stream_chat(request, &msgs, &tools, &mut report_event)
-        .await;
-    if let Some(renderer) = renderer {
-        renderer.compaction_end()?;
+    if let Some(error) = renderer_error {
+        store.interrupt_provider_exchange(session_id, &exchange_id)?;
+        return Err(error.into());
+    }
+    if let Some(renderer) = renderer
+        && let Err(error) = renderer.compaction_end()
+    {
+        store.interrupt_provider_exchange(session_id, &exchange_id)?;
+        return Err(error.into());
     }
     let result = match result {
         Ok(result) => result,
@@ -395,7 +449,7 @@ pub async fn run_compaction(
                 session_id,
                 &exchange_id,
                 error.class(),
-                serde_json::json!({"message":error.to_string()}),
+                error.diagnostic(),
                 None,
                 None,
             )?;
@@ -528,7 +582,9 @@ mod tests {
             _tools: &[Value],
             _on_event: &mut dyn FnMut(crate::provider::StreamEvent) -> Result<(), ProviderError>,
         ) -> Result<StreamResult, ProviderError> {
-            Err(ProviderError::ContextLength)
+            Err(ProviderError::ContextLength {
+                detail: "test overflow".into(),
+            })
         }
     }
 
@@ -551,10 +607,7 @@ mod tests {
             )]),
             output: Default::default(),
             line_wrapping: true,
-            compaction: crate::config::CompactionConfig {
-                fraction: 0.75,
-                keep_recent_turns: 2,
-            },
+            compaction: crate::config::CompactionConfig { fraction: 0.75 },
             limits: crate::config::LimitsConfig::default(),
             guardrail: crate::config::GuardrailConfig::default(),
             terminal_bell: crate::config::TerminalBellConfig::default(),
@@ -668,7 +721,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn zero_retention_still_keeps_the_current_dirty_turn() {
+    async fn fixed_retention_keeps_the_current_and_previous_turn() {
         let store = Store::open_memory().unwrap();
         let session = store.create_session("/tmp").unwrap();
         for n in 1..=2 {
@@ -700,8 +753,7 @@ mod tests {
                 },
             )
             .unwrap();
-        let mut config = test_config();
-        config.compaction.keep_recent_turns = 0;
+        let config = test_config();
         let request_model = crate::models::resolve_model_ref(&config, "test/fake-model").unwrap();
 
         run_compaction(
@@ -732,6 +784,7 @@ mod tests {
             [
                 "[summary of earlier conversation]\nsummary",
                 "[environment]\ncurrent working directory: /tmp",
+                "complete 2",
                 "current dirty turn"
             ]
         );
@@ -890,7 +943,7 @@ mod tests {
 
         assert_eq!(
             outcome,
-            CompactionOutcome::NotNeeded {
+            CompactionOutcome::Inapplicable {
                 keep_recent_turns: 2
             }
         );
@@ -944,8 +997,19 @@ mod tests {
         assert!(error.to_string().contains("compaction failed"));
         assert!(matches!(
             error.downcast_ref::<ProviderError>(),
-            Some(ProviderError::ContextLength)
+            Some(ProviderError::ContextLength { .. })
         ));
         assert_eq!(store.latest_summary_sequence(&session.id).unwrap(), None);
+    }
+
+    #[test]
+    fn threshold_reserves_fractional_or_fixed_headroom() {
+        assert_eq!(compaction_threshold(1_000_000, 0.75), 750_000);
+        assert_eq!(compaction_threshold(200_000, 0.75), 136_000);
+        assert_eq!(compaction_threshold(64_000, 0.75), 0);
+        assert_eq!(compaction_threshold(32_000, 0.75), 0);
+
+        assert!(!exceeds_compaction_threshold(136_000, 200_000, 0.75));
+        assert!(exceeds_compaction_threshold(136_001, 200_000, 0.75));
     }
 }

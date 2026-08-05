@@ -954,15 +954,10 @@ impl Renderer {
         }
     }
 
-    pub fn compaction_not_needed(&mut self, keep_recent_turns: usize) -> io::Result<()> {
+    pub fn compaction_inapplicable(&mut self, keep_recent_turns: usize) -> io::Result<()> {
         self.compaction_end()?;
         let line = format!(
-            "[mu] nothing to compact — keeping {keep_recent_turns} recent {}",
-            if keep_recent_turns == 1 {
-                "turn"
-            } else {
-                "turns"
-            }
+            "[mu] compaction inapplicable: no history exists before the {keep_recent_turns} retained turns"
         );
         if self.styled {
             self.notice(&line)
@@ -976,10 +971,12 @@ impl Renderer {
         &mut self,
         retry_count: u64,
         max_auto_retries: u64,
+        delay: Duration,
         reason: &str,
     ) -> io::Result<()> {
         self.notice(&format!(
-            "[mu] retrying [{retry_count}/{max_auto_retries}] after {reason}"
+            "[mu] retrying [{retry_count}/{max_auto_retries}] in {}s after {reason}",
+            delay.as_secs()
         ))
     }
 

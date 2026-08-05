@@ -379,8 +379,8 @@ This is the exact sequence the binary follows for one turn invocation:
    (`mu retry` skips this step, restores the original turn cwd, and resumes the
    same turn.)
 8. **Pre-turn compaction check** (§11): use the latest still-current reported
-   usage, otherwise estimate the projected context. If it exceeds the
-   configured fraction, compact and rebuild.
+   usage, otherwise estimate the projected context. If it exceeds the shared
+   fraction/headroom threshold, compact and rebuild.
 9. **Agent loop** — repeat until the model returns `finish_reason: "stop"` or the
    max-iterations cap is hit:
    a. Persist and sync a reconstructible `provider_requested` recipe, then send
@@ -390,12 +390,14 @@ This is the exact sequence the binary follows for one turn invocation:
    c. On failure, append `provider_failed`; partial content remains audit-only.
    d. On success, persist assembled native response JSON in `objects/`, then
       append one `provider_completed` event containing usage, the accepted
-      semantic assistant projection, and every Bash claim. Reject a
-      response naming any function other than `bash` before persisting it;
-      malformed Bash argument JSON is still a valid claim and later receives an
-      error result. Accumulated tool calls are accepted as executable claims
-      only when the provider finish reason is `tool_calls`; calls present on a
-      length, filtering, or other terminal reason remain audit-only.
+      semantic assistant projection, and every Bash claim. Reject a response
+      naming any function other than `bash` before persisting it. Completed tool
+      arguments must be a JSON object; empty/whitespace arguments normalize to
+      `{}`, while malformed or non-object JSON is a protocol failure and creates
+      no semantic assistant message or Bash claim. Accumulated tool calls are
+      accepted as executable claims only when the provider finish reason is
+      `tool_calls`; calls present on a length, filtering, or other terminal
+      reason remain audit-only.
    e. If `finish_reason` is `tool_calls`: split the calls into maximal
       contiguous batches of eligible readonly work. All output densities may
       execute contiguous `risk:"readonly"` `bash` calls concurrently, but
@@ -1052,6 +1054,15 @@ encrypted or signed continuation object. This supports DeepSeek thinking tool
 loops across provider fallback and model switches without model-name
 heuristics.
 
+Completed Chat tool arguments are validated after the stream terminates and
+before constructing the successful response: empty/whitespace becomes `{}`, a
+valid JSON object retains its original string byte-for-byte, and malformed or
+non-object JSON is a protocol failure. Usage objects and every numeric usage
+field tolerate omission or explicit `null`; missing prompt/completion counters
+become zero, input is the maximum of prompt tokens and cache hit plus miss,
+missing total is derived as input plus output, and missing cache-write remains
+absent. Present non-`u64` values remain protocol errors.
+
 **Responses.** Mu posts directly to the configured endpoint with `stream:true`,
 `store:false`, `include:["reasoning.encrypted_content"]`, locally reconstructed
 `input`, and a flat Responses function-tool definition. It never sends
@@ -1111,7 +1122,46 @@ reject audio locally with a clear error. Only successfully completed streams
 produce replay state, so retries never depend on a partial or remote response
 chain.
 
-**Model context window.** The 75% threshold needs the model's max context size.
+**Semantic provider failures.** Non-success HTTP responses and structured
+errors inside all three streams pass through one classifier. Durable failure
+classes and their actions are:
+
+| Class | Meaning | Action |
+|---|---|---|
+| `context_length` | genuine context overflow | context recovery |
+| `unavailable`, `auth` | model unavailable or authorization failure | advance a floating candidate immediately |
+| `overloaded`, `rate_limit`, `transport` | transient remote/delivery failure | retry, then advance |
+| `request_too_large`, `bad_request`, `protocol` | permanent request or invalid response | fail immediately |
+
+Structured `code`/`type` values are compared case-insensitively and take
+precedence over status/message heuristics. Known context, model-not-found,
+authentication, rate-limit, server, and overload codes map directly. Statuses
+401/404/429 are auth/unavailable/rate-limit; 403 is auth only with explicit
+auth, permission, model-access, or model-not-found evidence; 413 is
+`request_too_large` unless request-error text contains both an
+overflow/maximum verb and `context`, `prompt`, or `input length`. Qwen
+`range of input length` wording is context overflow, while generic `too many
+tokens`, `reduce the amount`, and `reduce the length` are not. Exact bracketed
+stream statuses such as `[503]` are recognized; arbitrary three-digit prose is
+not. Mu unwraps JSON encoded in known `error.metadata.raw` gateway envelopes
+before classifying the upstream cause.
+
+**Retry and fallback.** One logical call on a fixed `provider/model` permits
+five retries after its initial attempt. A floating model permits three retries
+per candidate, including the final candidate. Every wire attempt is its own
+durable exchange; counters reset after success and candidate advancement, and
+compaction has a separate budget from the following agent call. Retry delays
+are deterministic `1s, 2s, 4s, 4s, 4s` with no jitter.
+
+For HTTP rate-limit/overload responses Mu reads standard `Retry-After` integer
+seconds or HTTP-date before consuming the body and waits for the maximum of
+that hint and local backoff. Malformed/past hints add no delay; vendor reset
+headers are ignored. A requested wait over 60 seconds advances a floating
+choice immediately without consuming a retry, or fails if no candidate
+remains; a fixed choice fails and reports the duration. Retry notices include
+the retry ordinal, budget, effective delay, and semantic error.
+
+**Model context window.** Compaction thresholds need the model's max context size.
 Source it from `config.jsonc`: each configured model entry carries a
 `context_window` integer. mu does not fetch model cards. If a model has no
 configured `context_window`, the threshold-based tiers (Tier 1 pre-turn and Tier
@@ -1347,7 +1397,7 @@ are not visible in another.
       "enabled": true,
       "min_duration_ms": 10000
     },
-    "compaction": { "fraction": 0.75, "keep_recent_turns": 2 },  // optional
+    "compaction": { "fraction": 0.75 },  // optional
     "limits": { "max_iterations": 50, "max_lines": 2000, "max_bytes": 51200, "max_line_bytes": 10240 },
     "redaction": {
       "env": ["*_API_KEY", "*_API_TOKEN", "*_AUTH_TOKEN"] // optional; these are the defaults
@@ -1597,43 +1647,45 @@ used only where no API figure exists yet:
 Context management then uses a **three-tier strategy**, from most to least
 graceful:
 
-**Tier 1 — graceful pre-turn compaction (75% threshold).** At the start of each
-turn, Mu compares current reported usage or the projected bytes÷4 estimate
-against the model's context window. If it
-exceeds a configurable fraction (default 75%), mu compacts *before* sending the
-new turn. Because this runs between turns, it is fully graceful — no turn is
-wasted, no replay.
+**Tier 1 — graceful pre-turn compaction.** At the start of each turn, Mu
+compares current reported usage or the projected bytes÷4 estimate against:
+
+```text
+min(floor(context_window * configured_fraction),
+    context_window.saturating_sub(64_000))
+```
+
+Compaction runs only when context tokens are strictly greater than this
+threshold. At the default 75%, a 1,000,000-token window triggers above 750,000
+and a 200,000-token window above 136,000. This reserves at least 64K tokens of
+headroom.
 
 **Tier 2 — proactive in-loop compaction.** A single turn can add many large tool
-results, so the pre-turn figure goes stale *within* a turn. Before each model
-call after the first in the agent loop, mu re-estimates the working context
-(bytes÷4 over the in-memory message list) and compacts against the same fraction
-threshold if it has grown too large. This catches runaway tool output before it
-becomes a hard API error. If a
-single compaction cannot bring the context back under the threshold (e.g. the
-retained recent turns are themselves oversized), mu stops re-compacting for the
-rest of that turn and lets Tier 3 handle the true overflow, so it never loops on
-summarize calls.
+results, so the pre-turn figure goes stale *within* a turn. Every new semantic
+agent request passes the same threshold gate: the first request, each request
+after tool results changed context, and the first request after candidate
+advancement changed the active context window. An unchanged retry on the same
+candidate bypasses the gate. Provider advancement returns to this gate rather
+than contacting the next candidate directly.
 
 **Tier 3 — one reactive compaction on API overflow.** If the provider returns a
 context-length error and the current semantic context has not already been
 compacted, mu compacts once and retries. If compaction cannot remove history,
 the compaction request itself overflows, or the unchanged post-compaction
 request still overflows, the turn aborts without provider fallback. New
-assistant/tool content permits a later recovery cycle. Overflow is recognized
-from an HTTP `413`, a structured error
-`code`/`type` of `context_length_exceeded`, or a known overflow phrase in a 4xx
-body (e.g. "prompt is too long", "maximum context length", "context window") —
-message matching is gated to client errors so an unrelated 5xx body is not
-misclassified.
+assistant/tool content permits a later recovery cycle. The latest compaction
+result is tracked until semantic context changes: `Inapplicable` reports
+`context length exceeded and no history can be compacted` without another
+attempt; `Applied` followed by another overflow reports `context length
+exceeded immediately after compaction`.
 
 **Compaction algorithm** (same in all tiers): summarize everything up to a
-cut point into one compaction projection, keeping the most recent N
-`turn_started` events (default 2, configurable) verbatim after it. Derived
-location reminders do not consume the retention budget. The current dirty turn
-is retained even when N is zero. If there is no older complete turn to
-summarize, compaction is a reported no-op. The cut is always immediately before
-a turn, so a prompt/location pair or tool claim/result pair is never split.
+cut point into one compaction projection, keeping the two most recent
+`turn_started` events verbatim after it. Derived location reminders do not
+consume the retention budget. If there is no history before those two retained
+turns, the outcome is `Inapplicable`; only `Applied` changes context. The cut is
+always immediately before a turn, so a prompt/location pair or tool
+claim/result pair is never split.
 
 The summarizer uses a small compaction-specific system prompt rather than the
 session's agent system prompt, so tool, skill, runtime, and service inventories
@@ -1658,7 +1710,9 @@ never supplies a custom focus. Interactive compaction shows one mutable
 turn output; manual compaction replaces it with one result line containing the
 reported pre-compaction percentage, estimated post-compaction percentage, and
 elapsed time. Redirected output emits one plain status line. Provider failure
-or an empty summary exits non-zero and never reports success.
+or an empty summary exits non-zero and never reports success. An inapplicable
+manual request reports `compaction inapplicable: no history exists before the
+2 retained turns`.
 
 ### Agent-loop bounds
 
@@ -1771,8 +1825,8 @@ risk categories, and a strict JSON output contract.
   > Do not work around this; stop and ask the user to authorize, or choose a
   > less destructive approach.
   The agent can then adapt its approach or stop and ask the user.
-- **Reviewer failure** (timeout, malformed JSON, network error after 3 retry
-  attempts): an explicit Bash error records that execution never began and the
+- **Reviewer failure** (timeout, malformed JSON, or exhausted provider retry
+  budget): an explicit Bash error records that execution never began and the
   turn is **aborted**. Re-authorizing would likely fail again since the reviewer
   itself is malfunctioning.
 
@@ -1797,12 +1851,12 @@ prevents repeated destructive attempts without a second sliding-window policy;
 the general iteration limit remains an independent bound.
 
 **Retry.** Reviewer provider calls use the same availability policy as agent
-calls: one initial request plus three transient retries per candidate, then
-forward fallback for a bare review model. Parse failures retain a separate
-three-attempt semantic budget. Context-length errors are not retried. A
-floating guardrail request reads and advances the same per-session, per-model
-position as agent and compaction requests; a fixed review model leaves every
-floating position unchanged.
+calls: five transient retries for a fixed model or three per candidate for a
+floating model, with the shared deterministic delay and `Retry-After` policy.
+Parse failures retain a separate three-attempt semantic budget. Context-length
+errors are not retried. A floating guardrail request reads and advances the
+same per-session, per-model position as agent and compaction requests; a fixed
+review model leaves every floating position unchanged.
 
 **Config.**
 

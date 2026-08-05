@@ -7,7 +7,10 @@ use serde_json::{Value, json};
 use crate::bash::BashRisk;
 use crate::config::{Config, GuardrailConfig};
 use crate::models::{RequestOptions, ResolvedModelRef, resolve_model_choice};
-use crate::provider::{Message, ProviderError, approx_tokens};
+use crate::provider::{
+    MAX_PROVIDER_RETRY_AFTER, Message, ProviderDisposition, ProviderError, approx_tokens,
+    effective_retry_delay, provider_retry_delay, provider_retry_limit,
+};
 use crate::runtime::resume_session_fallback;
 use crate::store::{GuardrailCompletion, ProviderOrigin, RequestSubject, Store};
 use crate::{bash, provider};
@@ -221,9 +224,10 @@ impl Guardrail {
                         None,
                         None,
                     )?;
-                    if provider_retries < MAX_ATTEMPTS {
+                    let retry_limit = provider_retry_limit(&model);
+                    if provider_retries < retry_limit {
                         provider_retries += 1;
-                        tokio::time::sleep(Duration::from_secs(1 << (provider_retries - 1))).await;
+                        tokio::time::sleep(provider_retry_delay(provider_retries)).await;
                         continue;
                     }
                     if provider::advance_provider(&self.runtime, &mut model, &mut provider)?
@@ -236,13 +240,13 @@ impl Guardrail {
                         "reviewer failed after provider retries were exhausted: {last_error}"
                     );
                 }
-                Ok(Err(ProviderError::ContextLength)) => {
+                Ok(Err(error @ ProviderError::ContextLength { .. })) => {
                     let last_error = "reviewer context length exceeded".to_string();
                     store.fail_provider_exchange(
                         session_id,
                         &exchange_id,
-                        "context_length",
-                        json!({"message":last_error}),
+                        error.class(),
+                        error.diagnostic(),
                         None,
                         None,
                     )?;
@@ -254,18 +258,36 @@ impl Guardrail {
                         session_id,
                         &exchange_id,
                         error.class(),
-                        json!({"message":last_error}),
+                        error.diagnostic(),
                         None,
                         None,
                     )?;
-                    if error.retryable_for_live_turn() && provider_retries < MAX_ATTEMPTS {
+                    if !model.is_floating()
+                        && error
+                            .retry_after()
+                            .is_some_and(|wait| wait > MAX_PROVIDER_RETRY_AFTER)
+                    {
+                        anyhow::bail!(
+                            "reviewer provider requested retry after {} seconds, exceeding the 60-second limit",
+                            error.retry_after().unwrap_or_default().as_secs()
+                        );
+                    }
+                    let retry_limit = provider_retry_limit(&model);
+                    if error.disposition() == ProviderDisposition::Retry
+                        && error
+                            .retry_after()
+                            .is_none_or(|wait| wait <= MAX_PROVIDER_RETRY_AFTER)
+                        && provider_retries < retry_limit
+                    {
                         provider_retries += 1;
-                        tokio::time::sleep(Duration::from_secs(1 << (provider_retries - 1))).await;
+                        tokio::time::sleep(effective_retry_delay(&error, provider_retries)).await;
                         continue;
                     }
-                    if (error.retryable_for_live_turn() || error.fallback_immediately())
-                        && provider::advance_provider(&self.runtime, &mut model, &mut provider)?
-                            .is_some()
+                    if matches!(
+                        error.disposition(),
+                        ProviderDisposition::Retry | ProviderDisposition::Advance
+                    ) && provider::advance_provider(&self.runtime, &mut model, &mut provider)?
+                        .is_some()
                     {
                         provider_retries = 0;
                         continue;
@@ -273,6 +295,7 @@ impl Guardrail {
                     anyhow::bail!("reviewer provider error: {last_error}");
                 }
                 Ok(Ok(stream_result)) => {
+                    provider_retries = 0;
                     let content = match &stream_result.message {
                         Message::Assistant {
                             content: Some(c), ..

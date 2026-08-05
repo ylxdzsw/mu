@@ -8,7 +8,7 @@ use crate::provider::{
     ContentPart, FinishReason, FunctionCall, HttpProvider, Message, NativeReplay,
     NativeReplayPayload, ProviderError, ReasoningVisibility, SseEvent, StreamEvent, StreamResult,
     ToolCall, ToolCallDelta as ProviderToolCallDelta, Usage, UserContent, base64_encode,
-    stream_error_message,
+    classify_stream_error,
 };
 
 #[derive(Debug, Deserialize)]
@@ -48,30 +48,34 @@ struct FunctionDelta {
 
 #[derive(Debug, Deserialize)]
 struct UsageJson {
-    prompt_tokens: u64,
-    completion_tokens: u64,
-    total_tokens: u64,
+    #[serde(default)]
+    prompt_tokens: Option<u64>,
+    #[serde(default)]
+    completion_tokens: Option<u64>,
+    #[serde(default)]
+    total_tokens: Option<u64>,
     #[serde(default)]
     prompt_tokens_details: Option<PromptTokensDetailsJson>,
     #[serde(default)]
     completion_tokens_details: Option<CompletionTokensDetailsJson>,
     #[serde(default)]
-    prompt_cache_hit_tokens: u64,
+    prompt_cache_hit_tokens: Option<u64>,
     #[serde(default)]
-    prompt_cache_miss_tokens: u64,
+    prompt_cache_miss_tokens: Option<u64>,
 }
 
 #[derive(Debug, Default, Deserialize)]
 struct PromptTokensDetailsJson {
     #[serde(default)]
-    cached_tokens: u64,
+    cached_tokens: Option<u64>,
+    #[serde(default)]
     cache_creation_tokens: Option<u64>,
 }
 
 #[derive(Debug, Default, Deserialize)]
 struct CompletionTokensDetailsJson {
     #[serde(default)]
-    reasoning_tokens: u64,
+    reasoning_tokens: Option<u64>,
 }
 
 type ToolCallAccumulator = BTreeMap<usize, (Option<String>, Option<String>, String)>;
@@ -123,19 +127,10 @@ pub(crate) async fn stream(
     }
 
     let has_tool_calls = !state.tool_accum.is_empty();
-    let tool_calls = has_tool_calls.then(|| {
-        state
-            .tool_accum
-            .into_values()
-            .map(|(id, name, arguments)| ToolCall {
-                id: id.unwrap_or_else(|| "call".into()),
-                function: FunctionCall {
-                    name: name.unwrap_or_default(),
-                    arguments,
-                },
-            })
-            .collect()
-    });
+    let validate_arguments = matches!(state.finish_reason, FinishReason::ToolCalls);
+    let tool_calls = has_tool_calls
+        .then(|| completed_tool_calls(state.tool_accum, validate_arguments))
+        .transpose()?;
     let message = Message::Assistant {
         content: (!state.content.is_empty()).then_some(state.content),
         reasoning_content: (!state.reasoning_content.is_empty())
@@ -380,45 +375,37 @@ fn consume_sse_buffer(
                 continue;
             }
             let parsed: ChunkResponse =
-                serde_json::from_str(data).map_err(|e| ProviderError::SseParse(e.to_string()))?;
+                serde_json::from_str(data).map_err(|e| ProviderError::Protocol(e.to_string()))?;
 
             if let Some(error) = parsed.error {
-                let message = stream_error_message(&error);
-                let code = error["code"]
-                    .as_str()
-                    .or_else(|| error["type"].as_str())
-                    .unwrap_or("");
-                return Err(match code {
-                    "server_error" => ProviderError::HttpStatus {
-                        status: 500,
-                        body: message,
-                    },
-                    "rate_limit_exceeded" | "rate_limit_error" => {
-                        ProviderError::RateLimit { message }
-                    }
-                    "authentication_error" | "invalid_api_key" | "model_not_found" => {
-                        ProviderError::Unavailable(format!("{code}: {message}"))
-                    }
-                    _ => ProviderError::Other(format!("stream error: {message}")),
-                });
+                return Err(classify_stream_error(&error));
             }
 
             if let Some(u) = parsed.usage {
                 let prompt_tokens_details = u.prompt_tokens_details.unwrap_or_default();
                 let completion_tokens_details = u.completion_tokens_details.unwrap_or_default();
+                let prompt_tokens = u.prompt_tokens.unwrap_or(0);
+                let completion_tokens = u.completion_tokens.unwrap_or(0);
+                let prompt_cache_hit_tokens = u.prompt_cache_hit_tokens.unwrap_or(0);
+                let prompt_cache_miss_tokens = u.prompt_cache_miss_tokens.unwrap_or(0);
                 let cache_read = prompt_tokens_details
                     .cached_tokens
-                    .max(u.prompt_cache_hit_tokens);
-                let input_tokens = u
-                    .prompt_tokens
-                    .max(u.prompt_cache_hit_tokens + u.prompt_cache_miss_tokens);
+                    .unwrap_or(0)
+                    .max(prompt_cache_hit_tokens);
+                let input_tokens = prompt_tokens
+                    .max(prompt_cache_hit_tokens.saturating_add(prompt_cache_miss_tokens));
+                let total_tokens = u
+                    .total_tokens
+                    .unwrap_or_else(|| input_tokens.saturating_add(completion_tokens));
                 state.usage = Some(Usage {
                     input_tokens,
                     cache_read_input_tokens: cache_read,
                     cache_write_input_tokens: prompt_tokens_details.cache_creation_tokens,
-                    output_tokens: u.completion_tokens,
-                    reasoning_output_tokens: completion_tokens_details.reasoning_tokens,
-                    total_tokens: u.total_tokens,
+                    output_tokens: completion_tokens,
+                    reasoning_output_tokens: completion_tokens_details
+                        .reasoning_tokens
+                        .unwrap_or(0),
+                    total_tokens,
                 });
             }
 
@@ -501,6 +488,44 @@ fn consume_sse_buffer(
     Ok(())
 }
 
+fn completed_tool_calls(
+    tool_accum: ToolCallAccumulator,
+    validate_arguments: bool,
+) -> Result<Vec<ToolCall>, ProviderError> {
+    tool_accum
+        .into_values()
+        .map(|(id, name, arguments)| {
+            let arguments = if validate_arguments {
+                validate_tool_arguments(&arguments)?
+            } else {
+                arguments
+            };
+            Ok(ToolCall {
+                id: id.unwrap_or_else(|| "call".into()),
+                function: FunctionCall {
+                    name: name.unwrap_or_default(),
+                    arguments,
+                },
+            })
+        })
+        .collect()
+}
+
+fn validate_tool_arguments(arguments: &str) -> Result<String, ProviderError> {
+    if arguments.trim().is_empty() {
+        return Ok("{}".into());
+    }
+    let value: Value = serde_json::from_str(arguments).map_err(|error| {
+        ProviderError::Protocol(format!("invalid completed tool arguments: {error}"))
+    })?;
+    if !value.is_object() {
+        return Err(ProviderError::Protocol(
+            "completed tool arguments must be a JSON object".into(),
+        ));
+    }
+    Ok(arguments.to_string())
+}
+
 fn reasoning_text_from_value(value: &Value) -> Option<String> {
     match value {
         Value::String(text) => (!text.is_empty()).then(|| text.clone()),
@@ -567,7 +592,7 @@ fn next_event_boundary(buffer: &str) -> Option<(usize, usize)> {
 mod tests {
     use super::*;
     use crate::models::ResolvedModelRef;
-    use crate::provider::{Provider, is_context_length_error};
+    use crate::provider::{Provider, classify_http_error};
     use crate::responses::{
         ResponsesStreamState, build_responses_request_body, consume_responses_sse_buffer,
         responses_tool_calls,
@@ -661,6 +686,72 @@ mod tests {
         let usage = state.usage.unwrap();
         assert_eq!(usage.cache_read_input_tokens, 0);
         assert_eq!(usage.reasoning_output_tokens, 0);
+
+        let mut buffer = concat!(
+            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":null,\"completion_tokens\":null,\"total_tokens\":null,\"prompt_cache_hit_tokens\":null,\"prompt_cache_miss_tokens\":null,\"prompt_tokens_details\":{\"cached_tokens\":null,\"cache_creation_tokens\":null},\"completion_tokens_details\":{\"reasoning_tokens\":null}}}\n\n",
+            "data: [DONE]\n\n",
+        )
+        .to_string();
+        let mut state = StreamParseState::default();
+        consume_sse_buffer(&mut buffer, &mut state, &mut on_event).unwrap();
+        let usage = state.usage.unwrap();
+        assert_eq!(usage.input_tokens, 0);
+        assert_eq!(usage.output_tokens, 0);
+        assert_eq!(usage.total_tokens, 0);
+        assert_eq!(usage.cache_write_input_tokens, None);
+
+        let mut buffer =
+            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":8,\"completion_tokens\":3}}\n\n"
+                .to_string();
+        let mut state = StreamParseState::default();
+        consume_sse_buffer(&mut buffer, &mut state, &mut on_event).unwrap();
+        assert_eq!(state.usage.unwrap().total_tokens, 11);
+
+        let mut buffer =
+            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":\"8\"}}\n\n".to_string();
+        assert!(matches!(
+            consume_sse_buffer(&mut buffer, &mut StreamParseState::default(), &mut on_event),
+            Err(ProviderError::Protocol(_))
+        ));
+    }
+
+    #[test]
+    fn validates_only_completed_tool_call_arguments() {
+        let calls = |arguments: &str| {
+            BTreeMap::from([(
+                0,
+                (Some("call_1".into()), Some("bash".into()), arguments.into()),
+            )])
+        };
+
+        assert_eq!(
+            completed_tool_calls(calls("  \n"), true).unwrap()[0]
+                .function
+                .arguments,
+            "{}"
+        );
+        let preserved = "  {\"command\":\"pwd\"} \n";
+        assert_eq!(
+            completed_tool_calls(calls(preserved), true).unwrap()[0]
+                .function
+                .arguments,
+            preserved
+        );
+        for invalid in ["{", "[]", "\"text\"", "1", "true", "null"] {
+            assert!(
+                matches!(
+                    completed_tool_calls(calls(invalid), true),
+                    Err(ProviderError::Protocol(_))
+                ),
+                "accepted {invalid}"
+            );
+        }
+        assert_eq!(
+            completed_tool_calls(calls("{"), false).unwrap()[0]
+                .function
+                .arguments,
+            "{"
+        );
     }
 
     #[test]
@@ -706,18 +797,19 @@ mod tests {
             match expected {
                 "server" => assert!(matches!(
                     error,
-                    ProviderError::HttpStatus {
-                        status: 500,
-                        body
-                    } if body == "upstream unavailable"
+                    ProviderError::Overloaded {
+                        status: None,
+                        detail,
+                        ..
+                    } if detail == "upstream unavailable"
                 )),
                 "rate_limit" => assert!(matches!(
                     error,
-                    ProviderError::RateLimit { message } if message == "slow down"
+                    ProviderError::RateLimit { detail, .. } if detail == "slow down"
                 )),
                 "request" => assert!(matches!(
                     error,
-                    ProviderError::Other(message) if message == "stream error: bad prompt"
+                    ProviderError::BadRequestPermanent { detail, .. } if detail == "bad prompt"
                 )),
                 _ => unreachable!(),
             }
@@ -1180,7 +1272,9 @@ mod tests {
             StreamEvent::ToolCallDelta(delta) if delta.id.as_deref() == Some("call_1")
         )));
         assert_eq!(
-            responses_tool_calls(&state.output)[0].function.arguments,
+            responses_tool_calls(&state.output).unwrap()[0]
+                .function
+                .arguments,
             "{\"command\":\"pwd\"}"
         );
     }
@@ -1299,40 +1393,49 @@ mod tests {
 
     #[test]
     fn detects_context_length_errors_across_shapes() {
-        // Structured OpenAI-style code.
-        assert!(is_context_length_error(
-            400,
-            r#"{"error":{"message":"too long","code":"context_length_exceeded"}}"#
-        ));
-        // HTTP 413 regardless of body.
-        assert!(is_context_length_error(413, "Payload Too Large"));
-        // Anthropic-style prose on a 400.
-        assert!(is_context_length_error(
-            400,
-            r#"{"error":{"type":"invalid_request_error","message":"prompt is too long: 250000 tokens > 200000 maximum"}}"#
-        ));
-        // Generic phrasing.
-        assert!(is_context_length_error(
-            400,
-            "This model's maximum context length is 128000 tokens"
+        for body in [
+            r#"{"error":{"message":"too long","code":"context_length_exceeded"}}"#,
+            r#"{"error":{"type":"invalid_request_error","message":"prompt is too long: 250000 tokens > 200000 maximum"}}"#,
+            "This model's maximum context length is 128000 tokens",
+        ] {
+            assert!(matches!(
+                classify_http_error(400, body.into(), None),
+                ProviderError::ContextLength { .. }
+            ));
+        }
+        assert!(matches!(
+            classify_http_error(413, "Payload Too Large".into(), None),
+            ProviderError::RequestTooLarge { .. }
         ));
     }
 
     #[test]
     fn does_not_misclassify_unrelated_errors() {
         // Unrelated 400 (bad request) must not be treated as overflow.
-        assert!(!is_context_length_error(
-            400,
-            r#"{"error":{"message":"invalid 'model' parameter","code":"model_not_found"}}"#
+        assert!(!matches!(
+            classify_http_error(
+                400,
+                r#"{"error":{"message":"invalid 'model' parameter","code":"model_not_found"}}"#
+                    .into(),
+                None
+            ),
+            ProviderError::ContextLength { .. }
         ));
         // A 5xx whose body coincidentally mentions context length must not
         // trigger reactive compaction.
-        assert!(!is_context_length_error(
-            500,
-            "internal error in context length calculator"
+        assert!(!matches!(
+            classify_http_error(
+                500,
+                "internal error in context length calculator".into(),
+                None
+            ),
+            ProviderError::ContextLength { .. }
         ));
         // 401 auth failure.
-        assert!(!is_context_length_error(401, "invalid api key"));
+        assert!(!matches!(
+            classify_http_error(401, "invalid api key".into(), None),
+            ProviderError::ContextLength { .. }
+        ));
     }
 
     #[tokio::test]

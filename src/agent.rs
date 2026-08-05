@@ -13,8 +13,9 @@ use crate::config::Config;
 use crate::guardrail::Guardrail;
 use crate::models::{RequestOptions, ResolvedModelChoice, resolve_model_info};
 use crate::provider::{
-    FinishReason, Message, Provider, ProviderError, StreamEvent, ToolCall, ToolCallDelta, Usage,
-    advance_provider, approx_tokens,
+    FinishReason, MAX_PROVIDER_RETRY_AFTER, Message, Provider, ProviderDisposition, ProviderError,
+    StreamEvent, ToolCall, ToolCallDelta, Usage, advance_provider, approx_tokens,
+    effective_retry_delay, provider_retry_limit,
 };
 use crate::renderer::Renderer;
 use crate::runtime::resume_session_fallback;
@@ -107,7 +108,6 @@ impl<'a> AgentLoop<'a> {
     async fn run_turn_inner(&mut self, audit: &mut TurnAudit) -> Result<TurnResult> {
         bash::reset_cancellation_state();
         bash::install_signal_forwarder();
-        let mut live_provider_retries: u32 = 0;
         let pre_turn_compaction = compaction::maybe_compact_routed(
             self.store,
             self.config,
@@ -115,12 +115,11 @@ impl<'a> AgentLoop<'a> {
             &mut self.model,
             &mut self.provider,
             self.model_context_window,
-            &mut live_provider_retries,
             self.renderer,
         )
         .await?;
         self.sync_effective_model();
-        let mut context_compacted_since_change = pre_turn_compaction.is_some();
+        let mut latest_compaction_since_change = pre_turn_compaction;
 
         let mut guardrail = if self.config.guardrail.enabled {
             Some(Guardrail::new(self.config, &self.request.model))
@@ -135,23 +134,19 @@ impl<'a> AgentLoop<'a> {
 
         let mut total_usage = Usage::default();
         let mut context_tokens = 0;
-        let mut proactive_compaction_exhausted = false;
         let mut final_assistant = None;
-        const MAX_LIVE_PROVIDER_RETRIES: u32 = 3;
 
         for iteration in 0..max_iter {
-            // Proactive compaction (SPEC §11 Tier 2): `maybe_compact` only runs
-            // once before the turn, but a single turn can add many large tool
-            // results. Re-check the growing context before each subsequent model
-            // call so we compact gracefully instead of waiting for the hard API
-            // overflow guard (Tier 3, below). Uses the same context * fraction
-            // threshold as the pre-turn check.
-            if iteration > 0
-                && !proactive_compaction_exhausted
-                && let Some(context_window) = self.model_context_window
-            {
-                let threshold = (context_window as f64 * self.config.compaction.fraction) as u64;
-                if approx_context_tokens(&context) > threshold {
+            let mut live_provider_retries = 0;
+            let (exchange_id, stream_result, mut command_headers) = 'request_gate: loop {
+                if latest_compaction_since_change.is_none()
+                    && let Some(context_window) = self.model_context_window
+                    && compaction::exceeds_compaction_threshold(
+                        approx_context_tokens(&context),
+                        context_window,
+                        self.config.compaction.fraction,
+                    )
+                {
                     let outcome = compaction::maybe_compact_routed(
                         self.store,
                         self.config,
@@ -159,199 +154,249 @@ impl<'a> AgentLoop<'a> {
                         &mut self.model,
                         &mut self.provider,
                         self.model_context_window,
-                        &mut live_provider_retries,
                         self.renderer,
                     )
                     .await?;
                     self.sync_effective_model();
                     context = self.load_context()?;
-                    context_compacted_since_change = outcome.is_some();
-                    // If compaction could not get us back under the threshold
-                    // (e.g. the retained recent turns alone are huge), stop
-                    // retrying proactively this turn to avoid repeated
-                    // summarize calls; the reactive guard still covers a true
-                    // hard overflow.
-                    let active_threshold = self
-                        .model_context_window
-                        .map(|window| (window as f64 * self.config.compaction.fraction) as u64);
-                    if active_threshold
-                        .is_some_and(|threshold| approx_context_tokens(&context) > threshold)
-                    {
-                        proactive_compaction_exhausted = true;
+                    latest_compaction_since_change = outcome;
+                    if matches!(
+                        latest_compaction_since_change,
+                        Some(compaction::CompactionOutcome::Applied { .. })
+                    ) {
+                        continue 'request_gate;
                     }
                 }
-            }
 
-            let mut command_headers = StreamingCommandHeaders::default();
-            let (exchange_id, stream_result) = loop {
-                audit.begin_provider_request();
-                let request_context = crate::provider::filter_native_replay_for_config(
-                    &context,
-                    self.config,
-                    &self.request.model,
-                    self.provider.api_name(),
-                );
-                let native_request = self.provider.native_request(
-                    &self.request,
-                    &request_context,
-                    &tool_definitions,
-                )?;
-                let recipe = self.store.request_recipe(
-                    self.provider.request_format(),
-                    &native_request,
-                    serde_json::json!({
-                        "kind": "agent",
-                        "context_through_seq": self.store.current_context_seq(self.session_id)?,
-                        "native_replay_origins":
-                            crate::provider::native_replay_origins(&request_context),
-                    }),
-                    &tool_definitions,
-                )?;
-                let exchange_id = self.store.start_provider_request(
-                    self.session_id,
-                    &self.store.current_turn_id(self.session_id)?,
-                    "agent",
-                    ProviderOrigin {
-                        canonical_model_ref: self.request.model.canonical.clone(),
-                        provider_id: self.request.model.provider_id.clone(),
-                        api: self.provider.api_name().to_string(),
-                        endpoint: self.provider.endpoint().to_string(),
-                        wire_model: self.request.model.model_id.clone(),
-                        effort: self.request.model.effort.clone(),
-                    },
-                    recipe,
-                    None,
-                )?;
-                let reviews_destructive = guardrail
-                    .as_ref()
-                    .is_some_and(|guardrail| guardrail.should_review(BashRisk::Destructive));
-                let mut on_stream_event = |event: StreamEvent| -> Result<(), ProviderError> {
-                    let result = match event {
-                        StreamEvent::TextDelta(text) => {
-                            audit.current_partial_output.push_str(&text);
-                            self.renderer.assistant_text(&text)
-                        }
-                        StreamEvent::ReasoningStart(visibility) => {
-                            self.renderer.reasoning_start(visibility)
-                        }
-                        StreamEvent::ReasoningDelta(text) => self.renderer.reasoning_delta(&text),
-                        StreamEvent::ReasoningSummaryDelta { part_index, text } => {
-                            self.renderer.reasoning_summary_delta(part_index, &text)
-                        }
-                        StreamEvent::ReasoningEnd => self.renderer.reasoning_end(None),
-                        StreamEvent::ToolCallDelta(delta) => handle_tool_call_delta(
-                            self.renderer,
-                            &mut command_headers,
-                            reviews_destructive,
-                            delta,
-                        ),
-                        StreamEvent::Tick => self.renderer.thinking_tick(),
-                    };
-                    result.map_err(|e| ProviderError::Other(e.to_string()))
-                };
-                let result = self
-                    .provider
-                    .stream_chat(
+                let mut command_headers = StreamingCommandHeaders::default();
+                loop {
+                    audit.begin_provider_request();
+                    let request_context = crate::provider::filter_native_replay_for_config(
+                        &context,
+                        self.config,
+                        &self.request.model,
+                        self.provider.api_name(),
+                    );
+                    let native_request = self.provider.native_request(
                         &self.request,
                         &request_context,
                         &tool_definitions,
-                        &mut on_stream_event,
-                    )
-                    .await;
-                self.renderer.assistant_end()?;
-                match &result {
-                    Ok(stream_result) => {
-                        let usage = stream_result
-                            .usage
-                            .as_ref()
-                            .map(|u| (u.visible_input_tokens(), u.visible_output_tokens()));
-                        self.renderer.reasoning_end(usage)?;
-                    }
-                    Err(_) => self.renderer.cancel_live_state()?,
-                }
-                match result {
-                    Ok(r) => break (exchange_id, r),
-                    Err(ProviderError::ContextLength) if !context_compacted_since_change => {
-                        self.store.fail_provider_exchange(
-                            self.session_id,
-                            &exchange_id,
-                            "context_length",
-                            serde_json::json!({"message":"context length exceeded"}),
-                            partial_response(&audit.current_partial_output).as_ref(),
-                            None,
-                        )?;
+                    )?;
+                    let recipe = self.store.request_recipe(
+                        self.provider.request_format(),
+                        &native_request,
+                        serde_json::json!({
+                            "kind": "agent",
+                            "context_through_seq": self.store.current_context_seq(self.session_id)?,
+                            "native_replay_origins":
+                                crate::provider::native_replay_origins(&request_context),
+                        }),
+                        &tool_definitions,
+                    )?;
+                    let exchange_id = self.store.start_provider_request(
+                        self.session_id,
+                        &self.store.current_turn_id(self.session_id)?,
+                        "agent",
+                        ProviderOrigin {
+                            canonical_model_ref: self.request.model.canonical.clone(),
+                            provider_id: self.request.model.provider_id.clone(),
+                            api: self.provider.api_name().to_string(),
+                            endpoint: self.provider.endpoint().to_string(),
+                            wire_model: self.request.model.model_id.clone(),
+                            effort: self.request.model.effort.clone(),
+                        },
+                        recipe,
+                        None,
+                    )?;
+                    let reviews_destructive = guardrail
+                        .as_ref()
+                        .is_some_and(|guardrail| guardrail.should_review(BashRisk::Destructive));
+                    let mut renderer_error = None;
+                    let result = {
+                        let mut on_stream_event =
+                            |event: StreamEvent| -> Result<(), ProviderError> {
+                                if renderer_error.is_some() {
+                                    return Ok(());
+                                }
+                                let result = match event {
+                                    StreamEvent::TextDelta(text) => {
+                                        audit.current_partial_output.push_str(&text);
+                                        self.renderer.assistant_text(&text)
+                                    }
+                                    StreamEvent::ReasoningStart(visibility) => {
+                                        self.renderer.reasoning_start(visibility)
+                                    }
+                                    StreamEvent::ReasoningDelta(text) => {
+                                        self.renderer.reasoning_delta(&text)
+                                    }
+                                    StreamEvent::ReasoningSummaryDelta { part_index, text } => {
+                                        self.renderer.reasoning_summary_delta(part_index, &text)
+                                    }
+                                    StreamEvent::ReasoningEnd => self.renderer.reasoning_end(None),
+                                    StreamEvent::ToolCallDelta(delta) => handle_tool_call_delta(
+                                        self.renderer,
+                                        &mut command_headers,
+                                        reviews_destructive,
+                                        delta,
+                                    ),
+                                    StreamEvent::Tick => self.renderer.thinking_tick(),
+                                };
+                                if let Err(error) = result {
+                                    renderer_error = Some(error);
+                                }
+                                Ok(())
+                            };
+                        self.provider
+                            .stream_chat(
+                                &self.request,
+                                &request_context,
+                                &tool_definitions,
+                                &mut on_stream_event,
+                            )
+                            .await
+                    };
+                    if let Some(error) = renderer_error {
+                        self.store
+                            .interrupt_provider_exchange(self.session_id, &exchange_id)?;
                         audit.abandon_provider_request();
-                        let outcome = compaction::run_compaction_routed(
-                            self.store,
-                            self.config,
-                            self.session_id,
-                            &mut self.model,
-                            &mut self.provider,
-                            &mut live_provider_retries,
-                            None,
-                            Some(self.renderer),
-                        )
-                        .await?;
-                        if matches!(outcome, compaction::CompactionOutcome::NotNeeded { .. }) {
-                            bail!("context length exceeded and no history can be compacted");
+                        return Err(error.into());
+                    }
+                    if let Err(error) = self.renderer.assistant_end() {
+                        self.store
+                            .interrupt_provider_exchange(self.session_id, &exchange_id)?;
+                        audit.abandon_provider_request();
+                        return Err(error.into());
+                    }
+                    match &result {
+                        Ok(stream_result) => {
+                            let usage = stream_result
+                                .usage
+                                .as_ref()
+                                .map(|u| (u.visible_input_tokens(), u.visible_output_tokens()));
+                            if let Err(error) = self.renderer.reasoning_end(usage) {
+                                self.store
+                                    .interrupt_provider_exchange(self.session_id, &exchange_id)?;
+                                audit.abandon_provider_request();
+                                return Err(error.into());
+                            }
                         }
-                        self.sync_effective_model();
-                        context = self.load_context()?;
-                        context_compacted_since_change = true;
+                        Err(_) => {
+                            if let Err(error) = self.renderer.cancel_live_state() {
+                                self.store
+                                    .interrupt_provider_exchange(self.session_id, &exchange_id)?;
+                                audit.abandon_provider_request();
+                                return Err(error.into());
+                            }
+                        }
                     }
-                    Err(ProviderError::ContextLength) => {
-                        self.store.fail_provider_exchange(
-                            self.session_id,
-                            &exchange_id,
-                            "context_length",
-                            serde_json::json!({"message":"context length exceeded"}),
-                            partial_response(&audit.current_partial_output).as_ref(),
-                            None,
-                        )?;
-                        bail!("context length exceeded immediately after compaction");
-                    }
-                    Err(error)
-                        if error.retryable_for_live_turn()
-                            && live_provider_retries < MAX_LIVE_PROVIDER_RETRIES =>
-                    {
-                        self.store.fail_provider_exchange(
-                            self.session_id,
-                            &exchange_id,
-                            error.class(),
-                            serde_json::json!({"message":error.to_string()}),
-                            partial_response(&audit.current_partial_output).as_ref(),
-                            None,
-                        )?;
-                        audit.abandon_provider_request();
-                        live_provider_retries += 1;
-                        command_headers = StreamingCommandHeaders::default();
-                        self.renderer.turn_retry(
-                            live_provider_retries as u64,
-                            MAX_LIVE_PROVIDER_RETRIES as u64,
-                            &error.to_string(),
-                        )?;
-                        context = self.load_context()?;
-                    }
-                    Err(error) => {
-                        self.store.fail_provider_exchange(
-                            self.session_id,
-                            &exchange_id,
-                            error.class(),
-                            serde_json::json!({"message":error.to_string()}),
-                            partial_response(&audit.current_partial_output).as_ref(),
-                            None,
-                        )?;
-                        audit.abandon_provider_request();
-                        let should_advance =
-                            error.retryable_for_live_turn() || error.fallback_immediately();
-                        if should_advance && self.advance_provider(&error.to_string())? {
-                            live_provider_retries = 0;
+                    match result {
+                        Ok(r) => break 'request_gate (exchange_id, r, command_headers),
+                        Err(error @ ProviderError::ContextLength { .. }) => {
+                            self.store.fail_provider_exchange(
+                                self.session_id,
+                                &exchange_id,
+                                error.class(),
+                                error.diagnostic(),
+                                partial_response(&audit.current_partial_output).as_ref(),
+                                None,
+                            )?;
+                            audit.abandon_provider_request();
+                            match latest_compaction_since_change {
+                                None => {
+                                    let outcome = compaction::run_compaction_routed(
+                                        self.store,
+                                        self.config,
+                                        self.session_id,
+                                        &mut self.model,
+                                        &mut self.provider,
+                                        None,
+                                        Some(self.renderer),
+                                    )
+                                    .await?;
+                                    self.sync_effective_model();
+                                    context = self.load_context()?;
+                                    match outcome {
+                                        compaction::CompactionOutcome::Applied { .. } => {
+                                            latest_compaction_since_change = Some(outcome);
+                                            continue 'request_gate;
+                                        }
+                                        compaction::CompactionOutcome::Inapplicable { .. } => {
+                                            bail!(
+                                                "context length exceeded and no history can be compacted"
+                                            );
+                                        }
+                                    }
+                                }
+                                Some(compaction::CompactionOutcome::Inapplicable { .. }) => {
+                                    bail!(
+                                        "context length exceeded and no history can be compacted"
+                                    );
+                                }
+                                Some(compaction::CompactionOutcome::Applied { .. }) => {
+                                    bail!("context length exceeded immediately after compaction");
+                                }
+                            }
+                        }
+                        Err(error)
+                            if error.disposition() == ProviderDisposition::Retry
+                                && error
+                                    .retry_after()
+                                    .is_none_or(|wait| wait <= MAX_PROVIDER_RETRY_AFTER)
+                                && live_provider_retries < provider_retry_limit(&self.model) =>
+                        {
+                            self.store.fail_provider_exchange(
+                                self.session_id,
+                                &exchange_id,
+                                error.class(),
+                                error.diagnostic(),
+                                partial_response(&audit.current_partial_output).as_ref(),
+                                None,
+                            )?;
+                            audit.abandon_provider_request();
+                            live_provider_retries += 1;
                             command_headers = StreamingCommandHeaders::default();
-                            proactive_compaction_exhausted = false;
+                            let retry_limit = provider_retry_limit(&self.model);
+                            let delay = effective_retry_delay(&error, live_provider_retries);
+                            self.renderer.turn_retry(
+                                live_provider_retries as u64,
+                                retry_limit as u64,
+                                delay,
+                                &error.to_string(),
+                            )?;
+                            sleep(delay).await;
                             context = self.load_context()?;
-                            continue;
                         }
-                        bail!("provider error: {error}")
+                        Err(error) => {
+                            self.store.fail_provider_exchange(
+                                self.session_id,
+                                &exchange_id,
+                                error.class(),
+                                error.diagnostic(),
+                                partial_response(&audit.current_partial_output).as_ref(),
+                                None,
+                            )?;
+                            audit.abandon_provider_request();
+                            if !self.model.is_floating()
+                                && error
+                                    .retry_after()
+                                    .is_some_and(|wait| wait > MAX_PROVIDER_RETRY_AFTER)
+                            {
+                                bail!(
+                                    "provider requested retry after {} seconds, exceeding the 60-second limit",
+                                    error.retry_after().unwrap_or_default().as_secs()
+                                );
+                            }
+                            let should_advance = matches!(
+                                error.disposition(),
+                                ProviderDisposition::Retry | ProviderDisposition::Advance
+                            );
+                            if should_advance && self.advance_provider(&error.to_string())? {
+                                live_provider_retries = 0;
+                                context = self.load_context()?;
+                                continue 'request_gate;
+                            }
+                            bail!("provider error: {error}")
+                        }
                     }
                 }
             };
@@ -393,7 +438,7 @@ impl<'a> AgentLoop<'a> {
             )?;
             audit.commit_provider_response();
             context.push(accepted_message.clone());
-            context_compacted_since_change = false;
+            latest_compaction_since_change = None;
 
             match stream_result.finish_reason {
                 FinishReason::Stop => {
@@ -415,7 +460,7 @@ impl<'a> AgentLoop<'a> {
                         if bash::cancellation_requested() {
                             bail!("turn interrupted");
                         }
-                        let args = parse_tool_args(&tool_calls[cursor]);
+                        let args = parse_tool_args(&tool_calls[cursor])?;
                         let concurrent = self.concurrent_tool_call_eligible(
                             guardrail.as_ref(),
                             &tool_calls[cursor],
@@ -576,7 +621,7 @@ impl<'a> AgentLoop<'a> {
 
                         let mut end = cursor + 1;
                         while end < tool_calls.len() {
-                            let next_args = parse_tool_args(&tool_calls[end]);
+                            let next_args = parse_tool_args(&tool_calls[end])?;
                             let next_concurrent = self.concurrent_tool_call_eligible(
                                 guardrail.as_ref(),
                                 &tool_calls[end],
@@ -760,7 +805,7 @@ impl<'a> AgentLoop<'a> {
         let mut executions = Vec::new();
         let (manifest, objects_dir) = self.store.attachment_paths(self.session_id)?;
         for (call, bash_call_id) in batch.iter().zip(bash_call_ids) {
-            let args = parse_tool_args(call);
+            let args = parse_tool_args(call)?;
             let bash_args = bash::parse_args(&args)?;
             executions.push(ConcurrentBashExecution {
                 call,
@@ -853,8 +898,13 @@ fn partial_response(text: &str) -> Option<Value> {
     (!text.is_empty()).then(|| serde_json::json!({"output_text":text}))
 }
 
-fn parse_tool_args(call: &ToolCall) -> Value {
-    serde_json::from_str(&call.function.arguments).unwrap_or(Value::Object(Default::default()))
+fn parse_tool_args(call: &ToolCall) -> Result<Value> {
+    serde_json::from_str(&call.function.arguments).map_err(|error| {
+        anyhow::anyhow!(
+            "invalid JSON arguments for tool call `{}`: {error}",
+            call.id
+        )
+    })
 }
 
 /// Cheap char/4 estimate of the in-memory context size, mirroring the fallback
@@ -1608,7 +1658,9 @@ mod tests {
                 });
             }
             counts.0 += 1;
-            Err(ProviderError::ContextLength)
+            Err(ProviderError::ContextLength {
+                detail: "test overflow".into(),
+            })
         }
     }
 
@@ -1622,7 +1674,7 @@ mod tests {
             on_event: &mut dyn FnMut(crate::provider::StreamEvent) -> Result<(), ProviderError>,
         ) -> Result<StreamResult, ProviderError> {
             on_event(StreamEvent::TextDelta("unfinished answer".into()))?;
-            Err(ProviderError::Other("fatal stream failure".into()))
+            Err(ProviderError::Protocol("fatal stream failure".into()))
         }
     }
 
@@ -1642,7 +1694,8 @@ mod tests {
                 0 => {
                     on_event(StreamEvent::TextDelta("discarded partial".into()))?;
                     Err(ProviderError::RateLimit {
-                        message: "slow down".into(),
+                        retry_after: None,
+                        detail: "slow down".into(),
                     })
                 }
                 1 => Ok(StreamResult {
@@ -1997,7 +2050,7 @@ mod tests {
             .iter()
             .find(|event| event["type"] == "provider_failed")
             .unwrap();
-        assert_eq!(failed["error_class"], "provider");
+        assert_eq!(failed["error_class"], "protocol");
         assert!(failed["partial_response_json"].is_object());
         let _ = std::fs::remove_dir_all(tmp);
     }

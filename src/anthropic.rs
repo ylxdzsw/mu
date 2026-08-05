@@ -6,7 +6,7 @@ use crate::models::RequestOptions;
 use crate::provider::{
     Attachment, ContentPart, FinishReason, FunctionCall, HttpProvider, Message, NativeReplay,
     NativeReplayPayload, ProviderError, ReasoningVisibility, SseEvent, StreamEvent, StreamResult,
-    ToolCall, ToolCallDelta, Usage, UserContent, base64_encode, stream_error_message,
+    ToolCall, ToolCallDelta, Usage, UserContent, base64_encode, classify_stream_error,
 };
 
 const MAX_OUTPUT_TOKENS: u64 = 64_000;
@@ -35,12 +35,14 @@ pub(crate) async fn stream(
     let blocks = state.completed_blocks()?;
     let tool_calls = tool_calls_from_blocks(&blocks)?;
     if state.stop_reason.as_deref() == Some("tool_use") && tool_calls.is_empty() {
-        return Err(ProviderError::SseParse(
+        return Err(ProviderError::Protocol(
             "Anthropic stopped for tool_use without a tool_use block".into(),
         ));
     }
     if state.stop_reason.as_deref() == Some("model_context_window_exceeded") {
-        return Err(ProviderError::ContextLength);
+        return Err(ProviderError::ContextLength {
+            detail: "Anthropic reported model_context_window_exceeded".into(),
+        });
     }
     let finish_reason = finish_reason(state.stop_reason.as_deref(), &tool_calls);
     let usage = state.usage.finish();
@@ -91,7 +93,7 @@ pub(crate) fn build_request_body(
         match message {
             Message::System { content } => {
                 if saw_non_system || system.is_some() {
-                    return Err(ProviderError::Other(
+                    return Err(ProviderError::Protocol(
                         "Anthropic requires exactly one leading system message".into(),
                     ));
                 }
@@ -132,7 +134,7 @@ pub(crate) fn build_request_body(
                     })];
                     for attachment in attachments {
                         if !attachment.attachment.media_type.starts_with("image/") {
-                            return Err(ProviderError::Other(format!(
+                            return Err(ProviderError::Protocol(format!(
                                 "Anthropic Messages does not support tool attachment `{}` ({})",
                                 attachment.attachment.filename, attachment.attachment.media_type
                             )));
@@ -155,7 +157,7 @@ pub(crate) fn build_request_body(
     }
 
     let system = system.ok_or_else(|| {
-        ProviderError::Other("Anthropic request is missing the leading system message".into())
+        ProviderError::Protocol("Anthropic request is missing the leading system message".into())
     })?;
     let anthropic_tools = tools.iter().map(convert_tool).collect::<Vec<_>>();
     let mut body = serde_json::json!({
@@ -206,7 +208,7 @@ fn append_message(
         && last["role"].as_str() == Some(role)
     {
         let content = last["content"].as_array_mut().ok_or_else(|| {
-            ProviderError::Other(
+            ProviderError::Protocol(
                 "invalid Anthropic message content while assembling request".into(),
             )
         })?;
@@ -238,7 +240,7 @@ fn user_blocks(content: &UserContent) -> Result<Vec<Value>, ProviderError> {
                 {
                     Ok(image_block(attachment))
                 }
-                ContentPart::Attachment { attachment } => Err(ProviderError::Other(format!(
+                ContentPart::Attachment { attachment } => Err(ProviderError::Protocol(format!(
                     "Anthropic Messages does not support audio attachment `{}` ({})",
                     attachment.filename, attachment.media_type
                 ))),
@@ -281,13 +283,13 @@ fn assistant_blocks(
     if let Some(tool_calls) = tool_calls {
         for call in tool_calls {
             let input: Value = serde_json::from_str(&call.function.arguments).map_err(|error| {
-                ProviderError::Other(format!(
+                ProviderError::Protocol(format!(
                     "invalid JSON arguments for Anthropic tool call `{}`: {error}",
                     call.id
                 ))
             })?;
             if !input.is_object() {
-                return Err(ProviderError::Other(format!(
+                return Err(ProviderError::Protocol(format!(
                     "Anthropic tool call `{}` arguments must be a JSON object",
                     call.id
                 )));
@@ -321,7 +323,7 @@ impl AnthropicStreamState {
             .get_mut(index)
             .and_then(Option::as_mut)
             .ok_or_else(|| {
-                ProviderError::SseParse(format!(
+                ProviderError::Protocol(format!(
                     "Anthropic delta references missing content block {index}"
                 ))
             })
@@ -329,13 +331,13 @@ impl AnthropicStreamState {
 
     fn completed_blocks(&self) -> Result<Vec<Value>, ProviderError> {
         if !self.open_blocks.is_empty() {
-            return Err(ProviderError::SseParse(format!(
+            return Err(ProviderError::Protocol(format!(
                 "Anthropic stream ended with unclosed content blocks: {:?}",
                 self.open_blocks
             )));
         }
         if self.blocks.iter().any(Option::is_none) {
-            return Err(ProviderError::SseParse(
+            return Err(ProviderError::Protocol(
                 "Anthropic stream left a gap in content block indexes".into(),
             ));
         }
@@ -405,7 +407,7 @@ fn consume_event(
     on_event: &mut dyn FnMut(StreamEvent) -> Result<(), ProviderError>,
 ) -> Result<(), ProviderError> {
     let value: Value =
-        serde_json::from_str(data).map_err(|error| ProviderError::SseParse(error.to_string()))?;
+        serde_json::from_str(data).map_err(|error| ProviderError::Protocol(error.to_string()))?;
     match value["type"].as_str().unwrap_or("") {
         "message_start" => state.usage.update(&value["message"]["usage"]),
         "content_block_start" => {
@@ -414,7 +416,7 @@ fn consume_event(
                 state.blocks.resize(index + 1, None);
             }
             if state.blocks[index].is_some() || !state.open_blocks.insert(index) {
-                return Err(ProviderError::SseParse(format!(
+                return Err(ProviderError::Protocol(format!(
                     "Anthropic content block {index} started more than once"
                 )));
             }
@@ -422,7 +424,7 @@ fn consume_event(
             match block["type"].as_str().unwrap_or("") {
                 "thinking" => {
                     if state.reasoning_index.replace(index).is_some() {
-                        return Err(ProviderError::SseParse(
+                        return Err(ProviderError::Protocol(
                             "Anthropic started overlapping thinking blocks".into(),
                         ));
                     }
@@ -446,7 +448,7 @@ fn consume_event(
         "content_block_delta" => {
             let index = event_index(&value)?;
             if !state.open_blocks.contains(&index) {
-                return Err(ProviderError::SseParse(format!(
+                return Err(ProviderError::Protocol(format!(
                     "Anthropic delta references closed content block {index}"
                 )));
             }
@@ -476,13 +478,13 @@ fn consume_event(
                         .tool_arguments
                         .get_mut(&index)
                         .ok_or_else(|| {
-                            ProviderError::SseParse(format!(
+                            ProviderError::Protocol(format!(
                                 "Anthropic tool delta references missing block {index}"
                             ))
                         })?
                         .push_str(partial);
                     let tool_index = state.tool_indexes.get(&index).copied().ok_or_else(|| {
-                        ProviderError::SseParse(format!(
+                        ProviderError::Protocol(format!(
                             "Anthropic tool delta references missing block {index}"
                         ))
                     })?;
@@ -509,7 +511,7 @@ fn consume_event(
         "content_block_stop" => {
             let index = event_index(&value)?;
             if !state.open_blocks.remove(&index) {
-                return Err(ProviderError::SseParse(format!(
+                return Err(ProviderError::Protocol(format!(
                     "Anthropic stop references missing content block {index}"
                 )));
             }
@@ -517,12 +519,12 @@ fn consume_event(
                 && !arguments.is_empty()
             {
                 let input: Value = serde_json::from_str(&arguments).map_err(|error| {
-                    ProviderError::SseParse(format!(
+                    ProviderError::Protocol(format!(
                         "invalid Anthropic tool input for block {index}: {error}"
                     ))
                 })?;
                 if !input.is_object() {
-                    return Err(ProviderError::SseParse(format!(
+                    return Err(ProviderError::Protocol(format!(
                         "Anthropic tool input for block {index} is not an object"
                     )));
                 }
@@ -549,10 +551,10 @@ fn consume_event(
 
 fn event_index(value: &Value) -> Result<usize, ProviderError> {
     let index = value["index"].as_u64().ok_or_else(|| {
-        ProviderError::SseParse("Anthropic content block event is missing index".into())
+        ProviderError::Protocol("Anthropic content block event is missing index".into())
     })?;
     usize::try_from(index).map_err(|_| {
-        ProviderError::SseParse(format!(
+        ProviderError::Protocol(format!(
             "Anthropic content block index {index} is too large"
         ))
     })
@@ -561,7 +563,7 @@ fn event_index(value: &Value) -> Result<usize, ProviderError> {
 fn required_str<'a>(value: &'a Value, key: &str, context: &str) -> Result<&'a str, ProviderError> {
     value[key]
         .as_str()
-        .ok_or_else(|| ProviderError::SseParse(format!("{context} is missing `{key}`")))
+        .ok_or_else(|| ProviderError::Protocol(format!("{context} is missing `{key}`")))
 }
 
 fn append_json_string(value: &mut Value, key: &str, suffix: &str) {
@@ -573,21 +575,7 @@ fn append_json_string(value: &mut Value, key: &str, suffix: &str) {
 }
 
 fn stream_error(error: &Value) -> ProviderError {
-    let message = stream_error_message(error);
-    match error["type"].as_str().unwrap_or("") {
-        "overloaded_error" => ProviderError::HttpStatus {
-            status: 529,
-            body: message,
-        },
-        "rate_limit_error" => ProviderError::RateLimit { message },
-        "authentication_error" | "not_found_error" | "permission_error" => {
-            ProviderError::Unavailable(format!(
-                "{}: {message}",
-                error["type"].as_str().unwrap_or("provider unavailable")
-            ))
-        }
-        _ => ProviderError::Other(format!("Anthropic stream error: {message}")),
-    }
+    classify_stream_error(error)
 }
 
 fn text_from_blocks(blocks: &[Value]) -> Option<String> {
@@ -605,14 +593,14 @@ fn tool_calls_from_blocks(blocks: &[Value]) -> Result<Vec<ToolCall>, ProviderErr
         .filter(|block| block["type"] == "tool_use")
         .map(|block| {
             let id = block["id"].as_str().ok_or_else(|| {
-                ProviderError::SseParse("Anthropic tool_use block is missing `id`".into())
+                ProviderError::Protocol("Anthropic tool_use block is missing `id`".into())
             })?;
             let name = block["name"].as_str().ok_or_else(|| {
-                ProviderError::SseParse("Anthropic tool_use block is missing `name`".into())
+                ProviderError::Protocol("Anthropic tool_use block is missing `name`".into())
             })?;
             let input = &block["input"];
             if !input.is_object() {
-                return Err(ProviderError::SseParse(format!(
+                return Err(ProviderError::Protocol(format!(
                     "Anthropic tool_use block `{id}` has non-object input"
                 )));
             }
@@ -621,7 +609,7 @@ fn tool_calls_from_blocks(blocks: &[Value]) -> Result<Vec<ToolCall>, ProviderErr
                 function: FunctionCall {
                     name: name.to_string(),
                     arguments: serde_json::to_string(input)
-                        .map_err(|error| ProviderError::SseParse(error.to_string()))?,
+                        .map_err(|error| ProviderError::Protocol(error.to_string()))?,
                 },
             })
         })
@@ -642,7 +630,7 @@ fn finish_reason(reason: Option<&str>, tool_calls: &[ToolCall]) -> FinishReason 
 mod tests {
     use super::*;
     use crate::models::ResolvedModelRef;
-    use crate::provider::{ImageDetail, ToolAttachment};
+    use crate::provider::{ImageDetail, ProviderDisposition, ToolAttachment};
 
     const ENDPOINT: &str = "https://api.anthropic.test/v1/messages";
 
@@ -1008,7 +996,7 @@ mod tests {
             }),
         )
         .unwrap_err();
-        assert!(error.retryable_for_live_turn());
+        assert_eq!(error.disposition(), ProviderDisposition::Retry);
 
         let malformed = Message::Assistant {
             content: None,

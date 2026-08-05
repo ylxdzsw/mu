@@ -200,7 +200,6 @@ pub struct ModelConfig {
 #[derive(Debug, Clone, Deserialize)]
 pub struct CompactionConfig {
     pub fraction: f64,
-    pub keep_recent_turns: usize,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -780,7 +779,6 @@ mod tests {
         assert_eq!(config.output, OutputFormat::Detail);
         assert!(config.line_wrapping);
         assert_eq!(config.compaction.fraction, 0.75);
-        assert_eq!(config.compaction.keep_recent_turns, 2);
         assert_eq!(config.limits.max_iterations, 50);
         assert_eq!(config.guardrail.timeout_seconds, 120);
         assert!(config.terminal_bell.enabled);
