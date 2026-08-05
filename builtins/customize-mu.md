@@ -73,6 +73,7 @@ Complete shape, with default values where applicable:
   },
   "terminal_bell": { "enabled": true, "min_duration_ms": 10000 },
   "compaction": {
+    "enabled": true,
     "soft_fraction": 0.70,
     "hard_fraction": 0.85,
     "hard_headroom_tokens": 48000
@@ -98,6 +99,9 @@ At least one provider and model are required. Endpoint paths must end in
 `endpoint` is required; `api_key_env` and all model metadata are optional.
 Without `context_window`, percentage reporting and proactive compaction are
 unavailable. `output` is overridden by CLI `--output`.
+Set `compaction.enabled` to `false` to disable automatic soft-threshold,
+hard-threshold, and context-overflow compaction. Context-length failures then
+abort the turn, while explicit `mu compact` remains available.
 Compaction requires a model `context_window` and runs only when context tokens
 are strictly greater than the applicable threshold. Before a new turn's first
 provider request, `compaction.soft_fraction` sets the graceful threshold to

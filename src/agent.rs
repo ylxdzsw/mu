@@ -115,7 +115,7 @@ impl<'a> AgentLoop<'a> {
     ) -> Result<TurnResult> {
         bash::reset_cancellation_state();
         bash::install_signal_forwarder();
-        let pre_turn_compaction = if compact_at_turn_boundary {
+        let pre_turn_compaction = if compact_at_turn_boundary && self.config.compaction.enabled {
             compaction::maybe_compact_routed(
                 self.store,
                 self.config,
@@ -151,7 +151,8 @@ impl<'a> AgentLoop<'a> {
         for iteration in 0..max_iter {
             let mut live_provider_retries = 0;
             let (exchange_id, stream_result, mut command_headers) = 'request_gate: loop {
-                if latest_compaction_since_change.is_none()
+                if self.config.compaction.enabled
+                    && latest_compaction_since_change.is_none()
                     && let Some(context_window) = self.model_context_window
                     && compaction::exceeds_hard_compaction_threshold(
                         approx_context_tokens(&context),
@@ -315,6 +316,9 @@ impl<'a> AgentLoop<'a> {
                                 None,
                             )?;
                             audit.abandon_provider_request();
+                            if !self.config.compaction.enabled {
+                                return Err(error.into());
+                            }
                             match latest_compaction_since_change {
                                 None => {
                                     let outcome = compaction::run_compaction_routed(
@@ -1974,6 +1978,72 @@ mod tests {
                 .contains("context length exceeded immediately after compaction")
         );
         assert_eq!(*counts.lock().unwrap(), (2, 1));
+    }
+
+    #[tokio::test]
+    async fn disabled_compaction_aborts_on_the_first_context_error() {
+        let store = Store::open_memory().unwrap();
+        let session = store.create_session_seeded("system").unwrap();
+        for index in 0..5 {
+            store
+                .append_message(
+                    &session.id,
+                    &Message::User {
+                        content: UserContent::Text(format!("user {index}")),
+                    },
+                )
+                .unwrap();
+            store
+                .append_message(
+                    &session.id,
+                    &Message::Assistant {
+                        content: Some(format!("assistant {index}")),
+                        reasoning_content: None,
+                        native_replay: None,
+                        tool_calls: None,
+                    },
+                )
+                .unwrap();
+        }
+        store
+            .append_message(
+                &session.id,
+                &Message::User {
+                    content: UserContent::Text("current".into()),
+                },
+            )
+            .unwrap();
+        let mut config = test_config();
+        config.compaction.enabled = false;
+        let request_model = crate::models::resolve_model_ref(&config, "test/fake-model").unwrap();
+        let counts = Arc::new(Mutex::new((0, 0)));
+        let mut renderer = Renderer::with_format(OutputFormat::Detail);
+        let mut agent = AgentLoop {
+            config: &config,
+            model: ResolvedModelChoice::fixed(request_model.clone()),
+            provider: Box::new(ContextAfterCompactionProvider {
+                counts: counts.clone(),
+            }),
+            store: &store,
+            session_id: &session.id,
+            request: RequestOptions {
+                model: request_model,
+            },
+            model_context_window: None,
+            renderer: &mut renderer,
+        };
+
+        let error = match agent.run_turn().await {
+            Ok(_) => panic!("expected context length error"),
+            Err(error) => error,
+        };
+
+        assert!(matches!(
+            error.downcast_ref::<ProviderError>(),
+            Some(ProviderError::ContextLength { .. })
+        ));
+        assert_eq!(*counts.lock().unwrap(), (1, 0));
+        assert_eq!(store.latest_summary_sequence(&session.id).unwrap(), None);
     }
 
     #[tokio::test]

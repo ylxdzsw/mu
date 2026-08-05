@@ -277,9 +277,9 @@ accepts optional non-terminal stdin as a custom focus). The surface is small:
   `estimated` before a first turn or immediately after compaction. Consumers
   derive a percentage from `context_tokens / context_window` and compare the
   raw count with `compaction_soft_threshold_tokens` to render pending
-  compaction. The resolved model object includes its current effective
-  `replay_key`; `--include-models` adds the effective key for every configured
-  model.
+  compaction. That threshold is `null` when automatic compaction is disabled.
+  The resolved model object includes its current effective `replay_key`;
+  `--include-models` adds the effective key for every configured model.
 - `mu context [--export]` — introspect the agent context. By default it prints
   the assembled system prompt mu itself would use: the role preamble, the
   `<runtime>` block, the full skills index (built-in, global, and project), and
@@ -1401,6 +1401,7 @@ are not visible in another.
       "min_duration_ms": 10000
     },
     "compaction": {                         // optional
+      "enabled": true,
       "soft_fraction": 0.70,
       "hard_fraction": 0.85,
       "hard_headroom_tokens": 48000
@@ -1653,6 +1654,10 @@ used only where no API figure exists yet:
 
 Context management then uses a **three-tier strategy**, from most to least
 graceful:
+
+Setting `compaction.enabled` to `false` disables all three automatic tiers:
+thresholds are ignored and a provider context-length failure aborts the turn.
+Manual `mu compact` remains available.
 
 **Tier 1 — graceful new-turn compaction.** After a new prompt is durably
 appended but before its first provider request, Mu compares current reported

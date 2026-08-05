@@ -253,6 +253,9 @@ fn compaction_needed(
     context_window: Option<u64>,
     threshold: CompactionThreshold,
 ) -> Result<bool> {
+    if !config.compaction.enabled {
+        return Ok(false);
+    }
     let session = store
         .get_session(session_id)?
         .ok_or_else(|| anyhow::anyhow!("session not found"))?;
@@ -658,13 +661,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn compaction_keeps_only_requested_recent_turns() {
+    async fn manual_compaction_works_when_automatic_compaction_is_disabled() {
         let tmp = std::env::temp_dir().join(format!("mu-compaction-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&tmp).unwrap();
         let store = Store::open(&tmp.join("mu.db")).unwrap();
         let session = store.create_session("/tmp").unwrap();
-        let request_model =
-            crate::models::resolve_model_ref(&test_config(), "test/fake-model").unwrap();
+        let mut config = test_config();
+        config.compaction.enabled = false;
+        let request_model = crate::models::resolve_model_ref(&config, "test/fake-model").unwrap();
         store
             .append_message(
                 &session.id,
@@ -696,14 +700,14 @@ mod tests {
                 .unwrap();
         }
 
-        let outcome = run_compaction(
+        let mut model = ResolvedModelChoice::fixed(request_model);
+        let mut provider: Box<dyn Provider> = Box::new(FakeProvider);
+        let outcome = run_compaction_routed(
             &store,
-            &test_config(),
+            &config,
             &session.id,
-            &RequestOptions {
-                model: request_model.clone(),
-            },
-            &FakeProvider,
+            &mut model,
+            &mut provider,
             None,
             None,
         )
@@ -1192,5 +1196,25 @@ mod tests {
     fn hard_threshold_uses_configured_fraction_and_headroom() {
         assert_eq!(hard_compaction_threshold(200_000, 0.90, 10_000), 180_000);
         assert_eq!(hard_compaction_threshold(200_000, 0.99, 30_000), 170_000);
+    }
+
+    #[test]
+    fn disabled_compaction_ignores_soft_and_hard_thresholds() {
+        let store = Store::open_memory().unwrap();
+        let session = store.create_session_seeded("system").unwrap();
+        store
+            .append_message(
+                &session.id,
+                &Message::User {
+                    content: "large context".repeat(100).into(),
+                },
+            )
+            .unwrap();
+        let mut config = test_config();
+        config.compaction.enabled = false;
+
+        for threshold in [CompactionThreshold::Soft, CompactionThreshold::Hard] {
+            assert!(!compaction_needed(&store, &config, &session.id, Some(1), threshold).unwrap());
+        }
     }
 }

@@ -275,9 +275,13 @@ pub fn build_status_report(
         context_usage_source: context_usage.map(|(_, source)| source),
         project_root: project.map(|project| project.root.display().to_string()),
         context_window: model_info.context_window,
-        compaction_soft_threshold_tokens: model_info
-            .context_window
-            .map(|window| soft_compaction_threshold(window, config.compaction.soft_fraction)),
+        compaction_soft_threshold_tokens: if config.compaction.enabled {
+            model_info
+                .context_window
+                .map(|window| soft_compaction_threshold(window, config.compaction.soft_fraction))
+        } else {
+            None
+        },
         supported_effort_levels: model_info.supported_effort_levels,
         git: includes.git.then(|| project.map(git_status)).flatten(),
         session: session_summary.map(status_session),
@@ -965,6 +969,20 @@ mod tests {
             reported.context_usage_source,
             Some(ContextUsageSource::Reported)
         );
+
+        let mut disabled_config = test_config();
+        disabled_config.compaction.enabled = false;
+        let disabled = build_status_report(
+            &store,
+            &disabled_config,
+            &overrides,
+            None,
+            StatusIncludes::default(),
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(disabled.compaction_soft_threshold_tokens, None);
 
         store.append_summary(&session.id, "summary").unwrap();
         let estimated = build_status_report(
