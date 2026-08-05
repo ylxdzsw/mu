@@ -258,8 +258,6 @@ pub(crate) fn consume_responses_sse_buffer(
                     state.tool_indexes.insert(output_index, tool_index);
                     on_event(StreamEvent::ToolCallDelta(ProviderToolCallDelta {
                         index: tool_index,
-                        id: item["call_id"].as_str().map(str::to_owned),
-                        name: item["name"].as_str().map(str::to_owned),
                         arguments_delta: item["arguments"].as_str().unwrap_or("").to_string(),
                     }))?;
                 }
@@ -305,8 +303,6 @@ pub(crate) fn consume_responses_sse_buffer(
                 let delta = value["delta"].as_str().unwrap_or("").to_string();
                 on_event(StreamEvent::ToolCallDelta(ProviderToolCallDelta {
                     index,
-                    id: None,
-                    name: None,
                     arguments_delta: delta,
                 }))?;
             }
@@ -599,9 +595,7 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(deltas.len(), 4);
         assert_eq!(deltas[0].index, 0);
-        assert_eq!(deltas[0].id.as_deref(), Some("call_a"));
         assert_eq!(deltas[1].index, 1);
-        assert_eq!(deltas[1].id.as_deref(), Some("call_b"));
         assert_eq!(deltas[2].index, 1);
         assert_eq!(deltas[2].arguments_delta, "second");
         assert_eq!(deltas[3].index, 0);

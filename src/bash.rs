@@ -438,7 +438,7 @@ trait BashOutputTarget {
 
 impl BashOutputTarget for Renderer {
     fn push_output(&mut self, text: &str) -> Result<()> {
-        self.bash_output(None, "bash", text).map_err(Into::into)
+        self.bash_output(text).map_err(Into::into)
     }
 }
 
@@ -1232,14 +1232,17 @@ mod tests {
         )
         .unwrap();
 
+        let expected = "delegated prompt\n";
         let contents = (0..40).find_map(|_| {
-            std::fs::read_to_string(&output).ok().or_else(|| {
-                std::thread::sleep(std::time::Duration::from_millis(25));
-                None
-            })
+            let contents = std::fs::read_to_string(&output).ok();
+            if contents.as_deref() == Some(expected) {
+                return contents;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+            None
         });
         let _ = std::fs::remove_file(output);
-        assert_eq!(contents.as_deref(), Some("delegated prompt\n"));
+        assert_eq!(contents.as_deref(), Some(expected));
     }
 
     #[test]

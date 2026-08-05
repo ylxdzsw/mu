@@ -436,8 +436,6 @@ fn consume_event(
                     state.tool_arguments.insert(index, String::new());
                     on_event(StreamEvent::ToolCallDelta(ToolCallDelta {
                         index: tool_index,
-                        id: block["id"].as_str().map(str::to_owned),
-                        name: block["name"].as_str().map(str::to_owned),
                         arguments_delta: String::new(),
                     }))?;
                 }
@@ -490,8 +488,6 @@ fn consume_event(
                     })?;
                     on_event(StreamEvent::ToolCallDelta(ToolCallDelta {
                         index: tool_index,
-                        id: None,
-                        name: None,
                         arguments_delta: partial.to_string(),
                     }))?;
                 }
@@ -953,7 +949,7 @@ mod tests {
         assert!(events.iter().any(|event| matches!(
             event,
             StreamEvent::ToolCallDelta(delta)
-                if delta.id.as_deref() == Some("toolu_1")
+                if delta.index == 0
         )));
         assert!(
             events

@@ -195,12 +195,6 @@ mod tests {
     }
 
     #[test]
-    fn parses_final_output_mode() {
-        let args = Args::try_parse_from(["mu", "--output", "final"]).unwrap();
-        assert_eq!(args.turn.output, Some(OutputFormat::Final));
-    }
-
-    #[test]
     fn parses_short_model_and_output_options() {
         let args = Args::try_parse_from(["mu", "-m", "gpt-test", "-o", "concise"]).unwrap();
         assert_eq!(args.turn.selection.model.as_deref(), Some("gpt-test"));

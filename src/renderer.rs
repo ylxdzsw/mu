@@ -495,7 +495,7 @@ impl Renderer {
         self.write_committed(&line)
     }
 
-    pub fn bash_header_start(&mut self, _tool_call_id: Option<&str>) -> io::Result<bool> {
+    pub fn bash_header_start(&mut self) -> io::Result<bool> {
         if self.format == OutputFormat::Final {
             return Ok(true);
         }
@@ -634,11 +634,7 @@ impl Renderer {
         self.write_stdout_committed(&format!("{}\n", format_stdin_summary(bytes, self.styled)))
     }
 
-    pub fn bash_header_full(
-        &mut self,
-        tool_call_id: Option<&str>,
-        args: &serde_json::Value,
-    ) -> io::Result<bool> {
+    pub fn bash_header_full(&mut self, args: &serde_json::Value) -> io::Result<bool> {
         if self.format == OutputFormat::Final {
             return Ok(true);
         }
@@ -651,7 +647,7 @@ impl Renderer {
             .and_then(|value| value.as_str())
             .unwrap_or_default();
         let risk = args.get("risk").and_then(|value| value.as_str());
-        self.bash_header_start(tool_call_id)?;
+        self.bash_header_start()?;
         if self.format == OutputFormat::Concise {
             self.concise_tool_ready(Some(title), risk, false)?;
             return Ok(true);
@@ -715,7 +711,6 @@ impl Renderer {
     /// its live output needs a visible command header.
     pub fn tool_start(
         &mut self,
-        _tool_call_id: Option<&str>,
         name: &str,
         args: &serde_json::Value,
         header_already_rendered: bool,
@@ -733,15 +728,10 @@ impl Renderer {
         if header_already_rendered {
             return Ok(());
         }
-        self.bash_header_full(None, args).map(|_| ())
+        self.bash_header_full(args).map(|_| ())
     }
 
-    pub fn bash_output(
-        &mut self,
-        _tool_call_id: Option<&str>,
-        _tool: &str,
-        text: &str,
-    ) -> io::Result<()> {
+    pub fn bash_output(&mut self, text: &str) -> io::Result<()> {
         if self.format == OutputFormat::Final {
             return Ok(());
         }
@@ -791,13 +781,7 @@ impl Renderer {
         self.write_stdout_committed(&terminal_trim_committed_text(&text))
     }
 
-    pub fn tool_failed(
-        &mut self,
-        _tool_call_id: Option<&str>,
-        name: &str,
-        error: &str,
-        elapsed: Duration,
-    ) -> io::Result<()> {
+    pub fn tool_failed(&mut self, name: &str, error: &str, elapsed: Duration) -> io::Result<()> {
         if self.format == OutputFormat::Final {
             return Ok(());
         }
@@ -852,7 +836,6 @@ impl Renderer {
         risk_level: &str,
         user_auth_level: &str,
         reason: &str,
-        _command: &str,
     ) -> io::Result<()> {
         if self.format == OutputFormat::Final {
             return Ok(());
@@ -4703,7 +4686,7 @@ mod tests {
         let (mut renderer, output) =
             Renderer::with_test_shared_output(OutputFormat::Detail, true, None);
 
-        renderer.bash_header_start(Some("call_1")).unwrap();
+        renderer.bash_header_start().unwrap();
         assert_eq!(
             output.transcript(),
             format!("{GRAY}[preparing toolcall]{RESET}")
@@ -4737,7 +4720,7 @@ mod tests {
         renderer
             .assistant_text("An explanation ending in tail")
             .unwrap();
-        renderer.bash_header_start(Some("call_1")).unwrap();
+        renderer.bash_header_start().unwrap();
         renderer.bash_header_title_start().unwrap();
         renderer.bash_header_delta("Inspect").unwrap();
         renderer.bash_header_title_end().unwrap();
@@ -4760,11 +4743,9 @@ mod tests {
             "command": "printf 'a'\npwd",
         });
 
-        assert!(renderer.bash_header_full(Some("call_1"), &args).unwrap());
-        renderer
-            .tool_start(Some("call_1"), "bash", &args, true)
-            .unwrap();
-        renderer.bash_output(Some("call_1"), "bash", "a\n").unwrap();
+        assert!(renderer.bash_header_full(&args).unwrap());
+        renderer.tool_start("bash", &args, true).unwrap();
+        renderer.bash_output("a\n").unwrap();
         renderer.tool_finished(0, Duration::from_millis(1)).unwrap();
     }
 
@@ -4814,7 +4795,7 @@ mod tests {
 
         let (mut tool, tool_output) =
             Renderer::with_test_shared_output(OutputFormat::Detail, true, None);
-        tool.bash_header_start(None).unwrap();
+        tool.bash_header_start().unwrap();
         tool.bash_header_title_start().unwrap();
         tool.bash_header_delta("Inspect").unwrap();
         tool.bash_header_title_end().unwrap();
@@ -4895,13 +4876,9 @@ mod tests {
             "stdin": "hidden stdin",
         });
 
-        renderer.bash_header_full(Some("call_1"), &args).unwrap();
-        renderer
-            .tool_start(Some("call_1"), "bash", &args, true)
-            .unwrap();
-        renderer
-            .bash_output(Some("call_1"), "bash", "hidden output\n")
-            .unwrap();
+        renderer.bash_header_full(&args).unwrap();
+        renderer.tool_start("bash", &args, true).unwrap();
+        renderer.bash_output("hidden output\n").unwrap();
         renderer
             .tool_finished(7, Duration::from_millis(250))
             .unwrap();
@@ -4940,7 +4917,7 @@ mod tests {
         let (mut renderer, output) =
             Renderer::with_test_shared_output(OutputFormat::Concise, true, None);
 
-        renderer.bash_header_start(Some("call_1")).unwrap();
+        renderer.bash_header_start().unwrap();
         renderer
             .concise_tool_ready(Some("Review action"), Some("destructive"), true)
             .unwrap();
@@ -4960,7 +4937,7 @@ mod tests {
             "the guardrail transition must not flash the destructive tool line"
         );
         renderer
-            .guardrail_verdict(false, "high", "low", "not authorized", "do something")
+            .guardrail_verdict(false, "high", "low", "not authorized")
             .unwrap();
         renderer.guardrail_rejected().unwrap();
 
@@ -4983,13 +4960,9 @@ mod tests {
             .map(|line| format!("line{line}\n"))
             .collect::<String>();
 
-        renderer.bash_header_full(Some("call_1"), &args).unwrap();
-        renderer
-            .tool_start(Some("call_1"), "bash", &args, true)
-            .unwrap();
-        renderer
-            .bash_output(Some("call_1"), "bash", &command_output)
-            .unwrap();
+        renderer.bash_header_full(&args).unwrap();
+        renderer.tool_start("bash", &args, true).unwrap();
+        renderer.bash_output(&command_output).unwrap();
         renderer.tool_finished(0, Duration::from_millis(5)).unwrap();
 
         let transcript = output.transcript();

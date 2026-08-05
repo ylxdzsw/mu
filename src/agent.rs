@@ -61,8 +61,6 @@ struct ConcurrentBashExecution<'a> {
 
 #[derive(Default)]
 struct StreamingCommandHeader {
-    id: Option<String>,
-    name: Option<String>,
     arguments: String,
     display: CommandHeaderDisplay,
 }
@@ -490,7 +488,6 @@ impl<'a> AgentLoop<'a> {
                                 self.renderer,
                                 &mut command_headers,
                                 cursor,
-                                tc,
                                 &args,
                                 guardrail_pending,
                             )?;
@@ -519,10 +516,6 @@ impl<'a> AgentLoop<'a> {
                                 }
                                 if g.should_review(risk.expect("risk checked above")) {
                                     let args_for_review = args.clone();
-                                    let command = args_for_review
-                                        .get("command")
-                                        .and_then(|v| v.as_str())
-                                        .unwrap_or("");
                                     self.renderer.guardrail_start()?;
                                     let assessment_result = g
                                         .assess(
@@ -559,7 +552,6 @@ impl<'a> AgentLoop<'a> {
                                             &risk_level,
                                             &user_auth_level,
                                             &assessment.reason,
-                                            command,
                                         )?;
                                     } else {
                                         let deny_err = anyhow::anyhow!(
@@ -583,7 +575,6 @@ impl<'a> AgentLoop<'a> {
                                             &risk_level,
                                             &user_auth_level,
                                             &assessment.reason,
-                                            command,
                                         )?;
                                         self.renderer.guardrail_rejected()?;
                                         if let Some(denials) = g.denial_limit_reached() {
@@ -599,7 +590,6 @@ impl<'a> AgentLoop<'a> {
                             }
 
                             self.renderer.tool_start(
-                                Some(&tc.id),
                                 &tc.function.name,
                                 &args,
                                 header_already_rendered,
@@ -763,12 +753,8 @@ impl<'a> AgentLoop<'a> {
             Err(error) => {
                 let message = format!("error: {error}");
                 if emit_renderer {
-                    self.renderer.tool_failed(
-                        Some(&call.id),
-                        &call.function.name,
-                        &error.to_string(),
-                        elapsed,
-                    )?;
+                    self.renderer
+                        .tool_failed(&call.function.name, &error.to_string(), elapsed)?;
                 }
                 (message, Vec::new(), "error", None)
             }
@@ -840,7 +826,6 @@ impl<'a> AgentLoop<'a> {
                 self.renderer,
                 command_headers,
                 header_start_index + index,
-                exec.call,
                 &exec.args,
                 false,
             )?;
@@ -850,7 +835,6 @@ impl<'a> AgentLoop<'a> {
                 }
             }
             self.renderer.tool_start(
-                Some(&exec.call.id),
                 &exec.call.function.name,
                 &exec.args,
                 header_already_rendered,
@@ -902,8 +886,7 @@ impl<'a> AgentLoop<'a> {
         }
         let next = snapshot[exec.streamed_len..].to_string();
         exec.streamed_len = snapshot.len();
-        self.renderer
-            .bash_output(Some(&exec.call.id), &exec.call.function.name, &next)?;
+        self.renderer.bash_output(&next)?;
         Ok(true)
     }
 }
@@ -968,12 +951,6 @@ fn handle_tool_call_delta(
             .resize_with(delta.index + 1, StreamingCommandHeader::default);
     }
     let header = &mut headers.entries[delta.index];
-    if let Some(id) = delta.id {
-        header.id = Some(id);
-    }
-    if let Some(name) = delta.name {
-        header.name = Some(name);
-    }
     header.arguments.push_str(&delta.arguments_delta);
 
     if delta.index == 0 {
@@ -981,7 +958,6 @@ fn handle_tool_call_delta(
         header.display.update(
             renderer,
             CommandHeaderUpdate {
-                tool_call_id: header.id.as_deref(),
                 title: string_field_state(&header.arguments, "title"),
                 risk: string_field_state(&header.arguments, "risk"),
                 command: string_field_state(&header.arguments, "command"),
@@ -1007,7 +983,6 @@ fn finish_command_header(
     renderer: &mut Renderer,
     headers: &mut StreamingCommandHeaders,
     index: usize,
-    call: &ToolCall,
     args: &Value,
     guardrail_pending: bool,
 ) -> std::io::Result<bool> {
@@ -1017,9 +992,6 @@ fn finish_command_header(
             .resize_with(index + 1, StreamingCommandHeader::default);
     }
     let header = &mut headers.entries[index];
-    if header.id.is_none() {
-        header.id = Some(call.id.clone());
-    }
     header.finish(renderer, args, guardrail_pending)
 }
 
@@ -1037,7 +1009,6 @@ impl StreamingCommandHeader {
         self.display.update(
             renderer,
             CommandHeaderUpdate {
-                tool_call_id: self.id.as_deref(),
                 title: StringFieldState::from_final(title),
                 risk: StringFieldState::from_final(risk),
                 command: StringFieldState::from_final(command),
@@ -1062,10 +1033,9 @@ impl CommandHeaderDisplay {
     fn update(
         &mut self,
         renderer: &mut Renderer,
-        update: CommandHeaderUpdate<'_>,
+        update: CommandHeaderUpdate,
     ) -> std::io::Result<()> {
         let CommandHeaderUpdate {
-            tool_call_id,
             title,
             risk,
             command,
@@ -1075,7 +1045,7 @@ impl CommandHeaderDisplay {
             guardrail_pending,
         } = update;
         if !self.started {
-            self.started = renderer.bash_header_start(tool_call_id)?;
+            self.started = renderer.bash_header_start()?;
         }
 
         if renderer.output_format() == crate::cli::OutputFormat::Concise {
@@ -1284,8 +1254,7 @@ impl CommandHeaderDisplay {
     }
 }
 
-struct CommandHeaderUpdate<'a> {
-    tool_call_id: Option<&'a str>,
+struct CommandHeaderUpdate {
     title: StringFieldState,
     risk: StringFieldState,
     command: StringFieldState,

@@ -454,12 +454,6 @@ fn consume_sse_buffer(
                                 entry.2.push_str(args);
                             }
                         }
-                        let name = tc
-                            .function
-                            .as_ref()
-                            .and_then(|f| f.name.as_deref())
-                            .filter(|name| !name.is_empty())
-                            .map(str::to_owned);
                         let arguments_delta = tc
                             .function
                             .as_ref()
@@ -467,8 +461,6 @@ fn consume_sse_buffer(
                             .unwrap_or_default();
                         on_event(StreamEvent::ToolCallDelta(ProviderToolCallDelta {
                             index: tc.index,
-                            id: tc.id.clone(),
-                            name,
                             arguments_delta,
                         }))?;
                         state.tool_call_started = true;
@@ -641,13 +633,10 @@ mod tests {
         assert_eq!(seen, "hello");
         assert_eq!(tool_call_deltas.len(), 2);
         assert_eq!(tool_call_deltas[0].index, 0);
-        assert_eq!(tool_call_deltas[0].id.as_deref(), Some("call_1"));
-        assert_eq!(tool_call_deltas[0].name.as_deref(), Some("bash"));
         assert_eq!(
             tool_call_deltas[0].arguments_delta,
             "{\"title\":\"Inspect\",\"risk\":\"readonly\",\"command\":"
         );
-        assert!(tool_call_deltas[1].name.is_none());
         assert_eq!(tool_call_deltas[1].arguments_delta, "\"pwd\"}");
         assert_eq!(state.tool_accum.get(&0).unwrap().1.as_deref(), Some("bash"));
         assert_eq!(state.content, "hello");
@@ -1269,7 +1258,7 @@ mod tests {
             StreamEvent::ReasoningStart(ReasoningVisibility::Opaque)
         ));
         assert!(events.iter().any(|event| matches!(event,
-            StreamEvent::ToolCallDelta(delta) if delta.id.as_deref() == Some("call_1")
+            StreamEvent::ToolCallDelta(delta) if delta.index == 0
         )));
         assert_eq!(
             responses_tool_calls(&state.output).unwrap()[0]

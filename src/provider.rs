@@ -462,8 +462,6 @@ pub enum ReasoningVisibility {
 #[derive(Debug, Clone, Default)]
 pub struct ToolCallDelta {
     pub index: usize,
-    pub id: Option<String>,
-    pub name: Option<String>,
     pub arguments_delta: String,
 }
 

@@ -72,7 +72,7 @@ Complete shape, with default values where applicable:
     }
   },
   "terminal_bell": { "enabled": true, "min_duration_ms": 10000 },
-  "compaction": { "fraction": 0.75, "keep_recent_turns": 2 },
+  "compaction": { "soft_fraction": 0.70 },
   "limits": {
     "max_iterations": 50,
     "max_lines": 2000,
@@ -93,8 +93,9 @@ At least one provider and model are required. Endpoint paths must end in
 `/chat/completions`, `/responses`, or `/messages`; the suffix selects the API.
 `endpoint` is required; `api_key_env` and all model metadata are optional.
 Without `context_window`, percentage reporting and proactive compaction are
-unavailable. `output` is overridden by CLI `--output`. `compaction.fraction` is
-the context threshold and `keep_recent_turns` is the unsummarized suffix.
+unavailable. `output` is overridden by CLI `--output`.
+`compaction.soft_fraction` is the graceful new-turn threshold; Mu always keeps
+the two most recent turns outside the summary.
 `limits.max_iterations` caps one agent turn; the other limits bound the
 model-visible preview of bash output by lines, total bytes, and bytes per line.
 The bell sounds only for turns lasting at least `min_duration_ms`. The guardrail

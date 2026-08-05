@@ -62,33 +62,6 @@ fn clamp_for_summary(content: &str, max_chars: usize) -> String {
     format!("{head_str}\n…[{omitted} chars elided for summary]…\n{tail_str}")
 }
 
-#[cfg(test)]
-#[allow(clippy::too_many_arguments)]
-pub async fn maybe_compact(
-    store: &Store,
-    config: &Config,
-    session_id: &str,
-    request: &RequestOptions,
-    context_window: Option<u64>,
-    threshold: CompactionThreshold,
-    provider: &dyn Provider,
-    renderer: &mut Renderer,
-) -> Result<()> {
-    if compaction_needed(store, config, session_id, context_window, threshold)? {
-        run_compaction(
-            store,
-            config,
-            session_id,
-            request,
-            provider,
-            None,
-            Some(renderer),
-        )
-        .await?;
-    }
-    Ok(())
-}
-
 #[allow(clippy::too_many_arguments)]
 pub async fn maybe_compact_routed(
     store: &Store,
@@ -904,21 +877,16 @@ mod tests {
             ]
         );
 
-        let mut renderer = Renderer::with_format(crate::cli::OutputFormat::Final);
-        maybe_compact(
-            &store,
-            &test_config(),
-            &session.id,
-            &RequestOptions {
-                model: request_model,
-            },
-            Some(100_000),
-            CompactionThreshold::Soft,
-            &FailingProvider,
-            &mut renderer,
-        )
-        .await
-        .unwrap();
+        assert!(
+            !compaction_needed(
+                &store,
+                &test_config(),
+                &session.id,
+                Some(100_000),
+                CompactionThreshold::Soft,
+            )
+            .unwrap()
+        );
     }
 
     #[tokio::test]
