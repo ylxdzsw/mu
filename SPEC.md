@@ -1746,10 +1746,10 @@ budget, while the summarizer must still preserve every important fact needed to
 continue correctly. In either shell prompt mode, `/compact <instruction>` pipes
 the text after the command through this same stdin path. Automatic compaction
 never supplies a custom focus. Interactive compaction shows one mutable
-`[compacting <duration>]` line. Automatic compaction clears it before normal
-turn output; manual compaction replaces it with one result line containing the
-reported pre-compaction percentage, estimated post-compaction percentage, and
-elapsed time. Redirected output emits one plain status line. Provider failure
+`[compacting <duration>]` line. Successful automatic and manual compaction
+replace it with one committed result line containing the reported
+pre-compaction percentage, estimated post-compaction percentage, and elapsed
+time. Redirected output emits one plain status line. Provider failure
 or an empty summary exits non-zero and never reports success. An inapplicable
 manual request reports `compaction inapplicable: no history exists before the
 N retained turns`, where `N` is the retained suffix size selected by the

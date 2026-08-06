@@ -4930,6 +4930,49 @@ mod tests {
     }
 
     #[test]
+    fn compaction_result_is_committed_for_concise_interactive_and_redirected_output() {
+        let (mut interactive, stdout, _stderr) =
+            Renderer::with_test_output(OutputFormat::Concise, true, true, None);
+        interactive.compaction_start().unwrap();
+        interactive
+            .compaction_result(12_826, 10_582, Some(200_000), Duration::from_millis(2_400))
+            .unwrap();
+        let interactive_text = strip_ansi(&stdout.transcript());
+        assert!(
+            interactive_text.contains("[compacting "),
+            "{interactive_text:?}"
+        );
+        assert!(
+            interactive_text.ends_with("[mu] compacted 6.4% → ~5.3% in 2.4s\n"),
+            "{interactive_text:?}"
+        );
+
+        let (mut redirected, redirected_stdout, redirected_stderr) =
+            Renderer::with_test_output(OutputFormat::Concise, false, false, None);
+        redirected.compaction_start().unwrap();
+        redirected
+            .compaction_result(12_826, 10_582, Some(200_000), Duration::from_millis(2_400))
+            .unwrap();
+        assert_eq!(redirected_stdout.transcript(), "");
+        assert_eq!(
+            redirected_stderr.transcript(),
+            "[mu] compacted 6.4% → ~5.3% in 2.4s\n"
+        );
+
+        let (mut detail_redirected, detail_stdout, detail_stderr) =
+            Renderer::with_test_output(OutputFormat::Detail, false, false, None);
+        detail_redirected.compaction_start().unwrap();
+        detail_redirected
+            .compaction_result(12_826, 10_582, Some(200_000), Duration::from_millis(2_400))
+            .unwrap();
+        assert_eq!(detail_stdout.transcript(), "");
+        assert_eq!(
+            detail_stderr.transcript(),
+            "[mu] compacted 6.4% → ~5.3% in 2.4s\n"
+        );
+    }
+
+    #[test]
     fn turn_summary_shows_reported_cache_usage_without_a_total() {
         assert_eq!(
             format_turn_summary(

@@ -116,6 +116,7 @@ impl<'a> AgentLoop<'a> {
         bash::reset_cancellation_state();
         bash::install_signal_forwarder();
         let pre_turn_compaction = if compact_at_turn_boundary && self.config.compaction.enabled {
+            let started = Instant::now();
             compaction::maybe_compact_routed(
                 self.store,
                 self.config,
@@ -127,11 +128,16 @@ impl<'a> AgentLoop<'a> {
                 self.renderer,
             )
             .await?
+            .map(|outcome| (outcome, started))
         } else {
             None
         };
         self.sync_effective_model();
-        let mut latest_compaction_since_change = pre_turn_compaction;
+        let mut latest_compaction_since_change = None;
+        if let Some((outcome, started)) = pre_turn_compaction {
+            self.report_compaction(outcome, started)?;
+            latest_compaction_since_change = Some(outcome);
+        }
 
         let mut guardrail = if self.config.guardrail.enabled {
             Some(Guardrail::new(self.config, &self.request.model))
@@ -161,6 +167,7 @@ impl<'a> AgentLoop<'a> {
                         self.config.compaction.hard_headroom_tokens,
                     )
                 {
+                    let started = Instant::now();
                     let outcome = compaction::maybe_compact_routed(
                         self.store,
                         self.config,
@@ -173,6 +180,9 @@ impl<'a> AgentLoop<'a> {
                     )
                     .await?;
                     self.sync_effective_model();
+                    if let Some(outcome) = outcome {
+                        self.report_compaction(outcome, started)?;
+                    }
                     context = self.load_context()?;
                     latest_compaction_since_change = outcome;
                     if matches!(
@@ -321,6 +331,7 @@ impl<'a> AgentLoop<'a> {
                             }
                             match latest_compaction_since_change {
                                 None => {
+                                    let started = Instant::now();
                                     let outcome = compaction::run_compaction_routed(
                                         self.store,
                                         self.config,
@@ -332,6 +343,7 @@ impl<'a> AgentLoop<'a> {
                                     )
                                     .await?;
                                     self.sync_effective_model();
+                                    self.report_compaction(outcome, started)?;
                                     context = self.load_context()?;
                                     match outcome {
                                         compaction::CompactionOutcome::Applied { .. } => {
@@ -706,6 +718,26 @@ impl<'a> AgentLoop<'a> {
             self.model_context_window = resolve_model_info(self.config, &model).context_window;
         }
         self.request.model = model;
+    }
+
+    fn report_compaction(
+        &mut self,
+        outcome: compaction::CompactionOutcome,
+        started: Instant,
+    ) -> Result<()> {
+        if let compaction::CompactionOutcome::Applied {
+            before_context_tokens,
+            after_context_tokens_estimate,
+        } = outcome
+        {
+            self.renderer.compaction_result(
+                before_context_tokens,
+                after_context_tokens_estimate,
+                self.model_context_window,
+                started.elapsed(),
+            )?;
+        }
+        Ok(())
     }
 
     fn sync_model_from_history(&mut self) -> Result<()> {

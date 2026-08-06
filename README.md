@@ -316,10 +316,12 @@ prose and table cells for the terminal to wrap, but still caps compact rows at
 model-visible text.
 
 During compaction, interactive output uses one mutable
-`[compacting <duration>]` line. The completed result marks its rebuilt context
-percentage with `~` because it is estimated until the next provider response;
-the shell prompt uses the same marker and returns to an unprefixed percentage
-after that response supplies exact usage.
+`[compacting <duration>]` line, followed by a committed
+`[mu] compacted ...` result when automatic or manual compaction succeeds. The
+completed result marks its rebuilt context percentage with `~` because it is
+estimated until the next provider response; the shell prompt uses the same
+marker and returns to an unprefixed percentage after that response supplies
+exact usage.
 
 ## Native installation and portable builds
 
