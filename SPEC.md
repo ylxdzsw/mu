@@ -675,13 +675,17 @@ Assistant Markdown is parsed on TTYs. The renderer commits only output whose
 terminal representation is stable: ordinary prose streams as soon as it is not
 being held for an inline span, while headings, quotes, and list items stream once
 their line prefix is unambiguous. With `line_wrapping` enabled, the renderer
-retains at most five visible cells so an approaching ruler can replace the most
-recent retained whitespace with a newline. If no such whitespace exists, it
-hard-wraps at a Unicode grapheme boundary. ANSI and hyperlink controls consume
-zero cells; combining sequences, emoji ZWJ sequences, and other extended
-graphemes are never split. CJK text therefore falls back to grapheme-boundary
-wrapping. This is intentionally not full Unicode line breaking, dictionary
-segmentation, or hyphenation.
+retains at most seven visible cells: five so an approaching ruler can replace
+the most recent retained whitespace with a newline, plus one provisional
+overflow cell and its following whitespace. Prose normally wraps at the ruler,
+one cell short of the detected terminal width. When that cut would leave exactly
+one single-cell grapheme before whitespace, the grapheme may occupy the reserved
+final terminal column and the whitespace becomes a newline. Otherwise an
+unbroken run hard-wraps at a Unicode grapheme boundary. ANSI and hyperlink
+controls consume zero cells; combining sequences, emoji ZWJ sequences, and
+other extended graphemes are never split. CJK text therefore falls back to
+grapheme-boundary wrapping. This is intentionally not full Unicode line
+breaking, dictionary segmentation, or hyphenation.
 
 A heading prefix waits for the space after the full opening `#` run, so `##` is
 not rendered as h2 until it cannot still become h3. Closing heading hashes are

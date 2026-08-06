@@ -36,6 +36,7 @@ const REASONING_TITLE_MAX_WIDTH: usize = 80;
 const DEFAULT_TERMINAL_WIDTH: usize = 80;
 const TERMINAL_RIGHT_MARGIN: usize = 1;
 const WRAP_LOOKBEHIND_CELLS: usize = 5;
+const STREAM_WRAP_HOLDOUT_CELLS: usize = WRAP_LOOKBEHIND_CELLS + 2;
 const MARKDOWN_RULE_WIDTH: usize = 40;
 const MAX_TABLE_COLUMN_WIDTH: usize = 80;
 const MIN_TABLE_COLUMN_WIDTH: usize = 3;
@@ -1407,6 +1408,12 @@ struct DisplayUnit {
     whitespace: bool,
 }
 
+enum OverflowLaneDecision {
+    Inapplicable,
+    AwaitingWhitespace,
+    FollowedByWhitespace(usize),
+}
+
 impl TerminalLineWrapper {
     fn new(width: usize) -> Self {
         Self {
@@ -1421,7 +1428,7 @@ impl TerminalLineWrapper {
             let has_newline = part.ends_with('\n');
             let body = part.strip_suffix('\n').unwrap_or(part);
             self.pending.push_str(body);
-            self.flush_overflow(out);
+            self.flush_overflow(out, has_newline);
             if has_newline {
                 self.flush_all(out);
                 out.push('\n');
@@ -1432,11 +1439,11 @@ impl TerminalLineWrapper {
     }
 
     fn finish(&mut self, out: &mut String) {
-        self.flush_overflow(out);
+        self.flush_overflow(out, true);
         self.flush_all(out);
     }
 
-    fn flush_overflow(&mut self, out: &mut String) {
+    fn flush_overflow(&mut self, out: &mut String, complete: bool) {
         loop {
             let units = display_units(&self.pending);
             let pending_width = display_units_width(&units);
@@ -1465,6 +1472,22 @@ impl TerminalLineWrapper {
                 continue;
             }
 
+            match overflow_lane_decision(&units, hard_end, self.column, self.width, complete) {
+                OverflowLaneDecision::FollowedByWhitespace(boundary) => {
+                    let suffix = display_suffix_without_leading_whitespace(
+                        &self.pending,
+                        &units[boundary + 1..],
+                    );
+                    self.emit_raw_prefix(units[boundary].start, out);
+                    self.pending = suffix;
+                    out.push('\n');
+                    self.column = 0;
+                    continue;
+                }
+                OverflowLaneDecision::AwaitingWhitespace => return,
+                OverflowLaneDecision::Inapplicable => {}
+            }
+
             let emit_end = if hard_end > 0 {
                 units[hard_end - 1].end
             } else if self.column > 0 {
@@ -1489,7 +1512,7 @@ impl TerminalLineWrapper {
     fn flush_safe(&mut self, out: &mut String) {
         let units = display_units(&self.pending);
         let pending_width = display_units_width(&units);
-        let emit_width = pending_width.saturating_sub(WRAP_LOOKBEHIND_CELLS);
+        let emit_width = pending_width.saturating_sub(STREAM_WRAP_HOLDOUT_CELLS);
         if emit_width == 0 {
             return;
         }
@@ -1520,6 +1543,41 @@ impl TerminalLineWrapper {
             .saturating_add(display_units_width(&display_units(&emitted)));
         out.push_str(&emitted);
         self.pending.replace_range(..end, "");
+    }
+}
+
+fn overflow_lane_decision(
+    units: &[DisplayUnit],
+    hard_end: usize,
+    committed_width: usize,
+    wrap_width: usize,
+    complete: bool,
+) -> OverflowLaneDecision {
+    if committed_width.saturating_add(display_units_width(&units[..hard_end])) != wrap_width {
+        return OverflowLaneDecision::Inapplicable;
+    }
+    let Some(overflow) = units.get(hard_end) else {
+        return OverflowLaneDecision::Inapplicable;
+    };
+    if overflow.width != TERMINAL_RIGHT_MARGIN || overflow.whitespace {
+        return OverflowLaneDecision::Inapplicable;
+    }
+
+    let next = units
+        .iter()
+        .enumerate()
+        .skip(hard_end + 1)
+        .find(|(_, unit)| unit.width > 0);
+    match next {
+        Some((idx, unit)) => {
+            if unit.whitespace {
+                OverflowLaneDecision::FollowedByWhitespace(idx)
+            } else {
+                OverflowLaneDecision::Inapplicable
+            }
+        }
+        None if complete => OverflowLaneDecision::Inapplicable,
+        None => OverflowLaneDecision::AwaitingWhitespace,
     }
 }
 
@@ -4411,6 +4469,35 @@ mod tests {
             text.chars()
                 .filter(|ch| !ch.is_whitespace())
                 .collect::<String>()
+        );
+    }
+
+    #[test]
+    fn streaming_wrapper_uses_reserved_column_for_one_dangling_cell() {
+        let text = "abcdefghij, next";
+        let whole = wrap_terminal_chunks(&[text], 10);
+        let chunks = text.graphemes(true).collect::<Vec<_>>();
+
+        assert_eq!(whole, "abcdefghij,\nnext");
+        assert_eq!(wrap_terminal_chunks(&chunks, 10), whole);
+        assert_eq!(UnicodeWidthStr::width(whole.lines().next().unwrap()), 11);
+
+        let styled = format!("abcdefghij,{RESET} next");
+        assert_eq!(
+            wrap_terminal_chunks(&[&styled], 10),
+            format!("abcdefghij,{RESET}\nnext")
+        );
+        assert_eq!(
+            wrap_terminal_chunks(&["abcdefghij,, next"], 10),
+            "abcdefghij\n,, next"
+        );
+        assert_eq!(
+            wrap_terminal_chunks(&["abcdefghij界 next"], 10),
+            "abcdefghij\n界 next"
+        );
+        assert_eq!(
+            wrap_terminal_chunks(&["abcdefghij,\nnext"], 10),
+            "abcdefghij\n,\nnext"
         );
     }
 
