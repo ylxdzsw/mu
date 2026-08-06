@@ -365,12 +365,14 @@ population may leave a partial directory that later runs deliberately trust.
 Moving or upgrading the binary does not update either cache: remove the
 applicable cache subdirectory manually to regenerate it.
 
-Version tags publish portable Linux x86-64 musl and macOS ARM64/Intel archives
-with SHA-256 checksum files. The Linux archive statically links musl and
-vendored OpenSSL. The macOS archives retain only Apple system-library
-linkage. Built-ins are embedded, so those archives do not contain a separate
-`builtins/` directory. Releases continue to include the unchanged Windows
-MSYS2 UCRT64 package and archive.
+Version tags publish the three standalone portable Unix binaries, the zsh and
+Fish integrations, the native Arch package, and a Windows MSYS2 UCRT64 zip.
+The Linux binary statically links musl and vendored OpenSSL. The macOS binaries
+retain only Apple system-library linkage. The Windows zip contains the
+portable `mu.exe`, the Windows zsh integration, `WINDOWS.md`, and `LICENSE`.
+The generated `Cargo.lock` is uploaded as a normal CI artifact but is not part
+of a release. Unix binaries downloaded directly from a release may need their
+executable bit restored with `chmod +x`.
 
 ## Reference
 

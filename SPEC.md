@@ -135,12 +135,14 @@ refresh cached paths. The user must remove the applicable resource directory
 to regenerate it. Applet `argv[0]` dispatch occurs before portable
 initialization.
 
-Version-tag artifacts add portable Linux x86-64 musl and macOS ARM64/Intel
-archives with SHA-256 checksums. The archives omit external built-ins because
-they are embedded. Linux statically links musl and vendored OpenSSL
-with no dynamic library dependency; macOS retains only Apple system-library
-linkage. The existing Windows MSYS2 UCRT64 package and release archive remain
-unchanged and are published alongside them.
+Version-tag artifacts publish standalone portable Linux x86-64 musl and macOS
+ARM64/Intel binaries, the root-level `mu.zsh` and `mu.fish` integrations, the
+native Arch package, and a Windows MSYS2 UCRT64 zip. Linux statically links
+musl and vendored OpenSSL with no dynamic library dependency; macOS retains
+only Apple system-library linkage. The Windows zip contains the portable
+`mu.exe`, the Windows branch's `mu.zsh`, `WINDOWS.md`, and `LICENSE`.
+`Cargo.lock` remains generated build state and is uploaded only as a normal CI
+artifact, never as a release asset.
 
 ### 2.3 Interactive mode lives in shell surfaces
 

@@ -67,6 +67,14 @@ jobs:
           fi
           cargo build --bins --features portable
 
+      - name: Upload resolved Cargo.lock
+        uses: actions/upload-artifact@v7
+        with:
+          name: cargo-lock
+          path: Cargo.lock
+          if-no-files-found: error
+          retention-days: 14
+
       - name: Test shell integrations
         run: |
           zsh -n mu.zsh test.zsh
@@ -121,6 +129,14 @@ jobs:
             -name 'mu-*.pkg.tar.zst' ! -name 'mu-debug-*' -print -quit)
           test -n "$package"
           cp "$package" "$GITHUB_WORKSPACE/"
+
+      - name: Upload the Arch package
+        uses: actions/upload-artifact@v7
+        with:
+          name: native-arch-package
+          path: mu-*.pkg.tar.zst
+          if-no-files-found: error
+          retention-days: 14
 
       - name: Install and smoke-test the native package
         run: |
@@ -217,24 +233,18 @@ jobs:
           cargo tree --target x86_64-unknown-linux-musl \
             --features portable -i openssl-src >/dev/null
 
-      - name: Assemble the portable archive
+      - name: Stage the portable binary
         run: |
           set -euo pipefail
-          archive=mu-linux-x86_64-musl
-          mkdir -p "dist/$archive"
-          cp target/x86_64-unknown-linux-musl/release/mu "dist/$archive/"
-          cp mu.zsh mu.fish README.md SPEC.md LICENSE "dist/$archive/"
-          tar -czf "dist/$archive.tar.gz" -C dist "$archive"
-          (cd dist && sha256sum "$archive.tar.gz" \
-            > SHA256SUMS-linux-x86_64-musl.txt)
+          mkdir -p dist
+          cp target/x86_64-unknown-linux-musl/release/mu \
+            dist/mu-linux-x86_64-musl
 
-      - name: Upload the portable archive
+      - name: Upload the portable binary
         uses: actions/upload-artifact@v7
         with:
           name: portable-linux-x86_64-musl
-          path: |
-            dist/*.tar.gz
-            dist/SHA256SUMS-linux-x86_64-musl.txt
+          path: dist/mu-linux-x86_64-musl
           if-no-files-found: error
           retention-days: 14
 
@@ -300,24 +310,17 @@ jobs:
             exit 1
           fi
 
-      - name: Assemble the portable archive
+      - name: Stage the portable binary
         run: |
           set -euo pipefail
-          archive=mu-macos-${{ matrix.arch }}
-          mkdir -p "dist/$archive"
-          cp target/release/mu "dist/$archive/"
-          cp mu.zsh mu.fish README.md SPEC.md LICENSE "dist/$archive/"
-          tar -czf "dist/$archive.tar.gz" -C dist "$archive"
-          (cd dist && shasum -a 256 "$archive.tar.gz" \
-            > "SHA256SUMS-macos-${{ matrix.arch }}.txt")
+          mkdir -p dist
+          cp target/release/mu "dist/mu-macos-${{ matrix.arch }}"
 
-      - name: Upload the portable archive
+      - name: Upload the portable binary
         uses: actions/upload-artifact@v7
         with:
           name: portable-macos-${{ matrix.arch }}
-          path: |
-            dist/*.tar.gz
-            dist/SHA256SUMS-macos-${{ matrix.arch }}.txt
+          path: dist/mu-macos-${{ matrix.arch }}
           if-no-files-found: error
           retention-days: 14
 
@@ -383,6 +386,9 @@ jobs:
       - name: Lint
         run: cargo clippy --all-targets -- -D warnings
 
+      - name: Build portable binary
+        run: cargo build --release --features portable
+
       - name: Build and test the MSYS2 package
         id: package
         run: |
@@ -420,34 +426,27 @@ jobs:
             | (cd "$smoke" && /ucrt64/libexec/mu/apply_patch.exe)
           grep -qx works "$smoke/smoke.txt"
 
-      - name: Assemble Windows release artifacts
+      - name: Smoke-test the portable binary
+        run: |
+          set -euo pipefail
+          smoke=$(mktemp -d)
+          XDG_CACHE_HOME="$smoke/cache" target/release/mu.exe --help >/dev/null
+          test -f "$smoke/cache/mu/builtins/customize-mu.md"
+
+      - name: Assemble Windows release zip
         run: |
           set -euo pipefail
           archive=dist/mu-windows-msys2-ucrt64
-          mkdir -p \
-            "$archive/bin" \
-            "$archive/libexec" \
-            "$archive/share/zsh/plugins" \
-            "$archive/share/doc" \
-            "$archive/share/licenses"
-          cp /ucrt64/bin/mu.exe "$archive/bin/"
-          cp -a /ucrt64/libexec/mu "$archive/libexec/"
-          cp -a /ucrt64/share/mu "$archive/share/"
-          cp -a /ucrt64/share/zsh/plugins/mu "$archive/share/zsh/plugins/"
-          cp -a /ucrt64/share/doc/mu "$archive/share/doc/"
-          cp -a /ucrt64/share/licenses/mu "$archive/share/licenses/"
+          mkdir -p "$archive"
+          cp target/release/mu.exe "$archive/"
+          cp mu.zsh LICENSE WINDOWS.md "$archive/"
           (cd dist && zip -qr mu-windows-msys2-ucrt64.zip mu-windows-msys2-ucrt64)
-          sha256sum dist/*.pkg.tar.zst dist/*.zip \
-            > dist/SHA256SUMS-windows-msys2-ucrt64.txt
 
       - name: Upload Windows artifacts
         uses: actions/upload-artifact@v7
         with:
           name: windows-msys2-ucrt64
-          path: |
-            dist/*.pkg.tar.zst
-            dist/*.zip
-            dist/SHA256SUMS-windows-msys2-ucrt64.txt
+          path: dist/mu-windows-msys2-ucrt64.zip
           if-no-files-found: error
           retention-days: 14
 
@@ -460,6 +459,7 @@ jobs:
       contents: write
 
     steps:
+      - uses: actions/checkout@v6
       - uses: actions/download-artifact@v8
         with:
           pattern: portable-*
@@ -467,8 +467,33 @@ jobs:
           merge-multiple: true
       - uses: actions/download-artifact@v8
         with:
+          name: native-arch-package
+          path: dist
+      - uses: actions/download-artifact@v8
+        with:
           name: windows-msys2-ucrt64
           path: dist
+
+      - name: Stage shell integrations and verify release assets
+        run: |
+          set -euo pipefail
+          cp mu.zsh mu.fish dist/
+          expected=(
+            mu-linux-x86_64-musl
+            mu-macos-aarch64
+            mu-macos-x86_64
+            mu.zsh
+            mu.fish
+            mu-windows-msys2-ucrt64.zip
+          )
+          package=$(find dist -maxdepth 1 \
+            -name 'mu-*.pkg.tar.zst' -print -quit)
+          test -n "$package"
+          expected+=("$(basename "$package")")
+          for asset in "${expected[@]}"; do
+            test -f "dist/$asset"
+          done
+          test "$(find dist -maxdepth 1 -type f | wc -l)" -eq "${#expected[@]}"
 
       - name: Create or update the GitHub release
         env:
