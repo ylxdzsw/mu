@@ -83,6 +83,7 @@ type ToolCallAccumulator = BTreeMap<usize, (Option<String>, Option<String>, Stri
 struct StreamParseState {
     content: String,
     reasoning_content: String,
+    reasoning_content_present: bool,
     tool_accum: ToolCallAccumulator,
     finish_reason: FinishReason,
     usage: Option<Usage>,
@@ -95,6 +96,7 @@ impl Default for StreamParseState {
         Self {
             content: String::new(),
             reasoning_content: String::new(),
+            reasoning_content_present: false,
             tool_accum: BTreeMap::new(),
             finish_reason: FinishReason::Stop,
             usage: None,
@@ -133,16 +135,15 @@ pub(crate) async fn stream(
         .transpose()?;
     let message = Message::Assistant {
         content: (!state.content.is_empty()).then_some(state.content),
-        reasoning_content: (!state.reasoning_content.is_empty())
+        reasoning_content: state
+            .reasoning_content_present
             .then_some(state.reasoning_content.clone()),
         tool_calls,
-        native_replay: (!state.reasoning_content.is_empty() && has_tool_calls).then(|| {
-            NativeReplay {
-                provider_id: request.model.provider_id.clone(),
-                endpoint: provider.endpoint.clone(),
-                model: request.model.model_id.clone(),
-                payload: NativeReplayPayload::ChatReasoning(state.reasoning_content),
-            }
+        native_replay: (state.reasoning_content_present && has_tool_calls).then(|| NativeReplay {
+            provider_id: request.model.provider_id.clone(),
+            endpoint: provider.endpoint.clone(),
+            model: request.model.model_id.clone(),
+            payload: NativeReplayPayload::ChatReasoning(state.reasoning_content),
         }),
     };
     let native_response = match &message {
@@ -413,6 +414,9 @@ fn consume_sse_buffer(
             }
 
             if let Some(choice) = parsed.choices.first() {
+                if choice.delta.reasoning_content.is_some() {
+                    state.reasoning_content_present = true;
+                }
                 let reasoning_delta = choice
                     .delta
                     .reasoning_content
@@ -648,6 +652,24 @@ mod tests {
         assert_eq!(usage.cache_read_input_tokens, 3);
         assert_eq!(usage.cache_write_input_tokens, Some(2));
         assert_eq!(usage.total_tokens, 17);
+    }
+
+    #[test]
+    fn distinguishes_omitted_reasoning_from_explicit_empty_reasoning() {
+        let mut on_event = |_event: StreamEvent| -> Result<(), ProviderError> { Ok(()) };
+        let mut buffer =
+            "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"\"},\"finish_reason\":null}]}\n\n"
+                .to_string();
+        let mut state = StreamParseState::default();
+        consume_sse_buffer(&mut buffer, &mut state, &mut on_event).unwrap();
+        assert!(state.reasoning_content_present);
+        assert!(state.reasoning_content.is_empty());
+
+        let mut buffer =
+            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":null}]}\n\n".to_string();
+        let mut state = StreamParseState::default();
+        consume_sse_buffer(&mut buffer, &mut state, &mut on_event).unwrap();
+        assert!(!state.reasoning_content_present);
     }
 
     #[test]
@@ -1414,6 +1436,40 @@ mod tests {
             switched_provider_and_model["messages"][0]["reasoning_content"],
             "  exact\\ntrace  "
         );
+    }
+
+    #[test]
+    fn replays_explicit_empty_chat_reasoning() {
+        let message = Message::Assistant {
+            content: None,
+            reasoning_content: Some(String::new()),
+            tool_calls: Some(vec![ToolCall {
+                id: "call_1".into(),
+                function: FunctionCall {
+                    name: "bash".into(),
+                    arguments: "{}".into(),
+                },
+            }]),
+            native_replay: Some(NativeReplay {
+                provider_id: "test".into(),
+                endpoint: CHAT_ENDPOINT.into(),
+                model: "gpt-test".into(),
+                payload: NativeReplayPayload::ChatReasoning(String::new()),
+            }),
+        };
+
+        let body = build_chat_request_body(
+            &RequestOptions {
+                model: test_model(None),
+                cache_key: None,
+            },
+            CHAT_ENDPOINT,
+            &[message],
+            &[],
+        );
+
+        assert_eq!(body["messages"][0]["reasoning_content"], "");
+        assert_eq!(body["messages"][0]["tool_calls"][0]["id"], "call_1");
     }
 
     #[test]

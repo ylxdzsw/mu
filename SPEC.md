@@ -1070,6 +1070,9 @@ Chat Completions request, regardless of provider, model, endpoint, or
 encrypted or signed continuation object. This supports DeepSeek thinking tool
 loops across provider fallback and model switches without model-name
 heuristics.
+Mu distinguishes an omitted `reasoning_content` field from an explicitly empty
+string. An explicit empty string is persisted and replayed when attached to an
+assistant tool-call response; an omitted field remains omitted.
 
 Completed Chat tool arguments are validated after the stream terminates and
 before constructing the successful response: empty/whitespace becomes `{}`, a

@@ -826,6 +826,12 @@ impl<'a> AgentLoop<'a> {
         if call.function.name != "bash" {
             return false;
         }
+        // Schema-invalid readonly calls must take the sequential path so the
+        // normal tool-error persistence can return the validation failure to
+        // the model instead of aborting while preparing a concurrent batch.
+        if bash::parse_args::<bash::BashArgs>(args).is_err() {
+            return false;
+        }
         if bash::execution_mode(args) != ExecutionMode::Concurrent {
             return false;
         }
@@ -1745,6 +1751,10 @@ mod tests {
         barrier_path: String,
     }
 
+    struct InvalidReadonlyThenStopProvider {
+        step: Mutex<usize>,
+    }
+
     #[async_trait(?Send)]
     impl Provider for TwoReadonlyThenStopProvider {
         async fn stream_chat(
@@ -1825,6 +1835,71 @@ mod tests {
                     native_response: None,
                 }),
                 other => panic!("unexpected two-tool provider step {other}"),
+            }
+        }
+    }
+
+    #[async_trait(?Send)]
+    impl Provider for InvalidReadonlyThenStopProvider {
+        async fn stream_chat(
+            &self,
+            _request: &RequestOptions,
+            _messages: &[Message],
+            _tools: &[Value],
+            _on_event: &mut dyn FnMut(crate::provider::StreamEvent) -> Result<(), ProviderError>,
+        ) -> Result<StreamResult, ProviderError> {
+            let mut step = self.step.lock().unwrap();
+            let current = *step;
+            *step += 1;
+            match current {
+                0 => Ok(StreamResult {
+                    message: Message::Assistant {
+                        content: None,
+                        reasoning_content: None,
+                        native_replay: None,
+                        tool_calls: Some(vec![
+                            ToolCall {
+                                id: "call_valid".into(),
+                                function: crate::provider::FunctionCall {
+                                    name: "bash".into(),
+                                    arguments: serde_json::json!({
+                                        "title": "valid",
+                                        "risk": "readonly",
+                                        "command": "printf valid",
+                                    })
+                                    .to_string(),
+                                },
+                            },
+                            ToolCall {
+                                id: "call_invalid".into(),
+                                function: crate::provider::FunctionCall {
+                                    name: "bash".into(),
+                                    arguments: serde_json::json!({
+                                        "description": "missing title",
+                                        "risk": "readonly",
+                                        "command": "printf must-not-run",
+                                    })
+                                    .to_string(),
+                                },
+                            },
+                        ]),
+                    },
+                    finish_reason: FinishReason::ToolCalls,
+                    usage: None,
+                    native_response: None,
+                }),
+                1 => Ok(StreamResult {
+                    message: Message::Assistant {
+                        content: Some("recovered".into()),
+                        reasoning_content: None,
+                        native_replay: None,
+                        tool_calls: None,
+                    },
+                    finish_reason: FinishReason::Stop,
+                    usage: None,
+                    native_response: None,
+                }),
+                other => panic!("unexpected invalid-tool provider step {other}"),
             }
         }
     }
@@ -2213,6 +2288,77 @@ mod tests {
         assert!(tool_messages[0].1.contains("first"));
         assert_eq!(tool_messages[1].0, "call_second");
         assert!(tool_messages[1].1.contains("second"));
+        let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    #[tokio::test]
+    async fn invalid_readonly_bash_in_batch_persists_error_and_turn_continues() {
+        let tmp = std::env::temp_dir().join(format!(
+            "mu-agent-invalid-concurrent-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let store = Store::open(&tmp.join("mu.db")).unwrap();
+        let session = store.create_session("/tmp").unwrap();
+        let config = test_config();
+        let request_model = crate::models::resolve_model_ref(&config, "test/fake-model").unwrap();
+        store
+            .append_message(
+                &session.id,
+                &Message::System {
+                    content: "system".into(),
+                },
+            )
+            .unwrap();
+        store
+            .append_message(
+                &session.id,
+                &Message::User {
+                    content: UserContent::Text("run both".into()),
+                },
+            )
+            .unwrap();
+        let provider = Box::new(InvalidReadonlyThenStopProvider {
+            step: Mutex::new(0),
+        });
+        let mut renderer = Renderer::with_format(OutputFormat::Detail);
+        let mut agent = AgentLoop {
+            config: &config,
+            model: ResolvedModelChoice::fixed(request_model.clone()),
+            provider,
+            store: &store,
+            session_id: &session.id,
+            request: RequestOptions {
+                model: request_model,
+                cache_key: None,
+            },
+            model_context_window: None,
+            renderer: &mut renderer,
+        };
+
+        let result = agent.run_turn().await.unwrap();
+
+        assert_eq!(result.final_assistant.as_deref(), Some("recovered"));
+        let tool_messages: Vec<_> = store
+            .load_context_messages(&session.id)
+            .unwrap()
+            .into_iter()
+            .filter_map(|message| match message {
+                Message::Tool {
+                    content,
+                    tool_call_id,
+                    ..
+                } => Some((tool_call_id, content)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(tool_messages.len(), 2);
+        assert_eq!(tool_messages[0].0, "call_valid");
+        assert!(tool_messages[0].1.starts_with("valid\n"));
+        assert!(tool_messages[0].1.contains("[exit code: 0]"));
+        assert_eq!(tool_messages[1].0, "call_invalid");
+        assert!(tool_messages[1].1.contains("invalid tool arguments"));
+        assert!(!tool_messages[1].1.contains("must-not-run"));
         let _ = std::fs::remove_dir_all(tmp);
     }
 
