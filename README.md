@@ -6,17 +6,20 @@ as an interactive assistant inside zsh or Fish.
 
 ## Quick start
 
-Build the binary and put it on `PATH`:
+On Linux x86-64, download the latest portable binary and put it on `PATH`:
 
 ```sh
-cargo build --release --features portable
-export PATH="$PWD/target/release:$PATH"
+mkdir -p "$HOME/.local/bin"
+curl --fail --location --show-error \
+  https://github.com/ylxdzsw/mu/releases/latest/download/mu-linux-x86_64-musl \
+  --output "$HOME/.local/bin/mu"
+chmod +x "$HOME/.local/bin/mu"
+export PATH="$HOME/.local/bin:$PATH"
 ```
 
-The `portable` feature uses vendored OpenSSL where OpenSSL is the platform TLS
-backend and embeds Mu's built-in skills, so this source-tree binary can run
-without being installed. On its first normal invocation it
-writes the built-ins and three applet symlinks into your user cache.
+Add `$HOME/.local/bin` to your shell startup file if it is not already on
+`PATH`. The release binary embeds Mu's built-in skills and writes them plus
+three applet symlinks into your user cache on its first normal invocation.
 
 Now ask it something:
 
@@ -40,18 +43,32 @@ mu -c <<< 'Now identify the riskiest change.'
 ## Interactive shell usage
 
 The most comfortable way to use `mu` is right inside your shell. For zsh,
-source the included plugin from `.zshrc`:
+download the latest integration and source it from `.zshrc`:
+
+```sh
+mkdir -p "$HOME/.local/share/mu"
+curl --fail --location --show-error \
+  https://github.com/ylxdzsw/mu/releases/latest/download/mu.zsh \
+  --output "$HOME/.local/share/mu/mu.zsh"
+```
 
 ```zsh
-source /path/to/mu/mu.zsh
+source "$HOME/.local/share/mu/mu.zsh"
 # Arch package: source /usr/share/zsh/plugins/mu/mu.zsh
 ```
 
-For Fish 4 or newer, source the Fish plugin near the end of `config.fish`, after
-your prompt and key bindings:
+For Fish 4 or newer, download the latest integration and source it near the end
+of `config.fish`, after your prompt and key bindings:
+
+```sh
+mkdir -p "$HOME/.local/share/mu"
+curl --fail --location --show-error \
+  https://github.com/ylxdzsw/mu/releases/latest/download/mu.fish \
+  --output "$HOME/.local/share/mu/mu.fish"
+```
 
 ```fish
-source /path/to/mu/mu.fish
+source "$HOME/.local/share/mu/mu.fish"
 # The Arch package also loads /usr/share/fish/vendor_conf.d/mu.fish.
 # Source that file again at the end of config.fish if later configuration
 # replaces its prompt wrappers or Tab bindings.
