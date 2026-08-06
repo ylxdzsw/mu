@@ -22,6 +22,24 @@ pub struct InvocationOverrides {
 pub struct ResolvedInvocation {
     pub attached_session: Option<Session>,
     pub model: ResolvedModelChoice,
+    pub model_fallback: Option<ModelFallback>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelFallback {
+    pub remembered: String,
+    pub selected: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct ResolvedModelSelection {
+    pub model: ResolvedModelChoice,
+    pub fallback: Option<ModelFallback>,
+}
+
+struct RememberedModelSelection {
+    model: ResolvedModelChoice,
+    unavailable: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -126,38 +144,49 @@ pub fn resolve_invocation(
         None
     };
 
-    let mut model = if let Some(model_ref) = overrides.model.as_deref() {
-        resolve_model_choice(config, model_ref)?
+    let mut selection = if let Some(model_ref) = overrides.model.as_deref() {
+        RememberedModelSelection {
+            model: resolve_model_choice(config, model_ref)?,
+            unavailable: None,
+        }
     } else if let Some(session) = attached_session.as_ref() {
-        resolve_session_model(store, config, session)?
+        resolve_session_selection(store, config, session)?
     } else {
-        resolve_scope_model(store, config)?
+        resolve_scope_selection(store, config)?
     };
     if attached_session.is_none() {
-        model.reset();
+        selection.model.reset();
     } else if overrides.model.is_some()
         && let Some(session) = attached_session.as_ref()
     {
-        resume_session_fallback(store, config, &session.id, &mut model)?;
+        resume_session_fallback(store, config, &session.id, &mut selection.model)?;
     }
+    let selection = finish_selection(selection);
 
     Ok(ResolvedInvocation {
         attached_session,
-        model,
+        model: selection.model,
+        model_fallback: selection.fallback,
     })
 }
 
-pub fn resolve_scope_model(store: &Store, config: &Config) -> Result<ResolvedModelChoice> {
-    if let Some(model) = store
+fn resolve_scope_selection(store: &Store, config: &Config) -> Result<RememberedModelSelection> {
+    let remembered = store
         .current_session()?
-        .and_then(|session| session.last_model)
+        .and_then(|session| session.last_model);
+    if let Some(model_ref) = remembered.as_deref()
+        && let Ok(mut model) = resolve_model_choice(config, model_ref)
     {
-        let mut choice = resolve_model_choice(config, &model)?;
-        choice.reset();
-        Ok(choice)
-    } else {
-        first_model_choice(config)
+        model.reset();
+        return Ok(RememberedModelSelection {
+            model,
+            unavailable: None,
+        });
     }
+    Ok(RememberedModelSelection {
+        model: first_model_choice(config)?,
+        unavailable: remembered,
+    })
 }
 
 pub fn resolve_session_model(
@@ -165,32 +194,80 @@ pub fn resolve_session_model(
     config: &Config,
     session: &Session,
 ) -> Result<ResolvedModelChoice> {
-    let mut choice = if let Some(model) = session.last_model.as_deref() {
-        resolve_model_choice(config, model)
-    } else {
-        resolve_scope_model(store, config)
-    }?;
-    resume_session_fallback(store, config, &session.id, &mut choice)?;
-    Ok(choice)
+    Ok(resolve_session_selection(store, config, session)?.model)
 }
 
+fn resolve_session_selection(
+    store: &Store,
+    config: &Config,
+    session: &Session,
+) -> Result<RememberedModelSelection> {
+    let mut selection = match session.last_model.as_deref() {
+        Some(model_ref) => match resolve_model_choice(config, model_ref) {
+            Ok(model) => RememberedModelSelection {
+                model,
+                unavailable: None,
+            },
+            Err(_) => {
+                let mut selection = resolve_scope_selection(store, config)?;
+                selection.unavailable = Some(model_ref.to_string());
+                selection
+            }
+        },
+        None => resolve_scope_selection(store, config)?,
+    };
+    resume_session_fallback(store, config, &session.id, &mut selection.model)?;
+    Ok(selection)
+}
+
+#[cfg(test)]
 pub fn resolve_retry_model(
     store: &Store,
     config: &Config,
     session: &Session,
     override_ref: Option<&str>,
 ) -> Result<ResolvedModelChoice> {
+    Ok(resolve_retry_model_selection(store, config, session, override_ref)?.model)
+}
+
+pub fn resolve_retry_model_selection(
+    store: &Store,
+    config: &Config,
+    session: &Session,
+    override_ref: Option<&str>,
+) -> Result<ResolvedModelSelection> {
     if let Some(model) = override_ref {
         let mut choice = resolve_model_choice(config, model)?;
         resume_session_fallback(store, config, &session.id, &mut choice)?;
-        return Ok(choice);
+        return Ok(finish_selection(RememberedModelSelection {
+            model: choice,
+            unavailable: None,
+        }));
     }
     if let Some(model) = store.latest_attempt_model(&session.id)? {
-        let mut choice = resolve_model_choice(config, &model)?;
-        resume_session_fallback(store, config, &session.id, &mut choice)?;
-        return Ok(choice);
+        if let Ok(mut choice) = resolve_model_choice(config, &model) {
+            resume_session_fallback(store, config, &session.id, &mut choice)?;
+            return Ok(finish_selection(RememberedModelSelection {
+                model: choice,
+                unavailable: None,
+            }));
+        }
+        let mut selection = resolve_session_selection(store, config, session)?;
+        selection.unavailable = Some(model);
+        return Ok(finish_selection(selection));
     }
-    resolve_session_model(store, config, session)
+    resolve_session_selection(store, config, session).map(finish_selection)
+}
+
+fn finish_selection(selection: RememberedModelSelection) -> ResolvedModelSelection {
+    let fallback = selection.unavailable.map(|remembered| ModelFallback {
+        remembered,
+        selected: selection.model.active_model().canonical.clone(),
+    });
+    ResolvedModelSelection {
+        model: selection.model,
+        fallback,
+    }
 }
 
 pub fn resume_session_fallback(
@@ -602,6 +679,98 @@ mod tests {
         assert_eq!(
             resolved.model.active_model().canonical,
             "alpha/default-model:low"
+        );
+        assert!(
+            resolve_invocation(
+                &store,
+                &test_config(),
+                &InvocationOverrides {
+                    model: Some("alpha/removed-model".into()),
+                    ..Default::default()
+                },
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn removed_scope_model_falls_back_for_status() {
+        let store = Store::open_memory().unwrap();
+        let session = store.create_session("/tmp").unwrap();
+        finish_attempt(
+            &store,
+            &session.id,
+            "(removed)/removed-model:high",
+            "completed",
+        );
+        store.select_session(&session.id).unwrap();
+
+        let resolved =
+            resolve_invocation(&store, &test_config(), &InvocationOverrides::default()).unwrap();
+        let report = build_status_report(
+            &store,
+            &test_config(),
+            &InvocationOverrides::default(),
+            None,
+            StatusIncludes::default(),
+            None,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(
+            resolved.model.active_model().canonical,
+            "alpha/default-model"
+        );
+        assert_eq!(
+            resolved.model_fallback,
+            Some(ModelFallback {
+                remembered: "(removed)/removed-model:high".into(),
+                selected: "alpha/default-model".into(),
+            })
+        );
+        assert_eq!(report.model.canonical, "alpha/default-model");
+    }
+
+    #[test]
+    fn removed_attached_and_retry_models_continue_resolution_precedence() {
+        let store = Store::open_memory().unwrap();
+        let attached = store.create_session("/tmp").unwrap();
+        finish_attempt(&store, &attached.id, "removed/removed-model", "completed");
+        let current = store.create_session("/tmp").unwrap();
+        finish_attempt(&store, &current.id, "alpha/other-model:high", "completed");
+        store.select_session(&current.id).unwrap();
+        let attached = store.get_session(&attached.id).unwrap().unwrap();
+
+        let resolved = resolve_invocation(
+            &store,
+            &test_config(),
+            &InvocationOverrides {
+                session: Some(attached.id.clone()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let retry = resolve_retry_model_selection(&store, &test_config(), &attached, None).unwrap();
+
+        assert_eq!(
+            resolved.model.active_model().canonical,
+            "alpha/other-model:high"
+        );
+        assert_eq!(
+            resolved.model_fallback.as_ref().unwrap().remembered,
+            "removed/removed-model"
+        );
+        assert_eq!(
+            retry.model.active_model().canonical,
+            "alpha/other-model:high"
+        );
+        assert_eq!(
+            retry.fallback,
+            Some(ModelFallback {
+                remembered: "removed/removed-model".into(),
+                selected: "alpha/other-model:high".into(),
+            })
         );
     }
 

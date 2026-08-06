@@ -419,7 +419,12 @@ function _mu_fish_slash_command_candidates
 end
 
 function _mu_fish_model_records
-    set -l json (_mu_fish_status_json --include-models | string collect); or return 1
+    _mu_fish_sync_state
+    set -l command "$MU_FISH_BIN" status --json --include-models
+    set -q MU_FISH_EFFECTIVE_SESSION_ID[1]; and test -n "$MU_FISH_EFFECTIVE_SESSION_ID"; and set -a command -s "$MU_FISH_EFFECTIVE_SESSION_ID"
+    set -l json ($command 2>/dev/null | string collect)
+    set -l command_status $pipestatus[1]
+    test $command_status -eq 0; or return $command_status
     command -q jq; or return 1
     printf '%s' "$json" | jq -r '
         .available_models.providers[]? as $provider

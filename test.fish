@@ -178,6 +178,12 @@ contains :low $efforts; or fail 'effort candidates include low'
 contains :high $efforts; or fail 'effort candidates include high'
 set shared_efforts (_mu_fish_model_effort_suffixes shared)
 contains :medium $shared_efforts; or fail 'floating effort candidates merge provider suggestions'
+set -g MU_FISH_MODEL unknown
+_mu_fish_sync_state
+set models (_mu_fish_model_candidates gp)
+contains openai/gpt $models; or fail 'stale model override does not block model discovery'
+set -g MU_FISH_MODEL openai/gpt
+_mu_fish_sync_state
 assert_equal (_mu_fish_common_prefix 'file*one' 'file*two') 'file*' 'common prefix treats wildcard characters literally'
 set literal_matches (_mu_fish_matching_candidates 'file*' 'file*star' file-other)
 assert_equal (string join \x1e -- $literal_matches) 'file*star' 'candidate matching treats wildcard characters literally'

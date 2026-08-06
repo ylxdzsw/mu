@@ -429,6 +429,11 @@ model_candidates=("${(@f)$(_mu_zsh_model_completion_candidates "gpt:")}")
 [[ " ${(j: :)model_candidates} " == *" gpt:provider-custom "* ]] || fail "shows provider-defined effort strings"
 [[ " ${(j: :)model_candidates} " == *" shared:low "* ]] || fail "merges first floating-model provider efforts"
 [[ " ${(j: :)model_candidates} " == *" shared:medium "* ]] || fail "merges floating-model effort suggestions"
+MU_ZSH_MODEL=invalid/removed
+_mu_zsh_sync_state
+model_candidates=("${(@f)$(_mu_zsh_model_completion_candidates "")}")
+[[ " ${(j: :)model_candidates} " == *" openai/gpt "* ]] || fail "stale model override does not block model discovery"
+_mu_zsh_clear_model_state
 BUFFER="/model openai/gpt:h"
 CURSOR=${#BUFFER}
 completion_candidates=("${(@f)$(_mu_zsh_completion_candidates)}")

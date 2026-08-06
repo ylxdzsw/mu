@@ -364,10 +364,13 @@ This is the exact sequence the binary follows for one turn invocation:
    - Otherwise create `sessions/<id>.jsonl` atomically, retrying a fresh short
      random ID on collision, then sync its meta and system-prompt records.
    Resolve the model choice from an explicit `--model`, else the attached
-   session's latest agent/compaction provider request, else the old
-   `current-session` target's latest choice, else the first configured model.
-   An attached session restores its own floating provider position. A new
-   session inherits only the choice and starts at candidate zero.
+   session's latest agent/compaction provider request if it is still configured,
+   else the old `current-session` target's latest choice if it is still
+   configured, else the first configured model. An explicit unavailable model
+   is an error; an unavailable historical choice is skipped and reported when a
+   turn uses the fallback. An attached session restores its own floating
+   provider position. A new session inherits only the choice and starts at
+   candidate zero.
 5. **Acquire session ownership** (§11) with nonblocking exclusive `flock` on
    the journal. If it is already held, print `session busy` and exit non-zero.
 6. **Normalize any interrupted tail, then build the context list.** If the
@@ -1201,13 +1204,17 @@ references neither update nor erase floating positions. A new session starts
 each floating model at candidate zero. If a remembered provider disappears,
 that history entry is ignored and the next older valid position for the model
 is used; if none exists, the rebuilt chain starts at candidate zero. If the
-model has no candidates, resolution fails. Status and provider origins render
-floating choices as `(provider)/model[:effort]`.
+model has no candidates, explicit resolution fails. A historical choice with
+no candidates is unavailable and model selection continues. Status and
+provider origins render floating choices as `(provider)/model[:effort]`.
 
 Without an explicit override, model selection follows the attached session's
-latest eligible choice, then the `current-session` target's choice without its
-floating position, then the first configured fixed model. API keys are read
-from environment variables and are never persisted.
+latest choice if still configured, then the `current-session` target's latest
+choice if still configured and without its floating position, then the first
+configured fixed model. Mu does not rewrite an unavailable historical choice
+during resolution; the next successful provider request naturally becomes the
+latest choice. API keys are read from environment variables and are never
+persisted.
 
 **No provider, hard fail.** If no provider is configured, a provider has no
 valid supported endpoint, or a non-empty configured key env var is unset, a *turn* invocation

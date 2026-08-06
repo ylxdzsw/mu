@@ -440,8 +440,12 @@ _mu_zsh_has_custom_slash_command() {
 _mu_zsh_model_completion_candidates() {
   local fragment=$1
   local suffix_only=${2:-0}
+  local -a command
   local json
-  json=$(_mu_zsh_status_json --include-models) || return 1
+  _mu_zsh_sync_state
+  command=("$MU_ZSH_BIN" status --json --include-models)
+  [[ -n "$MU_ZSH_EFFECTIVE_SESSION_ID" ]] && command+=(-s "$MU_ZSH_EFFECTIVE_SESSION_ID")
+  json=$("${command[@]}" 2>/dev/null) || return 1
   command -v jq >/dev/null 2>&1 || return 1
   jq -r --arg fragment "$fragment" --arg suffix_only "$suffix_only" '
     def dedup:

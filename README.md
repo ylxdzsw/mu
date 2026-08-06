@@ -290,8 +290,11 @@ session always starts a floating choice from its first configured provider,
 even when it inherits the choice from the current session.
 
 Reorder providers in `config.jsonc` to change fallback order or the fixed
-default. Any OpenAI-compatible endpoint works; edit the endpoint, API-key
-environment variable, and model list to match your provider.
+default. If a session's last model is removed from the config, Mu continues
+through the normal selection order and reports the configured model it uses
+instead; an explicit unavailable `--model` remains an error. Any
+OpenAI-compatible endpoint works; edit the endpoint, API-key environment
+variable, and model list to match your provider.
 
 Chat Completions `reasoning_content` is replayed between all Chat Completions
 models. Opaque Responses and signed Anthropic continuation state is replayed

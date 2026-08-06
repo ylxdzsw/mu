@@ -45,7 +45,7 @@ use provider::{ContentPart, UserContent};
 use renderer::Renderer;
 use runtime::{
     InvocationOverrides, StatusIncludes, StatusReport, build_status_report, resolve_invocation,
-    resolve_retry_model, resolve_session_model,
+    resolve_retry_model_selection, resolve_session_model,
 };
 
 const MAX_SUBAGENT_TURN_DEPTH: u32 = 1;
@@ -108,6 +108,7 @@ struct RunTurnArgs<'a> {
     output: cli::OutputFormat,
     /// A short notice rendered before the turn (e.g. "resuming interrupted turn").
     preamble_notice: Option<&'a str>,
+    model_fallback: Option<runtime::ModelFallback>,
     compact_at_turn_boundary: bool,
 }
 
@@ -544,7 +545,7 @@ async fn run() -> Result<()> {
                 )
             })?;
 
-            let model = resolve_retry_model(
+            let selection = resolve_retry_model_selection(
                 &store,
                 &config,
                 &session,
@@ -555,9 +556,10 @@ async fn run() -> Result<()> {
                 config: &config,
                 store: &store,
                 session_id: &session.id,
-                model,
+                model: selection.model,
                 output,
                 preamble_notice: Some("[mu] resuming interrupted turn"),
+                model_fallback: selection.fallback,
                 compact_at_turn_boundary: false,
             })
             .await?;
@@ -696,6 +698,7 @@ async fn run_turn_from_source(
         model: resolved.model,
         output,
         preamble_notice: None,
+        model_fallback: resolved.model_fallback,
         compact_at_turn_boundary: true,
     })
     .await?;
@@ -875,6 +878,7 @@ async fn run_turn(args: RunTurnArgs<'_>) -> Result<()> {
         model,
         output,
         preamble_notice,
+        model_fallback,
         compact_at_turn_boundary,
     } = args;
     let request = RequestOptions::for_session(model.active_model().clone(), session_id, "agent");
@@ -890,6 +894,12 @@ async fn run_turn(args: RunTurnArgs<'_>) -> Result<()> {
     let turn_started = Instant::now();
     if let Some(notice) = preamble_notice {
         renderer.notice(notice)?;
+    }
+    if let Some(fallback) = model_fallback {
+        renderer.notice(&format!(
+            "[mu] remembered model {} is no longer configured; using {}",
+            fallback.remembered, fallback.selected
+        ))?;
     }
     let mut agent = agent::AgentLoop {
         config,
