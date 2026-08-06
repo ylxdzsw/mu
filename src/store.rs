@@ -1390,6 +1390,16 @@ impl Store {
             };
             let tools = self.read_object(&recipe.toolset)?;
             let tools: Vec<Value> = serde_json::from_slice(&tools)?;
+            let cache_key = recipe
+                .envelope
+                .get("prompt_cache_key")
+                .map(|value| {
+                    value
+                        .as_str()
+                        .context("provider request prompt_cache_key is not a string")
+                })
+                .transpose()?
+                .map(str::to_owned);
             let options = RequestOptions {
                 model: ResolvedModelRef {
                     canonical: origin.canonical_model_ref.clone(),
@@ -1397,6 +1407,7 @@ impl Store {
                     model_id: origin.wire_model.clone(),
                     effort: origin.effort.clone(),
                 },
+                cache_key,
             };
             match recipe.format.as_str() {
                 "openai.chat_completions.v1" => crate::chat_completions::build_chat_request_body(
@@ -2868,6 +2879,7 @@ mod tests {
                 model_id: "model".into(),
                 effort: Some("high".into()),
             },
+            cache_key: Some(format!("mu:{}:agent", session.id)),
         };
         let endpoint = "https://example.test/v1/chat/completions";
         let native =
@@ -2883,6 +2895,10 @@ mod tests {
                 &tools,
             )
             .unwrap();
+        assert_eq!(
+            recipe.envelope["prompt_cache_key"],
+            format!("mu:{}:agent", session.id)
+        );
         let exchange = store
             .start_provider_request(
                 &session.id,
@@ -2977,6 +2993,7 @@ mod tests {
                 model_id: "other-model".into(),
                 effort: None,
             },
+            cache_key: None,
         };
         let endpoint = "https://target.test/v1/chat/completions";
         let tools = vec![serde_json::json!({"type":"function","function":{"name":"bash"}})];

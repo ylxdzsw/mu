@@ -638,6 +638,7 @@ mod tests {
                 model_id: "claude-opus-5".into(),
                 effort: effort.map(str::to_owned),
             },
+            cache_key: None,
         }
     }
 
@@ -660,8 +661,10 @@ mod tests {
 
     #[test]
     fn builds_latest_messages_request_with_fixed_limits_and_tools() {
+        let mut request = request(Some("max"));
+        request.cache_key = Some("mu:ses_test:agent".into());
         let body = build_request_body(
-            &request(Some("max")),
+            &request,
             ENDPOINT,
             &[
                 system(),
@@ -692,6 +695,7 @@ mod tests {
         assert_eq!(body["thinking"]["display"], "summarized");
         assert_eq!(body["output_config"]["effort"], "max");
         assert_eq!(body["cache_control"]["type"], "ephemeral");
+        assert!(body.get("prompt_cache_key").is_none());
         assert_eq!(body["tools"][0]["name"], "bash");
         assert_eq!(body["tools"][0]["input_schema"]["required"][0], "command");
         assert!(body["tools"][0].get("strict").is_none());

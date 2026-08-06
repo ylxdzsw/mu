@@ -576,9 +576,8 @@ async fn run() -> Result<()> {
                 .get_session(&session)?
                 .ok_or_else(|| ExitError::session_not_found(&session))?;
             let mut model = resolve_session_model(&store, &config, &session_state)?;
-            let request = RequestOptions {
-                model: model.active_model().clone(),
-            };
+            let request =
+                RequestOptions::for_session(model.active_model().clone(), &session, "compaction");
             let mut provider = build_provider(&config, &request.model.provider_id)?;
             let _lock = acquire_session_lock_or_exit(&store, &session, cli::OutputFormat::Detail)?;
             store.normalize_interrupted_tail(&session)?;
@@ -878,9 +877,7 @@ async fn run_turn(args: RunTurnArgs<'_>) -> Result<()> {
         preamble_notice,
         compact_at_turn_boundary,
     } = args;
-    let request = RequestOptions {
-        model: model.active_model().clone(),
-    };
+    let request = RequestOptions::for_session(model.active_model().clone(), session_id, "agent");
     let model_context_window = models::resolve_model_info(config, &request.model).context_window;
     let provider = build_provider(config, &request.model.provider_id)?;
 

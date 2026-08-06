@@ -102,6 +102,9 @@ pub(crate) fn build_responses_request_body(
         "store": false,
         "include": ["reasoning.encrypted_content"]
     });
+    if let Some(cache_key) = request.cache_key.as_deref() {
+        body["prompt_cache_key"] = Value::String(cache_key.to_string());
+    }
     let mut reasoning = serde_json::Map::new();
     reasoning.insert("summary".into(), Value::String("auto".into()));
     if let Some(effort) = request.model.effort.as_deref() {

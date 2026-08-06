@@ -1861,6 +1861,7 @@ mod tests {
             session_id: &session.id,
             request: RequestOptions {
                 model: request_model,
+                cache_key: None,
             },
             model_context_window: None,
             renderer: &mut renderer,
@@ -1962,6 +1963,7 @@ mod tests {
             session_id: &session.id,
             request: RequestOptions {
                 model: request_model,
+                cache_key: None,
             },
             model_context_window: None,
             renderer: &mut renderer,
@@ -2028,6 +2030,7 @@ mod tests {
             session_id: &session.id,
             request: RequestOptions {
                 model: request_model,
+                cache_key: None,
             },
             model_context_window: None,
             renderer: &mut renderer,
@@ -2079,6 +2082,7 @@ mod tests {
             session_id: &session.id,
             request: RequestOptions {
                 model: request_model,
+                cache_key: None,
             },
             model_context_window: None,
             renderer: &mut renderer,
@@ -2150,6 +2154,7 @@ mod tests {
             session_id: &session.id,
             request: RequestOptions {
                 model: request_model,
+                cache_key: None,
             },
             model_context_window: None,
             renderer: &mut renderer,
@@ -2382,6 +2387,7 @@ mod tests {
             session_id: &session.id,
             request: RequestOptions {
                 model: request_model,
+                cache_key: None,
             },
             // At 200K, the hard threshold is 152K tokens. The ~620KB tool result
             // pushes the bytes/4 estimate past it without crossing soft at the boundary.
@@ -2461,6 +2467,7 @@ mod tests {
             session_id: &new_turn_session.id,
             request: RequestOptions {
                 model: request_model.clone(),
+                cache_key: None,
             },
             model_context_window: Some(200_000),
             renderer: &mut renderer,
@@ -2484,6 +2491,7 @@ mod tests {
             session_id: &retry_session.id,
             request: RequestOptions {
                 model: request_model,
+                cache_key: None,
             },
             model_context_window: Some(200_000),
             renderer: &mut renderer,
@@ -2598,6 +2606,7 @@ mod tests {
             session_id: &session.id,
             request: RequestOptions {
                 model: request_model,
+                cache_key: None,
             },
             model_context_window: None,
             renderer: &mut renderer,
@@ -2695,6 +2704,7 @@ mod tests {
             session_id: &session.id,
             request: RequestOptions {
                 model: request_model,
+                cache_key: None,
             },
             model_context_window: None,
             renderer: &mut renderer,

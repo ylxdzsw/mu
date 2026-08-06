@@ -1047,11 +1047,16 @@ entry per endpoint.
 All adapters accept the semantic transcript and Mu's `bash` function schema,
 stream protocol-neutral text/reasoning/tool-call events, and return a semantic
 assistant result plus usage. The renderer, tool executor, guardrail, retries,
-and compaction remain protocol-neutral.
+and compaction remain protocol-neutral. Each request also receives a stable
+cache-affinity key `mu:<session-id>:<purpose>`, where purpose is `agent`,
+`compaction`, or `guardrail`. Retries and provider/model fallback keep the same
+key. Chat Completions and Responses lower it to top-level `prompt_cache_key`;
+Anthropic Messages ignores it and uses its native prompt-cache controls.
 
 **Chat Completions.** Mu posts directly to the configured endpoint with
 `messages`, the Chat function wrapper, `stream:true`, and
-`stream_options:{include_usage:true}`. It accumulates indexed
+`stream_options:{include_usage:true}`, plus the request's
+`prompt_cache_key`. It accumulates indexed
 `delta.tool_calls`, assistant text, and optional `reasoning_content`. A resolved
 effort is sent as top-level `reasoning_effort`. Complete reasoning attached to
 an assistant tool-call response is persisted and replayed verbatim on every
@@ -1072,7 +1077,8 @@ absent. Present non-`u64` values remain protocol errors.
 
 **Responses.** Mu posts directly to the configured endpoint with `stream:true`,
 `store:false`, `include:["reasoning.encrypted_content"]`, locally reconstructed
-`input`, and a flat Responses function-tool definition. It never sends
+`input`, the request's `prompt_cache_key`, and a flat Responses function-tool
+definition. It never sends
 `previous_response_id` or a conversation identifier. Every request opts into
 reasoning summaries with `reasoning:{summary:"auto"}` and adds `effort` to that
 object when one is resolved. Providers that reject the summary option fail the
@@ -1525,7 +1531,10 @@ Conceptual event model:
   purpose (`agent`, `compaction`, or `guardrail`), exchange, canonical model
   reference, provider/API/endpoint/wire model, effort, and a versioned request
   recipe. Recipes reference semantic context by sequence and exact toolsets by
-  object hash; their checksum verifies reconstructed native request JSON.
+  object hash; their envelope retains the exact `prompt_cache_key` when the
+  protocol sends one, and their checksum verifies reconstructed native request
+  JSON. Reconstruction reuses that recorded key rather than deriving a current
+  value; older keyless recipes remain keyless.
 - **`provider_completed`** stores one assembled native response object plus the
   semantic projection accepted at that time. Assistant projections contain
   text/reasoning/native replay and all immutable Bash claims; compaction

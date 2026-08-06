@@ -208,6 +208,9 @@ pub(crate) fn build_chat_request_body(
         "stream": true,
         "stream_options": { "include_usage": true }
     });
+    if let Some(cache_key) = request.cache_key.as_deref() {
+        body["prompt_cache_key"] = Value::String(cache_key.to_string());
+    }
     if let Some(effort) = request.model.effort.as_deref() {
         // Chat Completions uses a top-level `reasoning_effort` string. (The
         // nested `reasoning: { effort }` object is the Responses API shape and
@@ -875,6 +878,7 @@ mod tests {
         let body = build_chat_request_body(
             &RequestOptions {
                 model: test_model(Some("provider-custom")),
+                cache_key: None,
             },
             CHAT_ENDPOINT,
             &[],
@@ -882,6 +886,24 @@ mod tests {
         );
 
         assert_eq!(body["reasoning_effort"], "provider-custom");
+    }
+
+    #[test]
+    fn chat_and_responses_requests_include_stable_session_cache_key() {
+        let request = RequestOptions::for_session(test_model(None), "ses_test", "agent");
+        let same = RequestOptions::for_session(test_model(Some("high")), "ses_test", "agent");
+        let compaction = RequestOptions::for_session(test_model(None), "ses_test", "compaction");
+
+        assert_eq!(request.cache_key.as_deref(), Some("mu:ses_test:agent"));
+        assert_eq!(request.cache_key, same.cache_key);
+        assert_ne!(request.cache_key, compaction.cache_key);
+
+        let chat = build_chat_request_body(&request, CHAT_ENDPOINT, &[], &[]);
+        let responses =
+            build_responses_request_body(&request, "https://api.test/v1/responses", &[], &[])
+                .unwrap();
+        assert_eq!(chat["prompt_cache_key"], "mu:ses_test:agent");
+        assert_eq!(responses["prompt_cache_key"], "mu:ses_test:agent");
     }
 
     #[test]
@@ -911,6 +933,7 @@ mod tests {
         let body = build_chat_request_body(
             &RequestOptions {
                 model: test_model(None),
+                cache_key: None,
             },
             CHAT_ENDPOINT,
             &messages,
@@ -959,6 +982,7 @@ mod tests {
         let body = build_responses_request_body(
             &RequestOptions {
                 model: test_model(Some("max")),
+                cache_key: None,
             },
             "https://api.test/v1/responses",
             &messages,
@@ -988,6 +1012,7 @@ mod tests {
         let body = build_responses_request_body(
             &RequestOptions {
                 model: test_model(None),
+                cache_key: None,
             },
             "https://api.test/v1/responses",
             &[],
@@ -1032,6 +1057,7 @@ mod tests {
         let matching = build_responses_request_body(
             &RequestOptions {
                 model: test_model(None),
+                cache_key: None,
             },
             "https://api.test/v1/responses",
             &messages,
@@ -1048,6 +1074,7 @@ mod tests {
         let switched = build_responses_request_body(
             &RequestOptions {
                 model: switched_model,
+                cache_key: None,
             },
             "https://other.test/responses",
             &messages,
@@ -1078,6 +1105,7 @@ mod tests {
         let responses = build_responses_request_body(
             &RequestOptions {
                 model: test_model(None),
+                cache_key: None,
             },
             "https://api.test/v1/responses",
             &messages,
@@ -1091,6 +1119,7 @@ mod tests {
         let chat = build_chat_request_body(
             &RequestOptions {
                 model: test_model(None),
+                cache_key: None,
             },
             CHAT_ENDPOINT,
             &messages,
@@ -1130,6 +1159,7 @@ mod tests {
         let chat = build_chat_request_body(
             &RequestOptions {
                 model: test_model(None),
+                cache_key: None,
             },
             CHAT_ENDPOINT,
             &messages,
@@ -1164,6 +1194,7 @@ mod tests {
         let responses = build_responses_request_body(
             &RequestOptions {
                 model: test_model(None),
+                cache_key: None,
             },
             "https://api.test/v1/responses",
             &[from_chat],
@@ -1189,6 +1220,7 @@ mod tests {
         let chat = build_chat_request_body(
             &RequestOptions {
                 model: test_model(None),
+                cache_key: None,
             },
             CHAT_ENDPOINT,
             &[from_responses],
@@ -1204,6 +1236,7 @@ mod tests {
         let error = build_responses_request_body(
             &RequestOptions {
                 model: test_model(None),
+                cache_key: None,
             },
             "https://api.test/v1/responses",
             &[Message::User {
@@ -1342,6 +1375,7 @@ mod tests {
         let matching = build_chat_request_body(
             &RequestOptions {
                 model: test_model(None),
+                cache_key: None,
             },
             CHAT_ENDPOINT,
             &messages,
@@ -1354,6 +1388,7 @@ mod tests {
         let switched_endpoint = build_chat_request_body(
             &RequestOptions {
                 model: test_model(None),
+                cache_key: None,
             },
             "https://other.test/chat/completions",
             &messages,
@@ -1369,6 +1404,7 @@ mod tests {
         let switched_provider_and_model = build_chat_request_body(
             &RequestOptions {
                 model: other_provider,
+                cache_key: None,
             },
             CHAT_ENDPOINT,
             &messages,
@@ -1467,6 +1503,7 @@ mod tests {
 
         let request = RequestOptions {
             model: test_model(None),
+            cache_key: None,
         };
         let mut on_event = |_event: StreamEvent| -> Result<(), ProviderError> { Ok(()) };
         let result = provider

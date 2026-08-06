@@ -170,9 +170,8 @@ impl Guardrail {
         loop {
             attempt += 1;
             let request_model = model.active_model().clone();
-            let request = RequestOptions {
-                model: request_model.clone(),
-            };
+            let request =
+                RequestOptions::for_session(request_model.clone(), session_id, "guardrail");
             let native_request = provider.native_request(&request, &msgs, &tools)?;
             let recipe = store.request_recipe(
                 provider.request_format(),

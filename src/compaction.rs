@@ -133,9 +133,8 @@ async fn run_compaction_routed_inner(
             return Ok(None);
         }
         switched = false;
-        let request = RequestOptions {
-            model: model.active_model().clone(),
-        };
+        let request =
+            RequestOptions::for_session(model.active_model().clone(), session_id, "compaction");
         match run_compaction(
             store,
             config,
@@ -774,6 +773,7 @@ mod tests {
             &session.id,
             &RequestOptions {
                 model: request_model.clone(),
+                cache_key: None,
             },
             &FakeProvider,
             None,
@@ -808,6 +808,7 @@ mod tests {
             &session.id,
             &RequestOptions {
                 model: request_model,
+                cache_key: None,
             },
             &FakeProvider,
             None,
@@ -918,6 +919,7 @@ mod tests {
             &session.id,
             &RequestOptions {
                 model: request_model,
+                cache_key: None,
             },
             &FakeProvider,
             None,
@@ -995,6 +997,7 @@ mod tests {
             &session.id,
             &RequestOptions {
                 model: request_model.clone(),
+                cache_key: None,
             },
             &FakeProvider,
             None,
@@ -1087,6 +1090,7 @@ mod tests {
             &session.id,
             &RequestOptions {
                 model: request_model,
+                cache_key: None,
             },
             &FakeProvider,
             None,
@@ -1140,6 +1144,7 @@ mod tests {
             &session.id,
             &RequestOptions {
                 model: request_model,
+                cache_key: None,
             },
             &FailingProvider,
             None,
