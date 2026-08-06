@@ -357,19 +357,13 @@ jobs:
             mingw-w64-ucrt-x86_64-ripgrep
             mingw-w64-ucrt-x86_64-rust
 
-      - name: Rebase the Windows patch onto the tagged master
+      - name: Select the maintained Windows revision for the tag
         if: github.ref_type == 'tag'
         run: |
           set -euo pipefail
-          candidate=$(git rev-parse HEAD)
           git fetch --no-tags origin \
-            +refs/heads/master:refs/remotes/origin/master \
             +refs/heads/msys2:refs/remotes/origin/msys2
-          fork=$(git merge-base origin/master origin/msys2)
-          git config user.name github-actions[bot]
-          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
           git checkout -B ci-msys2 origin/msys2
-          git rebase --onto "$candidate" "$fork"
 
       - name: Select the pushed Windows revision for packaging
         if: github.ref == 'refs/heads/msys2'
