@@ -56,7 +56,7 @@ Complete shape, with default values where applicable:
 
 ```jsonc
 {
-  "output": "detail",             // final | concise | detail | full
+  "output": "concise",            // final | concise | detail | full
   "line_wrapping": true,          // interactive output; no CLI override
   "providers": {
     "openai": {

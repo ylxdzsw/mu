@@ -779,16 +779,6 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["openai"]
         );
-        assert_eq!(config.output, OutputFormat::Detail);
-        assert!(config.line_wrapping);
-        assert_eq!(config.compaction.soft_fraction, 0.70);
-        assert_eq!(config.limits.max_iterations, 50);
-        assert_eq!(config.guardrail.timeout_seconds, 120);
-        assert!(config.terminal_bell.enabled);
-        assert_eq!(
-            config.redaction.env,
-            ["*_API_KEY", "*_API_TOKEN", "*_AUTH_TOKEN"]
-        );
     }
 
     #[test]

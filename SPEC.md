@@ -1185,8 +1185,8 @@ Model and provider selection come from `config.jsonc`: a complete `endpoint`, op
 env var holding the API key, and ordered provider/model definitions. If the
 global config file is missing, `mu` creates a starter `~/.mu/config.jsonc`
 automatically before loading configuration. The starter's first provider
-contains keyless 200K-context OpenCode Zen DeepSeek and Mimo models
-(`api_key_env: ""`), so a freshly built `mu` runs a turn with no additional
+contains keyless 200K-context OpenCode Zen DeepSeek and Mimo models (with
+`api_key_env` omitted), so a freshly built `mu` runs a turn with no additional
 setup; it also ships a commented keyed provider example.
 
 `provider/model[:effort]` is fixed. A bare `model[:effort]` expands to every
@@ -1388,7 +1388,7 @@ are not visible in another.
 
   ```jsonc
   {
-    "output": "detail",                         // optional default density
+    "output": "concise",                        // optional default density
     "line_wrapping": true,                      // interactive presentation only
     "providers": {
       "openai": {

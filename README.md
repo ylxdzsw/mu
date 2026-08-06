@@ -138,8 +138,8 @@ Choose how much the caller sees:
 
 ```sh
 mu -o final prompt.md       # final assistant message only
-mu -o concise prompt.md     # assistant text plus one-line tool calls
-mu -o detail prompt.md      # normal human transcript (built-in default)
+mu -o concise prompt.md     # assistant text plus one-line tool calls (default)
+mu -o detail prompt.md      # normal human transcript
 mu -o full prompt.md        # complete reasoning and tool details
 ```
 
@@ -253,10 +253,9 @@ mu's `customize-mu` reference if it wants the full configuration contract.
 
 ## Using your own provider
 
-On first use, `mu` creates `~/.mu/config.jsonc`. It ships with two providers:
-the keyless OpenCode Zen free model used by default, and a commented OpenAI
-example. To use a keyed provider, add its API key to `~/.mu/.env` (create the
-file if needed):
+On first use, `mu` creates `~/.mu/config.jsonc`. It ships with the keyless
+OpenCode Zen free models and a commented OpenAI example. To use a keyed
+provider, add its API key to `~/.mu/.env` (create the file if needed):
 
 ```dotenv
 OPENAI_API_KEY=...
