@@ -141,7 +141,7 @@ _mu_zsh_enter_mode
 [[ "$BUFFER" == "echo hello" ]] || fail "preserves buffer in mu mode"
 [[ "$CURSOR" -eq 0 ]] || fail "preserves cursor in mu mode"
 escaped_pwd=${PWD//\%/%%}
-expected_prompt="%F{6}prompt-test-model%f %F{12}${escaped_pwd}%f
+expected_prompt="%F{12}prompt-test-model%f %F{6}${escaped_pwd}%f
 mu> "
 [[ "$PROMPT" == "$MU_ZSH_PROMPT" ]] || fail "sets mu prompt"
 [[ "$PROMPT" == "$expected_prompt" ]] || fail "renders two-line mu prompt"
@@ -248,7 +248,7 @@ MU_ZSH_TEST_PROJECT_ROOT=$saved_project_root
 escaped_primary_root=${primary_root//\%/%%}
 nested_pwd=$worktree_root/src
 escaped_nested_pwd=${nested_pwd//\%/%%}
-[[ "$worktree_prompt" == *"%F{12}${escaped_nested_pwd}%f %F{8}(${escaped_primary_root})%f"* ]] || fail "shows primary project root from a linked worktree"
+[[ "$worktree_prompt" == *"%F{6}${escaped_nested_pwd}%f %F{8}(${escaped_primary_root})%f"* ]] || fail "shows primary project root from a linked worktree"
 
 global_fake_bin=$tmpdir/global-bin
 mkdir -p -- "$global_fake_bin"
@@ -270,7 +270,7 @@ global_prompt=$(_mu_zsh_build_mode_prompt)
 builtin cd "$saved_pwd"
 MU_ZSH_BIN=$prompt_fake_bin/mu
 escaped_global_pwd=${global_pwd//\%/%%}
-[[ "$global_prompt" == *"%F{12}${escaped_global_pwd}%f %F{8}(global)%f"* ]] || fail "shows global marker outside project scope"
+[[ "$global_prompt" == *"%F{6}${escaped_global_pwd}%f %F{8}(global)%f"* ]] || fail "shows global marker outside project scope"
 
 unclean_fake_bin=$tmpdir/unclean-bin
 mkdir -p -- "$unclean_fake_bin"

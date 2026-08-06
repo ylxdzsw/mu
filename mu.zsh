@@ -22,11 +22,11 @@ typeset -g MU_ZSH_PENDING_INPUT=
 typeset -g MU_ZSH_PENDING_PROMPT=
 typeset -gi MU_ZSH_PENDING_SUBMIT=0
 typeset -ga MU_ZSH_PENDING_ATTACHMENTS
-# 16-color theme slots (webterm/xterm Tango). model=cyan, ctx=magenta,
-# pwd=bright-blue, project=bright-black, unclean=bright-red.
-typeset -g MU_ZSH_PROMPT_MODEL_COLOR=${MU_ZSH_PROMPT_MODEL_COLOR:-6}
+# 16-color theme slots (webterm/xterm Tango). model=bright-blue, ctx=magenta,
+# pwd=cyan, project=bright-black, unclean=bright-red.
+typeset -g MU_ZSH_PROMPT_MODEL_COLOR=${MU_ZSH_PROMPT_MODEL_COLOR:-12}
 typeset -g MU_ZSH_PROMPT_CONTEXT_COLOR=${MU_ZSH_PROMPT_CONTEXT_COLOR:-5}
-typeset -g MU_ZSH_PROMPT_PWD_COLOR=${MU_ZSH_PROMPT_PWD_COLOR:-12}
+typeset -g MU_ZSH_PROMPT_PWD_COLOR=${MU_ZSH_PROMPT_PWD_COLOR:-6}
 typeset -g MU_ZSH_PROMPT_PROJECT_COLOR=${MU_ZSH_PROMPT_PROJECT_COLOR:-8}
 typeset -g MU_ZSH_PROMPT_UNCLEAN_COLOR=${MU_ZSH_PROMPT_UNCLEAN_COLOR:-9}
 typeset -g MU_ZSH_PROMPT_UNCLEAN_TEXT=${MU_ZSH_PROMPT_UNCLEAN_TEXT:-'interrupted · /retry'}
