@@ -21,6 +21,10 @@ typeset -g MU_ZSH_PROMPT=${MU_ZSH_PROMPT:-$MU_ZSH_PROMPT_INPUT}
 typeset -g MU_ZSH_PENDING_INPUT=
 typeset -g MU_ZSH_PENDING_PROMPT=
 typeset -gi MU_ZSH_PENDING_SUBMIT=0
+typeset -gi MU_ZSH_SPECULATIVE_MODEL_COLON=0
+typeset -g MU_ZSH_SPECULATIVE_MODEL_BUFFER=
+typeset -gi MU_ZSH_SPECULATIVE_MODEL_CURSOR=0
+typeset -ga MU_ZSH_MODEL_COMPLETION_EFFORTS
 typeset -ga MU_ZSH_PENDING_ATTACHMENTS
 # 16-color theme slots (webterm/xterm Tango). model=bright-blue, ctx=magenta,
 # pwd=cyan, project=bright-black, unclean=bright-red.
@@ -158,6 +162,49 @@ _mu_zsh_clear_tracked_state() {
   MU_ZSH_PENDING_ATTACHMENTS=()
   MU_ZSH_TRACKED_SCOPE=
   MU_ZSH_EFFECTIVE_ATTACHMENT_COUNT=0
+}
+
+_mu_zsh_clear_speculative_model_colon() {
+  MU_ZSH_SPECULATIVE_MODEL_COLON=0
+  MU_ZSH_SPECULATIVE_MODEL_BUFFER=
+  MU_ZSH_SPECULATIVE_MODEL_CURSOR=0
+}
+
+_mu_zsh_commit_speculative_model_colon_if_changed() {
+  (( MU_ZSH_SPECULATIVE_MODEL_COLON )) || return 0
+  if [[ "$BUFFER" != "$MU_ZSH_SPECULATIVE_MODEL_BUFFER" ||
+    $CURSOR -ne $MU_ZSH_SPECULATIVE_MODEL_CURSOR ]]; then
+    _mu_zsh_clear_speculative_model_colon
+  fi
+}
+
+_mu_zsh_commit_speculative_model_colon() {
+  (( MU_ZSH_SPECULATIVE_MODEL_COLON )) &&
+    _mu_zsh_clear_speculative_model_colon
+  return 0
+}
+
+_mu_zsh_strip_speculative_model_colon() {
+  local restored_cursor
+  (( MU_ZSH_SPECULATIVE_MODEL_COLON )) || return 1
+  [[ "$BUFFER" == "$MU_ZSH_SPECULATIVE_MODEL_BUFFER" &&
+    $CURSOR -eq $MU_ZSH_SPECULATIVE_MODEL_CURSOR ]] || {
+    _mu_zsh_clear_speculative_model_colon
+    return 1
+  }
+  restored_cursor=$(( MU_ZSH_SPECULATIVE_MODEL_CURSOR - 1 ))
+  BUFFER="${BUFFER[1,CURSOR-1]}${BUFFER[CURSOR+1,-1]}"
+  CURSOR=$restored_cursor
+  _mu_zsh_clear_speculative_model_colon
+  return 0
+}
+
+_mu_zsh_append_speculative_model_colon() {
+  BUFFER="${BUFFER[1,CURSOR]}:${BUFFER[CURSOR+1,-1]}"
+  (( CURSOR += 1 ))
+  MU_ZSH_SPECULATIVE_MODEL_COLON=1
+  MU_ZSH_SPECULATIVE_MODEL_BUFFER=$BUFFER
+  MU_ZSH_SPECULATIVE_MODEL_CURSOR=$CURSOR
 }
 
 _mu_zsh_activate_scope() {
@@ -460,16 +507,20 @@ _mu_zsh_model_completion_candidates() {
     }] as $models
     | [
         if $suffix_only == "1" then
-          $models[] as $model
+          ($fragment | if endswith(":") then .[:-1] else . end) as $base
+          | $models[] as $model
           | select(
-              $fragment == $model.canonical
-              or $fragment == $model.short
+              $base == $model.canonical
+              or $base == $model.short
             )
           | $model.efforts[]? | ":" + .
         elif ($fragment | contains(":")) then
-          $models[] as $model | $model.efforts[]? as $effort
-          | "\($model.canonical):\($effort)",
-            "\($model.short):\($effort)"
+          ($models[]
+            | select((.canonical | contains(":")) or (.short | contains(":")))
+            | .canonical, .short),
+          ($models[] as $model | $model.efforts[]? as $effort
+            | "\($model.canonical):\($effort)",
+              "\($model.short):\($effort)")
         else
           $models[]
           | .canonical, .short
@@ -484,6 +535,81 @@ _mu_zsh_model_completion_candidates() {
         .[]
       end
   ' <<< "$json"
+}
+
+_mu_zsh_model_completion_transition() {
+  local fragment=$1
+  local -a command result
+  local json
+
+  MU_ZSH_MODEL_COMPLETION_EFFORTS=()
+  _mu_zsh_sync_state
+  command=("$MU_ZSH_BIN" status --json --include-models)
+  [[ -n "$MU_ZSH_EFFECTIVE_SESSION_ID" ]] && command+=(-s "$MU_ZSH_EFFECTIVE_SESSION_ID")
+  json=$("${command[@]}" 2>/dev/null) || return 1
+  command -v jq >/dev/null 2>&1 || return 1
+  result=("${(@f)$(
+    jq -r --arg fragment "$fragment" '
+      def dedup:
+        reduce .[] as $item ([]; if index($item) then . else . + [$item] end);
+      def effort_rank:
+        . as $effort
+        | (["minimum", "low", "medium", "high", "xhigh", "max"] | index($effort)) // 6;
+      [.available_models.providers[]?.models[]? | {
+        canonical: (.id // ""),
+        short: (.model_id // ""),
+        efforts: (.supported_efforts // [])
+      }] as $models
+      | if ($fragment | contains("/")) then
+          ($models | map(select(.canonical == $fragment)) | .[0]) as $model
+          | select($model != null)
+          | select(([
+              $models[]
+              | select(.canonical != $fragment and (.canonical | startswith($fragment)))
+            ] | length) == 0)
+          | [$fragment]
+            + (($model.efforts | dedup)
+              | to_entries
+              | sort_by((.value | effort_rank), .key)
+              | map(":" + .value))
+        else
+          select(([
+            $models[] | select(.short == $fragment)
+          ] | length) > 0)
+          | select(([
+              $models[]
+              | select(.short != $fragment and (.short | startswith($fragment)))
+            ] | length) == 0)
+          | [$fragment]
+            + ([
+                $models[]
+                | select(.short == $fragment)
+                | .efforts[]?
+              ] | dedup
+              | to_entries
+              | sort_by((.value | effort_rank), .key)
+              | map(":" + .value))
+        end
+      | .[]
+    ' <<< "$json"
+  )}")
+  (( ${#result[@]} > 1 )) || return 1
+  REPLY=$result[1]
+  MU_ZSH_MODEL_COMPLETION_EFFORTS=("${result[@]:1}")
+  return 0
+}
+
+_mu_zsh_model_command_transition_allowed() {
+  local fragment=$1
+  local candidate
+  local -a matches
+
+  [[ "$fragment" == /model ]] && return 0
+  matches=()
+  for candidate in "${(@f)$(_mu_zsh_slash_command_candidates 2>/dev/null || true)}"; do
+    [[ "${candidate:l}" == "${fragment:l}"* ]] && matches+=("$candidate")
+  done
+  (( ${#matches[@]} == 1 )) && [[ "${matches[1]}" == /model ]]
 }
 
 _mu_zsh_slash_completion_context() {
@@ -524,21 +650,25 @@ _mu_zsh_completion_candidates() {
 }
 
 _mu_zsh_fallback_completion() {
-  local left arg suffix effort_suffix
+  local left arg model_fragment suffix effort_suffix
   local -a candidates effort_suffixes effort_candidates
 
   left=${BUFFER[1,$CURSOR]}
   if [[ "$left" == "/model "* ]]; then
     arg=${left#"/model "}
-    effort_suffixes=("${(@f)$(_mu_zsh_model_completion_candidates "$arg" 1)}")
-    effort_suffixes=("${(@)effort_suffixes:#}")
-    if (( ${#effort_suffixes[@]} )); then
-      for effort_suffix in "${effort_suffixes[@]}"; do
-        effort_candidates+=("$arg$effort_suffix")
-      done
-      compadd -Q -S '' -n -- "$arg"
-      compadd -Q -S '' -- "${effort_candidates[@]}"
-      return
+    if [[ "$arg" == *:* ]]; then
+      model_fragment=${arg%:*}
+      effort_suffixes=("${(@f)$(_mu_zsh_model_completion_candidates "$model_fragment:" 1)}")
+      effort_suffixes=("${(@)effort_suffixes:#}")
+      if (( ${#effort_suffixes[@]} )); then
+        compset -P '*:' 2>/dev/null || true
+        for effort_suffix in "${effort_suffixes[@]}"; do
+          effort_candidates+=("${effort_suffix#:}")
+        done
+        compadd -Q -S '' -n -- ''
+        compadd -Q -S '' -- "${effort_candidates[@]}"
+        return
+      fi
     fi
   fi
 
@@ -552,7 +682,7 @@ _mu_zsh_fallback_completion() {
 }
 
 _mu_zsh_completion_system() {
-  local left arg suffix effort_suffix
+  local left arg model_fragment suffix effort_suffix
   local -a candidates effort_suffixes effort_candidates
   local expl
 
@@ -565,17 +695,21 @@ _mu_zsh_completion_system() {
 
   if [[ "$left" == "/model "* ]]; then
     arg=${left#"/model "}
-    effort_suffixes=("${(@f)$(_mu_zsh_model_completion_candidates "$arg" 1)}")
-    effort_suffixes=("${(@)effort_suffixes:#}")
-    if (( ${#effort_suffixes[@]} )); then
-      for effort_suffix in "${effort_suffixes[@]}"; do
-        effort_candidates+=("$arg$effort_suffix")
-      done
-      _wanted mu-model-effort expl 'model effort' \
-        compadd -Q -S '' -n -- "$arg"
-      _wanted mu-model-effort expl 'model effort' \
-        compadd -Q -S '' -- "${effort_candidates[@]}"
-      return
+    if [[ "$arg" == *:* ]]; then
+      model_fragment=${arg%:*}
+      effort_suffixes=("${(@f)$(_mu_zsh_model_completion_candidates "$model_fragment:" 1)}")
+      effort_suffixes=("${(@)effort_suffixes:#}")
+      if (( ${#effort_suffixes[@]} )); then
+        compset -P '*:' 2>/dev/null || true
+        for effort_suffix in "${effort_suffixes[@]}"; do
+          effort_candidates+=("${effort_suffix#:}")
+        done
+        _wanted mu-model-effort expl 'model effort' \
+          compadd -Q -S '' -n -- ''
+        _wanted mu-model-effort expl 'model effort' \
+          compadd -Q -S '' -- "${effort_candidates[@]}"
+        return
+      fi
     fi
   fi
 
@@ -598,6 +732,9 @@ _mu_zsh_use_completion_system() {
 
 _mu_zsh_complete_slash() {
   local before_buffer=$BUFFER before_cursor=$CURSOR
+  local before_left=${BUFFER[1,$CURSOR]}
+  local model_arg effort
+  local -a display_efforts model_candidates
 
   _mu_zsh_slash_completion_context || return 1
   if _mu_zsh_use_completion_system; then
@@ -607,13 +744,39 @@ _mu_zsh_complete_slash() {
     zle _mu_zsh_complete_widget
   fi
 
+  if [[ "$before_left" != "/model "* &&
+    ( "$BUFFER" == "/model" || "$BUFFER" == "/model " ) &&
+    $CURSOR -eq ${#BUFFER} ]] &&
+    _mu_zsh_model_command_transition_allowed "$before_left"; then
+    [[ "$BUFFER" == "/model" ]] && {
+      BUFFER+=$' '
+      (( CURSOR += 1 ))
+    }
+    # This is intentionally list-only. Once the buffer already contains
+    # "/model ", later Tabs use ordinary model completion.
+    model_candidates=("${(@f)$(_mu_zsh_model_completion_candidates "" 2>/dev/null || true)}")
+    zle -M "${(j:  :)model_candidates}"
+    return
+  fi
+
+  if [[ "${before_buffer[1,$before_cursor]}" == "/model "* &&
+    $before_cursor -eq ${#before_buffer} &&
+    "$BUFFER" == "/model "* &&
+    "${BUFFER#"/model "}" != *[[:space:]]* ]]; then
+    CURSOR=${#BUFFER}
+  fi
+
   if [[ "${before_buffer[1,$before_cursor]}" == "/model "* ]] &&
-    [[ "$BUFFER" != "$before_buffer" || $CURSOR -ne $before_cursor ]] &&
-    [[ "${BUFFER[1,$CURSOR]}" == "/model "* && "${BUFFER[1,$CURSOR]}" != *:* ]]; then
-    # Generate a fresh effort list directly. Going back through the user's
-    # completion system can retain the model list (notably after infix
-    # matching) instead of recomputing candidates for the completed model.
-    zle _mu_zsh_list_widget 2>/dev/null || true
+    [[ "${BUFFER[1,$CURSOR]}" == "/model "* &&
+      $CURSOR -eq ${#BUFFER} ]]; then
+    model_arg=${BUFFER#"/model "}
+    if _mu_zsh_model_completion_transition "$model_arg"; then
+      _mu_zsh_append_speculative_model_colon
+      for effort in "${MU_ZSH_MODEL_COMPLETION_EFFORTS[@]}"; do
+        display_efforts+=("${effort#:}")
+      done
+      zle -M "${(j:  :)display_efforts}"
+    fi
   fi
 }
 
@@ -846,6 +1009,7 @@ _mu_zsh_enter_mode() {
 _mu_zsh_exit_mode() {
   [[ "$MU_ZSH_MODE" == shell ]] && return 0
 
+  _mu_zsh_clear_speculative_model_colon
   _mu_zsh_reset_history_navigation
   MU_ZSH_MODE=shell
   zle -K "${MU_ZSH_SAVED_KEYMAP:-main}" 2>/dev/null || zle -K main 2>/dev/null || true
@@ -856,6 +1020,7 @@ _mu_zsh_exit_mode() {
 }
 
 _mu_zsh_insert_newline() {
+  _mu_zsh_commit_speculative_model_colon
   [[ "$MU_ZSH_MODE" == mu ]] || {
     zle self-insert
     return
@@ -866,6 +1031,7 @@ _mu_zsh_insert_newline() {
 }
 
 _mu_zsh_history_up() {
+  _mu_zsh_commit_speculative_model_colon
   if [[ "${BUFFER[1,CURSOR]}" == *$'\n'* ]]; then
     zle up-line
     return
@@ -910,6 +1076,7 @@ _mu_zsh_history_up() {
 }
 
 _mu_zsh_history_down() {
+  _mu_zsh_commit_speculative_model_colon
   if [[ "${BUFFER[CURSOR+1,-1]}" == *$'\n'* ]]; then
     zle down-line
     return
@@ -968,6 +1135,7 @@ _mu_zsh_submit_prompt() {
 
 _mu_zsh_tab() {
   if [[ "$MU_ZSH_MODE" == mu ]]; then
+    _mu_zsh_commit_speculative_model_colon
     if _mu_zsh_slash_completion_context; then
       _mu_zsh_complete_slash
       return
@@ -996,6 +1164,8 @@ _mu_zsh_tab() {
 _mu_zsh_slash() {
   local should_complete=0
 
+  _mu_zsh_commit_speculative_model_colon
+
   if [[ "$MU_ZSH_MODE" == mu && "$BUFFER" != /* && "$CURSOR" -eq 0 ]]; then
     should_complete=1
   fi
@@ -1015,6 +1185,8 @@ _mu_zsh_accept() {
     return
   fi
 
+  _mu_zsh_commit_speculative_model_colon_if_changed
+  _mu_zsh_strip_speculative_model_colon 2>/dev/null || true
   local input=$BUFFER
   _mu_zsh_reset_history_navigation
   if [[ -z "${input//[[:space:]]/}" ]]; then
@@ -1033,6 +1205,7 @@ _mu_zsh_accept() {
 _mu_zsh_finish_pending() {
   (( MU_ZSH_PENDING_SUBMIT )) || return 0
 
+  _mu_zsh_clear_speculative_model_colon
   zle -I
   BUFFER=
   CURSOR=0
@@ -1056,11 +1229,60 @@ _mu_zsh_dispatch_pending() {
 }
 
 _mu_zsh_line_init() {
+  _mu_zsh_clear_speculative_model_colon
   _mu_zsh_reset_history_navigation
   [[ "$MU_ZSH_MODE" == mu ]] && _mu_zsh_refresh_prompt
   if [[ "$MU_ZSH_MODE" == mu ]]; then
     zle -K mumode 2>/dev/null || true
   fi
+}
+
+_mu_zsh_model_colon() {
+  if (( MU_ZSH_SPECULATIVE_MODEL_COLON )) &&
+    [[ "$BUFFER" == "$MU_ZSH_SPECULATIVE_MODEL_BUFFER" &&
+      $CURSOR -eq $MU_ZSH_SPECULATIVE_MODEL_CURSOR ]]; then
+    _mu_zsh_clear_speculative_model_colon
+    return 0
+  fi
+  _mu_zsh_commit_speculative_model_colon_if_changed
+  zle .self-insert
+}
+
+_mu_zsh_speculative_backspace() {
+  if (( MU_ZSH_SPECULATIVE_MODEL_COLON )) &&
+    [[ "$BUFFER" == "$MU_ZSH_SPECULATIVE_MODEL_BUFFER" &&
+      $CURSOR -eq $MU_ZSH_SPECULATIVE_MODEL_CURSOR ]]; then
+    _mu_zsh_strip_speculative_model_colon
+    return 0
+  fi
+  _mu_zsh_commit_speculative_model_colon_if_changed
+  zle .backward-delete-char
+}
+
+_mu_zsh_speculative_delete() {
+  _mu_zsh_commit_speculative_model_colon
+  zle .delete-char
+}
+
+_mu_zsh_speculative_cursor() {
+  _mu_zsh_commit_speculative_model_colon
+  zle "$1"
+}
+
+_mu_zsh_speculative_beginning() {
+  _mu_zsh_speculative_cursor .beginning-of-line
+}
+
+_mu_zsh_speculative_end() {
+  _mu_zsh_speculative_cursor .end-of-line
+}
+
+_mu_zsh_speculative_left() {
+  _mu_zsh_speculative_cursor .backward-char
+}
+
+_mu_zsh_speculative_right() {
+  _mu_zsh_speculative_cursor .forward-char
 }
 
 mu-zsh-mode() {
@@ -1084,6 +1306,16 @@ _mu_zsh_configure_keymap() {
   bindkey -M mumode $'\eOA' _mu_zsh_history_up
   bindkey -M mumode $'\e[B' _mu_zsh_history_down
   bindkey -M mumode $'\eOB' _mu_zsh_history_down
+  bindkey -M mumode ':' _mu_zsh_model_colon
+  bindkey -M mumode '^?' _mu_zsh_speculative_backspace
+  bindkey -M mumode '^H' _mu_zsh_speculative_backspace
+  bindkey -M mumode $'\e[3~' _mu_zsh_speculative_delete
+  bindkey -M mumode '^A' _mu_zsh_speculative_beginning
+  bindkey -M mumode '^E' _mu_zsh_speculative_end
+  bindkey -M mumode $'\e[D' _mu_zsh_speculative_left
+  bindkey -M mumode $'\e[C' _mu_zsh_speculative_right
+  bindkey -M mumode $'\e[H' _mu_zsh_speculative_beginning
+  bindkey -M mumode $'\e[F' _mu_zsh_speculative_end
   # Ctrl-C is intentionally left inherited from the main keymap: real terminals
   # deliver it as SIGINT (the tty intercepts it before ZLE), which the shell
   # already handles by cancelling the draft and redrawing a fresh mu> prompt.
@@ -1107,6 +1339,13 @@ if [[ -o zle ]]; then
   zle -N _mu_zsh_history_down
   zle -N _mu_zsh_finish_pending
   zle -N _mu_zsh_line_init
+  zle -N _mu_zsh_model_colon
+  zle -N _mu_zsh_speculative_backspace
+  zle -N _mu_zsh_speculative_delete
+  zle -N _mu_zsh_speculative_beginning
+  zle -N _mu_zsh_speculative_end
+  zle -N _mu_zsh_speculative_left
+  zle -N _mu_zsh_speculative_right
   zle -N mu-zsh-mode
   zle -N mu-zsh-exit-mode
   add-zle-hook-widget line-finish _mu_zsh_finish_pending 2>/dev/null || true

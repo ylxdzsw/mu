@@ -84,7 +84,7 @@ if [[ "$1" == "status" ]]; then
   [[ "$provider" == "$model" ]] && provider=test
   model_json="\"model\":{\"provider_id\":\"$provider\",\"model_id\":\"$model_id\",\"effort\":null,\"canonical\":\"$model\"}"
   if (( include_models )); then
-    print -r -- "{$model_json,\"context_tokens\":25,\"context_window\":100,\"project_root\":\"$MU_ZSH_TEST_PROJECT_ROOT\",\"available_models\":{\"providers\":[{\"id\":\"local\",\"models\":[{\"id\":\"local/solo\",\"model_id\":\"solo\",\"supported_efforts\":[\"max\"]},{\"id\":\"local/shared\",\"model_id\":\"shared\",\"supported_efforts\":[\"low\"]}]},{\"id\":\"openai\",\"models\":[{\"id\":\"openai/gpt\",\"model_id\":\"gpt\",\"supported_efforts\":[\"provider-custom\",\"high\",\"minimum\",\"low\",\"max\",\"medium\",\"xhigh\"]},{\"id\":\"openai/gpt-5.6-luna\",\"model_id\":\"gpt-5.6-luna\",\"supported_efforts\":[\"none\",\"max\"]},{\"id\":\"openai/shared\",\"model_id\":\"shared\",\"supported_efforts\":[\"medium\"]}]}]}}"
+    print -r -- "{$model_json,\"context_tokens\":25,\"context_window\":100,\"project_root\":\"$MU_ZSH_TEST_PROJECT_ROOT\",\"available_models\":{\"providers\":[{\"id\":\"local\",\"models\":[{\"id\":\"local/solo\",\"model_id\":\"solo\",\"supported_efforts\":[\"max\"]},{\"id\":\"local/shared\",\"model_id\":\"shared\",\"supported_efforts\":[\"low\"]}]},{\"id\":\"openai\",\"models\":[{\"id\":\"openai/gpt\",\"model_id\":\"gpt\",\"supported_efforts\":[\"provider-custom\",\"high\",\"minimum\",\"low\",\"max\",\"medium\",\"xhigh\"]},{\"id\":\"openai/gpt-5.6-luna\",\"model_id\":\"gpt-5.6-luna\",\"supported_efforts\":[\"none\",\"max\"]},{\"id\":\"openai/shared\",\"model_id\":\"shared\",\"supported_efforts\":[\"medium\"]},{\"id\":\"openai/version:latest\",\"model_id\":\"version:latest\",\"supported_efforts\":[\"max\"]}]}]}}"
   elif (( include_commands )); then
     print -r -- "{$model_json,\"context_tokens\":25,\"context_window\":100,\"project_root\":\"$MU_ZSH_TEST_PROJECT_ROOT\",\"commands\":[{\"name\":\"review.md\",\"path\":\"$MU_ZSH_TEST_PROJECT_ROOT/.mu/review.md\",\"scope\":\"project\"}]}"
   else
@@ -433,19 +433,33 @@ prefix_effort_suffixes=("${(@f)$(_mu_zsh_model_completion_candidates "gp" 1)}")
 prefix_effort_suffixes=("${(@)prefix_effort_suffixes:#}")
 (( ${#prefix_effort_suffixes[@]} == 0 )) ||
   fail "model prefixes do not switch to the effort menu"
+if _mu_zsh_model_completion_transition "gpt"; then
+  fail "exact models shadowed by longer model names do not transition to efforts"
+fi
+_mu_zsh_model_completion_transition "gpt-5.6-luna" ||
+  fail "unshadowed exact models transition to efforts"
+[[ "${(j:,:)MU_ZSH_MODEL_COMPLETION_EFFORTS}" == ":max,:none" ]] ||
+  fail "transition exposes the completed model's efforts"
+_mu_zsh_model_completion_transition "shared" ||
+  fail "floating exact models transition to efforts"
+[[ "${(j:,:)MU_ZSH_MODEL_COMPLETION_EFFORTS}" == ":low,:medium" ]] ||
+  fail "floating transition merges provider efforts"
+_mu_zsh_model_completion_transition "openai/version:latest" ||
+  fail "exact model ids containing a colon transition to efforts"
+colon_model_candidates=("${(@f)$(_mu_zsh_model_completion_candidates "openai/version:lat")}")
+[[ " ${(j: :)colon_model_candidates} " == *" openai/version:latest "* ]] ||
+  fail "completion preserves configured model ids containing a colon"
 captured_compadd_calls=()
 compadd() { captured_compadd_calls+=("${(j:,:)@}") }
-BUFFER="/model gpt"
+BUFFER="/model gpt:"
 CURSOR=${#BUFFER}
 _mu_zsh_fallback_completion
 unfunction compadd
-[[ "$captured_compadd_calls[1]" == *",-n,--,gpt" ]] ||
-  fail "exact-model completion keeps the bare model only as a hidden anchor"
-[[ "$captured_compadd_calls[2]" != *",gpt,"* && "$captured_compadd_calls[2]" != *,gpt ]] ||
-  fail "exact-model effort menu omits the bare model"
+[[ "$captured_compadd_calls[1]" == *",-n,--," ]] ||
+  fail "effort completion keeps the empty suffix only as a hidden anchor"
 for effort in minimum low medium high xhigh max provider-custom; do
-  [[ ",$captured_compadd_calls[2]," == *",gpt:$effort,"* ]] ||
-    fail "exact-model effort menu includes gpt:$effort"
+  [[ ",$captured_compadd_calls[2]," == *",$effort,"* ]] ||
+    fail "exact-model effort menu includes $effort"
 done
 model_candidates=("${(@f)$(_mu_zsh_model_completion_candidates "gpt:")}")
 [[ " ${(j: :)model_candidates} " == *" gpt:low "* ]] || fail "shows unqualified variants after colon"
@@ -709,7 +723,7 @@ if [ "$1" = "status" ]; then
   [ "$provider" = "$model" ] && provider=test
   model_json="\"model\":{\"provider_id\":\"$provider\",\"model_id\":\"$model_id\",\"effort\":null,\"canonical\":\"$model\"}"
   if [ "$include_models" -eq 1 ]; then
-    printf '%s\n' "{$model_json,\"context_tokens\":25,\"context_window\":100,\"project_root\":\"$MU_ZSH_TEST_PROJECT_ROOT\",\"available_models\":{\"providers\":[{\"id\":\"local\",\"models\":[{\"id\":\"local/solo\",\"model_id\":\"solo\",\"supported_efforts\":[\"max\"]},{\"id\":\"local/shared\",\"model_id\":\"shared\",\"supported_efforts\":[\"low\"]}]},{\"id\":\"openai\",\"models\":[{\"id\":\"openai/gpt\",\"model_id\":\"gpt\",\"supported_efforts\":[\"low\",\"high\"]},{\"id\":\"openai/gpt-5.6-luna\",\"model_id\":\"gpt-5.6-luna\",\"supported_efforts\":[\"none\",\"max\"]},{\"id\":\"openai/shared\",\"model_id\":\"shared\",\"supported_efforts\":[\"medium\"]}]}]}}"
+    printf '%s\n' "{$model_json,\"context_tokens\":25,\"context_window\":100,\"project_root\":\"$MU_ZSH_TEST_PROJECT_ROOT\",\"available_models\":{\"providers\":[{\"id\":\"local\",\"models\":[{\"id\":\"local/solo\",\"model_id\":\"solo\",\"supported_efforts\":[\"max\"]},{\"id\":\"local/shared\",\"model_id\":\"shared\",\"supported_efforts\":[\"low\"]}]},{\"id\":\"openai\",\"models\":[{\"id\":\"openai/gpt\",\"model_id\":\"gpt\",\"supported_efforts\":[\"low\",\"high\"]},{\"id\":\"openai/gpt-5.6-luna\",\"model_id\":\"gpt-5.6-luna\",\"supported_efforts\":[\"none\",\"max\"]},{\"id\":\"openai/shared\",\"model_id\":\"shared\",\"supported_efforts\":[\"medium\"]},{\"id\":\"openai/version:latest\",\"model_id\":\"version:latest\",\"supported_efforts\":[\"max\"]}]}]}}"
   elif [ "$include_commands" -eq 1 ] && [ -n "$TEST_EXTRA_COMMAND" ]; then
     printf '%s\n' "{$model_json,\"context_tokens\":25,\"context_window\":100,\"project_root\":\"$MU_ZSH_TEST_PROJECT_ROOT\",\"commands\":[{\"name\":\"$TEST_EXTRA_COMMAND\",\"path\":\"$MU_ZSH_TEST_PROJECT_ROOT/.mu/$TEST_EXTRA_COMMAND\",\"scope\":\"project\"}]}"
   else
@@ -988,7 +1002,7 @@ normalized=$(perl -pe 's/\e\[[0-?]*[ -\/]*[@-~]//g' "$slash_completion_transcrip
 [[ ! -e "$interactive_capture_calls" || ! -s "$interactive_capture_calls" ]] || fail "completed model slash command should not submit a prompt"
 
 common_prefix_transcript=$tmpdir/common-prefix-transcript
-common_prefix_setup="$interactive_setup; export TEST_EXTRA_COMMAND=model-helper.md; _mu_test_common_prefix_completion() { BUFFER='/mod'; CURSOR=\${#BUFFER}; _mu_zsh_complete_slash; zle -I; print -r -- \"[completion-buffer=\$BUFFER cursor=\$CURSOR]\"; BUFFER=; CURSOR=0; _mu_zsh_reset_mode_prompt; }; zle -N _mu_test_common_prefix_completion; bindkey -M mumode '^T' _mu_test_common_prefix_completion"
+common_prefix_setup="$interactive_setup; _mu_test_common_prefix_completion() { BUFFER='/mod'; CURSOR=\${#BUFFER}; _mu_zsh_complete_slash; zle -I; print -r -- \"[completion-buffer=\$BUFFER cursor=\$CURSOR]\"; BUFFER='/model o'; CURSOR=\${#BUFFER}; _mu_zsh_complete_slash; zle -I; print -r -- \"[model-prefix-buffer=\$BUFFER cursor=\$CURSOR]\"; BUFFER=; CURSOR=0; _mu_zsh_reset_mode_prompt; }; zle -N _mu_test_common_prefix_completion; bindkey -M mumode '^T' _mu_test_common_prefix_completion"
 rm -f -- "$interactive_capture_args" "$interactive_capture_stdin" "$interactive_capture_calls"
 interactive_status=0
 {
@@ -1000,7 +1014,8 @@ interactive_status=0
 (( interactive_status == 0 )) || fail "common-prefix completion transcript exited with status $interactive_status"
 
 normalized=$(perl -pe 's/\e\[[0-?]*[ -\/]*[@-~]//g' "$common_prefix_transcript" | col -b)
-[[ "$normalized" == *'[completion-buffer=/model cursor=6]'* ]] || fail "common-prefix completion should not add a suffix space"
+[[ "$normalized" == *'[completion-buffer=/model  cursor=7]'* ]] || fail "completing /model should enter its argument without filling a model prefix"
+[[ "$normalized" == *'[model-prefix-buffer=/model openai/ cursor=14]'* ]] || fail "later /model completion should use the normal common prefix"
 [[ ! -e "$interactive_capture_calls" || ! -s "$interactive_capture_calls" ]] || fail "common-prefix completion should not submit a prompt"
 
 model_effort_transcript=$tmpdir/model-effort-transcript
@@ -1016,8 +1031,9 @@ interactive_status=0
 (( interactive_status == 0 )) || fail "model effort completion transcript exited with status $interactive_status"
 
 normalized=$(perl -pe 's/\e\[[0-?]*[ -\/]*[@-~]//g' "$model_effort_transcript" | col -b)
-[[ "$normalized" == *'[first-buffer=/model gpt-5.6-luna first-cursor=19]'* ]] || fail "infix model completion should leave the cursor at the completed model"
-[[ "$normalized" == *':none'* && "$normalized" == *':max'* ]] || fail "one model completion should immediately list supported effort suffixes"
+raw_transcript=$(<"$model_effort_transcript")
+[[ "$normalized" == *'[first-buffer=/model gpt-5.6-luna: first-cursor=20]'* ]] || fail "infix model completion should append a speculative colon"
+[[ "$raw_transcript" == *'none'* && "$raw_transcript" == *'max'* ]] || fail "one model completion should immediately list supported efforts"
 [[ ! -e "$interactive_capture_calls" || ! -s "$interactive_capture_calls" ]] || fail "model effort completion should not submit a prompt"
 
 floating_effort_transcript=$tmpdir/floating-effort-transcript
@@ -1033,28 +1049,26 @@ interactive_status=0
 (( interactive_status == 0 )) || fail "floating effort completion transcript exited with status $interactive_status"
 
 normalized=$(perl -pe 's/\e\[[0-?]*[ -\/]*[@-~]//g' "$floating_effort_transcript" | col -b)
-[[ "$normalized" == *'[floating-buffer=/model shared cursor=13]'* ]] || fail "floating model effort listing should not modify the bare model"
-[[ "$normalized" == *':low'* && "$normalized" == *':medium'* ]] || fail "floating model completion should list merged provider efforts"
+raw_transcript=$(<"$floating_effort_transcript")
+[[ "$normalized" == *'[floating-buffer=/model shared: cursor=14]'* ]] || fail "floating model effort listing should append a speculative colon"
+[[ "$raw_transcript" == *'low'* && "$raw_transcript" == *'medium'* ]] || fail "floating model completion should list merged provider efforts"
 [[ ! -e "$interactive_capture_calls" || ! -s "$interactive_capture_calls" ]] || fail "floating model effort completion should not submit a prompt"
 
-floating_menu_transcript=$tmpdir/floating-menu-transcript
-floating_menu_setup="$interactive_setup; zstyle ':completion:*' menu select; _mu_test_floating_menu_state() { zle -I; print -r -- \"[cancelled-buffer=\$BUFFER cursor=\$CURSOR]\"; }; _mu_test_floating_menu_selection() { zle -I; print -r -- \"[selected-buffer=\$BUFFER cursor=\$CURSOR]\"; BUFFER=; CURSOR=0; _mu_zsh_reset_mode_prompt; }; zle -N _mu_test_floating_menu_state; zle -N _mu_test_floating_menu_selection; bindkey -M mumode '^T' _mu_test_floating_menu_state; bindkey -M mumode '^Y' _mu_test_floating_menu_selection"
+speculative_colon_transcript=$tmpdir/speculative-colon-transcript
+speculative_colon_setup="$interactive_setup; _mu_test_speculative_colon_state() { BUFFER='/model shared'; CURSOR=\${#BUFFER}; _mu_zsh_append_speculative_model_colon; _mu_zsh_model_colon; explicit=\"\$BUFFER,\$CURSOR,\$MU_ZSH_SPECULATIVE_MODEL_COLON\"; BUFFER='/model shared'; CURSOR=\${#BUFFER}; _mu_zsh_append_speculative_model_colon; _mu_zsh_speculative_backspace; back=\"\$BUFFER,\$CURSOR,\$MU_ZSH_SPECULATIVE_MODEL_COLON\"; BUFFER='/model shared'; CURSOR=\${#BUFFER}; _mu_zsh_append_speculative_model_colon; _mu_zsh_speculative_delete || true; delete=\"\$BUFFER,\$CURSOR,\$MU_ZSH_SPECULATIVE_MODEL_COLON\"; BUFFER='/model shared'; CURSOR=\${#BUFFER}; _mu_zsh_append_speculative_model_colon; (( CURSOR -= 1 )); _mu_zsh_commit_speculative_model_colon_if_changed; moved=\"\$BUFFER,\$CURSOR,\$MU_ZSH_SPECULATIVE_MODEL_COLON\"; BUFFER='/model shared'; CURSOR=\${#BUFFER}; _mu_zsh_append_speculative_model_colon; _mu_zsh_strip_speculative_model_colon; entered=\"\$BUFFER,\$CURSOR,\$MU_ZSH_SPECULATIVE_MODEL_COLON\"; zle -I; print -r -- \"[explicit=\$explicit back=\$back delete=\$delete moved=\$moved entered=\$entered]\"; BUFFER=; CURSOR=0; _mu_zsh_reset_mode_prompt; }; zle -N _mu_test_speculative_colon_state; bindkey -M mumode '^Y' _mu_test_speculative_colon_state"
 rm -f -- "$interactive_capture_args" "$interactive_capture_stdin" "$interactive_capture_calls"
 interactive_status=0
 {
-  send_interactive_setup "$floating_menu_setup"
-  print -rn -- $'\t/model shared\t\t'
-  sleep 0.3
-  print -rn -- $'\x03\x14\t\t\e[C\r\x19'
+  send_interactive_setup "$speculative_colon_setup"
+  print -rn -- $'\t\x19'
   sleep 0.4
   print -rn -- $'\x04'
-} | timeout 10 script -qfec 'TERM=xterm-256color zsh -df' "$floating_menu_transcript" >/dev/null || interactive_status=$?
-(( interactive_status == 0 )) || fail "floating model menu transcript exited with status $interactive_status"
+} | timeout 10 script -qfec 'TERM=xterm-256color zsh -df' "$speculative_colon_transcript" >/dev/null || interactive_status=$?
+(( interactive_status == 0 )) || fail "speculative colon transcript exited with status $interactive_status"
 
-normalized=$(perl -pe 's/\e\[[0-?]*[ -\/]*[@-~]//g' "$floating_menu_transcript" | col -b)
-[[ "$normalized" == *'[cancelled-buffer=/model shared cursor=13]'* ]] || fail "Ctrl-C should cancel model menu selection and restore the bare model"
-[[ "$normalized" == *'[selected-buffer=/model shared:low cursor=17]'* ]] || fail "floating model effort should remain selectable through the native zsh menu"
-[[ ! -e "$interactive_capture_calls" || ! -s "$interactive_capture_calls" ]] || fail "floating model menu completion should not submit a prompt"
+normalized=$(perl -pe 's/\e\[[0-?]*[ -\/]*[@-~]//g' "$speculative_colon_transcript" | col -b)
+[[ "$normalized" == *'[explicit=/model shared:,14,0 back=/model shared,13,0 delete=/model shared:,14,0 moved=/model shared:,13,0 entered=/model shared,13,0]'* ]] ||
+  fail "speculative colon editing actions should commit or remove the delimiter as specified"
 
 delete_slash_transcript=$tmpdir/delete-slash-transcript
 delete_slash_setup="$interactive_setup; _mu_test_delete_slash_completion() { BUFFER='/'; CURSOR=1; _mu_zsh_list_slash_choices; zle backward-delete-char; if _mu_zsh_slash_completion_context; then back_state=active; else back_state=inactive; fi; back_buffer=\$BUFFER; back_cursor=\$CURSOR; BUFFER='/'; CURSOR=0; _mu_zsh_list_slash_choices; zle delete-char; if _mu_zsh_slash_completion_context; then forward_state=active; else forward_state=inactive; fi; zle -I; print -r -- \"[back-buffer=\$back_buffer back-cursor=\$back_cursor back-context=\$back_state forward-buffer=\$BUFFER forward-cursor=\$CURSOR forward-context=\$forward_state]\"; BUFFER=; CURSOR=0; _mu_zsh_reset_mode_prompt; }; zle -N _mu_test_delete_slash_completion; bindkey -M mumode '^Y' _mu_test_delete_slash_completion"

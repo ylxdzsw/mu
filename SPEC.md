@@ -944,6 +944,10 @@ Consequences:
   key configuration.
 - Typing `/` at the start of a `mu>` line proactively lists slash commands.
   After that, Tab performs shell-native candidate matching and listing.
+- When Tab completes the slash command itself to `/model`, it appends one space
+  and immediately lists model candidates without inserting their common
+  prefix. Once the buffer is already `/model `, later Tabs use ordinary
+  shell-native model completion, including common-prefix insertion.
 - A buffer beginning with `/` is a slash command. Known custom commands take
   everything after their name as a custom instruction, including inserted
   newlines; `/compact` accepts the same instruction syntax as a custom focus.
@@ -960,10 +964,20 @@ Consequences:
 - `/model <model>` validates and stores a shell-only sticky override in the
   tracked bundle. It is forwarded as `--model` to later turns and `/retry`; it
   does not mutate persisted session state.
-- Completing a model that supports effort levels leaves the bare model in the
-  buffer and immediately opens the shell's effort candidates. Completion does
-  not append `:` or choose an effort until the user continues through the
-  shell's native completion UI.
+- Completing a bare or provider-qualified model appends a speculative `:` and
+  immediately opens its effort candidates when the completed reference is
+  exact, no other candidate of the same form has it as a strict prefix, and at
+  least one effort is configured. Provider-qualified references use that
+  provider's efforts; bare floating references use the deduplicated union from
+  every provider defining the model. The cursor follows the colon so effort
+  prefixes can be typed directly.
+- The speculative colon becomes explicit when the user types `:` (without
+  inserting a second colon), types another character, presses Tab, moves the
+  cursor, uses forward Delete, or performs another editing action. Backspace
+  while immediately after an unchanged speculative colon removes it. Enter
+  removes an unchanged speculative colon before submitting the bare model;
+  after the colon becomes explicit, Enter preserves it. Cancelling the whole
+  line discards its speculative state with the line.
 - Ctrl-D is the normal terminal EOT key (`^D`). xterm-style and browser-terminal
   input paths forward it as input when the browser or OS has
   not intercepted the key before the terminal receives it.
@@ -973,8 +987,9 @@ Consequences:
 - Source `mu.zsh` from `.zshrc`.
 - Tab completion delegates matching, candidate lists, and menu selection to the
   user's normal zsh completion settings.
-- Once a bare or provider-qualified model reference is exact, its zsh menu
-  displays only effort variants; the bare no-effort match remains hidden as an
+- Once a bare or provider-qualified model reference transitions to its
+  speculative colon, zsh immediately displays only its effort names. A later
+  Tab uses the native effort menu, with the empty effort kept as a hidden
   insertion anchor. Recognized effort names sort by increasing strength:
   `minimum`, `low`, `medium`, `high`, `xhigh`, `max`; arbitrary provider-defined
   names follow in declaration order.

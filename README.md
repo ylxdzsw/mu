@@ -92,9 +92,11 @@ runs against the current Mu session and shell state.
 Type `/` to list prompt-mode commands. The common ones:
 
 - `/new` starts a new session while keeping the current model and attachments.
-- `/model` selects a configured model for later turns in this shell scope. In
-  zsh, completing an exact model opens only its effort variants, ordered from
-  `minimum` through `max`.
+- `/model` selects a configured model for later turns in this shell scope.
+  Completing an unambiguous model appends a temporary `:` and lists its effort
+  variants; type an effort prefix directly, or press Enter to select the model
+  without an effort. In zsh, recognized efforts are ordered from `minimum`
+  through `max`.
 - `/attach <file>` adds an image or audio file to the next turn.
 - `/retry` resumes a turn interrupted by Ctrl-C, a crash, or a lost connection.
 - `/compact` compacts older turns in a long session, optionally with a focus

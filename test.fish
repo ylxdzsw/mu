@@ -178,6 +178,18 @@ contains :low $efforts; or fail 'effort candidates include low'
 contains :high $efforts; or fail 'effort candidates include high'
 set shared_efforts (_mu_fish_model_effort_suffixes shared)
 contains :medium $shared_efforts; or fail 'floating effort candidates merge provider suggestions'
+set model_records (_mu_fish_model_records)
+_mu_fish_model_completion_transition gpt $model_records; or fail 'unshadowed exact models transition to efforts'
+assert_equal (string join , -- $_MU_FISH_MODEL_COMPLETION_EFFORTS) :low,:high 'model transition exposes configured efforts'
+_mu_fish_model_completion_transition shared $model_records; or fail 'floating exact models transition to efforts'
+assert_equal (string join , -- $_MU_FISH_MODEL_COMPLETION_EFFORTS) :medium 'floating transition merges provider efforts'
+set shadow_records \
+    (printf 'openai/gpt\tgpt\tlow\n') \
+    (printf 'openai/gpt-plus\tgpt-plus\thigh\n')
+_mu_fish_model_completion_transition gpt $shadow_records; and fail 'prefix-shadowed exact models must not transition to efforts'
+set colon_records (printf 'openai/version:latest\tversion:latest\tmax\n')
+_mu_fish_model_completion_transition openai/version:latest $colon_records; or fail 'exact model ids containing a colon transition to efforts'
+contains openai/version:latest (_mu_fish_model_candidates openai/version:lat $colon_records); or fail 'completion preserves configured model ids containing a colon'
 set -g MU_FISH_MODEL unknown
 _mu_fish_sync_state
 set models (_mu_fish_model_candidates gp)
@@ -450,9 +462,30 @@ test $interactive_status -eq 0; or fail "model effort completion transcript exit
 
 set raw_transcript (string collect <"$model_effort_transcript")
 assert_contains "$raw_transcript" '/model gpt' 'one Tab completes the Fish model'
+assert_contains "$raw_transcript" '/model gpt:' 'one Tab appends the speculative colon'
 assert_contains "$raw_transcript" 'gpt:low' 'one Fish model completion immediately lists low effort'
 assert_contains "$raw_transcript" 'gpt:high' 'one Fish model completion immediately lists high effort'
 not test -s "$capture_calls"; or fail 'model effort completion should not submit a prompt'
+
+set speculative_colon_transcript "$TEST_TMPDIR/speculative-colon-transcript"
+set speculative_colon_setup (string join '; ' -- \
+    "$interactive_setup" \
+    'function _mu_test_speculative_colon_state; commandline -r "/model gpt"; commandline -C 10; _mu_fish_append_speculative_model_colon; _mu_fish_model_colon; set explicit (string join , -- (commandline | string collect) (commandline -C) $MU_FISH_SPECULATIVE_MODEL_COLON); commandline -r "/model gpt"; commandline -C 10; _mu_fish_append_speculative_model_colon; _mu_fish_speculative_backspace; set back (string join , -- (commandline | string collect) (commandline -C) $MU_FISH_SPECULATIVE_MODEL_COLON); commandline -r "/model gpt"; commandline -C 10; _mu_fish_append_speculative_model_colon; _mu_fish_speculative_delete; set delete (string join , -- (commandline | string collect) (commandline -C) $MU_FISH_SPECULATIVE_MODEL_COLON); commandline -r "/model gpt"; commandline -C 10; _mu_fish_append_speculative_model_colon; commandline -C 10; _mu_fish_commit_speculative_model_colon_if_changed; set moved (string join , -- (commandline | string collect) (commandline -C) $MU_FISH_SPECULATIVE_MODEL_COLON); commandline -r "/model gpt"; commandline -C 10; _mu_fish_append_speculative_model_colon; _mu_fish_strip_speculative_model_colon; set entered (string join , -- (commandline | string collect) (commandline -C) $MU_FISH_SPECULATIVE_MODEL_COLON); printf "\n[explicit=%s back=%s delete=%s moved=%s entered=%s]\n" $explicit $back $delete $moved $entered; commandline -r ""; commandline -f repaint; end' \
+    'bind -M mumode ctrl-y _mu_test_speculative_colon_state')
+rm -f "$interactive_ready"
+begin
+    sleep 0.2
+    send_interactive_setup "$speculative_colon_setup" "$interactive_ready"
+    printf '\t\x19'
+    sleep 0.4
+    printf '\x04'
+end | timeout 10 script -qfec \
+    'env fish_features=no-query-term,no-keyboard-protocols,no-mark-prompt TERM=xterm-256color fish --no-config' \
+    "$speculative_colon_transcript" >/dev/null
+set interactive_status $pipestatus[2]
+test $interactive_status -eq 0; or fail "speculative colon transcript exited with status $interactive_status"
+set raw_transcript (string collect <"$speculative_colon_transcript")
+assert_contains "$raw_transcript" '[explicit=/model gpt:,11,0 back=/model gpt,10,0 delete=/model gpt:,11,0 moved=/model gpt:,10,0 entered=/model gpt,10,0]' 'Fish speculative colon actions commit or remove the delimiter as specified'
 
 set shift_transcript "$TEST_TMPDIR/shift-transcript"
 rm -f "$capture_args" "$capture_stdin" "$capture_calls" "$interactive_ready"

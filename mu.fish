@@ -34,6 +34,10 @@ set -q MU_FISH_HISTORY_INDEX; or set -g MU_FISH_HISTORY_INDEX 0
 set -q MU_FISH_HISTORY_DRAFT; or set -g MU_FISH_HISTORY_DRAFT
 set -q MU_FISH_HISTORY_DRAFT_CURSOR; or set -g MU_FISH_HISTORY_DRAFT_CURSOR 0
 set -q MU_FISH_HISTORY_ENTRIES; or set -g MU_FISH_HISTORY_ENTRIES
+set -q MU_FISH_SPECULATIVE_MODEL_COLON; or set -g MU_FISH_SPECULATIVE_MODEL_COLON 0
+set -q MU_FISH_SPECULATIVE_MODEL_BUFFER; or set -g MU_FISH_SPECULATIVE_MODEL_BUFFER
+set -q MU_FISH_SPECULATIVE_MODEL_CURSOR; or set -g MU_FISH_SPECULATIVE_MODEL_CURSOR 0
+set -q _MU_FISH_MODEL_COMPLETION_EFFORTS; or set -g _MU_FISH_MODEL_COMPLETION_EFFORTS
 
 set -q MU_FISH_PROMPT_MODEL_COLOR; or set -g MU_FISH_PROMPT_MODEL_COLOR brblue
 set -q MU_FISH_PROMPT_CONTEXT_COLOR; or set -g MU_FISH_PROMPT_CONTEXT_COLOR magenta
@@ -153,6 +157,59 @@ function _mu_fish_clear_tracked_state
     set -g MU_FISH_PENDING_ATTACHMENTS
     set -g MU_FISH_TRACKED_SCOPE
     set -g MU_FISH_EFFECTIVE_ATTACHMENT_COUNT 0
+end
+
+function _mu_fish_clear_speculative_model_colon
+    set -g MU_FISH_SPECULATIVE_MODEL_COLON 0
+    set -g MU_FISH_SPECULATIVE_MODEL_BUFFER
+    set -g MU_FISH_SPECULATIVE_MODEL_CURSOR 0
+end
+
+function _mu_fish_commit_speculative_model_colon_if_changed
+    test "$MU_FISH_SPECULATIVE_MODEL_COLON" -eq 1; or return 0
+    set -l buffer (commandline | string collect)
+    set -l cursor (commandline -C)
+    if test "$buffer" != "$MU_FISH_SPECULATIVE_MODEL_BUFFER"; or test "$cursor" -ne "$MU_FISH_SPECULATIVE_MODEL_CURSOR"
+        _mu_fish_clear_speculative_model_colon
+    end
+end
+
+function _mu_fish_commit_speculative_model_colon
+    if test "$MU_FISH_SPECULATIVE_MODEL_COLON" -eq 1
+        _mu_fish_clear_speculative_model_colon
+    end
+    return 0
+end
+
+function _mu_fish_strip_speculative_model_colon
+    test "$MU_FISH_SPECULATIVE_MODEL_COLON" -eq 1; or return 1
+    set -l buffer (commandline | string collect)
+    set -l cursor (commandline -C)
+    test "$buffer" = "$MU_FISH_SPECULATIVE_MODEL_BUFFER"; or begin
+        _mu_fish_clear_speculative_model_colon
+        return 1
+    end
+    test "$cursor" -eq "$MU_FISH_SPECULATIVE_MODEL_CURSOR"; or begin
+        _mu_fish_clear_speculative_model_colon
+        return 1
+    end
+    set -l left (string sub --end (math "$cursor - 1") -- "$buffer")
+    set -l right (string sub --start (math "$cursor + 1") -- "$buffer")
+    commandline -r -- "$left$right"
+    commandline -C (math "$cursor - 1")
+    _mu_fish_clear_speculative_model_colon
+end
+
+function _mu_fish_append_speculative_model_colon
+    set -l buffer (commandline | string collect)
+    set -l cursor (commandline -C)
+    set -l left (string sub --end "$cursor" -- "$buffer")
+    set -l right (string sub --start (math "$cursor + 1") -- "$buffer")
+    commandline -r -- "$left:$right"
+    commandline -C (math "$cursor + 1")
+    set -g MU_FISH_SPECULATIVE_MODEL_COLON 1
+    set -g MU_FISH_SPECULATIVE_MODEL_BUFFER (commandline | string collect)
+    set -g MU_FISH_SPECULATIVE_MODEL_CURSOR (commandline -C)
 end
 
 function _mu_fish_activate_scope --argument-names scope
@@ -449,6 +506,12 @@ function _mu_fish_model_candidates --argument-names fragment
         set -q fields[3]; and set efforts (string split , -- "$fields[3]")
 
         if string match -q '*:*' -- "$fragment"
+            if string match -q '*:*' -- "$canonical"
+                test -n "$canonical"; and not contains -- "$canonical" $matches; and set -a matches "$canonical"
+            end
+            if string match -q '*:*' -- "$model_id"
+                test -n "$model_id"; and not contains -- "$model_id" $matches; and set -a matches "$model_id"
+            end
             for effort in $efforts
                 test -n "$effort"; or continue
                 test -n "$canonical"; and not contains -- "$canonical:$effort" $matches; and set -a matches "$canonical:$effort"
@@ -466,7 +529,8 @@ end
 function _mu_fish_model_effort_suffixes --argument-names fragment
     set -e argv[1]
     test -n "$fragment"; or return 0
-    string match -q '*:*' -- "$fragment"; and return 0
+    set -l base "$fragment"
+    string match -q '*:' -- "$base"; and set base (string replace -r ':$' '' -- "$base")
 
     set -l records $argv
     test (count $records) -gt 0; or set records (_mu_fish_model_records 2>/dev/null)
@@ -475,7 +539,7 @@ function _mu_fish_model_effort_suffixes --argument-names fragment
         set -l fields (string split \t -- "$record")
         set -l canonical "$fields[1]"
         set -l model_id "$fields[2]"
-        if test "$fragment" != "$canonical"; and test "$fragment" != "$model_id"
+        if test "$base" != "$canonical"; and test "$base" != "$model_id"
             continue
         end
         set -q fields[3]; or continue
@@ -487,10 +551,66 @@ function _mu_fish_model_effort_suffixes --argument-names fragment
     printf '%s\n' $matches
 end
 
+function _mu_fish_model_completion_transition --argument-names fragment
+    set -g _MU_FISH_MODEL_COMPLETION_EFFORTS
+    set -l records $argv[2..-1]
+    test (count $records) -gt 0; or set records (_mu_fish_model_records 2>/dev/null)
+    set -l qualified 0
+    string match -q '*/*' -- "$fragment"; and set qualified 1
+    set -l exact
+    for record in $records
+        set -l fields (string split \t -- "$record")
+        set -l canonical "$fields[1]"
+        set -l model_id "$fields[2]"
+        if test "$qualified" -eq 1
+            test "$canonical" = "$fragment"; and set -a exact "$record"
+        else
+            test "$model_id" = "$fragment"; and set -a exact "$record"
+        end
+    end
+    test (count $exact) -gt 0; or return 1
+
+    for record in $records
+        set -l fields (string split \t -- "$record")
+        set -l candidate "$fields[1]"
+        test "$qualified" -eq 1; or set candidate "$fields[2]"
+        set -l prefix (string sub --length (string length -- "$fragment") -- "$candidate")
+        test "$prefix" = "$fragment"; or continue
+        test "$candidate" = "$fragment"; and continue
+        return 1
+    end
+
+    if test "$qualified" -eq 1
+        set -l fields (string split \t -- "$exact[1]")
+        set -q fields[3]; or return 1
+        for effort in (string split , -- "$fields[3]")
+            test -n "$effort"; or continue
+            if not contains -- ":$effort" $_MU_FISH_MODEL_COMPLETION_EFFORTS
+                set -a _MU_FISH_MODEL_COMPLETION_EFFORTS ":$effort"
+            end
+        end
+    else
+        for record in $exact
+            set -l fields (string split \t -- "$record")
+            set -q fields[3]; or continue
+            for effort in (string split , -- "$fields[3]")
+                test -n "$effort"; or continue
+                if not contains -- ":$effort" $_MU_FISH_MODEL_COMPLETION_EFFORTS
+                    set -a _MU_FISH_MODEL_COMPLETION_EFFORTS ":$effort"
+                end
+            end
+        end
+    end
+    test (count $_MU_FISH_MODEL_COMPLETION_EFFORTS) -gt 0
+end
+
 function _mu_fish_native_model_candidates
     set -l records (_mu_fish_model_records 2>/dev/null)
-    _mu_fish_model_candidates '' $records
-    _mu_fish_model_candidates : $records
+    set -l fragment (commandline -ct)
+    if test "$MU_FISH_SPECULATIVE_MODEL_COLON" -eq 1; and string match -q '*:' -- "$fragment"
+        printf '%s\n' "$fragment"
+    end
+    _mu_fish_model_candidates "$fragment" $records
 end
 
 function _mu_fish_install_model_completion
@@ -740,6 +860,7 @@ function _mu_fish_complete_values --argument-names prefix fragment suffix
 end
 
 function _mu_fish_complete_slash
+    _mu_fish_commit_speculative_model_colon_if_changed
     set -l buffer (commandline)
     set -l cursor (commandline -C)
     set -l left (string sub --length $cursor -- "$buffer")
@@ -758,11 +879,36 @@ function _mu_fish_complete_slash
 
     if string match -q '/model *' -- "$left"
         commandline -f complete
+        set -l after_buffer (commandline)
+        set -l after_cursor (commandline -C)
+        if string match -q '/model * ' -- "$after_buffer"; and test "$after_cursor" -eq (string length -- "$after_buffer")
+            commandline -r -- (string replace -r ' $' '' -- "$after_buffer")
+            commandline -C (math "$after_cursor - 1")
+            set after_buffer (commandline)
+            set after_cursor (commandline -C)
+        end
+        set -l after_left (string sub --length $after_cursor -- "$after_buffer")
+        if string match -q '/model *' -- "$after_left"; and not string match -qr '[[:space:]]' -- (string replace -r '^/model ' '' -- "$after_left")
+            set -l model_arg (string replace -r '^/model ' '' -- "$after_left")
+            set -l records (_mu_fish_model_records 2>/dev/null)
+            if _mu_fish_model_completion_transition "$model_arg" $records
+                _mu_fish_append_speculative_model_colon
+                commandline -f complete
+            end
+        end
         return
     end
 
     if string match -q '/*' -- "$left"; and not string match -qr '[[:space:]]' -- "$left"
         set -l candidates (_mu_fish_slash_command_candidates)
+        set -l matches (_mu_fish_matching_candidates "$left" $candidates)
+        if test "$left" = /model; or test (count $matches) -eq 1 -a "$matches[1]" = /model
+            commandline -r -- '/model '
+            commandline -C 7
+            set -l records (_mu_fish_model_records 2>/dev/null)
+            _mu_fish_list_candidates (_mu_fish_model_candidates '' $records)
+            return
+        end
         _mu_fish_complete_values '' "$left" ' ' $candidates
         return
     end
@@ -772,6 +918,7 @@ end
 
 function _mu_fish_enter_mode
     test "$MU_FISH_MODE" = mu; and return 0
+    _mu_fish_clear_speculative_model_colon
     _mu_fish_reset_history_navigation
     set -g MU_FISH_MODE mu
     set -g MU_FISH_SAVED_BIND_MODE $fish_bind_mode
@@ -783,6 +930,7 @@ end
 
 function _mu_fish_exit_mode
     test "$MU_FISH_MODE" = shell; and return 0
+    _mu_fish_clear_speculative_model_colon
     _mu_fish_reset_history_navigation
     set -g MU_FISH_MODE shell
     set fish_bind_mode "$MU_FISH_SAVED_BIND_MODE"
@@ -791,6 +939,7 @@ function _mu_fish_exit_mode
 end
 
 function _mu_fish_tab
+    _mu_fish_commit_speculative_model_colon
     set -l cursor (commandline -C)
     if test "$MU_FISH_MODE" = mu
         set -l buffer (commandline)
@@ -817,6 +966,7 @@ function _mu_fish_tab
 end
 
 function _mu_fish_slash
+    _mu_fish_commit_speculative_model_colon
     set -l should_list 0
     test "$MU_FISH_MODE" = mu; and test (commandline -C) -eq 0; and set should_list 1
     commandline -i /
@@ -827,10 +977,12 @@ function _mu_fish_slash
 end
 
 function _mu_fish_insert_newline
+    _mu_fish_commit_speculative_model_colon
     commandline -i \n
 end
 
 function _mu_fish_history_up
+    _mu_fish_commit_speculative_model_colon
     if test (commandline -L) -gt 1
         commandline -f up-line
         return
@@ -856,6 +1008,7 @@ function _mu_fish_history_up
 end
 
 function _mu_fish_history_down
+    _mu_fish_commit_speculative_model_colon
     set -l lines (string split \n -- (commandline | string collect))
     if test (commandline -L) -lt (count $lines)
         commandline -f down-line
@@ -875,6 +1028,8 @@ function _mu_fish_history_down
 end
 
 function _mu_fish_accept
+    _mu_fish_commit_speculative_model_colon_if_changed
+    _mu_fish_strip_speculative_model_colon 2>/dev/null
     set -l input (commandline | string collect)
     _mu_fish_reset_history_navigation
     if string match -qr '^[[:space:]]*$' -- "$input"
@@ -906,6 +1061,58 @@ function mu-fish-exit-mode
     commandline -f repaint
 end
 
+function _mu_fish_model_colon
+    set -l buffer (commandline | string collect)
+    set -l cursor (commandline -C)
+    if test "$MU_FISH_SPECULATIVE_MODEL_COLON" -eq 1; and test "$buffer" = "$MU_FISH_SPECULATIVE_MODEL_BUFFER"; and test "$cursor" -eq "$MU_FISH_SPECULATIVE_MODEL_CURSOR"
+        _mu_fish_clear_speculative_model_colon
+        return 0
+    end
+    _mu_fish_commit_speculative_model_colon_if_changed
+    commandline -i :
+end
+
+function _mu_fish_speculative_backspace
+    set -l buffer (commandline | string collect)
+    set -l cursor (commandline -C)
+    if test "$MU_FISH_SPECULATIVE_MODEL_COLON" -eq 1; and test "$buffer" = "$MU_FISH_SPECULATIVE_MODEL_BUFFER"; and test "$cursor" -eq "$MU_FISH_SPECULATIVE_MODEL_CURSOR"
+        _mu_fish_strip_speculative_model_colon
+        return 0
+    end
+    _mu_fish_commit_speculative_model_colon_if_changed
+    commandline -f backward-delete-char
+end
+
+function _mu_fish_speculative_delete
+    _mu_fish_commit_speculative_model_colon
+    commandline -f delete-char
+end
+
+function _mu_fish_speculative_left
+    _mu_fish_commit_speculative_model_colon
+    commandline -f backward-char
+end
+
+function _mu_fish_speculative_right
+    _mu_fish_commit_speculative_model_colon
+    commandline -f forward-char
+end
+
+function _mu_fish_speculative_home
+    _mu_fish_commit_speculative_model_colon
+    commandline -f beginning-of-line
+end
+
+function _mu_fish_speculative_end
+    _mu_fish_commit_speculative_model_colon
+    commandline -f end-of-line
+end
+
+function _mu_fish_speculative_delete_or_exit
+    _mu_fish_commit_speculative_model_colon
+    commandline -f delete-or-exit
+end
+
 function _mu_fish_configure_keymap
     set -g _MU_FISH_INPUT_FUNCTIONS (bind --function-names)
     _mu_fish_capture_tab_binding default _MU_FISH_DEFAULT_TAB_BINDING
@@ -918,8 +1125,15 @@ function _mu_fish_configure_keymap
     bind -M mumode enter _mu_fish_accept
     bind -M mumode tab _mu_fish_tab
     bind -M mumode / _mu_fish_slash
-    bind -M mumode ctrl-c _mu_fish_reset_history_navigation cancel-commandline
-    bind -M mumode ctrl-d delete-or-exit
+    bind -M mumode ':' _mu_fish_model_colon
+    bind -M mumode backspace _mu_fish_speculative_backspace
+    bind -M mumode delete _mu_fish_speculative_delete
+    bind -M mumode left _mu_fish_speculative_left
+    bind -M mumode right _mu_fish_speculative_right
+    bind -M mumode home _mu_fish_speculative_home
+    bind -M mumode end _mu_fish_speculative_end
+    bind -M mumode ctrl-c _mu_fish_clear_speculative_model_colon _mu_fish_reset_history_navigation cancel-commandline
+    bind -M mumode ctrl-d _mu_fish_speculative_delete_or_exit
     bind -M mumode up _mu_fish_history_up
     bind -M mumode down _mu_fish_history_down
     bind -M mumode \e\[13\;2u _mu_fish_insert_newline
