@@ -789,6 +789,10 @@ pub(crate) fn classify_http_error(
 }
 
 pub(crate) fn classify_stream_error(error: &Value) -> ProviderError {
+    let error = error
+        .get("error")
+        .filter(|nested| nested.is_object())
+        .unwrap_or(error);
     let message = stream_error_message(error);
     let status = embedded_status(error).or_else(|| bracketed_status(&message));
     classify_provider_error(status, error, &error.to_string(), None)
@@ -850,6 +854,9 @@ fn classify_provider_error(
             retry_after,
             detail,
         };
+    }
+    if code_is("stream_read_error") || code_is("upstream_error") {
+        return ProviderError::Transport(detail);
     }
     if code_is("server_error") || code_is("overloaded_error") {
         return ProviderError::Overloaded {
@@ -1254,6 +1261,16 @@ mod tests {
                     "message": "[503] queue is full"
                 }),
                 "overloaded",
+                ProviderDisposition::Retry,
+            ),
+            (
+                502,
+                serde_json::json!({
+                    "code": "stream_read_error",
+                    "type": "upstream_error",
+                    "message": "upstream disconnected"
+                }),
+                "transport",
                 ProviderDisposition::Retry,
             ),
         ];

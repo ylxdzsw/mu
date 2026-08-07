@@ -651,6 +651,36 @@ mod tests {
     }
 
     #[test]
+    fn stream_read_error_is_retryable_transport_in_both_error_shapes() {
+        let buffers = [
+            concat!(
+                "data: {\"type\":\"error\",\"error\":{\"code\":\"stream_read_error\",",
+                "\"message\":\"upstream disconnected\",\"type\":\"upstream_error\"},",
+                "\"sequence_number\":0}\n\n",
+            )
+            .to_string(),
+            concat!(
+                "data: {\"type\":\"response.failed\",\"response\":{\"error\":",
+                "{\"code\":\"stream_read_error\",\"message\":\"upstream disconnected\",",
+                "\"type\":\"upstream_error\"}}}\n\n",
+            )
+            .to_string(),
+        ];
+
+        for mut buffer in buffers {
+            let mut state = ResponsesStreamState::default();
+            let mut events = Vec::new();
+            let error = consume(&mut state, &mut events, &mut buffer).unwrap_err();
+
+            assert!(matches!(
+                error,
+                ProviderError::Transport(ref detail) if detail == "upstream disconnected"
+            ));
+            assert_eq!(error.disposition(), ProviderDisposition::Retry);
+        }
+    }
+
+    #[test]
     fn top_level_rate_limit_error_is_retryable_and_preserves_message() {
         let mut state = ResponsesStreamState::default();
         let mut events = Vec::new();
