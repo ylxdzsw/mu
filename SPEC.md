@@ -970,6 +970,11 @@ Consequences:
 - Source `mu.zsh` from `.zshrc`.
 - Tab completion delegates matching, candidate lists, and menu selection to the
   user's normal zsh completion settings.
+- Once a bare or provider-qualified model reference is exact, its zsh menu
+  displays only effort variants; the bare no-effort match remains hidden as an
+  insertion anchor. Recognized effort names sort by increasing strength:
+  `minimum`, `low`, `medium`, `high`, `xhigh`, `max`; arbitrary provider-defined
+  names follow in declaration order.
 - While `mu>` mode is active, conflicting line-editor plugins should be
   suspended. Common ZLE helpers such as syntax highlighting and autosuggestions
   may be disabled automatically; additional plugin toggles may be attached with

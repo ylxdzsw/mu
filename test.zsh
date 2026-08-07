@@ -84,7 +84,7 @@ if [[ "$1" == "status" ]]; then
   [[ "$provider" == "$model" ]] && provider=test
   model_json="\"model\":{\"provider_id\":\"$provider\",\"model_id\":\"$model_id\",\"effort\":null,\"canonical\":\"$model\"}"
   if (( include_models )); then
-    print -r -- "{$model_json,\"context_tokens\":25,\"context_window\":100,\"project_root\":\"$MU_ZSH_TEST_PROJECT_ROOT\",\"available_models\":{\"providers\":[{\"id\":\"local\",\"models\":[{\"id\":\"local/solo\",\"model_id\":\"solo\",\"supported_efforts\":[\"max\"]},{\"id\":\"local/shared\",\"model_id\":\"shared\",\"supported_efforts\":[\"low\"]}]},{\"id\":\"openai\",\"models\":[{\"id\":\"openai/gpt\",\"model_id\":\"gpt\",\"supported_efforts\":[\"low\",\"high\",\"provider-custom\"]},{\"id\":\"openai/gpt-5.6-luna\",\"model_id\":\"gpt-5.6-luna\",\"supported_efforts\":[\"none\",\"max\"]},{\"id\":\"openai/shared\",\"model_id\":\"shared\",\"supported_efforts\":[\"medium\"]}]}]}}"
+    print -r -- "{$model_json,\"context_tokens\":25,\"context_window\":100,\"project_root\":\"$MU_ZSH_TEST_PROJECT_ROOT\",\"available_models\":{\"providers\":[{\"id\":\"local\",\"models\":[{\"id\":\"local/solo\",\"model_id\":\"solo\",\"supported_efforts\":[\"max\"]},{\"id\":\"local/shared\",\"model_id\":\"shared\",\"supported_efforts\":[\"low\"]}]},{\"id\":\"openai\",\"models\":[{\"id\":\"openai/gpt\",\"model_id\":\"gpt\",\"supported_efforts\":[\"provider-custom\",\"high\",\"minimum\",\"low\",\"max\",\"medium\",\"xhigh\"]},{\"id\":\"openai/gpt-5.6-luna\",\"model_id\":\"gpt-5.6-luna\",\"supported_efforts\":[\"none\",\"max\"]},{\"id\":\"openai/shared\",\"model_id\":\"shared\",\"supported_efforts\":[\"medium\"]}]}]}}"
   elif (( include_commands )); then
     print -r -- "{$model_json,\"context_tokens\":25,\"context_window\":100,\"project_root\":\"$MU_ZSH_TEST_PROJECT_ROOT\",\"commands\":[{\"name\":\"review.md\",\"path\":\"$MU_ZSH_TEST_PROJECT_ROOT/.mu/review.md\",\"scope\":\"project\"}]}"
   else
@@ -423,6 +423,30 @@ model_candidates=("${(@f)$(_mu_zsh_model_completion_candidates "")}")
 model_candidates=("${(@f)$(_mu_zsh_model_completion_candidates "gpt")}")
 [[ " ${(j: :)model_candidates} " == *" gpt "* ]] || fail "keeps all base models available for zsh matching"
 [[ " ${(j: :)model_candidates} " != *":high "* ]] || fail "does not show variants until colon"
+effort_suffixes=("${(@f)$(_mu_zsh_model_completion_candidates "gpt" 1)}")
+[[ "${(j:,:)effort_suffixes}" == ":minimum,:low,:medium,:high,:xhigh,:max,:provider-custom" ]] ||
+  fail "sorts recognized exact-model efforts by strength and leaves custom efforts last: ${(j:,:)effort_suffixes}"
+qualified_effort_suffixes=("${(@f)$(_mu_zsh_model_completion_candidates "openai/gpt" 1)}")
+[[ "${(j:,:)qualified_effort_suffixes}" == "${(j:,:)effort_suffixes}" ]] ||
+  fail "provider-qualified exact models use the same sorted effort menu"
+prefix_effort_suffixes=("${(@f)$(_mu_zsh_model_completion_candidates "gp" 1)}")
+prefix_effort_suffixes=("${(@)prefix_effort_suffixes:#}")
+(( ${#prefix_effort_suffixes[@]} == 0 )) ||
+  fail "model prefixes do not switch to the effort menu"
+captured_compadd_calls=()
+compadd() { captured_compadd_calls+=("${(j:,:)@}") }
+BUFFER="/model gpt"
+CURSOR=${#BUFFER}
+_mu_zsh_fallback_completion
+unfunction compadd
+[[ "$captured_compadd_calls[1]" == *",-n,--,gpt" ]] ||
+  fail "exact-model completion keeps the bare model only as a hidden anchor"
+[[ "$captured_compadd_calls[2]" != *",gpt,"* && "$captured_compadd_calls[2]" != *,gpt ]] ||
+  fail "exact-model effort menu omits the bare model"
+for effort in minimum low medium high xhigh max provider-custom; do
+  [[ ",$captured_compadd_calls[2]," == *",gpt:$effort,"* ]] ||
+    fail "exact-model effort menu includes gpt:$effort"
+done
 model_candidates=("${(@f)$(_mu_zsh_model_completion_candidates "gpt:")}")
 [[ " ${(j: :)model_candidates} " == *" gpt:low "* ]] || fail "shows unqualified variants after colon"
 [[ " ${(j: :)model_candidates} " == *" openai/gpt:high "* ]] || fail "shows provider-qualified variants after colon"

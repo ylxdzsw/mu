@@ -450,6 +450,9 @@ _mu_zsh_model_completion_candidates() {
   jq -r --arg fragment "$fragment" --arg suffix_only "$suffix_only" '
     def dedup:
       reduce .[] as $item ([]; if index($item) then . else . + [$item] end);
+    def effort_rank:
+      . as $effort
+      | (["minimum", "low", "medium", "high", "xhigh", "max"] | index($effort)) // 6;
     [.available_models.providers[]?.models[]? | {
       canonical: (.id // ""),
       short: (.model_id // ""),
@@ -472,7 +475,14 @@ _mu_zsh_model_completion_candidates() {
           | .canonical, .short
         end
       ]
-    | dedup[]
+    | dedup
+    | if $suffix_only == "1" then
+        to_entries
+        | sort_by((.value | ltrimstr(":") | effort_rank), .key)
+        | .[].value
+      else
+        .[]
+      end
   ' <<< "$json"
 }
 
@@ -523,10 +533,10 @@ _mu_zsh_fallback_completion() {
     effort_suffixes=("${(@f)$(_mu_zsh_model_completion_candidates "$arg" 1)}")
     effort_suffixes=("${(@)effort_suffixes:#}")
     if (( ${#effort_suffixes[@]} )); then
-      effort_candidates=("$arg")
       for effort_suffix in "${effort_suffixes[@]}"; do
         effort_candidates+=("$arg$effort_suffix")
       done
+      compadd -Q -S '' -n -- "$arg"
       compadd -Q -S '' -- "${effort_candidates[@]}"
       return
     fi
@@ -558,10 +568,11 @@ _mu_zsh_completion_system() {
     effort_suffixes=("${(@f)$(_mu_zsh_model_completion_candidates "$arg" 1)}")
     effort_suffixes=("${(@)effort_suffixes:#}")
     if (( ${#effort_suffixes[@]} )); then
-      effort_candidates=("$arg")
       for effort_suffix in "${effort_suffixes[@]}"; do
         effort_candidates+=("$arg$effort_suffix")
       done
+      _wanted mu-model-effort expl 'model effort' \
+        compadd -Q -S '' -n -- "$arg"
       _wanted mu-model-effort expl 'model effort' \
         compadd -Q -S '' -- "${effort_candidates[@]}"
       return
