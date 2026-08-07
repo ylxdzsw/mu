@@ -444,6 +444,28 @@ set interactive_status $pipestatus[2]
 test $interactive_status -eq 0; or fail "history restore transcript exited with status $interactive_status"
 assert_equal (cat "$capture_stdin") "$history_draft" 'Fish Down restores the pre-history Mu draft'
 
+set common_prefix_transcript "$TEST_TMPDIR/common-prefix-transcript"
+set common_prefix_setup (string join '; ' -- \
+    "$interactive_setup" \
+    'function _mu_test_common_prefix_completion; commandline -r "/mod"; commandline -C 4; _mu_fish_complete_slash; set first (string join , -- (commandline | string collect) (commandline -C)); commandline -r "/model o"; commandline -C 8; _mu_fish_complete_slash; printf "\n[first=%s later=%s,%s]\n" $first (commandline | string collect) (commandline -C); commandline -r ""; commandline -f repaint; end' \
+    'bind -M mumode ctrl-y _mu_test_common_prefix_completion')
+rm -f "$capture_args" "$capture_stdin" "$capture_calls" "$interactive_ready"
+begin
+    sleep 0.2
+    send_interactive_setup "$common_prefix_setup" "$interactive_ready"
+    printf '\t\x19'
+    sleep 0.4
+    printf '\x04'
+end | timeout 10 script -qfec \
+    'env fish_features=no-query-term,no-keyboard-protocols,no-mark-prompt TERM=xterm-256color fish --no-config' \
+    "$common_prefix_transcript" >/dev/null
+set interactive_status $pipestatus[2]
+test $interactive_status -eq 0; or fail "common-prefix completion transcript exited with status $interactive_status"
+
+set raw_transcript (string collect <"$common_prefix_transcript")
+assert_contains "$raw_transcript" '[first=/model ,7 later=/model openai/,14]' 'Fish defers model completion until the next Tab and then fills the native common prefix'
+not test -s "$capture_calls"; or fail 'common-prefix completion should not submit a prompt'
+
 set model_effort_transcript "$TEST_TMPDIR/model-effort-transcript"
 rm -f "$capture_args" "$capture_stdin" "$capture_calls" "$interactive_ready"
 begin

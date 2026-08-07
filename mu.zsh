@@ -734,7 +734,7 @@ _mu_zsh_complete_slash() {
   local before_buffer=$BUFFER before_cursor=$CURSOR
   local before_left=${BUFFER[1,$CURSOR]}
   local model_arg effort
-  local -a display_efforts model_candidates
+  local -a display_efforts
 
   _mu_zsh_slash_completion_context || return 1
   if _mu_zsh_use_completion_system; then
@@ -752,10 +752,6 @@ _mu_zsh_complete_slash() {
       BUFFER+=$' '
       (( CURSOR += 1 ))
     }
-    # This is intentionally list-only. Once the buffer already contains
-    # "/model ", later Tabs use ordinary model completion.
-    model_candidates=("${(@f)$(_mu_zsh_model_completion_candidates "" 2>/dev/null || true)}")
-    zle -M "${(j:  :)model_candidates}"
     return
   fi
 

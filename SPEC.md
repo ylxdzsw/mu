@@ -945,9 +945,9 @@ Consequences:
 - Typing `/` at the start of a `mu>` line proactively lists slash commands.
   After that, Tab performs shell-native candidate matching and listing.
 - When Tab completes the slash command itself to `/model`, it appends one space
-  and immediately lists model candidates without inserting their common
-  prefix. Once the buffer is already `/model `, later Tabs use ordinary
-  shell-native model completion, including common-prefix insertion.
+  and stops at `/model `. Once the buffer is already `/model `, later Tabs use
+  ordinary shell-native model completion, including candidate listing and
+  common-prefix insertion.
 - A buffer beginning with `/` is a slash command. Known custom commands take
   everything after their name as a custom instruction, including inserted
   newlines; `/compact` accepts the same instruction syntax as a custom focus.

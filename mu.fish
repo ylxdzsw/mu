@@ -905,8 +905,6 @@ function _mu_fish_complete_slash
         if test "$left" = /model; or test (count $matches) -eq 1 -a "$matches[1]" = /model
             commandline -r -- '/model '
             commandline -C 7
-            set -l records (_mu_fish_model_records 2>/dev/null)
-            _mu_fish_list_candidates (_mu_fish_model_candidates '' $records)
             return
         end
         _mu_fish_complete_values '' "$left" ' ' $candidates
