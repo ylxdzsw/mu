@@ -206,6 +206,7 @@ impl Renderer {
                 terminal_layout
                     .map(TerminalLayout::markdown)
                     .unwrap_or_default(),
+                format,
             ),
             assistant_block_open: false,
             live_line: None,
@@ -1377,6 +1378,7 @@ struct MarkdownLayout {
 
 struct MarkdownStream {
     layout: MarkdownLayout,
+    format: OutputFormat,
     line_wrapper: Option<TerminalLineWrapper>,
     pending_line: String,
     pending_block_separator: bool,
@@ -1390,7 +1392,7 @@ struct MarkdownStream {
 
 impl Default for MarkdownStream {
     fn default() -> Self {
-        Self::new(MarkdownLayout::default())
+        Self::new(MarkdownLayout::default(), OutputFormat::Detail)
     }
 }
 
@@ -1699,6 +1701,16 @@ struct InlineStream {
     pending: String,
     base_styles: Vec<MdStyle>,
     previous_source_char: Option<char>,
+    format: OutputFormat,
+}
+
+impl InlineStream {
+    fn new(format: OutputFormat) -> Self {
+        Self {
+            format,
+            ..Self::default()
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -1767,15 +1779,16 @@ struct BashPreviewSnapshot {
 }
 
 impl MarkdownStream {
-    fn new(layout: MarkdownLayout) -> Self {
+    fn new(layout: MarkdownLayout, format: OutputFormat) -> Self {
         Self {
             layout,
+            format,
             line_wrapper: layout.prose_width.map(TerminalLineWrapper::new),
             pending_line: String::new(),
             pending_block_separator: false,
             line_stream: None,
             line_prefix: None,
-            inline_stream: InlineStream::default(),
+            inline_stream: InlineStream::new(format),
             code_fence: None,
             table_candidate: None,
             table_buffer: None,
@@ -2032,7 +2045,7 @@ impl MarkdownStream {
             return;
         }
         if parse_heading_line(line).is_some() {
-            if let Some(rendered) = render_heading_line(line) {
+            if let Some(rendered) = render_heading_line(line, self.format) {
                 self.emit_wrappable(&rendered, out);
                 self.pending_block_separator = true;
             } else {
@@ -2041,19 +2054,19 @@ impl MarkdownStream {
             return;
         }
         if is_single_line_block(line.trim()) {
-            let rendered = render_markdown(line, self.layout.prose_width);
+            let rendered = render_markdown(line, self.layout.prose_width, self.format);
             self.emit_wrappable(&rendered, out);
             return;
         }
-        if let Some(rendered) = render_list_line(line, complete) {
+        if let Some(rendered) = render_list_line(line, complete, self.format) {
             self.emit_wrappable(&rendered, out);
             return;
         }
-        if let Some(rendered) = render_block_quote_line(line, complete) {
+        if let Some(rendered) = render_block_quote_line(line, complete, self.format) {
             self.emit_wrappable(&rendered, out);
             return;
         }
-        self.emit_wrappable(&render_inline_or_raw_line(line, complete), out);
+        self.emit_wrappable(&render_inline_or_raw_line(line, complete, self.format), out);
     }
 
     fn flush_table_candidate(&mut self, out: &mut Vec<String>) {
@@ -2064,7 +2077,7 @@ impl MarkdownStream {
 
     fn flush_table_buffer(&mut self, out: &mut Vec<String>) {
         if let Some(table) = self.table_buffer.take() {
-            let rendered = render_markdown(&table, self.layout.table_width);
+            let rendered = render_markdown(&table, self.layout.table_width, self.format);
             self.emit_verbatim(&rendered, out);
         }
     }
@@ -2334,9 +2347,9 @@ fn is_single_line_block(line: &str) -> bool {
     heading || rule
 }
 
-fn render_heading_line(line: &str) -> Option<String> {
+fn render_heading_line(line: &str, format: OutputFormat) -> Option<String> {
     let (level, content) = parse_heading_line(line)?;
-    let rendered = render_inline_markdown(content)?;
+    let rendered = render_inline_markdown(content, format)?;
     let mut out = String::new();
     let mut styles = Vec::new();
     push_styles(&mut out, &mut styles, heading_styles(level));
@@ -2380,9 +2393,9 @@ fn split_line_ending(line: &str) -> (&str, &str) {
         .unwrap_or((line, ""))
 }
 
-fn render_inline_or_raw_line(line: &str, complete: bool) -> String {
+fn render_inline_or_raw_line(line: &str, complete: bool, format: OutputFormat) -> String {
     let (body, ending) = split_line_ending(line);
-    render_inline_markdown(body)
+    render_inline_markdown(body, format)
         .map(|rendered| format!("{rendered}{ending}"))
         .unwrap_or_else(|| {
             if complete {
@@ -2393,13 +2406,13 @@ fn render_inline_or_raw_line(line: &str, complete: bool) -> String {
         })
 }
 
-fn render_list_line(line: &str, complete: bool) -> Option<String> {
+fn render_list_line(line: &str, complete: bool, format: OutputFormat) -> Option<String> {
     let (body, ending) = split_line_ending(line);
     let trimmed = body.trim_start_matches(' ');
     let indent = body.len().saturating_sub(trimmed.len());
     let (marker, rest) = parse_list_marker(trimmed)?;
     let (task, rest) = parse_task_marker(rest);
-    let rendered = render_inline_markdown(rest)?;
+    let rendered = render_inline_markdown(rest, format)?;
 
     let mut out = String::new();
     out.push_str(&"  ".repeat(indent / 2));
@@ -2487,7 +2500,7 @@ fn is_partial_task_marker(text: &str) -> bool {
             .any(|marker| marker.starts_with(text))
 }
 
-fn render_block_quote_line(line: &str, complete: bool) -> Option<String> {
+fn render_block_quote_line(line: &str, complete: bool, format: OutputFormat) -> Option<String> {
     let (body, ending) = split_line_ending(line);
     let mut rest = body.trim_start_matches(' ');
     let leading = body.len().saturating_sub(rest.len());
@@ -2504,7 +2517,7 @@ fn render_block_quote_line(line: &str, complete: bool) -> Option<String> {
         return None;
     }
 
-    let rendered = render_inline_markdown(rest)?;
+    let rendered = render_inline_markdown(rest, format)?;
     let mut out = String::new();
     for style in block_quote_styles() {
         out.push_str(style.ansi());
@@ -2517,7 +2530,7 @@ fn render_block_quote_line(line: &str, complete: bool) -> Option<String> {
     Some(out)
 }
 
-fn render_inline_markdown(markdown: &str) -> Option<String> {
+fn render_inline_markdown(markdown: &str, format: OutputFormat) -> Option<String> {
     let options = Options::ENABLE_STRIKETHROUGH;
     let parser = Parser::new_ext(markdown, options);
     let mut out = String::new();
@@ -2547,11 +2560,13 @@ fn render_inline_markdown(markdown: &str) -> Option<String> {
                     out.push_str(OSC8_CLOSE);
                     pop_styles(&mut out, &mut styles, link_styles().len());
                     let url = links.pop()?;
-                    out.push_str(DIM);
-                    out.push_str(" (");
-                    out.push_str(&hyperlink_text(&url, &url));
-                    out.push(')');
-                    out.push_str(RESET);
+                    if format != OutputFormat::Concise {
+                        out.push_str(DIM);
+                        out.push_str(" (");
+                        out.push_str(&hyperlink_text(&url, &url));
+                        out.push(')');
+                        out.push_str(RESET);
+                    }
                     for style in &styles {
                         out.push_str(style.ansi());
                     }
@@ -2722,12 +2737,14 @@ impl InlineStream {
         out.push_str(OSC8_CLOSE);
         out.push_str(RESET);
         self.reapply_base(&mut out);
-        out.push_str(DIM);
-        out.push_str(" (");
-        out.push_str(&hyperlink_text(url, url));
-        out.push(')');
-        out.push_str(RESET);
-        self.reapply_base(&mut out);
+        if self.format != OutputFormat::Concise {
+            out.push_str(DIM);
+            out.push_str(" (");
+            out.push_str(&hyperlink_text(url, url));
+            out.push(')');
+            out.push_str(RESET);
+            self.reapply_base(&mut out);
+        }
         Some((out, url_end + 1))
     }
 
@@ -2832,7 +2849,7 @@ impl TableState {
     }
 }
 
-fn render_markdown(markdown: &str, max_width: Option<usize>) -> String {
+fn render_markdown(markdown: &str, max_width: Option<usize>, format: OutputFormat) -> String {
     let options =
         Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TABLES | Options::ENABLE_TASKLISTS;
     let parser = Parser::new_ext(markdown, options);
@@ -3017,11 +3034,13 @@ fn render_markdown(markdown: &str, max_width: Option<usize>) -> String {
                     );
                     if let Some(url) = links.pop() {
                         let target = current_render_target(&mut out, &mut table_state);
-                        target.push_str(DIM);
-                        target.push_str(" (");
-                        target.push_str(&hyperlink_text(&url, &url));
-                        target.push(')');
-                        target.push_str(RESET);
+                        if format != OutputFormat::Concise {
+                            target.push_str(DIM);
+                            target.push_str(" (");
+                            target.push_str(&hyperlink_text(&url, &url));
+                            target.push(')');
+                            target.push_str(RESET);
+                        }
                         for style in &styles {
                             current_render_target(&mut out, &mut table_state)
                                 .push_str(style.ansi());
@@ -4435,7 +4454,11 @@ mod tests {
                 second_row.join(" | ")
             );
 
-            let plain = strip_ansi(&render_markdown(&markdown, Some(max_width)));
+            let plain = strip_ansi(&render_markdown(
+                &markdown,
+                Some(max_width),
+                OutputFormat::Detail,
+            ));
             let table_lines = plain
                 .lines()
                 .filter(|line| line.starts_with('|') && line.ends_with('|'))
@@ -4567,6 +4590,50 @@ mod tests {
         assert!(quote.contains(ITALIC), "{quote:?}");
         assert!(!quote.contains('│'), "{quote:?}");
         assert_eq!(strip_ansi(&stream.push("\n").concat()), "\n");
+    }
+
+    #[test]
+    fn concise_markdown_links_keep_the_target_hidden_but_clickable() {
+        let url = "https://example.com/docs";
+        let (mut renderer, output) =
+            Renderer::with_test_shared_output(OutputFormat::Concise, true, None);
+        renderer.assistant_text("[docs](").unwrap();
+        renderer.assistant_text(url).unwrap();
+        renderer.assistant_text(")\n").unwrap();
+        renderer.assistant_end().unwrap();
+        let transcript = output.transcript();
+        assert_eq!(strip_ansi(&transcript), "docs\n");
+        assert!(transcript.contains(&open_hyperlink(url)), "{transcript:?}");
+
+        let mut concise = MarkdownStream::new(MarkdownLayout::default(), OutputFormat::Concise);
+        let rendered = [
+            concise.push("[docs](").concat(),
+            concise.push(url).concat(),
+            concise.push(")\n").concat(),
+            concise.finish().concat(),
+        ]
+        .concat();
+
+        assert_eq!(strip_ansi(&rendered), "docs\n");
+        assert!(rendered.contains(&open_hyperlink(url)), "{rendered:?}");
+
+        let detail = strip_ansi(&render_markdown(
+            "[docs](https://example.com/docs)",
+            None,
+            OutputFormat::Detail,
+        ));
+        assert!(
+            detail.contains("docs (https://example.com/docs)"),
+            "{detail:?}"
+        );
+
+        let concise_table = strip_ansi(&render_markdown(
+            "| Name |\n| --- |\n| [docs](https://example.com/docs) |\n",
+            None,
+            OutputFormat::Concise,
+        ));
+        assert_eq!(concise_table.matches("https://example.com/docs").count(), 0);
+        assert!(concise_table.contains("docs"), "{concise_table:?}");
     }
 
     #[test]

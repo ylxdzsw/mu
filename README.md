@@ -335,7 +335,9 @@ sequential and ANSI-free. Interactive output also defaults to
 compact tool and status rows are ellipsized to it. Setting it to `false` leaves
 prose and table cells for the terminal to wrap, but still caps compact rows at
 80 visible cells. It never changes redirected, final, persisted, or
-model-visible text.
+model-visible text. In interactive concise output, Markdown links show only
+their labels while remaining clickable; detail and full output also show the
+full destination URL.
 
 During compaction, interactive output uses one mutable
 `[compacting <duration>]` line, followed by a committed

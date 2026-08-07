@@ -702,6 +702,9 @@ markers, and resets styling at the closing fence or response boundary. Emphasis
 uses regular cyan, while strong text uses bold. Block quotes use gray italics
 without a visible gutter marker. Underscores within words remain literal, so
 identifiers such as `CAP_SYS_ADMIN` are not interpreted as emphasis. Markdown
+links in interactive `concise` output show only their labels while retaining
+their terminal hyperlinks; interactive `detail` and `full` output also show the
+full destination URL.
 tables are buffered until the table is complete enough to align and commit once,
 so columns never require rewriting prior output. With wrapping enabled, table
 layout counts every border and padding cell, caps any one content column at 80
