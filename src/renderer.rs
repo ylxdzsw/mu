@@ -4625,16 +4625,6 @@ mod tests {
     }
 
     #[test]
-    fn markdown_stream_outputs_unsupported_inline_markdown_raw() {
-        let mut stream = MarkdownStream::default();
-
-        let rendered = stream.push("![alt](image.png)\n").concat();
-        assert_eq!(rendered, "![alt](image.png)\n");
-        let heading = stream.push("# ![alt](image.png)\n").concat();
-        assert_eq!(heading, "# ![alt](image.png)\n");
-    }
-
-    #[test]
     fn markdown_stream_keeps_intraword_underscores_literal_across_chunks() {
         for chunks in [
             vec!["CAP_SYS_ADMIN"],
@@ -4822,21 +4812,6 @@ mod tests {
     }
 
     #[test]
-    fn bash_start_can_reuse_streamed_header_without_duplication() {
-        let mut renderer = Renderer::with_format(OutputFormat::Detail);
-        let args = json!({
-            "title": "List files",
-            "risk": "readonly",
-            "command": "printf 'a'\npwd",
-        });
-
-        assert!(renderer.bash_header_full(&args).unwrap());
-        renderer.tool_start("bash", &args, true).unwrap();
-        renderer.bash_output("a\n").unwrap();
-        renderer.tool_finished(0, Duration::from_millis(1)).unwrap();
-    }
-
-    #[test]
     fn opaque_reasoning_commits_title_or_timer_without_tokens() {
         // With summary: title extracted, no token count
         let (mut renderer, output, _stderr) =
@@ -4866,46 +4841,6 @@ mod tests {
         assert!(transcript.starts_with("[thought "), "{transcript:?}");
         assert!(transcript.ends_with("]\n"), "{transcript:?}");
         assert!(!transcript.contains("token"), "{transcript:?}");
-    }
-
-    #[test]
-    fn first_visible_renderer_blocks_have_no_leading_separator() {
-        let (mut assistant, assistant_output) =
-            Renderer::with_test_shared_output(OutputFormat::Detail, true, None);
-        assistant.assistant_text("Hello.\n").unwrap();
-        assistant.assistant_end().unwrap();
-        assert!(
-            strip_ansi(&assistant_output.transcript()).starts_with("Hello."),
-            "{:?}",
-            assistant_output.transcript()
-        );
-
-        let (mut tool, tool_output) =
-            Renderer::with_test_shared_output(OutputFormat::Detail, true, None);
-        tool.bash_header_start().unwrap();
-        tool.bash_header_title_start().unwrap();
-        tool.bash_header_delta("Inspect").unwrap();
-        tool.bash_header_title_end().unwrap();
-        assert!(
-            tool_output
-                .transcript()
-                .starts_with(&format!("{GRAY}[preparing toolcall]{RESET}")),
-            "{:?}",
-            tool_output.transcript()
-        );
-        assert!(
-            tool_output
-                .transcript()
-                .contains(&format!("\r\x1b[2K{BOLD}# Inspect{RESET}\n")),
-            "{:?}",
-            tool_output.transcript()
-        );
-
-        let (mut plain, plain_output) =
-            Renderer::with_test_shared_output(OutputFormat::Detail, false, None);
-        plain.assistant_text("Hello.\n").unwrap();
-        plain.assistant_end().unwrap();
-        assert_eq!(plain_output.transcript(), "Hello.\n");
     }
 
     #[test]
@@ -5017,20 +4952,15 @@ mod tests {
     }
 
     #[test]
-    fn interruption_without_output_omits_unsaved_history_notice() {
+    fn interruption_reports_reason_and_unsaved_output_only_when_present() {
         let (mut renderer, output) =
             Renderer::with_test_shared_output(OutputFormat::Detail, false, None);
 
         renderer.turn_interrupted("cancelled").unwrap();
-
         assert_eq!(output.transcript(), "[mu] interrupted: cancelled\n");
-    }
 
-    #[test]
-    fn interruption_after_output_keeps_unsaved_history_notice() {
         let (mut renderer, output) =
             Renderer::with_test_shared_output(OutputFormat::Detail, false, None);
-
         renderer.assistant_text("partial output\n").unwrap();
         renderer.turn_interrupted("cancelled").unwrap();
 

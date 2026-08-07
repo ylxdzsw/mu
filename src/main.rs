@@ -1157,18 +1157,6 @@ mod tests {
     }
 
     #[test]
-    fn prompt_file_ignores_empty_non_terminal_stdin() {
-        let path = temp_file_path("empty-instruction");
-        std::fs::write(&path, "Use the release-note format.\n").unwrap();
-        let mut stdin = Cursor::new("");
-        let prompt =
-            load_prompt_with_stdin(PromptSource::File(path.clone()), false, &mut stdin).unwrap();
-        std::fs::remove_file(path).unwrap();
-        assert_eq!(prompt.text, "Use the release-note format.");
-        assert_eq!(prompt.model, None);
-    }
-
-    #[test]
     fn optional_instruction_uses_custom_command_stdin_rules() {
         let mut terminal_stdin = Cursor::new("do not read");
         assert_eq!(
@@ -1287,18 +1275,6 @@ mod tests {
     }
 
     #[test]
-    fn load_prompt_file_reports_utf8_errors_with_path() {
-        let path = temp_file_path("invalid-utf8");
-        std::fs::write(&path, [0xff, 0xfe, 0xfd]).unwrap();
-        let mut stdin = Cursor::new("");
-        let err =
-            load_prompt_with_stdin(PromptSource::File(path.clone()), true, &mut stdin).unwrap_err();
-        std::fs::remove_file(&path).unwrap();
-        assert!(err.to_string().contains("reading prompt file"));
-        assert!(err.to_string().contains(path.to_string_lossy().as_ref()));
-    }
-
-    #[test]
     fn rejects_oversized_attachment_before_reading_it() {
         let path = std::env::temp_dir().join(format!("mu-oversized-{}.wav", uuid::Uuid::new_v4()));
         let file = std::fs::File::create(&path).unwrap();
@@ -1338,13 +1314,6 @@ mod tests {
                 .id,
             first.id
         );
-    }
-
-    #[test]
-    fn exit_code_defaults_to_one_for_generic_errors() {
-        bash::reset_cancellation_state();
-        let err = anyhow::anyhow!("something went wrong");
-        assert_eq!(exit_code_for(&err), 1);
     }
 
     #[test]

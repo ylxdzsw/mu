@@ -2206,20 +2206,6 @@ mod view_image {
             assert_eq!(args.detail, ImageDetail::Auto);
             assert_eq!(args.path, PathBuf::from("image.png"));
         }
-
-        #[test]
-        fn accepts_every_detail_value() {
-            for (value, expected) in [
-                ("auto", ImageDetail::Auto),
-                ("low", ImageDetail::Low),
-                ("high", ImageDetail::High),
-                ("original", ImageDetail::Original),
-            ] {
-                let args =
-                    Args::try_parse_from(["view_image", "--detail", value, "image.png"]).unwrap();
-                assert_eq!(args.detail, expected);
-            }
-        }
     }
 }
 

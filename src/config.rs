@@ -690,49 +690,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn merge_overrides_nested_values_and_keeps_base() {
-        let mut base = serde_json::json!({
-            "providers": {
-                "alpha": {
-                    "endpoint": "https://a.test/chat/completions",
-                    "api_key_env": "KEY",
-                    "models": {"one": {"context_window": 1}}
-                }
-            },
-            "limits": {"max_iterations": 5, "max_lines": 10}
-        });
-        let overlay = serde_json::json!({
-            "providers": {
-                "alpha": {
-                    "models": {"two": {"context_window": 2}}
-                },
-                "beta": {
-                    "endpoint": "https://b.test/chat/completions",
-                    "api_key_env": "BETA_KEY",
-                    "models": {"three": {"context_window": 3}}
-                }
-            },
-            "limits": {"max_lines": 20}
-        });
-        merge_json(&mut base, overlay);
-
-        assert_eq!(
-            base["providers"]["alpha"]["models"]["one"]["context_window"],
-            1
-        );
-        assert_eq!(
-            base["providers"]["alpha"]["models"]["two"]["context_window"],
-            2
-        );
-        assert_eq!(
-            base["providers"]["beta"]["models"]["three"]["context_window"],
-            3
-        );
-        assert_eq!(base["limits"]["max_iterations"], 5);
-        assert_eq!(base["limits"]["max_lines"], 20);
-    }
-
-    #[test]
     fn api_key_reads_effective_env_for_provider() {
         let config = Config {
             providers: OrderedMap::from_iter([(

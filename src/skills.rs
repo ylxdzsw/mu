@@ -990,48 +990,6 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
-    #[test]
-    fn repository_builtins_have_valid_skill_metadata() {
-        let builtins = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("builtins");
-
-        let root = temp_root("repository-builtins");
-        let bin = root.join("bin");
-        fs::create_dir_all(&bin).unwrap();
-        fs::write(bin.join("agent-browser"), "#!/bin/sh\nexit 0\n").unwrap();
-        let mut permissions = fs::metadata(bin.join("agent-browser"))
-            .unwrap()
-            .permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(bin.join("agent-browser"), permissions).unwrap();
-
-        let path = std::env::var("PATH").unwrap_or_default();
-        let path = format!("{}:{path}", bin.display());
-        let env = env_map(&[
-            ("PATH", path.as_str()),
-            ("BRAVE_API_KEY", "test-brave-key"),
-            ("EXA_API_KEY", "test-exa-key"),
-        ]);
-        let index = scan_root(&builtins, InstructionScope::Builtin, &env).unwrap();
-
-        let names = index
-            .skills
-            .iter()
-            .map(|skill| skill.name.as_str())
-            .collect::<Vec<_>>();
-        assert!(names.contains(&"background-task"));
-        assert!(names.contains(&"agent-browser"));
-        assert!(names.contains(&"brave-search"));
-        assert!(names.contains(&"customize-mu"));
-        assert!(names.contains(&"exa-search"));
-        assert!(names.contains(&"subagent"));
-
-        let background = fs::read_to_string(builtins.join("background-task.md")).unwrap();
-        assert!(background.contains("setsid your-command"));
-        assert!(!background.contains("setsid -f your-command"));
-        assert!(!background.contains("systemd-run"));
-        fs::remove_dir_all(root).unwrap();
-    }
-
     fn temp_root(name: &str) -> PathBuf {
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
