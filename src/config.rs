@@ -169,6 +169,7 @@ pub struct Config {
     pub providers: OrderedMap<ProviderConfig>,
     pub output: OutputFormat,
     pub line_wrapping: bool,
+    pub auto_resume: bool,
     pub compaction: CompactionConfig,
     pub limits: LimitsConfig,
     pub guardrail: GuardrailConfig,
@@ -702,6 +703,7 @@ mod tests {
             )]),
             output: OutputFormat::Detail,
             line_wrapping: true,
+            auto_resume: false,
             compaction: CompactionConfig::default(),
             limits: LimitsConfig::default(),
             guardrail: GuardrailConfig::default(),
@@ -1012,6 +1014,11 @@ mod tests {
         assert!(!root.join(".gitignore").exists());
 
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn bundled_auto_resume_default_is_disabled() {
+        assert!(!bundled_test_default::<bool>("/auto_resume"));
     }
 
     #[test]

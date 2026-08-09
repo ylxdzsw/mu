@@ -965,6 +965,19 @@ impl Renderer {
         ))
     }
 
+    pub fn turn_auto_resume(&mut self, retry_count: u64, max_auto_retries: u64) -> io::Result<()> {
+        self.notice(&format!(
+            "[mu] auto-resuming [{retry_count}/{max_auto_retries}] after incomplete response"
+        ))
+    }
+
+    pub fn turn_auto_resume_exhausted(&mut self, retry_limit: u64) -> io::Result<()> {
+        self.notice(&format!(
+            "[mu] auto-resume exhausted [{retry_limit}/{retry_limit}]; \
+             use /retry to resume, or enter a new prompt to move on"
+        ))
+    }
+
     /// Announce that the turn was interrupted before it finished. This is an
     /// append-only notice: any partial assistant text streamed above was not
     /// persisted to session history (only completed messages are). The session
@@ -5036,6 +5049,22 @@ mod tests {
         assert!(
             transcript.contains("partial output above is not saved to session history"),
             "{transcript:?}"
+        );
+    }
+
+    #[test]
+    fn auto_resume_notices_state_the_attempt_and_recovery_choices() {
+        let (mut renderer, output) =
+            Renderer::with_test_shared_output(OutputFormat::Detail, false, None);
+
+        renderer.turn_auto_resume(2, 3).unwrap();
+        renderer.turn_auto_resume_exhausted(3).unwrap();
+
+        assert_eq!(
+            output.transcript(),
+            "[mu] auto-resuming [2/3] after incomplete response\n\
+             \n\
+             [mu] auto-resume exhausted [3/3]; use /retry to resume, or enter a new prompt to move on\n"
         );
     }
 

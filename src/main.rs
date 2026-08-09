@@ -558,7 +558,7 @@ async fn run() -> Result<()> {
                 session_id: &session.id,
                 model: selection.model,
                 output,
-                preamble_notice: Some("[mu] resuming interrupted turn"),
+                preamble_notice: Some("[mu] resuming incomplete turn"),
                 model_fallback: selection.fallback,
                 compact_at_turn_boundary: false,
             })
@@ -940,11 +940,16 @@ async fn run_turn(args: RunTurnArgs<'_>) -> Result<()> {
             }
         }
         Err(error) => {
-            // Nothing to clean up: only completed messages are persisted, so the
-            // log ends at the last landed message. The session is now "unclean";
-            // the next turn or `mu retry` will normalize any dangling tool call.
+            // Nothing to clean up: the log ends at the last landed message.
+            // A resumable completion is deliberately persisted but remains
+            // unclean; other failures may leave an interrupted request or Bash
+            // claim for the next turn or `mu retry` to normalize.
             if output != cli::OutputFormat::Final {
-                renderer.turn_interrupted(&error.to_string())?;
+                if let Some(exhausted) = error.downcast_ref::<agent::AutoResumeExhausted>() {
+                    renderer.turn_auto_resume_exhausted(exhausted.limit() as u64)?;
+                } else {
+                    renderer.turn_interrupted(&error.to_string())?;
+                }
             }
         }
     }

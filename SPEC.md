@@ -415,6 +415,16 @@ This is the exact sequence the binary follows for one turn invocation:
       unknown tool, or call that requires guardrail review is a sequential
       barrier.
    f. If `finish_reason` is `stop`: the loop ends.
+   g. A provider adapter may instead classify a complete, replayable assistant
+      response as `resume`. With `auto_resume:false`, this is an ordinary clean
+      turn ending. With `auto_resume:true`, persist it with
+      `turn_state:"resume"`, append a derived user
+      `Continue the current task from where you stopped.` message to the
+      same-turn provider context, consume one automatic retry credit, and loop
+      back to (a) without consuming an agent iteration. If no credit remains,
+      abort non-zero with the turn still resumable and direct the user to
+      `/retry` or a new prompt. Resume exhaustion does not advance a floating
+      provider.
 10. **For `detail` and `full`, print the turn summary line** to stderr (§5),
     release the journal lock, and exit 0. `concise` and
     `final` omit it.
@@ -1143,7 +1153,10 @@ Complete successful assistant content arrays are stored unchanged, including
 and replayed when the current Anthropic Messages model has the same effective
 `replay_key` as its origin. The adapter assumes current adaptive-thinking
 models; it has no manual thinking-budget mode, old-model compatibility matrix,
-or model-name heuristics.
+or model-name heuristics. An `end_turn` response containing one or more
+`thinking` or `redacted_thinking` blocks and no text or tool use is classified
+as resumable. This is one concrete resumable-response classifier, not the
+definition of the general resume mechanism.
 
 The semantic transcript remains authoritative for display, compaction, and
 cross-model continuation. Native replay requires the same API. Responses and
@@ -1193,9 +1206,9 @@ before classifying the upstream cause.
 **Retry and fallback.** One logical call on a fixed `provider/model` permits
 five retries after its initial attempt. A floating model permits three retries
 per candidate, including the final candidate. Every wire attempt is its own
-durable exchange; counters reset after success and candidate advancement, and
-compaction has a separate budget from the following agent call. Retry delays
-are deterministic `1s, 2s, 4s, 4s, 4s` with no jitter.
+durable exchange; counters reset after non-resumable text/tool progress and
+candidate advancement, and compaction has a separate budget from the following
+agent call. Retry delays are deterministic `1s, 2s, 4s, 4s, 4s` with no jitter.
 
 For HTTP rate-limit/overload responses Mu reads standard `Retry-After` integer
 seconds or HTTP-date before consuming the body and waits for the maximum of
@@ -1204,6 +1217,19 @@ headers are ignored. A requested wait over 60 seconds advances a floating
 choice immediately without consuming a retry, or fails if no candidate
 remains; a fixed choice fails and reports the duration. Retry notices include
 the retry ordinal, budget, effective delay, and semantic error.
+
+**Automatic resume.** Resume is a retry-budgeted continuation that preserves a
+complete problematic assistant response instead of discarding it. With
+`auto_resume:true`, Mu persists the response as `turn_state:"resume"` and sends
+the same turn again with a derived user
+`Continue the current task from where you stopped.` message. It has no retry
+delay, shares the current logical call's retry counter with transient provider
+errors, and reports
+`[mu] auto-resuming [n/limit] after incomplete response`. Normal text or tool
+progress resets that counter. On exhaustion Mu does not advance provider: it
+exits non-zero, leaves the latest turn dirty, and reports that `/retry` resumes
+it while a normal new prompt moves on. `final` suppresses intermediate notices
+and reports the unrecovered error through its normal non-zero error contract.
 
 **Model context window.** Compaction thresholds need the model's max context size.
 Source it from `config.jsonc`: each configured model entry carries a
@@ -1425,6 +1451,7 @@ are not visible in another.
   {
     "output": "concise",                        // optional default density
     "line_wrapping": true,                      // interactive presentation only
+    "auto_resume": false,                       // continue resumable responses
     "providers": {
       "openai": {
         "endpoint": "https://api.openai.com/v1/responses", // required complete POST URL
@@ -1461,7 +1488,11 @@ are not visible in another.
   At least one provider and one model are required; everything else has the
   defaults shown. `output` accepts `final`, `concise`, `detail`, or `full`; an
   explicit CLI `--output` overrides it. `line_wrapping` is a boolean and has no
-  CLI override. Provider and model order is meaningful:
+  CLI override. `auto_resume` is a boolean, defaults to `false`, and has no CLI
+  override. When enabled, complete provider responses classified as resumable
+  are preserved and continued within the same turn using the automatic retry
+  quota. When disabled, the same responses are ordinary clean turn endings.
+  Provider and model order is meaningful:
   project config entries are listed before inherited global entries, and model
   suggestions and bare-model fallback candidates follow that order.
   `supported_efforts` contains arbitrary
@@ -1572,11 +1603,13 @@ Conceptual event model:
   value; older keyless recipes remain keyless.
 - **`provider_completed`** stores one assembled native response object plus the
   semantic projection accepted at that time. Assistant projections contain
-  text/reasoning/native replay and all immutable Bash claims; compaction
-  projections contain summary and boundary; guardrail projections contain the
-  parsed authorization decision. The stored projection is authoritative during
-  normal loading and recovery; Mu never reruns a newer provider parser while
-  replaying a journal.
+  text/reasoning/native replay, all immutable Bash claims, and a derived
+  `turn_state`: `continue` for tool use, `resume` for a preserved response that
+  needs continuation, or `complete` for a clean ending. Compaction projections
+  contain summary and boundary; guardrail projections contain the parsed
+  authorization decision. The stored projection is authoritative during normal
+  loading and recovery; Mu never reruns a newer provider parser while replaying
+  a journal.
 - **`provider_failed`** and **`provider_interrupted`** terminate an exchange
   without adding semantic assistant history. A failure records a stable error
   class and may retain partial native JSON for audit.
@@ -1633,10 +1666,11 @@ into semantic history.
 
 ### Interrupted turns and retry
 
-There is no stored turn-status flag. A latest turn is clean only when it has a
-final accepted assistant projection and all of its Bash claims have results.
-A `turn_started` with no provider exchange, a failed/unmatched request, or an
-unresolved claim is dirty.
+There is no separate stored turn-status flag. A latest turn is clean only when
+its latest accepted assistant projection has `turn_state:"complete"` and all of
+its Bash claims have results. A `turn_started` with no provider exchange, a
+failed/unmatched request, a latest `turn_state:"resume"`, or an unresolved claim
+is dirty.
 
 **Rationale — derive, don't store.** A separate boolean can drift out of sync
 with the messages (precisely in the crash cases that matter) and would risk
@@ -1669,6 +1703,13 @@ per-call running marker.
   Without an override, retry uses the session's latest requested canonical
   model. It restores the original submitted cwd and refuses on a clean session
   ("nothing to retry").
+
+A latest `turn_state:"resume"` is also retryable. Automatic resume and explicit
+`mu retry` add the derived user continuation only while resuming that same
+turn. For completed historical resume steps, context projection infers whether
+the continuation was actually used from a following same-turn agent request.
+If the user submits a normal prompt while the latest resume remains unused, the
+new `turn_started` supersedes it and no synthetic continuation is inserted.
 
 ### Session concurrency ownership
 

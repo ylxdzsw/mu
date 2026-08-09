@@ -58,6 +58,7 @@ Complete shape, with default values where applicable:
 {
   "output": "concise",            // final | concise | detail | full
   "line_wrapping": true,          // interactive output; no CLI override
+  "auto_resume": false,           // continue replayable incomplete responses
   "providers": {
     "openai": {
       "endpoint": "https://api.openai.com/v1/responses", // complete POST URL
@@ -99,6 +100,11 @@ At least one provider and model are required. Endpoint paths must end in
 `endpoint` is required; `api_key_env` and all model metadata are optional.
 Without `context_window`, percentage reporting and proactive compaction are
 unavailable. `output` is overridden by CLI `--output`.
+`auto_resume` preserves provider responses classified as resumable and
+continues the same turn with a derived user `Continue` message. Attempts share
+the provider retry quota. Exhaustion leaves the turn incomplete for `/retry`;
+a normal new prompt supersedes the pending resume without inserting the derived
+message. When disabled, resumable responses are ordinary clean turn endings.
 Set `compaction.enabled` to `false` to disable automatic soft-threshold,
 hard-threshold, and context-overflow compaction. Context-length failures then
 abort the turn, while explicit `mu compact` remains available.

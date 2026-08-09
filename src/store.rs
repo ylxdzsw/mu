@@ -24,6 +24,7 @@ pub const BASH_CALL_ID_ENV: &str = "MU_BASH_CALL_ID";
 pub const ATTACHMENT_MANIFEST_ENV: &str = "MU_ATTACHMENT_MANIFEST";
 pub const OBJECTS_DIR_ENV: &str = "MU_OBJECTS_DIR";
 pub const INTERRUPTED_TOOL_RESULT: &str = "error: interrupted — this command may have started and not completed; its effects are unknown. Verify the resulting state before relying on it.";
+pub const RESUME_PROMPT: &str = "Continue the current task from where you stopped.";
 
 const FORMAT_VERSION: u32 = 1;
 const SESSION_ID_RETRIES: usize = 16;
@@ -661,6 +662,30 @@ impl Store {
         Ok(complete && calls.is_subset(&results))
     }
 
+    pub fn resume_reminder_needed(&self, session_id: &str) -> Result<bool> {
+        let journal = self.load(session_id)?;
+        let Some(turn_id) = latest_turn_id(&journal) else {
+            return Ok(false);
+        };
+        let exchange_turns = provider_exchange_turns(&journal);
+        let resumable = journal
+            .events
+            .iter()
+            .rev()
+            .find_map(|line| match &line.event {
+                Event::ProviderCompleted {
+                    exchange_id,
+                    projection: Projection::Assistant { turn_state, .. },
+                    ..
+                } if exchange_turns.get(exchange_id.as_str()) == Some(&turn_id) => {
+                    Some((line.seq, turn_state == "resume"))
+                }
+                _ => None,
+            });
+        Ok(resumable
+            .is_some_and(|(seq, resume)| resume && !resume_was_requested(&journal, &turn_id, seq)))
+    }
+
     pub fn normalize_interrupted_tail(&self, session_id: &str) -> Result<usize> {
         let journal = self.load(session_id)?;
         let mut terminal = HashSet::new();
@@ -1091,6 +1116,43 @@ impl Store {
         native_response: Option<&Value>,
         usage: Option<&Usage>,
     ) -> Result<(i64, Vec<i64>)> {
+        self.complete_assistant_exchange_inner(
+            session_id,
+            exchange_id,
+            message,
+            native_response,
+            usage,
+            false,
+        )
+    }
+
+    pub fn complete_resumable_assistant_exchange(
+        &self,
+        session_id: &str,
+        exchange_id: &str,
+        message: &Message,
+        native_response: Option<&Value>,
+        usage: Option<&Usage>,
+    ) -> Result<(i64, Vec<i64>)> {
+        self.complete_assistant_exchange_inner(
+            session_id,
+            exchange_id,
+            message,
+            native_response,
+            usage,
+            true,
+        )
+    }
+
+    fn complete_assistant_exchange_inner(
+        &self,
+        session_id: &str,
+        exchange_id: &str,
+        message: &Message,
+        native_response: Option<&Value>,
+        usage: Option<&Usage>,
+        resumable: bool,
+    ) -> Result<(i64, Vec<i64>)> {
         if !matches!(message, Message::Assistant { .. }) {
             self.fail_provider_exchange(
                 session_id,
@@ -1180,7 +1242,7 @@ impl Store {
                 usage: usage.cloned(),
                 projection: Projection::Assistant {
                     turn_state: if bash_calls.is_empty() {
-                        "complete".into()
+                        if resumable { "resume" } else { "complete" }.into()
                     } else {
                         "continue".into()
                     },
@@ -1508,6 +1570,7 @@ impl Store {
                 _ => None,
             })
             .collect::<HashMap<_, _>>();
+        let exchange_turns = provider_exchange_turns(journal);
         if let Some(line) = compaction
             && let Event::ProviderCompleted {
                 projection: Projection::Compaction { summary, .. },
@@ -1551,6 +1614,7 @@ impl Store {
                     exchange_id,
                     projection:
                         Projection::Assistant {
+                            turn_state,
                             text,
                             reasoning_content,
                             native_replay,
@@ -1583,6 +1647,14 @@ impl Store {
                         }),
                         native_replay,
                     });
+                    if turn_state == "resume"
+                        && let Some(turn_id) = exchange_turns.get(exchange_id.as_str())
+                        && resume_was_requested(journal, turn_id, line.seq)
+                    {
+                        messages.push(Message::User {
+                            content: RESUME_PROMPT.into(),
+                        });
+                    }
                 }
                 Event::BashCompleted {
                     call_id,
@@ -2262,7 +2334,7 @@ fn validate_events(events: &[EventLine]) -> Result<()> {
                         if exchange.is_some_and(|(purpose, _, _)| purpose != "agent") {
                             bail!("assistant projection does not complete an agent request")
                         }
-                        if !matches!(turn_state.as_str(), "continue" | "complete")
+                        if !matches!(turn_state.as_str(), "continue" | "resume" | "complete")
                             || (turn_state == "continue") != !bash_calls.is_empty()
                         {
                             bail!("assistant turn state does not match its Bash claims")
@@ -2416,6 +2488,36 @@ fn latest_turn_id(journal: &Journal) -> Option<String> {
             Event::TurnStarted { turn_id, .. } => Some(turn_id.clone()),
             _ => None,
         })
+}
+
+fn provider_exchange_turns(journal: &Journal) -> HashMap<&str, String> {
+    journal
+        .events
+        .iter()
+        .filter_map(|line| match &line.event {
+            Event::ProviderRequested {
+                exchange_id,
+                turn_id,
+                ..
+            } => Some((exchange_id.as_str(), turn_id.clone())),
+            _ => None,
+        })
+        .collect()
+}
+
+fn resume_was_requested(journal: &Journal, turn_id: &str, after_seq: i64) -> bool {
+    for line in journal.events.iter().filter(|line| line.seq > after_seq) {
+        match &line.event {
+            Event::TurnStarted { .. } => return false,
+            Event::ProviderRequested {
+                turn_id: request_turn,
+                purpose,
+                ..
+            } if request_turn == turn_id && purpose == "agent" => return true,
+            _ => {}
+        }
+    }
+    false
 }
 
 fn next_call_id(journal: &Journal) -> i64 {
@@ -2926,6 +3028,97 @@ mod tests {
     }
 
     #[test]
+    fn resumed_anthropic_request_reconstructs_derived_continuation() {
+        let store = Store::open_memory().unwrap();
+        let session = store.create_session_seeded("system").unwrap();
+        let turn = store
+            .start_turn(&session.id, "/tmp", None, &"work".into())
+            .unwrap();
+        let first = store
+            .start_test_provider_request(&session.id, &turn, "agent")
+            .unwrap();
+        let endpoint = "https://example.test/v1/messages";
+        store
+            .complete_resumable_assistant_exchange(
+                &session.id,
+                &first,
+                &Message::Assistant {
+                    content: None,
+                    reasoning_content: None,
+                    tool_calls: None,
+                    native_replay: Some(NativeReplay {
+                        provider_id: "test".into(),
+                        endpoint: endpoint.into(),
+                        model: "model".into(),
+                        payload: crate::provider::NativeReplayPayload::AnthropicContent(vec![
+                            serde_json::json!({
+                                "type": "thinking",
+                                "thinking": "working",
+                                "signature": "sig",
+                            }),
+                        ]),
+                    }),
+                },
+                None,
+                None,
+            )
+            .unwrap();
+
+        let mut messages = store.load_context_messages(&session.id).unwrap();
+        messages.push(Message::User {
+            content: RESUME_PROMPT.into(),
+        });
+        let options = RequestOptions {
+            model: ResolvedModelRef {
+                canonical: "test/model:high".into(),
+                provider_id: "test".into(),
+                model_id: "model".into(),
+                effort: Some("high".into()),
+            },
+            cache_key: None,
+        };
+        let native =
+            crate::anthropic::build_request_body(&options, endpoint, &messages, &[]).unwrap();
+        let recipe = store
+            .request_recipe(
+                "anthropic.messages.v1",
+                &native,
+                serde_json::json!({
+                    "kind": "agent",
+                    "context_through_seq": store.current_context_seq(&session.id).unwrap(),
+                    "native_replay_origins":
+                        crate::provider::native_replay_origins(&messages),
+                }),
+                &[],
+            )
+            .unwrap();
+        let resumed = store
+            .start_provider_request(
+                &session.id,
+                &turn,
+                "agent",
+                ProviderOrigin {
+                    canonical_model_ref: options.model.canonical.clone(),
+                    provider_id: options.model.provider_id.clone(),
+                    api: "anthropic_messages".into(),
+                    endpoint: endpoint.into(),
+                    wire_model: options.model.model_id.clone(),
+                    effort: options.model.effort.clone(),
+                },
+                recipe,
+                None,
+            )
+            .unwrap();
+
+        assert_eq!(
+            store
+                .reconstruct_provider_request(&session.id, &resumed)
+                .unwrap(),
+            native
+        );
+    }
+
+    #[test]
     fn legacy_replay_origin_and_recorded_selection_reconstruct_exactly() {
         let store = Store::open_memory().unwrap();
         let session = store.create_session_seeded("system").unwrap();
@@ -3378,5 +3571,88 @@ mod tests {
                 .unwrap()
                 .contains("not authorized")
         );
+    }
+
+    #[test]
+    fn resumable_completion_is_dirty_and_projects_a_used_resume_prompt() {
+        let store = Store::open_memory().unwrap();
+        let session = store.create_session_seeded("system").unwrap();
+        let turn = store
+            .start_turn(&session.id, "/tmp", None, &"work".into())
+            .unwrap();
+        let exchange = store
+            .start_test_provider_request(&session.id, &turn, "agent")
+            .unwrap();
+        store
+            .complete_resumable_assistant_exchange(
+                &session.id,
+                &exchange,
+                &Message::Assistant {
+                    content: None,
+                    reasoning_content: None,
+                    tool_calls: None,
+                    native_replay: None,
+                },
+                None,
+                None,
+            )
+            .unwrap();
+
+        assert!(!store.is_session_clean(&session.id).unwrap());
+        assert!(store.resume_reminder_needed(&session.id).unwrap());
+        assert!(!store.load_context_messages(&session.id).unwrap().iter().any(
+            |message| matches!(message, Message::User { content } if content.text() == RESUME_PROMPT)
+        ));
+
+        let resumed = store
+            .start_test_provider_request(&session.id, &turn, "agent")
+            .unwrap();
+        store
+            .interrupt_provider_exchange(&session.id, &resumed)
+            .unwrap();
+
+        assert!(!store.resume_reminder_needed(&session.id).unwrap());
+        assert!(store.load_context_messages(&session.id).unwrap().iter().any(
+            |message| matches!(message, Message::User { content } if content.text() == RESUME_PROMPT)
+        ));
+    }
+
+    #[test]
+    fn new_prompt_supersedes_unused_resume_without_synthetic_message() {
+        let store = Store::open_memory().unwrap();
+        let session = store.create_session_seeded("system").unwrap();
+        let turn = store
+            .start_turn(&session.id, "/tmp", None, &"work".into())
+            .unwrap();
+        let exchange = store
+            .start_test_provider_request(&session.id, &turn, "agent")
+            .unwrap();
+        store
+            .complete_resumable_assistant_exchange(
+                &session.id,
+                &exchange,
+                &Message::Assistant {
+                    content: None,
+                    reasoning_content: None,
+                    tool_calls: None,
+                    native_replay: None,
+                },
+                None,
+                None,
+            )
+            .unwrap();
+        store
+            .start_turn(&session.id, "/tmp", None, &"new direction".into())
+            .unwrap();
+
+        let context = store.load_context_messages(&session.id).unwrap();
+        assert!(!store.resume_reminder_needed(&session.id).unwrap());
+        assert!(!context.iter().any(
+            |message| matches!(message, Message::User { content } if content.text() == RESUME_PROMPT)
+        ));
+        assert!(matches!(
+            context.last(),
+            Some(Message::User { content }) if content.text() == "new direction"
+        ));
     }
 }

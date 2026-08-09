@@ -170,6 +170,7 @@ pub(crate) async fn stream(
                 "finish_reason": match &state.finish_reason {
                     FinishReason::Stop => "stop",
                     FinishReason::ToolCalls => "tool_calls",
+                    FinishReason::Resume => "stop",
                     FinishReason::Other(reason) => reason,
                 },
             }],

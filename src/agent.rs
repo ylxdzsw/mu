@@ -19,8 +19,31 @@ use crate::provider::{
 };
 use crate::renderer::Renderer;
 use crate::runtime::resume_session_fallback;
-use crate::store::{BashResultRecord, ProviderOrigin, Store};
+use crate::store::{BashResultRecord, ProviderOrigin, RESUME_PROMPT, Store};
 use bash::RunningBash;
+
+#[derive(Debug)]
+pub struct AutoResumeExhausted {
+    limit: u32,
+}
+
+impl AutoResumeExhausted {
+    pub fn limit(&self) -> u32 {
+        self.limit
+    }
+}
+
+impl std::fmt::Display for AutoResumeExhausted {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "auto-resume exhausted [{0}/{0}]; use /retry to resume, or enter a new prompt to move on",
+            self.limit
+        )
+    }
+}
+
+impl std::error::Error for AutoResumeExhausted {}
 
 pub struct TurnResult {
     pub usage: Usage,
@@ -154,8 +177,9 @@ impl<'a> AgentLoop<'a> {
         let mut context_tokens = 0;
         let mut final_assistant = None;
 
-        for iteration in 0..max_iter {
-            let mut live_provider_retries = 0;
+        let mut iteration = 0;
+        let mut live_provider_retries = 0;
+        while iteration < max_iter {
             let (exchange_id, stream_result, mut command_headers) = 'request_gate: loop {
                 if self.config.compaction.enabled
                     && latest_compaction_since_change.is_none()
@@ -459,13 +483,25 @@ impl<'a> AgentLoop<'a> {
                 *tool_calls = None;
                 *native_replay = None;
             }
-            let (_message_id, bash_call_ids) = self.store.complete_assistant_exchange(
-                self.session_id,
-                &exchange_id,
-                &accepted_message,
-                stream_result.native_response.as_ref(),
-                stream_result.usage.as_ref(),
-            )?;
+            let resumable =
+                self.config.auto_resume && stream_result.finish_reason == FinishReason::Resume;
+            let (_message_id, bash_call_ids) = if resumable {
+                self.store.complete_resumable_assistant_exchange(
+                    self.session_id,
+                    &exchange_id,
+                    &accepted_message,
+                    stream_result.native_response.as_ref(),
+                    stream_result.usage.as_ref(),
+                )?
+            } else {
+                self.store.complete_assistant_exchange(
+                    self.session_id,
+                    &exchange_id,
+                    &accepted_message,
+                    stream_result.native_response.as_ref(),
+                    stream_result.usage.as_ref(),
+                )?
+            };
             audit.commit_provider_response();
             context.push(accepted_message.clone());
             latest_compaction_since_change = None;
@@ -476,6 +512,23 @@ impl<'a> AgentLoop<'a> {
                         final_assistant = content.clone();
                     }
                     break;
+                }
+                FinishReason::Resume if !resumable => {
+                    if let Message::Assistant { content, .. } = &accepted_message {
+                        final_assistant = content.clone();
+                    }
+                    break;
+                }
+                FinishReason::Resume => {
+                    let retry_limit = provider_retry_limit(&self.model);
+                    if live_provider_retries >= retry_limit {
+                        return Err(AutoResumeExhausted { limit: retry_limit }.into());
+                    }
+                    live_provider_retries += 1;
+                    self.renderer
+                        .turn_auto_resume(live_provider_retries as u64, retry_limit as u64)?;
+                    context.push(resume_message());
+                    continue;
                 }
                 FinishReason::ToolCalls => {
                     let tool_calls = match &accepted_message {
@@ -693,6 +746,8 @@ impl<'a> AgentLoop<'a> {
                     .notice("[mu] max iterations reached; stopping")?;
                 bail!("max iterations reached");
             }
+            iteration += 1;
+            live_provider_retries = 0;
         }
 
         Ok(TurnResult {
@@ -708,7 +763,11 @@ impl<'a> AgentLoop<'a> {
     /// History is always valid here because the caller normalizes any
     /// interrupted tail (synthesizing missing tool results) before the turn.
     fn load_context(&self) -> Result<Vec<Message>> {
-        self.store.load_context_messages(self.session_id)
+        let mut context = self.store.load_context_messages(self.session_id)?;
+        if self.store.resume_reminder_needed(self.session_id)? {
+            context.push(resume_message());
+        }
+        Ok(context)
     }
 
     fn sync_effective_model(&mut self) {
@@ -937,6 +996,12 @@ impl<'a> AgentLoop<'a> {
 
 fn partial_response(text: &str) -> Option<Value> {
     (!text.is_empty()).then(|| serde_json::json!({"output_text":text}))
+}
+
+fn resume_message() -> Message {
+    Message::User {
+        content: RESUME_PROMPT.into(),
+    }
 }
 
 fn parse_tool_args(call: &ToolCall) -> Result<Value> {
@@ -1654,6 +1719,12 @@ mod tests {
         step: Mutex<usize>,
     }
 
+    struct ResumeThenStopProvider {
+        resumes_before_stop: usize,
+        calls: Mutex<usize>,
+        seen: Arc<Mutex<Vec<Vec<Message>>>>,
+    }
+
     struct PartialFailureProvider;
 
     struct ContextAfterCompactionProvider {
@@ -1743,6 +1814,43 @@ mod tests {
                 }),
                 other => panic!("unexpected retry provider step {other}"),
             }
+        }
+    }
+
+    #[async_trait(?Send)]
+    impl Provider for ResumeThenStopProvider {
+        async fn stream_chat(
+            &self,
+            _request: &RequestOptions,
+            messages: &[Message],
+            _tools: &[Value],
+            _on_event: &mut dyn FnMut(crate::provider::StreamEvent) -> Result<(), ProviderError>,
+        ) -> Result<StreamResult, ProviderError> {
+            self.seen.lock().unwrap().push(messages.to_vec());
+            let mut calls = self.calls.lock().unwrap();
+            let call = *calls;
+            *calls += 1;
+            let resumable = call < self.resumes_before_stop;
+            Ok(StreamResult {
+                message: Message::Assistant {
+                    content: (!resumable).then(|| "done".into()),
+                    reasoning_content: None,
+                    native_replay: None,
+                    tool_calls: None,
+                },
+                finish_reason: if resumable {
+                    FinishReason::Resume
+                } else {
+                    FinishReason::Stop
+                },
+                usage: Some(Usage {
+                    input_tokens: 10,
+                    output_tokens: 1,
+                    total_tokens: 11,
+                    ..Usage::default()
+                }),
+                native_response: None,
+            })
         }
     }
 
@@ -1923,6 +2031,7 @@ mod tests {
             )]),
             output: Default::default(),
             line_wrapping: true,
+            auto_resume: false,
             compaction: CompactionConfig::default(),
             limits: LimitsConfig::default(),
             guardrail: GuardrailConfig::default(),
@@ -2021,6 +2130,193 @@ mod tests {
         assert_eq!(failed["error_class"], "rate_limit");
         assert!(failed["partial_response_json"].is_object());
         let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    #[tokio::test]
+    async fn auto_resume_preserves_response_and_uses_synthetic_user_message() {
+        let store = Store::open_memory().unwrap();
+        let session = store.create_session_seeded("system").unwrap();
+        store
+            .start_turn(&session.id, "/tmp", None, &"work".into())
+            .unwrap();
+        let mut config = test_config();
+        config.auto_resume = true;
+        let request_model = crate::models::resolve_model_ref(&config, "test/fake-model").unwrap();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let provider = Box::new(ResumeThenStopProvider {
+            resumes_before_stop: 1,
+            calls: Mutex::new(0),
+            seen: Arc::clone(&seen),
+        });
+        let mut renderer = Renderer::with_format(OutputFormat::Detail);
+        let mut agent = AgentLoop {
+            config: &config,
+            model: ResolvedModelChoice::fixed(request_model.clone()),
+            provider,
+            store: &store,
+            session_id: &session.id,
+            request: RequestOptions {
+                model: request_model,
+                cache_key: None,
+            },
+            model_context_window: None,
+            renderer: &mut renderer,
+        };
+
+        let result = agent.run_turn().await.unwrap();
+
+        assert_eq!(result.final_assistant.as_deref(), Some("done"));
+        assert_eq!(result.usage.input_tokens, 20);
+        assert_eq!(result.usage.output_tokens, 2);
+        assert!(store.is_session_clean(&session.id).unwrap());
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 2);
+        assert!(!seen[0].iter().any(
+            |message| matches!(message, Message::User { content } if content.text() == RESUME_PROMPT)
+        ));
+        assert!(matches!(
+            seen[1].last(),
+            Some(Message::User { content }) if content.text() == RESUME_PROMPT
+        ));
+        let audit = store.audit_events(&session.id).unwrap();
+        assert_eq!(
+            audit
+                .iter()
+                .filter(|event| event["type"] == "provider_completed")
+                .count(),
+            2
+        );
+        assert_eq!(
+            audit
+                .iter()
+                .find(|event| event["type"] == "provider_completed")
+                .unwrap()["projection"]["turn_state"],
+            "resume"
+        );
+    }
+
+    #[tokio::test]
+    async fn disabled_auto_resume_keeps_resumable_completion_terminal() {
+        let store = Store::open_memory().unwrap();
+        let session = store.create_session_seeded("system").unwrap();
+        store
+            .start_turn(&session.id, "/tmp", None, &"work".into())
+            .unwrap();
+        let config = test_config();
+        let request_model = crate::models::resolve_model_ref(&config, "test/fake-model").unwrap();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let provider = Box::new(ResumeThenStopProvider {
+            resumes_before_stop: 1,
+            calls: Mutex::new(0),
+            seen: Arc::clone(&seen),
+        });
+        let mut renderer = Renderer::with_format(OutputFormat::Detail);
+        let mut agent = AgentLoop {
+            config: &config,
+            model: ResolvedModelChoice::fixed(request_model.clone()),
+            provider,
+            store: &store,
+            session_id: &session.id,
+            request: RequestOptions {
+                model: request_model,
+                cache_key: None,
+            },
+            model_context_window: None,
+            renderer: &mut renderer,
+        };
+
+        let result = agent.run_turn().await.unwrap();
+
+        assert_eq!(result.final_assistant, None);
+        assert_eq!(seen.lock().unwrap().len(), 1);
+        assert!(store.is_session_clean(&session.id).unwrap());
+        assert!(!store.resume_reminder_needed(&session.id).unwrap());
+        let completed = store
+            .audit_events(&session.id)
+            .unwrap()
+            .into_iter()
+            .find(|event| event["type"] == "provider_completed")
+            .unwrap();
+        assert_eq!(completed["projection"]["turn_state"], "complete");
+    }
+
+    #[tokio::test]
+    async fn exhausted_auto_resume_is_retryable_and_explicit_retry_resumes() {
+        let store = Store::open_memory().unwrap();
+        let session = store.create_session_seeded("system").unwrap();
+        store
+            .start_turn(&session.id, "/tmp", None, &"work".into())
+            .unwrap();
+        let mut config = test_config();
+        config.auto_resume = true;
+        let request_model = crate::models::resolve_model_ref(&config, "test/fake-model").unwrap();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let provider = Box::new(ResumeThenStopProvider {
+            resumes_before_stop: usize::MAX,
+            calls: Mutex::new(0),
+            seen: Arc::clone(&seen),
+        });
+        let mut renderer = Renderer::with_format(OutputFormat::Detail);
+        let mut agent = AgentLoop {
+            config: &config,
+            model: ResolvedModelChoice::fixed(request_model.clone()),
+            provider,
+            store: &store,
+            session_id: &session.id,
+            request: RequestOptions {
+                model: request_model.clone(),
+                cache_key: None,
+            },
+            model_context_window: None,
+            renderer: &mut renderer,
+        };
+
+        let error = match agent.run_turn().await {
+            Ok(_) => panic!("auto-resume should exhaust its retry quota"),
+            Err(error) => error,
+        };
+
+        assert!(
+            error
+                .to_string()
+                .contains("use /retry to resume, or enter a new prompt to move on")
+        );
+        assert_eq!(
+            seen.lock().unwrap().len(),
+            provider_retry_limit(&agent.model) as usize + 1
+        );
+        assert!(!store.is_session_clean(&session.id).unwrap());
+        assert!(store.resume_reminder_needed(&session.id).unwrap());
+
+        let retry_seen = Arc::new(Mutex::new(Vec::new()));
+        let provider = Box::new(ResumeThenStopProvider {
+            resumes_before_stop: 0,
+            calls: Mutex::new(0),
+            seen: Arc::clone(&retry_seen),
+        });
+        let mut renderer = Renderer::with_format(OutputFormat::Detail);
+        let mut retry = AgentLoop {
+            config: &config,
+            model: ResolvedModelChoice::fixed(request_model.clone()),
+            provider,
+            store: &store,
+            session_id: &session.id,
+            request: RequestOptions {
+                model: request_model,
+                cache_key: None,
+            },
+            model_context_window: None,
+            renderer: &mut renderer,
+        };
+
+        let result = retry.resume_turn().await.unwrap();
+
+        assert_eq!(result.final_assistant.as_deref(), Some("done"));
+        assert!(store.is_session_clean(&session.id).unwrap());
+        assert!(matches!(
+            retry_seen.lock().unwrap()[0].last(),
+            Some(Message::User { content }) if content.text() == RESUME_PROMPT
+        ));
     }
 
     #[tokio::test]

@@ -98,7 +98,8 @@ Type `/` to list prompt-mode commands. The common ones:
   without an effort. In zsh, recognized efforts are ordered from `minimum`
   through `max`.
 - `/attach <file>` adds an image or audio file to the next turn.
-- `/retry` resumes a turn interrupted by Ctrl-C, a crash, or a lost connection.
+- `/retry` resumes a turn interrupted by Ctrl-C, a crash, a lost connection, or
+  exhausted automatic resume attempts.
 - `/compact` compacts older turns in a long session, optionally with a focus
   instruction. It reports when all history is already inside the configured
   recent-turn retention window.
@@ -196,7 +197,8 @@ messages, and exits. A few ideas follow from that:
   providers, with fixed `provider/model[:effort]` selection or per-session
   provider fallback from a bare `model[:effort]` in configured provider order.
 - Persistent global or project-scoped sessions, continuation, transcripts,
-  automatic context compaction, and interrupted-turn recovery.
+  automatic context compaction, optional automatic response resumption, and
+  interrupted-turn recovery.
 - Four output densities with automatic interactive-terminal rendering.
 - Image and audio attachments from the CLI and both shell prompt modes.
 - Reusable prompt files, executable prompts, slash commands, project/user
@@ -340,6 +342,13 @@ prose and table cells for the terminal to wrap, but still caps compact rows at
 model-visible text. In interactive concise output, Markdown links show only
 their labels while remaining clickable; detail and full output also show the
 full destination URL.
+
+Setting `"auto_resume": true` automatically continues provider responses that
+Mu classifies as resumable while preserving the problematic assistant message.
+It is `false` by default. Resume attempts share the normal automatic retry
+quota and show `[mu] auto-resuming [n/limit] after incomplete response`. If the
+quota is exhausted, the turn exits incomplete and `/retry` resumes it; entering
+a normal prompt instead starts a new turn without Mu's synthetic continuation.
 
 During compaction, interactive output uses one mutable
 `[compacting <duration>]` line, followed by a committed

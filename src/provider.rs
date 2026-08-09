@@ -469,6 +469,7 @@ pub struct ToolCallDelta {
 pub enum FinishReason {
     Stop,
     ToolCalls,
+    Resume,
     Other(String),
 }
 
@@ -1112,6 +1113,7 @@ mod tests {
             ]),
             output: Default::default(),
             line_wrapping: true,
+            auto_resume: false,
             compaction: CompactionConfig::default(),
             limits: LimitsConfig::default(),
             guardrail: GuardrailConfig::default(),

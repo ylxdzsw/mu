@@ -3,6 +3,8 @@
   "output": "concise",
   // Wrap interactive output to the terminal width.
   "line_wrapping": true,
+  // Automatically continue replayable incomplete assistant responses.
+  "auto_resume": false,
   // Providers and models, in default and fallback order.
   "providers": {
     // Default provider: OpenCode Zen's free DeepSeek and Mimo models. They need

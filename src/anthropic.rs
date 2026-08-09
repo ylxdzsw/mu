@@ -44,7 +44,7 @@ pub(crate) async fn stream(
             detail: "Anthropic reported model_context_window_exceeded".into(),
         });
     }
-    let finish_reason = finish_reason(state.stop_reason.as_deref(), &tool_calls);
+    let finish_reason = finish_reason(state.stop_reason.as_deref(), &blocks, &tool_calls);
     let usage = state.usage.finish();
     let native_response = Some(serde_json::json!({
         "type": "message",
@@ -612,7 +612,19 @@ fn tool_calls_from_blocks(blocks: &[Value]) -> Result<Vec<ToolCall>, ProviderErr
         .collect()
 }
 
-fn finish_reason(reason: Option<&str>, tool_calls: &[ToolCall]) -> FinishReason {
+fn finish_reason(reason: Option<&str>, blocks: &[Value], tool_calls: &[ToolCall]) -> FinishReason {
+    if reason == Some("end_turn")
+        && tool_calls.is_empty()
+        && !blocks.is_empty()
+        && blocks.iter().all(|block| {
+            matches!(
+                block["type"].as_str(),
+                Some("thinking" | "redacted_thinking")
+            )
+        })
+    {
+        return FinishReason::Resume;
+    }
     match reason {
         Some("end_turn" | "stop_sequence") => FinishReason::Stop,
         Some("tool_use") => FinishReason::ToolCalls,
@@ -699,6 +711,37 @@ mod tests {
         assert_eq!(body["tools"][0]["name"], "bash");
         assert_eq!(body["tools"][0]["input_schema"]["required"][0], "command");
         assert!(body["tools"][0].get("strict").is_none());
+    }
+
+    #[test]
+    fn classifies_only_thinking_only_end_turn_as_resumable() {
+        let thinking = serde_json::json!({
+            "type": "thinking",
+            "thinking": "still working",
+            "signature": "sig",
+        });
+        let redacted = serde_json::json!({
+            "type": "redacted_thinking",
+            "data": "opaque",
+        });
+        let text = serde_json::json!({ "type": "text", "text": "done" });
+
+        assert_eq!(
+            finish_reason(Some("end_turn"), std::slice::from_ref(&thinking), &[]),
+            FinishReason::Resume
+        );
+        assert_eq!(
+            finish_reason(Some("end_turn"), &[redacted], &[]),
+            FinishReason::Resume
+        );
+        assert_eq!(
+            finish_reason(Some("end_turn"), &[thinking, text], &[]),
+            FinishReason::Stop
+        );
+        assert_eq!(
+            finish_reason(Some("end_turn"), &[], &[]),
+            FinishReason::Stop
+        );
     }
 
     #[test]
@@ -925,11 +968,11 @@ mod tests {
         assert_eq!(calls[0].function.arguments, r#"{"command":"pwd"}"#);
         assert_eq!(text_from_blocks(&blocks).as_deref(), Some("done"));
         assert!(matches!(
-            finish_reason(state.stop_reason.as_deref(), &calls),
+            finish_reason(state.stop_reason.as_deref(), &blocks, &calls),
             FinishReason::ToolCalls
         ));
         assert!(matches!(
-            finish_reason(Some("refusal"), &[]),
+            finish_reason(Some("refusal"), &[], &[]),
             FinishReason::Other(reason) if reason == "refusal"
         ));
 
