@@ -455,10 +455,8 @@ BUFFER="/model gpt:"
 CURSOR=${#BUFFER}
 _mu_zsh_fallback_completion
 unfunction compadd
-[[ "$captured_compadd_calls[1]" == *",-n,--," ]] ||
-  fail "effort completion keeps the empty suffix only as a hidden anchor"
 for effort in minimum low medium high xhigh max provider-custom; do
-  [[ ",$captured_compadd_calls[2]," == *",$effort,"* ]] ||
+  [[ ",$captured_compadd_calls[1]," == *",$effort,"* ]] ||
     fail "exact-model effort menu includes $effort"
 done
 model_candidates=("${(@f)$(_mu_zsh_model_completion_candidates "gpt:")}")

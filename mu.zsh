@@ -665,7 +665,6 @@ _mu_zsh_fallback_completion() {
         for effort_suffix in "${effort_suffixes[@]}"; do
           effort_candidates+=("${effort_suffix#:}")
         done
-        compadd -Q -S '' -n -- ''
         compadd -Q -S '' -- "${effort_candidates[@]}"
         return
       fi
@@ -704,8 +703,6 @@ _mu_zsh_completion_system() {
         for effort_suffix in "${effort_suffixes[@]}"; do
           effort_candidates+=("${effort_suffix#:}")
         done
-        _wanted mu-model-effort expl 'model effort' \
-          compadd -Q -S '' -n -- ''
         _wanted mu-model-effort expl 'model effort' \
           compadd -Q -S '' -- "${effort_candidates[@]}"
         return
