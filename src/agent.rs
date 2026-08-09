@@ -522,6 +522,13 @@ impl<'a> AgentLoop<'a> {
                 FinishReason::Resume => {
                     let retry_limit = provider_retry_limit(&self.model);
                     if live_provider_retries >= retry_limit {
+                        let reason =
+                            format!("auto-resume exhaustion [{retry_limit}/{retry_limit}]");
+                        if self.advance_provider(&reason)? {
+                            live_provider_retries = 0;
+                            context = self.load_context()?;
+                            continue;
+                        }
                         return Err(AutoResumeExhausted { limit: retry_limit }.into());
                     }
                     live_provider_retries += 1;
@@ -1731,6 +1738,58 @@ mod tests {
         counts: Arc<Mutex<(u32, u32)>>,
     }
 
+    fn spawn_stop_server(
+        seen_request: Arc<Mutex<String>>,
+    ) -> (String, std::thread::JoinHandle<()>) {
+        use std::io::{Read, Write};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0; 4096];
+            loop {
+                let read = stream.read(&mut buffer).unwrap();
+                request.extend_from_slice(&buffer[..read]);
+                let Some(header_end) = request.windows(4).position(|part| part == b"\r\n\r\n")
+                else {
+                    continue;
+                };
+                let headers = String::from_utf8_lossy(&request[..header_end]);
+                let content_length = headers
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse::<usize>().unwrap())
+                    })
+                    .unwrap_or_default();
+                if request.len() >= header_end + 4 + content_length {
+                    break;
+                }
+            }
+            *seen_request.lock().unwrap() = String::from_utf8_lossy(&request).into_owned();
+
+            let body = concat!(
+                "data: {\"choices\":[{\"delta\":{\"content\":\"fallback done\"},",
+                "\"finish_reason\":\"stop\"}]}\n\n",
+                "data: [DONE]\n\n"
+            );
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\
+                 Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .unwrap();
+        });
+        (format!("http://{address}/chat/completions"), handle)
+    }
+
     #[async_trait(?Send)]
     impl Provider for ContextAfterCompactionProvider {
         async fn stream_chat(
@@ -2241,7 +2300,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn exhausted_auto_resume_is_retryable_and_explicit_retry_resumes() {
+    async fn fixed_auto_resume_exhaustion_is_retryable_and_explicit_retry_resumes() {
         let store = Store::open_memory().unwrap();
         let session = store.create_session_seeded("system").unwrap();
         store
@@ -2317,6 +2376,77 @@ mod tests {
             retry_seen.lock().unwrap()[0].last(),
             Some(Message::User { content }) if content.text() == RESUME_PROMPT
         ));
+    }
+
+    #[tokio::test]
+    async fn floating_auto_resume_exhaustion_advances_provider() {
+        let store = Store::open_memory().unwrap();
+        let session = store.create_session_seeded("system").unwrap();
+        store
+            .start_turn(&session.id, "/tmp", None, &"work".into())
+            .unwrap();
+        let seen_request = Arc::new(Mutex::new(String::new()));
+        let (fallback_endpoint, server) = spawn_stop_server(Arc::clone(&seen_request));
+        let model = crate::config::ModelConfig {
+            context_window: None,
+            supported_efforts: None,
+            replay_key: None,
+        };
+        let mut config = test_config();
+        config.auto_resume = true;
+        config.providers = crate::config::OrderedMap::from_iter([
+            (
+                "first".into(),
+                ProviderConfig {
+                    endpoint: "http://localhost/chat/completions".into(),
+                    api_key_env: String::new(),
+                    models: crate::config::OrderedMap::from_iter([(
+                        "fake-model".into(),
+                        model.clone(),
+                    )]),
+                },
+            ),
+            (
+                "second".into(),
+                ProviderConfig {
+                    endpoint: fallback_endpoint,
+                    api_key_env: String::new(),
+                    models: crate::config::OrderedMap::from_iter([("fake-model".into(), model)]),
+                },
+            ),
+        ]);
+        let model = crate::models::resolve_model_choice(&config, "fake-model").unwrap();
+        let retry_limit = provider_retry_limit(&model);
+        let request_model = model.active_model().clone();
+        let first_seen = Arc::new(Mutex::new(Vec::new()));
+        let provider = Box::new(ResumeThenStopProvider {
+            resumes_before_stop: usize::MAX,
+            calls: Mutex::new(0),
+            seen: Arc::clone(&first_seen),
+        });
+        let mut renderer = Renderer::with_format(OutputFormat::Detail);
+        let mut agent = AgentLoop {
+            config: &config,
+            model,
+            provider,
+            store: &store,
+            session_id: &session.id,
+            request: RequestOptions {
+                model: request_model,
+                cache_key: None,
+            },
+            model_context_window: None,
+            renderer: &mut renderer,
+        };
+
+        let result = agent.run_turn().await.unwrap();
+        server.join().unwrap();
+
+        assert_eq!(result.final_assistant.as_deref(), Some("fallback done"));
+        assert_eq!(agent.model.active_model().provider_id, "second");
+        assert_eq!(first_seen.lock().unwrap().len(), retry_limit as usize + 1);
+        assert!(seen_request.lock().unwrap().contains(RESUME_PROMPT));
+        assert!(store.is_session_clean(&session.id).unwrap());
     }
 
     #[tokio::test]

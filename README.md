@@ -347,8 +347,10 @@ Setting `"auto_resume": true` automatically continues provider responses that
 Mu classifies as resumable while preserving the problematic assistant message.
 It is `false` by default. Resume attempts share the normal automatic retry
 quota and show `[mu] auto-resuming [n/limit] after incomplete response`. If the
-quota is exhausted, the turn exits incomplete and `/retry` resumes it; entering
-a normal prompt instead starts a new turn without Mu's synthetic continuation.
+quota is exhausted, a floating model falls back to its next provider candidate
+and continues from the preserved history. A fixed or final candidate exits
+incomplete and `/retry` resumes it; entering a normal prompt instead starts a
+new turn without Mu's synthetic continuation.
 
 During compaction, interactive output uses one mutable
 `[compacting <duration>]` line, followed by a committed

@@ -422,9 +422,10 @@ This is the exact sequence the binary follows for one turn invocation:
       `Continue the current task from where you stopped.` message to the
       same-turn provider context, consume one automatic retry credit, and loop
       back to (a) without consuming an agent iteration. If no credit remains,
-      abort non-zero with the turn still resumable and direct the user to
-      `/retry` or a new prompt. Resume exhaustion does not advance a floating
-      provider.
+      advance a floating provider candidate under the normal fallback policy
+      and continue with the preserved response. If no candidate remains, abort
+      non-zero with the turn still resumable and direct the user to `/retry` or
+      a new prompt.
 10. **For `detail` and `full`, print the turn summary line** to stderr (§5),
     release the journal lock, and exit 0. `concise` and
     `final` omit it.
@@ -1226,10 +1227,12 @@ the same turn again with a derived user
 delay, shares the current logical call's retry counter with transient provider
 errors, and reports
 `[mu] auto-resuming [n/limit] after incomplete response`. Normal text or tool
-progress resets that counter. On exhaustion Mu does not advance provider: it
-exits non-zero, leaves the latest turn dirty, and reports that `/retry` resumes
-it while a normal new prompt moves on. `final` suppresses intermediate notices
-and reports the unrecovered error through its normal non-zero error contract.
+progress resets that counter. On exhaustion Mu advances a floating provider
+candidate under the normal fallback policy and continues from the preserved
+history. If the choice is fixed or no candidate remains, Mu exits non-zero,
+leaves the latest turn dirty, and reports that `/retry` resumes it while a
+normal new prompt moves on. `final` suppresses intermediate notices and reports
+the unrecovered error through its normal non-zero error contract.
 
 **Model context window.** Compaction thresholds need the model's max context size.
 Source it from `config.jsonc`: each configured model entry carries a

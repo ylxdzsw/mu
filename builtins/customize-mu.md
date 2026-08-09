@@ -102,9 +102,10 @@ Without `context_window`, percentage reporting and proactive compaction are
 unavailable. `output` is overridden by CLI `--output`.
 `auto_resume` preserves provider responses classified as resumable and
 continues the same turn with a derived user `Continue` message. Attempts share
-the provider retry quota. Exhaustion leaves the turn incomplete for `/retry`;
-a normal new prompt supersedes the pending resume without inserting the derived
-message. When disabled, resumable responses are ordinary clean turn endings.
+the provider retry quota. Exhaustion advances a floating provider candidate;
+a fixed or final candidate leaves the turn incomplete for `/retry`. A normal
+new prompt supersedes the pending resume without inserting the derived message.
+When disabled, resumable responses are ordinary clean turn endings.
 Set `compaction.enabled` to `false` to disable automatic soft-threshold,
 hard-threshold, and context-overflow compaction. Context-length failures then
 abort the turn, while explicit `mu compact` remains available.
