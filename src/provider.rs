@@ -65,17 +65,17 @@ pub enum NativeReplayPayload {
 }
 
 impl NativeReplay {
-    fn api_name(&self) -> &'static str {
+    fn api(&self) -> ModelApi {
         match &self.payload {
-            NativeReplayPayload::ChatReasoning(_) => "chat_completions",
-            NativeReplayPayload::ResponsesOutput(_) => "responses",
-            NativeReplayPayload::AnthropicContent(_) => "anthropic_messages",
+            NativeReplayPayload::ChatReasoning(_) => ModelApi::ChatCompletions,
+            NativeReplayPayload::ResponsesOutput(_) => ModelApi::Responses,
+            NativeReplayPayload::AnthropicContent(_) => ModelApi::AnthropicMessages,
         }
     }
 
     fn origin(&self) -> ReplayOrigin {
         ReplayOrigin {
-            api: self.api_name().to_string(),
+            api: self.api().name().to_string(),
             provider_id: self.provider_id.clone(),
             endpoint: self.endpoint.clone(),
             model: self.model.clone(),
@@ -102,37 +102,37 @@ pub fn filter_native_replay_for_config(
     messages: &[Message],
     config: &Config,
     target: &ResolvedModelRef,
-    target_api: &str,
+    target_api: ModelApi,
 ) -> Vec<Message> {
-    if target_api == "chat_completions" {
-        return filter_native_replay(messages, |native| native.api_name() == target_api);
+    if target_api == ModelApi::ChatCompletions {
+        return filter_native_replay(messages, |native| native.api() == target_api);
     }
     let target_key = config.replay_key(&target.provider_id, &target.model_id);
     filter_native_replay(messages, |native| {
-        native.api_name() == target_api
+        native.api() == target_api
             && config.replay_key(&native.provider_id, &native.model) == target_key
     })
 }
 
 pub fn filter_native_replay_for_origins(
     messages: &[Message],
-    target_api: &str,
+    target_api: ModelApi,
     origins: &[ReplayOrigin],
 ) -> Vec<Message> {
     filter_native_replay(messages, |native| {
-        native.api_name() == target_api && origins.contains(&native.origin())
+        native.api() == target_api && origins.contains(&native.origin())
     })
 }
 
 pub fn filter_native_replay_for_legacy_origin(
     messages: &[Message],
-    target_api: &str,
+    target_api: ModelApi,
     provider_id: &str,
     endpoint: &str,
     model: &str,
 ) -> Vec<Message> {
     filter_native_replay(messages, |native| {
-        native.api_name() == target_api
+        native.api() == target_api
             && native.provider_id == provider_id
             && native.endpoint == endpoint
             && native.model == model
@@ -161,6 +161,24 @@ pub enum ModelApi {
     ChatCompletions,
     Responses,
     AnthropicMessages,
+}
+
+impl ModelApi {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::ChatCompletions => "chat_completions",
+            Self::Responses => "responses",
+            Self::AnthropicMessages => "anthropic_messages",
+        }
+    }
+
+    pub fn request_format(self) -> &'static str {
+        match self {
+            Self::ChatCompletions => "openai.chat_completions.v1",
+            Self::Responses => "openai.responses.v1",
+            Self::AnthropicMessages => "anthropic.messages.v1",
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -692,16 +710,8 @@ fn write_status_detail(
 
 #[async_trait(?Send)]
 pub trait Provider: Send + Sync {
-    fn request_format(&self) -> &'static str {
-        "test.v1"
-    }
-
     fn endpoint(&self) -> &str {
         ""
-    }
-
-    fn api_name(&self) -> &'static str {
-        "test"
     }
 
     fn api(&self) -> ModelApi {
@@ -717,24 +727,8 @@ pub trait Provider: Send + Sync {
 
 #[async_trait(?Send)]
 impl Provider for HttpProvider {
-    fn request_format(&self) -> &'static str {
-        match self.api {
-            ModelApi::ChatCompletions => "openai.chat_completions.v1",
-            ModelApi::Responses => "openai.responses.v1",
-            ModelApi::AnthropicMessages => "anthropic.messages.v1",
-        }
-    }
-
     fn endpoint(&self) -> &str {
         &self.endpoint
-    }
-
-    fn api_name(&self) -> &'static str {
-        match self.api {
-            ModelApi::ChatCompletions => "chat_completions",
-            ModelApi::Responses => "responses",
-            ModelApi::AnthropicMessages => "anthropic_messages",
-        }
     }
 
     fn api(&self) -> ModelApi {
@@ -1450,7 +1444,8 @@ mod tests {
         let target = target_model();
 
         let separate = replay_config(None, None);
-        let filtered = filter_native_replay_for_config(&messages, &separate, &target, "responses");
+        let filtered =
+            filter_native_replay_for_config(&messages, &separate, &target, ModelApi::Responses);
         assert!(matches!(
             &filtered[0],
             Message::Assistant {
@@ -1460,7 +1455,8 @@ mod tests {
         ));
 
         let shared = replay_config(Some("compatible"), Some("compatible"));
-        let filtered = filter_native_replay_for_config(&messages, &shared, &target, "responses");
+        let filtered =
+            filter_native_replay_for_config(&messages, &shared, &target, ModelApi::Responses);
         assert!(matches!(
             &filtered[0],
             Message::Assistant {
@@ -1470,7 +1466,8 @@ mod tests {
         ));
 
         let changed = replay_config(Some("compatible"), Some("replacement"));
-        let filtered = filter_native_replay_for_config(&messages, &changed, &target, "responses");
+        let filtered =
+            filter_native_replay_for_config(&messages, &changed, &target, ModelApi::Responses);
         assert!(matches!(
             &filtered[0],
             Message::Assistant {
@@ -1490,7 +1487,7 @@ mod tests {
             &messages,
             &config,
             &target_model(),
-            "chat_completions",
+            ModelApi::ChatCompletions,
         );
         assert!(matches!(
             &filtered[0],
@@ -1511,7 +1508,7 @@ mod tests {
             &messages,
             &config,
             &target_model(),
-            "chat_completions",
+            ModelApi::ChatCompletions,
         );
         assert!(matches!(
             &filtered[0],

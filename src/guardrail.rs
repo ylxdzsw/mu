@@ -178,7 +178,7 @@ impl Guardrail {
             );
             let native_request = request.json(provider.api())?;
             let recipe = store.request_recipe(
-                provider.request_format(),
+                provider.api().request_format(),
                 &native_request,
                 json!({
                     "kind": "guardrail",
@@ -196,7 +196,7 @@ impl Guardrail {
                 ProviderOrigin {
                     canonical_model_ref: request_model.canonical.clone(),
                     provider_id: request_model.provider_id.clone(),
-                    api: provider.api_name().to_string(),
+                    api: provider.api().name().to_string(),
                     endpoint: provider.endpoint().to_string(),
                     wire_model: request_model.model_id.clone(),
                     effort: request_model.effort.clone(),

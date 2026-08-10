@@ -1414,6 +1414,12 @@ impl Store {
             }
             request
         } else {
+            let api = match recipe.format.as_str() {
+                "openai.chat_completions.v1" => ModelApi::ChatCompletions,
+                "openai.responses.v1" => ModelApi::Responses,
+                "anthropic.messages.v1" => ModelApi::AnthropicMessages,
+                format => bail!("unsupported provider request format: {format}"),
+            };
             let through_seq = recipe.input["context_through_seq"]
                 .as_i64()
                 .context("agent request recipe has no context boundary")?;
@@ -1422,11 +1428,11 @@ impl Store {
                 let origins: Vec<crate::provider::ReplayOrigin> =
                     serde_json::from_value(origins.clone())
                         .context("invalid native replay origins in request recipe")?;
-                crate::provider::filter_native_replay_for_origins(&messages, &origin.api, &origins)
+                crate::provider::filter_native_replay_for_origins(&messages, api, &origins)
             } else {
                 crate::provider::filter_native_replay_for_legacy_origin(
                     &messages,
-                    &origin.api,
+                    api,
                     &origin.provider_id,
                     &origin.endpoint,
                     &origin.wire_model,
@@ -1454,12 +1460,6 @@ impl Store {
                 cache_key,
                 messages,
                 bash: false,
-            };
-            let api = match recipe.format.as_str() {
-                "openai.chat_completions.v1" => ModelApi::ChatCompletions,
-                "openai.responses.v1" => ModelApi::Responses,
-                "anthropic.messages.v1" => ModelApi::AnthropicMessages,
-                format => bail!("unsupported provider request format: {format}"),
             };
             request.historical_json(api, &tools)?
         };
@@ -3137,7 +3137,7 @@ mod tests {
         let replay_origins = crate::provider::native_replay_origins(&messages);
         let request_messages = crate::provider::filter_native_replay_for_origins(
             &messages,
-            "chat_completions",
+            ModelApi::ChatCompletions,
             &replay_origins,
         );
         let options = Request {

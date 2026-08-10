@@ -393,7 +393,7 @@ pub async fn run_compaction(
     let native_request = request.json(provider.api())?;
     let summarize_through_seq = cut_seq.saturating_sub(1);
     let recipe = store.request_recipe(
-        provider.request_format(),
+        provider.api().request_format(),
         &native_request,
         serde_json::json!({
             "kind": "compaction",
@@ -412,7 +412,7 @@ pub async fn run_compaction(
         ProviderOrigin {
             canonical_model_ref: model.canonical.clone(),
             provider_id: model.provider_id.clone(),
-            api: provider.api_name().to_string(),
+            api: provider.api().name().to_string(),
             endpoint: provider.endpoint().to_string(),
             wire_model: model.model_id.clone(),
             effort: model.effort.clone(),

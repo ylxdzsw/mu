@@ -229,7 +229,7 @@ impl<'a> AgentLoop<'a> {
                         &context,
                         self.config,
                         self.model.active_model(),
-                        self.provider.api_name(),
+                        self.provider.api(),
                     );
                     let request = Request {
                         model: self.model.active_model().clone(),
@@ -239,7 +239,7 @@ impl<'a> AgentLoop<'a> {
                     };
                     let native_request = request.json(self.provider.api())?;
                     let recipe = self.store.request_recipe(
-                        self.provider.request_format(),
+                        self.provider.api().request_format(),
                         &native_request,
                         serde_json::json!({
                             "kind": "agent",
@@ -256,7 +256,7 @@ impl<'a> AgentLoop<'a> {
                         ProviderOrigin {
                             canonical_model_ref: request.model.canonical.clone(),
                             provider_id: request.model.provider_id.clone(),
-                            api: self.provider.api_name().to_string(),
+                            api: self.provider.api().name().to_string(),
                             endpoint: self.provider.endpoint().to_string(),
                             wire_model: request.model.model_id.clone(),
                             effort: request.model.effort.clone(),
