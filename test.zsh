@@ -1034,6 +1034,27 @@ raw_transcript=$(<"$model_effort_transcript")
 [[ "$raw_transcript" == *'none'* && "$raw_transcript" == *'max'* ]] || fail "one model completion should immediately list supported efforts"
 [[ ! -e "$interactive_capture_calls" || ! -s "$interactive_capture_calls" ]] || fail "model effort completion should not submit a prompt"
 
+effort_menu_transcript=$tmpdir/effort-menu-transcript
+effort_menu_setup="$interactive_setup; zstyle ':completion:*' menu select; MU_ZSH_TEST_MENU_CAPTURE=0; _mu_test_capture_effort_menu() { (( MU_ZSH_TEST_MENU_CAPTURE += 1 )); zle -I; print -r -- \"[menu-\$MU_ZSH_TEST_MENU_CAPTURE-buffer=\$BUFFER cursor=\$CURSOR]\"; BUFFER=; CURSOR=0; _mu_zsh_reset_mode_prompt; }; zle -N _mu_test_capture_effort_menu; bindkey -M mumode '^T' _mu_test_capture_effort_menu"
+rm -f -- "$interactive_capture_args" "$interactive_capture_stdin" "$interactive_capture_calls"
+interactive_status=0
+{
+  send_interactive_setup "$effort_menu_setup"
+  print -rn -- $'\t'"/model shared"$'\t\t\r\x14'"/model shared:"$'\t\r\x14'"/model shared"$'\tl\x7f\x14'
+  sleep 0.4
+  print -rn -- $'\x04'
+} | timeout 10 script -qfec 'TERM=xterm-256color zsh -df' "$effort_menu_transcript" >/dev/null || interactive_status=$?
+(( interactive_status == 0 )) || fail "effort menu transcript exited with status $interactive_status"
+
+normalized=$(perl -pe 's/\e\[[0-?]*[ -\/]*[@-~]//g' "$effort_menu_transcript" | col -b)
+[[ "$normalized" == *'[menu-1-buffer=/model shared:low cursor=17]'* ]] ||
+  fail "Tab after a speculative colon should immediately select the first ordered effort"
+[[ "$normalized" == *'[menu-2-buffer=/model shared:low cursor=17]'* ]] ||
+  fail "Tab after an explicit empty colon should immediately select the first ordered effort"
+[[ "$normalized" == *'[menu-3-buffer=/model shared: cursor=14]'* ]] ||
+  fail "typing after a speculative colon should commit it before Backspace"
+[[ ! -e "$interactive_capture_calls" || ! -s "$interactive_capture_calls" ]] || fail "effort menu completion should not submit a prompt"
+
 floating_effort_transcript=$tmpdir/floating-effort-transcript
 floating_effort_setup="$interactive_setup; zstyle ':completion:*' menu select; _mu_test_floating_effort_completion() { BUFFER='/model shared'; CURSOR=\${#BUFFER}; _mu_zsh_complete_slash; zle -I; print -r -- \"[floating-buffer=\$BUFFER cursor=\$CURSOR]\"; BUFFER=; CURSOR=0; _mu_zsh_reset_mode_prompt; }; zle -N _mu_test_floating_effort_completion; bindkey -M mumode '^T' _mu_test_floating_effort_completion"
 rm -f -- "$interactive_capture_args" "$interactive_capture_stdin" "$interactive_capture_calls"
@@ -1053,7 +1074,7 @@ raw_transcript=$(<"$floating_effort_transcript")
 [[ ! -e "$interactive_capture_calls" || ! -s "$interactive_capture_calls" ]] || fail "floating model effort completion should not submit a prompt"
 
 speculative_colon_transcript=$tmpdir/speculative-colon-transcript
-speculative_colon_setup="$interactive_setup; _mu_test_speculative_colon_state() { BUFFER='/model shared'; CURSOR=\${#BUFFER}; _mu_zsh_append_speculative_model_colon; _mu_zsh_model_colon; explicit=\"\$BUFFER,\$CURSOR,\$MU_ZSH_SPECULATIVE_MODEL_COLON\"; BUFFER='/model shared'; CURSOR=\${#BUFFER}; _mu_zsh_append_speculative_model_colon; _mu_zsh_speculative_backspace; back=\"\$BUFFER,\$CURSOR,\$MU_ZSH_SPECULATIVE_MODEL_COLON\"; BUFFER='/model shared'; CURSOR=\${#BUFFER}; _mu_zsh_append_speculative_model_colon; _mu_zsh_speculative_delete || true; delete=\"\$BUFFER,\$CURSOR,\$MU_ZSH_SPECULATIVE_MODEL_COLON\"; BUFFER='/model shared'; CURSOR=\${#BUFFER}; _mu_zsh_append_speculative_model_colon; (( CURSOR -= 1 )); _mu_zsh_commit_speculative_model_colon_if_changed; moved=\"\$BUFFER,\$CURSOR,\$MU_ZSH_SPECULATIVE_MODEL_COLON\"; BUFFER='/model shared'; CURSOR=\${#BUFFER}; _mu_zsh_append_speculative_model_colon; _mu_zsh_strip_speculative_model_colon; entered=\"\$BUFFER,\$CURSOR,\$MU_ZSH_SPECULATIVE_MODEL_COLON\"; zle -I; print -r -- \"[explicit=\$explicit back=\$back delete=\$delete moved=\$moved entered=\$entered]\"; BUFFER=; CURSOR=0; _mu_zsh_reset_mode_prompt; }; zle -N _mu_test_speculative_colon_state; bindkey -M mumode '^Y' _mu_test_speculative_colon_state"
+speculative_colon_setup="$interactive_setup; _mu_test_speculative_colon_state() { BUFFER='/model shared'; CURSOR=\${#BUFFER}; _mu_zsh_append_speculative_model_colon; _mu_zsh_model_colon; explicit=\"\$BUFFER,\$CURSOR,\$MU_ZSH_SPECULATIVE_MODEL_COLON\"; BUFFER='/model shared'; CURSOR=\${#BUFFER}; _mu_zsh_append_speculative_model_colon; _mu_zsh_speculative_backspace; back=\"\$BUFFER,\$CURSOR,\$MU_ZSH_SPECULATIVE_MODEL_COLON\"; BUFFER='/model shared'; CURSOR=\${#BUFFER}; _mu_zsh_append_speculative_model_colon; _mu_zsh_speculative_delete || true; delete=\"\$BUFFER,\$CURSOR,\$MU_ZSH_SPECULATIVE_MODEL_COLON\"; BUFFER='/model shared'; CURSOR=\${#BUFFER}; _mu_zsh_append_speculative_model_colon; (( CURSOR -= 1 )); _mu_zsh_resolve_speculative_model_colon; moved=\"\$BUFFER,\$CURSOR,\$MU_ZSH_SPECULATIVE_MODEL_COLON\"; BUFFER='/model shared'; CURSOR=\${#BUFFER}; _mu_zsh_append_speculative_model_colon; _mu_zsh_resolve_speculative_model_colon discard; entered=\"\$BUFFER,\$CURSOR,\$MU_ZSH_SPECULATIVE_MODEL_COLON\"; zle -I; print -r -- \"[explicit=\$explicit back=\$back delete=\$delete moved=\$moved entered=\$entered]\"; BUFFER=; CURSOR=0; _mu_zsh_reset_mode_prompt; }; zle -N _mu_test_speculative_colon_state; bindkey -M mumode '^Y' _mu_test_speculative_colon_state"
 rm -f -- "$interactive_capture_args" "$interactive_capture_stdin" "$interactive_capture_calls"
 interactive_status=0
 {

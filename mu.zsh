@@ -164,39 +164,26 @@ _mu_zsh_clear_tracked_state() {
   MU_ZSH_EFFECTIVE_ATTACHMENT_COUNT=0
 }
 
-_mu_zsh_clear_speculative_model_colon() {
+_mu_zsh_resolve_speculative_model_colon() {
+  local action=${1:-commit}
+  local current=0
+  local restored_cursor
+
+  if (( MU_ZSH_SPECULATIVE_MODEL_COLON )) &&
+    [[ "$BUFFER" == "$MU_ZSH_SPECULATIVE_MODEL_BUFFER" &&
+      $CURSOR -eq $MU_ZSH_SPECULATIVE_MODEL_CURSOR ]]; then
+    current=1
+    if [[ "$action" == discard ]]; then
+      restored_cursor=$(( CURSOR - 1 ))
+      BUFFER="${BUFFER[1,CURSOR-1]}${BUFFER[CURSOR+1,-1]}"
+      CURSOR=$restored_cursor
+    fi
+  fi
+
   MU_ZSH_SPECULATIVE_MODEL_COLON=0
   MU_ZSH_SPECULATIVE_MODEL_BUFFER=
   MU_ZSH_SPECULATIVE_MODEL_CURSOR=0
-}
-
-_mu_zsh_commit_speculative_model_colon_if_changed() {
-  (( MU_ZSH_SPECULATIVE_MODEL_COLON )) || return 0
-  if [[ "$BUFFER" != "$MU_ZSH_SPECULATIVE_MODEL_BUFFER" ||
-    $CURSOR -ne $MU_ZSH_SPECULATIVE_MODEL_CURSOR ]]; then
-    _mu_zsh_clear_speculative_model_colon
-  fi
-}
-
-_mu_zsh_commit_speculative_model_colon() {
-  (( MU_ZSH_SPECULATIVE_MODEL_COLON )) &&
-    _mu_zsh_clear_speculative_model_colon
-  return 0
-}
-
-_mu_zsh_strip_speculative_model_colon() {
-  local restored_cursor
-  (( MU_ZSH_SPECULATIVE_MODEL_COLON )) || return 1
-  [[ "$BUFFER" == "$MU_ZSH_SPECULATIVE_MODEL_BUFFER" &&
-    $CURSOR -eq $MU_ZSH_SPECULATIVE_MODEL_CURSOR ]] || {
-    _mu_zsh_clear_speculative_model_colon
-    return 1
-  }
-  restored_cursor=$(( MU_ZSH_SPECULATIVE_MODEL_CURSOR - 1 ))
-  BUFFER="${BUFFER[1,CURSOR-1]}${BUFFER[CURSOR+1,-1]}"
-  CURSOR=$restored_cursor
-  _mu_zsh_clear_speculative_model_colon
-  return 0
+  REPLY=$current
 }
 
 _mu_zsh_append_speculative_model_colon() {
@@ -665,7 +652,7 @@ _mu_zsh_fallback_completion() {
         for effort_suffix in "${effort_suffixes[@]}"; do
           effort_candidates+=("${effort_suffix#:}")
         done
-        compadd -Q -S '' -- "${effort_candidates[@]}"
+        compadd -V mu-model-effort -Q -S '' -- "${effort_candidates[@]}"
         return
       fi
     fi
@@ -703,7 +690,7 @@ _mu_zsh_completion_system() {
         for effort_suffix in "${effort_suffixes[@]}"; do
           effort_candidates+=("${effort_suffix#:}")
         done
-        _wanted mu-model-effort expl 'model effort' \
+        _wanted -V mu-model-effort expl 'model effort' \
           compadd -Q -S '' -- "${effort_candidates[@]}"
         return
       fi
@@ -730,13 +717,31 @@ _mu_zsh_use_completion_system() {
 _mu_zsh_complete_slash() {
   local before_buffer=$BUFFER before_cursor=$CURSOR
   local before_left=${BUFFER[1,$CURSOR]}
+  local completion_mode=complete
   local model_arg effort
-  local -a display_efforts
+  local -a display_efforts effort_suffixes
 
   _mu_zsh_slash_completion_context || return 1
+  if [[ "$before_left" == "/model "* ]]; then
+    model_arg=${before_left#"/model "}
+    if [[ "$model_arg" == *: ]]; then
+      effort_suffixes=("${(@f)$(_mu_zsh_model_completion_candidates "$model_arg" 1)}")
+      effort_suffixes=("${(@)effort_suffixes:#}")
+      # An empty effort token needs menu-complete; expand-or-complete would
+      # spend this Tab rebuilding the already-visible candidate list.
+      (( ${#effort_suffixes[@]} )) && completion_mode=menu
+    fi
+  fi
+
   if _mu_zsh_use_completion_system; then
     local compcontext=mu-zsh-slash
-    zle expand-or-complete
+    if [[ "$completion_mode" == menu ]]; then
+      zle menu-complete
+    else
+      zle expand-or-complete
+    fi
+  elif [[ "$completion_mode" == menu ]]; then
+    zle _mu_zsh_menu_widget
   else
     zle _mu_zsh_complete_widget
   fi
@@ -1002,7 +1007,7 @@ _mu_zsh_enter_mode() {
 _mu_zsh_exit_mode() {
   [[ "$MU_ZSH_MODE" == shell ]] && return 0
 
-  _mu_zsh_clear_speculative_model_colon
+  _mu_zsh_resolve_speculative_model_colon
   _mu_zsh_reset_history_navigation
   MU_ZSH_MODE=shell
   zle -K "${MU_ZSH_SAVED_KEYMAP:-main}" 2>/dev/null || zle -K main 2>/dev/null || true
@@ -1013,7 +1018,7 @@ _mu_zsh_exit_mode() {
 }
 
 _mu_zsh_insert_newline() {
-  _mu_zsh_commit_speculative_model_colon
+  _mu_zsh_resolve_speculative_model_colon
   [[ "$MU_ZSH_MODE" == mu ]] || {
     zle self-insert
     return
@@ -1024,7 +1029,7 @@ _mu_zsh_insert_newline() {
 }
 
 _mu_zsh_history_up() {
-  _mu_zsh_commit_speculative_model_colon
+  _mu_zsh_resolve_speculative_model_colon
   if [[ "${BUFFER[1,CURSOR]}" == *$'\n'* ]]; then
     zle up-line
     return
@@ -1069,7 +1074,7 @@ _mu_zsh_history_up() {
 }
 
 _mu_zsh_history_down() {
-  _mu_zsh_commit_speculative_model_colon
+  _mu_zsh_resolve_speculative_model_colon
   if [[ "${BUFFER[CURSOR+1,-1]}" == *$'\n'* ]]; then
     zle down-line
     return
@@ -1128,7 +1133,7 @@ _mu_zsh_submit_prompt() {
 
 _mu_zsh_tab() {
   if [[ "$MU_ZSH_MODE" == mu ]]; then
-    _mu_zsh_commit_speculative_model_colon
+    _mu_zsh_resolve_speculative_model_colon
     if _mu_zsh_slash_completion_context; then
       _mu_zsh_complete_slash
       return
@@ -1157,7 +1162,7 @@ _mu_zsh_tab() {
 _mu_zsh_slash() {
   local should_complete=0
 
-  _mu_zsh_commit_speculative_model_colon
+  _mu_zsh_resolve_speculative_model_colon
 
   if [[ "$MU_ZSH_MODE" == mu && "$BUFFER" != /* && "$CURSOR" -eq 0 ]]; then
     should_complete=1
@@ -1178,8 +1183,7 @@ _mu_zsh_accept() {
     return
   fi
 
-  _mu_zsh_commit_speculative_model_colon_if_changed
-  _mu_zsh_strip_speculative_model_colon 2>/dev/null || true
+  _mu_zsh_resolve_speculative_model_colon discard
   local input=$BUFFER
   _mu_zsh_reset_history_navigation
   if [[ -z "${input//[[:space:]]/}" ]]; then
@@ -1198,7 +1202,7 @@ _mu_zsh_accept() {
 _mu_zsh_finish_pending() {
   (( MU_ZSH_PENDING_SUBMIT )) || return 0
 
-  _mu_zsh_clear_speculative_model_colon
+  _mu_zsh_resolve_speculative_model_colon
   zle -I
   BUFFER=
   CURSOR=0
@@ -1222,7 +1226,7 @@ _mu_zsh_dispatch_pending() {
 }
 
 _mu_zsh_line_init() {
-  _mu_zsh_clear_speculative_model_colon
+  _mu_zsh_resolve_speculative_model_colon
   _mu_zsh_reset_history_navigation
   [[ "$MU_ZSH_MODE" == mu ]] && _mu_zsh_refresh_prompt
   if [[ "$MU_ZSH_MODE" == mu ]]; then
@@ -1230,35 +1234,30 @@ _mu_zsh_line_init() {
   fi
 }
 
+_mu_zsh_self_insert() {
+  _mu_zsh_resolve_speculative_model_colon
+  zle .self-insert
+}
+
 _mu_zsh_model_colon() {
-  if (( MU_ZSH_SPECULATIVE_MODEL_COLON )) &&
-    [[ "$BUFFER" == "$MU_ZSH_SPECULATIVE_MODEL_BUFFER" &&
-      $CURSOR -eq $MU_ZSH_SPECULATIVE_MODEL_CURSOR ]]; then
-    _mu_zsh_clear_speculative_model_colon
-    return 0
-  fi
-  _mu_zsh_commit_speculative_model_colon_if_changed
+  _mu_zsh_resolve_speculative_model_colon
+  (( REPLY )) && return 0
   zle .self-insert
 }
 
 _mu_zsh_speculative_backspace() {
-  if (( MU_ZSH_SPECULATIVE_MODEL_COLON )) &&
-    [[ "$BUFFER" == "$MU_ZSH_SPECULATIVE_MODEL_BUFFER" &&
-      $CURSOR -eq $MU_ZSH_SPECULATIVE_MODEL_CURSOR ]]; then
-    _mu_zsh_strip_speculative_model_colon
-    return 0
-  fi
-  _mu_zsh_commit_speculative_model_colon_if_changed
+  _mu_zsh_resolve_speculative_model_colon discard
+  (( REPLY )) && return 0
   zle .backward-delete-char
 }
 
 _mu_zsh_speculative_delete() {
-  _mu_zsh_commit_speculative_model_colon
+  _mu_zsh_resolve_speculative_model_colon
   zle .delete-char
 }
 
 _mu_zsh_speculative_cursor() {
-  _mu_zsh_commit_speculative_model_colon
+  _mu_zsh_resolve_speculative_model_colon
   zle "$1"
 }
 
@@ -1290,6 +1289,7 @@ mu-zsh-exit-mode() {
 }
 
 _mu_zsh_configure_keymap() {
+  bindkey -R -M mumode ' -~' _mu_zsh_self_insert
   bindkey -M mumode '^M' _mu_zsh_accept
   bindkey -M mumode '^J' _mu_zsh_accept
   bindkey -M mumode $'\e[13;2u' _mu_zsh_insert_newline
@@ -1323,6 +1323,7 @@ if [[ -o zle ]]; then
   _mu_zsh_configure_keymap
   _mu_zsh_save_widget_bindings
   zle -C _mu_zsh_complete_widget complete-word _mu_zsh_fallback_completion
+  zle -C _mu_zsh_menu_widget menu-complete _mu_zsh_fallback_completion
   zle -C _mu_zsh_list_widget list-choices _mu_zsh_fallback_completion
   zle -N _mu_zsh_tab
   zle -N _mu_zsh_slash
@@ -1332,6 +1333,7 @@ if [[ -o zle ]]; then
   zle -N _mu_zsh_history_down
   zle -N _mu_zsh_finish_pending
   zle -N _mu_zsh_line_init
+  zle -N _mu_zsh_self_insert
   zle -N _mu_zsh_model_colon
   zle -N _mu_zsh_speculative_backspace
   zle -N _mu_zsh_speculative_delete
