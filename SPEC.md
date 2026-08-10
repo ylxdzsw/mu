@@ -1290,9 +1290,10 @@ global and project `.mu` directories.
   environment-variable and executable names. A skill is active and listed only
   when every declared variable is present and every declared command resolves
   on `PATH`.
-- On startup `mu` scans `.mu` with bounded depth/file limits, parses only
-  qualifying front-matter, and injects a compact `<available_skills>` block —
-  name, description, absolute file path — into the system prompt.
+- On startup `mu` scans regular files directly in `.mu` plus direct
+  `folder/SKILL.md` files, parses qualifying front-matter, and injects a compact
+  `<available_skills>` block — name, description, absolute file path — into the
+  system prompt. Supporting files below skill folders are not indexed.
 - Before responding, the model actively scans the listed skills. When the user
   names a skill or one is even partially relevant, the model reads the full
   file via `bash`, using the **absolute path** from the injected block. Loading

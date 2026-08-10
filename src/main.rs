@@ -939,7 +939,7 @@ fn resolve_prompt_source(
     let project_config_dir = scope.project().map(|project| project.root.join(".mu"));
     let index =
         skills::scan_instruction_index(&paths::global_dir(), project_config_dir.as_deref())?;
-    if let Some(command) = skills::find_command(&index, &name) {
+    if let Some(command) = index.commands.iter().find(|command| command.name == name) {
         return Ok(PromptSource::Command {
             path: PathBuf::from(&command.path),
             scope: command.scope,

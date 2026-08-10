@@ -2,9 +2,7 @@ use std::path::Path;
 
 use chrono::Local;
 
-use crate::skills::{
-    InstructionScope, SkillMeta, format_skills_block, read_agents_md, scan_instruction_index,
-};
+use crate::skills::{InstructionScope, SkillMeta, format_skills_block, scan_instruction_index};
 
 const ROLE_PREAMBLE: &str = include_str!("system_preamble.md");
 
@@ -174,7 +172,7 @@ fn assemble_context(
 }
 
 fn agents_md_block(path: &Path, scope: &str) -> Option<String> {
-    let contents = read_agents_md(path)?;
+    let contents = std::fs::read_to_string(path).ok()?;
     let absolute_path = path.canonicalize().ok()?;
     let escaped_path = xml_escape_attribute(&absolute_path.display().to_string());
     let mut block = format!("<agents_md scope=\"{scope}\" path=\"{escaped_path}\">\n");

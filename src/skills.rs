@@ -1,20 +1,16 @@
 use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::os::unix::fs::PermissionsExt;
-use std::path::{Component, Path};
+use std::path::Path;
 
 use anyhow::{Context, Result};
 
 use crate::config::EnvMap;
 
-const MAX_DEPTH: usize = 4;
-const MAX_FILES_PER_ROOT: usize = 512;
-const MAX_SKILLS: usize = 64;
-const MAX_COMMANDS: usize = 256;
 const MAX_NAME_LEN: usize = 64;
 const MAX_DESCRIPTION_LEN: usize = 256;
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct SkillMeta {
     pub name: String,
     pub description: String,
@@ -23,31 +19,31 @@ pub struct SkillMeta {
     pub requirements: SkillRequirements,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
 pub struct SkillRequirements {
     pub env: Vec<String>,
     pub commands: Vec<String>,
 }
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct CommandMeta {
     pub name: String,
     pub path: String,
     pub scope: InstructionScope,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug)]
 pub struct CommandPrompt {
     pub text: String,
     pub model: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, PartialEq)]
 pub struct MuShebang {
     pub model: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum InstructionScope {
     Builtin,
@@ -55,50 +51,12 @@ pub enum InstructionScope {
     Project,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Default)]
 pub struct InstructionIndex {
     pub skills: Vec<SkillMeta>,
     pub commands: Vec<CommandMeta>,
 }
 
-#[derive(Debug, Clone, Copy)]
-struct ScanLimits {
-    max_depth: usize,
-    max_files: usize,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct SnapshotEntry {
-    path: String,
-    kind: SnapshotKind,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum SnapshotKind {
-    Dir,
-    File,
-}
-
-#[derive(Debug)]
-struct RootIndex {
-    skills: Vec<SkillMeta>,
-    commands: Vec<CommandMeta>,
-}
-
-#[derive(Debug)]
-struct ScanSnapshot {
-    entries: Vec<SnapshotEntry>,
-    truncated: bool,
-}
-
-#[derive(Debug)]
-struct ParsedInstruction {
-    is_command: bool,
-    skill: Option<ParsedSkill>,
-    skill_error: Option<anyhow::Error>,
-}
-
-#[derive(Debug)]
 struct ParsedSkill {
     name: String,
     description: String,
@@ -157,16 +115,10 @@ fn scan_instruction_index_with_builtins(
         }
     }
 
-    let mut skills = skills_by_name.into_values().collect::<Vec<_>>();
-    let mut commands = commands_by_name.into_values().collect::<Vec<_>>();
-    if skills.len() > MAX_SKILLS {
-        skills.truncate(MAX_SKILLS);
-    }
-    if commands.len() > MAX_COMMANDS {
-        commands.truncate(MAX_COMMANDS);
-    }
-
-    Ok(InstructionIndex { skills, commands })
+    Ok(InstructionIndex {
+        skills: skills_by_name.into_values().collect(),
+        commands: commands_by_name.into_values().collect(),
+    })
 }
 
 pub fn format_skills_block(skills: &[SkillMeta]) -> String {
@@ -190,10 +142,6 @@ pub fn format_skills_block(skills: &[SkillMeta]) -> String {
     }
     lines.push("</available_skills>".into());
     lines.join("\n")
-}
-
-pub fn read_agents_md(path: &Path) -> Option<String> {
-    std::fs::read_to_string(path).ok()
 }
 
 pub fn command_prompt(path: &Path) -> Result<CommandPrompt> {
@@ -244,214 +192,108 @@ fn mu_shebang_args(line: &str) -> Option<Vec<&str>> {
     Some(tokens[mu_index + 1..].to_vec())
 }
 
-pub fn find_command<'a>(index: &'a InstructionIndex, name: &str) -> Option<&'a CommandMeta> {
-    index.commands.iter().find(|command| command.name == name)
-}
-
-fn scan_root(root: &Path, scope: InstructionScope, env: &EnvMap) -> Result<RootIndex> {
+fn scan_root(root: &Path, scope: InstructionScope, env: &EnvMap) -> Result<InstructionIndex> {
     if !root.is_dir() {
-        return Ok(RootIndex {
-            skills: Vec::new(),
-            commands: Vec::new(),
-        });
+        return Ok(InstructionIndex::default());
     }
 
-    let limits = ScanLimits {
-        max_depth: MAX_DEPTH,
-        max_files: MAX_FILES_PER_ROOT,
-    };
-    let snapshot = collect_snapshot(root, limits)?;
-    Ok(build_root_index(root, scope, &snapshot, env))
-}
-
-fn collect_snapshot(root: &Path, limits: ScanLimits) -> Result<ScanSnapshot> {
     let mut entries = Vec::new();
-    let mut file_count = 0;
-    let mut truncated = false;
-    collect_snapshot_dir(
-        root,
-        Path::new(""),
-        0,
-        limits,
-        &mut entries,
-        &mut file_count,
-        &mut truncated,
-    )?;
-    entries.sort_by(|a, b| {
-        a.path
-            .cmp(&b.path)
-            .then_with(|| kind_name(&a.kind).cmp(kind_name(&b.kind)))
-    });
-    Ok(ScanSnapshot { entries, truncated })
-}
-
-fn collect_snapshot_dir(
-    root: &Path,
-    relative_dir: &Path,
-    depth: usize,
-    limits: ScanLimits,
-    entries: &mut Vec<SnapshotEntry>,
-    file_count: &mut usize,
-    truncated: &mut bool,
-) -> Result<()> {
-    if depth >= limits.max_depth {
-        return Ok(());
-    }
-
-    let dir = root.join(relative_dir);
-    let mut children = Vec::new();
-    for entry in std::fs::read_dir(&dir).with_context(|| format!("reading {}", dir.display()))? {
+    for entry in std::fs::read_dir(root).with_context(|| format!("reading {}", root.display()))? {
         let entry = entry?;
         let name = entry.file_name();
         let name = name.to_string_lossy();
-        if is_reserved_entry(relative_dir, &name) {
+        if name == "AGENTS.md" || !is_valid_instruction_name(&name) {
             continue;
         }
-        children.push((name.to_string(), entry.path()));
-    }
-    children.sort_by(|a, b| a.0.cmp(&b.0));
-
-    for (name, path) in children {
-        let relative = relative_dir.join(&name);
+        let path = entry.path();
         let Ok(metadata) = std::fs::symlink_metadata(&path) else {
             continue;
         };
-        if metadata.is_dir() {
-            if is_valid_instruction_relative_path(&relative) {
-                entries.push(SnapshotEntry {
-                    path: slash_path(&relative),
-                    kind: SnapshotKind::Dir,
-                });
-                collect_snapshot_dir(
-                    root,
-                    &relative,
-                    depth + 1,
-                    limits,
-                    entries,
-                    file_count,
-                    truncated,
-                )?;
+        if metadata.is_file() {
+            entries.push((name.into_owned(), path));
+        } else if metadata.is_dir() {
+            let path = path.join("SKILL.md");
+            if std::fs::symlink_metadata(&path).is_ok_and(|metadata| metadata.is_file()) {
+                entries.push((format!("{name}/SKILL.md"), path));
             }
-        } else if metadata.is_file() {
-            if *file_count >= limits.max_files {
-                *truncated = true;
-                continue;
-            }
-            *file_count += 1;
-            if !is_valid_instruction_relative_path(&relative) {
-                continue;
-            }
-            entries.push(SnapshotEntry {
-                path: slash_path(&relative),
-                kind: SnapshotKind::File,
-            });
         }
     }
-
-    Ok(())
-}
-
-fn build_root_index(
-    root: &Path,
-    scope: InstructionScope,
-    snapshot: &ScanSnapshot,
-    env: &EnvMap,
-) -> RootIndex {
+    entries.sort_by(|a, b| a.0.cmp(&b.0));
     let mut skills = Vec::new();
     let mut commands = Vec::new();
-    let mut warnings = Vec::new();
 
-    if snapshot.truncated {
-        warnings.push(format!(
-            "{} scan reached the {} file limit",
-            root.display(),
-            MAX_FILES_PER_ROOT
-        ));
-    }
-
-    for entry in snapshot
-        .entries
-        .iter()
-        .filter(|entry| matches!(entry.kind, SnapshotKind::File))
-    {
-        let relative = Path::new(&entry.path);
-        let path = root.join(relative);
+    for (relative, path) in entries {
         let content = match std::fs::read_to_string(&path) {
             Ok(content) => content,
             Err(error) => {
-                warnings.push(format!("failed to read {}: {error}", path.display()));
+                eprintln!("warning: failed to read {}: {error}", path.display());
                 continue;
             }
         };
-        let parsed = parse_instruction(&content);
-        if let Some(error) = parsed.skill_error {
-            warnings.push(format!("invalid skill {}: {error}", path.display()));
+        let (frontmatter, is_command) = strip_optional_mu_shebang(&content);
+        let skill = if frontmatter.starts_with("---") {
+            match parse_skill_frontmatter(frontmatter) {
+                Ok(skill) => Some(skill),
+                Err(error) => {
+                    eprintln!("warning: invalid skill {}: {error}", path.display());
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        if !is_command && skill.is_none() {
+            continue;
         }
-        if parsed.is_command && commands.len() < MAX_COMMANDS {
+        let absolute_path = path
+            .canonicalize()
+            .unwrap_or_else(|_| path.clone())
+            .display()
+            .to_string();
+        if is_command {
             commands.push(CommandMeta {
-                name: entry.path.clone(),
-                path: path
-                    .canonicalize()
-                    .unwrap_or_else(|_| path.clone())
-                    .display()
-                    .to_string(),
+                name: relative.clone(),
+                path: absolute_path.clone(),
                 scope,
             });
         }
-        if let Some(skill) = parsed.skill {
-            match expected_skill_name(relative) {
+        if let Some(skill) = skill {
+            let expected = if relative == "SKILL.md" {
+                None
+            } else if let Some(parent) = relative.strip_suffix("/SKILL.md") {
+                Some(parent.to_string())
+            } else {
+                Path::new(&relative)
+                    .file_stem()
+                    .map(|stem| stem.to_string_lossy().into_owned())
+            };
+            match expected {
                 Some(expected) if expected == skill.name => {
-                    if skills.len() < MAX_SKILLS && requirements_met(&skill.requirements, env) {
+                    if requirements_met(&skill.requirements, env) {
                         skills.push(SkillMeta {
                             name: skill.name,
                             description: skill.description,
-                            path: path
-                                .canonicalize()
-                                .unwrap_or_else(|_| path.clone())
-                                .display()
-                                .to_string(),
+                            path: absolute_path,
                             scope,
                             requirements: skill.requirements,
                         });
                     }
                 }
-                Some(expected) => warnings.push(format!(
-                    "skill {} has name {}, expected {}",
+                Some(expected) => eprintln!(
+                    "warning: skill {} has name {}, expected {}",
                     path.display(),
                     skill.name,
                     expected
-                )),
-                None => warnings.push(format!(
-                    "skill {} has no valid inferred name",
+                ),
+                None => eprintln!(
+                    "warning: skill {} has no valid inferred name",
                     path.display()
-                )),
+                ),
             }
         }
     }
 
-    for warning in &warnings {
-        eprintln!("warning: {warning}");
-    }
-
-    RootIndex { skills, commands }
-}
-
-fn parse_instruction(content: &str) -> ParsedInstruction {
-    let (after_shebang, is_command) = strip_optional_mu_shebang(content);
-    let (skill, skill_error) = match parse_skill_frontmatter(after_shebang) {
-        Ok(skill) => (Some(skill), None),
-        Err(error) if is_requirement_error(&error) => (None, Some(error)),
-        Err(_) => (None, None),
-    };
-    ParsedInstruction {
-        is_command,
-        skill,
-        skill_error,
-    }
-}
-
-fn is_requirement_error(error: &anyhow::Error) -> bool {
-    error.to_string().contains("requirement")
+    Ok(InstructionIndex { skills, commands })
 }
 
 fn strip_instruction_headers(content: &str) -> &str {
@@ -461,17 +303,13 @@ fn strip_instruction_headers(content: &str) -> &str {
 
 fn strip_optional_mu_shebang(content: &str) -> (&str, bool) {
     let first_line = content.lines().next().unwrap_or_default();
-    if !is_mu_shebang(first_line) {
+    if mu_shebang_args(first_line).is_none() {
         return (content, false);
     }
     match content.find('\n') {
         Some(idx) => (&content[idx + 1..], true),
         None => ("", true),
     }
-}
-
-fn is_mu_shebang(line: &str) -> bool {
-    mu_shebang_args(line).is_some()
 }
 
 fn parse_skill_frontmatter(content: &str) -> Result<ParsedSkill> {
@@ -488,7 +326,9 @@ fn parse_skill_frontmatter(content: &str) -> Result<ParsedSkill> {
             let value = value.trim().trim_matches('"');
             match key.trim() {
                 "name" => name = Some(value.to_string()),
-                "description" => description = Some(collapse_description(value)),
+                "description" => {
+                    description = Some(value.split_whitespace().collect::<Vec<_>>().join(" "))
+                }
                 "requires_env" => requirements.env = parse_requirement_list(value)?,
                 "requires_commands" => requirements.commands = parse_requirement_list(value)?,
                 _ => {}
@@ -522,9 +362,6 @@ fn parse_requirement_list(value: &str) -> Result<Vec<String>> {
             anyhow::bail!("empty requirement entry");
         }
         entries.push(entry.to_string());
-    }
-    if entries.is_empty() {
-        anyhow::bail!("empty requirement list");
     }
     Ok(entries)
 }
@@ -591,23 +428,6 @@ fn strip_closed_frontmatter(content: &str) -> Option<&str> {
     Some(after_marker.strip_prefix('\n').unwrap_or(after_marker))
 }
 
-fn collapse_description(value: &str) -> String {
-    value.split_whitespace().collect::<Vec<_>>().join(" ")
-}
-
-fn expected_skill_name(relative: &Path) -> Option<String> {
-    let file_name = relative.file_name()?.to_string_lossy();
-    if file_name == "SKILL.md" {
-        return relative
-            .parent()?
-            .file_name()
-            .map(|name| name.to_string_lossy().into_owned());
-    }
-    relative
-        .file_stem()
-        .map(|stem| stem.to_string_lossy().into_owned())
-}
-
 fn valid_skill_name(name: &str) -> bool {
     if name.is_empty() || name.len() > MAX_NAME_LEN {
         return false;
@@ -622,58 +442,13 @@ fn valid_skill_name(name: &str) -> bool {
     chars.all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '_' || ch == '-')
 }
 
-fn is_reserved_entry(relative_dir: &Path, name: &str) -> bool {
-    if name == "." || name == ".." {
-        return true;
-    }
-    if relative_dir.as_os_str().is_empty() {
-        return matches!(
-            name,
-            "cache"
-                | "locks"
-                | "sessions"
-                | "objects"
-                | "current-session"
-                | "config.jsonc"
-                | ".env"
-                | ".gitignore"
-                | "AGENTS.md"
-        ) || name == "sessions.db"
-            || name.starts_with("sessions.db-");
-    }
-    false
-}
-
-fn is_valid_instruction_relative_path(path: &Path) -> bool {
-    path.components().all(|component| match component {
-        Component::Normal(name) => {
-            let name = name.to_string_lossy();
-            !name.is_empty()
-                && !name.starts_with('.')
-                && !name.starts_with('-')
-                && name
-                    .chars()
-                    .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.'))
-        }
-        _ => false,
-    })
-}
-
-fn slash_path(path: &Path) -> String {
-    path.components()
-        .filter_map(|component| match component {
-            Component::Normal(name) => Some(name.to_string_lossy().into_owned()),
-            _ => None,
-        })
-        .collect::<Vec<_>>()
-        .join("/")
-}
-
-fn kind_name(kind: &SnapshotKind) -> &'static str {
-    match kind {
-        SnapshotKind::Dir => "dir",
-        SnapshotKind::File => "file",
-    }
+fn is_valid_instruction_name(name: &str) -> bool {
+    !name.is_empty()
+        && !name.starts_with('.')
+        && !name.starts_with('-')
+        && name
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.'))
 }
 
 #[cfg(test)]
@@ -685,10 +460,10 @@ mod tests {
 
     #[test]
     fn detects_and_parses_mu_shebangs() {
-        assert!(is_mu_shebang("#!/usr/bin/env mu"));
-        assert!(is_mu_shebang("#!/usr/bin/env -S mu --output detail"));
-        assert!(is_mu_shebang("#!/usr/bin/mu"));
-        assert!(!is_mu_shebang("#!/usr/bin/env bash"));
+        assert!(mu_shebang_args("#!/usr/bin/env mu").is_some());
+        assert!(mu_shebang_args("#!/usr/bin/env -S mu --output detail").is_some());
+        assert!(mu_shebang_args("#!/usr/bin/mu").is_some());
+        assert!(mu_shebang_args("#!/usr/bin/env bash").is_none());
         assert_eq!(
             parse_mu_shebang("#!/usr/bin/env mu").unwrap(),
             Some(MuShebang { model: None })
@@ -769,13 +544,18 @@ mod tests {
     }
 
     #[test]
-    fn scans_legacy_skill_md_when_name_matches_parent() {
-        let root = temp_root("legacy-skill");
+    fn scans_folder_skill_md_when_name_matches_parent() {
+        let root = temp_root("folder-skill");
         let dir = root.join("review");
         fs::create_dir_all(&dir).unwrap();
         fs::write(
             dir.join("SKILL.md"),
             "---\nname: review\ndescription: Review changes.\n---\nReview it.\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.join("helper"),
+            "#!/usr/bin/env mu\nThis supporting file is not a command.\n",
         )
         .unwrap();
 

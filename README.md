@@ -140,6 +140,10 @@ model:
 #!/usr/bin/env -S mu --model openai/gpt-5:high
 ```
 
+Instruction discovery reads direct `.mu` files and direct
+`.mu/<skill>/SKILL.md` files; supporting files below skill folders are not
+indexed.
+
 Preview the exact user-prompt text without starting a turn:
 
 ```sh

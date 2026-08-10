@@ -277,12 +277,11 @@ obedience; the agent decides whether its instructions apply. Relative paths in
 a skill resolve from the skill file's directory.
 
 Discovery scans built-in, global, then project roots; later active entries
-shadow the same skill name or command path. Paths are ASCII alphanumeric plus
-`_`, `-`, and `.`, with no component starting `.` or `-`; symlinks are not
-followed. Reserved root entries are `cache`, `locks`, `sessions`, `objects`,
-`current-session`, `sessions.db*`, `config.jsonc`, `.env`, `.gitignore`, and
-`AGENTS.md`. Each root scans at depth 4 and at most 512 files; the merged
-alphabetical index exposes at most 64 skills and 256 commands.
+shadow the same skill name or command path. Each root scans its direct regular
+files plus direct `folder/SKILL.md` files; supporting files below skill folders
+are not indexed. Names are ASCII alphanumeric plus `_`, `-`, and `.`, cannot
+start with `.` or `-`, and symlinks are not followed. `AGENTS.md` is excluded
+because Mu loads it separately.
 
 In skill examples, pass multiline or escaping-sensitive command input through
 the Bash tool's `stdin` argument. Keep it out of the command string and omit
