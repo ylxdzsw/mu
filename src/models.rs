@@ -108,7 +108,7 @@ pub struct AvailableModel {
 }
 
 pub fn validate_config(config: &Config) -> Result<()> {
-    first_model_ref(config)?;
+    first_model_choice(config)?;
     if let Some(review_model) = config.guardrail.review_model.as_deref() {
         resolve_model_choice(config, review_model)
             .with_context(|| "invalid `guardrail.review_model` in config.jsonc")?;
@@ -116,17 +116,14 @@ pub fn validate_config(config: &Config) -> Result<()> {
     Ok(())
 }
 
-pub fn first_model_ref(config: &Config) -> Result<ResolvedModelRef> {
+pub fn first_model_choice(config: &Config) -> Result<ResolvedModelChoice> {
     for (provider_id, provider) in config.providers.iter() {
         if let Some((model_id, _)) = provider.models.iter().next() {
-            return resolve_exact_model(config, provider_id, model_id, None);
+            return resolve_model(config, provider_id, model_id, None, false)
+                .map(ResolvedModelChoice::fixed);
         }
     }
     bail!("no models configured in config.jsonc")
-}
-
-pub fn first_model_choice(config: &Config) -> Result<ResolvedModelChoice> {
-    first_model_ref(config).map(ResolvedModelChoice::fixed)
 }
 
 #[cfg(test)]
@@ -147,7 +144,7 @@ pub fn resolve_model_choice(config: &Config, raw: &str) -> Result<ResolvedModelC
 
     if let Some((provider_id, model_id)) = explicit_provider(config, raw) {
         let (model_id, effort) = split_model_effort(model_id);
-        return resolve_exact_model(config, provider_id, model_id, effort)
+        return resolve_model(config, provider_id, model_id, effort, false)
             .map(ResolvedModelChoice::fixed);
     }
 
@@ -252,15 +249,6 @@ fn resolve_floating_model(
         active,
         floating: true,
     })
-}
-
-fn resolve_exact_model(
-    config: &Config,
-    provider_id: &str,
-    model_id: &str,
-    effort: Option<String>,
-) -> Result<ResolvedModelRef> {
-    resolve_model(config, provider_id, model_id, effort, false)
 }
 
 fn resolve_model(
@@ -470,7 +458,8 @@ mod tests {
 
     #[test]
     fn first_model_uses_configured_order() {
-        let resolved = first_model_ref(&test_config()).unwrap();
+        let choice = first_model_choice(&test_config()).unwrap();
+        let resolved = choice.active_model();
         assert_eq!(resolved.canonical, "alpha/common-model");
     }
 
@@ -503,7 +492,8 @@ mod tests {
             ),
         ]);
 
-        let resolved = first_model_ref(&config).unwrap();
+        let choice = first_model_choice(&config).unwrap();
+        let resolved = choice.active_model();
         assert_eq!(resolved.canonical, "alpha/first-real");
     }
 

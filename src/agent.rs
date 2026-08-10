@@ -14,8 +14,8 @@ use crate::guardrail::Guardrail;
 use crate::models::{ResolvedModelChoice, resolve_model_info};
 use crate::provider::{
     FinishReason, MAX_PROVIDER_RETRY_AFTER, Message, Provider, ProviderDisposition, ProviderError,
-    Request, StreamEvent, ToolCall, ToolCallDelta, Usage, advance_provider, approx_tokens,
-    effective_retry_delay, provider_retry_limit,
+    Request, StreamEvent, ToolCall, ToolCallDelta, Usage, advance_provider, effective_retry_delay,
+    provider_retry_limit,
 };
 use crate::renderer::Renderer;
 use crate::runtime::resume_session_fallback;
@@ -54,25 +54,6 @@ pub struct TurnResult {
     pub context_tokens: u64,
     pub context_window: Option<u64>,
     pub final_assistant: Option<String>,
-}
-
-#[derive(Default)]
-struct TurnAudit {
-    current_partial_output: String,
-}
-
-impl TurnAudit {
-    fn begin_provider_request(&mut self) {
-        self.current_partial_output.clear();
-    }
-
-    fn abandon_provider_request(&mut self) {
-        self.current_partial_output.clear();
-    }
-
-    fn commit_provider_response(&mut self) {
-        self.current_partial_output.clear();
-    }
 }
 
 struct ConcurrentBashExecution<'a> {
@@ -122,18 +103,16 @@ pub struct AgentLoop<'a> {
 
 impl<'a> AgentLoop<'a> {
     pub async fn run_turn(&mut self) -> Result<TurnResult> {
-        let mut audit = TurnAudit::default();
-        self.run_turn_inner(&mut audit, true).await
+        self.run_turn_inner(&mut String::new(), true).await
     }
 
     pub async fn resume_turn(&mut self) -> Result<TurnResult> {
-        let mut audit = TurnAudit::default();
-        self.run_turn_inner(&mut audit, false).await
+        self.run_turn_inner(&mut String::new(), false).await
     }
 
     async fn run_turn_inner(
         &mut self,
-        audit: &mut TurnAudit,
+        current_partial_output: &mut String,
         compact_at_turn_boundary: bool,
     ) -> Result<TurnResult> {
         bash::reset_cancellation_state();
@@ -187,7 +166,7 @@ impl<'a> AgentLoop<'a> {
                     && latest_compaction_since_change.is_none()
                     && let Some(context_window) = self.model_context_window
                     && compaction::exceeds_hard_compaction_threshold(
-                        approx_context_tokens(&context),
+                        context.iter().map(Message::approx_tokens).sum(),
                         context_window,
                         self.config.compaction.hard_fraction,
                         self.config.compaction.hard_headroom_tokens,
@@ -224,7 +203,7 @@ impl<'a> AgentLoop<'a> {
 
                 let mut command_headers = StreamingCommandHeaders::default();
                 loop {
-                    audit.begin_provider_request();
+                    current_partial_output.clear();
                     let request_context = crate::provider::filter_native_replay_for_config(
                         &context,
                         self.config,
@@ -275,7 +254,7 @@ impl<'a> AgentLoop<'a> {
                                 }
                                 let result = match event {
                                     StreamEvent::TextDelta(text) => {
-                                        audit.current_partial_output.push_str(&text);
+                                        current_partial_output.push_str(&text);
                                         self.renderer.assistant_text(&text)
                                     }
                                     StreamEvent::ReasoningStart(visibility) => {
@@ -306,13 +285,13 @@ impl<'a> AgentLoop<'a> {
                     if let Some(error) = renderer_error {
                         self.store
                             .interrupt_provider_exchange(self.session_id, &exchange_id)?;
-                        audit.abandon_provider_request();
+                        current_partial_output.clear();
                         return Err(error.into());
                     }
                     if let Err(error) = self.renderer.assistant_end() {
                         self.store
                             .interrupt_provider_exchange(self.session_id, &exchange_id)?;
-                        audit.abandon_provider_request();
+                        current_partial_output.clear();
                         return Err(error.into());
                     }
                     match &result {
@@ -324,7 +303,7 @@ impl<'a> AgentLoop<'a> {
                             if let Err(error) = self.renderer.reasoning_end(usage) {
                                 self.store
                                     .interrupt_provider_exchange(self.session_id, &exchange_id)?;
-                                audit.abandon_provider_request();
+                                current_partial_output.clear();
                                 return Err(error.into());
                             }
                         }
@@ -332,7 +311,7 @@ impl<'a> AgentLoop<'a> {
                             if let Err(error) = self.renderer.cancel_live_state() {
                                 self.store
                                     .interrupt_provider_exchange(self.session_id, &exchange_id)?;
-                                audit.abandon_provider_request();
+                                current_partial_output.clear();
                                 return Err(error.into());
                             }
                         }
@@ -345,10 +324,10 @@ impl<'a> AgentLoop<'a> {
                                 &exchange_id,
                                 error.class(),
                                 error.diagnostic(),
-                                partial_response(&audit.current_partial_output).as_ref(),
+                                partial_response(current_partial_output).as_ref(),
                                 None,
                             )?;
-                            audit.abandon_provider_request();
+                            current_partial_output.clear();
                             if !self.config.compaction.enabled {
                                 return Err(error.into());
                             }
@@ -408,10 +387,10 @@ impl<'a> AgentLoop<'a> {
                                 &exchange_id,
                                 error.class(),
                                 error.diagnostic(),
-                                partial_response(&audit.current_partial_output).as_ref(),
+                                partial_response(current_partial_output).as_ref(),
                                 None,
                             )?;
-                            audit.abandon_provider_request();
+                            current_partial_output.clear();
                             live_provider_retries += 1;
                             command_headers = StreamingCommandHeaders::default();
                             let retry_limit = provider_retry_limit(&self.model);
@@ -431,10 +410,10 @@ impl<'a> AgentLoop<'a> {
                                 &exchange_id,
                                 error.class(),
                                 error.diagnostic(),
-                                partial_response(&audit.current_partial_output).as_ref(),
+                                partial_response(current_partial_output).as_ref(),
                                 None,
                             )?;
-                            audit.abandon_provider_request();
+                            current_partial_output.clear();
                             if !self.model.is_floating()
                                 && error
                                     .retry_after()
@@ -507,7 +486,7 @@ impl<'a> AgentLoop<'a> {
                     stream_result.usage.as_ref(),
                 )?
             };
-            audit.commit_provider_response();
+            current_partial_output.clear();
             context.push(accepted_message.clone());
             latest_compaction_since_change = None;
 
@@ -991,41 +970,6 @@ fn parse_tool_args(call: &ToolCall) -> Result<Value> {
             call.id
         )
     })
-}
-
-/// Cheap char/4 estimate of the in-memory context size, mirroring the fallback
-/// estimator used elsewhere. Used for the hard request-level compaction check so
-/// growing tool output is caught before it forces a hard API overflow.
-fn approx_context_tokens(context: &[Message]) -> u64 {
-    context
-        .iter()
-        .map(|message| match message {
-            Message::System { content } => approx_tokens(content),
-            Message::User { content } => approx_tokens(&content.text()),
-            Message::Assistant {
-                content,
-                reasoning_content,
-                tool_calls,
-                native_replay,
-            } => {
-                approx_tokens(content.as_deref().unwrap_or(""))
-                    + approx_tokens(reasoning_content.as_deref().unwrap_or(""))
-                    + tool_calls
-                        .as_ref()
-                        .map(|calls| {
-                            approx_tokens(&serde_json::to_string(calls).unwrap_or_default())
-                        })
-                        .unwrap_or(0)
-                    + native_replay
-                        .as_ref()
-                        .map(|native| {
-                            approx_tokens(&serde_json::to_string(native).unwrap_or_default())
-                        })
-                        .unwrap_or(0)
-            }
-            Message::Tool { content, .. } => approx_tokens(content),
-        })
-        .sum()
 }
 
 fn handle_tool_call_delta(

@@ -39,6 +39,37 @@ pub enum Message {
     },
 }
 
+impl Message {
+    pub fn approx_tokens(&self) -> u64 {
+        match self {
+            Self::System { content } => approx_tokens(content),
+            Self::User { content } => approx_tokens(&content.text()),
+            Self::Assistant {
+                content,
+                reasoning_content,
+                tool_calls,
+                native_replay,
+            } => {
+                approx_tokens(content.as_deref().unwrap_or(""))
+                    + approx_tokens(reasoning_content.as_deref().unwrap_or(""))
+                    + tool_calls
+                        .as_ref()
+                        .map(|calls| {
+                            approx_tokens(&serde_json::to_string(calls).unwrap_or_default())
+                        })
+                        .unwrap_or(0)
+                    + native_replay
+                        .as_ref()
+                        .map(|native| {
+                            approx_tokens(&serde_json::to_string(native).unwrap_or_default())
+                        })
+                        .unwrap_or(0)
+            }
+            Self::Tool { content, .. } => approx_tokens(content),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct NativeReplay {
     #[serde(default)]

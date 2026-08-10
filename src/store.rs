@@ -17,7 +17,7 @@ use crate::bash::BashRisk;
 use crate::models::ResolvedModelRef;
 use crate::provider::{
     Attachment, ContentPart, ImageDetail, Message, ModelApi, NativeReplay, Request, ToolAttachment,
-    ToolCall, Usage, UserContent, approx_tokens,
+    ToolCall, Usage, UserContent,
 };
 
 pub const BASH_CALL_ID_ENV: &str = "MU_BASH_CALL_ID";
@@ -997,7 +997,7 @@ impl Store {
         Ok(self
             .load_context_messages(session_id)?
             .iter()
-            .map(message_tokens)
+            .map(Message::approx_tokens)
             .sum())
     }
 
@@ -2618,31 +2618,6 @@ fn location_context(
         lines.push("</system-reminder>".to_string());
     }
     Some(lines.join("\n"))
-}
-
-fn message_tokens(message: &Message) -> u64 {
-    match message {
-        Message::System { content } => approx_tokens(content),
-        Message::User { content } => approx_tokens(&content.text()),
-        Message::Assistant {
-            content,
-            reasoning_content,
-            tool_calls,
-            native_replay,
-        } => {
-            approx_tokens(content.as_deref().unwrap_or(""))
-                + approx_tokens(reasoning_content.as_deref().unwrap_or(""))
-                + tool_calls
-                    .as_ref()
-                    .map(|calls| approx_tokens(&serde_json::to_string(calls).unwrap_or_default()))
-                    .unwrap_or(0)
-                + native_replay
-                    .as_ref()
-                    .map(|native| approx_tokens(&serde_json::to_string(native).unwrap_or_default()))
-                    .unwrap_or(0)
-        }
-        Message::Tool { content, .. } => approx_tokens(content),
-    }
 }
 
 fn activity_at(journal: &Journal) -> &str {

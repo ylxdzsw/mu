@@ -400,23 +400,6 @@ fn ensure_subagent_turn_allowed(depth: u32) -> Result<()> {
     Ok(())
 }
 
-#[derive(Debug)]
-struct ProjectInfo {
-    path: String,
-    is_project: bool,
-    marker: Option<&'static str>,
-    project_root: Option<String>,
-    needs_confirmation: bool,
-}
-
-#[derive(Debug)]
-struct ProjectInitInfo {
-    path: String,
-    project_root: String,
-    created_files: Vec<&'static str>,
-    already_initialized: bool,
-}
-
 fn resolve_existing_dir(base: &Path, path: &Path) -> Result<PathBuf> {
     let path = if path.is_absolute() {
         path.to_path_buf()
@@ -429,63 +412,6 @@ fn resolve_existing_dir(base: &Path, path: &Path) -> Result<PathBuf> {
         bail!("not a directory: {}", path.display());
     }
     Ok(path)
-}
-
-fn resolve_target_dir(base: &Path, path: Option<&Path>) -> Result<PathBuf> {
-    resolve_existing_dir(base, path.unwrap_or(base))
-}
-
-fn inspect_project_path(base: &Path, path: &Path) -> Result<ProjectInfo> {
-    let path = resolve_existing_dir(base, path)?;
-    let marker = project_marker_at(&path);
-    let discovered = paths::discover_project(&path);
-    Ok(ProjectInfo {
-        path: path.display().to_string(),
-        is_project: marker.is_some(),
-        marker,
-        project_root: discovered
-            .as_ref()
-            .map(|project| project.root.display().to_string()),
-        needs_confirmation: marker.is_none(),
-    })
-}
-
-fn project_marker_at(path: &Path) -> Option<&'static str> {
-    if path.join(".mu").is_dir() {
-        Some("mu")
-    } else if path.join(".git").exists() {
-        Some("git")
-    } else {
-        None
-    }
-}
-
-fn print_project_info(info: &ProjectInfo) {
-    println!("path: {}", info.path);
-    println!("is_project: {}", info.is_project);
-    println!(
-        "marker: {}",
-        info.marker.unwrap_or(if info.needs_confirmation {
-            "(none)"
-        } else {
-            "unknown"
-        })
-    );
-    println!(
-        "project_root: {}",
-        info.project_root.as_deref().unwrap_or("(none)")
-    );
-}
-
-fn print_project_init_info(info: &ProjectInitInfo) {
-    println!("path: {}", info.path);
-    println!("project_root: {}", info.project_root);
-    println!("already_initialized: {}", info.already_initialized);
-    if info.created_files.is_empty() {
-        println!("created_files: (none)");
-    } else {
-        println!("created_files: {}", info.created_files.join(", "));
-    }
 }
 
 fn resolve_transcript_session(
@@ -514,19 +440,42 @@ async fn run() -> Result<()> {
         Some(Command::Project { sub }) => {
             match sub {
                 ProjectSub::Inspect { path } => {
-                    let info = inspect_project_path(&cwd, &path)?;
-                    print_project_info(&info);
+                    let path = resolve_existing_dir(&cwd, &path)?;
+                    let marker = if path.join(".mu").is_dir() {
+                        Some("mu")
+                    } else if path.join(".git").exists() {
+                        Some("git")
+                    } else {
+                        None
+                    };
+                    let project_root = paths::discover_project(&path);
+                    println!("path: {}", path.display());
+                    println!("is_project: {}", marker.is_some());
+                    println!("marker: {}", marker.unwrap_or("(none)"));
+                    println!(
+                        "project_root: {}",
+                        project_root
+                            .as_ref()
+                            .map_or("(none)".into(), |project| project
+                                .root
+                                .display()
+                                .to_string())
+                    );
                 }
                 ProjectSub::Init { path, force } => {
-                    let root = resolve_target_dir(&cwd, path.as_deref())?;
+                    let root = resolve_existing_dir(&cwd, path.as_deref().unwrap_or(&cwd))?;
                     let result = paths::init_project_layout_at(&root, force)?;
-                    let info = ProjectInitInfo {
-                        path: result.root.display().to_string(),
-                        project_root: result.root.display().to_string(),
-                        created_files: result.created_files,
-                        already_initialized: result.already_initialized,
-                    };
-                    print_project_init_info(&info);
+                    println!("path: {}", result.root.display());
+                    println!("project_root: {}", result.root.display());
+                    println!("already_initialized: {}", result.already_initialized);
+                    println!(
+                        "created_files: {}",
+                        if result.created_files.is_empty() {
+                            "(none)".into()
+                        } else {
+                            result.created_files.join(", ")
+                        }
+                    );
                 }
             }
             return Ok(());
@@ -592,7 +541,12 @@ async fn run() -> Result<()> {
         }
         Some(Command::Status(status_args)) => {
             let config = Config::load_for_scope(project_config_dir.as_deref())?;
-            let store = open_status_store(scope.session_store_path().as_path())?;
+            let store_path = scope.session_store_path();
+            let store = if store_path.exists() {
+                store::Store::open(&store_path)?
+            } else {
+                store::Store::open_memory()?
+            };
             let index = if status_args.include_commands || status_args.include_skills {
                 Some(skills::scan_instruction_index_with_env(
                     &paths::global_dir(),
@@ -803,13 +757,16 @@ async fn run_turn_from_source(
         &InvocationOverrides {
             session: turn.selection.session.clone(),
             continue_current: turn.selection.continue_current,
-            model: model_override(turn.selection.model.clone(), loaded_prompt.model),
+            model: turn.selection.model.clone().or(loaded_prompt.model),
         },
     )?;
     let session = if let Some(session) = resolved.attached_session.clone() {
         session
     } else {
-        create_seeded_session(&store, project_config_dir)?
+        store.create_session_seeded(&system_prompt::build_system_prompt(
+            &paths::global_dir(),
+            project_config_dir,
+        )?)?
     };
     let session_id = session.id.clone();
 
@@ -890,10 +847,6 @@ fn load_prompt_with_stdin(
             })
         }
     }
-}
-
-fn model_override(explicit: Option<String>, shebang: Option<String>) -> Option<String> {
-    explicit.or(shebang)
 }
 
 fn load_optional_stdin_instruction() -> Result<Option<String>> {
@@ -1101,16 +1054,6 @@ async fn run_turn(args: RunTurnArgs<'_>) -> Result<()> {
     result.map(|_| ())
 }
 
-fn create_seeded_session(
-    store: &store::Store,
-    project_config_dir: Option<&std::path::Path>,
-) -> Result<store::Session> {
-    store.create_session_seeded(&system_prompt::build_system_prompt(
-        &paths::global_dir(),
-        project_config_dir,
-    )?)
-}
-
 fn build_prompt_content(prompt: &str, attachments: Vec<ContentPart>) -> UserContent {
     if attachments.is_empty() {
         return UserContent::Text(prompt.to_string());
@@ -1137,14 +1080,6 @@ fn resolve_retry_session(
         ));
     }
     store.current_session()
-}
-
-fn open_status_store(path: &std::path::Path) -> Result<store::Store> {
-    if path.exists() {
-        store::Store::open(path)
-    } else {
-        store::Store::open_memory()
-    }
 }
 
 fn print_status_report(report: &StatusReport) {
@@ -1255,18 +1190,6 @@ mod tests {
         std::fs::remove_file(path).unwrap();
         assert!(error.to_string().contains("invalid prompt file"));
         assert!(format!("{error:#}").contains("unsupported mu shebang arguments"));
-    }
-
-    #[test]
-    fn explicit_model_overrides_shebang_model() {
-        assert_eq!(
-            model_override(Some("explicit/model".into()), Some("command/model".into())).as_deref(),
-            Some("explicit/model")
-        );
-        assert_eq!(
-            model_override(None, Some("command/model".into())).as_deref(),
-            Some("command/model")
-        );
     }
 
     #[test]
