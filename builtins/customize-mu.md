@@ -57,7 +57,6 @@ Complete shape, with default values where applicable:
 ```jsonc
 {
   "output": "concise",            // final | concise | detail | full
-  "line_wrapping": true,          // interactive output; no CLI override
   "auto_resume": false,           // continue replayable incomplete responses
   "providers": {
     "openai": {

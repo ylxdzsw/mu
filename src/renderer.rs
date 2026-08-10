@@ -72,31 +72,19 @@ pub struct Renderer {
 #[derive(Clone, Copy)]
 struct TerminalLayout {
     line_width: usize,
-    line_wrapping: bool,
 }
 
 impl TerminalLayout {
-    fn new(line_wrapping: bool, detected_width: Option<usize>) -> Self {
-        let line_width = if line_wrapping {
-            detected_width.unwrap_or(DEFAULT_TERMINAL_WIDTH)
-        } else {
-            DEFAULT_TERMINAL_WIDTH
-        }
-        .max(1);
+    fn new(detected_width: Option<usize>) -> Self {
         Self {
-            line_width,
-            line_wrapping,
+            line_width: detected_width.unwrap_or(DEFAULT_TERMINAL_WIDTH).max(1),
         }
     }
 
     fn markdown(self) -> MarkdownLayout {
-        if self.line_wrapping {
-            MarkdownLayout {
-                prose_width: Some(self.line_width),
-                table_width: Some(self.line_width),
-            }
-        } else {
-            MarkdownLayout::default()
+        MarkdownLayout {
+            prose_width: Some(self.line_width),
+            table_width: Some(self.line_width),
         }
     }
 }
@@ -157,22 +145,21 @@ impl Renderer {
     }
 
     pub fn with_format(format: OutputFormat) -> Self {
-        Self::with_terminal_bell(format, None, true)
+        Self::with_terminal_bell(format, None)
     }
 
     pub fn with_terminal_bell(
         format: OutputFormat,
         turn_done_bell_min_duration: Option<Duration>,
-        line_wrapping: bool,
     ) -> Self {
         let stdout = io::stdout();
         let styled = format != OutputFormat::Final && stdout.is_terminal();
-        let detected_width = if styled && line_wrapping {
+        let detected_width = if styled {
             stdout_terminal_width(&stdout)
         } else {
             None
         };
-        let terminal_layout = styled.then(|| TerminalLayout::new(line_wrapping, detected_width));
+        let terminal_layout = styled.then(|| TerminalLayout::new(detected_width));
         let stderr = io::stderr();
         let stderr_is_terminal = stderr.is_terminal();
         Self::with_outputs(
@@ -230,7 +217,7 @@ impl Renderer {
         let stdout = SharedOutput::default();
         let stderr = SharedOutput::default();
         let terminal_layout = (format != OutputFormat::Final && stdout_is_terminal)
-            .then(|| TerminalLayout::new(true, Some(DEFAULT_TERMINAL_WIDTH)));
+            .then(|| TerminalLayout::new(Some(DEFAULT_TERMINAL_WIDTH)));
         let renderer = Self::with_outputs(
             format,
             Box::new(stdout.clone()),
@@ -248,26 +235,9 @@ impl Renderer {
         output_is_terminal: bool,
         turn_done_bell_min_duration: Option<Duration>,
     ) -> (Self, SharedOutput) {
-        Self::with_test_shared_output_layout(
-            format,
-            output_is_terminal,
-            true,
-            Some(DEFAULT_TERMINAL_WIDTH),
-            turn_done_bell_min_duration,
-        )
-    }
-
-    #[cfg(test)]
-    fn with_test_shared_output_layout(
-        format: OutputFormat,
-        output_is_terminal: bool,
-        line_wrapping: bool,
-        detected_width: Option<usize>,
-        turn_done_bell_min_duration: Option<Duration>,
-    ) -> (Self, SharedOutput) {
         let output = SharedOutput::default();
         let terminal_layout = (format != OutputFormat::Final && output_is_terminal)
-            .then(|| TerminalLayout::new(line_wrapping, detected_width));
+            .then(|| TerminalLayout::new(Some(DEFAULT_TERMINAL_WIDTH)));
         let renderer = Self::with_outputs(
             format,
             Box::new(output.clone()),
@@ -4860,13 +4830,8 @@ mod tests {
 
     #[test]
     fn tool_header_flushes_wrapping_lookbehind_before_starting_its_block() {
-        let (mut renderer, output) = Renderer::with_test_shared_output_layout(
-            OutputFormat::Detail,
-            true,
-            true,
-            Some(80),
-            None,
-        );
+        let (mut renderer, output) =
+            Renderer::with_test_shared_output(OutputFormat::Detail, true, None);
 
         renderer
             .assistant_text("An explanation ending in tail")
@@ -4887,13 +4852,8 @@ mod tests {
 
     #[test]
     fn reasoning_start_flushes_wrapping_lookbehind_before_starting_its_block() {
-        let (mut renderer, output) = Renderer::with_test_shared_output_layout(
-            OutputFormat::Detail,
-            true,
-            true,
-            Some(80),
-            None,
-        );
+        let (mut renderer, output) =
+            Renderer::with_test_shared_output(OutputFormat::Detail, true, None);
 
         renderer
             .assistant_text("An explanation ending in tail")

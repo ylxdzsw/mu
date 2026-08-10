@@ -168,7 +168,6 @@ fn parse_double_quoted_env_value(source: &str) -> std::result::Result<String, &'
 pub struct Config {
     pub providers: OrderedMap<ProviderConfig>,
     pub output: OutputFormat,
-    pub line_wrapping: bool,
     pub auto_resume: bool,
     pub compaction: CompactionConfig,
     pub limits: LimitsConfig,
@@ -702,7 +701,6 @@ mod tests {
                 },
             )]),
             output: OutputFormat::Detail,
-            line_wrapping: true,
             auto_resume: false,
             compaction: CompactionConfig::default(),
             limits: LimitsConfig::default(),
@@ -751,7 +749,6 @@ mod tests {
             },
             "limits": {"max_lines": 123},
             "compaction": {"enabled": false},
-            "line_wrapping": false,
             "guardrail": {"max_denials_per_turn": 7}
         });
         let project = serde_json::json!({
@@ -766,7 +763,6 @@ mod tests {
         assert_eq!(config.limits.max_bytes, 456);
         assert_eq!(config.limits.max_line_bytes, 10_240);
         assert!(!config.compaction.enabled);
-        assert!(!config.line_wrapping);
         assert!(!config.guardrail.enabled);
         assert_eq!(config.guardrail.timeout_seconds, 120);
         assert_eq!(config.guardrail.max_denials_per_turn, 7);

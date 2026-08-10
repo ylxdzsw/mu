@@ -607,7 +607,6 @@ mod tests {
                 },
             )]),
             output: Default::default(),
-            line_wrapping: true,
             auto_resume: false,
             compaction: crate::config::CompactionConfig::default(),
             limits: crate::config::LimitsConfig::default(),

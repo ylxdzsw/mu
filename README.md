@@ -336,14 +336,11 @@ Setting `"output": "concise"` in global or project `config.jsonc` changes the
 default output density; an explicit `-o`/`--output` always wins. Output density
 controls brevity, not terminal behavior: `mu` automatically enables live lines,
 color, and rich Markdown when stdout is a terminal, and redirected output is
-sequential and ANSI-free. Interactive output also defaults to
-`"line_wrapping": true`: prose and tables fit the detected terminal width, while
-compact tool and status rows are ellipsized to it. Setting it to `false` leaves
-prose and table cells for the terminal to wrap, but still caps compact rows at
-80 visible cells. It never changes redirected, final, persisted, or
-model-visible text. In interactive concise output, Markdown links show only
-their labels while remaining clickable; detail and full output also show the
-full destination URL.
+sequential and ANSI-free. Interactive prose and tables fit the detected terminal
+width, while compact tool and status rows are ellipsized to it. This never
+changes redirected, final, persisted, or model-visible text. In interactive
+concise output, Markdown links show only their labels while remaining clickable;
+detail and full output also show the full destination URL.
 
 Setting `"auto_resume": true` automatically continues provider responses that
 Mu classifies as resumable while preserving the problematic assistant message.

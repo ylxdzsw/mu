@@ -1007,7 +1007,6 @@ mod tests {
                 },
             )]),
             output: Default::default(),
-            line_wrapping: true,
             auto_resume: false,
             compaction: CompactionConfig::default(),
             limits: LimitsConfig::default(),

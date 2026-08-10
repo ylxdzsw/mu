@@ -660,20 +660,14 @@ ANSI-free. `final` ignores interactivity. Interactive rendering keeps normal
 scrollback and never uses an alternate screen, clears the screen, or requires
 mouse interaction.
 
-The top-level `line_wrapping` setting controls only interactive presentation and
-defaults to `true`. When enabled, the renderer samples the stdout terminal width
-once at turn startup, reserves the final terminal column, and uses 80 visible
-cells if width detection fails. It wraps assistant prose and bounds rendered
-tables to that ruler. Compact renderer-owned rows such as tool titles, command
-previews, and mutable live lines are ellipsized to the same ruler. Mu does not
-handle `SIGWINCH`, reflow committed output, or rewrite scrollback after a
-terminal resize.
-
-When `line_wrapping` is `false`, assistant prose is left for the terminal to
-hard-wrap and table cells are not split into continuation rows. Renderer-owned
-single-row presentation is still ellipsized to a fixed 80 visible cells.
-Neither value changes redirected output, `final` output, persisted messages, or
-model-visible content.
+The renderer samples the stdout terminal width once at turn startup, reserves
+the final terminal column, and uses 80 visible cells if width detection fails.
+It wraps assistant prose and bounds rendered tables to that ruler. Compact
+renderer-owned rows such as tool titles, command previews, and mutable live
+lines are ellipsized to the same ruler. Mu does not handle `SIGWINCH`, reflow
+committed output, or rewrite scrollback after a terminal resize. This does not
+change redirected output, `final` output, persisted messages, or model-visible
+content.
 
 **Concurrency contract.** All output modes may run contiguous readonly
 `bash` calls concurrently. Interactive output keeps append-only scrollback and
@@ -689,8 +683,8 @@ selected density and detected interactivity.
 Assistant Markdown is parsed on TTYs. The renderer commits only output whose
 terminal representation is stable: ordinary prose streams as soon as it is not
 being held for an inline span, while headings, quotes, and list items stream once
-their line prefix is unambiguous. With `line_wrapping` enabled, the renderer
-retains at most seven visible cells: five so an approaching ruler can replace
+their line prefix is unambiguous. The renderer retains at most seven visible
+cells: five so an approaching ruler can replace
 the most recent retained whitespace with a newline, plus one provisional
 overflow cell and its following whitespace. Prose normally wraps at the ruler,
 one cell short of the detected terminal width. When that cut would leave exactly
@@ -1452,7 +1446,6 @@ are not visible in another.
   ```jsonc
   {
     "output": "concise",                        // optional default density
-    "line_wrapping": true,                      // interactive presentation only
     "auto_resume": false,                       // continue resumable responses
     "providers": {
       "openai": {
@@ -1489,11 +1482,11 @@ are not visible in another.
 
   At least one provider and one model are required; everything else has the
   defaults shown. `output` accepts `final`, `concise`, `detail`, or `full`; an
-  explicit CLI `--output` overrides it. `line_wrapping` is a boolean and has no
-  CLI override. `auto_resume` is a boolean, defaults to `false`, and has no CLI
-  override. When enabled, complete provider responses classified as resumable
-  are preserved and continued within the same turn using the automatic retry
-  quota. When disabled, the same responses are ordinary clean turn endings.
+  explicit CLI `--output` overrides it. `auto_resume` is a boolean, defaults to
+  `false`, and has no CLI override. When enabled, complete provider responses
+  classified as resumable are preserved and continued within the same turn
+  using the automatic retry quota. When disabled, the same responses are
+  ordinary clean turn endings.
   Provider and model order is meaningful:
   project config entries are listed before inherited global entries, and model
   suggestions and bare-model fallback candidates follow that order.

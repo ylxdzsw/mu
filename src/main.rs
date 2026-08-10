@@ -578,8 +578,7 @@ async fn run() -> Result<()> {
             let mut provider = build_provider(&config, &model.active_model().provider_id)?;
             let _lock = acquire_session_lock_or_exit(&store, &session, cli::OutputFormat::Detail)?;
             store.normalize_interrupted_tail(&session)?;
-            let mut renderer =
-                Renderer::with_terminal_bell(cli::OutputFormat::Detail, None, config.line_wrapping);
+            let mut renderer = Renderer::with_terminal_bell(cli::OutputFormat::Detail, None);
             let started = Instant::now();
             let outcome = compaction::run_compaction_routed(
                 &store,
@@ -884,8 +883,7 @@ async fn run_turn(args: RunTurnArgs<'_>) -> Result<()> {
         .terminal_bell
         .enabled
         .then_some(Duration::from_millis(config.terminal_bell.min_duration_ms));
-    let mut renderer =
-        Renderer::with_terminal_bell(output, turn_done_bell_min_duration, config.line_wrapping);
+    let mut renderer = Renderer::with_terminal_bell(output, turn_done_bell_min_duration);
     let turn_started = Instant::now();
     if let Some(notice) = preamble_notice {
         renderer.notice(notice)?;
