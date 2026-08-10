@@ -1174,9 +1174,6 @@ mod edit {
         /// Tolerate line-ending and line-edge whitespace differences
         #[arg(long)]
         relaxed: bool,
-        /// Replace every occurrence of each SEARCH block
-        #[arg(long)]
-        all: bool,
         /// Existing file to edit
         file: PathBuf,
     }
@@ -1275,7 +1272,7 @@ mod edit {
     fn run(args: Args, document: &str) -> Result<String> {
         let blocks = parse_document(document)?;
         let cwd = std::env::current_dir().context("determining current directory")?;
-        let planned = preflight(&cwd, args.file, blocks, args.all, args.relaxed)?;
+        let planned = preflight(&cwd, args.file, blocks, args.relaxed)?;
         super::apply_patch::atomic_write(
             &planned.target,
             &planned.content,
@@ -1411,7 +1408,6 @@ mod edit {
         cwd: &Path,
         reported_path: PathBuf,
         blocks: Vec<Block>,
-        replace_all: bool,
         relaxed: bool,
     ) -> Result<PlannedEdit> {
         let path = resolve_path(cwd, &reported_path);
@@ -1468,30 +1464,26 @@ mod edit {
                 }
                 exact
             };
-            if !replace_all && locations.len() != 1 {
+            if locations.len() != 1 {
                 let mode = if relaxed { " with --relaxed" } else { "" };
                 bail!(
-                    "block {block_number} matched {} locations in {}{mode}; add surrounding context or retry with --all",
+                    "block {block_number} matched {} locations in {}{mode}; add surrounding context and retry",
                     locations.len(),
                     reported_path.display()
                 );
             }
-            for location in locations {
-                let replacement = if relaxed {
-                    adapt_replacement_line_endings(&original, location, &block.replacement)
-                } else {
-                    block.replacement.clone()
-                };
-                matches.push(Match {
-                    start: location.start,
-                    end: location.end,
-                    block: block_index,
-                    replacement,
-                });
-                if !replace_all {
-                    break;
-                }
-            }
+            let location = locations[0];
+            let replacement = if relaxed {
+                adapt_replacement_line_endings(&original, location, &block.replacement)
+            } else {
+                block.replacement.clone()
+            };
+            matches.push(Match {
+                start: location.start,
+                end: location.end,
+                block: block_index,
+                replacement,
+            });
         }
 
         matches.sort_by_key(|found| (found.start, found.end, found.block));
@@ -1499,12 +1491,6 @@ mod edit {
             if pair[1].start < pair[0].end {
                 let first = pair[0].block + 1;
                 let second = pair[1].block + 1;
-                if first == second {
-                    bail!(
-                        "block {first} has overlapping matches in {}; add surrounding context or edit in separate steps",
-                        reported_path.display()
-                    );
-                }
                 bail!(
                     "blocks {first} and {second} overlap in {}; combine them into one block",
                     reported_path.display()
@@ -1810,11 +1796,13 @@ mod edit {
         }
 
         #[test]
-        fn parses_file_and_matching_flags() {
-            let args = Args::try_parse_from(["edit", "--relaxed", "--all", "src/main.rs"]).unwrap();
+        fn parses_file_and_relaxed_flag_and_rejects_all() {
+            let args = Args::try_parse_from(["edit", "--relaxed", "src/main.rs"]).unwrap();
             assert!(args.relaxed);
-            assert!(args.all);
             assert_eq!(args.file, PathBuf::from("src/main.rs"));
+
+            let error = Args::try_parse_from(["edit", "--all", "src/main.rs"]).unwrap_err();
+            assert_eq!(error.kind(), clap::error::ErrorKind::UnknownArgument);
         }
 
         #[test]
@@ -1885,7 +1873,7 @@ mod edit {
                     replacement: "G".into(),
                 },
             ];
-            let planned = preflight(&dir, PathBuf::from("file.txt"), blocks, false, false).unwrap();
+            let planned = preflight(&dir, PathBuf::from("file.txt"), blocks, false).unwrap();
             assert_eq!(planned.content, "A beta G\n");
             assert_eq!(planned.replacements, 2);
             super::super::apply_patch::atomic_write(
@@ -1904,22 +1892,11 @@ mod edit {
         }
 
         #[test]
-        fn all_replaces_every_non_overlapping_occurrence() {
-            let dir = temp_dir();
-            fs::write(dir.join("file.txt"), "x x x").unwrap();
-            let blocks = parse_document(&block("x", "y")).unwrap();
-            let planned = preflight(&dir, PathBuf::from("file.txt"), blocks, true, false).unwrap();
-            assert_eq!(planned.content, "y y y");
-            assert_eq!(planned.replacements, 3);
-            fs::remove_dir_all(dir).unwrap();
-        }
-
-        #[test]
         fn empty_replacement_deletes_the_match() {
             let dir = temp_dir();
             fs::write(dir.join("file.txt"), "keep remove keep").unwrap();
             let blocks = parse_document(&block(" remove", "")).unwrap();
-            let planned = preflight(&dir, PathBuf::from("file.txt"), blocks, false, false).unwrap();
+            let planned = preflight(&dir, PathBuf::from("file.txt"), blocks, false).unwrap();
             assert_eq!(planned.content, "keep keep");
             fs::remove_dir_all(dir).unwrap();
         }
@@ -1935,7 +1912,6 @@ mod edit {
                 PathBuf::from("file.txt"),
                 parse_document(&block("missing", "new")).unwrap(),
                 false,
-                false,
             )
             .unwrap_err();
             assert!(error.to_string().contains("did not match"));
@@ -1944,7 +1920,6 @@ mod edit {
                 &dir,
                 PathBuf::from("file.txt"),
                 parse_document(&block("same", "new")).unwrap(),
-                false,
                 false,
             )
             .unwrap_err();
@@ -1959,7 +1934,7 @@ mod edit {
             let path = dir.join("file.txt");
             fs::write(&path, "first\r\nold\r\nlast\r\n").unwrap();
             let blocks = parse_document(&block("first\nold\nlast", "first\nnew\nlast")).unwrap();
-            let error = preflight(&dir, PathBuf::from("file.txt"), blocks, false, false)
+            let error = preflight(&dir, PathBuf::from("file.txt"), blocks, false)
                 .unwrap_err()
                 .to_string();
             assert!(error.contains("matched once after normalizing line endings"));
@@ -1976,7 +1951,7 @@ mod edit {
             let dir = temp_dir();
             fs::write(dir.join("file.txt"), "first\r\nold\r\nlast\r\n").unwrap();
             let blocks = parse_document(&block("first\nold\nlast", "first\nnew\nlast")).unwrap();
-            let planned = preflight(&dir, PathBuf::from("file.txt"), blocks, false, true).unwrap();
+            let planned = preflight(&dir, PathBuf::from("file.txt"), blocks, true).unwrap();
             assert_eq!(planned.content, "first\r\nnew\r\nlast\r\n");
             fs::remove_dir_all(dir).unwrap();
         }
@@ -1986,19 +1961,19 @@ mod edit {
             let dir = temp_dir();
             fs::write(dir.join("file.txt"), "    old value  \nkeep\n").unwrap();
             let blocks = parse_document(&block("  old value\nkeep", "  new value\nkeep")).unwrap();
-            let planned = preflight(&dir, PathBuf::from("file.txt"), blocks, false, true).unwrap();
+            let planned = preflight(&dir, PathBuf::from("file.txt"), blocks, true).unwrap();
             assert_eq!(planned.content, "  new value\nkeep\n");
 
             fs::write(dir.join("file.txt"), "a  b\n").unwrap();
             let blocks = parse_document(&block("a b", "changed")).unwrap();
-            let error = preflight(&dir, PathBuf::from("file.txt"), blocks, false, true)
+            let error = preflight(&dir, PathBuf::from("file.txt"), blocks, true)
                 .unwrap_err()
                 .to_string();
             assert!(error.contains("even with --relaxed"));
 
             fs::write(dir.join("file.txt"), "\n").unwrap();
             let blocks = parse_document(&block(" ", "changed")).unwrap();
-            let error = preflight(&dir, PathBuf::from("file.txt"), blocks, false, true)
+            let error = preflight(&dir, PathBuf::from("file.txt"), blocks, true)
                 .unwrap_err()
                 .to_string();
             assert!(error.contains("even with --relaxed"));
@@ -2006,26 +1981,21 @@ mod edit {
         }
 
         #[test]
-        fn relaxed_ambiguity_is_reported_and_all_replaces_every_candidate() {
+        fn relaxed_ambiguity_is_reported() {
             let dir = temp_dir();
             fs::write(dir.join("file.txt"), "  old\n    old\n").unwrap();
             let blocks = parse_document(&block("\told", "\tnew")).unwrap();
-            let error = preflight(&dir, PathBuf::from("file.txt"), blocks, false, false)
+            let error = preflight(&dir, PathBuf::from("file.txt"), blocks, false)
                 .unwrap_err()
                 .to_string();
             assert!(error.contains("relaxed matching found 2 locations"));
 
             let blocks = parse_document(&block("\told", "\tnew")).unwrap();
-            let error = preflight(&dir, PathBuf::from("file.txt"), blocks, false, true)
+            let error = preflight(&dir, PathBuf::from("file.txt"), blocks, true)
                 .unwrap_err()
                 .to_string();
             assert!(error.contains("matched 2 locations"));
             assert!(error.contains("with --relaxed"));
-
-            let blocks = parse_document(&block("\told", "\tnew")).unwrap();
-            let planned = preflight(&dir, PathBuf::from("file.txt"), blocks, true, true).unwrap();
-            assert_eq!(planned.content, "\tnew\n\tnew\n");
-            assert_eq!(planned.replacements, 2);
             fs::remove_dir_all(dir).unwrap();
         }
 
@@ -2039,7 +2009,6 @@ mod edit {
                 path.clone(),
                 parse_document(&block("old", "new")).unwrap(),
                 false,
-                false,
             )
             .unwrap();
             assert_eq!(planned.target, path);
@@ -2051,7 +2020,6 @@ mod edit {
                 missing.clone(),
                 parse_document(&block("old", "new")).unwrap(),
                 false,
-                false,
             )
             .unwrap_err();
             assert!(error.to_string().contains("cannot edit missing file"));
@@ -2060,7 +2028,7 @@ mod edit {
         }
 
         #[test]
-        fn rejects_overlapping_blocks_and_overlapping_all_matches() {
+        fn rejects_overlapping_blocks() {
             let dir = temp_dir();
             fs::write(dir.join("file.txt"), "abc").unwrap();
             let blocks = vec![
@@ -2073,15 +2041,8 @@ mod edit {
                     replacement: "y".into(),
                 },
             ];
-            let error =
-                preflight(&dir, PathBuf::from("file.txt"), blocks, false, false).unwrap_err();
+            let error = preflight(&dir, PathBuf::from("file.txt"), blocks, false).unwrap_err();
             assert!(error.to_string().contains("blocks 1 and 2 overlap"));
-
-            fs::write(dir.join("file.txt"), "aaa").unwrap();
-            let blocks = parse_document(&block("aa", "x")).unwrap();
-            let error =
-                preflight(&dir, PathBuf::from("file.txt"), blocks, true, false).unwrap_err();
-            assert!(error.to_string().contains("overlapping matches"));
             fs::remove_dir_all(dir).unwrap();
         }
 
@@ -2096,7 +2057,7 @@ mod edit {
             fs::set_permissions(&target, fs::Permissions::from_mode(0o640)).unwrap();
             symlink("target.txt", dir.join("link.txt")).unwrap();
             let blocks = parse_document(&block("old", "new")).unwrap();
-            let planned = preflight(&dir, PathBuf::from("link.txt"), blocks, false, false).unwrap();
+            let planned = preflight(&dir, PathBuf::from("link.txt"), blocks, false).unwrap();
             super::super::apply_patch::atomic_write(
                 &planned.target,
                 &planned.content,

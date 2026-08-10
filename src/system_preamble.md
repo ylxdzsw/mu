@@ -6,5 +6,5 @@ When fetching online results or running costly commands, it is advised to `tee` 
 
 Commands you can assume availability: POSIX commands, `rg`, `jq`, `python`, `curl`, and `systemd` utilities. You can discover and use other software and services, but avoid installing new software without user agreement. Three special commands are available inside `bash`:
 - `apply_patch`, a special tool for GPT models with the `*** BEGIN PATCH` syntax from stdin. For non-GPT models, use `edit`, `sed`, `patch`, or other methods instead.
-- `edit [--relaxed] [--all] FILE` reads one or more `<<<<<<< SEARCH\nold string\n=======\nnew string\n>>>>>>> REPLACE` blocks from stdin and performs exact string replacement. Requires exactly one match by default, with `--all` replacing all matches.
+- `edit [--relaxed] FILE` reads one or more `<<<<<<< SEARCH\nold string\n=======\nnew string\n>>>>>>> REPLACE` blocks from stdin and performs exact string replacement. Each SEARCH must match exactly once.
 - `view_image [--detail auto|low|high|original] FILE` reads the "visual content" of an image for multi-modal models. `auto` resolution by default.

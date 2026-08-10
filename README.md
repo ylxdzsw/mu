@@ -181,7 +181,9 @@ messages, and exits. A few ideas follow from that:
 - **Shell-native interaction.** The zsh and Fish integrations add a persistent
   prompt mode without replacing the shell or duplicating the agent runtime.
 - **One universal tool.** The model sees `bash`; existing command-line tools
-  provide search, editing, testing, web access, and specialized workflows.
+  provide search, editing, testing, web access, and specialized workflows. Mu's
+  `edit [--relaxed] FILE` applet requires every SEARCH block to match exactly
+  once.
 - **Streaming, durable sessions.** Output appears as it is produced, while
   completed events are appended to per-session journals and survive separate
   invocations.

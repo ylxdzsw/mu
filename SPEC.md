@@ -487,7 +487,7 @@ normal CLI parsing or portable initialization, `mu` checks the basename of
   symlink edits its regular-file target while preserving the link; deleting a
   symlink removes only the link; moving a symlink renames the link. Dangling
   links can therefore be deleted or moved but cannot be updated.
-- **`edit [--relaxed] [--all] FILE`** reads one or more replacement blocks from
+- **`edit [--relaxed] FILE`** reads one or more replacement blocks from
   stdin. Each block has marker-only framing lines and this shape:
   ```text
   <<<<<<< SEARCH
@@ -510,11 +510,10 @@ normal CLI parsing or portable initialization, `mu` checks the basename of
   line endings to the dominant style around each matched range so an LF edit
   does not introduce mixed endings into a CRLF file.
 
-  Without `--all`, every SEARCH must occur exactly once at the selected tier.
-  With `--all`, every occurrence at that tier is replaced. All matches are
+  Every SEARCH must occur exactly once at the selected tier. All matches are
   calculated against the original UTF-8 file snapshot, and overlapping matches
-  are rejected. Relative paths resolve from the shell call's working directory;
-  absolute paths are used as written.
+  between blocks are rejected. Relative paths resolve from the shell call's
+  working directory; absolute paths are used as written.
   Updating through a symlink edits its regular-file target while preserving
   the link and its target's permissions. The entire document is preflighted
   before the target is opened; Mu then takes a non-blocking advisory lock on
