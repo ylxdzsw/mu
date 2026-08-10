@@ -361,7 +361,7 @@ impl Renderer {
         if self.format == OutputFormat::Final {
             return Ok(());
         }
-        self.assistant_block_open = false;
+        self.assistant_end()?;
         self.reasoning = Some(ReasoningState {
             started: Instant::now(),
             visibility,
@@ -4880,6 +4880,31 @@ mod tests {
         let normalized = strip_ansi(&output.transcript().replace('\r', ""));
         assert!(
             normalized.contains("An explanation ending in tail\n\n[preparing toolcall]# Inspect\n"),
+            "{normalized:?}"
+        );
+        assert_eq!(normalized.matches("tail").count(), 1, "{normalized:?}");
+    }
+
+    #[test]
+    fn reasoning_start_flushes_wrapping_lookbehind_before_starting_its_block() {
+        let (mut renderer, output) = Renderer::with_test_shared_output_layout(
+            OutputFormat::Detail,
+            true,
+            true,
+            Some(80),
+            None,
+        );
+
+        renderer
+            .assistant_text("An explanation ending in tail")
+            .unwrap();
+        renderer
+            .reasoning_start(ReasoningVisibility::Opaque)
+            .unwrap();
+
+        let normalized = strip_ansi(&output.transcript().replace('\r', ""));
+        assert!(
+            normalized.starts_with("An explanation ending in tail\n\n[thought "),
             "{normalized:?}"
         );
         assert_eq!(normalized.matches("tail").count(), 1, "{normalized:?}");
