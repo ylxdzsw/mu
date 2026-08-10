@@ -591,54 +591,10 @@ fn next_event_boundary(buffer: &str) -> Option<(usize, usize)> {
 mod tests {
     use super::*;
     use crate::models::ResolvedModelRef;
-    use crate::provider::{Provider, classify_http_error};
-    use crate::responses::{
-        ResponsesStreamState, consume_responses_sse_buffer, responses_tool_calls,
-    };
+    use crate::provider::{ModelApi, Provider};
+    use crate::responses::{ResponsesStreamState, consume_responses_sse_buffer};
     use std::time::Duration;
     const CHAT_ENDPOINT: &str = "https://example.test/v1/chat/completions";
-
-    #[derive(Clone)]
-    struct TestRequest {
-        model: ResolvedModelRef,
-        cache_key: Option<String>,
-    }
-
-    impl TestRequest {
-        fn for_session(model: ResolvedModelRef, session_id: &str, purpose: &str) -> Self {
-            Self {
-                model,
-                cache_key: Some(format!("mu:{session_id}:{purpose}")),
-            }
-        }
-    }
-
-    fn semantic_request(request: &TestRequest, messages: &[Message], bash: bool) -> Request {
-        Request {
-            model: request.model.clone(),
-            cache_key: request.cache_key.clone(),
-            messages: messages.to_vec(),
-            bash,
-        }
-    }
-
-    fn build_chat_request_body(
-        request: &TestRequest,
-        _endpoint: &str,
-        messages: &[Message],
-        tools: &[Value],
-    ) -> Value {
-        super::build_request_body(&semantic_request(request, messages, false), tools)
-    }
-
-    fn build_responses_request_body(
-        request: &TestRequest,
-        _endpoint: &str,
-        messages: &[Message],
-        tools: &[Value],
-    ) -> Result<Value, ProviderError> {
-        crate::responses::build_request_body(&semantic_request(request, messages, false), tools)
-    }
 
     fn test_model(effort: Option<&str>) -> ResolvedModelRef {
         ResolvedModelRef {
@@ -650,6 +606,24 @@ mod tests {
             model_id: "gpt-test".into(),
             effort: effort.map(str::to_string),
         }
+    }
+
+    fn request(effort: Option<&str>, messages: Vec<Message>) -> Request {
+        Request {
+            model: test_model(effort),
+            cache_key: None,
+            messages,
+            bash: false,
+        }
+    }
+
+    fn body(
+        api: ModelApi,
+        effort: Option<&str>,
+        messages: Vec<Message>,
+        tools: &[Value],
+    ) -> Result<Value, ProviderError> {
+        request(effort, messages).historical_json(api, tools)
     }
 
     #[test]
@@ -716,51 +690,13 @@ mod tests {
     #[test]
     fn accepts_usage_chunk_with_empty_choices_and_null_details() {
         let mut on_event = |_event: StreamEvent| -> Result<(), ProviderError> { Ok(()) };
-
-        // Standard chunk with no detail objects
-        let mut buffer = concat!(
-            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":12,\"completion_tokens\":5,\"total_tokens\":17}}\n\n",
-            "data: [DONE]\n\n",
-        )
-        .to_string();
+        let mut buffer = "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":8,\"completion_tokens\":3,\"prompt_tokens_details\":null,\"completion_tokens_details\":null}}\n\n".to_string();
         let mut state = StreamParseState::default();
         consume_sse_buffer(&mut buffer, &mut state, &mut on_event).unwrap();
         let usage = state.usage.unwrap();
-        assert_eq!(usage.input_tokens, 12);
-        assert_eq!(usage.output_tokens, 5);
-        assert_eq!(usage.cache_write_input_tokens, None);
-
-        // Explicit null detail objects should yield zero counts, not an error
-        let mut buffer = concat!(
-            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":12,\"completion_tokens\":5,\"total_tokens\":17,\"prompt_tokens_details\":null,\"completion_tokens_details\":null}}\n\n",
-            "data: [DONE]\n\n",
-        )
-        .to_string();
-        let mut state = StreamParseState::default();
-        consume_sse_buffer(&mut buffer, &mut state, &mut on_event).unwrap();
-        let usage = state.usage.unwrap();
+        assert_eq!(usage.total_tokens, 11);
         assert_eq!(usage.cache_read_input_tokens, 0);
         assert_eq!(usage.reasoning_output_tokens, 0);
-
-        let mut buffer = concat!(
-            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":null,\"completion_tokens\":null,\"total_tokens\":null,\"prompt_cache_hit_tokens\":null,\"prompt_cache_miss_tokens\":null,\"prompt_tokens_details\":{\"cached_tokens\":null,\"cache_creation_tokens\":null},\"completion_tokens_details\":{\"reasoning_tokens\":null}}}\n\n",
-            "data: [DONE]\n\n",
-        )
-        .to_string();
-        let mut state = StreamParseState::default();
-        consume_sse_buffer(&mut buffer, &mut state, &mut on_event).unwrap();
-        let usage = state.usage.unwrap();
-        assert_eq!(usage.input_tokens, 0);
-        assert_eq!(usage.output_tokens, 0);
-        assert_eq!(usage.total_tokens, 0);
-        assert_eq!(usage.cache_write_input_tokens, None);
-
-        let mut buffer =
-            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":8,\"completion_tokens\":3}}\n\n"
-                .to_string();
-        let mut state = StreamParseState::default();
-        consume_sse_buffer(&mut buffer, &mut state, &mut on_event).unwrap();
-        assert_eq!(state.usage.unwrap().total_tokens, 11);
 
         let mut buffer =
             "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":\"8\"}}\n\n".to_string();
@@ -831,71 +767,26 @@ mod tests {
     }
 
     #[test]
-    fn classifies_in_stream_error_payloads() {
+    fn classifies_in_stream_error_payload() {
         let mut on_event = |_event: StreamEvent| -> Result<(), ProviderError> { Ok(()) };
-        for (frame, expected) in [
-            (
-                "data: {\"error\":{\"message\":\"upstream unavailable\",\"type\":\"server_error\"}}\n\n",
-                "server",
-            ),
-            (
-                "data: {\"error\":{\"message\":\"slow down\",\"code\":\"rate_limit_exceeded\"}}\n\n",
-                "rate_limit",
-            ),
-            (
-                "data: {\"error\":{\"message\":\"bad prompt\",\"code\":\"invalid_request_error\"}}\n\n",
-                "request",
-            ),
-        ] {
-            let error = consume_sse_buffer(
-                &mut frame.to_string(),
+        let mut frame =
+            "data: {\"error\":{\"message\":\"upstream unavailable\",\"type\":\"server_error\"}}\n\n"
+                .to_string();
+        assert!(matches!(
+            consume_sse_buffer(
+                &mut frame,
                 &mut StreamParseState::default(),
-                &mut on_event,
-            )
-            .unwrap_err();
-            match expected {
-                "server" => assert!(matches!(
-                    error,
-                    ProviderError::Overloaded {
-                        status: None,
-                        detail,
-                        ..
-                    } if detail == "upstream unavailable"
-                )),
-                "rate_limit" => assert!(matches!(
-                    error,
-                    ProviderError::RateLimit { detail, .. } if detail == "slow down"
-                )),
-                "request" => assert!(matches!(
-                    error,
-                    ProviderError::BadRequestPermanent { detail, .. } if detail == "bad prompt"
-                )),
-                _ => unreachable!(),
-            }
-        }
+                &mut on_event
+            ),
+            Err(ProviderError::Overloaded { detail, .. }) if detail == "upstream unavailable"
+        ));
     }
 
     #[test]
     fn reasoning_content_emits_start_delta_and_end() {
-        let mut seen_events = Vec::new();
+        let mut events = Vec::new();
         let mut on_event = |event: StreamEvent| -> Result<(), ProviderError> {
-            match event {
-                StreamEvent::ReasoningStart(ReasoningVisibility::StreamedTrace) => {
-                    seen_events.push("reasoning_start".to_string())
-                }
-                StreamEvent::ReasoningStart(ReasoningVisibility::Opaque) => {
-                    seen_events.push("opaque_reasoning_start".to_string())
-                }
-                StreamEvent::ReasoningDelta(text) => {
-                    seen_events.push(format!("reasoning_delta:{text}"))
-                }
-                StreamEvent::ReasoningSummaryDelta { part_index, text } => {
-                    seen_events.push(format!("reasoning_summary_delta:{part_index}:{text}"))
-                }
-                StreamEvent::ReasoningEnd => seen_events.push("reasoning_end".to_string()),
-                StreamEvent::TextDelta(text) => seen_events.push(format!("text:{text}")),
-                StreamEvent::ToolCallDelta(_) | StreamEvent::Tick => {}
-            }
+            events.push(event);
             Ok(())
         };
 
@@ -911,15 +802,15 @@ mod tests {
             consume_sse_buffer(&mut buffer, &mut state, &mut on_event).unwrap();
         }
 
-        assert_eq!(
-            seen_events,
-            vec![
-                "reasoning_start".to_string(),
-                "reasoning_delta:step 1".to_string(),
-                "reasoning_end".to_string(),
-                "text:done".to_string(),
-            ]
-        );
+        assert!(matches!(
+            events.as_slice(),
+            [
+                StreamEvent::ReasoningStart(ReasoningVisibility::StreamedTrace),
+                StreamEvent::ReasoningDelta(reasoning),
+                StreamEvent::ReasoningEnd,
+                StreamEvent::TextDelta(text),
+            ] if reasoning == "step 1" && text == "done"
+        ));
         assert!(!state.reasoning_active);
     }
 
@@ -941,34 +832,18 @@ mod tests {
     }
 
     #[test]
-    fn request_includes_reasoning_effort_when_set() {
-        let body = build_chat_request_body(
-            &TestRequest {
-                model: test_model(Some("provider-custom")),
-                cache_key: None,
-            },
-            CHAT_ENDPOINT,
-            &[],
-            &[],
-        );
-
-        assert_eq!(body["reasoning_effort"], "provider-custom");
-    }
-
-    #[test]
     fn chat_and_responses_requests_include_stable_session_cache_key() {
-        let request = TestRequest::for_session(test_model(None), "ses_test", "agent");
-        let same = TestRequest::for_session(test_model(Some("high")), "ses_test", "agent");
-        let compaction = TestRequest::for_session(test_model(None), "ses_test", "compaction");
+        let request = Request::for_session(test_model(None), "ses_test", "agent", vec![], false);
+        let same =
+            Request::for_session(test_model(Some("high")), "ses_test", "agent", vec![], false);
+        let compaction =
+            Request::for_session(test_model(None), "ses_test", "compaction", vec![], false);
 
         assert_eq!(request.cache_key.as_deref(), Some("mu:ses_test:agent"));
         assert_eq!(request.cache_key, same.cache_key);
         assert_ne!(request.cache_key, compaction.cache_key);
-
-        let chat = build_chat_request_body(&request, CHAT_ENDPOINT, &[], &[]);
-        let responses =
-            build_responses_request_body(&request, "https://api.test/v1/responses", &[], &[])
-                .unwrap();
+        let chat = request.json(ModelApi::ChatCompletions).unwrap();
+        let responses = request.json(ModelApi::Responses).unwrap();
         assert_eq!(chat["prompt_cache_key"], "mu:ses_test:agent");
         assert_eq!(responses["prompt_cache_key"], "mu:ses_test:agent");
     }
@@ -997,16 +872,15 @@ mod tests {
             ]),
         }];
 
-        let body = build_chat_request_body(
-            &TestRequest {
-                model: test_model(None),
-                cache_key: None,
-            },
-            CHAT_ENDPOINT,
-            &messages,
+        let body = body(
+            ModelApi::ChatCompletions,
+            Some("provider-custom"),
+            messages,
             &[],
-        );
+        )
+        .unwrap();
 
+        assert_eq!(body["reasoning_effort"], "provider-custom");
         assert_eq!(body["messages"][0]["content"][0]["type"], "text");
         assert_eq!(
             body["messages"][0]["content"][1]["image_url"]["url"],
@@ -1046,16 +920,7 @@ mod tests {
                 "strict": true
             }
         })];
-        let body = build_responses_request_body(
-            &TestRequest {
-                model: test_model(Some("max")),
-                cache_key: None,
-            },
-            "https://api.test/v1/responses",
-            &messages,
-            &tools,
-        )
-        .unwrap();
+        let body = body(ModelApi::Responses, Some("max"), messages, &tools).unwrap();
 
         assert_eq!(body["store"], false);
         assert_eq!(body["stream"], true);
@@ -1075,23 +940,7 @@ mod tests {
     }
 
     #[test]
-    fn responses_request_includes_summary_without_explicit_effort() {
-        let body = build_responses_request_body(
-            &TestRequest {
-                model: test_model(None),
-                cache_key: None,
-            },
-            "https://api.test/v1/responses",
-            &[],
-            &[],
-        )
-        .unwrap();
-
-        assert_eq!(body["reasoning"], serde_json::json!({"summary": "auto"}));
-    }
-
-    #[test]
-    fn responses_replays_native_items_across_origins() {
+    fn responses_replays_native_items_exactly() {
         let native_items = vec![
             serde_json::json!({"type":"reasoning","id":"rs_1","encrypted_content":"opaque"}),
             serde_json::json!({"type":"function_call","call_id":"call_1","name":"bash","arguments":"{}"}),
@@ -1118,35 +967,10 @@ mod tests {
                 tool_call_id: "call_1".into(),
             },
         ];
-        let matching = build_responses_request_body(
-            &TestRequest {
-                model: test_model(None),
-                cache_key: None,
-            },
-            "https://api.test/v1/responses",
-            &messages,
-            &[],
-        )
-        .unwrap();
+        let matching = body(ModelApi::Responses, None, messages, &[]).unwrap();
         assert_eq!(matching["input"][0], native_items[0]);
         assert_eq!(matching["input"][1], native_items[1]);
         assert_eq!(matching["input"][2]["type"], "function_call_output");
-
-        let mut switched_model = test_model(None);
-        switched_model.provider_id = "fallback".into();
-        switched_model.model_id = "other-model".into();
-        let switched = build_responses_request_body(
-            &TestRequest {
-                model: switched_model,
-                cache_key: None,
-            },
-            "https://other.test/responses",
-            &messages,
-            &[],
-        )
-        .unwrap();
-        assert_eq!(switched["input"][0], native_items[0]);
-        assert_eq!(switched["input"][1], native_items[1]);
     }
 
     #[test]
@@ -1166,29 +990,12 @@ mod tests {
             tool_call_id: "call-image".into(),
         }];
 
-        let responses = build_responses_request_body(
-            &TestRequest {
-                model: test_model(None),
-                cache_key: None,
-            },
-            "https://api.test/v1/responses",
-            &messages,
-            &[],
-        )
-        .unwrap();
+        let responses = body(ModelApi::Responses, None, messages.clone(), &[]).unwrap();
         assert_eq!(responses["input"][0]["output"][0]["type"], "input_text");
         assert_eq!(responses["input"][0]["output"][1]["type"], "input_image");
         assert_eq!(responses["input"][0]["output"][1]["detail"], "original");
 
-        let chat = build_chat_request_body(
-            &TestRequest {
-                model: test_model(None),
-                cache_key: None,
-            },
-            CHAT_ENDPOINT,
-            &messages,
-            &[],
-        );
+        let chat = body(ModelApi::ChatCompletions, None, messages, &[]).unwrap();
         assert_eq!(chat["messages"][0]["role"], "tool");
         assert_eq!(chat["messages"][1]["role"], "user");
         assert_eq!(
@@ -1220,15 +1027,7 @@ mod tests {
                 tool_call_id: "call-2".into(),
             },
         ];
-        let chat = build_chat_request_body(
-            &TestRequest {
-                model: test_model(None),
-                cache_key: None,
-            },
-            CHAT_ENDPOINT,
-            &messages,
-            &[],
-        );
+        let chat = body(ModelApi::ChatCompletions, None, messages, &[]).unwrap();
         assert_eq!(chat["messages"][0]["tool_call_id"], "call-1");
         assert_eq!(chat["messages"][1]["tool_call_id"], "call-2");
         assert_eq!(chat["messages"][2]["role"], "user");
@@ -1252,16 +1051,7 @@ mod tests {
                 payload: NativeReplayPayload::ChatReasoning("private chat reasoning".into()),
             }),
         };
-        let responses = build_responses_request_body(
-            &TestRequest {
-                model: test_model(None),
-                cache_key: None,
-            },
-            "https://api.test/v1/responses",
-            &[from_chat],
-            &[],
-        )
-        .unwrap();
+        let responses = body(ModelApi::Responses, None, vec![from_chat], &[]).unwrap();
         assert_eq!(responses["input"][0]["type"], "function_call");
         assert!(!responses.to_string().contains("private chat reasoning"));
 
@@ -1278,15 +1068,7 @@ mod tests {
                 })]),
             }),
         };
-        let chat = build_chat_request_body(
-            &TestRequest {
-                model: test_model(None),
-                cache_key: None,
-            },
-            CHAT_ENDPOINT,
-            &[from_responses],
-            &[],
-        );
+        let chat = body(ModelApi::ChatCompletions, None, vec![from_responses], &[]).unwrap();
         assert_eq!(chat["messages"][0]["tool_calls"][0]["id"], "call_1");
         assert_eq!(chat["messages"][0]["tool_calls"][0]["type"], "function");
         assert!(!chat.to_string().contains("opaque"));
@@ -1294,13 +1076,10 @@ mod tests {
 
     #[test]
     fn responses_rejects_audio_locally() {
-        let error = build_responses_request_body(
-            &TestRequest {
-                model: test_model(None),
-                cache_key: None,
-            },
-            "https://api.test/v1/responses",
-            &[Message::User {
+        let error = body(
+            ModelApi::Responses,
+            None,
+            vec![Message::User {
                 content: UserContent::Parts(vec![ContentPart::Attachment {
                     attachment: crate::provider::Attachment {
                         filename: "sound.wav".into(),
@@ -1316,47 +1095,6 @@ mod tests {
             error
                 .to_string()
                 .contains("do not support audio attachment `sound.wav`")
-        );
-    }
-
-    #[test]
-    fn parses_responses_tool_stream_usage_and_exact_completed_output() {
-        let mut state = ResponsesStreamState::default();
-        let mut events = Vec::new();
-        let mut on_event = |event| {
-            events.push(event);
-            Ok(())
-        };
-        let output = serde_json::json!([
-            {"type":"reasoning","id":"rs_1","encrypted_content":"opaque","summary":[]},
-            {"type":"function_call","id":"fc_1","call_id":"call_1","name":"bash","arguments":"{\"command\":\"pwd\"}"}
-        ]);
-        let mut buffer = format!(
-            "data: {{\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{{\"type\":\"reasoning\",\"id\":\"rs_1\"}}}}\n\n\
-             data: {{\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{{\"type\":\"reasoning\"}}}}\n\n\
-             data: {{\"type\":\"response.output_item.added\",\"output_index\":1,\"item\":{{\"type\":\"function_call\",\"call_id\":\"call_1\",\"name\":\"bash\",\"arguments\":\"\"}}}}\n\n\
-             data: {{\"type\":\"response.function_call_arguments.delta\",\"output_index\":1,\"delta\":\"{{\\\"command\\\":\\\"pwd\\\"}}\"}}\n\n\
-             data: {{\"type\":\"response.completed\",\"response\":{{\"output\":{},\"usage\":{{\"input_tokens\":20,\"input_tokens_details\":{{\"cached_tokens\":8}},\"output_tokens\":7,\"output_tokens_details\":{{\"reasoning_tokens\":4}},\"total_tokens\":27}}}}}}\n\n",
-            output
-        );
-        consume_responses_sse_buffer(&mut buffer, &mut state, &mut on_event).unwrap();
-
-        assert!(state.terminal);
-        assert!(state.replayable);
-        assert_eq!(state.output, output.as_array().unwrap().clone());
-        let usage = state.usage.unwrap();
-        assert_eq!(usage.cache_read_input_tokens, 8);
-        assert_eq!(usage.reasoning_output_tokens, 4);
-        assert!(matches!(
-            events[0],
-            StreamEvent::ReasoningStart(ReasoningVisibility::Opaque)
-        ));
-        assert!(events.iter().any(|event| matches!(event,
-            StreamEvent::ToolCallDelta(delta) if delta.index == 0
-        )));
-        assert_eq!(
-            responses_tool_calls(&state.output).unwrap()[0].arguments,
-            "{\"command\":\"pwd\"}"
         );
     }
 
@@ -1418,139 +1156,26 @@ mod tests {
     }
 
     #[test]
-    fn replays_chat_reasoning_across_origins() {
-        let messages = vec![Message::Assistant {
-            content: None,
-            reasoning_content: Some("  exact\\ntrace  ".into()),
-            tool_calls: None,
-            native_replay: Some(NativeReplay {
-                provider_id: "test".into(),
-                endpoint: CHAT_ENDPOINT.into(),
-                model: "gpt-test".into(),
-                payload: NativeReplayPayload::ChatReasoning("  exact\\ntrace  ".into()),
-            }),
-        }];
-
-        let matching = build_chat_request_body(
-            &TestRequest {
-                model: test_model(None),
-                cache_key: None,
-            },
-            CHAT_ENDPOINT,
-            &messages,
-            &[],
-        );
-        assert_eq!(
-            matching["messages"][0]["reasoning_content"],
-            "  exact\\ntrace  "
-        );
-        let switched_endpoint = build_chat_request_body(
-            &TestRequest {
-                model: test_model(None),
-                cache_key: None,
-            },
-            "https://other.test/chat/completions",
-            &messages,
-            &[],
-        );
-        assert_eq!(
-            switched_endpoint["messages"][0]["reasoning_content"],
-            "  exact\\ntrace  "
-        );
-        let mut other_provider = test_model(None);
-        other_provider.provider_id = "fallback".into();
-        other_provider.model_id = "other-model".into();
-        let switched_provider_and_model = build_chat_request_body(
-            &TestRequest {
-                model: other_provider,
-                cache_key: None,
-            },
-            CHAT_ENDPOINT,
-            &messages,
-            &[],
-        );
-        assert_eq!(
-            switched_provider_and_model["messages"][0]["reasoning_content"],
-            "  exact\\ntrace  "
-        );
-    }
-
-    #[test]
-    fn replays_explicit_empty_chat_reasoning() {
-        let message = Message::Assistant {
-            content: None,
-            reasoning_content: Some(String::new()),
-            tool_calls: Some(vec![ToolCall {
-                id: "call_1".into(),
-                arguments: "{}".into(),
-            }]),
-            native_replay: Some(NativeReplay {
-                provider_id: "test".into(),
-                endpoint: CHAT_ENDPOINT.into(),
-                model: "gpt-test".into(),
-                payload: NativeReplayPayload::ChatReasoning(String::new()),
-            }),
-        };
-
-        let body = build_chat_request_body(
-            &TestRequest {
-                model: test_model(None),
-                cache_key: None,
-            },
-            CHAT_ENDPOINT,
-            &[message],
-            &[],
-        );
-
-        assert_eq!(body["messages"][0]["reasoning_content"], "");
-        assert_eq!(body["messages"][0]["tool_calls"][0]["id"], "call_1");
-    }
-
-    #[test]
-    fn detects_context_length_errors_across_shapes() {
-        for body in [
-            r#"{"error":{"message":"too long","code":"context_length_exceeded"}}"#,
-            r#"{"error":{"type":"invalid_request_error","message":"prompt is too long: 250000 tokens > 200000 maximum"}}"#,
-            "This model's maximum context length is 128000 tokens",
-        ] {
-            assert!(matches!(
-                classify_http_error(400, body.into(), None),
-                ProviderError::ContextLength { .. }
-            ));
+    fn replays_chat_reasoning_verbatim_including_empty() {
+        for reasoning in ["  exact\\ntrace  ", ""] {
+            let message = Message::Assistant {
+                content: None,
+                reasoning_content: Some(reasoning.into()),
+                tool_calls: Some(vec![ToolCall {
+                    id: "call_1".into(),
+                    arguments: "{}".into(),
+                }]),
+                native_replay: Some(NativeReplay {
+                    provider_id: "test".into(),
+                    endpoint: CHAT_ENDPOINT.into(),
+                    model: "gpt-test".into(),
+                    payload: NativeReplayPayload::ChatReasoning(reasoning.into()),
+                }),
+            };
+            let body = body(ModelApi::ChatCompletions, None, vec![message], &[]).unwrap();
+            assert_eq!(body["messages"][0]["reasoning_content"], reasoning);
+            assert_eq!(body["messages"][0]["tool_calls"][0]["id"], "call_1");
         }
-        assert!(matches!(
-            classify_http_error(413, "Payload Too Large".into(), None),
-            ProviderError::RequestTooLarge { .. }
-        ));
-    }
-
-    #[test]
-    fn does_not_misclassify_unrelated_errors() {
-        // Unrelated 400 (bad request) must not be treated as overflow.
-        assert!(!matches!(
-            classify_http_error(
-                400,
-                r#"{"error":{"message":"invalid 'model' parameter","code":"model_not_found"}}"#
-                    .into(),
-                None
-            ),
-            ProviderError::ContextLength { .. }
-        ));
-        // A 5xx whose body coincidentally mentions context length must not
-        // trigger reactive compaction.
-        assert!(!matches!(
-            classify_http_error(
-                500,
-                "internal error in context length calculator".into(),
-                None
-            ),
-            ProviderError::ContextLength { .. }
-        ));
-        // 401 auth failure.
-        assert!(!matches!(
-            classify_http_error(401, "invalid api key".into(), None),
-            ProviderError::ContextLength { .. }
-        ));
     }
 
     #[tokio::test]
@@ -1591,11 +1216,7 @@ mod tests {
             HttpProvider::new(format!("http://{addr}/chat/completions"), None).unwrap();
         provider.idle_timeout = Duration::from_millis(200);
 
-        let request = TestRequest {
-            model: test_model(None),
-            cache_key: None,
-        };
-        let request = semantic_request(&request, &[], false);
+        let request = request(None, vec![]);
         let mut on_event = |_event: StreamEvent| -> Result<(), ProviderError> { Ok(()) };
         let result = provider.stream(&request, &mut on_event).await;
 

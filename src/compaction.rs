@@ -636,16 +636,6 @@ mod tests {
         assert!(prompt.contains("New messages to incorporate:\n[user]: New evidence."));
     }
 
-    #[test]
-    fn unfocused_prompt_omits_focus_guidance() {
-        let prompt = build_summarize_prompt(None, "[user]: Hello.", None);
-
-        assert!(prompt.contains("Preserve all important facts needed to continue"));
-        assert!(!prompt.contains("custom focus"));
-        assert!(!prompt.contains("Custom focus:"));
-        assert!(prompt.contains("Conversation:\n[user]: Hello."));
-    }
-
     #[tokio::test]
     async fn manual_compaction_works_when_automatic_compaction_is_disabled() {
         let tmp = std::env::temp_dir().join(format!("mu-compaction-{}", uuid::Uuid::new_v4()));

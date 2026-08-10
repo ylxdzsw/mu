@@ -1023,7 +1023,7 @@ mod tests {
 
     #[test]
     fn env_parser_accepts_the_restricted_shell_subset() {
-        let entries = parse_env_file(
+        let entries = parse_env_file(concat!(
             r#"
 # comment
   # indented comment
@@ -1033,7 +1033,8 @@ SINGLE='hello world $HOME and `ticks`'
 DOUBLE="say \"hello\" for \$5 at \\tmp with \`ticks\` and it's fine"
 export   EXPORTED='exported value'
 "#,
-        )
+            "DUP=first\r\nDUP=second",
+        ))
         .unwrap()
         .into_iter()
         .collect::<EnvMap>();
@@ -1055,6 +1056,7 @@ export   EXPORTED='exported value'
             entries.get("EXPORTED").map(String::as_str),
             Some("exported value")
         );
+        assert_eq!(entries.get("DUP").map(String::as_str), Some("second"));
     }
 
     #[test]
@@ -1088,16 +1090,6 @@ export   EXPORTED='exported value'
             let error = parse_env_file(source).expect_err(case);
             assert_eq!(error.line, 1, "{case}");
         }
-    }
-
-    #[test]
-    fn env_parser_accepts_crlf_and_last_duplicate_wins() {
-        let entries = parse_env_file("NAME=first\r\nNAME=second")
-            .unwrap()
-            .into_iter()
-            .collect::<EnvMap>();
-
-        assert_eq!(entries.get("NAME").map(String::as_str), Some("second"));
     }
 
     #[test]

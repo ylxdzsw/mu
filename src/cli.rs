@@ -173,9 +173,9 @@ mod tests {
     fn parses_prompt_file_with_turn_options() {
         let args = Args::try_parse_from([
             "mu",
-            "--output",
+            "-o",
             "detail",
-            "--model",
+            "-m",
             "gpt-test",
             "-a",
             "image.png",
@@ -192,19 +192,7 @@ mod tests {
             args.turn.attachments,
             vec![PathBuf::from("image.png"), PathBuf::from("audio.wav")]
         );
-    }
-
-    #[test]
-    fn parses_short_model_and_output_options() {
-        let args = Args::try_parse_from(["mu", "-m", "gpt-test", "-o", "concise"]).unwrap();
-        assert_eq!(args.turn.selection.model.as_deref(), Some("gpt-test"));
-        assert_eq!(args.turn.output, Some(OutputFormat::Concise));
-    }
-
-    #[test]
-    fn leaves_output_unspecified_for_config_resolution() {
-        let args = Args::try_parse_from(["mu"]).unwrap();
-        assert_eq!(args.turn.output, None);
+        assert_eq!(Args::try_parse_from(["mu"]).unwrap().turn.output, None);
     }
 
     #[test]

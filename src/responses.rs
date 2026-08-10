@@ -510,13 +510,13 @@ mod tests {
     }
 
     #[test]
-    fn accumulates_text_and_refusal_deltas_with_usage_defaults() {
+    fn accumulates_text_refusal_and_usage() {
         let mut state = ResponsesStreamState::default();
         let mut events = Vec::new();
         let mut buffer = concat!(
             "data: {\"type\":\"response.output_text.delta\",\"delta\":\"hello\"}\n\n",
             "data: {\"type\":\"response.refusal.delta\",\"delta\":\" no\"}\n\n",
-            "data: {\"type\":\"response.completed\",\"response\":{\"output\":[],\"usage\":{\"input_tokens\":12,\"input_tokens_details\":null,\"output_tokens\":5,\"output_tokens_details\":null,\"total_tokens\":17}}}\n\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"output\":[],\"usage\":{\"input_tokens\":12,\"input_tokens_details\":{\"cached_tokens\":3,\"cache_creation_tokens\":2},\"output_tokens\":5,\"output_tokens_details\":{\"reasoning_tokens\":4},\"total_tokens\":17}}}\n\n",
         )
         .to_string();
 
@@ -527,10 +527,10 @@ mod tests {
         assert!(state.replayable);
         let usage = state.usage.unwrap();
         assert_eq!(usage.input_tokens, 12);
-        assert_eq!(usage.cache_read_input_tokens, 0);
-        assert_eq!(usage.cache_write_input_tokens, None);
+        assert_eq!(usage.cache_read_input_tokens, 3);
+        assert_eq!(usage.cache_write_input_tokens, Some(2));
         assert_eq!(usage.output_tokens, 5);
-        assert_eq!(usage.reasoning_output_tokens, 0);
+        assert_eq!(usage.reasoning_output_tokens, 4);
         assert_eq!(usage.total_tokens, 17);
     }
 
@@ -626,95 +626,43 @@ mod tests {
     }
 
     #[test]
-    fn response_failed_server_error_is_retryable_and_preserves_message() {
-        let mut state = ResponsesStreamState::default();
-        let mut events = Vec::new();
-        let mut buffer = concat!(
-            "data: {\"type\":\"response.failed\",\"response\":{\"error\":",
-            "{\"code\":\"server_error\",\"message\":\"generation failed\"}}}\n\n",
-        )
-        .to_string();
-
-        let error = consume(&mut state, &mut events, &mut buffer).unwrap_err();
-
-        assert!(matches!(
-            error,
-            ProviderError::Overloaded {
-                status: None,
-                ref detail,
-                ..
-            } if detail == "generation failed"
-        ));
-        assert_eq!(error.disposition(), ProviderDisposition::Retry);
-    }
-
-    #[test]
-    fn stream_read_error_is_retryable_transport_in_both_error_shapes() {
-        let buffers = [
-            concat!(
-                "data: {\"type\":\"error\",\"error\":{\"code\":\"stream_read_error\",",
-                "\"message\":\"upstream disconnected\",\"type\":\"upstream_error\"},",
-                "\"sequence_number\":0}\n\n",
+    fn classifies_response_error_envelopes() {
+        for (buffer, class, disposition) in [
+            (
+                "data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"code\":\"server_error\",\"message\":\"generation failed\"}}}\n\n",
+                "overloaded",
+                ProviderDisposition::Retry,
+            ),
+            (
+                "data: {\"type\":\"error\",\"error\":{\"code\":\"stream_read_error\",\"message\":\"upstream disconnected\",\"type\":\"upstream_error\"}}\n\n",
+                "transport",
+                ProviderDisposition::Retry,
+            ),
+            (
+                "data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"code\":\"stream_read_error\",\"message\":\"upstream disconnected\",\"type\":\"upstream_error\"}}}\n\n",
+                "transport",
+                ProviderDisposition::Retry,
+            ),
+            (
+                "data: {\"type\":\"error\",\"code\":\"rate_limit_exceeded\",\"message\":\"slow down\"}\n\n",
+                "rate_limit",
+                ProviderDisposition::Retry,
+            ),
+            (
+                "data: {\"type\":\"error\",\"code\":\"invalid_prompt\",\"message\":\"unsupported input\"}\n\n",
+                "bad_request",
+                ProviderDisposition::Fail,
+            ),
+        ] {
+            let error = consume(
+                &mut ResponsesStreamState::default(),
+                &mut Vec::new(),
+                &mut buffer.to_string(),
             )
-            .to_string(),
-            concat!(
-                "data: {\"type\":\"response.failed\",\"response\":{\"error\":",
-                "{\"code\":\"stream_read_error\",\"message\":\"upstream disconnected\",",
-                "\"type\":\"upstream_error\"}}}\n\n",
-            )
-            .to_string(),
-        ];
-
-        for mut buffer in buffers {
-            let mut state = ResponsesStreamState::default();
-            let mut events = Vec::new();
-            let error = consume(&mut state, &mut events, &mut buffer).unwrap_err();
-
-            assert!(matches!(
-                error,
-                ProviderError::Transport(ref detail) if detail == "upstream disconnected"
-            ));
-            assert_eq!(error.disposition(), ProviderDisposition::Retry);
+            .unwrap_err();
+            assert_eq!(error.class(), class);
+            assert_eq!(error.disposition(), disposition);
         }
-    }
-
-    #[test]
-    fn top_level_rate_limit_error_is_retryable_and_preserves_message() {
-        let mut state = ResponsesStreamState::default();
-        let mut events = Vec::new();
-        let mut buffer = concat!(
-            "data: {\"type\":\"error\",\"code\":\"rate_limit_exceeded\",",
-            "\"message\":\"slow down\",\"param\":null,\"sequence_number\":1}\n\n",
-        )
-        .to_string();
-
-        let error = consume(&mut state, &mut events, &mut buffer).unwrap_err();
-
-        assert!(matches!(
-            error,
-            ProviderError::RateLimit { ref detail, .. } if detail == "slow down"
-        ));
-        assert_eq!(error.disposition(), ProviderDisposition::Retry);
-    }
-
-    #[test]
-    fn invalid_prompt_error_remains_fatal_and_keeps_its_code() {
-        let mut state = ResponsesStreamState::default();
-        let mut events = Vec::new();
-        let mut buffer = concat!(
-            "data: {\"type\":\"error\",\"code\":\"invalid_prompt\",",
-            "\"message\":\"unsupported input\",\"param\":\"input\",\"sequence_number\":1}\n\n",
-        )
-        .to_string();
-
-        let error = consume(&mut state, &mut events, &mut buffer).unwrap_err();
-
-        assert!(matches!(
-            error,
-            ProviderError::BadRequestPermanent { ref detail, .. }
-                if detail == "unsupported input"
-        ));
-        assert_eq!(error.disposition(), ProviderDisposition::Fail);
     }
 
     #[test]

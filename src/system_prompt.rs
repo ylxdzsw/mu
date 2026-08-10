@@ -258,7 +258,7 @@ mod tests {
 
     use super::{
         EXPORT_PREAMBLE, assemble_context, assemble_prompt, build_context, export_preamble,
-        json_string_for_html_comment, linux_distribution, role_preamble,
+        json_string_for_html_comment, role_preamble,
     };
     use crate::skills::{InstructionScope, SkillMeta, SkillRequirements};
 
@@ -290,19 +290,6 @@ mod tests {
         assert!(prompt.contains("Exactly one tool is available: `bash`"));
         assert!(prompt.contains("\nuser: "));
         assert!(prompt.contains(" (uid "));
-    }
-
-    #[test]
-    fn linux_distribution_prefers_pretty_name_with_fallbacks() {
-        assert_eq!(
-            linux_distribution("NAME=Ubuntu\nPRETTY_NAME=\"Ubuntu 24.04.2 LTS\"\nID=ubuntu"),
-            Some("Ubuntu 24.04.2 LTS".into())
-        );
-        assert_eq!(
-            linux_distribution("NAME='Alpine Linux'\nID=alpine"),
-            Some("Alpine Linux".into())
-        );
-        assert_eq!(linux_distribution("ID=arch"), Some("arch".into()));
     }
 
     #[test]

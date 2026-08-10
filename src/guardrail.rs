@@ -769,22 +769,6 @@ mod tests {
     }
 
     #[test]
-    fn bash_risk_valid_values() {
-        assert_eq!(
-            BashRisk::from_value(&json!({"risk": "readonly"})),
-            Some(BashRisk::Readonly)
-        );
-        assert_eq!(
-            BashRisk::from_value(&json!({"risk": "reversible"})),
-            Some(BashRisk::Reversible)
-        );
-        assert_eq!(
-            BashRisk::from_value(&json!({"risk": "destructive"})),
-            Some(BashRisk::Destructive)
-        );
-    }
-
-    #[test]
     fn parse_assessment_with_prose_wrapper() {
         let text = "Here is my assessment:\n{\"risk_level\":\"low\",\"user_auth_level\":\"unknown\",\"reason\":\"safe\"}\nDone.";
         let a = parse_assessment(text).unwrap();

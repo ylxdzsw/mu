@@ -640,13 +640,8 @@ mod tests {
 
     const ENDPOINT: &str = "https://api.anthropic.test/v1/messages";
 
-    struct TestRequest {
-        model: ResolvedModelRef,
-        cache_key: Option<String>,
-    }
-
-    fn request(effort: Option<&str>) -> TestRequest {
-        TestRequest {
+    fn request(effort: Option<&str>, messages: Vec<Message>) -> Request {
+        Request {
             model: ResolvedModelRef {
                 canonical: "anthropic/claude-opus-5".into(),
                 provider_id: "anthropic".into(),
@@ -654,21 +649,17 @@ mod tests {
                 effort: effort.map(str::to_owned),
             },
             cache_key: None,
+            messages,
+            bash: false,
         }
     }
 
     fn request_body(
-        request: &TestRequest,
-        messages: &[Message],
+        effort: Option<&str>,
+        messages: Vec<Message>,
         tools: &[Value],
     ) -> Result<Value, ProviderError> {
-        Request {
-            model: request.model.clone(),
-            cache_key: request.cache_key.clone(),
-            messages: messages.to_vec(),
-            bash: false,
-        }
-        .historical_json(ModelApi::AnthropicMessages, tools)
+        request(effort, messages).historical_json(ModelApi::AnthropicMessages, tools)
     }
 
     fn system() -> Message {
@@ -690,31 +681,34 @@ mod tests {
 
     #[test]
     fn builds_latest_messages_request_with_fixed_limits_and_tools() {
-        let mut request = request(Some("max"));
-        request.cache_key = Some("mu:ses_test:agent".into());
-        let body = request_body(
-            &request,
-            &[
+        let mut request = request(
+            Some("max"),
+            vec![
                 system(),
                 Message::User {
                     content: "hello".into(),
                 },
             ],
-            &[serde_json::json!({
-                "type": "function",
-                "function": {
-                    "name": "bash",
-                    "description": "Run Bash",
-                    "parameters": {
-                        "type": "object",
-                        "properties": { "command": { "type": "string" } },
-                        "required": ["command"],
+        );
+        request.cache_key = Some("mu:ses_test:agent".into());
+        let body = request
+            .historical_json(
+                ModelApi::AnthropicMessages,
+                &[serde_json::json!({
+                    "type": "function",
+                    "function": {
+                        "name": "bash",
+                        "description": "Run Bash",
+                        "parameters": {
+                            "type": "object",
+                            "properties": { "command": { "type": "string" } },
+                            "required": ["command"],
+                        },
+                        "strict": true,
                     },
-                    "strict": true,
-                },
-            })],
-        )
-        .unwrap();
+                })],
+            )
+            .unwrap();
 
         assert_eq!(body["max_tokens"], 64_000);
         assert_eq!(body["stream"], true);
@@ -768,8 +762,8 @@ mod tests {
             data: vec![1, 2, 3],
         };
         let body = request_body(
-            &request(None),
-            &[
+            None,
+            vec![
                 system(),
                 Message::User {
                     content: UserContent::Parts(vec![
@@ -813,8 +807,8 @@ mod tests {
         assert!(tool_image.get("detail").is_none());
 
         let error = request_body(
-            &request(None),
-            &[
+            None,
+            vec![
                 system(),
                 Message::User {
                     content: UserContent::Parts(vec![ContentPart::Attachment {
@@ -837,7 +831,7 @@ mod tests {
     }
 
     #[test]
-    fn replays_exact_native_blocks_across_origins() {
+    fn replays_exact_native_blocks() {
         let native_blocks = vec![
             serde_json::json!({
                 "type": "thinking",
@@ -866,16 +860,10 @@ mod tests {
             }),
         };
 
-        let matching = request_body(&request(None), &[system(), message.clone()], &[]).unwrap();
+        let matching = request_body(None, vec![system(), message], &[]).unwrap();
         assert_eq!(
             matching["messages"][0]["content"],
             Value::Array(native_blocks)
-        );
-
-        let foreign = request_body(&request(None), &[system(), message], &[]).unwrap();
-        assert_eq!(
-            foreign["messages"][0]["content"],
-            matching["messages"][0]["content"]
         );
     }
 
@@ -1056,7 +1044,7 @@ mod tests {
             }]),
             native_replay: None,
         };
-        let error = request_body(&request(None), &[system(), malformed], &[]).unwrap_err();
+        let error = request_body(None, vec![system(), malformed], &[]).unwrap_err();
         assert!(error.to_string().contains("toolu_bad"));
     }
 }

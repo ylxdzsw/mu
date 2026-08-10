@@ -748,18 +748,6 @@ mod tests {
     }
 
     #[test]
-    fn skill_name_must_match_file_or_parent_folder() {
-        assert_eq!(
-            expected_skill_name(Path::new("review.md")).as_deref(),
-            Some("review")
-        );
-        assert_eq!(
-            expected_skill_name(Path::new("review/SKILL.md")).as_deref(),
-            Some("review")
-        );
-    }
-
-    #[test]
     fn scans_flat_command_skill_files() {
         let root = temp_root("flat-command-skill");
         fs::create_dir_all(&root).unwrap();

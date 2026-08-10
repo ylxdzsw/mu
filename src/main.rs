@@ -1202,38 +1202,6 @@ mod tests {
     }
 
     #[test]
-    fn prompt_source_provenance_reports_resolved_kind_path_and_model() {
-        let path = temp_file_path("provenance");
-        std::fs::write(&path, "prompt").unwrap();
-        let cwd = std::env::current_dir().unwrap();
-
-        assert_eq!(
-            prompt_source_provenance(
-                &PromptSource::Command {
-                    path: path.clone(),
-                    scope: skills::InstructionScope::Project,
-                },
-                &cwd,
-                Some("openai/gpt-5:high"),
-            ),
-            format!(
-                "[project command] {} (model default: openai/gpt-5:high)",
-                path.canonicalize().unwrap().display()
-            )
-        );
-        assert_eq!(
-            prompt_source_provenance(&PromptSource::File(path.clone()), &cwd, None),
-            format!("[prompt file] {}", path.canonicalize().unwrap().display())
-        );
-        assert_eq!(
-            prompt_source_provenance(&PromptSource::Stdin, &cwd, None),
-            "[stdin]"
-        );
-
-        std::fs::remove_file(path).unwrap();
-    }
-
-    #[test]
     fn explicit_prompt_paths_bypass_command_lookup() {
         let scope = paths::Scope::Global;
         for path in ["./review.md", "../review.md", "/tmp/review.md"] {

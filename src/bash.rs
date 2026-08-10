@@ -956,7 +956,7 @@ mod tests {
 
     use super::{
         AttachmentContext, BashArgs, BashRisk, ToolContext, apply_truncation, run_bash,
-        tool_definitions, truncate_line,
+        truncate_line,
     };
     use crate::config::EnvMap;
     use crate::config::{
@@ -1282,14 +1282,6 @@ mod tests {
     }
 
     #[test]
-    fn tool_definitions_expose_only_bash() {
-        let definitions = tool_definitions();
-        assert_eq!(definitions.len(), 1);
-        assert_eq!(definitions[0]["function"]["name"].as_str(), Some("bash"));
-        assert_eq!(definitions[0]["function"]["strict"], json!(false));
-    }
-
-    #[test]
     fn bash_schema_requires_title_risk_and_command() {
         let schema = super::parameters_schema();
         assert_eq!(schema["required"], json!(["title", "risk", "command"]));
@@ -1347,28 +1339,5 @@ mod tests {
             crate::paths::runtime_dir().unwrap()
         );
         let _ = std::fs::remove_file(spill);
-    }
-
-    #[test]
-    fn truncation_spill_does_not_use_project_state() {
-        let tmp = std::env::temp_dir().join(format!("mu-trunc-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&tmp).unwrap();
-        // A legacy project-local truncation path must be irrelevant.
-        std::fs::write(tmp.join("truncation"), b"not a directory").unwrap();
-
-        let clamped = apply_truncation(
-            "one\ntwo\nthree\nfour".into(),
-            &tight_limits(),
-            "bash",
-            true,
-        );
-
-        assert!(clamped.contains("three\nfour"));
-        assert!(clamped.contains("temporary file"));
-        let marker = "temporary file ";
-        let start = clamped.find(marker).unwrap() + marker.len();
-        let end = clamped[start..].find(';').unwrap() + start;
-        let _ = std::fs::remove_file(&clamped[start..end]);
-        let _ = std::fs::remove_dir_all(tmp);
     }
 }

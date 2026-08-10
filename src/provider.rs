@@ -1384,6 +1384,22 @@ mod tests {
             ),
             ProviderError::BadRequestPermanent { .. }
         ));
+        assert!(matches!(
+            classify_http_error(
+                400,
+                "This model's maximum context length is 128000 tokens".into(),
+                None
+            ),
+            ProviderError::ContextLength { .. }
+        ));
+        assert!(!matches!(
+            classify_http_error(
+                500,
+                "internal error in context length calculator".into(),
+                None
+            ),
+            ProviderError::ContextLength { .. }
+        ));
     }
 
     #[test]
@@ -1437,7 +1453,7 @@ mod tests {
     }
 
     #[test]
-    fn current_replay_keys_reinterpret_existing_history_within_one_api() {
+    fn replay_filter_respects_keys_and_api() {
         let messages = vec![replay_message(NativeReplayPayload::ResponsesOutput(vec![
             serde_json::json!({"type":"reasoning","encrypted_content":"opaque"}),
         ]))];
@@ -1475,10 +1491,7 @@ mod tests {
                 ..
             }
         ));
-    }
 
-    #[test]
-    fn chat_reasoning_replays_across_keys_within_chat_completions() {
         let config = replay_config(Some("source"), Some("target"));
         let messages = vec![replay_message(NativeReplayPayload::ChatReasoning(
             "trace".into(),
@@ -1496,10 +1509,7 @@ mod tests {
                 ..
             }
         ));
-    }
 
-    #[test]
-    fn replay_key_never_crosses_api_variants() {
         let config = replay_config(Some("compatible"), Some("compatible"));
         let messages = vec![replay_message(NativeReplayPayload::ResponsesOutput(vec![
             serde_json::json!({"type":"reasoning","encrypted_content":"opaque"}),
