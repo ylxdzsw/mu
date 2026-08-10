@@ -572,7 +572,7 @@ impl Store {
             .and_then(|provider_id| provider_id.strip_suffix(')'))
             .unwrap_or(provider_id);
         let (wire_model, effort) = wire_model
-            .rsplit_once(':')
+            .split_once(':')
             .map_or((wire_model, None), |(model, effort)| (model, Some(effort)));
         let native = serde_json::json!({"model":wire_model});
         let exchange_id = self.start_provider_request(

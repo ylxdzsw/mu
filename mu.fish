@@ -506,12 +506,6 @@ function _mu_fish_model_candidates --argument-names fragment
         set -q fields[3]; and set efforts (string split , -- "$fields[3]")
 
         if string match -q '*:*' -- "$fragment"
-            if string match -q '*:*' -- "$canonical"
-                test -n "$canonical"; and not contains -- "$canonical" $matches; and set -a matches "$canonical"
-            end
-            if string match -q '*:*' -- "$model_id"
-                test -n "$model_id"; and not contains -- "$model_id" $matches; and set -a matches "$model_id"
-            end
             for effort in $efforts
                 test -n "$effort"; or continue
                 test -n "$canonical"; and not contains -- "$canonical:$effort" $matches; and set -a matches "$canonical:$effort"

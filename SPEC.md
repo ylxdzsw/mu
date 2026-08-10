@@ -1244,6 +1244,7 @@ setup; it also ships a commented keyed provider example.
 
 `provider/model[:effort]` is fixed. A bare `model[:effort]` expands to every
 configured provider containing that model in literal merged config order.
+Model ids cannot contain `:`; it is reserved for the effort separator.
 Fallback is forward-only and per-session. Provider-request history derives one
 remembered position per floating model id across agent, compaction, and
 guardrail calls. Effort is request metadata and does not reset the provider;

@@ -443,6 +443,9 @@ impl Config {
                 anyhow::anyhow!("invalid provider `{provider_id}` in config.jsonc: {error}")
             })?;
             for (model_id, model) in &provider.models {
+                if model_id.contains(':') {
+                    bail!("model id `{model_id}` contains reserved `:` in config.jsonc");
+                }
                 if model
                     .replay_key
                     .as_deref()
@@ -846,6 +849,21 @@ mod tests {
             .as_ref()
             .unwrap();
         assert_eq!(efforts, &["none", "minimal", "provider-custom"]);
+    }
+
+    #[test]
+    fn model_ids_cannot_contain_colons() {
+        let error = config_from_value(serde_json::json!({
+            "providers": {
+                "openai": {
+                    "endpoint": "http://localhost/chat/completions",
+                    "models": {"version:latest": {"context_window": 128000}}
+                }
+            }
+        }))
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("contains reserved `:`"), "{error}");
     }
 
     #[test]

@@ -502,9 +502,6 @@ _mu_zsh_model_completion_candidates() {
             )
           | $model.efforts[]? | ":" + .
         elif ($fragment | contains(":")) then
-          ($models[]
-            | select((.canonical | contains(":")) or (.short | contains(":")))
-            | .canonical, .short),
           ($models[] as $model | $model.efforts[]? as $effort
             | "\($model.canonical):\($effort)",
               "\($model.short):\($effort)")

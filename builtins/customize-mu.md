@@ -131,8 +131,8 @@ provider defining that model id; a session remembers its position per model.
 Provider and model object order controls the default model, fallback, status,
 and completion order, with project entries before inherited global entries.
 Effort strings are provider-defined and unrestricted; `supported_efforts` is
-only an ordered status/completion hint. An exact model id containing `:` wins
-before effort-suffix parsing.
+only an ordered status/completion hint. Model ids cannot contain `:` because it
+separates the effort suffix.
 
 `replay_key` is a non-empty, non-secret compatibility label, defaulting to
 `provider/model`. Responses and Anthropic native state is shared only within

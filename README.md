@@ -198,6 +198,7 @@ messages, and exits. A few ideas follow from that:
 - OpenAI-compatible Chat Completions, OpenAI Responses, and Anthropic Messages
   providers, with fixed `provider/model[:effort]` selection or per-session
   provider fallback from a bare `model[:effort]` in configured provider order.
+  Model ids cannot contain `:`, which separates the effort suffix.
 - Persistent global or project-scoped sessions, continuation, transcripts,
   automatic context compaction, optional automatic response resumption, and
   interrupted-turn recovery.

@@ -187,9 +187,6 @@ set shadow_records \
     (printf 'openai/gpt\tgpt\tlow\n') \
     (printf 'openai/gpt-plus\tgpt-plus\thigh\n')
 _mu_fish_model_completion_transition gpt $shadow_records; and fail 'prefix-shadowed exact models must not transition to efforts'
-set colon_records (printf 'openai/version:latest\tversion:latest\tmax\n')
-_mu_fish_model_completion_transition openai/version:latest $colon_records; or fail 'exact model ids containing a colon transition to efforts'
-contains openai/version:latest (_mu_fish_model_candidates openai/version:lat $colon_records); or fail 'completion preserves configured model ids containing a colon'
 set -g MU_FISH_MODEL unknown
 _mu_fish_sync_state
 set models (_mu_fish_model_candidates gp)

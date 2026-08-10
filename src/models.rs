@@ -141,12 +141,12 @@ pub fn resolve_model_choice(config: &Config, raw: &str) -> Result<ResolvedModelC
     }
 
     if let Some((provider_id, rest)) = parenthesized_provider(raw) {
-        let (model_id, effort) = split_floating_model(config, rest);
+        let (model_id, effort) = split_model_effort(rest);
         return resolve_floating_model(config, model_id, effort, Some(provider_id));
     }
 
     if let Some((provider_id, model_id)) = explicit_provider(config, raw) {
-        let (model_id, effort) = split_exact_model(config, provider_id, model_id);
+        let (model_id, effort) = split_model_effort(model_id);
         return resolve_exact_model(config, provider_id, model_id, effort)
             .map(ResolvedModelChoice::fixed);
     }
@@ -155,7 +155,7 @@ pub fn resolve_model_choice(config: &Config, raw: &str) -> Result<ResolvedModelC
         bail!("model not configured: {raw}");
     }
 
-    let (model_id, effort) = split_floating_model(config, raw);
+    let (model_id, effort) = split_model_effort(raw);
     if config
         .providers
         .iter()
@@ -217,42 +217,9 @@ fn parenthesized_provider(raw: &str) -> Option<(&str, &str)> {
     (!provider_id.is_empty() && !rest.is_empty()).then_some((provider_id, rest))
 }
 
-fn split_exact_model<'a>(
-    config: &Config,
-    provider_id: &str,
-    raw: &'a str,
-) -> (&'a str, Option<String>) {
-    if config.model_config(provider_id, raw).is_some() {
-        return (raw, None);
-    }
-    raw.rsplit_once(':')
-        .filter(|(model_id, effort)| {
-            !model_id.is_empty()
-                && !effort.is_empty()
-                && config.model_config(provider_id, model_id).is_some()
-        })
-        .map_or((raw, None), |(model_id, effort)| {
-            (model_id, Some(effort.to_string()))
-        })
-}
-
-fn split_floating_model<'a>(config: &Config, raw: &'a str) -> (&'a str, Option<String>) {
-    if config
-        .providers
-        .iter()
-        .any(|(_, provider)| provider.models.contains_key(raw))
-    {
-        return (raw, None);
-    }
-    raw.rsplit_once(':')
-        .filter(|(model_id, effort)| {
-            !model_id.is_empty()
-                && !effort.is_empty()
-                && config
-                    .providers
-                    .iter()
-                    .any(|(_, provider)| provider.models.contains_key(model_id))
-        })
+fn split_model_effort(raw: &str) -> (&str, Option<String>) {
+    raw.split_once(':')
+        .filter(|(model_id, effort)| !model_id.is_empty() && !effort.is_empty())
         .map_or((raw, None), |(model_id, effort)| {
             (model_id, Some(effort.to_string()))
         })
@@ -379,14 +346,6 @@ mod tests {
                                 },
                             ),
                             (
-                                "version:latest".into(),
-                                ModelConfig {
-                                    context_window: Some(200),
-                                    supported_efforts: None,
-                                    replay_key: None,
-                                },
-                            ),
-                            (
                                 "DeepSeek-V4".into(),
                                 ModelConfig {
                                     context_window: Some(300),
@@ -449,24 +408,13 @@ mod tests {
     #[test]
     fn resolves_arbitrary_effort_without_allowlist_validation() {
         let resolved =
-            resolve_model_ref(&test_config(), "alpha/common-model:provider-custom").unwrap();
+            resolve_model_ref(&test_config(), "alpha/common-model:provider:custom").unwrap();
         assert_eq!(resolved.model_id, "common-model");
-        assert_eq!(resolved.effort.as_deref(), Some("provider-custom"));
-        assert_eq!(resolved.canonical, "alpha/common-model:provider-custom");
+        assert_eq!(resolved.effort.as_deref(), Some("provider:custom"));
+        assert_eq!(resolved.canonical, "alpha/common-model:provider:custom");
 
         let unlisted = resolve_model_ref(&test_config(), "alpha/nested/model:none").unwrap();
         assert_eq!(unlisted.effort.as_deref(), Some("none"));
-    }
-
-    #[test]
-    fn exact_model_id_takes_precedence_over_effort_suffix() {
-        let exact = resolve_model_ref(&test_config(), "alpha/version:latest").unwrap();
-        assert_eq!(exact.model_id, "version:latest");
-        assert_eq!(exact.effort, None);
-
-        let with_effort = resolve_model_ref(&test_config(), "alpha/version:latest:max").unwrap();
-        assert_eq!(with_effort.model_id, "version:latest");
-        assert_eq!(with_effort.effort.as_deref(), Some("max"));
     }
 
     #[test]
