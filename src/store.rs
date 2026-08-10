@@ -14,10 +14,10 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 use crate::bash::BashRisk;
-use crate::models::{RequestOptions, ResolvedModelRef};
+use crate::models::ResolvedModelRef;
 use crate::provider::{
-    Attachment, ContentPart, ImageDetail, Message, NativeReplay, ToolAttachment, ToolCall, Usage,
-    UserContent, approx_tokens,
+    Attachment, ContentPart, ImageDetail, Message, ModelApi, NativeReplay, Request, ToolAttachment,
+    ToolCall, Usage, UserContent, approx_tokens,
 };
 
 pub const BASH_CALL_ID_ENV: &str = "MU_BASH_CALL_ID";
@@ -226,7 +226,6 @@ struct PersistedBashCall {
     call_id: i64,
     provider_call_id: String,
     position: usize,
-    name: String,
     arguments: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     declared_risk: Option<String>,
@@ -1173,22 +1172,6 @@ impl Store {
         else {
             unreachable!()
         };
-        if let Some(call) = tool_calls
-            .as_deref()
-            .unwrap_or_default()
-            .iter()
-            .find(|call| call.function.name != "bash")
-        {
-            self.fail_provider_exchange(
-                session_id,
-                exchange_id,
-                "invalid_response",
-                serde_json::json!({"message":format!("unknown tool: {}", call.function.name)}),
-                native_response,
-                usage,
-            )?;
-            bail!("unknown tool: {}", call.function.name)
-        }
         let mut provider_call_ids = HashSet::new();
         if let Some(call) = tool_calls
             .as_deref()
@@ -1219,9 +1202,8 @@ impl Store {
                     call_id: next_call,
                     provider_call_id: call.id.clone(),
                     position,
-                    name: call.function.name.clone(),
-                    arguments: call.function.arguments.clone(),
-                    declared_risk: BashRisk::from_args_json(&call.function.arguments)
+                    arguments: call.arguments.clone(),
+                    declared_risk: BashRisk::from_args_json(&call.arguments)
                         .map(|risk| risk.as_str().to_string()),
                 };
                 next_call += 1;
@@ -1462,7 +1444,7 @@ impl Store {
                 })
                 .transpose()?
                 .map(str::to_owned);
-            let options = RequestOptions {
+            let request = Request {
                 model: ResolvedModelRef {
                     canonical: origin.canonical_model_ref.clone(),
                     provider_id: origin.provider_id.clone(),
@@ -1470,28 +1452,16 @@ impl Store {
                     effort: origin.effort.clone(),
                 },
                 cache_key,
+                messages,
+                bash: false,
             };
-            match recipe.format.as_str() {
-                "openai.chat_completions.v1" => crate::chat_completions::build_chat_request_body(
-                    &options,
-                    &origin.endpoint,
-                    &messages,
-                    &tools,
-                ),
-                "openai.responses.v1" => crate::responses::build_responses_request_body(
-                    &options,
-                    &origin.endpoint,
-                    &messages,
-                    &tools,
-                )?,
-                "anthropic.messages.v1" => crate::anthropic::build_request_body(
-                    &options,
-                    &origin.endpoint,
-                    &messages,
-                    &tools,
-                )?,
+            let api = match recipe.format.as_str() {
+                "openai.chat_completions.v1" => ModelApi::ChatCompletions,
+                "openai.responses.v1" => ModelApi::Responses,
+                "anthropic.messages.v1" => ModelApi::AnthropicMessages,
                 format => bail!("unsupported provider request format: {format}"),
-            }
+            };
+            request.historical_json(api, &tools)?
         };
         if hex(Sha256::digest(canonical_json(&request))) != recipe.canonical_sha256 {
             bail!("reconstructed provider request checksum mismatch")
@@ -1638,10 +1608,7 @@ impl Store {
                                 .iter()
                                 .map(|call| ToolCall {
                                     id: call.provider_call_id.clone(),
-                                    function: crate::provider::FunctionCall {
-                                        name: call.name.clone(),
-                                        arguments: call.arguments.clone(),
-                                    },
+                                    arguments: call.arguments.clone(),
                                 })
                                 .collect()
                         }),
@@ -1707,10 +1674,7 @@ impl Store {
                         .iter()
                         .map(|call| ToolCall {
                             id: call.provider_call_id.clone(),
-                            function: crate::provider::FunctionCall {
-                                name: call.name.clone(),
-                                arguments: call.arguments.clone(),
-                            },
+                            arguments: call.arguments.clone(),
                         })
                         .collect(),
                     seq: line.seq,
@@ -2808,7 +2772,7 @@ fn canonical_json(value: &Value) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::provider::{FunctionCall, Message};
+    use crate::provider::Message;
 
     #[test]
     fn short_id_collision_retries_and_journal_replays() {
@@ -2845,10 +2809,7 @@ mod tests {
                             .into_iter()
                             .map(|id| ToolCall {
                                 id: id.into(),
-                                function: FunctionCall {
-                                    name: "bash".into(),
-                                    arguments: r#"{"risk":"readonly","command":"true"}"#.into(),
-                                },
+                                arguments: r#"{"risk":"readonly","command":"true"}"#.into(),
                             })
                             .collect(),
                     ),
@@ -2913,10 +2874,7 @@ mod tests {
                     reasoning_content: None,
                     tool_calls: Some(vec![ToolCall {
                         id: "provider-call".into(),
-                        function: FunctionCall {
-                            name: "bash".into(),
-                            arguments: r#"{"risk":"readonly","command":"true"}"#.into(),
-                        },
+                        arguments: r#"{"risk":"readonly","command":"true"}"#.into(),
                     }]),
                     native_replay: None,
                 },
@@ -2974,7 +2932,8 @@ mod tests {
             .unwrap();
         let messages = store.load_context_messages(&session.id).unwrap();
         let tools = vec![serde_json::json!({"type":"function","function":{"name":"bash"}})];
-        let options = RequestOptions {
+        let endpoint = "https://example.test/v1/chat/completions";
+        let options = Request {
             model: ResolvedModelRef {
                 canonical: "test/model:high".into(),
                 provider_id: "test".into(),
@@ -2982,10 +2941,12 @@ mod tests {
                 effort: Some("high".into()),
             },
             cache_key: Some(format!("mu:{}:agent", session.id)),
+            messages,
+            bash: false,
         };
-        let endpoint = "https://example.test/v1/chat/completions";
-        let native =
-            crate::chat_completions::build_chat_request_body(&options, endpoint, &messages, &tools);
+        let native = options
+            .historical_json(ModelApi::ChatCompletions, &tools)
+            .unwrap();
         let recipe = store
             .request_recipe(
                 "openai.chat_completions.v1",
@@ -3068,7 +3029,7 @@ mod tests {
         messages.push(Message::User {
             content: RESUME_PROMPT.into(),
         });
-        let options = RequestOptions {
+        let options = Request {
             model: ResolvedModelRef {
                 canonical: "test/model:high".into(),
                 provider_id: "test".into(),
@@ -3076,9 +3037,12 @@ mod tests {
                 effort: Some("high".into()),
             },
             cache_key: None,
+            messages: messages.clone(),
+            bash: false,
         };
-        let native =
-            crate::anthropic::build_request_body(&options, endpoint, &messages, &[]).unwrap();
+        let native = options
+            .historical_json(ModelApi::AnthropicMessages, &[])
+            .unwrap();
         let recipe = store
             .request_recipe(
                 "anthropic.messages.v1",
@@ -3133,10 +3097,7 @@ mod tests {
                     reasoning_content: Some("trace".into()),
                     tool_calls: Some(vec![ToolCall {
                         id: "provider-call".into(),
-                        function: FunctionCall {
-                            name: "bash".into(),
-                            arguments: r#"{"risk":"readonly","command":"pwd"}"#.into(),
-                        },
+                        arguments: r#"{"risk":"readonly","command":"pwd"}"#.into(),
                     }]),
                     native_replay: Some(NativeReplay {
                         provider_id: String::new(),
@@ -3179,7 +3140,7 @@ mod tests {
             "chat_completions",
             &replay_origins,
         );
-        let options = RequestOptions {
+        let options = Request {
             model: ResolvedModelRef {
                 canonical: "target/other-model".into(),
                 provider_id: "target".into(),
@@ -3187,15 +3148,14 @@ mod tests {
                 effort: None,
             },
             cache_key: None,
+            messages: request_messages,
+            bash: false,
         };
-        let endpoint = "https://target.test/v1/chat/completions";
         let tools = vec![serde_json::json!({"type":"function","function":{"name":"bash"}})];
-        let native = crate::chat_completions::build_chat_request_body(
-            &options,
-            endpoint,
-            &request_messages,
-            &tools,
-        );
+        let endpoint = "https://target.test/v1/chat/completions";
+        let native = options
+            .historical_json(ModelApi::ChatCompletions, &tools)
+            .unwrap();
         let recipe = store
             .request_recipe(
                 "openai.chat_completions.v1",
@@ -3318,10 +3278,7 @@ mod tests {
             .unwrap();
         let call = ToolCall {
             id: "call_1".into(),
-            function: FunctionCall {
-                name: "bash".into(),
-                arguments: r#"{"risk":"readonly","command":"pwd"}"#.into(),
-            },
+            arguments: r#"{"risk":"readonly","command":"pwd"}"#.into(),
         };
 
         let error = store
@@ -3476,10 +3433,7 @@ mod tests {
                     reasoning_content: None,
                     tool_calls: Some(vec![ToolCall {
                         id: "provider-call".into(),
-                        function: FunctionCall {
-                            name: "bash".into(),
-                            arguments: r#"{"risk":"destructive","command":"rm x"}"#.into(),
-                        },
+                        arguments: r#"{"risk":"destructive","command":"rm x"}"#.into(),
                     }]),
                     native_replay: None,
                 },

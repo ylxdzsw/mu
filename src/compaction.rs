@@ -2,10 +2,10 @@ use anyhow::Result;
 
 use crate::bash;
 use crate::config::Config;
-use crate::models::{RequestOptions, ResolvedModelChoice, resolve_model_info};
+use crate::models::{ResolvedModelChoice, ResolvedModelRef, resolve_model_info};
 use crate::provider::{
-    MAX_PROVIDER_RETRY_AFTER, Message, Provider, ProviderDisposition, ProviderError, StreamEvent,
-    advance_provider, effective_retry_delay, provider_retry_limit,
+    MAX_PROVIDER_RETRY_AFTER, Message, Provider, ProviderDisposition, ProviderError, Request,
+    StreamEvent, advance_provider, effective_retry_delay, provider_retry_limit,
 };
 use crate::renderer::Renderer;
 use crate::store::{CompactionCompletion, ProviderOrigin, Store};
@@ -133,13 +133,11 @@ async fn run_compaction_routed_inner(
             return Ok(None);
         }
         switched = false;
-        let request =
-            RequestOptions::for_session(model.active_model().clone(), session_id, "compaction");
         match run_compaction(
             store,
             config,
             session_id,
-            &request,
+            model.active_model(),
             provider.as_ref(),
             custom_focus,
             renderer.as_deref_mut(),
@@ -279,7 +277,7 @@ pub async fn run_compaction(
     store: &Store,
     _config: &Config,
     session_id: &str,
-    request: &RequestOptions,
+    model: &ResolvedModelRef,
     provider: &dyn Provider,
     custom_focus: Option<&str>,
     mut renderer: Option<&mut Renderer>,
@@ -361,9 +359,8 @@ pub async fn run_compaction(
             if m.kind == "assistant" {
                 for c in &m.bash_calls {
                     text.push_str(&format!(
-                        "\n[toolcall {}]: {}",
-                        c.function.name,
-                        clamp_for_summary(&c.function.arguments, MAX_SUMMARY_TOOL_CHARS)
+                        "\n[toolcall bash]: {}",
+                        clamp_for_summary(&c.arguments, MAX_SUMMARY_TOOL_CHARS)
                     ));
                 }
             }
@@ -392,8 +389,8 @@ pub async fn run_compaction(
         },
     ];
 
-    let tools: Vec<serde_json::Value> = vec![];
-    let native_request = provider.native_request(request, &msgs, &tools)?;
+    let request = Request::for_session(model.clone(), session_id, "compaction", msgs, false);
+    let native_request = request.json(provider.api())?;
     let summarize_through_seq = cut_seq.saturating_sub(1);
     let recipe = store.request_recipe(
         provider.request_format(),
@@ -406,19 +403,19 @@ pub async fn run_compaction(
             "focus": custom_focus,
             "prompt_version": 1,
         }),
-        &tools,
+        &request.tools(),
     )?;
     let exchange_id = store.start_provider_request(
         session_id,
         &store.current_turn_id(session_id)?,
         "compaction",
         ProviderOrigin {
-            canonical_model_ref: request.model.canonical.clone(),
-            provider_id: request.model.provider_id.clone(),
+            canonical_model_ref: model.canonical.clone(),
+            provider_id: model.provider_id.clone(),
             api: provider.api_name().to_string(),
             endpoint: provider.endpoint().to_string(),
-            wire_model: request.model.model_id.clone(),
-            effort: request.model.effort.clone(),
+            wire_model: model.model_id.clone(),
+            effort: model.effort.clone(),
         },
         recipe,
         None,
@@ -440,9 +437,7 @@ pub async fn run_compaction(
             }
             Ok(())
         };
-        provider
-            .stream_chat(request, &msgs, &tools, &mut report_event)
-            .await
+        provider.stream(&request, &mut report_event).await
     };
     if let Some(error) = renderer_error {
         store.interrupt_provider_exchange(session_id, &exchange_id)?;
@@ -541,32 +536,25 @@ fn build_summarize_prompt(
 mod tests {
     use std::path::Path;
 
-    use async_trait::async_trait;
-    use serde_json::Value;
-
     use super::*;
-    use crate::models::RequestOptions;
-    use crate::provider::{
-        FinishReason, FunctionCall, ProviderError, StreamResult, ToolCall, Usage,
-    };
+    use crate::provider::{FinishReason, ProviderError, StreamResult, ToolCall, Usage};
     use crate::store::BashResultRecord;
+    use async_trait::async_trait;
 
     struct FakeProvider;
 
     #[async_trait(?Send)]
     impl Provider for FakeProvider {
-        async fn stream_chat(
+        async fn stream(
             &self,
-            _request: &RequestOptions,
-            messages: &[Message],
-            _tools: &[Value],
+            request: &Request,
             _on_event: &mut dyn FnMut(crate::provider::StreamEvent) -> Result<(), ProviderError>,
         ) -> Result<StreamResult, ProviderError> {
             assert!(matches!(
-                messages.first(),
+                request.messages.first(),
                 Some(Message::System { content }) if content == SUMMARIZER_SYSTEM_PROMPT
             ));
-            assert_eq!(messages.len(), 2);
+            assert_eq!(request.messages.len(), 2);
             Ok(StreamResult {
                 message: Message::Assistant {
                     content: Some("summary".into()),
@@ -590,11 +578,9 @@ mod tests {
 
     #[async_trait(?Send)]
     impl Provider for FailingProvider {
-        async fn stream_chat(
+        async fn stream(
             &self,
-            _request: &RequestOptions,
-            _messages: &[Message],
-            _tools: &[Value],
+            _request: &Request,
             _on_event: &mut dyn FnMut(crate::provider::StreamEvent) -> Result<(), ProviderError>,
         ) -> Result<StreamResult, ProviderError> {
             Err(ProviderError::ContextLength {
@@ -772,10 +758,7 @@ mod tests {
             &store,
             &config,
             &session.id,
-            &RequestOptions {
-                model: request_model.clone(),
-                cache_key: None,
-            },
+            &request_model,
             &FakeProvider,
             None,
             None,
@@ -807,10 +790,7 @@ mod tests {
             &store,
             &config,
             &session.id,
-            &RequestOptions {
-                model: request_model,
-                cache_key: None,
-            },
+            &request_model,
             &FakeProvider,
             None,
             None,
@@ -886,10 +866,7 @@ mod tests {
                         (1..=5)
                             .map(|n| ToolCall {
                                 id: format!("call-{n}"),
-                                function: FunctionCall {
-                                    name: "bash".into(),
-                                    arguments: r#"{"risk":"readonly","command":"true"}"#.into(),
-                                },
+                                arguments: r#"{"risk":"readonly","command":"true"}"#.into(),
                             })
                             .collect(),
                     ),
@@ -918,10 +895,7 @@ mod tests {
             &store,
             &config,
             &session.id,
-            &RequestOptions {
-                model: request_model,
-                cache_key: None,
-            },
+            &request_model,
             &FakeProvider,
             None,
             None,
@@ -996,10 +970,7 @@ mod tests {
             &store,
             &test_config(),
             &session.id,
-            &RequestOptions {
-                model: request_model.clone(),
-                cache_key: None,
-            },
+            &request_model,
             &FakeProvider,
             None,
             None,
@@ -1089,10 +1060,7 @@ mod tests {
             &store,
             &test_config(),
             &session.id,
-            &RequestOptions {
-                model: request_model,
-                cache_key: None,
-            },
+            &request_model,
             &FakeProvider,
             None,
             None,
@@ -1143,10 +1111,7 @@ mod tests {
             &store,
             &test_config(),
             &session.id,
-            &RequestOptions {
-                model: request_model,
-                cache_key: None,
-            },
+            &request_model,
             &FailingProvider,
             None,
             None,

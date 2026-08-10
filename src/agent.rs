@@ -11,10 +11,10 @@ use crate::bash::{BashRisk, ExecutionMode, ToolContext, ToolResult};
 use crate::compaction;
 use crate::config::Config;
 use crate::guardrail::Guardrail;
-use crate::models::{RequestOptions, ResolvedModelChoice, resolve_model_info};
+use crate::models::{ResolvedModelChoice, resolve_model_info};
 use crate::provider::{
     FinishReason, MAX_PROVIDER_RETRY_AFTER, Message, Provider, ProviderDisposition, ProviderError,
-    StreamEvent, ToolCall, ToolCallDelta, Usage, advance_provider, approx_tokens,
+    Request, StreamEvent, ToolCall, ToolCallDelta, Usage, advance_provider, approx_tokens,
     effective_retry_delay, provider_retry_limit,
 };
 use crate::renderer::Renderer;
@@ -115,7 +115,7 @@ pub struct AgentLoop<'a> {
     pub provider: Box<dyn Provider>,
     pub store: &'a Store,
     pub session_id: &'a str,
-    pub request: RequestOptions,
+    pub cache_key: Option<String>,
     pub model_context_window: Option<u64>,
     pub renderer: &'a mut Renderer,
 }
@@ -138,6 +138,7 @@ impl<'a> AgentLoop<'a> {
     ) -> Result<TurnResult> {
         bash::reset_cancellation_state();
         bash::install_signal_forwarder();
+        let provider_before_compaction = self.model.active_model().provider_id.clone();
         let pre_turn_compaction = if compact_at_turn_boundary && self.config.compaction.enabled {
             let started = Instant::now();
             compaction::maybe_compact_routed(
@@ -155,7 +156,9 @@ impl<'a> AgentLoop<'a> {
         } else {
             None
         };
-        self.sync_effective_model();
+        if self.model.active_model().provider_id != provider_before_compaction {
+            self.update_model_context_window();
+        }
         let mut latest_compaction_since_change = None;
         if let Some((outcome, started)) = pre_turn_compaction {
             self.report_compaction(outcome, started)?;
@@ -163,14 +166,13 @@ impl<'a> AgentLoop<'a> {
         }
 
         let mut guardrail = if self.config.guardrail.enabled {
-            Some(Guardrail::new(self.config, &self.request.model))
+            Some(Guardrail::new(self.config, self.model.active_model()))
         } else {
             None
         };
 
         let mut context = self.load_context()?;
 
-        let tool_definitions = bash::tool_definitions();
         let max_iter = self.config.limits.max_iterations;
 
         let mut total_usage = Usage::default();
@@ -192,6 +194,7 @@ impl<'a> AgentLoop<'a> {
                     )
                 {
                     let started = Instant::now();
+                    let provider_before_compaction = self.model.active_model().provider_id.clone();
                     let outcome = compaction::maybe_compact_routed(
                         self.store,
                         self.config,
@@ -203,7 +206,9 @@ impl<'a> AgentLoop<'a> {
                         self.renderer,
                     )
                     .await?;
-                    self.sync_effective_model();
+                    if self.model.active_model().provider_id != provider_before_compaction {
+                        self.update_model_context_window();
+                    }
                     if let Some(outcome) = outcome {
                         self.report_compaction(outcome, started)?;
                     }
@@ -223,14 +228,16 @@ impl<'a> AgentLoop<'a> {
                     let request_context = crate::provider::filter_native_replay_for_config(
                         &context,
                         self.config,
-                        &self.request.model,
+                        self.model.active_model(),
                         self.provider.api_name(),
                     );
-                    let native_request = self.provider.native_request(
-                        &self.request,
-                        &request_context,
-                        &tool_definitions,
-                    )?;
+                    let request = Request {
+                        model: self.model.active_model().clone(),
+                        cache_key: self.cache_key.clone(),
+                        messages: request_context,
+                        bash: true,
+                    };
+                    let native_request = request.json(self.provider.api())?;
                     let recipe = self.store.request_recipe(
                         self.provider.request_format(),
                         &native_request,
@@ -238,21 +245,21 @@ impl<'a> AgentLoop<'a> {
                             "kind": "agent",
                             "context_through_seq": self.store.current_context_seq(self.session_id)?,
                             "native_replay_origins":
-                                crate::provider::native_replay_origins(&request_context),
+                                crate::provider::native_replay_origins(&request.messages),
                         }),
-                        &tool_definitions,
+                        &request.tools(),
                     )?;
                     let exchange_id = self.store.start_provider_request(
                         self.session_id,
                         &self.store.current_turn_id(self.session_id)?,
                         "agent",
                         ProviderOrigin {
-                            canonical_model_ref: self.request.model.canonical.clone(),
-                            provider_id: self.request.model.provider_id.clone(),
+                            canonical_model_ref: request.model.canonical.clone(),
+                            provider_id: request.model.provider_id.clone(),
                             api: self.provider.api_name().to_string(),
                             endpoint: self.provider.endpoint().to_string(),
-                            wire_model: self.request.model.model_id.clone(),
-                            effort: self.request.model.effort.clone(),
+                            wire_model: request.model.model_id.clone(),
+                            effort: request.model.effort.clone(),
                         },
                         recipe,
                         None,
@@ -295,14 +302,7 @@ impl<'a> AgentLoop<'a> {
                                 }
                                 Ok(())
                             };
-                        self.provider
-                            .stream_chat(
-                                &self.request,
-                                &request_context,
-                                &tool_definitions,
-                                &mut on_stream_event,
-                            )
-                            .await
+                        self.provider.stream(&request, &mut on_stream_event).await
                     };
                     if let Some(error) = renderer_error {
                         self.store
@@ -356,6 +356,8 @@ impl<'a> AgentLoop<'a> {
                             match latest_compaction_since_change {
                                 None => {
                                     let started = Instant::now();
+                                    let provider_before_compaction =
+                                        self.model.active_model().provider_id.clone();
                                     let outcome = compaction::run_compaction_routed(
                                         self.store,
                                         self.config,
@@ -366,7 +368,11 @@ impl<'a> AgentLoop<'a> {
                                         Some(self.renderer),
                                     )
                                     .await?;
-                                    self.sync_effective_model();
+                                    if self.model.active_model().provider_id
+                                        != provider_before_compaction
+                                    {
+                                        self.update_model_context_window();
+                                    }
                                     self.report_compaction(outcome, started)?;
                                     context = self.load_context()?;
                                     match outcome {
@@ -551,16 +557,13 @@ impl<'a> AgentLoop<'a> {
                             bail!("turn interrupted");
                         }
                         let args = parse_tool_args(&tool_calls[cursor])?;
-                        let concurrent = self.concurrent_tool_call_eligible(
-                            guardrail.as_ref(),
-                            &tool_calls[cursor],
-                            &args,
-                        );
+                        let concurrent =
+                            self.concurrent_tool_call_eligible(guardrail.as_ref(), &args);
 
                         if !concurrent {
                             let tc = &tool_calls[cursor];
                             let guardrail_pending =
-                                guardrail_review_required(guardrail.as_ref(), tc, &args);
+                                guardrail_review_required(guardrail.as_ref(), &args);
 
                             let header_already_rendered = finish_command_header(
                                 self.renderer,
@@ -573,9 +576,7 @@ impl<'a> AgentLoop<'a> {
                             // Guardrail: review destructive bash calls before execution.
                             // The streamed command header above is the proposed action;
                             // denied commands still never stream execution output.
-                            if let Some(g) = guardrail.as_mut()
-                                && tc.function.name == "bash"
-                            {
+                            if let Some(g) = guardrail.as_mut() {
                                 let risk = BashRisk::from_value(&args);
                                 if risk.is_none() {
                                     let err = anyhow::anyhow!(
@@ -667,27 +668,19 @@ impl<'a> AgentLoop<'a> {
                                 }
                             }
 
-                            self.renderer.tool_start(
-                                &tc.function.name,
-                                &args,
-                                header_already_rendered,
-                            )?;
+                            self.renderer.tool_start(&args, header_already_rendered)?;
                             let started = Instant::now();
 
-                            let tool_result = if tc.function.name == "bash" {
-                                let (manifest, objects_dir) =
-                                    self.store.attachment_paths(self.session_id)?;
-                                let mut ctx = ToolContext {
-                                    config: self.config,
-                                    renderer: self.renderer,
-                                    attachment_manifest: Some(&manifest),
-                                    objects_dir: Some(&objects_dir),
-                                    bash_call_id: bash_call_ids[cursor],
-                                };
-                                bash::execute(args, &mut ctx).await
-                            } else {
-                                Err(anyhow::anyhow!("unknown tool: {}", tc.function.name))
+                            let (manifest, objects_dir) =
+                                self.store.attachment_paths(self.session_id)?;
+                            let mut ctx = ToolContext {
+                                config: self.config,
+                                renderer: self.renderer,
+                                attachment_manifest: Some(&manifest),
+                                objects_dir: Some(&objects_dir),
+                                bash_call_id: bash_call_ids[cursor],
                             };
+                            let tool_result = bash::execute(args, &mut ctx).await;
 
                             self.persist_bash_result(
                                 bash_call_ids[cursor],
@@ -704,11 +697,8 @@ impl<'a> AgentLoop<'a> {
                         let mut end = cursor + 1;
                         while end < tool_calls.len() {
                             let next_args = parse_tool_args(&tool_calls[end])?;
-                            let next_concurrent = self.concurrent_tool_call_eligible(
-                                guardrail.as_ref(),
-                                &tool_calls[end],
-                                &next_args,
-                            );
+                            let next_concurrent =
+                                self.concurrent_tool_call_eligible(guardrail.as_ref(), &next_args);
                             if !next_concurrent {
                                 break;
                             }
@@ -777,13 +767,9 @@ impl<'a> AgentLoop<'a> {
         Ok(context)
     }
 
-    fn sync_effective_model(&mut self) {
-        let model = self.model.active_model().clone();
-        let provider_changed = self.request.model.provider_id != model.provider_id;
-        if provider_changed {
-            self.model_context_window = resolve_model_info(self.config, &model).context_window;
-        }
-        self.request.model = model;
+    fn update_model_context_window(&mut self) {
+        self.model_context_window =
+            resolve_model_info(self.config, self.model.active_model()).context_window;
     }
 
     fn report_compaction(
@@ -814,8 +800,8 @@ impl<'a> AgentLoop<'a> {
                 self.config,
                 &self.model.active_model().provider_id,
             )?;
+            self.update_model_context_window();
         }
-        self.sync_effective_model();
         Ok(())
     }
 
@@ -829,7 +815,7 @@ impl<'a> AgentLoop<'a> {
         self.renderer.notice(&format!(
             "[mu] switching provider {previous} -> {next_provider} after {reason}"
         ))?;
-        self.sync_effective_model();
+        self.update_model_context_window();
         Ok(true)
     }
 
@@ -857,8 +843,7 @@ impl<'a> AgentLoop<'a> {
             Err(error) => {
                 let message = format!("error: {error}");
                 if emit_renderer {
-                    self.renderer
-                        .tool_failed(&call.function.name, &error.to_string(), elapsed)?;
+                    self.renderer.tool_failed(&error.to_string(), elapsed)?;
                 }
                 (message, Vec::new(), "error", None)
             }
@@ -883,15 +868,7 @@ impl<'a> AgentLoop<'a> {
         Ok(())
     }
 
-    fn concurrent_tool_call_eligible(
-        &self,
-        guardrail: Option<&Guardrail>,
-        call: &ToolCall,
-        args: &Value,
-    ) -> bool {
-        if call.function.name != "bash" {
-            return false;
-        }
+    fn concurrent_tool_call_eligible(&self, guardrail: Option<&Guardrail>, args: &Value) -> bool {
         // Schema-invalid readonly calls must take the sequential path so the
         // normal tool-error persistence can return the validation failure to
         // the model instead of aborting while preparing a concurrent batch.
@@ -901,7 +878,7 @@ impl<'a> AgentLoop<'a> {
         if bash::execution_mode(args) != ExecutionMode::Concurrent {
             return false;
         }
-        !guardrail_review_required(guardrail, call, args)
+        !guardrail_review_required(guardrail, args)
     }
 
     async fn execute_concurrent_bash_batch(
@@ -944,11 +921,8 @@ impl<'a> AgentLoop<'a> {
                     self.renderer.notice(&format!("[redaction] {warning}"))?;
                 }
             }
-            self.renderer.tool_start(
-                &exec.call.function.name,
-                &exec.args,
-                header_already_rendered,
-            )?;
+            self.renderer
+                .tool_start(&exec.args, header_already_rendered)?;
             self.stream_running_bash(exec).await?;
             let (result, elapsed, final_output) = exec
                 .running
@@ -1012,7 +986,7 @@ fn resume_message() -> Message {
 }
 
 fn parse_tool_args(call: &ToolCall) -> Result<Value> {
-    serde_json::from_str(&call.function.arguments).map_err(|error| {
+    serde_json::from_str(&call.arguments).map_err(|error| {
         anyhow::anyhow!(
             "invalid JSON arguments for tool call `{}`: {error}",
             call.id
@@ -1693,10 +1667,7 @@ fn stream_all(
     Ok(complete)
 }
 
-fn guardrail_review_required(guardrail: Option<&Guardrail>, call: &ToolCall, args: &Value) -> bool {
-    if call.function.name != "bash" {
-        return false;
-    }
+fn guardrail_review_required(guardrail: Option<&Guardrail>, args: &Value) -> bool {
     let Some(guardrail) = guardrail else {
         return false;
     };
@@ -1711,9 +1682,6 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
 
-    use async_trait::async_trait;
-    use serde_json::Value;
-
     use super::*;
     use crate::cli::OutputFormat;
     use crate::config::{
@@ -1721,6 +1689,7 @@ mod tests {
         TerminalBellConfig,
     };
     use crate::provider::{FinishReason, ProviderError, StreamResult, Usage, UserContent};
+    use async_trait::async_trait;
 
     struct RetryThenStopProvider {
         step: Mutex<usize>,
@@ -1792,15 +1761,13 @@ mod tests {
 
     #[async_trait(?Send)]
     impl Provider for ContextAfterCompactionProvider {
-        async fn stream_chat(
+        async fn stream(
             &self,
-            _request: &RequestOptions,
-            _messages: &[Message],
-            tools: &[Value],
+            request: &Request,
             _on_event: &mut dyn FnMut(crate::provider::StreamEvent) -> Result<(), ProviderError>,
         ) -> Result<StreamResult, ProviderError> {
             let mut counts = self.counts.lock().unwrap();
-            if tools.is_empty() {
+            if !request.bash {
                 counts.1 += 1;
                 return Ok(StreamResult {
                     message: Message::Assistant {
@@ -1823,11 +1790,9 @@ mod tests {
 
     #[async_trait(?Send)]
     impl Provider for PartialFailureProvider {
-        async fn stream_chat(
+        async fn stream(
             &self,
-            _request: &RequestOptions,
-            _messages: &[Message],
-            _tools: &[Value],
+            _request: &Request,
             on_event: &mut dyn FnMut(crate::provider::StreamEvent) -> Result<(), ProviderError>,
         ) -> Result<StreamResult, ProviderError> {
             on_event(StreamEvent::TextDelta("unfinished answer".into()))?;
@@ -1837,11 +1802,9 @@ mod tests {
 
     #[async_trait(?Send)]
     impl Provider for RetryThenStopProvider {
-        async fn stream_chat(
+        async fn stream(
             &self,
-            _request: &RequestOptions,
-            _messages: &[Message],
-            _tools: &[Value],
+            _request: &Request,
             on_event: &mut dyn FnMut(crate::provider::StreamEvent) -> Result<(), ProviderError>,
         ) -> Result<StreamResult, ProviderError> {
             let mut step = self.step.lock().unwrap();
@@ -1878,14 +1841,12 @@ mod tests {
 
     #[async_trait(?Send)]
     impl Provider for ResumeThenStopProvider {
-        async fn stream_chat(
+        async fn stream(
             &self,
-            _request: &RequestOptions,
-            messages: &[Message],
-            _tools: &[Value],
+            request: &Request,
             _on_event: &mut dyn FnMut(crate::provider::StreamEvent) -> Result<(), ProviderError>,
         ) -> Result<StreamResult, ProviderError> {
-            self.seen.lock().unwrap().push(messages.to_vec());
+            self.seen.lock().unwrap().push(request.messages.to_vec());
             let mut calls = self.calls.lock().unwrap();
             let call = *calls;
             *calls += 1;
@@ -1924,11 +1885,9 @@ mod tests {
 
     #[async_trait(?Send)]
     impl Provider for TwoReadonlyThenStopProvider {
-        async fn stream_chat(
+        async fn stream(
             &self,
-            _request: &RequestOptions,
-            _messages: &[Message],
-            _tools: &[Value],
+            _request: &Request,
             _on_event: &mut dyn FnMut(crate::provider::StreamEvent) -> Result<(), ProviderError>,
         ) -> Result<StreamResult, ProviderError> {
             let mut step = self.step.lock().unwrap();
@@ -1949,29 +1908,23 @@ mod tests {
                             tool_calls: Some(vec![
                                 ToolCall {
                                     id: "call_first".into(),
-                                    function: crate::provider::FunctionCall {
-                                        name: "bash".into(),
-                                        arguments: serde_json::json!({
-                                            "title": "first",
-                                            "risk": "readonly",
-                                            "command": first_command,
-                                            "timeout": 3,
-                                        })
-                                        .to_string(),
-                                    },
+                                    arguments: serde_json::json!({
+                                        "title": "first",
+                                        "risk": "readonly",
+                                        "command": first_command,
+                                        "timeout": 3,
+                                    })
+                                    .to_string(),
                                 },
                                 ToolCall {
                                     id: "call_second".into(),
-                                    function: crate::provider::FunctionCall {
-                                        name: "bash".into(),
-                                        arguments: serde_json::json!({
-                                            "title": "second",
-                                            "risk": "readonly",
-                                            "command": second_command,
-                                            "timeout": 3,
-                                        })
-                                        .to_string(),
-                                    },
+                                    arguments: serde_json::json!({
+                                        "title": "second",
+                                        "risk": "readonly",
+                                        "command": second_command,
+                                        "timeout": 3,
+                                    })
+                                    .to_string(),
                                 },
                             ]),
                         },
@@ -2008,11 +1961,9 @@ mod tests {
 
     #[async_trait(?Send)]
     impl Provider for InvalidReadonlyThenStopProvider {
-        async fn stream_chat(
+        async fn stream(
             &self,
-            _request: &RequestOptions,
-            _messages: &[Message],
-            _tools: &[Value],
+            _request: &Request,
             _on_event: &mut dyn FnMut(crate::provider::StreamEvent) -> Result<(), ProviderError>,
         ) -> Result<StreamResult, ProviderError> {
             let mut step = self.step.lock().unwrap();
@@ -2027,27 +1978,21 @@ mod tests {
                         tool_calls: Some(vec![
                             ToolCall {
                                 id: "call_valid".into(),
-                                function: crate::provider::FunctionCall {
-                                    name: "bash".into(),
-                                    arguments: serde_json::json!({
-                                        "title": "valid",
-                                        "risk": "readonly",
-                                        "command": "printf valid",
-                                    })
-                                    .to_string(),
-                                },
+                                arguments: serde_json::json!({
+                                    "title": "valid",
+                                    "risk": "readonly",
+                                    "command": "printf valid",
+                                })
+                                .to_string(),
                             },
                             ToolCall {
                                 id: "call_invalid".into(),
-                                function: crate::provider::FunctionCall {
-                                    name: "bash".into(),
-                                    arguments: serde_json::json!({
-                                        "description": "missing title",
-                                        "risk": "readonly",
-                                        "command": "printf must-not-run",
-                                    })
-                                    .to_string(),
-                                },
+                                arguments: serde_json::json!({
+                                    "description": "missing title",
+                                    "risk": "readonly",
+                                    "command": "printf must-not-run",
+                                })
+                                .to_string(),
                             },
                         ]),
                     },
@@ -2134,10 +2079,7 @@ mod tests {
             provider,
             store: &store,
             session_id: &session.id,
-            request: RequestOptions {
-                model: request_model,
-                cache_key: None,
-            },
+            cache_key: None,
             model_context_window: None,
             renderer: &mut renderer,
         };
@@ -2214,10 +2156,7 @@ mod tests {
             provider,
             store: &store,
             session_id: &session.id,
-            request: RequestOptions {
-                model: request_model,
-                cache_key: None,
-            },
+            cache_key: None,
             model_context_window: None,
             renderer: &mut renderer,
         };
@@ -2276,10 +2215,7 @@ mod tests {
             provider,
             store: &store,
             session_id: &session.id,
-            request: RequestOptions {
-                model: request_model,
-                cache_key: None,
-            },
+            cache_key: None,
             model_context_window: None,
             renderer: &mut renderer,
         };
@@ -2322,10 +2258,7 @@ mod tests {
             provider,
             store: &store,
             session_id: &session.id,
-            request: RequestOptions {
-                model: request_model.clone(),
-                cache_key: None,
-            },
+            cache_key: None,
             model_context_window: None,
             renderer: &mut renderer,
         };
@@ -2360,10 +2293,7 @@ mod tests {
             provider,
             store: &store,
             session_id: &session.id,
-            request: RequestOptions {
-                model: request_model,
-                cache_key: None,
-            },
+            cache_key: None,
             model_context_window: None,
             renderer: &mut renderer,
         };
@@ -2417,7 +2347,6 @@ mod tests {
         ]);
         let model = crate::models::resolve_model_choice(&config, "fake-model").unwrap();
         let retry_limit = provider_retry_limit(&model);
-        let request_model = model.active_model().clone();
         let first_seen = Arc::new(Mutex::new(Vec::new()));
         let provider = Box::new(ResumeThenStopProvider {
             resumes_before_stop: usize::MAX,
@@ -2431,10 +2360,7 @@ mod tests {
             provider,
             store: &store,
             session_id: &session.id,
-            request: RequestOptions {
-                model: request_model,
-                cache_key: None,
-            },
+            cache_key: None,
             model_context_window: None,
             renderer: &mut renderer,
         };
@@ -2494,10 +2420,7 @@ mod tests {
             }),
             store: &store,
             session_id: &session.id,
-            request: RequestOptions {
-                model: request_model,
-                cache_key: None,
-            },
+            cache_key: None,
             model_context_window: None,
             renderer: &mut renderer,
         };
@@ -2561,10 +2484,7 @@ mod tests {
             }),
             store: &store,
             session_id: &session.id,
-            request: RequestOptions {
-                model: request_model,
-                cache_key: None,
-            },
+            cache_key: None,
             model_context_window: None,
             renderer: &mut renderer,
         };
@@ -2613,10 +2533,7 @@ mod tests {
             provider: Box::new(PartialFailureProvider),
             store: &store,
             session_id: &session.id,
-            request: RequestOptions {
-                model: request_model,
-                cache_key: None,
-            },
+            cache_key: None,
             model_context_window: None,
             renderer: &mut renderer,
         };
@@ -2685,10 +2602,7 @@ mod tests {
             provider,
             store: &store,
             session_id: &session.id,
-            request: RequestOptions {
-                model: request_model,
-                cache_key: None,
-            },
+            cache_key: None,
             model_context_window: None,
             renderer: &mut renderer,
         };
@@ -2754,10 +2668,7 @@ mod tests {
             provider,
             store: &store,
             session_id: &session.id,
-            request: RequestOptions {
-                model: request_model,
-                cache_key: None,
-            },
+            cache_key: None,
             model_context_window: None,
             renderer: &mut renderer,
         };
@@ -2799,14 +2710,12 @@ mod tests {
 
     #[async_trait(?Send)]
     impl Provider for BoundaryCompactionProvider {
-        async fn stream_chat(
+        async fn stream(
             &self,
-            _request: &RequestOptions,
-            messages: &[Message],
-            _tools: &[Value],
+            request: &Request,
             _on_event: &mut dyn FnMut(crate::provider::StreamEvent) -> Result<(), ProviderError>,
         ) -> Result<StreamResult, ProviderError> {
-            let summarizing = messages.iter().any(|message| {
+            let summarizing = request.messages.iter().any(|message| {
                 matches!(
                     message,
                     Message::User { content }
@@ -2835,14 +2744,12 @@ mod tests {
 
     #[async_trait(?Send)]
     impl Provider for GrowThenStopProvider {
-        async fn stream_chat(
+        async fn stream(
             &self,
-            _request: &RequestOptions,
-            messages: &[Message],
-            _tools: &[Value],
+            request: &Request,
             _on_event: &mut dyn FnMut(crate::provider::StreamEvent) -> Result<(), ProviderError>,
         ) -> Result<StreamResult, ProviderError> {
-            let is_summarize = messages.iter().any(|message| match message {
+            let is_summarize = request.messages.iter().any(|message| match message {
                 Message::User { content } => {
                     let text = content.text();
                     text.contains("Summarize this conversation")
@@ -2880,15 +2787,12 @@ mod tests {
                         native_replay: None,
                         tool_calls: Some(vec![ToolCall {
                             id: "call_grow".into(),
-                            function: crate::provider::FunctionCall {
-                                name: "bash".into(),
-                                arguments: serde_json::json!({
-                                    "title": "grow context",
-                                    "risk": "readonly",
-                                    "command": "head -c 620000 /dev/zero | tr '\\0' x",
-                                })
-                                .to_string(),
-                            },
+                            arguments: serde_json::json!({
+                                "title": "grow context",
+                                "risk": "readonly",
+                                "command": "head -c 620000 /dev/zero | tr '\\0' x",
+                            })
+                            .to_string(),
                         }]),
                     },
                     finish_reason: FinishReason::ToolCalls,
@@ -2989,10 +2893,7 @@ mod tests {
             provider,
             store: &store,
             session_id: &session.id,
-            request: RequestOptions {
-                model: request_model,
-                cache_key: None,
-            },
+            cache_key: None,
             // At 200K, the hard threshold is 152K tokens. The ~620KB tool result
             // pushes the bytes/4 estimate past it without crossing soft at the boundary.
             model_context_window: Some(200_000),
@@ -3069,10 +2970,7 @@ mod tests {
             provider: Box::new(BoundaryCompactionProvider),
             store: &store,
             session_id: &new_turn_session.id,
-            request: RequestOptions {
-                model: request_model.clone(),
-                cache_key: None,
-            },
+            cache_key: None,
             model_context_window: Some(200_000),
             renderer: &mut renderer,
         };
@@ -3093,10 +2991,7 @@ mod tests {
             provider: Box::new(BoundaryCompactionProvider),
             store: &store,
             session_id: &retry_session.id,
-            request: RequestOptions {
-                model: request_model,
-                cache_key: None,
-            },
+            cache_key: None,
             model_context_window: Some(200_000),
             renderer: &mut renderer,
         };
@@ -3116,11 +3011,9 @@ mod tests {
 
     #[async_trait(?Send)]
     impl Provider for TwoCallUsageProvider {
-        async fn stream_chat(
+        async fn stream(
             &self,
-            _request: &RequestOptions,
-            _messages: &[Message],
-            _tools: &[Value],
+            _request: &Request,
             _on_event: &mut dyn FnMut(crate::provider::StreamEvent) -> Result<(), ProviderError>,
         ) -> Result<StreamResult, ProviderError> {
             let mut step = self.step.lock().unwrap();
@@ -3134,15 +3027,12 @@ mod tests {
                         native_replay: None,
                         tool_calls: Some(vec![ToolCall {
                             id: "call_readonly".into(),
-                            function: crate::provider::FunctionCall {
-                                name: "bash".into(),
-                                arguments: serde_json::json!({
-                                    "title": "noop",
-                                    "risk": "readonly",
-                                    "command": "true",
-                                })
-                                .to_string(),
-                            },
+                            arguments: serde_json::json!({
+                                "title": "noop",
+                                "risk": "readonly",
+                                "command": "true",
+                            })
+                            .to_string(),
                         }]),
                     },
                     finish_reason: FinishReason::ToolCalls,
@@ -3208,10 +3098,7 @@ mod tests {
             provider,
             store: &store,
             session_id: &session.id,
-            request: RequestOptions {
-                model: request_model,
-                cache_key: None,
-            },
+            cache_key: None,
             model_context_window: None,
             renderer: &mut renderer,
         };
@@ -3237,11 +3124,9 @@ mod tests {
 
     #[async_trait(?Send)]
     impl Provider for LengthFinishProvider {
-        async fn stream_chat(
+        async fn stream(
             &self,
-            _request: &RequestOptions,
-            _messages: &[Message],
-            _tools: &[Value],
+            _request: &Request,
             _on_event: &mut dyn FnMut(crate::provider::StreamEvent) -> Result<(), ProviderError>,
         ) -> Result<StreamResult, ProviderError> {
             Ok(StreamResult {
@@ -3251,15 +3136,12 @@ mod tests {
                     native_replay: None,
                     tool_calls: Some(vec![ToolCall {
                         id: "truncated".into(),
-                        function: crate::provider::FunctionCall {
-                            name: "bash".into(),
-                            arguments: serde_json::json!({
-                                "title": "must not run",
-                                "risk": "readonly",
-                                "command": "false",
-                            })
-                            .to_string(),
-                        },
+                        arguments: serde_json::json!({
+                            "title": "must not run",
+                            "risk": "readonly",
+                            "command": "false",
+                        })
+                        .to_string(),
                     }]),
                 },
                 finish_reason: FinishReason::Other("length".into()),
@@ -3306,10 +3188,7 @@ mod tests {
             provider,
             store: &store,
             session_id: &session.id,
-            request: RequestOptions {
-                model: request_model,
-                cache_key: None,
-            },
+            cache_key: None,
             model_context_window: None,
             renderer: &mut renderer,
         };

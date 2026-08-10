@@ -3,11 +3,10 @@ use std::collections::BTreeMap;
 use serde::Deserialize;
 use serde_json::Value;
 
-use crate::models::RequestOptions;
 use crate::provider::{
-    ContentPart, FinishReason, FunctionCall, HttpProvider, Message, NativeReplay,
-    NativeReplayPayload, ProviderError, ReasoningVisibility, SseEvent, StreamEvent, StreamResult,
-    ToolCall, ToolCallDelta as ProviderToolCallDelta, Usage, UserContent, base64_encode,
+    ContentPart, FinishReason, HttpProvider, Message, NativeReplay, NativeReplayPayload,
+    ProviderError, ReasoningVisibility, Request, SseEvent, StreamEvent, StreamResult, ToolCall,
+    ToolCallDelta as ProviderToolCallDelta, Usage, UserContent, base64_encode,
     classify_stream_error,
 };
 
@@ -108,12 +107,10 @@ impl Default for StreamParseState {
 
 pub(crate) async fn stream(
     provider: &HttpProvider,
-    request: &RequestOptions,
-    messages: &[Message],
-    tools: &[Value],
+    request: &Request,
     on_event: &mut dyn FnMut(StreamEvent) -> Result<(), ProviderError>,
 ) -> Result<StreamResult, ProviderError> {
-    let body = build_chat_request_body(request, &provider.endpoint, messages, tools);
+    let body = request.json(crate::provider::ModelApi::ChatCompletions)?;
     let mut state = StreamParseState::default();
     provider
         .stream_sse(&body, &mut |event| match event {
@@ -164,7 +161,10 @@ pub(crate) async fn stream(
                     "tool_calls": tool_calls.as_ref().map(|calls| calls.iter().map(|call| serde_json::json!({
                         "id": &call.id,
                         "type": "function",
-                        "function": &call.function,
+                        "function": {
+                            "name": "bash",
+                            "arguments": &call.arguments,
+                        },
                     })).collect::<Vec<_>>()),
                 },
                 "finish_reason": match &state.finish_reason {
@@ -197,15 +197,10 @@ pub(crate) async fn stream(
     })
 }
 
-pub(crate) fn build_chat_request_body(
-    request: &RequestOptions,
-    _endpoint: &str,
-    messages: &[Message],
-    tools: &[Value],
-) -> Value {
+pub(crate) fn build_request_body(request: &Request, tools: &[Value]) -> Value {
     let mut body = serde_json::json!({
         "model": request.model.model_id.as_str(),
-        "messages": chat_messages_json(messages),
+        "messages": chat_messages_json(&request.messages),
         "tools": tools,
         "stream": true,
         "stream_options": { "include_usage": true }
@@ -274,7 +269,10 @@ fn chat_message_json(message: &Message) -> Vec<Value> {
                             serde_json::json!({
                                 "id": call.id,
                                 "type": "function",
-                                "function": &call.function,
+                                "function": {
+                                    "name": "bash",
+                                    "arguments": &call.arguments,
+                                },
                             })
                         })
                         .collect(),
@@ -495,18 +493,19 @@ fn completed_tool_calls(
     tool_accum
         .into_values()
         .map(|(id, name, arguments)| {
+            let id = id.unwrap_or_else(|| "call".into());
+            let name = name.unwrap_or_default();
+            if name != "bash" {
+                return Err(ProviderError::Protocol(format!(
+                    "Chat Completions tool call `{id}` calls unsupported tool `{name}`"
+                )));
+            }
             let arguments = if validate_arguments {
                 validate_tool_arguments(&arguments)?
             } else {
                 arguments
             };
-            Ok(ToolCall {
-                id: id.unwrap_or_else(|| "call".into()),
-                function: FunctionCall {
-                    name: name.unwrap_or_default(),
-                    arguments,
-                },
-            })
+            Ok(ToolCall { id, arguments })
         })
         .collect()
 }
@@ -594,11 +593,52 @@ mod tests {
     use crate::models::ResolvedModelRef;
     use crate::provider::{Provider, classify_http_error};
     use crate::responses::{
-        ResponsesStreamState, build_responses_request_body, consume_responses_sse_buffer,
-        responses_tool_calls,
+        ResponsesStreamState, consume_responses_sse_buffer, responses_tool_calls,
     };
     use std::time::Duration;
     const CHAT_ENDPOINT: &str = "https://example.test/v1/chat/completions";
+
+    #[derive(Clone)]
+    struct TestRequest {
+        model: ResolvedModelRef,
+        cache_key: Option<String>,
+    }
+
+    impl TestRequest {
+        fn for_session(model: ResolvedModelRef, session_id: &str, purpose: &str) -> Self {
+            Self {
+                model,
+                cache_key: Some(format!("mu:{session_id}:{purpose}")),
+            }
+        }
+    }
+
+    fn semantic_request(request: &TestRequest, messages: &[Message], bash: bool) -> Request {
+        Request {
+            model: request.model.clone(),
+            cache_key: request.cache_key.clone(),
+            messages: messages.to_vec(),
+            bash,
+        }
+    }
+
+    fn build_chat_request_body(
+        request: &TestRequest,
+        _endpoint: &str,
+        messages: &[Message],
+        tools: &[Value],
+    ) -> Value {
+        super::build_request_body(&semantic_request(request, messages, false), tools)
+    }
+
+    fn build_responses_request_body(
+        request: &TestRequest,
+        _endpoint: &str,
+        messages: &[Message],
+        tools: &[Value],
+    ) -> Result<Value, ProviderError> {
+        crate::responses::build_request_body(&semantic_request(request, messages, false), tools)
+    }
 
     fn test_model(effort: Option<&str>) -> ResolvedModelRef {
         ResolvedModelRef {
@@ -740,16 +780,12 @@ mod tests {
         };
 
         assert_eq!(
-            completed_tool_calls(calls("  \n"), true).unwrap()[0]
-                .function
-                .arguments,
+            completed_tool_calls(calls("  \n"), true).unwrap()[0].arguments,
             "{}"
         );
         let preserved = "  {\"command\":\"pwd\"} \n";
         assert_eq!(
-            completed_tool_calls(calls(preserved), true).unwrap()[0]
-                .function
-                .arguments,
+            completed_tool_calls(calls(preserved), true).unwrap()[0].arguments,
             preserved
         );
         for invalid in ["{", "[]", "\"text\"", "1", "true", "null"] {
@@ -762,11 +798,19 @@ mod tests {
             );
         }
         assert_eq!(
-            completed_tool_calls(calls("{"), false).unwrap()[0]
-                .function
-                .arguments,
+            completed_tool_calls(calls("{"), false).unwrap()[0].arguments,
             "{"
         );
+        assert!(matches!(
+            completed_tool_calls(
+                BTreeMap::from([(
+                    0,
+                    (Some("call_1".into()), Some("python".into()), "{}".into())
+                )]),
+                true
+            ),
+            Err(ProviderError::Protocol(message)) if message.contains("unsupported tool `python`")
+        ));
     }
 
     #[test]
@@ -899,7 +943,7 @@ mod tests {
     #[test]
     fn request_includes_reasoning_effort_when_set() {
         let body = build_chat_request_body(
-            &RequestOptions {
+            &TestRequest {
                 model: test_model(Some("provider-custom")),
                 cache_key: None,
             },
@@ -913,9 +957,9 @@ mod tests {
 
     #[test]
     fn chat_and_responses_requests_include_stable_session_cache_key() {
-        let request = RequestOptions::for_session(test_model(None), "ses_test", "agent");
-        let same = RequestOptions::for_session(test_model(Some("high")), "ses_test", "agent");
-        let compaction = RequestOptions::for_session(test_model(None), "ses_test", "compaction");
+        let request = TestRequest::for_session(test_model(None), "ses_test", "agent");
+        let same = TestRequest::for_session(test_model(Some("high")), "ses_test", "agent");
+        let compaction = TestRequest::for_session(test_model(None), "ses_test", "compaction");
 
         assert_eq!(request.cache_key.as_deref(), Some("mu:ses_test:agent"));
         assert_eq!(request.cache_key, same.cache_key);
@@ -954,7 +998,7 @@ mod tests {
         }];
 
         let body = build_chat_request_body(
-            &RequestOptions {
+            &TestRequest {
                 model: test_model(None),
                 cache_key: None,
             },
@@ -1003,7 +1047,7 @@ mod tests {
             }
         })];
         let body = build_responses_request_body(
-            &RequestOptions {
+            &TestRequest {
                 model: test_model(Some("max")),
                 cache_key: None,
             },
@@ -1033,7 +1077,7 @@ mod tests {
     #[test]
     fn responses_request_includes_summary_without_explicit_effort() {
         let body = build_responses_request_body(
-            &RequestOptions {
+            &TestRequest {
                 model: test_model(None),
                 cache_key: None,
             },
@@ -1057,10 +1101,7 @@ mod tests {
             reasoning_content: None,
             tool_calls: Some(vec![ToolCall {
                 id: "call_1".into(),
-                function: FunctionCall {
-                    name: "bash".into(),
-                    arguments: "{}".into(),
-                },
+                arguments: "{}".into(),
             }]),
             native_replay: Some(NativeReplay {
                 provider_id: "test".into(),
@@ -1078,7 +1119,7 @@ mod tests {
             },
         ];
         let matching = build_responses_request_body(
-            &RequestOptions {
+            &TestRequest {
                 model: test_model(None),
                 cache_key: None,
             },
@@ -1095,7 +1136,7 @@ mod tests {
         switched_model.provider_id = "fallback".into();
         switched_model.model_id = "other-model".into();
         let switched = build_responses_request_body(
-            &RequestOptions {
+            &TestRequest {
                 model: switched_model,
                 cache_key: None,
             },
@@ -1126,7 +1167,7 @@ mod tests {
         }];
 
         let responses = build_responses_request_body(
-            &RequestOptions {
+            &TestRequest {
                 model: test_model(None),
                 cache_key: None,
             },
@@ -1140,7 +1181,7 @@ mod tests {
         assert_eq!(responses["input"][0]["output"][1]["detail"], "original");
 
         let chat = build_chat_request_body(
-            &RequestOptions {
+            &TestRequest {
                 model: test_model(None),
                 cache_key: None,
             },
@@ -1180,7 +1221,7 @@ mod tests {
             },
         ];
         let chat = build_chat_request_body(
-            &RequestOptions {
+            &TestRequest {
                 model: test_model(None),
                 cache_key: None,
             },
@@ -1198,10 +1239,7 @@ mod tests {
     fn switching_between_apis_keeps_semantics_without_foreign_native_state() {
         let call = ToolCall {
             id: "call_1".into(),
-            function: FunctionCall {
-                name: "bash".into(),
-                arguments: "{}".into(),
-            },
+            arguments: "{}".into(),
         };
         let from_chat = Message::Assistant {
             content: None,
@@ -1215,7 +1253,7 @@ mod tests {
             }),
         };
         let responses = build_responses_request_body(
-            &RequestOptions {
+            &TestRequest {
                 model: test_model(None),
                 cache_key: None,
             },
@@ -1241,7 +1279,7 @@ mod tests {
             }),
         };
         let chat = build_chat_request_body(
-            &RequestOptions {
+            &TestRequest {
                 model: test_model(None),
                 cache_key: None,
             },
@@ -1257,7 +1295,7 @@ mod tests {
     #[test]
     fn responses_rejects_audio_locally() {
         let error = build_responses_request_body(
-            &RequestOptions {
+            &TestRequest {
                 model: test_model(None),
                 cache_key: None,
             },
@@ -1317,9 +1355,7 @@ mod tests {
             StreamEvent::ToolCallDelta(delta) if delta.index == 0
         )));
         assert_eq!(
-            responses_tool_calls(&state.output).unwrap()[0]
-                .function
-                .arguments,
+            responses_tool_calls(&state.output).unwrap()[0].arguments,
             "{\"command\":\"pwd\"}"
         );
     }
@@ -1396,7 +1432,7 @@ mod tests {
         }];
 
         let matching = build_chat_request_body(
-            &RequestOptions {
+            &TestRequest {
                 model: test_model(None),
                 cache_key: None,
             },
@@ -1409,7 +1445,7 @@ mod tests {
             "  exact\\ntrace  "
         );
         let switched_endpoint = build_chat_request_body(
-            &RequestOptions {
+            &TestRequest {
                 model: test_model(None),
                 cache_key: None,
             },
@@ -1425,7 +1461,7 @@ mod tests {
         other_provider.provider_id = "fallback".into();
         other_provider.model_id = "other-model".into();
         let switched_provider_and_model = build_chat_request_body(
-            &RequestOptions {
+            &TestRequest {
                 model: other_provider,
                 cache_key: None,
             },
@@ -1446,10 +1482,7 @@ mod tests {
             reasoning_content: Some(String::new()),
             tool_calls: Some(vec![ToolCall {
                 id: "call_1".into(),
-                function: FunctionCall {
-                    name: "bash".into(),
-                    arguments: "{}".into(),
-                },
+                arguments: "{}".into(),
             }]),
             native_replay: Some(NativeReplay {
                 provider_id: "test".into(),
@@ -1460,7 +1493,7 @@ mod tests {
         };
 
         let body = build_chat_request_body(
-            &RequestOptions {
+            &TestRequest {
                 model: test_model(None),
                 cache_key: None,
             },
@@ -1558,14 +1591,13 @@ mod tests {
             HttpProvider::new(format!("http://{addr}/chat/completions"), None).unwrap();
         provider.idle_timeout = Duration::from_millis(200);
 
-        let request = RequestOptions {
+        let request = TestRequest {
             model: test_model(None),
             cache_key: None,
         };
+        let request = semantic_request(&request, &[], false);
         let mut on_event = |_event: StreamEvent| -> Result<(), ProviderError> { Ok(()) };
-        let result = provider
-            .stream_chat(&request, &[], &[], &mut on_event)
-            .await;
+        let result = provider.stream(&request, &mut on_event).await;
 
         server.abort();
 

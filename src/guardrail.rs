@@ -6,9 +6,9 @@ use serde_json::{Value, json};
 
 use crate::bash::BashRisk;
 use crate::config::{Config, GuardrailConfig};
-use crate::models::{RequestOptions, ResolvedModelRef, resolve_model_choice};
+use crate::models::{ResolvedModelRef, resolve_model_choice};
 use crate::provider::{
-    MAX_PROVIDER_RETRY_AFTER, Message, ProviderDisposition, ProviderError, approx_tokens,
+    MAX_PROVIDER_RETRY_AFTER, Message, ProviderDisposition, ProviderError, Request, approx_tokens,
     effective_retry_delay, provider_retry_delay, provider_retry_limit,
 };
 use crate::runtime::resume_session_fallback;
@@ -161,7 +161,6 @@ impl Guardrail {
                 content: user_content.into(),
             },
         ];
-        let tools = Vec::new();
         let timeout = Duration::from_secs(self.config.timeout_seconds);
         let mut attempt = 0;
         let mut parse_attempts = 0;
@@ -170,9 +169,14 @@ impl Guardrail {
         loop {
             attempt += 1;
             let request_model = model.active_model().clone();
-            let request =
-                RequestOptions::for_session(request_model.clone(), session_id, "guardrail");
-            let native_request = provider.native_request(&request, &msgs, &tools)?;
+            let request = Request::for_session(
+                request_model.clone(),
+                session_id,
+                "guardrail",
+                msgs.clone(),
+                false,
+            );
+            let native_request = request.json(provider.api())?;
             let recipe = store.request_recipe(
                 provider.request_format(),
                 &native_request,
@@ -183,7 +187,7 @@ impl Guardrail {
                     "context_through_seq": store.current_context_seq(session_id)?,
                     "policy_version": 1,
                 }),
-                &tools,
+                &request.tools(),
             )?;
             let exchange_id = store.start_provider_request(
                 session_id,
@@ -205,9 +209,7 @@ impl Guardrail {
             )?;
             let mut ignore_event = |_event: crate::provider::StreamEvent| Ok(());
             let result = tokio::time::timeout(timeout, async {
-                provider
-                    .stream_chat(&request, &msgs, &tools, &mut ignore_event)
-                    .await
+                provider.stream(&request, &mut ignore_event).await
             })
             .await;
 
@@ -417,10 +419,10 @@ fn collect_transcript_entries(messages: &[Message]) -> Vec<TranscriptEntry> {
                 }
                 if let Some(calls) = tool_calls {
                     for tc in calls {
-                        if !tc.function.arguments.trim().is_empty() {
+                        if !tc.arguments.trim().is_empty() {
                             entries.push(TranscriptEntry {
                                 kind: TranscriptEntryKind::ToolCall,
-                                text: tc.function.arguments.clone(),
+                                text: tc.arguments.clone(),
                             });
                         }
                     }
@@ -695,7 +697,7 @@ mod tests {
 
     use super::*;
     use crate::config::{ModelConfig, OrderedMap, ProviderConfig};
-    use crate::provider::{FunctionCall, ToolCall};
+    use crate::provider::ToolCall;
 
     fn test_guardrail(max_denials_per_turn: u32) -> Guardrail {
         Guardrail {
@@ -859,10 +861,9 @@ mod tests {
                     reasoning_content: None,
                     tool_calls: Some(vec![ToolCall {
                         id: "call-reviewed".into(),
-                        function: FunctionCall {
-                            name: "bash".into(),
-                            arguments: r#"{"title":"Remove file","risk":"destructive","command":"rm /tmp/x"}"#.into(),
-                        },
+                        arguments:
+                            r#"{"title":"Remove file","risk":"destructive","command":"rm /tmp/x"}"#
+                                .into(),
                     }]),
                     native_replay: None,
                 },

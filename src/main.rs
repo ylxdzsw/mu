@@ -39,7 +39,7 @@ use attachment::MAX_ATTACHMENT_BYTES;
 use attachment::load_attachments;
 use cli::{Args, Command, ProjectSub, SessionSub};
 use config::Config;
-use models::{RequestOptions, ResolvedModelChoice};
+use models::ResolvedModelChoice;
 use provider::build_provider;
 use provider::{ContentPart, UserContent};
 use renderer::Renderer;
@@ -423,10 +423,7 @@ async fn run() -> Result<()> {
                         // Emit toolcall requests immediately under their assistant message
                         if r.kind == "assistant" {
                             for tc in &r.bash_calls {
-                                println!(
-                                    "[{}:toolcall] {} {}",
-                                    r.seq, tc.function.name, tc.function.arguments
-                                );
+                                println!("[{}:toolcall] bash {}", r.seq, tc.arguments);
                             }
                         }
 
@@ -578,9 +575,7 @@ async fn run() -> Result<()> {
                 .get_session(&session)?
                 .ok_or_else(|| ExitError::session_not_found(&session))?;
             let mut model = resolve_session_model(&store, &config, &session_state)?;
-            let request =
-                RequestOptions::for_session(model.active_model().clone(), &session, "compaction");
-            let mut provider = build_provider(&config, &request.model.provider_id)?;
+            let mut provider = build_provider(&config, &model.active_model().provider_id)?;
             let _lock = acquire_session_lock_or_exit(&store, &session, cli::OutputFormat::Detail)?;
             store.normalize_interrupted_tail(&session)?;
             let mut renderer =
@@ -881,9 +876,9 @@ async fn run_turn(args: RunTurnArgs<'_>) -> Result<()> {
         model_fallback,
         compact_at_turn_boundary,
     } = args;
-    let request = RequestOptions::for_session(model.active_model().clone(), session_id, "agent");
-    let model_context_window = models::resolve_model_info(config, &request.model).context_window;
-    let provider = build_provider(config, &request.model.provider_id)?;
+    let active_model = model.active_model();
+    let model_context_window = models::resolve_model_info(config, active_model).context_window;
+    let provider = build_provider(config, &active_model.provider_id)?;
 
     let turn_done_bell_min_duration = config
         .terminal_bell
@@ -907,7 +902,7 @@ async fn run_turn(args: RunTurnArgs<'_>) -> Result<()> {
         provider,
         store,
         session_id,
-        request,
+        cache_key: Some(format!("mu:{session_id}:agent")),
         model_context_window,
         renderer: &mut renderer,
     };

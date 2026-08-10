@@ -709,18 +709,12 @@ impl Renderer {
         Ok(())
     }
 
-    /// Completion-only tools are silent here. Bash is the exception because
-    /// its live output needs a visible command header.
     pub fn tool_start(
         &mut self,
-        name: &str,
         args: &serde_json::Value,
         header_already_rendered: bool,
     ) -> io::Result<()> {
         if self.format == OutputFormat::Final {
-            return Ok(());
-        }
-        if name != "bash" {
             return Ok(());
         }
         self.assistant_block_open = false;
@@ -783,14 +777,14 @@ impl Renderer {
         self.write_stdout_committed(&terminal_trim_committed_text(&text))
     }
 
-    pub fn tool_failed(&mut self, name: &str, error: &str, elapsed: Duration) -> io::Result<()> {
+    pub fn tool_failed(&mut self, error: &str, elapsed: Duration) -> io::Result<()> {
         if self.format == OutputFormat::Final {
             return Ok(());
         }
         if self.format == OutputFormat::Concise {
             if self.concise_tool.is_none() {
                 self.concise_tool = Some(ConciseToolState {
-                    title: name.to_string(),
+                    title: "bash".to_string(),
                     risk: None,
                 });
             }
@@ -801,10 +795,10 @@ impl Renderer {
         let elapsed = format_duration(elapsed);
         let line = if self.styled {
             format!(
-                "{RED}✗ {BOLD}{name} failed{RESET}{RED}: {error}{RESET}{DIM} · {elapsed}{RESET}\n"
+                "{RED}✗ {BOLD}bash failed{RESET}{RED}: {error}{RESET}{DIM} · {elapsed}{RESET}\n"
             )
         } else {
-            format!("✗ {name} failed: {error} · {elapsed}\n")
+            format!("✗ bash failed: {error} · {elapsed}\n")
         };
         let line = self.fit_one_line(&terminal_trim_committed_text(&line));
         self.write_stdout_committed(&line)
@@ -5022,7 +5016,7 @@ mod tests {
         });
 
         renderer.bash_header_full(&args).unwrap();
-        renderer.tool_start("bash", &args, true).unwrap();
+        renderer.tool_start(&args, true).unwrap();
         renderer.bash_output("hidden output\n").unwrap();
         renderer
             .tool_finished(7, Duration::from_millis(250))
@@ -5117,7 +5111,7 @@ mod tests {
             .collect::<String>();
 
         renderer.bash_header_full(&args).unwrap();
-        renderer.tool_start("bash", &args, true).unwrap();
+        renderer.tool_start(&args, true).unwrap();
         renderer.bash_output(&command_output).unwrap();
         renderer.tool_finished(0, Duration::from_millis(5)).unwrap();
 

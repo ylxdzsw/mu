@@ -12,7 +12,7 @@ use serde_json::Value;
 use tokio::time::{self, MissedTickBehavior};
 
 use crate::config::Config;
-use crate::models::{RequestOptions, ResolvedModelChoice, ResolvedModelRef};
+use crate::models::{ResolvedModelChoice, ResolvedModelRef};
 
 #[derive(Debug, Clone)]
 pub enum Message {
@@ -161,6 +161,72 @@ pub enum ModelApi {
     ChatCompletions,
     Responses,
     AnthropicMessages,
+}
+
+#[derive(Debug)]
+pub struct Request {
+    pub model: ResolvedModelRef,
+    pub cache_key: Option<String>,
+    pub messages: Vec<Message>,
+    pub bash: bool,
+}
+
+impl Request {
+    pub fn for_session(
+        model: ResolvedModelRef,
+        session_id: &str,
+        purpose: &str,
+        messages: Vec<Message>,
+        bash: bool,
+    ) -> Self {
+        Self {
+            model,
+            cache_key: Some(format!("mu:{session_id}:{purpose}")),
+            messages,
+            bash,
+        }
+    }
+
+    pub fn json(&self, api: ModelApi) -> Result<Value, ProviderError> {
+        let tools = self.tools();
+        self.json_with_tools(api, &tools)
+    }
+
+    pub(crate) fn historical_json(
+        &self,
+        api: ModelApi,
+        tools: &[Value],
+    ) -> Result<Value, ProviderError> {
+        if tools.iter().any(|tool| {
+            tool.pointer("/function/name")
+                .or_else(|| tool.get("name"))
+                .and_then(Value::as_str)
+                != Some("bash")
+        }) {
+            return Err(ProviderError::Protocol(
+                "recorded request contains a non-bash tool".into(),
+            ));
+        }
+        self.json_with_tools(api, tools)
+    }
+
+    fn json_with_tools(&self, api: ModelApi, tools: &[Value]) -> Result<Value, ProviderError> {
+        match api {
+            ModelApi::ChatCompletions => {
+                Ok(crate::chat_completions::build_request_body(self, tools))
+            }
+            ModelApi::Responses => crate::responses::build_request_body(self, tools),
+            ModelApi::AnthropicMessages => crate::anthropic::build_request_body(self, tools),
+        }
+    }
+
+    pub fn tools(&self) -> Vec<Value> {
+        if self.bash {
+            crate::bash::tool_definitions()
+        } else {
+            Vec::new()
+        }
+    }
 }
 
 /// Bound the connect phase so a dead host fails fast instead of hanging the turn.
@@ -402,12 +468,6 @@ pub struct ToolAttachment {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolCall {
     pub id: String,
-    pub function: FunctionCall,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct FunctionCall {
-    pub name: String,
     pub arguments: String,
 }
 
@@ -644,24 +704,13 @@ pub trait Provider: Send + Sync {
         "test"
     }
 
-    fn native_request(
-        &self,
-        request: &RequestOptions,
-        messages: &[Message],
-        tools: &[Value],
-    ) -> Result<Value, ProviderError> {
-        Ok(serde_json::json!({
-            "model": request.model.model_id,
-            "message_count": messages.len(),
-            "tools": tools,
-        }))
+    fn api(&self) -> ModelApi {
+        ModelApi::ChatCompletions
     }
 
-    async fn stream_chat(
+    async fn stream(
         &self,
-        request: &RequestOptions,
-        messages: &[Message],
-        tools: &[Value],
+        request: &Request,
         on_event: &mut dyn FnMut(StreamEvent) -> Result<(), ProviderError>,
     ) -> Result<StreamResult, ProviderError>;
 }
@@ -688,48 +737,21 @@ impl Provider for HttpProvider {
         }
     }
 
-    fn native_request(
-        &self,
-        request: &RequestOptions,
-        messages: &[Message],
-        tools: &[Value],
-    ) -> Result<Value, ProviderError> {
-        match self.api {
-            ModelApi::ChatCompletions => Ok(crate::chat_completions::build_chat_request_body(
-                request,
-                &self.endpoint,
-                messages,
-                tools,
-            )),
-            ModelApi::Responses => crate::responses::build_responses_request_body(
-                request,
-                &self.endpoint,
-                messages,
-                tools,
-            ),
-            ModelApi::AnthropicMessages => {
-                crate::anthropic::build_request_body(request, &self.endpoint, messages, tools)
-            }
-        }
+    fn api(&self) -> ModelApi {
+        self.api
     }
 
-    async fn stream_chat(
+    async fn stream(
         &self,
-        request: &RequestOptions,
-        messages: &[Message],
-        tools: &[Value],
+        request: &Request,
         on_event: &mut dyn FnMut(StreamEvent) -> Result<(), ProviderError>,
     ) -> Result<StreamResult, ProviderError> {
         match self.api {
             ModelApi::ChatCompletions => {
-                crate::chat_completions::stream(self, request, messages, tools, on_event).await
+                crate::chat_completions::stream(self, request, on_event).await
             }
-            ModelApi::Responses => {
-                crate::responses::stream(self, request, messages, tools, on_event).await
-            }
-            ModelApi::AnthropicMessages => {
-                crate::anthropic::stream(self, request, messages, tools, on_event).await
-            }
+            ModelApi::Responses => crate::responses::stream(self, request, on_event).await,
+            ModelApi::AnthropicMessages => crate::anthropic::stream(self, request, on_event).await,
         }
     }
 }
@@ -1076,6 +1098,49 @@ mod tests {
         RedactionConfig, TerminalBellConfig,
     };
     use crate::models::ResolvedModelRef;
+
+    fn request(bash: bool) -> Request {
+        Request {
+            model: ResolvedModelRef {
+                canonical: "test/model".into(),
+                provider_id: "test".into(),
+                model_id: "model".into(),
+                effort: None,
+            },
+            cache_key: None,
+            messages: vec![
+                Message::System {
+                    content: "system".into(),
+                },
+                Message::User {
+                    content: "hello".into(),
+                },
+            ],
+            bash,
+        }
+    }
+
+    #[test]
+    fn request_boolean_controls_the_fixed_bash_schema() {
+        for (api, name_pointer) in [
+            (ModelApi::ChatCompletions, "/tools/0/function/name"),
+            (ModelApi::Responses, "/tools/0/name"),
+            (ModelApi::AnthropicMessages, "/tools/0/name"),
+        ] {
+            let with_bash = request(true).json(api).unwrap();
+            assert_eq!(
+                with_bash.pointer(name_pointer).and_then(Value::as_str),
+                Some("bash")
+            );
+            assert_eq!(
+                request(false).json(api).unwrap()["tools"]
+                    .as_array()
+                    .unwrap()
+                    .len(),
+                0
+            );
+        }
+    }
 
     fn replay_config(source_key: Option<&str>, target_key: Option<&str>) -> Config {
         Config {

@@ -2,22 +2,19 @@ use std::collections::BTreeMap;
 
 use serde_json::Value;
 
-use crate::models::RequestOptions;
 use crate::provider::{
-    ContentPart, FinishReason, FunctionCall, HttpProvider, Message, NativeReplay,
-    NativeReplayPayload, ProviderError, ReasoningVisibility, SseEvent, StreamEvent, StreamResult,
-    ToolCall, ToolCallDelta as ProviderToolCallDelta, Usage, UserContent, base64_encode,
+    ContentPart, FinishReason, HttpProvider, Message, NativeReplay, NativeReplayPayload,
+    ProviderError, ReasoningVisibility, Request, SseEvent, StreamEvent, StreamResult, ToolCall,
+    ToolCallDelta as ProviderToolCallDelta, Usage, UserContent, base64_encode,
     classify_stream_error, next_event_boundary,
 };
 
 pub(crate) async fn stream(
     provider: &HttpProvider,
-    request: &RequestOptions,
-    messages: &[Message],
-    tools: &[Value],
+    request: &Request,
     on_event: &mut dyn FnMut(StreamEvent) -> Result<(), ProviderError>,
 ) -> Result<StreamResult, ProviderError> {
-    let body = build_responses_request_body(request, &provider.endpoint, messages, tools)?;
+    let body = request.json(crate::provider::ModelApi::Responses)?;
     let mut state = ResponsesStreamState::default();
     provider
         .stream_sse(&body, &mut |event| match event {
@@ -70,14 +67,12 @@ pub(crate) async fn stream(
     })
 }
 
-pub(crate) fn build_responses_request_body(
-    request: &RequestOptions,
-    _endpoint: &str,
-    messages: &[Message],
+pub(crate) fn build_request_body(
+    request: &Request,
     tools: &[Value],
 ) -> Result<Value, ProviderError> {
     let mut input = Vec::new();
-    for message in messages {
+    for message in &request.messages {
         responses_input_items(message, &mut input)?;
     }
     let response_tools = tools
@@ -143,8 +138,8 @@ fn responses_input_items(message: &Message, input: &mut Vec<Value>) -> Result<()
                         serde_json::json!({
                             "type": "function_call",
                             "call_id": call.id,
-                            "name": call.function.name,
-                            "arguments": call.function.arguments
+                            "name": "bash",
+                            "arguments": call.arguments
                         })
                     }));
                 }
@@ -423,6 +418,12 @@ pub(crate) fn responses_tool_calls(output: &[Value]) -> Result<Vec<ToolCall>, Pr
         .filter(|item| item["type"] == "function_call")
         .map(|item| {
             let id = item["call_id"].as_str().unwrap_or("call");
+            let name = item["name"].as_str().unwrap_or("");
+            if name != "bash" {
+                return Err(ProviderError::Protocol(format!(
+                    "Responses function call `{id}` calls unsupported tool `{name}`"
+                )));
+            }
             let arguments = item["arguments"].as_str().unwrap_or("");
             let arguments = if arguments.trim().is_empty() {
                 "{}".into()
@@ -441,10 +442,7 @@ pub(crate) fn responses_tool_calls(output: &[Value]) -> Result<Vec<ToolCall>, Pr
             };
             Ok(ToolCall {
                 id: id.to_string(),
-                function: FunctionCall {
-                    name: item["name"].as_str().unwrap_or("").to_string(),
-                    arguments,
-                },
+                arguments,
             })
         })
         .collect()
@@ -746,9 +744,7 @@ mod tests {
         };
 
         assert_eq!(
-            responses_tool_calls(&output(" \n")).unwrap()[0]
-                .function
-                .arguments,
+            responses_tool_calls(&output(" \n")).unwrap()[0].arguments,
             "{}"
         );
         for invalid in ["{", "[]", "\"text\"", "1", "true", "null"] {
@@ -757,5 +753,11 @@ mod tests {
                 Err(ProviderError::Protocol(_))
             ));
         }
+        let mut unsupported = output("{}");
+        unsupported[0]["name"] = Value::String("python".into());
+        assert!(matches!(
+            responses_tool_calls(&unsupported),
+            Err(ProviderError::Protocol(message)) if message.contains("unsupported tool `python`")
+        ));
     }
 }

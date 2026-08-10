@@ -578,10 +578,7 @@ mod tests {
             .unwrap();
         let call = crate::provider::ToolCall {
             id: uuid::Uuid::new_v4().to_string(),
-            function: crate::provider::FunctionCall {
-                name: "bash".into(),
-                arguments: r#"{"title":"Test","risk":"destructive","command":"true"}"#.into(),
-            },
+            arguments: r#"{"title":"Test","risk":"destructive","command":"true"}"#.into(),
         };
         let (_, call_ids) = store
             .append_message_with_bash_calls(

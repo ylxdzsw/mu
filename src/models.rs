@@ -79,21 +79,6 @@ impl ResolvedModelChoice {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RequestOptions {
-    pub model: ResolvedModelRef,
-    pub cache_key: Option<String>,
-}
-
-impl RequestOptions {
-    pub fn for_session(model: ResolvedModelRef, session_id: &str, purpose: &str) -> Self {
-        Self {
-            model,
-            cache_key: Some(format!("mu:{session_id}:{purpose}")),
-        }
-    }
-}
-
 #[derive(Debug, Clone, Serialize)]
 pub struct ResolvedModelInfo {
     pub context_window: Option<u64>,

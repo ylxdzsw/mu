@@ -2,23 +2,21 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde_json::Value;
 
-use crate::models::RequestOptions;
 use crate::provider::{
-    Attachment, ContentPart, FinishReason, FunctionCall, HttpProvider, Message, NativeReplay,
-    NativeReplayPayload, ProviderError, ReasoningVisibility, SseEvent, StreamEvent, StreamResult,
-    ToolCall, ToolCallDelta, Usage, UserContent, base64_encode, classify_stream_error,
+    Attachment, ContentPart, FinishReason, HttpProvider, Message, NativeReplay,
+    NativeReplayPayload, ProviderError, ReasoningVisibility, Request, SseEvent, StreamEvent,
+    StreamResult, ToolCall, ToolCallDelta, Usage, UserContent, base64_encode,
+    classify_stream_error,
 };
 
 const MAX_OUTPUT_TOKENS: u64 = 64_000;
 
 pub(crate) async fn stream(
     provider: &HttpProvider,
-    request: &RequestOptions,
-    messages: &[Message],
-    tools: &[Value],
+    request: &Request,
     on_event: &mut dyn FnMut(StreamEvent) -> Result<(), ProviderError>,
 ) -> Result<StreamResult, ProviderError> {
-    let body = build_request_body(request, &provider.endpoint, messages, tools)?;
+    let body = request.json(crate::provider::ModelApi::AnthropicMessages)?;
     let mut state = AnthropicStreamState::default();
     provider
         .stream_sse(&body, &mut |event| match event {
@@ -80,16 +78,14 @@ pub(crate) async fn stream(
 }
 
 pub(crate) fn build_request_body(
-    request: &RequestOptions,
-    _endpoint: &str,
-    messages: &[Message],
+    request: &Request,
     tools: &[Value],
 ) -> Result<Value, ProviderError> {
     let mut system = None;
     let mut wire_messages = Vec::new();
     let mut saw_non_system = false;
 
-    for message in messages {
+    for message in &request.messages {
         match message {
             Message::System { content } => {
                 if saw_non_system || system.is_some() {
@@ -282,7 +278,7 @@ fn assistant_blocks(
     }
     if let Some(tool_calls) = tool_calls {
         for call in tool_calls {
-            let input: Value = serde_json::from_str(&call.function.arguments).map_err(|error| {
+            let input: Value = serde_json::from_str(&call.arguments).map_err(|error| {
                 ProviderError::Protocol(format!(
                     "invalid JSON arguments for Anthropic tool call `{}`: {error}",
                     call.id
@@ -297,7 +293,7 @@ fn assistant_blocks(
             blocks.push(serde_json::json!({
                 "type": "tool_use",
                 "id": call.id,
-                "name": call.function.name,
+                "name": "bash",
                 "input": input,
             }));
         }
@@ -594,6 +590,11 @@ fn tool_calls_from_blocks(blocks: &[Value]) -> Result<Vec<ToolCall>, ProviderErr
             let name = block["name"].as_str().ok_or_else(|| {
                 ProviderError::Protocol("Anthropic tool_use block is missing `name`".into())
             })?;
+            if name != "bash" {
+                return Err(ProviderError::Protocol(format!(
+                    "Anthropic tool_use block `{id}` calls unsupported tool `{name}`"
+                )));
+            }
             let input = &block["input"];
             if !input.is_object() {
                 return Err(ProviderError::Protocol(format!(
@@ -602,11 +603,8 @@ fn tool_calls_from_blocks(blocks: &[Value]) -> Result<Vec<ToolCall>, ProviderErr
             }
             Ok(ToolCall {
                 id: id.to_string(),
-                function: FunctionCall {
-                    name: name.to_string(),
-                    arguments: serde_json::to_string(input)
-                        .map_err(|error| ProviderError::Protocol(error.to_string()))?,
-                },
+                arguments: serde_json::to_string(input)
+                    .map_err(|error| ProviderError::Protocol(error.to_string()))?,
             })
         })
         .collect()
@@ -638,12 +636,17 @@ fn finish_reason(reason: Option<&str>, blocks: &[Value], tool_calls: &[ToolCall]
 mod tests {
     use super::*;
     use crate::models::ResolvedModelRef;
-    use crate::provider::{ImageDetail, ProviderDisposition, ToolAttachment};
+    use crate::provider::{ImageDetail, ModelApi, ProviderDisposition, ToolAttachment};
 
     const ENDPOINT: &str = "https://api.anthropic.test/v1/messages";
 
-    fn request(effort: Option<&str>) -> RequestOptions {
-        RequestOptions {
+    struct TestRequest {
+        model: ResolvedModelRef,
+        cache_key: Option<String>,
+    }
+
+    fn request(effort: Option<&str>) -> TestRequest {
+        TestRequest {
             model: ResolvedModelRef {
                 canonical: "anthropic/claude-opus-5".into(),
                 provider_id: "anthropic".into(),
@@ -652,6 +655,20 @@ mod tests {
             },
             cache_key: None,
         }
+    }
+
+    fn request_body(
+        request: &TestRequest,
+        messages: &[Message],
+        tools: &[Value],
+    ) -> Result<Value, ProviderError> {
+        Request {
+            model: request.model.clone(),
+            cache_key: request.cache_key.clone(),
+            messages: messages.to_vec(),
+            bash: false,
+        }
+        .historical_json(ModelApi::AnthropicMessages, tools)
     }
 
     fn system() -> Message {
@@ -675,9 +692,8 @@ mod tests {
     fn builds_latest_messages_request_with_fixed_limits_and_tools() {
         let mut request = request(Some("max"));
         request.cache_key = Some("mu:ses_test:agent".into());
-        let body = build_request_body(
+        let body = request_body(
             &request,
-            ENDPOINT,
             &[
                 system(),
                 Message::User {
@@ -751,9 +767,8 @@ mod tests {
             media_type: "image/png".into(),
             data: vec![1, 2, 3],
         };
-        let body = build_request_body(
+        let body = request_body(
             &request(None),
-            ENDPOINT,
             &[
                 system(),
                 Message::User {
@@ -771,10 +786,7 @@ mod tests {
                     reasoning_content: None,
                     tool_calls: Some(vec![ToolCall {
                         id: "toolu_1".into(),
-                        function: FunctionCall {
-                            name: "bash".into(),
-                            arguments: r#"{"command":"pwd"}"#.into(),
-                        },
+                        arguments: r#"{"command":"pwd"}"#.into(),
                     }]),
                     native_replay: None,
                 },
@@ -800,9 +812,8 @@ mod tests {
         assert_eq!(tool_image["type"], "image");
         assert!(tool_image.get("detail").is_none());
 
-        let error = build_request_body(
+        let error = request_body(
             &request(None),
-            ENDPOINT,
             &[
                 system(),
                 Message::User {
@@ -845,10 +856,7 @@ mod tests {
             reasoning_content: None,
             tool_calls: Some(vec![ToolCall {
                 id: "toolu_1".into(),
-                function: FunctionCall {
-                    name: "bash".into(),
-                    arguments: r#"{"command":"pwd"}"#.into(),
-                },
+                arguments: r#"{"command":"pwd"}"#.into(),
             }]),
             native_replay: Some(NativeReplay {
                 provider_id: "anthropic".into(),
@@ -858,21 +866,13 @@ mod tests {
             }),
         };
 
-        let matching =
-            build_request_body(&request(None), ENDPOINT, &[system(), message.clone()], &[])
-                .unwrap();
+        let matching = request_body(&request(None), &[system(), message.clone()], &[]).unwrap();
         assert_eq!(
             matching["messages"][0]["content"],
             Value::Array(native_blocks)
         );
 
-        let foreign = build_request_body(
-            &request(None),
-            "https://other.test/v1/messages",
-            &[system(), message],
-            &[],
-        )
-        .unwrap();
+        let foreign = request_body(&request(None), &[system(), message], &[]).unwrap();
         assert_eq!(
             foreign["messages"][0]["content"],
             matching["messages"][0]["content"]
@@ -965,7 +965,13 @@ mod tests {
         assert_eq!(blocks[2]["text"], "done");
         let calls = tool_calls_from_blocks(&blocks).unwrap();
         assert_eq!(calls[0].id, "toolu_1");
-        assert_eq!(calls[0].function.arguments, r#"{"command":"pwd"}"#);
+        assert_eq!(calls[0].arguments, r#"{"command":"pwd"}"#);
+        let mut unsupported = blocks.clone();
+        unsupported[1]["name"] = Value::String("python".into());
+        assert!(matches!(
+            tool_calls_from_blocks(&unsupported),
+            Err(ProviderError::Protocol(message)) if message.contains("unsupported tool `python`")
+        ));
         assert_eq!(text_from_blocks(&blocks).as_deref(), Some("done"));
         assert!(matches!(
             finish_reason(state.stop_reason.as_deref(), &blocks, &calls),
@@ -1046,15 +1052,11 @@ mod tests {
             reasoning_content: None,
             tool_calls: Some(vec![ToolCall {
                 id: "toolu_bad".into(),
-                function: FunctionCall {
-                    name: "bash".into(),
-                    arguments: "{".into(),
-                },
+                arguments: "{".into(),
             }]),
             native_replay: None,
         };
-        let error =
-            build_request_body(&request(None), ENDPOINT, &[system(), malformed], &[]).unwrap_err();
+        let error = request_body(&request(None), &[system(), malformed], &[]).unwrap_err();
         assert!(error.to_string().contains("toolu_bad"));
     }
 }
