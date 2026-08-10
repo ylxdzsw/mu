@@ -8,7 +8,7 @@ use pulldown_cmark::{Alignment, Event, HeadingLevel, Options, Parser, Tag, TagEn
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
-use crate::cli::OutputFormat;
+use crate::OutputFormat;
 use crate::provider::ReasoningVisibility;
 
 const RESET: &str = "\x1b[0m";

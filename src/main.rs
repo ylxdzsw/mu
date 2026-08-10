@@ -6,7 +6,8 @@ use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
-use clap::Parser;
+use clap::{Args as ClapArgs, Parser, Subcommand, ValueEnum};
+use serde::Deserialize;
 
 #[cfg(not(unix))]
 compile_error!("mu is supported only on Unix-like systems");
@@ -17,7 +18,6 @@ mod applets;
 mod attachment;
 mod bash;
 mod chat_completions;
-mod cli;
 mod compaction;
 mod config;
 mod guardrail;
@@ -37,7 +37,6 @@ mod system_prompt;
 #[cfg(test)]
 use attachment::MAX_ATTACHMENT_BYTES;
 use attachment::load_attachments;
-use cli::{Args, Command, ProjectSub, SessionSub};
 use config::Config;
 use models::ResolvedModelChoice;
 use provider::build_provider;
@@ -47,6 +46,161 @@ use runtime::{
     InvocationOverrides, StatusIncludes, StatusReport, build_status_report, resolve_invocation,
     resolve_retry_model_selection, resolve_session_model,
 };
+
+#[derive(Parser, Debug)]
+#[command(name = "mu", about = "Fast terminal agent harness")]
+struct Args {
+    #[command(flatten)]
+    turn: TurnArgs,
+
+    /// Run one turn from a prompt file
+    #[arg(value_name = "PROMPT_FILE")]
+    prompt_file: Option<PathBuf>,
+
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+
+#[derive(ClapArgs, Debug, Clone, Default)]
+struct SelectionArgs {
+    #[arg(short = 's', long)]
+    session: Option<String>,
+
+    /// Continue the last selected session in this scope
+    #[arg(short = 'c', long = "continue")]
+    continue_current: bool,
+
+    #[arg(short = 'm', long)]
+    model: Option<String>,
+}
+
+#[derive(ClapArgs, Debug, Clone)]
+struct TurnArgs {
+    #[command(flatten)]
+    selection: SelectionArgs,
+
+    #[arg(short = 'a', long = "attach", value_name = "FILE")]
+    attachments: Vec<PathBuf>,
+
+    /// Output density (overrides config)
+    #[arg(short = 'o', long, value_enum)]
+    output: Option<OutputFormat>,
+}
+
+#[derive(ClapArgs, Debug, Clone)]
+struct RetryArgs {
+    #[command(flatten)]
+    selection: SelectionArgs,
+
+    /// Output density (overrides config)
+    #[arg(short = 'o', long, value_enum)]
+    output: Option<OutputFormat>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, ValueEnum, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum OutputFormat {
+    Final,
+    Concise,
+    #[default]
+    Detail,
+    Full,
+}
+
+#[derive(Subcommand, Debug)]
+enum Command {
+    /// Project management
+    Project {
+        #[command(subcommand)]
+        sub: ProjectSub,
+    },
+    /// Session management
+    Session {
+        #[command(subcommand)]
+        sub: SessionSub,
+    },
+    /// Inspect the resolved model and context state
+    Status(StatusArgs),
+    /// Print the user's mu instructions and skills for a foreign agent
+    Context {
+        /// Emit the curated projection for another agent to ingest (user
+        /// AGENTS.md and non-built-in skills, with an explanatory preamble)
+        /// instead of the raw system prompt mu itself would use.
+        #[arg(long)]
+        export: bool,
+    },
+    /// Preview the resolved user prompt
+    Cat {
+        #[arg(value_name = "TARGET")]
+        target: Option<PathBuf>,
+    },
+    /// Resume an interrupted (unclean) turn in a session
+    Retry(RetryArgs),
+    /// Force compaction for a session
+    Compact {
+        #[arg(long)]
+        session: String,
+    },
+}
+
+#[derive(ClapArgs, Debug, Clone)]
+struct StatusArgs {
+    #[command(flatten)]
+    selection: SelectionArgs,
+
+    #[arg(long)]
+    json: bool,
+
+    #[arg(long)]
+    include_models: bool,
+
+    /// Include Git branch and worktree cleanliness
+    #[arg(long)]
+    include_git: bool,
+
+    /// Include session counts, activity, and compaction state
+    #[arg(long)]
+    include_session_details: bool,
+
+    #[arg(long)]
+    include_commands: bool,
+
+    #[arg(long)]
+    include_skills: bool,
+}
+
+#[derive(Subcommand, Debug)]
+enum SessionSub {
+    /// Create a new session and print its id
+    New,
+    /// List recent sessions
+    List {
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+    },
+    /// Print a session transcript
+    Transcript {
+        #[arg(long)]
+        session: Option<String>,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum ProjectSub {
+    /// Inspect whether a directory is an existing mu project
+    Inspect {
+        #[arg(long)]
+        path: PathBuf,
+    },
+    /// Explicitly create mu project metadata in a directory
+    Init {
+        #[arg(long)]
+        path: Option<PathBuf>,
+
+        #[arg(long)]
+        force: bool,
+    },
+}
 
 const MAX_SUBAGENT_TURN_DEPTH: u32 = 1;
 const OUTPUT_FINAL: u8 = 0;
@@ -105,7 +259,7 @@ struct RunTurnArgs<'a> {
     store: &'a store::Store,
     session_id: &'a str,
     model: ResolvedModelChoice,
-    output: cli::OutputFormat,
+    output: OutputFormat,
     /// A short notice rendered before the turn (e.g. "resuming interrupted turn").
     preamble_notice: Option<&'a str>,
     model_fallback: Option<runtime::ModelFallback>,
@@ -126,7 +280,7 @@ fn main() {
             .and_then(|runtime| runtime.block_on(run()))
     });
     if let Err(e) = result {
-        if error_output_format() == cli::OutputFormat::Final {
+        if error_output_format() == OutputFormat::Final {
             let _ = write_final_error(&e.to_string());
         } else {
             let mut r = Renderer::with_format(error_output_format());
@@ -151,56 +305,53 @@ fn exit_code_for(error: &anyhow::Error) -> i32 {
     1
 }
 
-fn error_output_format() -> cli::OutputFormat {
+fn error_output_format() -> OutputFormat {
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         if arg == "--output" || arg == "-o" {
             return match args.next().as_deref() {
-                Some("final") => cli::OutputFormat::Final,
-                Some("concise") => cli::OutputFormat::Concise,
-                Some("full") => cli::OutputFormat::Full,
-                _ => cli::OutputFormat::Detail,
+                Some("final") => OutputFormat::Final,
+                Some("concise") => OutputFormat::Concise,
+                Some("full") => OutputFormat::Full,
+                _ => OutputFormat::Detail,
             };
         }
         if let Some(value) = arg.strip_prefix("--output=") {
             return match value {
-                "final" => cli::OutputFormat::Final,
-                "concise" => cli::OutputFormat::Concise,
-                "full" => cli::OutputFormat::Full,
-                _ => cli::OutputFormat::Detail,
+                "final" => OutputFormat::Final,
+                "concise" => OutputFormat::Concise,
+                "full" => OutputFormat::Full,
+                _ => OutputFormat::Detail,
             };
         }
         if let Some(value) = arg.strip_prefix("-o").filter(|value| !value.is_empty()) {
             return match value {
-                "final" => cli::OutputFormat::Final,
-                "concise" => cli::OutputFormat::Concise,
-                "full" => cli::OutputFormat::Full,
-                _ => cli::OutputFormat::Detail,
+                "final" => OutputFormat::Final,
+                "concise" => OutputFormat::Concise,
+                "full" => OutputFormat::Full,
+                _ => OutputFormat::Detail,
             };
         }
     }
     match RESOLVED_OUTPUT.load(Ordering::Relaxed) {
-        OUTPUT_FINAL => cli::OutputFormat::Final,
-        OUTPUT_CONCISE => cli::OutputFormat::Concise,
-        OUTPUT_FULL => cli::OutputFormat::Full,
-        _ => cli::OutputFormat::Detail,
+        OUTPUT_FINAL => OutputFormat::Final,
+        OUTPUT_CONCISE => OutputFormat::Concise,
+        OUTPUT_FULL => OutputFormat::Full,
+        _ => OutputFormat::Detail,
     }
 }
 
-fn set_resolved_output(format: cli::OutputFormat) {
+fn set_resolved_output(format: OutputFormat) {
     let value = match format {
-        cli::OutputFormat::Final => OUTPUT_FINAL,
-        cli::OutputFormat::Concise => OUTPUT_CONCISE,
-        cli::OutputFormat::Detail => OUTPUT_DETAIL,
-        cli::OutputFormat::Full => OUTPUT_FULL,
+        OutputFormat::Final => OUTPUT_FINAL,
+        OutputFormat::Concise => OUTPUT_CONCISE,
+        OutputFormat::Detail => OUTPUT_DETAIL,
+        OutputFormat::Full => OUTPUT_FULL,
     };
     RESOLVED_OUTPUT.store(value, Ordering::Relaxed);
 }
 
-fn resolve_output(
-    explicit: Option<cli::OutputFormat>,
-    config_default: cli::OutputFormat,
-) -> cli::OutputFormat {
+fn resolve_output(explicit: Option<OutputFormat>, config_default: OutputFormat) -> OutputFormat {
     explicit.unwrap_or(config_default)
 }
 
@@ -219,8 +370,8 @@ fn write_final_error(message: &str) -> io::Result<()> {
     stdout.flush()
 }
 
-fn exit_session_busy(output: cli::OutputFormat) -> ! {
-    if output == cli::OutputFormat::Final {
+fn exit_session_busy(output: OutputFormat) -> ! {
+    if output == OutputFormat::Final {
         let _ = write_final_error("session busy");
     } else {
         eprintln!("session busy");
@@ -231,7 +382,7 @@ fn exit_session_busy(output: cli::OutputFormat) -> ! {
 fn acquire_session_lock_or_exit<'a>(
     store: &'a store::Store,
     session_id: &str,
-    output: cli::OutputFormat,
+    output: OutputFormat,
 ) -> Result<store::SessionLock<'a>> {
     match store.acquire_session_lock(session_id) {
         Ok(lock) => Ok(lock),
@@ -483,11 +634,11 @@ async fn run() -> Result<()> {
             }
             return Ok(());
         }
-        Some(Command::Context(context_args)) => {
+        Some(Command::Context { export }) => {
             // Introspection only: no provider, and no config load. Both builders
             // scan the instruction index and read AGENTS.md directly, which
             // tolerate a missing ~/.mu, so this works in any directory.
-            let context = if context_args.export {
+            let context = if export {
                 system_prompt::build_context(&paths::global_dir(), project_config_dir.as_deref())?
             } else {
                 system_prompt::build_system_prompt(
@@ -528,7 +679,7 @@ async fn run() -> Result<()> {
 
             // Nothing to resume on a session whose last turn already finished.
             if store.is_session_clean(&session.id)? {
-                if output != cli::OutputFormat::Final {
+                if output != OutputFormat::Final {
                     println!("session is already complete; nothing to retry");
                 }
                 return Ok(());
@@ -576,9 +727,9 @@ async fn run() -> Result<()> {
                 .ok_or_else(|| ExitError::session_not_found(&session))?;
             let mut model = resolve_session_model(&store, &config, &session_state)?;
             let mut provider = build_provider(&config, &model.active_model().provider_id)?;
-            let _lock = acquire_session_lock_or_exit(&store, &session, cli::OutputFormat::Detail)?;
+            let _lock = acquire_session_lock_or_exit(&store, &session, OutputFormat::Detail)?;
             store.normalize_interrupted_tail(&session)?;
-            let mut renderer = Renderer::with_terminal_bell(cli::OutputFormat::Detail, None);
+            let mut renderer = Renderer::with_terminal_bell(OutputFormat::Detail, None);
             let started = Instant::now();
             let outcome = compaction::run_compaction_routed(
                 &store,
@@ -632,8 +783,8 @@ async fn run_turn_from_source(
     scope: &paths::Scope,
     project_config_dir: Option<&Path>,
     config: &Config,
-    turn: cli::TurnArgs,
-    output: cli::OutputFormat,
+    turn: TurnArgs,
+    output: OutputFormat,
     prompt_source: PromptSource,
 ) -> Result<()> {
     let loaded_prompt = load_prompt(prompt_source)?;
@@ -917,7 +1068,7 @@ async fn run_turn(args: RunTurnArgs<'_>) -> Result<()> {
                 .context_window
                 .map(|cw| (r.context_tokens as f64 / cw as f64) * 100.0);
             renderer.finish_turn()?;
-            if output == cli::OutputFormat::Final {
+            if output == OutputFormat::Final {
                 write_final_stdout(r.final_assistant.as_deref())?;
             } else {
                 let turn_elapsed = turn_started.elapsed();
@@ -937,7 +1088,7 @@ async fn run_turn(args: RunTurnArgs<'_>) -> Result<()> {
             // A resumable completion is deliberately persisted but remains
             // unclean; other failures may leave an interrupted request or Bash
             // claim for the next turn or `mu retry` to normalize.
-            if output != cli::OutputFormat::Final {
+            if output != OutputFormat::Final {
                 if let Some(exhausted) = error.downcast_ref::<agent::AutoResumeExhausted>() {
                     renderer.turn_auto_resume_exhausted(exhausted.limit() as u64)?;
                 } else {
@@ -973,7 +1124,7 @@ fn build_prompt_content(prompt: &str, attachments: Vec<ContentPart>) -> UserCont
 
 fn resolve_retry_session(
     store: &store::Store,
-    retry: &cli::RetryArgs,
+    retry: &RetryArgs,
 ) -> Result<Option<store::Session>> {
     if retry.selection.session.is_some() && retry.selection.continue_current {
         bail!("use either -s/--session or -c/--continue, not both");
@@ -1121,12 +1272,12 @@ mod tests {
     #[test]
     fn explicit_output_overrides_config_default() {
         assert_eq!(
-            resolve_output(None, cli::OutputFormat::Concise),
-            cli::OutputFormat::Concise
+            resolve_output(None, OutputFormat::Concise),
+            OutputFormat::Concise
         );
         assert_eq!(
-            resolve_output(Some(cli::OutputFormat::Full), cli::OutputFormat::Concise),
-            cli::OutputFormat::Full
+            resolve_output(Some(OutputFormat::Full), OutputFormat::Concise),
+            OutputFormat::Full
         );
     }
 

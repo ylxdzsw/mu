@@ -1137,7 +1137,7 @@ impl CommandHeaderDisplay {
             self.started = renderer.bash_header_start()?;
         }
 
-        if renderer.output_format() == crate::cli::OutputFormat::Concise {
+        if renderer.output_format() == crate::OutputFormat::Concise {
             let ready = title.complete_value().is_some() && risk.complete_value().is_some();
             if ready || arguments_complete {
                 renderer.concise_tool_ready(
@@ -1153,7 +1153,7 @@ impl CommandHeaderDisplay {
             return Ok(());
         }
 
-        if renderer.output_format() == crate::cli::OutputFormat::Full {
+        if renderer.output_format() == crate::OutputFormat::Full {
             return self.update_full(
                 renderer,
                 FullCommandHeaderUpdate {
@@ -1682,7 +1682,7 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use super::*;
-    use crate::cli::OutputFormat;
+    use crate::OutputFormat;
     use crate::config::{
         CompactionConfig, GuardrailConfig, LimitsConfig, ProviderConfig, RedactionConfig,
         TerminalBellConfig,

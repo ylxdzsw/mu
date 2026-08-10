@@ -6,7 +6,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use serde::de::{MapAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize};
 
-use crate::cli::OutputFormat;
+use crate::OutputFormat;
 use crate::paths;
 
 pub type EnvMap = HashMap<String, String>;
