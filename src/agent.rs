@@ -247,7 +247,6 @@ impl<'a> AgentLoop<'a> {
                             "native_replay_origins":
                                 crate::provider::native_replay_origins(&request.messages),
                         }),
-                        &request.tools(),
                     )?;
                     let exchange_id = self.store.start_provider_request(
                         self.session_id,

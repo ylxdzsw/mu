@@ -607,12 +607,7 @@ mod tests {
                     effort: request_model.effort.clone(),
                 },
                 store
-                    .request_recipe(
-                        "test.v1",
-                        &native,
-                        serde_json::json!({"kind":"guardrail"}),
-                        &[],
-                    )
+                    .request_recipe("test.v1", &native, serde_json::json!({"kind":"guardrail"}))
                     .unwrap(),
                 Some(crate::store::RequestSubject {
                     call_id: call_ids[0],

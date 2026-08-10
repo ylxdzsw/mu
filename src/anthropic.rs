@@ -640,7 +640,7 @@ mod tests {
 
     const ENDPOINT: &str = "https://api.anthropic.test/v1/messages";
 
-    fn request(effort: Option<&str>, messages: Vec<Message>) -> Request {
+    fn request(effort: Option<&str>, messages: Vec<Message>, bash: bool) -> Request {
         Request {
             model: ResolvedModelRef {
                 canonical: "anthropic/claude-opus-5".into(),
@@ -650,16 +650,16 @@ mod tests {
             },
             cache_key: None,
             messages,
-            bash: false,
+            bash,
         }
     }
 
     fn request_body(
         effort: Option<&str>,
         messages: Vec<Message>,
-        tools: &[Value],
+        bash: bool,
     ) -> Result<Value, ProviderError> {
-        request(effort, messages).historical_json(ModelApi::AnthropicMessages, tools)
+        request(effort, messages, bash).json(ModelApi::AnthropicMessages)
     }
 
     fn system() -> Message {
@@ -689,26 +689,10 @@ mod tests {
                     content: "hello".into(),
                 },
             ],
+            true,
         );
         request.cache_key = Some("mu:ses_test:agent".into());
-        let body = request
-            .historical_json(
-                ModelApi::AnthropicMessages,
-                &[serde_json::json!({
-                    "type": "function",
-                    "function": {
-                        "name": "bash",
-                        "description": "Run Bash",
-                        "parameters": {
-                            "type": "object",
-                            "properties": { "command": { "type": "string" } },
-                            "required": ["command"],
-                        },
-                        "strict": true,
-                    },
-                })],
-            )
-            .unwrap();
+        let body = request.json(ModelApi::AnthropicMessages).unwrap();
 
         assert_eq!(body["max_tokens"], 64_000);
         assert_eq!(body["stream"], true);
@@ -719,7 +703,6 @@ mod tests {
         assert_eq!(body["cache_control"]["type"], "ephemeral");
         assert!(body.get("prompt_cache_key").is_none());
         assert_eq!(body["tools"][0]["name"], "bash");
-        assert_eq!(body["tools"][0]["input_schema"]["required"][0], "command");
         assert!(body["tools"][0].get("strict").is_none());
     }
 
@@ -794,7 +777,7 @@ mod tests {
                     tool_call_id: "toolu_1".into(),
                 },
             ],
-            &[],
+            false,
         )
         .unwrap();
 
@@ -820,7 +803,7 @@ mod tests {
                     }]),
                 },
             ],
-            &[],
+            false,
         )
         .unwrap_err();
         assert!(
@@ -860,7 +843,7 @@ mod tests {
             }),
         };
 
-        let matching = request_body(None, vec![system(), message], &[]).unwrap();
+        let matching = request_body(None, vec![system(), message], false).unwrap();
         assert_eq!(
             matching["messages"][0]["content"],
             Value::Array(native_blocks)
@@ -1044,7 +1027,7 @@ mod tests {
             }]),
             native_replay: None,
         };
-        let error = request_body(None, vec![system(), malformed], &[]).unwrap_err();
+        let error = request_body(None, vec![system(), malformed], false).unwrap_err();
         assert!(error.to_string().contains("toolu_bad"));
     }
 }

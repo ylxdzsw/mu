@@ -101,7 +101,6 @@ pub struct RequestRecipe {
     pub format: String,
     pub input: Value,
     pub envelope: Value,
-    pub toolset: ObjectRef,
     pub canonical_sha256: String,
 }
 
@@ -576,7 +575,6 @@ impl Store {
             .rsplit_once(':')
             .map_or((wire_model, None), |(model, effort)| (model, Some(effort)));
         let native = serde_json::json!({"model":wire_model});
-        let tools = crate::bash::tool_definitions();
         let exchange_id = self.start_provider_request(
             session_id,
             &turn_id,
@@ -589,12 +587,7 @@ impl Store {
                 wire_model: wire_model.to_string(),
                 effort: effort.map(str::to_string),
             },
-            self.request_recipe(
-                "test.v1",
-                &native,
-                serde_json::json!({"kind":"agent"}),
-                &tools,
-            )?,
+            self.request_recipe("test.v1", &native, serde_json::json!({"kind":"agent"}))?,
             None,
         )?;
         if outcome == "completed" {
@@ -918,7 +911,6 @@ impl Store {
             "test.v1",
             &native_request,
             serde_json::json!({"kind":purpose}),
-            &[],
         )?;
         self.start_provider_request(
             session_id,
@@ -1348,16 +1340,11 @@ impl Store {
         Ok(())
     }
 
-    pub fn write_json_object(&self, value: &Value) -> Result<ObjectRef> {
-        self.write_object(&serde_json::to_vec(value)?)
-    }
-
     pub fn request_recipe(
         &self,
         format: &str,
         native_request: &Value,
         mut input: Value,
-        tools: &[Value],
     ) -> Result<RequestRecipe> {
         let mut envelope = native_request.clone();
         let mut native_fields = serde_json::Map::new();
@@ -1368,7 +1355,7 @@ impl Store {
                 }
             }
         }
-        if (input["kind"] != "agent" || format == "test.v1")
+        if (input["kind"] != "agent" || format.starts_with("test."))
             && let Some(object) = input.as_object_mut()
         {
             object.insert("native_fields".into(), Value::Object(native_fields));
@@ -1377,7 +1364,6 @@ impl Store {
             format: format.to_string(),
             input,
             envelope,
-            toolset: self.write_json_object(&Value::Array(tools.to_vec()))?,
             canonical_sha256: hex(Sha256::digest(canonical_json(native_request))),
         })
     }
@@ -1438,8 +1424,6 @@ impl Store {
                     &origin.wire_model,
                 )
             };
-            let tools = self.read_object(&recipe.toolset)?;
-            let tools: Vec<Value> = serde_json::from_slice(&tools)?;
             let cache_key = recipe
                 .envelope
                 .get("prompt_cache_key")
@@ -1459,9 +1443,9 @@ impl Store {
                 },
                 cache_key,
                 messages,
-                bash: false,
+                bash: true,
             };
-            request.historical_json(api, &tools)?
+            request.json(api)?
         };
         if hex(Sha256::digest(canonical_json(&request))) != recipe.canonical_sha256 {
             bail!("reconstructed provider request checksum mismatch")
@@ -2543,11 +2527,7 @@ fn is_semantic(event: &Event) -> bool {
 }
 
 fn reported_context_tokens(journal: &Journal) -> Option<u64> {
-    let current_toolset = Value::Array(crate::bash::tool_definitions());
-    let current_toolset = hex(Sha256::digest(
-        serde_json::to_vec(&current_toolset).expect("serializing tool definitions cannot fail"),
-    ));
-    let mut toolsets = HashMap::new();
+    let mut request_formats = HashMap::new();
     let mut latest = None;
     let mut semantic_after = false;
     for line in journal.events.iter() {
@@ -2555,10 +2535,12 @@ fn reported_context_tokens(journal: &Journal) -> Option<u64> {
             Event::ProviderRequested {
                 exchange_id,
                 purpose,
+                origin,
                 request_recipe,
                 ..
             } if purpose == "agent" => {
-                toolsets.insert(exchange_id.as_str(), request_recipe.toolset.sha256.as_str());
+                let current = request_format_is_current(&origin.api, &request_recipe.format);
+                request_formats.insert(exchange_id.as_str(), current);
             }
             Event::ProviderCompleted {
                 exchange_id,
@@ -2566,9 +2548,9 @@ fn reported_context_tokens(journal: &Journal) -> Option<u64> {
                 projection: Projection::Assistant { .. },
                 ..
             } => {
-                latest = toolsets
+                latest = request_formats
                     .get(exchange_id.as_str())
-                    .map(|toolset| (usage.total_tokens, *toolset));
+                    .map(|current| (usage.total_tokens, *current));
                 semantic_after = false;
             }
             Event::ProviderCompleted {
@@ -2585,8 +2567,16 @@ fn reported_context_tokens(journal: &Journal) -> Option<u64> {
         }
     }
     latest
-        .filter(|(_, toolset)| !semantic_after && *toolset == current_toolset)
+        .filter(|(_, current)| !semantic_after && *current)
         .map(|(tokens, _)| tokens)
+}
+
+fn request_format_is_current(api: &str, format: &str) -> bool {
+    #[cfg(test)]
+    if api == "test" {
+        return format == "test.v1";
+    }
+    ModelApi::from_name(api).is_some_and(|api| format == api.request_format())
 }
 
 fn user_text(content: &PersistedUserContent) -> String {
@@ -2931,9 +2921,8 @@ mod tests {
             .start_turn(&session.id, "/tmp", Some("/repo"), &"hello".into())
             .unwrap();
         let messages = store.load_context_messages(&session.id).unwrap();
-        let tools = vec![serde_json::json!({"type":"function","function":{"name":"bash"}})];
         let endpoint = "https://example.test/v1/chat/completions";
-        let options = Request {
+        let request = Request {
             model: ResolvedModelRef {
                 canonical: "test/model:high".into(),
                 provider_id: "test".into(),
@@ -2942,11 +2931,9 @@ mod tests {
             },
             cache_key: Some(format!("mu:{}:agent", session.id)),
             messages,
-            bash: false,
+            bash: true,
         };
-        let native = options
-            .historical_json(ModelApi::ChatCompletions, &tools)
-            .unwrap();
+        let native = request.json(ModelApi::ChatCompletions).unwrap();
         let recipe = store
             .request_recipe(
                 "openai.chat_completions.v1",
@@ -2955,7 +2942,6 @@ mod tests {
                     "kind": "agent",
                     "context_through_seq": store.current_context_seq(&session.id).unwrap()
                 }),
-                &tools,
             )
             .unwrap();
         assert_eq!(
@@ -2968,12 +2954,12 @@ mod tests {
                 &turn,
                 "agent",
                 ProviderOrigin {
-                    canonical_model_ref: options.model.canonical.clone(),
-                    provider_id: options.model.provider_id.clone(),
+                    canonical_model_ref: request.model.canonical.clone(),
+                    provider_id: request.model.provider_id.clone(),
                     api: "chat_completions".into(),
                     endpoint: endpoint.into(),
-                    wire_model: options.model.model_id.clone(),
-                    effort: options.model.effort.clone(),
+                    wire_model: request.model.model_id.clone(),
+                    effort: request.model.effort.clone(),
                 },
                 recipe,
                 None,
@@ -3029,7 +3015,7 @@ mod tests {
         messages.push(Message::User {
             content: RESUME_PROMPT.into(),
         });
-        let options = Request {
+        let request = Request {
             model: ResolvedModelRef {
                 canonical: "test/model:high".into(),
                 provider_id: "test".into(),
@@ -3038,11 +3024,9 @@ mod tests {
             },
             cache_key: None,
             messages: messages.clone(),
-            bash: false,
+            bash: true,
         };
-        let native = options
-            .historical_json(ModelApi::AnthropicMessages, &[])
-            .unwrap();
+        let native = request.json(ModelApi::AnthropicMessages).unwrap();
         let recipe = store
             .request_recipe(
                 "anthropic.messages.v1",
@@ -3053,7 +3037,6 @@ mod tests {
                     "native_replay_origins":
                         crate::provider::native_replay_origins(&messages),
                 }),
-                &[],
             )
             .unwrap();
         let resumed = store
@@ -3062,12 +3045,12 @@ mod tests {
                 &turn,
                 "agent",
                 ProviderOrigin {
-                    canonical_model_ref: options.model.canonical.clone(),
-                    provider_id: options.model.provider_id.clone(),
+                    canonical_model_ref: request.model.canonical.clone(),
+                    provider_id: request.model.provider_id.clone(),
                     api: "anthropic_messages".into(),
                     endpoint: endpoint.into(),
-                    wire_model: options.model.model_id.clone(),
-                    effort: options.model.effort.clone(),
+                    wire_model: request.model.model_id.clone(),
+                    effort: request.model.effort.clone(),
                 },
                 recipe,
                 None,
@@ -3140,7 +3123,7 @@ mod tests {
             ModelApi::ChatCompletions,
             &replay_origins,
         );
-        let options = Request {
+        let request = Request {
             model: ResolvedModelRef {
                 canonical: "target/other-model".into(),
                 provider_id: "target".into(),
@@ -3149,13 +3132,10 @@ mod tests {
             },
             cache_key: None,
             messages: request_messages,
-            bash: false,
+            bash: true,
         };
-        let tools = vec![serde_json::json!({"type":"function","function":{"name":"bash"}})];
         let endpoint = "https://target.test/v1/chat/completions";
-        let native = options
-            .historical_json(ModelApi::ChatCompletions, &tools)
-            .unwrap();
+        let native = request.json(ModelApi::ChatCompletions).unwrap();
         let recipe = store
             .request_recipe(
                 "openai.chat_completions.v1",
@@ -3165,7 +3145,6 @@ mod tests {
                     "context_through_seq": store.current_context_seq(&session.id).unwrap(),
                     "native_replay_origins": replay_origins,
                 }),
-                &tools,
             )
             .unwrap();
         let exchange = store
@@ -3174,11 +3153,11 @@ mod tests {
                 &store.current_turn_id(&session.id).unwrap(),
                 "agent",
                 ProviderOrigin {
-                    canonical_model_ref: options.model.canonical.clone(),
-                    provider_id: options.model.provider_id.clone(),
+                    canonical_model_ref: request.model.canonical.clone(),
+                    provider_id: request.model.provider_id.clone(),
                     api: "chat_completions".into(),
                     endpoint: endpoint.into(),
-                    wire_model: options.model.model_id.clone(),
+                    wire_model: request.model.model_id.clone(),
                     effort: None,
                 },
                 recipe,
@@ -3195,7 +3174,7 @@ mod tests {
     }
 
     #[test]
-    fn reported_context_is_invalidated_when_the_toolset_differs() {
+    fn reported_context_is_invalidated_when_the_request_format_is_not_current() {
         let store = Store::open_memory().unwrap();
         let session = store.create_session_seeded("system").unwrap();
         let turn = store
@@ -3216,7 +3195,7 @@ mod tests {
                     effort: None,
                 },
                 store
-                    .request_recipe("test.v1", &native, serde_json::json!({"kind":"agent"}), &[])
+                    .request_recipe("test.v0", &native, serde_json::json!({"kind":"agent"}))
                     .unwrap(),
                 None,
             )
@@ -3271,7 +3250,7 @@ mod tests {
                     effort: None,
                 },
                 store
-                    .request_recipe("test.v1", &native, serde_json::json!({"kind":"agent"}), &[])
+                    .request_recipe("test.v1", &native, serde_json::json!({"kind":"agent"}))
                     .unwrap(),
                 None,
             )
@@ -3441,12 +3420,7 @@ mod tests {
             .unwrap();
         let native = serde_json::json!({"model":"reviewer","messages":[]});
         let recipe = store
-            .request_recipe(
-                "test.v1",
-                &native,
-                serde_json::json!({"kind":"guardrail"}),
-                &[],
-            )
+            .request_recipe("test.v1", &native, serde_json::json!({"kind":"guardrail"}))
             .unwrap();
         let exchange = store
             .start_provider_request(
@@ -3502,7 +3476,6 @@ mod tests {
                         "test.v1",
                         &serde_json::json!({"model":"model"}),
                         serde_json::json!({"kind":"agent"}),
-                        &[],
                     )
                     .unwrap(),
                 None,

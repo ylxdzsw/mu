@@ -164,6 +164,15 @@ pub enum ModelApi {
 }
 
 impl ModelApi {
+    pub(crate) fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "chat_completions" => Some(Self::ChatCompletions),
+            "responses" => Some(Self::Responses),
+            "anthropic_messages" => Some(Self::AnthropicMessages),
+            _ => None,
+        }
+    }
+
     pub fn name(self) -> &'static str {
         match self {
             Self::ChatCompletions => "chat_completions",
@@ -207,34 +216,12 @@ impl Request {
 
     pub fn json(&self, api: ModelApi) -> Result<Value, ProviderError> {
         let tools = self.tools();
-        self.json_with_tools(api, &tools)
-    }
-
-    pub(crate) fn historical_json(
-        &self,
-        api: ModelApi,
-        tools: &[Value],
-    ) -> Result<Value, ProviderError> {
-        if tools.iter().any(|tool| {
-            tool.pointer("/function/name")
-                .or_else(|| tool.get("name"))
-                .and_then(Value::as_str)
-                != Some("bash")
-        }) {
-            return Err(ProviderError::Protocol(
-                "recorded request contains a non-bash tool".into(),
-            ));
-        }
-        self.json_with_tools(api, tools)
-    }
-
-    fn json_with_tools(&self, api: ModelApi, tools: &[Value]) -> Result<Value, ProviderError> {
         match api {
             ModelApi::ChatCompletions => {
-                Ok(crate::chat_completions::build_request_body(self, tools))
+                Ok(crate::chat_completions::build_request_body(self, &tools))
             }
-            ModelApi::Responses => crate::responses::build_request_body(self, tools),
-            ModelApi::AnthropicMessages => crate::anthropic::build_request_body(self, tools),
+            ModelApi::Responses => crate::responses::build_request_body(self, &tools),
+            ModelApi::AnthropicMessages => crate::anthropic::build_request_body(self, &tools),
         }
     }
 

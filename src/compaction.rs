@@ -403,7 +403,6 @@ pub async fn run_compaction(
             "focus": custom_focus,
             "prompt_version": 1,
         }),
-        &request.tools(),
     )?;
     let exchange_id = store.start_provider_request(
         session_id,

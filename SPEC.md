@@ -1355,7 +1355,7 @@ The project-local directory is `.mu`. It may contain:
 - `sessions/`, containing one append-only `<session-id>.jsonl` journal per
   session.
 - `objects/`, containing immutable SHA-256-addressed attachments, native
-  provider JSON, toolsets, and large semantic content.
+  provider JSON, and large semantic content.
 - `current-session`, a relative symlink to the last selected journal.
 - `.gitignore`, which ignores those runtime paths.
 
@@ -1591,11 +1591,12 @@ Conceptual event model:
 - **`provider_requested`** is synced before contact and identifies the turn,
   purpose (`agent`, `compaction`, or `guardrail`), exchange, canonical model
   reference, provider/API/endpoint/wire model, effort, and a versioned request
-  recipe. Recipes reference semantic context by sequence and exact toolsets by
-  object hash; their envelope retains the exact `prompt_cache_key` when the
-  protocol sends one, and their checksum verifies reconstructed native request
-  JSON. Reconstruction reuses that recorded key rather than deriving a current
-  value; older keyless recipes remain keyless.
+  recipe. Agent recipes reference semantic context by sequence; their request
+  format versions the complete wire contract, including the fixed Bash schema.
+  The envelope retains the exact `prompt_cache_key` when the protocol sends one,
+  and the checksum verifies reconstructed native request JSON. Reconstruction
+  reuses that recorded key rather than deriving a current value; older keyless
+  recipes remain keyless.
 - **`provider_completed`** stores one assembled native response object plus the
   semantic projection accepted at that time. Assistant projections contain
   text/reasoning/native replay, all immutable Bash claims, and a derived

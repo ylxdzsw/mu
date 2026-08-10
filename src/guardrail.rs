@@ -187,7 +187,6 @@ impl Guardrail {
                     "context_through_seq": store.current_context_seq(session_id)?,
                     "policy_version": 1,
                 }),
-                &request.tools(),
             )?;
             let exchange_id = store.start_provider_request(
                 session_id,

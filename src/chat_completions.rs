@@ -608,12 +608,12 @@ mod tests {
         }
     }
 
-    fn request(effort: Option<&str>, messages: Vec<Message>) -> Request {
+    fn request(effort: Option<&str>, messages: Vec<Message>, bash: bool) -> Request {
         Request {
             model: test_model(effort),
             cache_key: None,
             messages,
-            bash: false,
+            bash,
         }
     }
 
@@ -621,9 +621,9 @@ mod tests {
         api: ModelApi,
         effort: Option<&str>,
         messages: Vec<Message>,
-        tools: &[Value],
+        bash: bool,
     ) -> Result<Value, ProviderError> {
-        request(effort, messages).historical_json(api, tools)
+        request(effort, messages, bash).json(api)
     }
 
     #[test]
@@ -876,7 +876,7 @@ mod tests {
             ModelApi::ChatCompletions,
             Some("provider-custom"),
             messages,
-            &[],
+            false,
         )
         .unwrap();
 
@@ -911,16 +911,7 @@ mod tests {
                 },
             ]),
         }];
-        let tools = vec![serde_json::json!({
-            "type": "function",
-            "function": {
-                "name": "bash",
-                "description": "run a command",
-                "parameters": {"type": "object"},
-                "strict": true
-            }
-        })];
-        let body = body(ModelApi::Responses, Some("max"), messages, &tools).unwrap();
+        let body = body(ModelApi::Responses, Some("max"), messages, true).unwrap();
 
         assert_eq!(body["store"], false);
         assert_eq!(body["stream"], true);
@@ -930,7 +921,7 @@ mod tests {
         assert!(body.get("previous_response_id").is_none());
         assert!(body.get("conversation").is_none());
         assert_eq!(body["tools"][0]["name"], "bash");
-        assert_eq!(body["tools"][0]["strict"], true);
+        assert_eq!(body["tools"][0]["strict"], false);
         assert!(body["tools"][0].get("function").is_none());
         assert_eq!(body["input"][0]["content"][0]["type"], "input_text");
         assert_eq!(
@@ -967,7 +958,7 @@ mod tests {
                 tool_call_id: "call_1".into(),
             },
         ];
-        let matching = body(ModelApi::Responses, None, messages, &[]).unwrap();
+        let matching = body(ModelApi::Responses, None, messages, false).unwrap();
         assert_eq!(matching["input"][0], native_items[0]);
         assert_eq!(matching["input"][1], native_items[1]);
         assert_eq!(matching["input"][2]["type"], "function_call_output");
@@ -990,12 +981,12 @@ mod tests {
             tool_call_id: "call-image".into(),
         }];
 
-        let responses = body(ModelApi::Responses, None, messages.clone(), &[]).unwrap();
+        let responses = body(ModelApi::Responses, None, messages.clone(), false).unwrap();
         assert_eq!(responses["input"][0]["output"][0]["type"], "input_text");
         assert_eq!(responses["input"][0]["output"][1]["type"], "input_image");
         assert_eq!(responses["input"][0]["output"][1]["detail"], "original");
 
-        let chat = body(ModelApi::ChatCompletions, None, messages, &[]).unwrap();
+        let chat = body(ModelApi::ChatCompletions, None, messages, false).unwrap();
         assert_eq!(chat["messages"][0]["role"], "tool");
         assert_eq!(chat["messages"][1]["role"], "user");
         assert_eq!(
@@ -1027,7 +1018,7 @@ mod tests {
                 tool_call_id: "call-2".into(),
             },
         ];
-        let chat = body(ModelApi::ChatCompletions, None, messages, &[]).unwrap();
+        let chat = body(ModelApi::ChatCompletions, None, messages, false).unwrap();
         assert_eq!(chat["messages"][0]["tool_call_id"], "call-1");
         assert_eq!(chat["messages"][1]["tool_call_id"], "call-2");
         assert_eq!(chat["messages"][2]["role"], "user");
@@ -1051,7 +1042,7 @@ mod tests {
                 payload: NativeReplayPayload::ChatReasoning("private chat reasoning".into()),
             }),
         };
-        let responses = body(ModelApi::Responses, None, vec![from_chat], &[]).unwrap();
+        let responses = body(ModelApi::Responses, None, vec![from_chat], false).unwrap();
         assert_eq!(responses["input"][0]["type"], "function_call");
         assert!(!responses.to_string().contains("private chat reasoning"));
 
@@ -1068,7 +1059,7 @@ mod tests {
                 })]),
             }),
         };
-        let chat = body(ModelApi::ChatCompletions, None, vec![from_responses], &[]).unwrap();
+        let chat = body(ModelApi::ChatCompletions, None, vec![from_responses], false).unwrap();
         assert_eq!(chat["messages"][0]["tool_calls"][0]["id"], "call_1");
         assert_eq!(chat["messages"][0]["tool_calls"][0]["type"], "function");
         assert!(!chat.to_string().contains("opaque"));
@@ -1088,7 +1079,7 @@ mod tests {
                     },
                 }]),
             }],
-            &[],
+            false,
         )
         .unwrap_err();
         assert!(
@@ -1172,7 +1163,7 @@ mod tests {
                     payload: NativeReplayPayload::ChatReasoning(reasoning.into()),
                 }),
             };
-            let body = body(ModelApi::ChatCompletions, None, vec![message], &[]).unwrap();
+            let body = body(ModelApi::ChatCompletions, None, vec![message], false).unwrap();
             assert_eq!(body["messages"][0]["reasoning_content"], reasoning);
             assert_eq!(body["messages"][0]["tool_calls"][0]["id"], "call_1");
         }
@@ -1216,7 +1207,7 @@ mod tests {
             HttpProvider::new(format!("http://{addr}/chat/completions"), None).unwrap();
         provider.idle_timeout = Duration::from_millis(200);
 
-        let request = request(None, vec![]);
+        let request = request(None, vec![], false);
         let mut on_event = |_event: StreamEvent| -> Result<(), ProviderError> { Ok(()) };
         let result = provider.stream(&request, &mut on_event).await;
 
