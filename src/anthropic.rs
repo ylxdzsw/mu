@@ -442,7 +442,7 @@ fn consume_event(
         "content_block_delta" => {
             let index = event_index(&value)?;
             if !state.open_blocks.contains(&index) {
-                return Err(ProviderError::Protocol(format!(
+                return Err(ProviderError::Transport(format!(
                     "Anthropic delta references closed content block {index}"
                 )));
             }
@@ -1003,6 +1003,24 @@ mod tests {
                 .to_string()
                 .contains("unclosed")
         );
+        consume(
+            &mut state,
+            &mut events,
+            serde_json::json!({ "type": "content_block_stop", "index": 0 }),
+        )
+        .unwrap();
+        let error = consume(
+            &mut state,
+            &mut events,
+            serde_json::json!({
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": { "type": "text_delta", "text": "late" },
+            }),
+        )
+        .unwrap_err();
+        assert!(matches!(error, ProviderError::Transport(_)));
+        assert_eq!(error.disposition(), ProviderDisposition::Retry);
 
         let error = consume(
             &mut AnthropicStreamState::default(),

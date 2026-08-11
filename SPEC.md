@@ -1142,6 +1142,10 @@ provider request, before network I/O.
 
 Anthropic text, thinking summaries, signatures, citations, tool input, usage,
 and stop reasons are accumulated from indexed SSE content-block events.
+A delta for a content block that is not currently open is rejected as a
+transient transport failure, so the regular bounded retry and provider fallback
+path applies without accepting or persisting the malformed partial response.
+Other malformed content-block sequencing remains a fatal protocol failure.
 Complete successful assistant content arrays are stored unchanged, including
 `thinking`, `redacted_thinking`, signatures, text, citations, and `tool_use`,
 and replayed when the current Anthropic Messages model has the same effective
