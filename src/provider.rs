@@ -549,17 +549,10 @@ pub enum StreamEvent {
     Tick,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReasoningVisibility {
     StreamedTrace,
     Opaque,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ReasoningBlock {
-    pub visibility: ReasoningVisibility,
-    pub summary_parts: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default)]

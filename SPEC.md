@@ -1129,16 +1129,6 @@ current Responses model has the same effective `replay_key` as its origin.
 Semantic tool results become `function_call_output` items connected by
 `call_id`.
 
-Successful provider streams also project their normalized reasoning summaries
-into the semantic assistant record as ordered reasoning blocks. Each block
-retains its streamed-trace/opaque visibility and its summary-text parts.
-Multiple deltas for one provider part are joined and the resulting non-empty
-texts are stored in provider-index order; indexes themselves are not persisted.
-Only completed blocks with non-empty summary text are stored. Ticks, elapsed
-timers, live indicators, and other renderer-only state are not persisted. This
-projection is produced from stream events as they arrive and is never
-reconstructed later by reparsing native replay data.
-
 **Anthropic Messages.** Mu posts directly to the configured endpoint using
 `x-api-key` and `anthropic-version:2023-06-01`, with `stream:true`,
 `max_tokens:64000`, adaptive thinking displayed as summaries, and automatic
@@ -1624,16 +1614,13 @@ Conceptual event model:
   recipes remain keyless.
 - **`provider_completed`** stores one assembled native response object plus the
   semantic projection accepted at that time. Assistant projections contain
-  text, Chat `reasoning_content`, ordered normalized reasoning-summary blocks,
-  native replay, all immutable Bash claims, and a derived `turn_state`:
-  `continue` for tool use, `resume` for a preserved response that needs
-  continuation, or `complete` for a clean ending. Older version-1 entries may
-  lack reasoning-summary blocks; that means the semantic summary is
-  unavailable, and readers do not synthesize it from native data. Compaction
-  projections contain summary and boundary; guardrail projections contain the
-  parsed authorization decision. The stored projection is authoritative during
-  normal loading and recovery; Mu never reruns a newer provider parser while
-  replaying a journal.
+  text/reasoning/native replay, all immutable Bash claims, and a derived
+  `turn_state`: `continue` for tool use, `resume` for a preserved response that
+  needs continuation, or `complete` for a clean ending. Compaction projections
+  contain summary and boundary; guardrail projections contain the parsed
+  authorization decision. The stored projection is authoritative during normal
+  loading and recovery; Mu never reruns a newer provider parser while replaying
+  a journal.
 - **`provider_failed`** and **`provider_interrupted`** terminate an exchange
   without adding semantic assistant history. A failure records a stable error
   class and may retain partial native JSON for audit.

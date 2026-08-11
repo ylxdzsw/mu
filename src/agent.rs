@@ -1,7 +1,4 @@
-use std::{
-    collections::BTreeMap,
-    time::{Duration, Instant},
-};
+use std::time::{Duration, Instant};
 
 use anyhow::{Result, bail};
 use serde_json::Value;
@@ -17,8 +14,8 @@ use crate::guardrail::Guardrail;
 use crate::models::{ResolvedModelChoice, resolve_model_info};
 use crate::provider::{
     FinishReason, MAX_PROVIDER_RETRY_AFTER, Message, Provider, ProviderDisposition, ProviderError,
-    ReasoningBlock, ReasoningVisibility, Request, StreamEvent, ToolCall, ToolCallDelta, Usage,
-    advance_provider, effective_retry_delay, provider_retry_limit,
+    Request, StreamEvent, ToolCall, ToolCallDelta, Usage, advance_provider, effective_retry_delay,
+    provider_retry_limit,
 };
 use crate::renderer::Renderer;
 use crate::runtime::resume_session_fallback;
@@ -93,55 +90,6 @@ struct CommandHeaderDisplay {
     stdin_line_done: bool,
 }
 
-#[derive(Default)]
-struct ReasoningProjection {
-    active: Option<ActiveReasoningBlock>,
-    blocks: Vec<ReasoningBlock>,
-}
-
-struct ActiveReasoningBlock {
-    visibility: ReasoningVisibility,
-    summary_parts: BTreeMap<usize, String>,
-}
-
-impl ReasoningProjection {
-    fn start(&mut self, visibility: ReasoningVisibility) {
-        self.end();
-        self.active = Some(ActiveReasoningBlock {
-            visibility,
-            summary_parts: BTreeMap::new(),
-        });
-    }
-
-    fn summary_delta(&mut self, part_index: usize, text: &str) {
-        if let Some(active) = self.active.as_mut() {
-            active
-                .summary_parts
-                .entry(part_index)
-                .or_default()
-                .push_str(text);
-        }
-    }
-
-    fn end(&mut self) {
-        let Some(active) = self.active.take() else {
-            return;
-        };
-        let summary_parts = active
-            .summary_parts
-            .into_iter()
-            .filter(|(_, text)| !text.is_empty())
-            .map(|(_, text)| text)
-            .collect::<Vec<_>>();
-        if !summary_parts.is_empty() {
-            self.blocks.push(ReasoningBlock {
-                visibility: active.visibility,
-                summary_parts,
-            });
-        }
-    }
-}
-
 pub struct AgentLoop<'a> {
     pub config: &'a Config,
     pub model: ResolvedModelChoice,
@@ -213,7 +161,7 @@ impl<'a> AgentLoop<'a> {
         let mut iteration = 0;
         let mut live_provider_retries = 0;
         while iteration < max_iter {
-            let (exchange_id, stream_result, mut command_headers, reasoning_blocks) = 'request_gate: loop {
+            let (exchange_id, stream_result, mut command_headers) = 'request_gate: loop {
                 if self.config.compaction.enabled
                     && latest_compaction_since_change.is_none()
                     && let Some(context_window) = self.model_context_window
@@ -256,7 +204,6 @@ impl<'a> AgentLoop<'a> {
                 let mut command_headers = StreamingCommandHeaders::default();
                 loop {
                     current_partial_output.clear();
-                    let mut reasoning_projection = ReasoningProjection::default();
                     let request_context = crate::provider::filter_native_replay_for_config(
                         &context,
                         self.config,
@@ -311,20 +258,15 @@ impl<'a> AgentLoop<'a> {
                                         self.renderer.assistant_text(&text)
                                     }
                                     StreamEvent::ReasoningStart(visibility) => {
-                                        reasoning_projection.start(visibility);
                                         self.renderer.reasoning_start(visibility)
                                     }
                                     StreamEvent::ReasoningDelta(text) => {
                                         self.renderer.reasoning_delta(&text)
                                     }
                                     StreamEvent::ReasoningSummaryDelta { part_index, text } => {
-                                        reasoning_projection.summary_delta(part_index, &text);
                                         self.renderer.reasoning_summary_delta(part_index, &text)
                                     }
-                                    StreamEvent::ReasoningEnd => {
-                                        reasoning_projection.end();
-                                        self.renderer.reasoning_end(None)
-                                    }
+                                    StreamEvent::ReasoningEnd => self.renderer.reasoning_end(None),
                                     StreamEvent::ToolCallDelta(delta) => handle_tool_call_delta(
                                         self.renderer,
                                         &mut command_headers,
@@ -364,7 +306,6 @@ impl<'a> AgentLoop<'a> {
                                 current_partial_output.clear();
                                 return Err(error.into());
                             }
-                            reasoning_projection.end();
                         }
                         Err(_) => {
                             if let Err(error) = self.renderer.cancel_live_state() {
@@ -376,14 +317,7 @@ impl<'a> AgentLoop<'a> {
                         }
                     }
                     match result {
-                        Ok(r) => {
-                            break 'request_gate (
-                                exchange_id,
-                                r,
-                                command_headers,
-                                reasoning_projection.blocks,
-                            );
-                        }
+                        Ok(r) => break 'request_gate (exchange_id, r, command_headers),
                         Err(error @ ProviderError::ContextLength { .. }) => {
                             self.store.fail_provider_exchange(
                                 self.session_id,
@@ -540,7 +474,6 @@ impl<'a> AgentLoop<'a> {
                     self.session_id,
                     &exchange_id,
                     &accepted_message,
-                    &reasoning_blocks,
                     stream_result.native_response.as_ref(),
                     stream_result.usage.as_ref(),
                 )?
@@ -549,7 +482,6 @@ impl<'a> AgentLoop<'a> {
                     self.session_id,
                     &exchange_id,
                     &accepted_message,
-                    &reasoning_blocks,
                     stream_result.native_response.as_ref(),
                     stream_result.usage.as_ref(),
                 )?
@@ -1718,8 +1650,6 @@ mod tests {
         counts: Arc<Mutex<(u32, u32)>>,
     }
 
-    struct ReasoningSummaryProvider;
-
     fn spawn_stop_server(
         seen_request: Arc<Mutex<String>>,
     ) -> (String, std::thread::JoinHandle<()>) {
@@ -1810,46 +1740,6 @@ mod tests {
         ) -> Result<StreamResult, ProviderError> {
             on_event(StreamEvent::TextDelta("unfinished answer".into()))?;
             Err(ProviderError::Protocol("fatal stream failure".into()))
-        }
-    }
-
-    #[async_trait(?Send)]
-    impl Provider for ReasoningSummaryProvider {
-        async fn stream(
-            &self,
-            _request: &Request,
-            on_event: &mut dyn FnMut(crate::provider::StreamEvent) -> Result<(), ProviderError>,
-        ) -> Result<StreamResult, ProviderError> {
-            on_event(StreamEvent::ReasoningStart(ReasoningVisibility::Opaque))?;
-            on_event(StreamEvent::ReasoningSummaryDelta {
-                part_index: 1,
-                text: "second".into(),
-            })?;
-            on_event(StreamEvent::ReasoningSummaryDelta {
-                part_index: 0,
-                text: "first ".into(),
-            })?;
-            on_event(StreamEvent::ReasoningSummaryDelta {
-                part_index: 0,
-                text: "part".into(),
-            })?;
-            on_event(StreamEvent::ReasoningEnd)?;
-            on_event(StreamEvent::ReasoningStart(ReasoningVisibility::Opaque))?;
-            on_event(StreamEvent::ReasoningSummaryDelta {
-                part_index: 2,
-                text: "final".into(),
-            })?;
-            Ok(StreamResult {
-                message: Message::Assistant {
-                    content: Some("done".into()),
-                    reasoning_content: None,
-                    native_replay: None,
-                    tool_calls: None,
-                },
-                finish_reason: FinishReason::Stop,
-                usage: None,
-                native_response: None,
-            })
         }
     }
 
@@ -2183,55 +2073,6 @@ mod tests {
         assert_eq!(failed["error_class"], "rate_limit");
         assert!(failed["partial_response_json"].is_object());
         let _ = std::fs::remove_dir_all(tmp);
-    }
-
-    #[tokio::test]
-    async fn completed_reasoning_summaries_are_persisted_in_provider_order() {
-        let store = Store::open_memory().unwrap();
-        let session = store.create_session_seeded("system").unwrap();
-        store
-            .append_message(
-                &session.id,
-                &Message::User {
-                    content: "work".into(),
-                },
-            )
-            .unwrap();
-        let config = test_config();
-        let request_model = crate::models::resolve_model_ref(&config, "test/fake-model").unwrap();
-        let mut renderer = Renderer::with_format(OutputFormat::Detail);
-        let mut agent = AgentLoop {
-            config: &config,
-            model: ResolvedModelChoice::fixed(request_model),
-            provider: Box::new(ReasoningSummaryProvider),
-            store: &store,
-            session_id: &session.id,
-            cache_key: None,
-            model_context_window: None,
-            renderer: &mut renderer,
-        };
-
-        agent.run_turn().await.unwrap();
-
-        let completed = store
-            .audit_events(&session.id)
-            .unwrap()
-            .into_iter()
-            .find(|event| event["type"] == "provider_completed")
-            .unwrap();
-        assert_eq!(
-            completed["projection"]["reasoning_blocks"],
-            serde_json::json!([
-                {
-                    "visibility": "opaque",
-                    "summary_parts": ["first part", "second"],
-                },
-                {
-                    "visibility": "opaque",
-                    "summary_parts": ["final"],
-                },
-            ])
-        );
     }
 
     #[tokio::test]
