@@ -172,6 +172,23 @@ impl Renderer {
         )
     }
 
+    pub fn with_transcript_output(
+        format: OutputFormat,
+        stdout: Box<dyn Write + Send>,
+        line_width: usize,
+    ) -> Self {
+        let terminal_layout =
+            (format != OutputFormat::Final).then(|| TerminalLayout::new(Some(line_width)));
+        Self::with_outputs(
+            format,
+            stdout,
+            Box::new(io::sink()),
+            false,
+            terminal_layout,
+            None,
+        )
+    }
+
     fn with_outputs(
         format: OutputFormat,
         stdout: Box<dyn Write + Send>,
@@ -261,6 +278,30 @@ impl Renderer {
         blocks.extend(self.markdown.finish());
         self.write_assistant_blocks(blocks)?;
         self.assistant_block_open = false;
+        self.ensure_line_start()
+    }
+
+    pub fn transcript_prompt(&mut self, text: &str) -> io::Result<()> {
+        self.assistant_end()?;
+        self.reasoning_end(None)?;
+        self.ensure_block_separator_if_needed()?;
+        self.last_committed_block = Some(CommittedBlock::Other);
+        if self.styled {
+            self.write_stdout_committed(&format!("{CYAN}{BOLD}mu>{RESET} "))?;
+        } else {
+            self.write_stdout_committed("mu> ")?;
+        }
+        self.write_stdout_committed(text)?;
+        self.ensure_line_start()
+    }
+
+    pub fn transcript_final_text(&mut self, text: &str) -> io::Result<()> {
+        if text.is_empty() {
+            return Ok(());
+        }
+        self.ensure_block_separator_if_needed()?;
+        self.last_committed_block = Some(CommittedBlock::Other);
+        self.write_stdout_committed(text)?;
         self.ensure_line_start()
     }
 

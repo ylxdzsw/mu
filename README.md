@@ -174,6 +174,17 @@ transcript --session <id>`, and `mu status --json`. Add `--include-git` or
 `--include-session-details` when those heavier status sections are needed. Run
 `mu --help` for the full CLI surface.
 
+Replay or share a session without contacting a provider:
+
+```sh
+mu session transcript -o full
+mu session transcript --session ses_... --html > session.html
+```
+
+Terminal replay uses the same Markdown and Bash renderer as a live turn;
+redirected output is ANSI-free. HTML export is a single file containing the
+terminal transcript and loads pinned xterm.js assets from jsDelivr when opened.
+
 ## How it works
 
 The core stays deliberately small. Each turn starts a fresh native process,

@@ -51,6 +51,31 @@ pub struct SessionSummary {
     pub turn_count: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TranscriptEvent {
+    User(String),
+    Assistant {
+        turn_state: String,
+        text: Option<String>,
+        reasoning_content: Option<String>,
+        bash_calls: Vec<TranscriptBashCall>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TranscriptBashCall {
+    pub arguments: String,
+    pub result: Option<TranscriptBashResult>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TranscriptBashResult {
+    pub outcome: String,
+    pub output: String,
+    pub exit_code: Option<i32>,
+    pub duration_ms: Option<u64>,
+}
+
 #[derive(Debug, Clone)]
 pub struct MessageRecord {
     pub kind: String,
@@ -783,6 +808,65 @@ impl Store {
             .into_iter()
             .filter(|record| record.seq >= start_seq)
             .collect())
+    }
+
+    pub fn transcript_events(&self, session_id: &str) -> Result<Vec<TranscriptEvent>> {
+        let journal = self.load(session_id)?;
+        let mut results = HashMap::new();
+        for line in journal.events.iter() {
+            if let Event::BashCompleted {
+                call_id,
+                outcome,
+                output,
+                exit_code,
+                duration_ms,
+                ..
+            } = &line.event
+            {
+                results.insert(
+                    *call_id,
+                    TranscriptBashResult {
+                        outcome: outcome.clone(),
+                        output: self.hydrate_text(output)?,
+                        exit_code: *exit_code,
+                        duration_ms: *duration_ms,
+                    },
+                );
+            }
+        }
+
+        let mut events = Vec::new();
+        for line in journal.events.iter() {
+            match &line.event {
+                Event::TurnStarted { prompt, .. } => {
+                    events.push(TranscriptEvent::User(user_text(prompt)));
+                }
+                Event::ProviderCompleted {
+                    projection:
+                        Projection::Assistant {
+                            turn_state,
+                            text,
+                            reasoning_content,
+                            bash_calls,
+                            ..
+                        },
+                    ..
+                } => events.push(TranscriptEvent::Assistant {
+                    turn_state: turn_state.clone(),
+                    text: text.clone(),
+                    reasoning_content: reasoning_content.clone(),
+                    bash_calls: bash_calls
+                        .iter()
+                        .map(|call| TranscriptBashCall {
+                            arguments: call.arguments.clone(),
+                            result: results.get(&call.call_id).cloned(),
+                        })
+                        .collect(),
+                }),
+                _ => {}
+            }
+        }
+        Ok(events)
     }
 
     #[cfg(test)]
@@ -2754,6 +2838,65 @@ mod tests {
             .unwrap();
         assert!(turn.starts_with('t'));
         assert_eq!(store.load_context_messages(&session.id).unwrap().len(), 3);
+    }
+
+    #[test]
+    fn transcript_projection_pairs_bash_results_without_native_state() {
+        let store = Store::open_memory().unwrap();
+        let session = store.create_session_seeded("system").unwrap();
+        store
+            .start_turn(&session.id, "/tmp", None, &"Run it".into())
+            .unwrap();
+        let (_, call_ids) = store
+            .append_message_with_bash_calls(
+                &session.id,
+                &Message::Assistant {
+                    content: Some("I will run it.".into()),
+                    reasoning_content: Some("Inspect first.".into()),
+                    tool_calls: Some(vec![ToolCall {
+                        id: "call-1".into(),
+                        arguments: r#"{"title":"Run","command":"printf ok","risk":"readonly"}"#
+                            .into(),
+                    }]),
+                    native_replay: None,
+                },
+            )
+            .unwrap();
+        store
+            .persist_bash_result(
+                &session.id,
+                BashResultRecord {
+                    bash_call_id: call_ids[0],
+                    outcome: "completed",
+                    exit_code: Some(0),
+                    duration_ms: Some(7),
+                },
+                "ok",
+                &[],
+            )
+            .unwrap();
+
+        assert_eq!(
+            store.transcript_events(&session.id).unwrap(),
+            vec![
+                TranscriptEvent::User("Run it".into()),
+                TranscriptEvent::Assistant {
+                    turn_state: "continue".into(),
+                    text: Some("I will run it.".into()),
+                    reasoning_content: Some("Inspect first.".into()),
+                    bash_calls: vec![TranscriptBashCall {
+                        arguments: r#"{"title":"Run","command":"printf ok","risk":"readonly"}"#
+                            .into(),
+                        result: Some(TranscriptBashResult {
+                            outcome: "completed".into(),
+                            output: "ok".into(),
+                            exit_code: Some(0),
+                            duration_ms: Some(7),
+                        }),
+                    }],
+                },
+            ]
+        );
     }
 
     #[test]

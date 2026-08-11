@@ -3,6 +3,7 @@ use std::io::{self, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process;
 use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
@@ -182,6 +183,14 @@ enum SessionSub {
     Transcript {
         #[arg(long)]
         session: Option<String>,
+
+        /// Output density
+        #[arg(short = 'o', long, value_enum, default_value = "detail")]
+        output: OutputFormat,
+
+        /// Emit a browser-viewable xterm.js document
+        #[arg(long)]
+        html: bool,
     },
 }
 
@@ -428,6 +437,132 @@ fn resolve_transcript_session(
         .ok_or_else(|| anyhow::anyhow!("no sessions found in active scope"))
 }
 
+#[derive(Clone, Default)]
+struct TranscriptBuffer(Arc<Mutex<Vec<u8>>>);
+
+impl TranscriptBuffer {
+    fn text(&self) -> Result<String> {
+        Ok(String::from_utf8(
+            self.0.lock().expect("transcript buffer poisoned").clone(),
+        )?)
+    }
+}
+
+impl Write for TranscriptBuffer {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.0
+            .lock()
+            .expect("transcript buffer poisoned")
+            .extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+fn replay_transcript(
+    renderer: &mut Renderer,
+    events: &[store::TranscriptEvent],
+    output: OutputFormat,
+) -> Result<()> {
+    for event in events {
+        match event {
+            store::TranscriptEvent::User(text) => renderer.transcript_prompt(text)?,
+            store::TranscriptEvent::Assistant {
+                turn_state,
+                text,
+                reasoning_content,
+                bash_calls,
+            } => {
+                if output == OutputFormat::Final {
+                    if turn_state == "complete"
+                        && let Some(text) = text
+                    {
+                        renderer.transcript_final_text(text)?;
+                    }
+                    continue;
+                }
+                if output == OutputFormat::Full
+                    && let Some(reasoning) = reasoning_content
+                    && !reasoning.is_empty()
+                {
+                    renderer.reasoning_start(provider::ReasoningVisibility::StreamedTrace)?;
+                    renderer.reasoning_delta(reasoning)?;
+                    renderer.reasoning_end(None)?;
+                }
+                if let Some(text) = text {
+                    renderer.assistant_text(text)?;
+                    renderer.assistant_end()?;
+                }
+                for call in bash_calls {
+                    let args: serde_json::Value = serde_json::from_str(&call.arguments)
+                        .context("parsing persisted Bash arguments")?;
+                    renderer.bash_header_full(&args)?;
+                    renderer.tool_start(&args, true)?;
+                    match &call.result {
+                        Some(result) if result.outcome == "completed" => {
+                            renderer.bash_output(&result.output)?;
+                            renderer.tool_finished(
+                                result
+                                    .exit_code
+                                    .context("completed Bash result has no exit code")?,
+                                Duration::from_millis(result.duration_ms.unwrap_or_default()),
+                            )?;
+                        }
+                        Some(result) => renderer.tool_failed(
+                            result
+                                .output
+                                .strip_prefix("error: ")
+                                .unwrap_or(&result.outcome),
+                            Duration::from_millis(result.duration_ms.unwrap_or_default()),
+                        )?,
+                        None => renderer.tool_failed("incomplete", Duration::ZERO)?,
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+const TRANSCRIPT_HTML_COLUMNS: usize = 100;
+
+fn transcript_html(ansi: &str) -> Result<String> {
+    let transcript = serde_json::to_string(ansi)?.replace('<', "\\u003c");
+    Ok(format!(
+        r##"<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Mu transcript</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/css/xterm.css">
+<style>
+html,body,#terminal {{ height:100%; margin:0 }}
+body {{ box-sizing:border-box; padding:16px; background:#000 }}
+#terminal {{ max-width:100%; overflow:hidden }}
+</style>
+</head>
+<body>
+<div id="terminal"></div>
+<script src="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/lib/xterm.js"></script>
+<script>
+const term = new Terminal({{
+  cols:{TRANSCRIPT_HTML_COLUMNS}, rows:30, convertEol:true, disableStdin:true, scrollback:100000,
+  fontFamily:"ui-monospace,SFMono-Regular,Menlo,Consolas,monospace",
+  theme:{{background:"#000000"}}
+}});
+term.open(document.getElementById("terminal"));
+term.write({transcript});
+</script>
+</body>
+</html>
+"##
+    ))
+}
+
 async fn run() -> Result<()> {
     let args = Args::parse();
     let cwd = std::env::current_dir()?;
@@ -508,7 +643,11 @@ async fn run() -> Result<()> {
                         println!("{}  {}  {}  {}", s.id, title, model, updated);
                     }
                 }
-                SessionSub::Transcript { session } => {
+                SessionSub::Transcript {
+                    session,
+                    output,
+                    html,
+                } => {
                     if !store_path.exists() {
                         return Err(session.as_deref().map_or_else(
                             || anyhow::anyhow!("no sessions found in active scope"),
@@ -517,23 +656,20 @@ async fn run() -> Result<()> {
                     }
                     let store = store::Store::open(&store_path)?;
                     let session = resolve_transcript_session(&store, session.as_deref())?;
-                    for r in store.message_records_from_seq(&session.id, 0)? {
-                        println!("[{}:{}] {}", r.seq, r.kind, r.content);
-
-                        // Emit toolcall requests immediately under their assistant message
-                        if r.kind == "assistant" {
-                            for tc in &r.bash_calls {
-                                println!("[{}:toolcall] bash {}", r.seq, tc.arguments);
-                            }
-                        }
-
-                        // Surface the tool schema together with the system message
-                        if r.kind == "system"
-                            && let Ok(schema) =
-                                serde_json::to_string_pretty(&crate::bash::tool_definitions())
-                        {
-                            println!("[{}:system:toolschema]\n{}", r.seq, schema);
-                        }
+                    let events = store.transcript_events(&session.id)?;
+                    if html {
+                        let buffer = TranscriptBuffer::default();
+                        let mut renderer = Renderer::with_transcript_output(
+                            output,
+                            Box::new(buffer.clone()),
+                            TRANSCRIPT_HTML_COLUMNS - 1,
+                        );
+                        replay_transcript(&mut renderer, &events, output)?;
+                        let html = transcript_html(&buffer.text()?)?;
+                        io::stdout().write_all(html.as_bytes())?;
+                    } else {
+                        let mut renderer = Renderer::with_format(output);
+                        replay_transcript(&mut renderer, &events, output)?;
                     }
                 }
             }
@@ -1354,6 +1490,73 @@ mod tests {
                 .id,
             first.id
         );
+    }
+
+    #[test]
+    fn final_transcript_keeps_only_completed_assistant_text() {
+        let events = vec![
+            store::TranscriptEvent::User("Question".into()),
+            store::TranscriptEvent::Assistant {
+                turn_state: "continue".into(),
+                text: Some("Intermediate".into()),
+                reasoning_content: None,
+                bash_calls: Vec::new(),
+            },
+            store::TranscriptEvent::Assistant {
+                turn_state: "complete".into(),
+                text: Some("Final answer".into()),
+                reasoning_content: None,
+                bash_calls: Vec::new(),
+            },
+        ];
+        let buffer = TranscriptBuffer::default();
+        let mut renderer =
+            Renderer::with_transcript_output(OutputFormat::Final, Box::new(buffer.clone()), 79);
+
+        replay_transcript(&mut renderer, &events, OutputFormat::Final).unwrap();
+
+        assert_eq!(buffer.text().unwrap(), "mu> Question\n\nFinal answer\n");
+    }
+
+    #[test]
+    fn full_transcript_replays_reasoning_and_complete_bash_output() {
+        let events = vec![
+            store::TranscriptEvent::User("Question".into()),
+            store::TranscriptEvent::Assistant {
+                turn_state: "continue".into(),
+                text: Some("Running **now**.".into()),
+                reasoning_content: Some("Private trace".into()),
+                bash_calls: vec![store::TranscriptBashCall {
+                    arguments: r#"{"title":"Inspect","command":"printf all","risk":"readonly"}"#
+                        .into(),
+                    result: Some(store::TranscriptBashResult {
+                        outcome: "completed".into(),
+                        output: "line1\nline2\nline3\nline4\nline5\nline6\n".into(),
+                        exit_code: Some(0),
+                        duration_ms: Some(5),
+                    }),
+                }],
+            },
+        ];
+        let buffer = TranscriptBuffer::default();
+        let mut renderer =
+            Renderer::with_transcript_output(OutputFormat::Full, Box::new(buffer.clone()), 79);
+
+        replay_transcript(&mut renderer, &events, OutputFormat::Full).unwrap();
+
+        let transcript = buffer.text().unwrap();
+        assert!(transcript.contains("Private trace"));
+        assert!(transcript.contains("Running "));
+        assert!(transcript.contains("line1\nline2\nline3\nline4\nline5\nline6\n"));
+        assert!(!transcript.contains("omitted"));
+    }
+
+    #[test]
+    fn transcript_html_uses_pinned_xterm_and_escapes_embedded_script_end() {
+        let html = transcript_html("</script>\n").unwrap();
+
+        assert!(html.contains("@xterm/xterm@5.5.0"));
+        assert!(html.contains(r#"term.write("\u003c/script>\n")"#));
     }
 
     #[test]

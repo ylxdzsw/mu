@@ -313,8 +313,21 @@ accepts optional non-terminal stdin as a custom focus). The surface is small:
   rejected; model selection belongs to an actual turn. Creation does not update
   `current-session`.
 - `mu session list` — list recent sessions.
-- `mu session transcript [--session <id>]` — print a persisted session
-  transcript, defaulting to the last selected session in the active scope.
+- `mu session transcript [--session <id>] [-o final|concise|detail|full]
+  [--html]` — replay a persisted session, defaulting to the last selected
+  session and `detail` output. A terminal receives the normal styled renderer;
+  redirected output is ANSI-free and preserves assistant Markdown. The replay
+  contains user prompts, assistant text, and Bash calls/results, but not the
+  system prompt, compaction summaries, native provider payloads, or session
+  metadata. Flattened assistant fields are displayed in
+  reasoning-then-text-then-tool-call order. Only open Chat Completions
+  `reasoning_content` is displayed, and only in `full`; opaque Responses and
+  Anthropic reasoning is omitted. `final` keeps the user prompts and the final
+  completed assistant message of each turn. `concise` uses one-line Bash
+  results, `detail` uses the normal capped preview, and `full` includes complete
+  persisted redacted Bash output. `--html` emits one HTML file containing a
+  fixed-width ANSI replay rendered by pinned xterm.js assets from jsDelivr, so
+  the resulting file requires network access when opened.
 - `mu compact --session <id>` — force compaction. Terminal stdin is not read;
   non-terminal stdin is an optional verbatim custom focus instruction.
 - `mu retry [-s <id>] [-c] [-m|--model <id>] [-o|--output final|concise|detail|full]`
