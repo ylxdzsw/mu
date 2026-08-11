@@ -16,8 +16,8 @@ use sha2::{Digest, Sha256};
 use crate::bash::BashRisk;
 use crate::models::ResolvedModelRef;
 use crate::provider::{
-    Attachment, ContentPart, ImageDetail, Message, ModelApi, NativeReplay, Request, ToolAttachment,
-    ToolCall, Usage, UserContent,
+    Attachment, ContentPart, ImageDetail, Message, ModelApi, NativeReplay, ReasoningBlock, Request,
+    ToolAttachment, ToolCall, Usage, UserContent,
 };
 
 pub const BASH_CALL_ID_ENV: &str = "MU_BASH_CALL_ID";
@@ -83,6 +83,12 @@ pub struct GuardrailCompletion<'a> {
     pub reason: Option<&'a str>,
     pub native_response: Option<&'a Value>,
     pub usage: Option<&'a Usage>,
+}
+
+struct AssistantCompletion<'a> {
+    message: &'a Message,
+    reasoning_blocks: &'a [ReasoningBlock],
+    resumable: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -198,6 +204,8 @@ enum Projection {
         text: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         reasoning_content: Option<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        reasoning_blocks: Vec<ReasoningBlock>,
         #[serde(skip_serializing_if = "Option::is_none")]
         native_replay: Option<NativeReplay>,
         bash_calls: Vec<PersistedBashCall>,
@@ -600,6 +608,7 @@ impl Store {
                     tool_calls: None,
                     native_replay: None,
                 },
+                &[],
                 None,
                 Some(&Usage {
                     total_tokens: context_tokens,
@@ -859,7 +868,7 @@ impl Store {
                 let turn_id = self.current_turn_id(session_id)?;
                 let exchange_id =
                     self.start_test_provider_request(session_id, &turn_id, "agent")?;
-                self.complete_assistant_exchange(session_id, &exchange_id, message, None, None)
+                self.complete_assistant_exchange(session_id, &exchange_id, message, &[], None, None)
             }
             Message::System { .. } => Ok((1, Vec::new())),
             Message::Tool { .. } => bail!("Bash results require an internal Bash call identity"),
@@ -1104,16 +1113,20 @@ impl Store {
         session_id: &str,
         exchange_id: &str,
         message: &Message,
+        reasoning_blocks: &[ReasoningBlock],
         native_response: Option<&Value>,
         usage: Option<&Usage>,
     ) -> Result<(i64, Vec<i64>)> {
         self.complete_assistant_exchange_inner(
             session_id,
             exchange_id,
-            message,
+            AssistantCompletion {
+                message,
+                reasoning_blocks,
+                resumable: false,
+            },
             native_response,
             usage,
-            false,
         )
     }
 
@@ -1122,16 +1135,20 @@ impl Store {
         session_id: &str,
         exchange_id: &str,
         message: &Message,
+        reasoning_blocks: &[ReasoningBlock],
         native_response: Option<&Value>,
         usage: Option<&Usage>,
     ) -> Result<(i64, Vec<i64>)> {
         self.complete_assistant_exchange_inner(
             session_id,
             exchange_id,
-            message,
+            AssistantCompletion {
+                message,
+                reasoning_blocks,
+                resumable: true,
+            },
             native_response,
             usage,
-            true,
         )
     }
 
@@ -1139,11 +1156,15 @@ impl Store {
         &self,
         session_id: &str,
         exchange_id: &str,
-        message: &Message,
+        completion: AssistantCompletion<'_>,
         native_response: Option<&Value>,
         usage: Option<&Usage>,
-        resumable: bool,
     ) -> Result<(i64, Vec<i64>)> {
+        let AssistantCompletion {
+            message,
+            reasoning_blocks,
+            resumable,
+        } = completion;
         if !matches!(message, Message::Assistant { .. }) {
             self.fail_provider_exchange(
                 session_id,
@@ -1222,6 +1243,7 @@ impl Store {
                     },
                     text: content.clone(),
                     reasoning_content: reasoning_content.clone(),
+                    reasoning_blocks: reasoning_blocks.to_vec(),
                     native_replay: native_replay.clone(),
                     bash_calls,
                 },
@@ -2740,6 +2762,25 @@ mod tests {
     use crate::provider::Message;
 
     #[test]
+    fn assistant_projection_accepts_absent_reasoning_blocks() {
+        let projection: Projection = serde_json::from_value(serde_json::json!({
+            "kind": "assistant",
+            "turn_state": "complete",
+            "text": "older entry",
+            "bash_calls": [],
+        }))
+        .unwrap();
+
+        assert!(matches!(
+            projection,
+            Projection::Assistant {
+                reasoning_blocks,
+                ..
+            } if reasoning_blocks.is_empty()
+        ));
+    }
+
+    #[test]
     fn short_id_collision_retries_and_journal_replays() {
         let store = Store::open_memory().unwrap();
         let collision = "ses_00000000";
@@ -2981,6 +3022,7 @@ mod tests {
                         ]),
                     }),
                 },
+                &[],
                 None,
                 None,
             )
@@ -3185,6 +3227,7 @@ mod tests {
                     tool_calls: None,
                     native_replay: None,
                 },
+                &[],
                 None,
                 Some(&Usage {
                     total_tokens: 10,
@@ -3245,6 +3288,7 @@ mod tests {
                     tool_calls: Some(vec![call.clone(), call]),
                     native_replay: None,
                 },
+                &[],
                 None,
                 None,
             )
@@ -3495,6 +3539,7 @@ mod tests {
                     tool_calls: None,
                     native_replay: None,
                 },
+                &[],
                 None,
                 None,
             )
@@ -3539,6 +3584,7 @@ mod tests {
                     tool_calls: None,
                     native_replay: None,
                 },
+                &[],
                 None,
                 None,
             )
