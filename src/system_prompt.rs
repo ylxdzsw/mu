@@ -39,7 +39,10 @@ pub fn assemble_prompt(
     global_config_dir: &Path,
     project_config_dir: Option<&Path>,
 ) -> String {
-    let mut parts = vec![role_preamble().to_string()];
+    let mut parts = vec![format!(
+        "<system_preamble>\n{}\n</system_preamble>",
+        role_preamble()
+    )];
 
     let os = os_description();
     let date = Local::now().format("%Y-%m-%d").to_string();
@@ -284,8 +287,13 @@ mod tests {
     #[test]
     fn role_preamble_explicitly_limits_tools() {
         let prompt = assemble_prompt(&[], Path::new("/tmp/mu-test-global"), None);
-        assert!(prompt.starts_with(role_preamble()));
+        assert!(prompt.starts_with("<system_preamble>\n"));
+        assert!(prompt.contains(&format!(
+            "<system_preamble>\n{}\n</system_preamble>",
+            role_preamble()
+        )));
         assert!(prompt.contains("Exactly one tool is available: `bash`"));
+        assert!(prompt.contains("</system_preamble>\n\n<runtime>"));
         assert!(prompt.contains("\nuser: "));
         assert!(prompt.contains(" (uid "));
     }
@@ -306,7 +314,11 @@ mod tests {
             "<agents_md scope=\"global\" path=\"{}\">\nGlobal mu instructions.\n</agents_md>",
             agents_path.display()
         )));
-        assert!(context.contains("<available_skills>"));
+        assert!(context.contains(
+            "<skills>\nBefore responding, actively scan the available skills below."
+        ));
+        assert!(context.contains("\n## Available skills\n\n- brave-search:"));
+        assert!(context.contains("\n</skills>"));
         assert!(context.contains("brave-search"));
         assert!(!context.contains("Relative paths inside a skill file"));
         assert!(!context.contains(role_preamble()));
@@ -418,7 +430,7 @@ mod tests {
 
         assert!(context.starts_with(EXPORT_PREAMBLE));
         assert!(context.contains(&env_path.display().to_string()));
-        assert!(!context.contains("<available_skills>"));
+        assert!(!context.contains("<skills>"));
         assert!(!context.contains("<agents_md"));
     }
 

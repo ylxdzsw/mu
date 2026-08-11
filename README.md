@@ -216,8 +216,8 @@ messages, and exits. A few ideas follow from that:
 ## Sharing mu's context with other agents
 
 `mu context` introspects the agent context and has two modes. On its own it
-prints the assembled system prompt mu itself would use — role preamble, runtime
-block, the full skills index, and your merged `AGENTS.md` — so you can see
+prints the assembled system prompt mu itself would use — `<system_preamble>`,
+`<runtime>`, `<skills>`, and your merged `<agents_md>` blocks — so you can see
 exactly what a new session receives:
 
 ```sh
@@ -227,9 +227,13 @@ mu context --export    # a portable projection for another agent to ingest
 
 `--export` instead emits a projection tailored for a *foreign* agent: a short
 preamble explaining the content was authored for mu, followed by your own merged
-`AGENTS.md` and your non-built-in skills. The role preamble, runtime block, and
-built-in skills are left out. Neither mode contacts a provider, and scope
-resolves from the working directory like `mu status`.
+`AGENTS.md` and your non-built-in skills. The `<system_preamble>` and `<runtime>`
+blocks and built-in skills are left out. Neither mode contacts a provider, and
+scope resolves from the working directory like `mu status`.
+
+In Mu's own system prompt, the role text is wrapped in `<system_preamble>`,
+runtime facts in `<runtime>`, skill guidance and metadata in a single `<skills>`
+Markdown document, and each instruction file in `<agents_md>`.
 
 Because `--export` re-reads your instructions and skills on every call, it stays
 current with no separate sync step. In a project with no user `AGENTS.md` and no

@@ -36,8 +36,8 @@ before filesystem root. If no project is found, `mu` uses global scope.
 - Environment: process environment, then global `.env`, then project `.mu/.env`.
 - Instruction index: built-ins, then global `.mu`, then project `.mu`; later
   scopes shadow earlier skills or commands with the same name.
-- Prompt guidance: role preamble and runtime context, then available skill
-  metadata, then global `AGENTS.md`, then project `AGENTS.md`.
+- Prompt guidance: `<system_preamble>`, then `<runtime>`, then the `<skills>`
+  Markdown document, then global and project `<agents_md>` blocks.
 
 Use project files for repository-specific behavior. Use global files for the
 user's personal defaults. Avoid editing built-ins unless the user is changing

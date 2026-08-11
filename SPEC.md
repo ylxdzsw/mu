@@ -283,10 +283,10 @@ accepts optional non-terminal stdin as a custom focus). The surface is small:
   The resolved model object includes its current effective `replay_key`;
   `--include-models` adds the effective key for every configured model.
 - `mu context [--export]` — introspect the agent context. By default it prints
-  the assembled system prompt mu itself would use: the role preamble, the
-  `<runtime>` block, the full skills index (built-in, global, and project), and
-  the merged `AGENTS.md` — a faithful mirror of the persisted system message, so
-  it never contacts a provider. `--export` instead prints a portable projection
+  the assembled system prompt mu itself would use: the `<system_preamble>`,
+  `<runtime>`, and `<skills>` blocks plus the merged `<agents_md>` blocks — a
+  faithful mirror of the persisted system message, so it never contacts a
+  provider. `--export` instead prints a portable projection
   for a *foreign* agent to ingest: an explanatory preamble (noting the content
   was authored for mu, and pointing at the `customize-mu` reference when that
   built-in is present, while listing the absolute paths of existing global and
@@ -296,13 +296,13 @@ accepts optional non-terminal stdin as a custom focus). The surface is small:
   precedence so a foreign agent can parse and load them when a skill needs their
   values, without displaying the files or exposing secret values in output)
   followed by the user's own merged `AGENTS.md` (each wrapped with its scope and
-  absolute source path) and non-built-in skills; the role preamble, `<runtime>`
-  block, and built-in skills are omitted. In `--export` mode, when the user has no
-  `AGENTS.md`, non-built-in skills, or `.env` files, the output is empty (exit
-  0), so a `SessionStart`-style hook injects nothing in a project with no mu
-  configuration. Neither mode loads
-  a provider; scope resolves from the working directory like other introspection
-  commands. See the README for a Claude Code hook example.
+  absolute source path) and non-built-in skills; the `<system_preamble>` and
+  `<runtime>` blocks and built-in skills are omitted. In `--export` mode, when
+  the user has no `AGENTS.md`, non-built-in skills, or `.env` files, the output
+  is empty (exit 0), so a `SessionStart`-style hook injects nothing in a project
+  with no mu configuration. Neither mode loads a provider; scope resolves from
+  the working directory like other introspection commands. See the README for a
+  Claude Code hook example.
 - `mu cat [<prompt-file-or-command>]` — resolve and load the same user-prompt
   text as a turn without contacting a provider or creating session state. With
   no target, stdin is the complete prompt. With a file-backed target, terminal
@@ -1292,8 +1292,10 @@ global and project `.mu` directories.
   on `PATH`.
 - On startup `mu` scans regular files directly in `.mu` plus direct
   `folder/SKILL.md` files, parses qualifying front-matter, and injects a compact
-  `<available_skills>` block — name, description, absolute file path — into the
-  system prompt. Supporting files below skill folders are not indexed.
+  `<skills>` block into the system prompt. The block contains one complete
+  Markdown document: loading guidance followed by each active skill's name,
+  description, and absolute file path. Supporting files below skill folders are
+  not indexed.
 - Before responding, the model actively scans the listed skills. When the user
   names a skill or one is even partially relevant, the model reads the full
   file via `bash`, using the **absolute path** from the injected block. Loading
@@ -1530,14 +1532,19 @@ is created, persisted as the first message, and then loaded from session history
 for later turns. Existing sessions do not rebuild it when files or config change.
 The assembled prompt has this fixed order:
 
-1. A short role/behavior preamble (a few sentences). Illustrative:
-   > You are mu, a terminal agent. Exactly one function tool is available:
-   > `bash`; do not call any other function tool. Inside `bash`, Mu provides
-   > `apply_patch` for structured file edits, `edit` for exact replacements,
-   > and `view_image` for loading an image into the tool result. These are shell
-   > commands, not function tools.
-   > Each bash call is isolated; pass `cwd` explicitly when needed. Keep
-   > responses concise.
+1. A `<system_preamble>` block containing a short role/behavior preamble (a few
+   sentences). Illustrative:
+   ```
+   <system_preamble>
+   You are mu, a terminal agent. Exactly one function tool is available:
+   `bash`; do not call any other function tool. Inside `bash`, Mu provides
+   `apply_patch` for structured file edits, `edit` for exact replacements,
+   and `view_image` for loading an image into the tool result. These are shell
+   commands, not function tools.
+   Each bash call is isolated; pass `cwd` explicitly when needed. Keep
+   responses concise.
+   </system_preamble>
+   ```
    The exact wording lives in `src/system_preamble.md`; keep it short.
 2. A `<runtime>` block of host-stable facts only, as plain `key: value` lines:
    ```
@@ -1554,8 +1561,10 @@ The assembled prompt has this fixed order:
    directory and active Git worktree root are turn-level facts; semantic replay
    derives the first location block and later change reminders from
    `turn_started` (§11, "Agent environment context").
-3. The `<available_skills>` block (§8), or omitted if there are no skills. Skill
-   metadata is merged from built-in, global, and active-project instruction
+3. The `<skills>` block (§8), or omitted if there are no skills. Its contents
+   form a complete Markdown document, with the loading instructions as leading
+   paragraphs and the skill metadata under an `Available skills` heading.
+   Metadata is merged from built-in, global, and active-project instruction
    indexes. Priority is project > global/user > built-in for same-name skills
    and commands.
 4. The global `AGENTS.md`, wrapped in `<agents_md scope="global"
