@@ -536,6 +536,21 @@ fn replay_transcript(
     Ok(())
 }
 
+fn write_terminal_transcript_separator(
+    stdout: &mut impl Write,
+    stdout_is_terminal: bool,
+    events: &[store::TranscriptEvent],
+) -> io::Result<()> {
+    if stdout_is_terminal
+        && events
+            .iter()
+            .any(|event| matches!(event, store::TranscriptEvent::User { .. }))
+    {
+        stdout.write_all(b"\n")?;
+    }
+    Ok(())
+}
+
 const TRANSCRIPT_HTML_COLUMNS: usize = 100;
 
 fn transcript_html(ansi: &str) -> Result<String> {
@@ -659,6 +674,12 @@ async fn run() -> Result<()> {
                 let html = transcript_html(&buffer.text()?)?;
                 io::stdout().write_all(html.as_bytes())?;
             } else {
+                let stdout = io::stdout();
+                write_terminal_transcript_separator(
+                    &mut stdout.lock(),
+                    stdout.is_terminal(),
+                    &events,
+                )?;
                 let mut renderer = Renderer::with_format(output);
                 replay_transcript(&mut renderer, &events, output, context_window)?;
             }
@@ -1574,6 +1595,27 @@ mod tests {
             buffer.text().unwrap(),
             "test/model ~42% /work\nmu> Question\n\nFinal answer\n"
         );
+    }
+
+    #[test]
+    fn terminal_transcript_starts_after_an_empty_line() {
+        let events = vec![store::TranscriptEvent::User {
+            text: "Question".into(),
+            cwd: "/work".into(),
+            model: None,
+            context: None,
+        }];
+        let mut terminal = Vec::new();
+        write_terminal_transcript_separator(&mut terminal, true, &events).unwrap();
+        assert_eq!(terminal, b"\n");
+
+        let mut redirected = Vec::new();
+        write_terminal_transcript_separator(&mut redirected, false, &events).unwrap();
+        assert!(redirected.is_empty());
+
+        let mut empty = Vec::new();
+        write_terminal_transcript_separator(&mut empty, true, &[]).unwrap();
+        assert!(empty.is_empty());
     }
 
     #[test]
