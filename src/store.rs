@@ -1181,6 +1181,37 @@ impl Store {
             .sum())
     }
 
+    pub(crate) fn estimate_compaction_context_tokens(
+        &self,
+        session_id: &str,
+        exchange_id: &str,
+        summary: &str,
+        through_seq: i64,
+        retained_turn_ids: &[String],
+    ) -> Result<u64> {
+        let mut journal = self.load(session_id)?;
+        let seq = journal.events.last().map_or(1, |line| line.seq + 1);
+        Arc::make_mut(&mut journal.events).push(EventLine {
+            seq,
+            at: now(),
+            event: Event::ProviderCompleted {
+                exchange_id: exchange_id.to_string(),
+                response_json: None,
+                usage: None,
+                projection: Projection::Compaction {
+                    summary: summary.to_string(),
+                    through_seq,
+                    retained_turn_ids: retained_turn_ids.to_vec(),
+                },
+            },
+        });
+        Ok(self
+            .context(&journal)?
+            .iter()
+            .map(Message::approx_tokens)
+            .sum())
+    }
+
     pub fn acquire_session_lock(&self, session_id: &str) -> Result<SessionLock<'_>> {
         if !valid_session_id(session_id) {
             bail!("session not found: {session_id}")

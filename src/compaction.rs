@@ -275,7 +275,7 @@ fn compaction_needed(
 
 pub async fn run_compaction(
     store: &Store,
-    _config: &Config,
+    config: &Config,
     session_id: &str,
     model: &ResolvedModelRef,
     provider: &dyn Provider,
@@ -493,6 +493,36 @@ pub async fn run_compaction(
         }
     };
     let retained_turn_ids = store.turn_ids_after(session_id, summarize_through_seq)?;
+    let after_context_tokens_estimate = store.estimate_compaction_context_tokens(
+        session_id,
+        &exchange_id,
+        &content,
+        summarize_through_seq,
+        &retained_turn_ids,
+    )?;
+    if let Some(context_window) = resolve_model_info(config, model).context_window {
+        let soft_threshold =
+            soft_compaction_threshold(context_window, config.compaction.soft_fraction);
+        if after_context_tokens_estimate > soft_threshold {
+            let message = format!(
+                "compaction insufficient: estimated context {after_context_tokens_estimate} exceeds soft threshold {soft_threshold}"
+            );
+            store.fail_provider_exchange(
+                session_id,
+                &exchange_id,
+                "insufficient_compaction",
+                serde_json::json!({
+                    "message": message,
+                    "estimated_context_tokens": after_context_tokens_estimate,
+                    "soft_threshold_tokens": soft_threshold,
+                    "context_window": context_window,
+                }),
+                result.native_response.as_ref(),
+                result.usage.as_ref(),
+            )?;
+            return Err(anyhow::anyhow!(message));
+        }
+    }
     store.complete_compaction_exchange(
         session_id,
         &exchange_id,
@@ -506,7 +536,7 @@ pub async fn run_compaction(
     )?;
     Ok(CompactionOutcome::Applied {
         before_context_tokens,
-        after_context_tokens_estimate: store.estimate_context_tokens(session_id)?,
+        after_context_tokens_estimate,
     })
 }
 
@@ -594,7 +624,7 @@ mod tests {
         }
     }
 
-    fn test_config() -> Config {
+    fn test_config_with_context_window(context_window: Option<u64>) -> Config {
         Config {
             providers: crate::config::OrderedMap::from_iter([(
                 "test".into(),
@@ -604,7 +634,7 @@ mod tests {
                     models: crate::config::OrderedMap::from_iter([(
                         "fake-model".into(),
                         crate::config::ModelConfig {
-                            context_window: None,
+                            context_window,
                             supported_efforts: None,
                             replay_key: None,
                         },
@@ -620,6 +650,10 @@ mod tests {
             redaction: crate::config::RedactionConfig::default(),
             env: Default::default(),
         }
+    }
+
+    fn test_config() -> Config {
+        test_config_with_context_window(None)
     }
 
     #[test]
@@ -1084,6 +1118,110 @@ mod tests {
             Some(ProviderError::ContextLength { .. })
         ));
         assert_eq!(store.latest_summary_sequence(&session.id).unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn insufficient_compaction_records_failure_without_changing_context() {
+        let store = Store::open_memory().unwrap();
+        let session = store
+            .create_session_seeded("session system prompt")
+            .unwrap();
+        let config = test_config_with_context_window(Some(1_000));
+        let request_model = crate::models::resolve_model_ref(&config, "test/fake-model").unwrap();
+
+        for n in 1..=2 {
+            store
+                .append_message(
+                    &session.id,
+                    &Message::User {
+                        content: format!("old user {n}").into(),
+                    },
+                )
+                .unwrap();
+            store
+                .append_message(
+                    &session.id,
+                    &Message::assistant(Some(format!("old assistant {n}")), None, None, None),
+                )
+                .unwrap();
+        }
+        store
+            .append_summary(&session.id, "existing summary")
+            .unwrap();
+        let previous_summary_seq = store.latest_summary_sequence(&session.id).unwrap();
+
+        for n in 3..=8 {
+            store
+                .append_message(
+                    &session.id,
+                    &Message::User {
+                        content: format!("user {n}").into(),
+                    },
+                )
+                .unwrap();
+            store
+                .append_message(
+                    &session.id,
+                    &Message::assistant(
+                        Some(format!("assistant {n} {}", "x".repeat(800))),
+                        None,
+                        None,
+                        None,
+                    ),
+                )
+                .unwrap();
+        }
+        let context_before = store.load_context_messages(&session.id).unwrap();
+        let usage_before = store
+            .get_session(&session.id)
+            .unwrap()
+            .unwrap()
+            .reported_context_tokens;
+
+        let error = run_compaction(
+            &store,
+            &config,
+            &session.id,
+            &request_model,
+            &FakeProvider,
+            None,
+            None,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(error.to_string().contains("compaction insufficient"));
+        assert_eq!(
+            store.latest_summary_sequence(&session.id).unwrap(),
+            previous_summary_seq
+        );
+        assert_eq!(
+            format!("{:?}", store.load_context_messages(&session.id).unwrap()),
+            format!("{context_before:?}")
+        );
+        assert_eq!(
+            store
+                .get_session(&session.id)
+                .unwrap()
+                .unwrap()
+                .reported_context_tokens,
+            usage_before
+        );
+        let failure = store
+            .audit_events(&session.id)
+            .unwrap()
+            .into_iter()
+            .rev()
+            .find(|event| event["type"] == "provider_failed")
+            .unwrap();
+        assert_eq!(failure["error_class"], "insufficient_compaction");
+        assert_eq!(failure["error"]["soft_threshold_tokens"], 700);
+        assert!(
+            failure["error"]["estimated_context_tokens"]
+                .as_u64()
+                .unwrap()
+                > 700
+        );
     }
 
     #[test]

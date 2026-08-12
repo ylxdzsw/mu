@@ -28,6 +28,31 @@ pub struct ToolResult {
     pub attachments: Vec<ToolAttachment>,
 }
 
+#[derive(Debug)]
+struct BashExecutionError {
+    reason: String,
+    partial_output: String,
+    redacted: bool,
+}
+
+impl BashExecutionError {
+    fn new(reason: String, partial_output: String, redacted: bool) -> Self {
+        Self {
+            reason,
+            partial_output,
+            redacted,
+        }
+    }
+}
+
+impl fmt::Display for BashExecutionError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.reason)
+    }
+}
+
+impl std::error::Error for BashExecutionError {}
+
 pub struct ToolContext<'a> {
     pub config: &'a Config,
     pub renderer: &'a mut Renderer,
@@ -71,6 +96,29 @@ pub fn apply_truncation(
     use_tail: bool,
 ) -> String {
     truncate_output(&output, limits, prefix, use_tail)
+}
+
+pub(crate) fn model_failure_output(error: &anyhow::Error, limits: &LimitsConfig) -> String {
+    let Some(error) = error.downcast_ref::<BashExecutionError>() else {
+        return format!("error: {error}");
+    };
+    let mut message = format!("error: {}", error.reason);
+    let partial_output = error.partial_output.trim_end_matches('\n');
+    if partial_output.is_empty() {
+        return message;
+    }
+    message.push_str("\npartial output:\n");
+    message.push_str(&apply_truncation(
+        partial_output.to_string(),
+        limits,
+        "bash",
+        true,
+    ));
+    if error.redacted {
+        message.push_str("\n\n");
+        message.push_str(REDACTION_REMINDER);
+    }
+    message
 }
 
 fn truncate_output(
@@ -651,7 +699,7 @@ fn run_bash_inner(
     let mut status: Option<ExitStatus> = None;
     let mut stdout_closed = false;
     let mut interrupted = false;
-    let mut terminal_error: Option<anyhow::Error> = None;
+    let mut terminal_error: Option<BashExecutionError> = None;
 
     loop {
         if cancellation_requested() {
@@ -660,16 +708,10 @@ fn run_bash_inner(
             drain_available(&rx, target, &mut output, redactor)?;
             flush_redactor(target, &mut output, redactor)?;
             let _ = child.wait();
-            let reminder = if redactor.did_redact() {
-                format!("\n\n{REDACTION_REMINDER}")
-            } else {
-                String::new()
-            };
-            terminal_error = Some(anyhow::anyhow!(
-                "command interrupted by {}{}{}",
-                signal_name(last_signal()),
-                partial_output_suffix(&output),
-                reminder
+            terminal_error = Some(BashExecutionError::new(
+                format!("command interrupted by {}", signal_name(last_signal())),
+                std::mem::take(&mut output),
+                redactor.did_redact(),
             ));
             break;
         }
@@ -679,15 +721,10 @@ fn run_bash_inner(
             drain_available(&rx, target, &mut output, redactor)?;
             flush_redactor(target, &mut output, redactor)?;
             let _ = child.wait();
-            let reminder = if redactor.did_redact() {
-                format!("\n\n{REDACTION_REMINDER}")
-            } else {
-                String::new()
-            };
-            terminal_error = Some(anyhow::anyhow!(
-                "command timed out after {timeout_secs}s{}{}",
-                partial_output_suffix(&output),
-                reminder
+            terminal_error = Some(BashExecutionError::new(
+                format!("command timed out after {timeout_secs}s"),
+                std::mem::take(&mut output),
+                redactor.did_redact(),
             ));
             break;
         }
@@ -706,16 +743,13 @@ fn run_bash_inner(
                     drain_available(&rx, target, &mut output, redactor)?;
                     flush_redactor(target, &mut output, redactor)?;
                     let _ = child.wait();
-                    let reminder = if redactor.did_redact() {
-                        format!("\n\n{REDACTION_REMINDER}")
-                    } else {
-                        String::new()
-                    };
-                    terminal_error = Some(anyhow::anyhow!(
-                        "command killed: output exceeded {} MB limit{}{}",
-                        MAX_OUTPUT_BYTES / (1024 * 1024),
-                        partial_output_suffix(&output),
-                        reminder
+                    terminal_error = Some(BashExecutionError::new(
+                        format!(
+                            "command killed: output exceeded {} MB limit",
+                            MAX_OUTPUT_BYTES / (1024 * 1024)
+                        ),
+                        std::mem::take(&mut output),
+                        redactor.did_redact(),
                     ));
                     break;
                 }
@@ -734,20 +768,15 @@ fn run_bash_inner(
     let status = status.unwrap_or_else(|| child.wait().expect("bash status"));
     flush_redactor(target, &mut output, redactor)?;
     if let Some(error) = terminal_error {
-        return Err(error);
+        return Err(error.into());
     }
     if interrupted || (cancellation_requested() && status.signal().is_some()) {
-        let reminder = if redactor.did_redact() {
-            format!("\n\n{REDACTION_REMINDER}")
-        } else {
-            String::new()
-        };
-        bail!(
-            "command interrupted by {}{}{}",
-            signal_name(last_signal()),
-            partial_output_suffix(&output),
-            reminder
-        );
+        return Err(BashExecutionError::new(
+            format!("command interrupted by {}", signal_name(last_signal())),
+            output,
+            redactor.did_redact(),
+        )
+        .into());
     }
     Ok(BashRunResult {
         output: output.trim_end_matches('\n').to_string(),
@@ -793,15 +822,6 @@ fn flush_redactor(
     output.push_str(&redacted);
     target.push_output(&redacted)?;
     Ok(())
-}
-
-fn partial_output_suffix(output: &str) -> String {
-    let output = output.trim_end_matches('\n');
-    if output.is_empty() {
-        String::new()
-    } else {
-        format!("; partial output:\n{output}")
-    }
 }
 
 fn is_e2big(error: &std::io::Error) -> bool {
@@ -956,8 +976,8 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        AttachmentContext, BashArgs, BashRisk, ToolContext, apply_truncation, run_bash,
-        truncate_line,
+        AttachmentContext, BashArgs, BashExecutionError, BashRisk, REDACTION_REMINDER, ToolContext,
+        apply_truncation, model_failure_output, run_bash, truncate_line,
     };
     use crate::config::EnvMap;
     use crate::config::{
@@ -1337,6 +1357,33 @@ mod tests {
         assert_eq!(
             spill.parent().unwrap(),
             crate::paths::runtime_dir().unwrap()
+        );
+        let _ = std::fs::remove_file(spill);
+    }
+
+    #[test]
+    fn model_failure_keeps_reason_and_bounds_partial_output() {
+        let error = anyhow::Error::new(BashExecutionError::new(
+            "command timed out after 120s".into(),
+            "one\ntwo\nthree\nfour".into(),
+            true,
+        ));
+        let output = model_failure_output(&error, &tight_limits());
+
+        assert!(output.starts_with("error: command timed out after 120s\npartial output:\n"));
+        assert!(!output.contains("\none\n"));
+        assert!(output.contains("three\nfour"));
+        assert!(output.contains("lines elided"));
+        assert!(output.contains("temporary file"));
+        assert!(output.ends_with(REDACTION_REMINDER));
+
+        let marker = "temporary file ";
+        let start = output.find(marker).unwrap() + marker.len();
+        let end = output[start..].find(';').unwrap() + start;
+        let spill = PathBuf::from(&output[start..end]);
+        assert_eq!(
+            std::fs::read_to_string(&spill).unwrap(),
+            "one\ntwo\nthree\nfour"
         );
         let _ = std::fs::remove_file(spill);
     }

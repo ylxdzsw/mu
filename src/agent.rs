@@ -816,7 +816,7 @@ impl<'a> AgentLoop<'a> {
                 )
             }
             Err(error) => {
-                let message = format!("error: {error}");
+                let message = bash::model_failure_output(&error, &self.config.limits);
                 if emit_renderer {
                     self.renderer.tool_failed(&error.to_string(), elapsed)?;
                 }

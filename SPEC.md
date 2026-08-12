@@ -631,6 +631,11 @@ the budget:
   actively remove spill files, and it makes no retention promise; the OS or an
   administrator may remove one at any time. A missing spill is likewise
   harmless — the model just gets a shell error when it tries to read the path.
+- Timeout, interruption, and internal output-limit failures apply the same caps
+  to their partial output. The failure reason remains outside the truncated
+  preview and therefore always remains visible. Partial output is redacted
+  before truncation or spill; failures without partial output remain
+  `error: <reason>`.
 
 All local search, file reads, writes, edits, tests, and web fetches go through
 `bash`. The model should choose ordinary structured CLI patterns (`rg`, `find`,
@@ -1905,6 +1910,14 @@ the latest summary plus later semantic events, so compacted history is
 naturally excluded without deleting anything. Earlier journal events remain
 available for audit. When a prior summary exists, only semantic events after
 its boundary and before the new cut are incorporated into the updated summary.
+Before committing the summary projection, mu builds that candidate context and
+estimates its tokens. If the estimate is strictly greater than the active
+model's soft threshold, the compaction exchange is recorded as failed with
+class `insufficient_compaction`; the candidate summary and boundary are not
+committed, so the prior semantic context and context-usage status remain
+authoritative. This validation is shared by manual, soft, hard, and reactive
+compaction. When the active model has no configured context window, no soft
+threshold exists and this sufficiency check is unavailable.
 
 **Manual compaction.** `mu compact` forces compaction of the current session on
 demand; `-s|--session <id>` selects another session in the active scope.
@@ -1918,11 +1931,11 @@ never supplies a custom focus. Interactive compaction shows one mutable
 `[compacting <duration>]` line. Successful automatic and manual compaction
 replace it with one committed result line containing the reported
 pre-compaction percentage, estimated post-compaction percentage, and elapsed
-time. Redirected output emits one plain status line. Provider failure
-or an empty summary exits non-zero and never reports success. An inapplicable
-manual request reports `compaction inapplicable: no history exists before the
-N retained turns`, where `N` is the retained suffix size selected by the
-request budget.
+time. Redirected output emits one plain status line. Provider failure, an empty
+summary, or an insufficient candidate context exits non-zero and never reports
+success. An inapplicable manual request reports `compaction inapplicable: no
+history exists before the N retained turns`, where `N` is the retained suffix
+size selected by the request budget.
 
 ### Agent-loop bounds
 

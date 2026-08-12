@@ -394,7 +394,9 @@ During compaction, interactive output uses one mutable
 completed result marks its rebuilt context percentage with `~` because it is
 estimated until the next provider response; the shell prompt uses the same
 marker and returns to an unprefixed percentage after that response supplies
-exact usage.
+exact usage. If the rebuilt context would still exceed the model's soft
+threshold, compaction exits nonzero and records a failed attempt without
+changing the conversation's prior summary, boundary, or context status.
 
 ## Native installation and portable builds
 
