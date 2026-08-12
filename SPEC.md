@@ -320,17 +320,25 @@ accepts optional non-terminal stdin as a custom focus). The surface is small:
   [--html]` — replay a persisted session, defaulting to the last selected
   session and `detail` output. A terminal receives the normal styled renderer;
   redirected output is ANSI-free and preserves assistant Markdown. The replay
-  contains user prompts, assistant text, and Bash calls/results, but not the
-  system prompt, compaction summaries, native provider payloads, or session
-  metadata. Assistant reasoning, text blocks, and Bash calls are displayed in
-  their persisted item order. Only open Chat Completions `reasoning_content` is
-  displayed, and only in `full`; opaque Responses and Anthropic reasoning is
-  omitted. `final` keeps the user prompts and concatenated text items from the
-  final completed assistant message of each turn. `concise` uses one-line Bash
-  results, `detail` uses the normal capped preview, and `full` includes complete
-  persisted redacted Bash output. `--html` emits one HTML file containing a
-  fixed-width ANSI replay rendered by pinned xterm.js assets from jsDelivr, so
-  the resulting file requires network access when opened.
+  synthesizes the shell prompt status before each submitted prompt from the
+  journal: the turn's requested model, the recorded cwd, and the context usage
+  immediately before that turn. Provider-reported usage is exact; reconstructed
+  usage is prefixed with `~`. Percentages use the historical model's context
+  window from current config and are omitted when that model is no longer
+  configured. The first prompt has no context percentage because the journal
+  cannot distinguish a newly created shell session from a preselected empty
+  session. The replay contains user prompts, assistant text, and Bash
+  calls/results, but not the system prompt, compaction summaries, native
+  provider payloads, or session metadata. Assistant reasoning, text blocks, and
+  Bash calls are displayed in their persisted item order. Only open Chat
+  Completions `reasoning_content` is displayed, and only in `full`; opaque
+  Responses and Anthropic reasoning is omitted. `final` keeps the user prompts
+  and concatenated text items from the final completed assistant message of
+  each turn. `concise` uses one-line Bash results, `detail` uses the normal
+  capped preview, and `full` includes complete persisted redacted Bash output.
+  `--html` emits one HTML file containing a fixed-width ANSI replay rendered by
+  pinned xterm.js assets from jsDelivr, so the resulting file requires network
+  access when opened.
 - `mu compact [-s|--session <id>]` — force compaction, defaulting to the last
   selected session. Terminal stdin is not read; non-terminal stdin is an
   optional verbatim custom focus instruction.

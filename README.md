@@ -182,8 +182,11 @@ mu transcript --session ses_... --html > session.html
 ```
 
 Terminal replay uses the same Markdown and Bash renderer as a live turn;
-redirected output is ANSI-free. HTML export is a single file containing the
-terminal transcript and loads pinned xterm.js assets from jsDelivr when opened.
+redirected output is ANSI-free. Each user turn includes a synthesized shell
+status line with its requested model, recorded cwd, and historical context
+percentage when the model remains configured. HTML export is a single file
+containing the terminal transcript and loads pinned xterm.js assets from
+jsDelivr when opened.
 `mu compact` compacts the current session; pass `-s <id>` to select another
 session in the active scope.
 

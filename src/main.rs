@@ -448,10 +448,28 @@ fn replay_transcript(
     renderer: &mut Renderer,
     events: &[store::TranscriptEvent],
     output: OutputFormat,
+    context_window: impl Fn(&str) -> Option<u64>,
 ) -> Result<()> {
     for event in events {
         match event {
-            store::TranscriptEvent::User(text) => renderer.transcript_prompt(text)?,
+            store::TranscriptEvent::User {
+                text,
+                cwd,
+                model,
+                context,
+            } => {
+                let context_percent = context.as_ref().and_then(|context| {
+                    context_window(model.as_deref()?)
+                        .filter(|window| *window > 0)
+                        .map(|window| {
+                            (
+                                context.tokens as f64 / window as f64 * 100.0,
+                                context.estimated,
+                            )
+                        })
+                });
+                renderer.transcript_prompt(model.as_deref(), context_percent, cwd, text)?;
+            }
             store::TranscriptEvent::Assistant { turn_state, items } => {
                 if output == OutputFormat::Final {
                     if turn_state == "complete" {
@@ -620,6 +638,16 @@ async fn run() -> Result<()> {
             let store = store::Store::open(&store_path)?;
             let session = resolve_session_or_current(&store, session.as_deref())?;
             let events = store.transcript_events(&session.id)?;
+            let config = paths::global_dir()
+                .join("config.jsonc")
+                .exists()
+                .then(|| Config::load_for_scope(project_config_dir.as_deref()))
+                .and_then(Result::ok);
+            let context_window = |model: &str| {
+                let config = config.as_ref()?;
+                let choice = models::resolve_model_choice(config, model).ok()?;
+                models::resolve_model_info(config, choice.active_model()).context_window
+            };
             if html {
                 let buffer = TranscriptBuffer::default();
                 let mut renderer = Renderer::with_transcript_output(
@@ -627,12 +655,12 @@ async fn run() -> Result<()> {
                     Box::new(buffer.clone()),
                     TRANSCRIPT_HTML_COLUMNS - 1,
                 );
-                replay_transcript(&mut renderer, &events, output)?;
+                replay_transcript(&mut renderer, &events, output, context_window)?;
                 let html = transcript_html(&buffer.text()?)?;
                 io::stdout().write_all(html.as_bytes())?;
             } else {
                 let mut renderer = Renderer::with_format(output);
-                replay_transcript(&mut renderer, &events, output)?;
+                replay_transcript(&mut renderer, &events, output, context_window)?;
             }
             return Ok(());
         }
@@ -1514,7 +1542,15 @@ mod tests {
     #[test]
     fn final_transcript_keeps_only_completed_assistant_text() {
         let events = vec![
-            store::TranscriptEvent::User("Question".into()),
+            store::TranscriptEvent::User {
+                text: "Question".into(),
+                cwd: "/work".into(),
+                model: Some("test/model".into()),
+                context: Some(store::TranscriptContext {
+                    tokens: 42,
+                    estimated: true,
+                }),
+            },
             store::TranscriptEvent::Assistant {
                 turn_state: "continue".into(),
                 items: vec![store::TranscriptAssistantItem::Text("Intermediate".into())],
@@ -1532,15 +1568,23 @@ mod tests {
         let mut renderer =
             Renderer::with_transcript_output(OutputFormat::Final, Box::new(buffer.clone()), 79);
 
-        replay_transcript(&mut renderer, &events, OutputFormat::Final).unwrap();
+        replay_transcript(&mut renderer, &events, OutputFormat::Final, |_| Some(100)).unwrap();
 
-        assert_eq!(buffer.text().unwrap(), "mu> Question\n\nFinal answer\n");
+        assert_eq!(
+            buffer.text().unwrap(),
+            "test/model ~42% /work\nmu> Question\n\nFinal answer\n"
+        );
     }
 
     #[test]
     fn full_transcript_replays_reasoning_and_complete_bash_output() {
         let events = vec![
-            store::TranscriptEvent::User("Question".into()),
+            store::TranscriptEvent::User {
+                text: "Question".into(),
+                cwd: "/work".into(),
+                model: Some("test/model".into()),
+                context: None,
+            },
             store::TranscriptEvent::Assistant {
                 turn_state: "continue".into(),
                 items: vec![
@@ -1563,7 +1607,7 @@ mod tests {
         let mut renderer =
             Renderer::with_transcript_output(OutputFormat::Full, Box::new(buffer.clone()), 79);
 
-        replay_transcript(&mut renderer, &events, OutputFormat::Full).unwrap();
+        replay_transcript(&mut renderer, &events, OutputFormat::Full, |_| None).unwrap();
 
         let transcript = buffer.text().unwrap();
         assert!(transcript.contains("Private trace"));

@@ -53,11 +53,22 @@ pub struct SessionSummary {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TranscriptEvent {
-    User(String),
+    User {
+        text: String,
+        cwd: String,
+        model: Option<String>,
+        context: Option<TranscriptContext>,
+    },
     Assistant {
         turn_state: String,
         items: Vec<TranscriptAssistantItem>,
     },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TranscriptContext {
+    pub tokens: u64,
+    pub estimated: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -842,33 +853,85 @@ impl Store {
     pub fn transcript_events(&self, session_id: &str) -> Result<Vec<TranscriptEvent>> {
         let journal = self.load(session_id)?;
         let mut results = HashMap::new();
+        let mut turn_models = HashMap::new();
         for line in journal.events.iter() {
-            if let Event::BashCompleted {
-                call_id,
-                outcome,
-                output,
-                exit_code,
-                duration_ms,
-                ..
-            } = &line.event
-            {
-                results.insert(
-                    *call_id,
-                    TranscriptBashResult {
-                        outcome: outcome.clone(),
-                        output: self.hydrate_text(output)?,
-                        exit_code: *exit_code,
-                        duration_ms: *duration_ms,
-                    },
-                );
+            match &line.event {
+                Event::BashCompleted {
+                    call_id,
+                    outcome,
+                    output,
+                    exit_code,
+                    duration_ms,
+                    ..
+                } => {
+                    results.insert(
+                        *call_id,
+                        TranscriptBashResult {
+                            outcome: outcome.clone(),
+                            output: self.hydrate_text(output)?,
+                            exit_code: *exit_code,
+                            duration_ms: *duration_ms,
+                        },
+                    );
+                }
+                Event::ProviderRequested {
+                    turn_id,
+                    purpose,
+                    origin,
+                    ..
+                } if purpose == "agent" => {
+                    turn_models
+                        .entry(turn_id.as_str())
+                        .or_insert_with(|| origin.canonical_model_ref.clone());
+                }
+                _ => {}
             }
         }
 
         let mut events = Vec::new();
+        let mut remembered_model = None;
+        let mut seen_turn = false;
         for line in journal.events.iter() {
             match &line.event {
-                Event::TurnStarted { prompt, .. } => {
-                    events.push(TranscriptEvent::User(user_text(prompt)));
+                Event::TurnStarted {
+                    turn_id,
+                    cwd,
+                    prompt,
+                    ..
+                } => {
+                    let context = if seen_turn {
+                        match reported_context_tokens_before(&journal, line.seq - 1) {
+                            Some(tokens) => Some(TranscriptContext {
+                                tokens,
+                                estimated: false,
+                            }),
+                            None => Some(TranscriptContext {
+                                tokens: self
+                                    .context_until(&journal, line.seq - 1)?
+                                    .iter()
+                                    .map(Message::approx_tokens)
+                                    .sum(),
+                                estimated: true,
+                            }),
+                        }
+                    } else {
+                        None
+                    };
+                    events.push(TranscriptEvent::User {
+                        text: user_text(prompt),
+                        cwd: cwd.clone(),
+                        model: turn_models
+                            .get(turn_id.as_str())
+                            .cloned()
+                            .or_else(|| remembered_model.clone()),
+                        context,
+                    });
+                    seen_turn = true;
+                }
+                Event::ProviderRequested {
+                    purpose, origin, ..
+                } if purpose == "agent" || purpose == "compaction" => {
+                    remembered_model = Some(origin.canonical_model_ref.clone());
                 }
                 Event::ProviderCompleted {
                     projection:
@@ -3029,10 +3092,14 @@ fn is_semantic(event: &Event) -> bool {
 }
 
 fn reported_context_tokens(journal: &Journal) -> Option<u64> {
+    reported_context_tokens_before(journal, i64::MAX)
+}
+
+fn reported_context_tokens_before(journal: &Journal, max_seq: i64) -> Option<u64> {
     let mut request_formats = HashMap::new();
     let mut latest = None;
     let mut semantic_after = false;
-    for line in journal.events.iter() {
+    for line in journal.events.iter().filter(|line| line.seq <= max_seq) {
         match &line.event {
             Event::ProviderRequested {
                 exchange_id,
@@ -3725,7 +3792,12 @@ mod tests {
         assert_eq!(
             store.transcript_events(&session.id).unwrap(),
             vec![
-                TranscriptEvent::User("Run it".into()),
+                TranscriptEvent::User {
+                    text: "Run it".into(),
+                    cwd: "/tmp".into(),
+                    model: Some("test/model".into()),
+                    context: None,
+                },
                 TranscriptEvent::Assistant {
                     turn_state: "continue".into(),
                     items: vec![
@@ -3760,6 +3832,68 @@ mod tests {
                 MessageRecordItem::Text(after),
             ] if before == "I will run it." && after == " Finished."
         ));
+    }
+
+    #[test]
+    fn transcript_projection_reconstructs_prompt_model_and_context_state() {
+        let store = Store::open_memory().unwrap();
+        let session = store.create_session_seeded("system").unwrap();
+        store
+            .start_turn(&session.id, "/first", None, &"First".into())
+            .unwrap();
+        store
+            .append_test_agent_exchange(&session.id, "test/model:high", "completed", 25)
+            .unwrap();
+        store
+            .start_turn(&session.id, "/second", None, &"Second".into())
+            .unwrap();
+        store
+            .start_turn(&session.id, "/third", None, &"Third".into())
+            .unwrap();
+
+        let prompts = store
+            .transcript_events(&session.id)
+            .unwrap()
+            .into_iter()
+            .filter_map(|event| match event {
+                TranscriptEvent::User {
+                    cwd,
+                    model,
+                    context,
+                    ..
+                } => Some((cwd, model, context)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            prompts[0],
+            ("/first".into(), Some("test/model:high".into()), None)
+        );
+        assert_eq!(
+            prompts[1],
+            (
+                "/second".into(),
+                Some("test/model:high".into()),
+                Some(TranscriptContext {
+                    tokens: 25,
+                    estimated: false,
+                }),
+            )
+        );
+        assert_eq!(prompts[2].0, "/third");
+        assert_eq!(prompts[2].1.as_deref(), Some("test/model:high"));
+        assert!(
+            matches!(
+                prompts[2].2,
+                Some(TranscriptContext {
+                    tokens,
+                    estimated: true
+                }) if tokens > 0
+            ),
+            "{:?}",
+            prompts[2].2
+        );
     }
 
     #[test]

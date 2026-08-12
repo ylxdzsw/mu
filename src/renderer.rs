@@ -25,6 +25,8 @@ const OSC8_ST: &str = "\x1b\\";
 const RED: &str = "\x1b[31m"; // destructive / error (regular)
 const GREEN: &str = "\x1b[32m"; // ok icon + text (regular, non-bright)
 const BRIGHT_YELLOW: &str = "\x1b[93m"; // reversible risk (bright)
+const BRIGHT_BLUE: &str = "\x1b[94m"; // prompt model
+const MAGENTA: &str = "\x1b[35m"; // prompt context
 const BLUE: &str = "\x1b[34m"; // H2, links, stdin (regular)
 const CYAN: &str = "\x1b[36m"; // H1, readonly, info (regular)
 const GRAY: &str = "\x1b[90m"; // meta / quote (bright-black)
@@ -281,14 +283,37 @@ impl Renderer {
         self.ensure_line_start()
     }
 
-    pub fn transcript_prompt(&mut self, text: &str) -> io::Result<()> {
+    pub fn transcript_prompt(
+        &mut self,
+        model: Option<&str>,
+        context_percent: Option<(f64, bool)>,
+        cwd: &str,
+        text: &str,
+    ) -> io::Result<()> {
         self.assistant_end()?;
         self.reasoning_end(None)?;
         self.ensure_block_separator_if_needed()?;
         self.last_committed_block = Some(CommittedBlock::Other);
+        let model = model.unwrap_or("mu");
         if self.styled {
+            self.write_stdout_committed(&format!("{BRIGHT_BLUE}{model}{RESET}"))?;
+            if let Some((percent, estimated)) = context_percent {
+                self.write_stdout_committed(&format!(
+                    " {MAGENTA}{}{percent:.0}%{RESET}",
+                    if estimated { "~" } else { "" }
+                ))?;
+            }
+            self.write_stdout_committed(&format!(" {CYAN}{cwd}{RESET}\n"))?;
             self.write_stdout_committed(&format!("{CYAN}{BOLD}mu>{RESET} "))?;
         } else {
+            self.write_stdout_committed(model)?;
+            if let Some((percent, estimated)) = context_percent {
+                self.write_stdout_committed(&format!(
+                    " {}{percent:.0}%",
+                    if estimated { "~" } else { "" }
+                ))?;
+            }
+            self.write_stdout_committed(&format!(" {cwd}\n"))?;
             self.write_stdout_committed("mu> ")?;
         }
         self.write_stdout_committed(text)?;
