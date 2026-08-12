@@ -8,8 +8,8 @@ use crate::bash::BashRisk;
 use crate::config::{Config, GuardrailConfig};
 use crate::models::{ResolvedModelRef, resolve_model_choice};
 use crate::provider::{
-    MAX_PROVIDER_RETRY_AFTER, Message, ProviderDisposition, ProviderError, Request, approx_tokens,
-    effective_retry_delay, provider_retry_delay, provider_retry_limit,
+    AssistantItem, MAX_PROVIDER_RETRY_AFTER, Message, ProviderDisposition, ProviderError, Request,
+    approx_tokens, effective_retry_delay, provider_retry_delay, provider_retry_limit,
 };
 use crate::runtime::resume_session_fallback;
 use crate::store::{GuardrailCompletion, ProviderOrigin, RequestSubject, Store};
@@ -296,13 +296,8 @@ impl Guardrail {
                 }
                 Ok(Ok(stream_result)) => {
                     provider_retries = 0;
-                    let content = match &stream_result.message {
-                        Message::Assistant {
-                            content: Some(c), ..
-                        } => c.as_str(),
-                        _ => "",
-                    };
-                    match parse_assessment(content) {
+                    let content = stream_result.message.assistant_text().unwrap_or_default();
+                    match parse_assessment(&content) {
                         Ok(assessment) => {
                             let risk_level = assessment.risk_level.to_string();
                             let user_auth_level = assessment.user_auth_level.to_string();
@@ -405,25 +400,22 @@ fn collect_transcript_entries(messages: &[Message]) -> Vec<TranscriptEntry> {
                     });
                 }
             }
-            Message::Assistant {
-                content,
-                tool_calls,
-                ..
-            } => {
-                if let Some(text) = content.as_ref().filter(|c| !c.trim().is_empty()) {
-                    entries.push(TranscriptEntry {
-                        kind: TranscriptEntryKind::Assistant,
-                        text: text.clone(),
-                    });
-                }
-                if let Some(calls) = tool_calls {
-                    for tc in calls {
-                        if !tc.arguments.trim().is_empty() {
+            Message::Assistant { items, .. } => {
+                for item in items {
+                    match item {
+                        AssistantItem::Text { text } if !text.trim().is_empty() => {
                             entries.push(TranscriptEntry {
-                                kind: TranscriptEntryKind::ToolCall,
-                                text: tc.arguments.clone(),
+                                kind: TranscriptEntryKind::Assistant,
+                                text: text.clone(),
                             });
                         }
+                        AssistantItem::BashCall(call) if !call.arguments.trim().is_empty() => {
+                            entries.push(TranscriptEntry {
+                                kind: TranscriptEntryKind::ToolCall,
+                                text: call.arguments.clone(),
+                            });
+                        }
+                        _ => {}
                     }
                 }
             }
@@ -780,12 +772,7 @@ mod tests {
             Message::User {
                 content: "delete the database".into(),
             },
-            Message::Assistant {
-                content: Some("I'll run rm".into()),
-                reasoning_content: None,
-                native_replay: None,
-                tool_calls: None,
-            },
+            Message::assistant(Some("I'll run rm".into()), None, None, None),
         ];
         let action = serde_json::json!({
             "tool": "bash",
@@ -837,17 +824,17 @@ mod tests {
         let (_, bash_call_ids) = store
             .append_message_with_bash_calls(
                 &session.id,
-                &Message::Assistant {
-                    content: None,
-                    reasoning_content: None,
-                    tool_calls: Some(vec![ToolCall {
+                &Message::assistant(
+                    None,
+                    None,
+                    Some(vec![ToolCall {
                         id: "call-reviewed".into(),
                         arguments:
                             r#"{"title":"Remove file","risk":"destructive","command":"rm /tmp/x"}"#
                                 .into(),
                     }]),
-                    native_replay: None,
-                },
+                    None,
+                ),
             )
             .unwrap();
         let model = ResolvedModelRef {

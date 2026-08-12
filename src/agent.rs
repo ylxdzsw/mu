@@ -13,9 +13,9 @@ use crate::config::Config;
 use crate::guardrail::Guardrail;
 use crate::models::{ResolvedModelChoice, resolve_model_info};
 use crate::provider::{
-    FinishReason, MAX_PROVIDER_RETRY_AFTER, Message, Provider, ProviderDisposition, ProviderError,
-    Request, StreamEvent, ToolCall, ToolCallDelta, Usage, advance_provider, effective_retry_delay,
-    provider_retry_limit,
+    AssistantItem, FinishReason, MAX_PROVIDER_RETRY_AFTER, Message, Provider, ProviderDisposition,
+    ProviderError, Request, StreamEvent, ToolCall, ToolCallDelta, Usage, advance_provider,
+    effective_retry_delay, provider_retry_limit,
 };
 use crate::renderer::Renderer;
 use crate::runtime::resume_session_fallback;
@@ -458,14 +458,15 @@ impl<'a> AgentLoop<'a> {
             let mut accepted_message = stream_result.message.clone();
             if !matches!(stream_result.finish_reason, FinishReason::ToolCalls)
                 && let Message::Assistant {
-                    tool_calls,
+                    items,
                     native_replay,
-                    ..
                 } = &mut accepted_message
-                && tool_calls.as_ref().is_some_and(|calls| !calls.is_empty())
             {
-                *tool_calls = None;
-                *native_replay = None;
+                let before = items.len();
+                items.retain(|item| !matches!(item, AssistantItem::BashCall(_)));
+                if items.len() != before {
+                    *native_replay = None;
+                }
             }
             let resumable =
                 self.config.auto_resume && stream_result.finish_reason == FinishReason::Resume;
@@ -492,15 +493,11 @@ impl<'a> AgentLoop<'a> {
 
             match stream_result.finish_reason {
                 FinishReason::Stop => {
-                    if let Message::Assistant { content, .. } = &accepted_message {
-                        final_assistant = content.clone();
-                    }
+                    final_assistant = accepted_message.assistant_text();
                     break;
                 }
                 FinishReason::Resume if !resumable => {
-                    if let Message::Assistant { content, .. } = &accepted_message {
-                        final_assistant = content.clone();
-                    }
+                    final_assistant = accepted_message.assistant_text();
                     break;
                 }
                 FinishReason::Resume => {
@@ -522,12 +519,14 @@ impl<'a> AgentLoop<'a> {
                     continue;
                 }
                 FinishReason::ToolCalls => {
-                    let tool_calls = match &accepted_message {
-                        Message::Assistant { tool_calls, .. } => tool_calls
-                            .as_ref()
-                            .ok_or_else(|| anyhow::anyhow!("missing tool_calls"))?,
-                        _ => bail!("expected assistant message with tool calls"),
-                    };
+                    let tool_calls = accepted_message
+                        .assistant_tool_calls()
+                        .into_iter()
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    if tool_calls.is_empty() {
+                        bail!("missing tool calls");
+                    }
 
                     let mut cursor = 0;
                     while cursor < tool_calls.len() {
@@ -707,9 +706,7 @@ impl<'a> AgentLoop<'a> {
                     }
                 }
                 FinishReason::Other(reason) => {
-                    if let Message::Assistant { content, .. } = &accepted_message {
-                        final_assistant = content.clone();
-                    }
+                    final_assistant = accepted_message.assistant_text();
                     self.renderer
                         .notice(&format!("[mu] stopped: finish_reason={reason}"))?;
                     break;
@@ -1713,12 +1710,7 @@ mod tests {
             if !request.bash {
                 counts.1 += 1;
                 return Ok(StreamResult {
-                    message: Message::Assistant {
-                        content: Some("summary".into()),
-                        reasoning_content: None,
-                        native_replay: None,
-                        tool_calls: None,
-                    },
+                    message: Message::assistant(Some("summary".into()), None, None, None),
                     finish_reason: FinishReason::Stop,
                     usage: None,
                     native_response: None,
@@ -1762,12 +1754,7 @@ mod tests {
                     })
                 }
                 1 => Ok(StreamResult {
-                    message: Message::Assistant {
-                        content: Some("done".into()),
-                        reasoning_content: None,
-                        native_replay: None,
-                        tool_calls: None,
-                    },
+                    message: Message::assistant(Some("done".into()), None, None, None),
                     finish_reason: FinishReason::Stop,
                     usage: Some(Usage {
                         input_tokens: 1,
@@ -1795,12 +1782,7 @@ mod tests {
             *calls += 1;
             let resumable = call < self.resumes_before_stop;
             Ok(StreamResult {
-                message: Message::Assistant {
-                    content: (!resumable).then(|| "done".into()),
-                    reasoning_content: None,
-                    native_replay: None,
-                    tool_calls: None,
-                },
+                message: Message::assistant((!resumable).then(|| "done".into()), None, None, None),
                 finish_reason: if resumable {
                     FinishReason::Resume
                 } else {
@@ -1844,11 +1826,10 @@ mod tests {
                     );
                     let second_command = format!("touch '{}'; printf second", self.barrier_path);
                     Ok(StreamResult {
-                        message: Message::Assistant {
-                            content: None,
-                            reasoning_content: None,
-                            native_replay: None,
-                            tool_calls: Some(vec![
+                        message: Message::assistant(
+                            None,
+                            None,
+                            Some(vec![
                                 ToolCall {
                                     id: "call_first".into(),
                                     arguments: serde_json::json!({
@@ -1870,7 +1851,8 @@ mod tests {
                                     .to_string(),
                                 },
                             ]),
-                        },
+                            None,
+                        ),
                         finish_reason: FinishReason::ToolCalls,
                         usage: Some(Usage {
                             input_tokens: 1,
@@ -1882,12 +1864,7 @@ mod tests {
                     })
                 }
                 1 => Ok(StreamResult {
-                    message: Message::Assistant {
-                        content: Some("done".into()),
-                        reasoning_content: None,
-                        native_replay: None,
-                        tool_calls: None,
-                    },
+                    message: Message::assistant(Some("done".into()), None, None, None),
                     finish_reason: FinishReason::Stop,
                     usage: Some(Usage {
                         input_tokens: 1,
@@ -1914,11 +1891,10 @@ mod tests {
             *step += 1;
             match current {
                 0 => Ok(StreamResult {
-                    message: Message::Assistant {
-                        content: None,
-                        reasoning_content: None,
-                        native_replay: None,
-                        tool_calls: Some(vec![
+                    message: Message::assistant(
+                        None,
+                        None,
+                        Some(vec![
                             ToolCall {
                                 id: "call_valid".into(),
                                 arguments: serde_json::json!({
@@ -1938,18 +1914,14 @@ mod tests {
                                 .to_string(),
                             },
                         ]),
-                    },
+                        None,
+                    ),
                     finish_reason: FinishReason::ToolCalls,
                     usage: None,
                     native_response: None,
                 }),
                 1 => Ok(StreamResult {
-                    message: Message::Assistant {
-                        content: Some("recovered".into()),
-                        reasoning_content: None,
-                        native_replay: None,
-                        tool_calls: None,
-                    },
+                    message: Message::assistant(Some("recovered".into()), None, None, None),
                     finish_reason: FinishReason::Stop,
                     usage: None,
                     native_response: None,
@@ -2042,22 +2014,16 @@ mod tests {
                 .count(),
             1
         );
-        assert!(matches!(
-            messages.last(),
-            Some(Message::Assistant {
-                content: Some(content),
-                tool_calls: None,
-                ..
-            }) if content == "done"
-        ));
-        assert!(!messages.iter().any(|message| {
-            match message {
-                Message::Assistant { content, .. } => content
-                    .as_deref()
-                    .is_some_and(|content| content.contains("discarded partial")),
-                _ => false,
-            }
-        }));
+        assert_eq!(
+            messages.last().and_then(Message::assistant_text).as_deref(),
+            Some("done")
+        );
+        assert!(
+            !messages
+                .iter()
+                .filter_map(Message::assistant_text)
+                .any(|content| content.contains("discarded partial"))
+        );
         let audit = store.audit_events(&session.id).unwrap();
         assert_eq!(
             audit
@@ -2333,12 +2299,7 @@ mod tests {
             store
                 .append_message(
                     &session.id,
-                    &Message::Assistant {
-                        content: Some(format!("assistant {index}")),
-                        reasoning_content: None,
-                        native_replay: None,
-                        tool_calls: None,
-                    },
+                    &Message::assistant(Some(format!("assistant {index}")), None, None, None),
                 )
                 .unwrap();
         }
@@ -2396,12 +2357,7 @@ mod tests {
             store
                 .append_message(
                     &session.id,
-                    &Message::Assistant {
-                        content: Some(format!("assistant {index}")),
-                        reasoning_content: None,
-                        native_replay: None,
-                        tool_calls: None,
-                    },
+                    &Message::assistant(Some(format!("assistant {index}")), None, None, None),
                 )
                 .unwrap();
         }
@@ -2488,14 +2444,12 @@ mod tests {
         assert!(error.to_string().contains("provider error"));
         let messages = store.load_context_messages(&session.id).unwrap();
         assert!(matches!(messages.last(), Some(Message::User { .. })));
-        assert!(!messages.iter().any(|message| {
-            match message {
-                Message::Assistant { content, .. } => content
-                    .as_deref()
-                    .is_some_and(|content| content.contains("unfinished answer")),
-                _ => false,
-            }
-        }));
+        assert!(
+            !messages
+                .iter()
+                .filter_map(Message::assistant_text)
+                .any(|content| content.contains("unfinished answer"))
+        );
         let audit = store.audit_events(&session.id).unwrap();
         let failed = audit
             .iter()
@@ -2666,12 +2620,12 @@ mod tests {
                 )
             });
             Ok(StreamResult {
-                message: Message::Assistant {
-                    content: Some(if summarizing { "summary" } else { "done" }.into()),
-                    reasoning_content: None,
-                    native_replay: None,
-                    tool_calls: None,
-                },
+                message: Message::assistant(
+                    Some(if summarizing { "summary" } else { "done" }.into()),
+                    None,
+                    None,
+                    None,
+                ),
                 finish_reason: FinishReason::Stop,
                 usage: Some(Usage {
                     input_tokens: 1,
@@ -2701,12 +2655,7 @@ mod tests {
             });
             if is_summarize {
                 return Ok(StreamResult {
-                    message: Message::Assistant {
-                        content: Some("summary".into()),
-                        reasoning_content: None,
-                        native_replay: None,
-                        tool_calls: None,
-                    },
+                    message: Message::assistant(Some("summary".into()), None, None, None),
                     finish_reason: FinishReason::Stop,
                     usage: Some(Usage {
                         input_tokens: 1,
@@ -2723,11 +2672,10 @@ mod tests {
             *step += 1;
             match current {
                 0 => Ok(StreamResult {
-                    message: Message::Assistant {
-                        content: None,
-                        reasoning_content: None,
-                        native_replay: None,
-                        tool_calls: Some(vec![ToolCall {
+                    message: Message::assistant(
+                        None,
+                        None,
+                        Some(vec![ToolCall {
                             id: "call_grow".into(),
                             arguments: serde_json::json!({
                                 "title": "grow context",
@@ -2736,7 +2684,8 @@ mod tests {
                             })
                             .to_string(),
                         }]),
-                    },
+                        None,
+                    ),
                     finish_reason: FinishReason::ToolCalls,
                     usage: Some(Usage {
                         input_tokens: 10,
@@ -2747,12 +2696,7 @@ mod tests {
                     native_response: None,
                 }),
                 _ => Ok(StreamResult {
-                    message: Message::Assistant {
-                        content: Some("done".into()),
-                        reasoning_content: None,
-                        native_replay: None,
-                        tool_calls: None,
-                    },
+                    message: Message::assistant(Some("done".into()), None, None, None),
                     finish_reason: FinishReason::Stop,
                     usage: Some(Usage {
                         input_tokens: 10,
@@ -2799,12 +2743,7 @@ mod tests {
             store
                 .append_message(
                     &session.id,
-                    &Message::Assistant {
-                        content: Some(format!("reply {turn}")),
-                        reasoning_content: None,
-                        native_replay: None,
-                        tool_calls: None,
-                    },
+                    &Message::assistant(Some(format!("reply {turn}")), None, None, None),
                 )
                 .unwrap();
         }
@@ -2853,14 +2792,10 @@ mod tests {
         );
         // The turn still completed cleanly after compaction.
         let messages = store.load_context_messages(&session.id).unwrap();
-        assert!(matches!(
-            messages.last(),
-            Some(Message::Assistant {
-                content: Some(content),
-                tool_calls: None,
-                ..
-            }) if content == "done"
-        ));
+        assert_eq!(
+            messages.last().and_then(Message::assistant_text).as_deref(),
+            Some("done")
+        );
 
         let _ = std::fs::remove_dir_all(tmp);
     }
@@ -2887,12 +2822,7 @@ mod tests {
                 store
                     .append_message(
                         session_id,
-                        &Message::Assistant {
-                            content: Some(assistant.into()),
-                            reasoning_content: None,
-                            native_replay: None,
-                            tool_calls: None,
-                        },
+                        &Message::assistant(Some(assistant.into()), None, None, None),
                     )
                     .unwrap();
             }
@@ -2963,11 +2893,10 @@ mod tests {
             *step += 1;
             match current {
                 0 => Ok(StreamResult {
-                    message: Message::Assistant {
-                        content: None,
-                        reasoning_content: None,
-                        native_replay: None,
-                        tool_calls: Some(vec![ToolCall {
+                    message: Message::assistant(
+                        None,
+                        None,
+                        Some(vec![ToolCall {
                             id: "call_readonly".into(),
                             arguments: serde_json::json!({
                                 "title": "noop",
@@ -2976,7 +2905,8 @@ mod tests {
                             })
                             .to_string(),
                         }]),
-                    },
+                        None,
+                    ),
                     finish_reason: FinishReason::ToolCalls,
                     usage: Some(Usage {
                         input_tokens: 100,
@@ -2987,12 +2917,7 @@ mod tests {
                     native_response: None,
                 }),
                 _ => Ok(StreamResult {
-                    message: Message::Assistant {
-                        content: Some("done".into()),
-                        reasoning_content: None,
-                        native_replay: None,
-                        tool_calls: None,
-                    },
+                    message: Message::assistant(Some("done".into()), None, None, None),
                     finish_reason: FinishReason::Stop,
                     usage: Some(Usage {
                         input_tokens: 130,
@@ -3072,11 +2997,10 @@ mod tests {
             _on_event: &mut dyn FnMut(crate::provider::StreamEvent) -> Result<(), ProviderError>,
         ) -> Result<StreamResult, ProviderError> {
             Ok(StreamResult {
-                message: Message::Assistant {
-                    content: Some("partial answer".into()),
-                    reasoning_content: None,
-                    native_replay: None,
-                    tool_calls: Some(vec![ToolCall {
+                message: Message::assistant(
+                    Some("partial answer".into()),
+                    None,
+                    Some(vec![ToolCall {
                         id: "truncated".into(),
                         arguments: serde_json::json!({
                             "title": "must not run",
@@ -3085,7 +3009,8 @@ mod tests {
                         })
                         .to_string(),
                     }]),
-                },
+                    None,
+                ),
                 finish_reason: FinishReason::Other("length".into()),
                 usage: Some(Usage {
                     input_tokens: 5,
@@ -3141,13 +3066,12 @@ mod tests {
         // `--output final`, rather than emitting nothing.
         assert_eq!(result.final_assistant.as_deref(), Some("partial answer"));
         assert!(store.is_session_clean(&session.id).unwrap());
-        assert!(matches!(
-            store.load_context_messages(&session.id).unwrap().last(),
-            Some(Message::Assistant {
-                tool_calls: None,
-                ..
-            })
-        ));
+        let messages = store.load_context_messages(&session.id).unwrap();
+        assert!(
+            messages
+                .last()
+                .is_some_and(|message| message.assistant_tool_calls().is_empty())
+        );
 
         let _ = std::fs::remove_dir_all(tmp);
     }

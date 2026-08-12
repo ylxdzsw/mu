@@ -1,9 +1,9 @@
 use std::collections::{HashMap, HashSet};
 use std::fs::{File, OpenOptions};
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -16,8 +16,8 @@ use sha2::{Digest, Sha256};
 use crate::bash::BashRisk;
 use crate::models::ResolvedModelRef;
 use crate::provider::{
-    Attachment, ContentPart, ImageDetail, Message, ModelApi, NativeReplay, Request, ToolAttachment,
-    ToolCall, Usage, UserContent,
+    AssistantItem, Attachment, ContentPart, ImageDetail, Message, ModelApi, NativeReplay, Request,
+    ToolAttachment, ToolCall, Usage, UserContent,
 };
 
 pub const BASH_CALL_ID_ENV: &str = "MU_BASH_CALL_ID";
@@ -26,7 +26,7 @@ pub const OBJECTS_DIR_ENV: &str = "MU_OBJECTS_DIR";
 pub const INTERRUPTED_TOOL_RESULT: &str = "error: interrupted — this command may have started and not completed; its effects are unknown. Verify the resulting state before relying on it.";
 pub const RESUME_PROMPT: &str = "Continue the current task from where you stopped.";
 
-const FORMAT_VERSION: u32 = 1;
+const FORMAT_VERSION: u32 = 2;
 const SESSION_ID_RETRIES: usize = 16;
 const EXTERNAL_TEXT_BYTES: usize = 256 * 1024;
 const MAX_BASH_ATTACHMENTS: usize = 8;
@@ -56,16 +56,18 @@ pub enum TranscriptEvent {
     User(String),
     Assistant {
         turn_state: String,
-        text: Option<String>,
-        reasoning_content: Option<String>,
-        bash_calls: Vec<TranscriptBashCall>,
+        items: Vec<TranscriptAssistantItem>,
     },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TranscriptBashCall {
-    pub arguments: String,
-    pub result: Option<TranscriptBashResult>,
+pub enum TranscriptAssistantItem {
+    Reasoning(Option<String>),
+    Text(String),
+    BashCall {
+        arguments: String,
+        result: Option<TranscriptBashResult>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -79,9 +81,14 @@ pub struct TranscriptBashResult {
 #[derive(Debug, Clone)]
 pub struct MessageRecord {
     pub kind: String,
-    pub content: String,
-    pub bash_calls: Vec<ToolCall>,
+    pub items: Vec<MessageRecordItem>,
     pub seq: i64,
+}
+
+#[derive(Debug, Clone)]
+pub enum MessageRecordItem {
+    Text(String),
+    BashCall(ToolCall),
 }
 
 pub struct BashResultRecord<'a> {
@@ -215,17 +222,13 @@ enum Event {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 enum Projection {
     Assistant {
         turn_state: String,
         #[serde(skip_serializing_if = "Option::is_none")]
-        text: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        reasoning_content: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
         native_replay: Option<NativeReplay>,
-        bash_calls: Vec<PersistedBashCall>,
+        items: Vec<PersistedAssistantItem>,
     },
     Compaction {
         summary: String,
@@ -246,13 +249,36 @@ enum Projection {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct PersistedBashCall {
-    call_id: i64,
-    provider_call_id: String,
-    position: usize,
-    arguments: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    declared_risk: Option<String>,
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+enum PersistedAssistantItem {
+    Reasoning {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        text: Option<String>,
+    },
+    Text {
+        text: String,
+    },
+    BashCall {
+        call_id: i64,
+        provider_call_id: String,
+        arguments: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        declared_risk: Option<String>,
+    },
+}
+
+impl PersistedAssistantItem {
+    fn bash_call(&self) -> Option<(i64, &str, &str)> {
+        match self {
+            Self::BashCall {
+                call_id,
+                provider_call_id,
+                arguments,
+                ..
+            } => Some((*call_id, provider_call_id, arguments)),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -620,9 +646,7 @@ impl Store {
                 session_id,
                 &exchange_id,
                 &Message::Assistant {
-                    content: None,
-                    reasoning_content: None,
-                    tool_calls: None,
+                    items: Vec::new(),
                     native_replay: None,
                 },
                 None,
@@ -661,13 +685,15 @@ impl Store {
                 Event::ProviderCompleted {
                     projection:
                         Projection::Assistant {
-                            turn_state,
-                            bash_calls,
-                            ..
+                            turn_state, items, ..
                         },
                     ..
                 } => {
-                    calls.extend(bash_calls.iter().map(|call| call.call_id));
+                    calls.extend(
+                        items
+                            .iter()
+                            .filter_map(|item| item.bash_call().map(|call| call.0)),
+                    );
                     complete = turn_state == "complete";
                 }
                 Event::BashCompleted { call_id, .. } => {
@@ -728,14 +754,17 @@ impl Store {
                 } => {
                     terminal.insert(exchange_id.clone());
                     match projection {
-                        Projection::Assistant { bash_calls, .. } => {
+                        Projection::Assistant { items, .. } => {
                             let turn_id = exchange_turns
                                 .get(exchange_id)
                                 .cloned()
                                 .or_else(|| latest_turn_before(&journal.events, line.seq))
                                 .context("assistant completion has no request turn")?;
-                            for call in bash_calls {
-                                calls.insert(call.call_id, turn_id.clone());
+                            for call_id in items
+                                .iter()
+                                .filter_map(|item| item.bash_call().map(|call| call.0))
+                            {
+                                calls.insert(call_id, turn_id.clone());
                             }
                         }
                         Projection::Guardrail {
@@ -844,22 +873,26 @@ impl Store {
                 Event::ProviderCompleted {
                     projection:
                         Projection::Assistant {
-                            turn_state,
-                            text,
-                            reasoning_content,
-                            bash_calls,
-                            ..
+                            turn_state, items, ..
                         },
                     ..
                 } => events.push(TranscriptEvent::Assistant {
                     turn_state: turn_state.clone(),
-                    text: text.clone(),
-                    reasoning_content: reasoning_content.clone(),
-                    bash_calls: bash_calls
+                    items: items
                         .iter()
-                        .map(|call| TranscriptBashCall {
-                            arguments: call.arguments.clone(),
-                            result: results.get(&call.call_id).cloned(),
+                        .map(|item| match item {
+                            PersistedAssistantItem::Reasoning { text } => {
+                                TranscriptAssistantItem::Reasoning(text.clone())
+                            }
+                            PersistedAssistantItem::Text { text } => {
+                                TranscriptAssistantItem::Text(text.clone())
+                            }
+                            PersistedAssistantItem::BashCall {
+                                call_id, arguments, ..
+                            } => TranscriptAssistantItem::BashCall {
+                                arguments: arguments.clone(),
+                                result: results.get(call_id).cloned(),
+                            },
                         })
                         .collect(),
                 }),
@@ -1093,21 +1126,8 @@ impl Store {
         if locks.contains_key(session_id) {
             return Err(anyhow::Error::new(SessionBusy));
         }
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(self.session_path(session_id))
-            .with_context(|| format!("opening session journal: {session_id}"))?;
-        match flock_nonblocking(&file) {
-            Ok(()) => {}
-            Err(error) if error.raw_os_error() == Some(libc::EWOULDBLOCK) => {
-                return Err(anyhow::Error::new(SessionBusy));
-            }
-            Err(error) => return Err(error.into()),
-        }
-        let mut file = file;
-        let journal = read_journal(&mut file, Some(session_id), true)?;
-        locks.insert(session_id.to_string(), LockedSession { file, journal });
+        let locked = self.open_locked_session(session_id)?;
+        locks.insert(session_id.to_string(), locked);
         Ok(SessionLock {
             store: self,
             session_id: session_id.to_string(),
@@ -1126,17 +1146,13 @@ impl Store {
         {
             return Ok(true);
         }
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(self.session_path(session_id))?;
-        match flock_nonblocking(&file) {
-            Ok(()) => {
+        match open_current_locked(&self.session_path(session_id)) {
+            Ok(file) => {
                 flock(&file, libc::LOCK_UN)?;
                 Ok(false)
             }
-            Err(error) if error.raw_os_error() == Some(libc::EWOULDBLOCK) => Ok(true),
-            Err(error) => Err(error.into()),
+            Err(error) if error.downcast_ref::<SessionBusy>().is_some() => Ok(true),
+            Err(error) => Err(error),
         }
     }
 
@@ -1240,19 +1256,19 @@ impl Store {
             bail!("provider completion is not an assistant message")
         }
         let Message::Assistant {
-            content,
-            reasoning_content,
-            tool_calls,
+            items,
             native_replay,
         } = message
         else {
             unreachable!()
         };
         let mut provider_call_ids = HashSet::new();
-        if let Some(call) = tool_calls
-            .as_deref()
-            .unwrap_or_default()
+        if let Some(call) = items
             .iter()
+            .filter_map(|item| match item {
+                AssistantItem::BashCall(call) => Some(call),
+                _ => None,
+            })
             .find(|call| !provider_call_ids.insert(call.id.as_str()))
         {
             self.fail_provider_exchange(
@@ -1268,25 +1284,28 @@ impl Store {
             bail!("duplicate provider tool call id: {}", call.id)
         }
         let mut next_call = self.with_journal(session_id, |journal| Ok(next_call_id(journal)))?;
-        let bash_calls = tool_calls
-            .as_deref()
-            .unwrap_or_default()
+        let mut ids = Vec::new();
+        let items = items
             .iter()
-            .enumerate()
-            .map(|(position, call)| {
-                let persisted = PersistedBashCall {
-                    call_id: next_call,
-                    provider_call_id: call.id.clone(),
-                    position,
-                    arguments: call.arguments.clone(),
-                    declared_risk: BashRisk::from_args_json(&call.arguments)
-                        .map(|risk| risk.as_str().to_string()),
-                };
-                next_call += 1;
-                persisted
+            .map(|item| match item {
+                AssistantItem::Reasoning { text } => {
+                    PersistedAssistantItem::Reasoning { text: text.clone() }
+                }
+                AssistantItem::Text { text } => PersistedAssistantItem::Text { text: text.clone() },
+                AssistantItem::BashCall(call) => {
+                    let call_id = next_call;
+                    next_call += 1;
+                    ids.push(call_id);
+                    PersistedAssistantItem::BashCall {
+                        call_id,
+                        provider_call_id: call.id.clone(),
+                        arguments: call.arguments.clone(),
+                        declared_risk: BashRisk::from_args_json(&call.arguments)
+                            .map(|risk| risk.as_str().to_string()),
+                    }
+                }
             })
             .collect::<Vec<_>>();
-        let ids = bash_calls.iter().map(|call| call.call_id).collect();
         let response_json = native_response
             .map(serde_json::to_vec)
             .transpose()?
@@ -1299,15 +1318,13 @@ impl Store {
                 response_json,
                 usage: usage.cloned(),
                 projection: Projection::Assistant {
-                    turn_state: if bash_calls.is_empty() {
+                    turn_state: if ids.is_empty() {
                         if resumable { "resume" } else { "complete" }.into()
                     } else {
                         "continue".into()
                     },
-                    text: content.clone(),
-                    reasoning_content: reasoning_content.clone(),
                     native_replay: native_replay.clone(),
-                    bash_calls,
+                    items,
                 },
             },
         )?;
@@ -1458,6 +1475,14 @@ impl Store {
         exchange_id: &str,
     ) -> Result<Value> {
         let journal = self.load(session_id)?;
+        self.reconstruct_provider_request_from(&journal, exchange_id)
+    }
+
+    fn reconstruct_provider_request_from(
+        &self,
+        journal: &Journal,
+        exchange_id: &str,
+    ) -> Result<Value> {
         let (origin, recipe) = journal
             .events
             .iter()
@@ -1493,7 +1518,7 @@ impl Store {
             let through_seq = recipe.input["context_through_seq"]
                 .as_i64()
                 .context("agent request recipe has no context boundary")?;
-            let messages = self.context_until(&journal, through_seq)?;
+            let messages = self.context_until(journal, through_seq)?;
             let messages = if let Some(origins) = recipe.input.get("native_replay_origins") {
                 let origins: Vec<crate::provider::ReplayOrigin> =
                     serde_json::from_value(origins.clone())
@@ -1535,6 +1560,19 @@ impl Store {
             bail!("reconstructed provider request checksum mismatch")
         }
         Ok(request)
+    }
+
+    fn verify_request_recipes(&self, journal: &Journal) -> Result<()> {
+        for exchange_id in journal.events.iter().filter_map(|line| match &line.event {
+            Event::ProviderRequested { exchange_id, .. } => Some(exchange_id.as_str()),
+            _ => None,
+        }) {
+            self.reconstruct_provider_request_from(journal, exchange_id)
+                .with_context(|| {
+                    format!("verifying migrated provider request recipe: {exchange_id}")
+                })?;
+        }
+        Ok(())
     }
 
     fn project_session(&self, journal: &Journal) -> Result<Session> {
@@ -1653,10 +1691,8 @@ impl Store {
                     projection:
                         Projection::Assistant {
                             turn_state,
-                            text,
-                            reasoning_content,
                             native_replay,
-                            bash_calls,
+                            items,
                             ..
                         },
                     ..
@@ -1669,17 +1705,25 @@ impl Store {
                         native.provider_id = origin.provider_id.clone();
                     }
                     messages.push(Message::Assistant {
-                        content: text.clone(),
-                        reasoning_content: reasoning_content.clone(),
-                        tool_calls: (!bash_calls.is_empty()).then(|| {
-                            bash_calls
-                                .iter()
-                                .map(|call| ToolCall {
-                                    id: call.provider_call_id.clone(),
-                                    arguments: call.arguments.clone(),
-                                })
-                                .collect()
-                        }),
+                        items: items
+                            .iter()
+                            .map(|item| match item {
+                                PersistedAssistantItem::Reasoning { text } => {
+                                    AssistantItem::Reasoning { text: text.clone() }
+                                }
+                                PersistedAssistantItem::Text { text } => {
+                                    AssistantItem::Text { text: text.clone() }
+                                }
+                                PersistedAssistantItem::BashCall {
+                                    provider_call_id,
+                                    arguments,
+                                    ..
+                                } => AssistantItem::BashCall(ToolCall {
+                                    id: provider_call_id.clone(),
+                                    arguments: arguments.clone(),
+                                }),
+                            })
+                            .collect(),
                         native_replay,
                     });
                     if turn_state == "resume"
@@ -1704,7 +1748,7 @@ impl Store {
                             .iter()
                             .map(|attachment| self.hydrate_tool_attachment(attachment))
                             .collect::<Result<_>>()?,
-                        tool_call_id: call.provider_call_id.clone(),
+                        tool_call_id: call.0.to_string(),
                     });
                 }
                 _ => {}
@@ -1719,30 +1763,34 @@ impl Store {
             match &line.event {
                 Event::SystemPrompt { content } => records.push(MessageRecord {
                     kind: "system".into(),
-                    content: content.clone(),
-                    bash_calls: Vec::new(),
+                    items: vec![MessageRecordItem::Text(content.clone())],
                     seq: line.seq,
                 }),
                 Event::TurnStarted { prompt, .. } => records.push(MessageRecord {
                     kind: "user".into(),
-                    content: user_text(prompt),
-                    bash_calls: Vec::new(),
+                    items: vec![MessageRecordItem::Text(user_text(prompt))],
                     seq: line.seq,
                 }),
                 Event::ProviderCompleted {
-                    projection:
-                        Projection::Assistant {
-                            text, bash_calls, ..
-                        },
+                    projection: Projection::Assistant { items, .. },
                     ..
                 } => records.push(MessageRecord {
                     kind: "assistant".into(),
-                    content: text.clone().unwrap_or_default(),
-                    bash_calls: bash_calls
+                    items: items
                         .iter()
-                        .map(|call| ToolCall {
-                            id: call.provider_call_id.clone(),
-                            arguments: call.arguments.clone(),
+                        .filter_map(|item| match item {
+                            PersistedAssistantItem::Text { text } => {
+                                Some(MessageRecordItem::Text(text.clone()))
+                            }
+                            PersistedAssistantItem::BashCall {
+                                provider_call_id,
+                                arguments,
+                                ..
+                            } => Some(MessageRecordItem::BashCall(ToolCall {
+                                id: provider_call_id.clone(),
+                                arguments: arguments.clone(),
+                            })),
+                            _ => None,
                         })
                         .collect(),
                     seq: line.seq,
@@ -1752,14 +1800,12 @@ impl Store {
                     ..
                 } => records.push(MessageRecord {
                     kind: "summary".into(),
-                    content: summary.clone(),
-                    bash_calls: Vec::new(),
+                    items: vec![MessageRecordItem::Text(summary.clone())],
                     seq: line.seq,
                 }),
                 Event::BashCompleted { output, .. } => records.push(MessageRecord {
                     kind: "bash_result".into(),
-                    content: self.hydrate_text(output)?,
-                    bash_calls: Vec::new(),
+                    items: vec![MessageRecordItem::Text(self.hydrate_text(output)?)],
                     seq: line.seq,
                 }),
                 _ => {}
@@ -1936,19 +1982,7 @@ impl Store {
             return operation(locked);
         }
         drop(locks);
-        let mut file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(self.session_path(session_id))?;
-        match flock_nonblocking(&file) {
-            Ok(()) => {}
-            Err(error) if error.raw_os_error() == Some(libc::EWOULDBLOCK) => {
-                return Err(anyhow::Error::new(SessionBusy));
-            }
-            Err(error) => return Err(error.into()),
-        }
-        let journal = read_journal(&mut file, Some(session_id), true)?;
-        let mut locked = LockedSession { file, journal };
+        let mut locked = self.open_locked_session(session_id)?;
         let result = operation(&mut locked);
         flock(&locked.file, libc::LOCK_UN)?;
         result
@@ -2003,7 +2037,37 @@ impl Store {
             .file_stem()
             .and_then(|value| value.to_str())
             .map(str::to_string);
-        read_journal(&mut file, expected.as_deref(), false)
+        match journal_version(&mut file)? {
+            FORMAT_VERSION => read_journal(&mut file, expected.as_deref(), false),
+            migration::LEGACY_VERSION => {
+                drop(file);
+                let locked = self.open_locked_path(path, expected.as_deref())?;
+                let journal = locked.journal.clone();
+                flock(&locked.file, libc::LOCK_UN)?;
+                Ok(journal)
+            }
+            _ => bail!("unsupported session journal format"),
+        }
+    }
+
+    fn open_locked_session(&self, session_id: &str) -> Result<LockedSession> {
+        if !valid_session_id(session_id) {
+            bail!("session not found: {session_id}")
+        }
+        self.open_locked_path(&self.session_path(session_id), Some(session_id))
+            .with_context(|| format!("opening session journal: {session_id}"))
+    }
+
+    fn open_locked_path(&self, path: &Path, expected_id: Option<&str>) -> Result<LockedSession> {
+        let mut file = open_current_locked(path)?;
+        match journal_version(&mut file)? {
+            FORMAT_VERSION => {
+                let journal = read_journal(&mut file, expected_id, true)?;
+                Ok(LockedSession { file, journal })
+            }
+            migration::LEGACY_VERSION => migration::migrate(self, path, file, expected_id),
+            _ => bail!("unsupported session journal format"),
+        }
     }
 }
 
@@ -2220,6 +2284,39 @@ fn read_object_from(objects_dir: &Path, sha256: &str) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
+fn journal_version(file: &mut File) -> Result<u32> {
+    file.seek(SeekFrom::Start(0))?;
+    let mut line = String::new();
+    BufReader::new(file).read_line(&mut line)?;
+    if !line.ends_with('\n') {
+        bail!("session journal has no complete meta line")
+    }
+    let meta: Meta = serde_json::from_str(&line).context("decoding session meta")?;
+    if meta.kind != "meta" || meta.format != "mu-session" {
+        bail!("unsupported session journal format")
+    }
+    Ok(meta.version)
+}
+
+fn open_current_locked(path: &Path) -> Result<File> {
+    loop {
+        let file = OpenOptions::new().read(true).write(true).open(path)?;
+        match flock_nonblocking(&file) {
+            Ok(()) => {}
+            Err(error) if error.raw_os_error() == Some(libc::EWOULDBLOCK) => {
+                return Err(anyhow::Error::new(SessionBusy));
+            }
+            Err(error) => return Err(error.into()),
+        }
+        let opened = file.metadata()?;
+        let current = std::fs::metadata(path)?;
+        if opened.dev() == current.dev() && opened.ino() == current.ino() {
+            return Ok(file);
+        }
+        flock(&file, libc::LOCK_UN)?;
+    }
+}
+
 fn read_journal(
     file: &mut File,
     expected_id: Option<&str>,
@@ -2273,6 +2370,302 @@ fn read_journal(
         meta,
         events: events.into(),
     })
+}
+
+mod migration {
+    use super::*;
+    use crate::provider::NativeReplayPayload;
+
+    pub(super) const LEGACY_VERSION: u32 = 1;
+
+    #[derive(Deserialize)]
+    struct LegacyMeta {
+        #[serde(rename = "type")]
+        kind: String,
+        format: String,
+        version: u32,
+        session_id: String,
+        created_at: String,
+    }
+
+    #[derive(Deserialize)]
+    struct LegacyEventLine {
+        seq: i64,
+        #[serde(rename = "at")]
+        _at: String,
+        #[serde(rename = "type")]
+        kind: String,
+    }
+
+    #[derive(Deserialize)]
+    struct LegacyAssistant {
+        turn_state: String,
+        #[serde(default)]
+        text: Option<String>,
+        #[serde(default)]
+        reasoning_content: Option<String>,
+        #[serde(default)]
+        native_replay: Option<NativeReplay>,
+        bash_calls: Vec<LegacyBashCall>,
+    }
+
+    #[derive(Clone, Deserialize)]
+    struct LegacyBashCall {
+        call_id: i64,
+        provider_call_id: String,
+        position: usize,
+        arguments: String,
+        #[serde(default)]
+        declared_risk: Option<String>,
+    }
+
+    pub(super) fn migrate(
+        store: &Store,
+        path: &Path,
+        mut old_file: File,
+        expected_id: Option<&str>,
+    ) -> Result<LockedSession> {
+        let (meta, events) = convert(&mut old_file, expected_id)?;
+        let parent = path.parent().context("session journal has no parent")?;
+        let (temporary, mut file) = create_temporary(parent, &meta.session_id)?;
+        let result = (|| {
+            flock(&file, libc::LOCK_EX)?;
+            write_json_line(&mut file, &meta)?;
+            for event in &events {
+                write_json_line(&mut file, event)?;
+            }
+            file.sync_all()?;
+            let journal = read_journal(&mut file, expected_id, false)?;
+            store.verify_request_recipes(&journal)?;
+            std::fs::rename(&temporary, path)?;
+            sync_dir(parent)?;
+            Ok(LockedSession { file, journal })
+        })();
+        if result.is_err() {
+            let _ = std::fs::remove_file(&temporary);
+        }
+        result
+    }
+
+    fn convert(file: &mut File, expected_id: Option<&str>) -> Result<(Meta, Vec<EventLine>)> {
+        file.seek(SeekFrom::Start(0))?;
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes)?;
+        let complete = bytes
+            .iter()
+            .rposition(|byte| *byte == b'\n')
+            .map_or(0, |position| position + 1);
+        if complete == 0 {
+            bail!("session journal has no complete meta line")
+        }
+        let text =
+            std::str::from_utf8(&bytes[..complete]).context("session journal is not UTF-8")?;
+        let mut lines = text.lines();
+        let legacy: LegacyMeta =
+            serde_json::from_str(lines.next().context("missing session meta")?)
+                .context("decoding session meta")?;
+        if legacy.kind != "meta"
+            || legacy.format != "mu-session"
+            || legacy.version != LEGACY_VERSION
+        {
+            bail!("unsupported session journal format")
+        }
+        if !valid_session_id(&legacy.session_id) {
+            bail!("invalid session id in journal meta")
+        }
+        if expected_id.is_some_and(|expected| expected != legacy.session_id) {
+            bail!("session filename does not match meta id")
+        }
+
+        let mut events = Vec::new();
+        for (index, line) in lines.enumerate() {
+            let mut value: Value = serde_json::from_str(line)
+                .with_context(|| format!("decoding session event at line {}", index + 2))?;
+            let legacy_line: LegacyEventLine = serde_json::from_value(value.clone())
+                .with_context(|| format!("decoding session event at line {}", index + 2))?;
+            let expected = events
+                .last()
+                .map_or(1, |previous: &EventLine| previous.seq + 1);
+            if legacy_line.seq != expected {
+                bail!(
+                    "noncontiguous session sequence at line {}: expected {}, found {}",
+                    index + 2,
+                    expected,
+                    legacy_line.seq
+                )
+            }
+            if legacy_line.kind == "provider_completed"
+                && value["projection"]["kind"] == "assistant"
+            {
+                let assistant: LegacyAssistant =
+                    serde_json::from_value(value["projection"].clone()).with_context(|| {
+                        format!("decoding v1 assistant projection at line {}", index + 2)
+                    })?;
+                value["projection"] = serde_json::to_value(convert_assistant(assistant)?)?;
+            }
+            events.push(serde_json::from_value(value).with_context(|| {
+                format!("decoding migrated session event at line {}", index + 2)
+            })?);
+        }
+        validate_events(&events)?;
+        Ok((
+            Meta {
+                kind: legacy.kind,
+                format: legacy.format,
+                version: FORMAT_VERSION,
+                session_id: legacy.session_id,
+                created_at: legacy.created_at,
+            },
+            events,
+        ))
+    }
+
+    fn convert_assistant(mut assistant: LegacyAssistant) -> Result<Projection> {
+        assistant
+            .bash_calls
+            .sort_unstable_by_key(|call| call.position);
+        let mut provider_ids = HashSet::new();
+        for (position, call) in assistant.bash_calls.iter().enumerate() {
+            if call.position != position {
+                bail!("noncontiguous Bash claim position: {}", call.position)
+            }
+            if !provider_ids.insert(call.provider_call_id.as_str()) {
+                bail!("duplicate Bash claim provider call id")
+            }
+        }
+        let items = recover_native(&assistant).unwrap_or_else(|| canonical_items(&assistant));
+        Ok(Projection::Assistant {
+            turn_state: assistant.turn_state,
+            native_replay: assistant.native_replay,
+            items,
+        })
+    }
+
+    fn canonical_items(assistant: &LegacyAssistant) -> Vec<PersistedAssistantItem> {
+        let mut items = Vec::new();
+        if let Some(text) = &assistant.reasoning_content {
+            items.push(PersistedAssistantItem::Reasoning {
+                text: Some(text.clone()),
+            });
+        }
+        if let Some(text) = &assistant.text {
+            items.push(PersistedAssistantItem::Text { text: text.clone() });
+        }
+        items.extend(assistant.bash_calls.iter().cloned().map(persisted_call));
+        items
+    }
+
+    fn recover_native(assistant: &LegacyAssistant) -> Option<Vec<PersistedAssistantItem>> {
+        if assistant.reasoning_content.is_some() {
+            return None;
+        }
+        match &assistant.native_replay.as_ref()?.payload {
+            NativeReplayPayload::AnthropicContent(blocks) => {
+                recover_blocks(assistant, blocks, true)
+            }
+            NativeReplayPayload::ResponsesOutput(output) => {
+                recover_blocks(assistant, output, false)
+            }
+            NativeReplayPayload::ChatReasoning(_) => None,
+        }
+    }
+
+    fn recover_blocks(
+        assistant: &LegacyAssistant,
+        values: &[Value],
+        anthropic: bool,
+    ) -> Option<Vec<PersistedAssistantItem>> {
+        let claims = assistant
+            .bash_calls
+            .iter()
+            .map(|call| (call.provider_call_id.as_str(), call))
+            .collect::<HashMap<_, _>>();
+        let mut items = Vec::new();
+        let mut matched = Vec::new();
+        let mut text = String::new();
+        let mut text_present = false;
+        for value in values {
+            match (anthropic, value["type"].as_str()) {
+                (true, Some("thinking" | "redacted_thinking")) | (false, Some("reasoning")) => {
+                    items.push(PersistedAssistantItem::Reasoning { text: None });
+                }
+                (true, Some("text")) => {
+                    let part = value["text"].as_str()?;
+                    text.push_str(part);
+                    text_present = true;
+                    items.push(PersistedAssistantItem::Text {
+                        text: part.to_string(),
+                    });
+                }
+                (false, Some("message")) => {
+                    for part in value["content"].as_array().into_iter().flatten() {
+                        let part = match part["type"].as_str() {
+                            Some("output_text") => part["text"].as_str(),
+                            Some("refusal") => part["refusal"].as_str(),
+                            _ => continue,
+                        }?;
+                        text.push_str(part);
+                        text_present = true;
+                        items.push(PersistedAssistantItem::Text {
+                            text: part.to_string(),
+                        });
+                    }
+                }
+                (true, Some("tool_use")) => {
+                    recover_call(value["id"].as_str(), &claims, &mut matched, &mut items);
+                }
+                (false, Some("function_call")) => {
+                    recover_call(value["call_id"].as_str(), &claims, &mut matched, &mut items);
+                }
+                _ => {}
+            }
+        }
+        let expected = assistant
+            .bash_calls
+            .iter()
+            .map(|call| call.provider_call_id.clone())
+            .collect::<Vec<_>>();
+        ((text_present.then_some(text) == assistant.text) && matched == expected).then_some(items)
+    }
+
+    fn recover_call(
+        id: Option<&str>,
+        claims: &HashMap<&str, &LegacyBashCall>,
+        matched: &mut Vec<String>,
+        items: &mut Vec<PersistedAssistantItem>,
+    ) {
+        let Some(id) = id else {
+            return;
+        };
+        if let Some(call) = claims.get(id) {
+            matched.push(call.provider_call_id.clone());
+            items.push(persisted_call((*call).clone()));
+        }
+    }
+
+    fn persisted_call(call: LegacyBashCall) -> PersistedAssistantItem {
+        PersistedAssistantItem::BashCall {
+            call_id: call.call_id,
+            provider_call_id: call.provider_call_id,
+            arguments: call.arguments,
+            declared_risk: call.declared_risk,
+        }
+    }
+
+    fn create_temporary(parent: &Path, session_id: &str) -> Result<(PathBuf, File)> {
+        for _ in 0..SESSION_ID_RETRIES {
+            let suffix = hex(crate::random::random_bytes::<8>()?);
+            let path = parent.join(format!(".{session_id}.migrate-{suffix}"));
+            let mut options = OpenOptions::new();
+            options.read(true).write(true).create_new(true).mode(0o600);
+            match options.open(&path) {
+                Ok(file) => return Ok((path, file)),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        bail!("could not allocate migration temporary file")
+    }
 }
 
 fn validate_events(events: &[EventLine]) -> Result<()> {
@@ -2359,40 +2752,49 @@ fn validate_events(events: &[EventLine]) -> Result<()> {
                 }
                 match projection {
                     Projection::Assistant {
-                        turn_state,
-                        bash_calls,
-                        ..
+                        turn_state, items, ..
                     } => {
                         if exchange.is_some_and(|(purpose, _, _)| purpose != "agent") {
                             bail!("assistant projection does not complete an agent request")
                         }
+                        let has_calls = items
+                            .iter()
+                            .any(|item| matches!(item, PersistedAssistantItem::BashCall { .. }));
                         if !matches!(turn_state.as_str(), "continue" | "resume" | "complete")
-                            || (turn_state == "continue") != !bash_calls.is_empty()
+                            || (turn_state == "continue") != has_calls
                         {
                             bail!("assistant turn state does not match its Bash claims")
                         }
-                        let mut positions = HashSet::new();
                         let mut provider_ids = HashSet::new();
-                        for call in bash_calls {
-                            if !positions.insert(call.position)
-                                || !provider_ids.insert(&call.provider_call_id)
-                            {
-                                bail!("duplicate Bash claim position or provider call id")
+                        for item in items {
+                            let PersistedAssistantItem::BashCall {
+                                call_id,
+                                provider_call_id,
+                                arguments,
+                                declared_risk,
+                            } = item
+                            else {
+                                continue;
+                            };
+                            if !provider_ids.insert(provider_call_id) {
+                                bail!("duplicate provider call id")
                             }
-                            if call.position >= bash_calls.len() {
-                                bail!("noncontiguous Bash claim position: {}", call.position)
-                            }
-                            if let Some(risk) = &call.declared_risk
+                            if let Some(risk) = declared_risk
                                 && risk.parse::<BashRisk>().is_err()
                             {
                                 bail!("invalid declared Bash risk: {risk}")
+                            }
+                            if !serde_json::from_str::<Value>(arguments)
+                                .is_ok_and(|arguments| arguments.is_object())
+                            {
+                                bail!("Bash claim arguments are not a JSON object")
                             }
                             let turn_id = exchange
                                 .map(|(_, turn_id, _)| turn_id.clone())
                                 .or_else(|| latest_turn_before(events, line.seq))
                                 .context("assistant projection has no turn")?;
-                            if calls.insert(call.call_id, turn_id).is_some() {
-                                bail!("duplicate Bash call id: {}", call.call_id)
+                            if calls.insert(*call_id, turn_id).is_some() {
+                                bail!("duplicate Bash call id: {call_id}")
                             }
                         }
                     }
@@ -2558,9 +2960,12 @@ fn next_call_id(journal: &Journal) -> i64 {
         .iter()
         .filter_map(|line| match &line.event {
             Event::ProviderCompleted {
-                projection: Projection::Assistant { bash_calls, .. },
+                projection: Projection::Assistant { items, .. },
                 ..
-            } => bash_calls.iter().map(|call| call.call_id).max(),
+            } => items
+                .iter()
+                .filter_map(|item| item.bash_call().map(|call| call.0))
+                .max(),
             _ => None,
         })
         .max()
@@ -2568,12 +2973,20 @@ fn next_call_id(journal: &Journal) -> i64 {
         + 1
 }
 
-fn find_call(journal: &Journal, call_id: i64) -> Option<&PersistedBashCall> {
+fn find_call(journal: &Journal, call_id: i64) -> Option<(&str, &str)> {
     journal.events.iter().find_map(|line| match &line.event {
         Event::ProviderCompleted {
-            projection: Projection::Assistant { bash_calls, .. },
+            projection: Projection::Assistant { items, .. },
             ..
-        } => bash_calls.iter().find(|call| call.call_id == call_id),
+        } => items.iter().find_map(|item| match item {
+            PersistedAssistantItem::BashCall {
+                call_id: candidate,
+                provider_call_id,
+                arguments,
+                ..
+            } if *candidate == call_id => Some((provider_call_id.as_str(), arguments.as_str())),
+            _ => None,
+        }),
         _ => None,
     })
 }
@@ -2581,9 +2994,14 @@ fn find_call(journal: &Journal, call_id: i64) -> Option<&PersistedBashCall> {
 fn call_turn_id(journal: &Journal, call_id: i64) -> Option<String> {
     let assistant_seq = journal.events.iter().find_map(|line| match &line.event {
         Event::ProviderCompleted {
-            projection: Projection::Assistant { bash_calls, .. },
+            projection: Projection::Assistant { items, .. },
             ..
-        } if bash_calls.iter().any(|call| call.call_id == call_id) => Some(line.seq),
+        } if items
+            .iter()
+            .any(|item| item.bash_call().is_some_and(|call| call.0 == call_id)) =>
+        {
+            Some(line.seq)
+        }
         _ => None,
     })?;
     journal
@@ -2821,7 +3239,426 @@ fn canonical_json(value: &Value) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::provider::Message;
+    use crate::provider::{Message, NativeReplayPayload};
+
+    fn v1_journal(store: &Store, session_id: &str, prompt: &str, projection: Value) -> Vec<Value> {
+        let native = serde_json::json!({"model":"model","messages":[]});
+        let recipe = store
+            .request_recipe("test.v1", &native, serde_json::json!({"kind":"agent"}))
+            .unwrap();
+        vec![
+            serde_json::json!({
+                "type":"meta",
+                "format":"mu-session",
+                "version":1,
+                "session_id":session_id,
+                "created_at":"2026-01-01T00:00:00.000Z"
+            }),
+            serde_json::json!({
+                "seq":1,
+                "at":"2026-01-01T00:00:00.000Z",
+                "type":"system_prompt",
+                "content":"system"
+            }),
+            serde_json::json!({
+                "seq":2,
+                "at":"2026-01-01T00:00:01.000Z",
+                "type":"turn_started",
+                "turn_id":"t2",
+                "cwd":"/tmp",
+                "prompt":{"kind":"text","text":prompt}
+            }),
+            serde_json::json!({
+                "seq":3,
+                "at":"2026-01-01T00:00:02.000Z",
+                "type":"provider_requested",
+                "turn_id":"t2",
+                "exchange_id":"e3",
+                "purpose":"agent",
+                "origin":{
+                    "canonical_model_ref":"test/model",
+                    "provider_id":"test",
+                    "api":"test",
+                    "endpoint":"",
+                    "wire_model":"model"
+                },
+                "request_recipe":recipe
+            }),
+            serde_json::json!({
+                "seq":4,
+                "at":"2026-01-01T00:00:03.000Z",
+                "type":"provider_completed",
+                "exchange_id":"e3",
+                "projection":projection
+            }),
+        ]
+    }
+
+    fn write_journal(path: &Path, lines: Vec<Value>, tail: &[u8]) {
+        let mut bytes = lines
+            .into_iter()
+            .map(|line| serde_json::to_string(&line).unwrap())
+            .collect::<Vec<_>>()
+            .join("\n")
+            .into_bytes();
+        bytes.push(b'\n');
+        bytes.extend_from_slice(tail);
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    fn write_v1_journal(store: &Store, session_id: &str, projection: Value, tail: &[u8]) {
+        write_journal(
+            &store.session_path(session_id),
+            v1_journal(store, session_id, "go", projection),
+            tail,
+        );
+    }
+
+    fn journal_json(path: &Path) -> Vec<Value> {
+        std::fs::read_to_string(path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn v1_migration_is_lazy_ordered_atomic_and_inode_locked() {
+        let store = Store::open_memory().unwrap();
+        let first = store.create_session_seeded("system").unwrap();
+        let untouched = store.create_session_seeded("system").unwrap();
+        let busy = store.create_session_seeded("system").unwrap();
+        let replay = NativeReplay {
+            provider_id: "test".into(),
+            endpoint: String::new(),
+            model: "model".into(),
+            payload: NativeReplayPayload::AnthropicContent(vec![
+                serde_json::json!({"type":"thinking","thinking":"trace","signature":"sig"}),
+                serde_json::json!({"type":"text","text":"before"}),
+                serde_json::json!({"type":"tool_use","id":"audit","name":"other","input":{}}),
+                serde_json::json!({
+                    "type":"tool_use",
+                    "id":"call-1",
+                    "name":"bash",
+                    "input":{"command":"true","risk":"readonly"}
+                }),
+                serde_json::json!({"type":"redacted_thinking","data":"secret"}),
+                serde_json::json!({"type":"text","text":"after"}),
+            ]),
+        };
+        write_v1_journal(
+            &store,
+            &first.id,
+            serde_json::json!({
+                "kind":"assistant",
+                "turn_state":"continue",
+                "text":"beforeafter",
+                "native_replay":replay,
+                "bash_calls":[{
+                    "call_id":1,
+                    "provider_call_id":"call-1",
+                    "position":0,
+                    "arguments":"{\"command\":\"true\",\"risk\":\"readonly\"}",
+                    "declared_risk":"readonly"
+                }]
+            }),
+            br#"{"seq":5,"#,
+        );
+        for session in [&untouched, &busy] {
+            write_v1_journal(
+                &store,
+                &session.id,
+                serde_json::json!({
+                    "kind":"assistant",
+                    "turn_state":"complete",
+                    "text":"",
+                    "reasoning_content":"",
+                    "bash_calls":[]
+                }),
+                &[],
+            );
+        }
+        let untouched_path = store.session_path(&untouched.id);
+        let untouched_bytes = std::fs::read(&untouched_path).unwrap();
+        let untouched_inode = std::fs::metadata(&untouched_path).unwrap().ino();
+        let first_path = store.session_path(&first.id);
+        let first_inode = std::fs::metadata(&first_path).unwrap().ino();
+        store.select_session(&first.id).unwrap();
+
+        let lock = store.acquire_session_lock(&first.id).unwrap();
+        let other = Store::open(&store.root).unwrap();
+        assert!(
+            other
+                .acquire_session_lock(&first.id)
+                .unwrap_err()
+                .downcast_ref::<SessionBusy>()
+                .is_some()
+        );
+        let migrated = journal_json(&first_path);
+        assert_eq!(migrated[0]["version"], 2);
+        assert_eq!(
+            migrated[4]["projection"]["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|item| item["type"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["reasoning", "text", "bash_call", "reasoning", "text"]
+        );
+        assert_ne!(std::fs::metadata(&first_path).unwrap().ino(), first_inode);
+        assert_eq!(std::fs::read(&untouched_path).unwrap(), untouched_bytes);
+        assert_eq!(
+            std::fs::metadata(&untouched_path).unwrap().ino(),
+            untouched_inode
+        );
+        drop(lock);
+        assert_eq!(store.current_session().unwrap().unwrap().id, first.id);
+
+        assert_eq!(
+            store.transcript_events(&first.id).unwrap()[1],
+            TranscriptEvent::Assistant {
+                turn_state: "continue".into(),
+                items: vec![
+                    TranscriptAssistantItem::Reasoning(None),
+                    TranscriptAssistantItem::Text("before".into()),
+                    TranscriptAssistantItem::BashCall {
+                        arguments: "{\"command\":\"true\",\"risk\":\"readonly\"}".into(),
+                        result: None,
+                    },
+                    TranscriptAssistantItem::Reasoning(None),
+                    TranscriptAssistantItem::Text("after".into()),
+                ],
+            }
+        );
+
+        let busy_path = store.session_path(&busy.id);
+        let busy_bytes = std::fs::read(&busy_path).unwrap();
+        let busy_file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&busy_path)
+            .unwrap();
+        flock(&busy_file, libc::LOCK_EX).unwrap();
+        assert!(
+            store
+                .get_session(&busy.id)
+                .unwrap_err()
+                .downcast_ref::<SessionBusy>()
+                .is_some()
+        );
+        assert_eq!(std::fs::read(&busy_path).unwrap(), busy_bytes);
+        flock(&busy_file, libc::LOCK_UN).unwrap();
+
+        store.get_session(&untouched.id).unwrap();
+        let canonical = journal_json(&untouched_path);
+        assert_eq!(
+            canonical[4]["projection"]["items"],
+            serde_json::json!([
+                {"type":"reasoning","text":""},
+                {"type":"text","text":""}
+            ])
+        );
+    }
+
+    #[test]
+    fn v1_migration_preserves_historical_request_checksums() {
+        let store = Store::open_memory().unwrap();
+        let session = store.create_session_seeded("system").unwrap();
+        let endpoint = "https://example.test/v1/chat/completions";
+        let replay = NativeReplay {
+            provider_id: "test".into(),
+            endpoint: endpoint.into(),
+            model: "model".into(),
+            payload: NativeReplayPayload::ChatReasoning("trace".into()),
+        };
+        let assistant = Message::assistant(
+            Some("running".into()),
+            Some("trace".into()),
+            Some(vec![ToolCall {
+                id: "call-1".into(),
+                arguments: r#"{"command":"true","risk":"readonly"}"#.into(),
+            }]),
+            Some(replay.clone()),
+        );
+        let request = Request {
+            model: ResolvedModelRef {
+                canonical: "test/model".into(),
+                provider_id: "test".into(),
+                model_id: "model".into(),
+                effort: None,
+            },
+            cache_key: None,
+            messages: vec![
+                Message::System {
+                    content: "system".into(),
+                },
+                Message::User {
+                    content: "[environment]\ncurrent working directory: /tmp".into(),
+                },
+                Message::User {
+                    content: "work".into(),
+                },
+                assistant,
+                Message::Tool {
+                    content: "ok".into(),
+                    attachments: Vec::new(),
+                    tool_call_id: "call-1".into(),
+                },
+            ],
+            bash: true,
+        };
+        let native = request.json(ModelApi::ChatCompletions).unwrap();
+        let recipe = store
+            .request_recipe(
+                "openai.chat_completions.v1",
+                &native,
+                serde_json::json!({
+                    "kind":"agent",
+                    "context_through_seq":5
+                }),
+            )
+            .unwrap();
+        let path = store.session_path(&session.id);
+        let projection = serde_json::json!({
+            "kind":"assistant",
+            "turn_state":"continue",
+            "text":"running",
+            "reasoning_content":"trace",
+            "native_replay":replay,
+            "bash_calls":[{
+                "call_id":1,
+                "provider_call_id":"call-1",
+                "position":0,
+                "arguments":"{\"command\":\"true\",\"risk\":\"readonly\"}",
+                "declared_risk":"readonly"
+            }]
+        });
+        let mut lines = v1_journal(&store, &session.id, "work", projection);
+        lines.extend([
+            serde_json::json!({
+                "seq":5,
+                "at":"2026-01-01T00:00:04.000Z",
+                "type":"bash_completed",
+                "turn_id":"t2",
+                "call_id":1,
+                "outcome":"completed",
+                "output":{"kind":"inline","text":"ok"},
+                "exit_code":0,
+                "duration_ms":1,
+                "attachments":[]
+            }),
+            serde_json::json!({
+                "seq":6,
+                "at":"2026-01-01T00:00:05.000Z",
+                "type":"provider_requested",
+                "turn_id":"t2",
+                "exchange_id":"e6",
+                "purpose":"agent",
+                "origin":{
+                    "canonical_model_ref":"test/model",
+                    "provider_id":"test",
+                    "api":"chat_completions",
+                    "endpoint":endpoint,
+                    "wire_model":"model"
+                },
+                "request_recipe":recipe
+            }),
+        ]);
+        write_journal(&path, lines, &[]);
+
+        let reopened = Store::open(&store.root).unwrap();
+        assert_eq!(
+            reopened
+                .reconstruct_provider_request(&session.id, "e6")
+                .unwrap(),
+            native
+        );
+        assert_eq!(journal_json(&path)[0]["version"], 2);
+    }
+
+    #[test]
+    fn v1_migration_recovers_responses_item_order() {
+        let store = Store::open_memory().unwrap();
+        let session = store.create_session_seeded("system").unwrap();
+        let fallback = store.create_session_seeded("system").unwrap();
+        write_v1_journal(
+            &store,
+            &session.id,
+            serde_json::json!({
+                "kind":"assistant",
+                "turn_state":"continue",
+                "text":"before denied after",
+                "native_replay":NativeReplay {
+                    provider_id:"test".into(),
+                    endpoint:String::new(),
+                    model:"model".into(),
+                    payload:NativeReplayPayload::ResponsesOutput(vec![
+                        serde_json::json!({"type":"reasoning","encrypted_content":"opaque"}),
+                        serde_json::json!({"type":"message","content":[
+                            {"type":"output_text","text":"before"},
+                            {"type":"refusal","refusal":" denied"}
+                        ]}),
+                        serde_json::json!({
+                            "type":"function_call",
+                            "call_id":"call-1",
+                            "name":"bash",
+                            "arguments":"{\"command\":\"true\",\"risk\":\"readonly\"}"
+                        }),
+                        serde_json::json!({"type":"message","content":[
+                            {"type":"output_text","text":" after"}
+                        ]})
+                    ]),
+                },
+                "bash_calls":[{
+                    "call_id":1,
+                    "provider_call_id":"call-1",
+                    "position":0,
+                    "arguments":"{\"command\":\"true\",\"risk\":\"readonly\"}",
+                    "declared_risk":"readonly"
+                }]
+            }),
+            &[],
+        );
+
+        store.get_session(&session.id).unwrap();
+        assert_eq!(
+            journal_json(&store.session_path(&session.id))[4]["projection"]["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|item| item["type"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["reasoning", "text", "text", "bash_call", "text"]
+        );
+
+        write_v1_journal(
+            &store,
+            &fallback.id,
+            serde_json::json!({
+                "kind":"assistant",
+                "turn_state":"complete",
+                "text":"authoritative",
+                "native_replay":NativeReplay {
+                    provider_id:"test".into(),
+                    endpoint:String::new(),
+                    model:"model".into(),
+                    payload:NativeReplayPayload::ResponsesOutput(vec![
+                        serde_json::json!({"type":"reasoning","encrypted_content":"opaque"}),
+                        serde_json::json!({"type":"message","content":[
+                            {"type":"output_text","text":"different"}
+                        ]})
+                    ]),
+                },
+                "bash_calls":[]
+            }),
+            &[],
+        );
+        store.get_session(&fallback.id).unwrap();
+        assert_eq!(
+            journal_json(&store.session_path(&fallback.id))[4]["projection"]["items"],
+            serde_json::json!([{"type":"text","text":"authoritative"}])
+        );
+    }
 
     #[test]
     fn short_id_collision_retries_and_journal_replays() {
@@ -2851,13 +3688,22 @@ mod tests {
             .append_message_with_bash_calls(
                 &session.id,
                 &Message::Assistant {
-                    content: Some("I will run it.".into()),
-                    reasoning_content: Some("Inspect first.".into()),
-                    tool_calls: Some(vec![ToolCall {
-                        id: "call-1".into(),
-                        arguments: r#"{"title":"Run","command":"printf ok","risk":"readonly"}"#
-                            .into(),
-                    }]),
+                    items: vec![
+                        AssistantItem::Reasoning {
+                            text: Some("Inspect first.".into()),
+                        },
+                        AssistantItem::Text {
+                            text: "I will run it.".into(),
+                        },
+                        AssistantItem::BashCall(ToolCall {
+                            id: "call-1".into(),
+                            arguments: r#"{"title":"Run","command":"printf ok","risk":"readonly"}"#
+                                .into(),
+                        }),
+                        AssistantItem::Text {
+                            text: " Finished.".into(),
+                        },
+                    ],
                     native_replay: None,
                 },
             )
@@ -2882,21 +3728,38 @@ mod tests {
                 TranscriptEvent::User("Run it".into()),
                 TranscriptEvent::Assistant {
                     turn_state: "continue".into(),
-                    text: Some("I will run it.".into()),
-                    reasoning_content: Some("Inspect first.".into()),
-                    bash_calls: vec![TranscriptBashCall {
-                        arguments: r#"{"title":"Run","command":"printf ok","risk":"readonly"}"#
-                            .into(),
-                        result: Some(TranscriptBashResult {
-                            outcome: "completed".into(),
-                            output: "ok".into(),
-                            exit_code: Some(0),
-                            duration_ms: Some(7),
-                        }),
-                    }],
+                    items: vec![
+                        TranscriptAssistantItem::Reasoning(Some("Inspect first.".into())),
+                        TranscriptAssistantItem::Text("I will run it.".into()),
+                        TranscriptAssistantItem::BashCall {
+                            arguments: r#"{"title":"Run","command":"printf ok","risk":"readonly"}"#
+                                .into(),
+                            result: Some(TranscriptBashResult {
+                                outcome: "completed".into(),
+                                output: "ok".into(),
+                                exit_code: Some(0),
+                                duration_ms: Some(7),
+                            }),
+                        },
+                        TranscriptAssistantItem::Text(" Finished.".into()),
+                    ],
                 },
             ]
         );
+        let records = store.message_records_from_seq(&session.id, 0).unwrap();
+        assert!(matches!(
+            records
+                .iter()
+                .find(|record| record.kind == "assistant")
+                .unwrap()
+                .items
+                .as_slice(),
+            [
+                MessageRecordItem::Text(before),
+                MessageRecordItem::BashCall(_),
+                MessageRecordItem::Text(after),
+            ] if before == "I will run it." && after == " Finished."
+        ));
     }
 
     #[test]
@@ -2909,10 +3772,10 @@ mod tests {
         let (_, call_ids) = store
             .append_message_with_bash_calls(
                 &session.id,
-                &Message::Assistant {
-                    content: None,
-                    reasoning_content: None,
-                    tool_calls: Some(
+                &Message::assistant(
+                    None,
+                    None,
+                    Some(
                         ["first", "second"]
                             .into_iter()
                             .map(|id| ToolCall {
@@ -2921,8 +3784,8 @@ mod tests {
                             })
                             .collect(),
                     ),
-                    native_replay: None,
-                },
+                    None,
+                ),
             )
             .unwrap();
         let (manifest, objects) = store.attachment_paths(&session.id).unwrap();
@@ -2977,15 +3840,15 @@ mod tests {
         let (_, call_ids) = store
             .append_message_with_bash_calls(
                 &session.id,
-                &Message::Assistant {
-                    content: None,
-                    reasoning_content: None,
-                    tool_calls: Some(vec![ToolCall {
+                &Message::assistant(
+                    None,
+                    None,
+                    Some(vec![ToolCall {
                         id: "provider-call".into(),
                         arguments: r#"{"risk":"readonly","command":"true"}"#.into(),
                     }]),
-                    native_replay: None,
-                },
+                    None,
+                ),
             )
             .unwrap();
         let (manifest, objects) = store.attachment_paths(&session.id).unwrap();
@@ -3107,11 +3970,11 @@ mod tests {
             .complete_resumable_assistant_exchange(
                 &session.id,
                 &first,
-                &Message::Assistant {
-                    content: None,
-                    reasoning_content: None,
-                    tool_calls: None,
-                    native_replay: Some(NativeReplay {
+                &Message::assistant(
+                    None,
+                    None,
+                    None,
+                    Some(NativeReplay {
                         provider_id: "test".into(),
                         endpoint: endpoint.into(),
                         model: "model".into(),
@@ -3123,7 +3986,7 @@ mod tests {
                             }),
                         ]),
                     }),
-                },
+                ),
                 None,
                 None,
             )
@@ -3193,14 +4056,14 @@ mod tests {
         let (_, call_ids) = store
             .append_message_with_bash_calls(
                 &session.id,
-                &Message::Assistant {
-                    content: None,
-                    reasoning_content: Some("trace".into()),
-                    tool_calls: Some(vec![ToolCall {
+                &Message::assistant(
+                    None,
+                    Some("trace".into()),
+                    Some(vec![ToolCall {
                         id: "provider-call".into(),
                         arguments: r#"{"risk":"readonly","command":"pwd"}"#.into(),
                     }]),
-                    native_replay: Some(NativeReplay {
+                    Some(NativeReplay {
                         provider_id: String::new(),
                         endpoint: String::new(),
                         model: "model".into(),
@@ -3208,7 +4071,7 @@ mod tests {
                             "trace".into(),
                         ),
                     }),
-                },
+                ),
             )
             .unwrap();
         store
@@ -3322,12 +4185,7 @@ mod tests {
             .complete_assistant_exchange(
                 &session.id,
                 &exchange,
-                &Message::Assistant {
-                    content: Some("done".into()),
-                    reasoning_content: None,
-                    tool_calls: None,
-                    native_replay: None,
-                },
+                &Message::assistant(Some("done".into()), None, None, None),
                 None,
                 Some(&Usage {
                     total_tokens: 10,
@@ -3382,12 +4240,7 @@ mod tests {
             .complete_assistant_exchange(
                 &session.id,
                 &exchange,
-                &Message::Assistant {
-                    content: None,
-                    reasoning_content: None,
-                    tool_calls: Some(vec![call.clone(), call]),
-                    native_replay: None,
-                },
+                &Message::assistant(None, None, Some(vec![call.clone(), call]), None),
                 None,
                 None,
             )
@@ -3525,15 +4378,15 @@ mod tests {
         let (_, calls) = store
             .append_message_with_bash_calls(
                 &session.id,
-                &Message::Assistant {
-                    content: None,
-                    reasoning_content: None,
-                    tool_calls: Some(vec![ToolCall {
+                &Message::assistant(
+                    None,
+                    None,
+                    Some(vec![ToolCall {
                         id: "provider-call".into(),
                         arguments: r#"{"risk":"destructive","command":"rm x"}"#.into(),
                     }]),
-                    native_replay: None,
-                },
+                    None,
+                ),
             )
             .unwrap();
         let native = serde_json::json!({"model":"reviewer","messages":[]});
@@ -3632,12 +4485,7 @@ mod tests {
             .complete_resumable_assistant_exchange(
                 &session.id,
                 &exchange,
-                &Message::Assistant {
-                    content: None,
-                    reasoning_content: None,
-                    tool_calls: None,
-                    native_replay: None,
-                },
+                &Message::assistant(None, None, None, None),
                 None,
                 None,
             )
@@ -3676,12 +4524,7 @@ mod tests {
             .complete_resumable_assistant_exchange(
                 &session.id,
                 &exchange,
-                &Message::Assistant {
-                    content: None,
-                    reasoning_content: None,
-                    tool_calls: None,
-                    native_replay: None,
-                },
+                &Message::assistant(None, None, None, None),
                 None,
                 None,
             )

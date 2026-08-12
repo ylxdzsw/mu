@@ -3,10 +3,10 @@ use std::collections::BTreeMap;
 use serde_json::Value;
 
 use crate::provider::{
-    ContentPart, FinishReason, HttpProvider, Message, NativeReplay, NativeReplayPayload,
-    ProviderError, ReasoningVisibility, Request, SseEvent, StreamEvent, StreamResult, ToolCall,
-    ToolCallDelta as ProviderToolCallDelta, Usage, UserContent, base64_encode,
-    classify_stream_error, next_event_boundary,
+    AssistantItem, ContentPart, FinishReason, HttpProvider, Message, NativeReplay,
+    NativeReplayPayload, ProviderError, ReasoningVisibility, Request, SseEvent, StreamEvent,
+    StreamResult, ToolCall, ToolCallDelta as ProviderToolCallDelta, Usage, UserContent,
+    base64_encode, classify_stream_error, next_event_boundary,
 };
 
 pub(crate) async fn stream(
@@ -36,14 +36,29 @@ pub(crate) async fn stream(
 
     let native_response = state.native_response;
     let output = state.output;
-    let tool_calls = responses_tool_calls(&output)?;
-    let content = if state.content.is_empty() {
-        responses_output_text(&output)
-    } else {
-        Some(state.content)
-    };
+    let mut items = responses_items(&output)?;
+    if !state.content.is_empty()
+        && !items
+            .iter()
+            .any(|item| matches!(item, AssistantItem::Text { .. }))
+    {
+        let position = items
+            .iter()
+            .position(|item| matches!(item, AssistantItem::BashCall(_)))
+            .unwrap_or(items.len());
+        items.insert(
+            position,
+            AssistantItem::Text {
+                text: state.content,
+            },
+        );
+    }
+    let tool_calls = items
+        .iter()
+        .filter(|item| matches!(item, AssistantItem::BashCall(_)))
+        .count();
     let finish_reason = state.finish_reason.unwrap_or({
-        if tool_calls.is_empty() {
+        if tool_calls == 0 {
             FinishReason::Stop
         } else {
             FinishReason::ToolCalls
@@ -51,9 +66,7 @@ pub(crate) async fn stream(
     });
     Ok(StreamResult {
         message: Message::Assistant {
-            content,
-            reasoning_content: None,
-            tool_calls: (!tool_calls.is_empty()).then_some(tool_calls),
+            items,
             native_replay: state.replayable.then(|| NativeReplay {
                 provider_id: request.model.provider_id.clone(),
                 endpoint: provider.endpoint.clone(),
@@ -118,10 +131,8 @@ fn responses_input_items(message: &Message, input: &mut Vec<Value>) -> Result<()
             "role": "user", "content": responses_user_content(content)?
         })),
         Message::Assistant {
-            content,
-            tool_calls,
+            items,
             native_replay,
-            ..
         } => {
             if let Some(NativeReplay {
                 payload: NativeReplayPayload::ResponsesOutput(items),
@@ -130,19 +141,21 @@ fn responses_input_items(message: &Message, input: &mut Vec<Value>) -> Result<()
             {
                 input.extend(items.iter().cloned());
             } else {
-                if let Some(content) = content {
+                if let Some(content) = message.assistant_text() {
                     input.push(serde_json::json!({ "role": "assistant", "content": content }));
                 }
-                if let Some(tool_calls) = tool_calls {
-                    input.extend(tool_calls.iter().map(|call| {
-                        serde_json::json!({
+                input.extend(items.iter().filter_map(|item| {
+                    if let AssistantItem::BashCall(call) = item {
+                        Some(serde_json::json!({
                             "type": "function_call",
                             "call_id": call.id,
                             "name": "bash",
                             "arguments": call.arguments
-                        })
-                    }));
-                }
+                        }))
+                    } else {
+                        None
+                    }
+                }));
             }
         }
         Message::Tool {
@@ -412,54 +425,71 @@ fn responses_usage(value: &Value) -> Option<Usage> {
     })
 }
 
+#[cfg(test)]
 pub(crate) fn responses_tool_calls(output: &[Value]) -> Result<Vec<ToolCall>, ProviderError> {
-    output
-        .iter()
-        .filter(|item| item["type"] == "function_call")
-        .map(|item| {
-            let id = item["call_id"].as_str().unwrap_or("call");
-            let name = item["name"].as_str().unwrap_or("");
-            if name != "bash" {
-                return Err(ProviderError::Protocol(format!(
-                    "Responses function call `{id}` calls unsupported tool `{name}`"
-                )));
-            }
-            let arguments = item["arguments"].as_str().unwrap_or("");
-            let arguments = if arguments.trim().is_empty() {
-                "{}".into()
-            } else {
-                let value: Value = serde_json::from_str(arguments).map_err(|error| {
-                    ProviderError::Protocol(format!(
-                        "invalid completed Responses tool arguments for `{id}`: {error}"
-                    ))
-                })?;
-                if !value.is_object() {
-                    return Err(ProviderError::Protocol(format!(
-                        "completed Responses tool arguments for `{id}` must be a JSON object"
-                    )));
-                }
-                arguments.to_string()
-            };
-            Ok(ToolCall {
-                id: id.to_string(),
-                arguments,
+    responses_items(output).map(|items| {
+        items
+            .into_iter()
+            .filter_map(|item| match item {
+                AssistantItem::BashCall(call) => Some(call),
+                _ => None,
             })
-        })
-        .collect()
+            .collect()
+    })
 }
 
-fn responses_output_text(output: &[Value]) -> Option<String> {
-    let text = output
-        .iter()
-        .filter(|item| item["type"] == "message")
-        .flat_map(|item| item["content"].as_array().into_iter().flatten())
-        .filter_map(|part| match part["type"].as_str() {
-            Some("output_text") => part["text"].as_str(),
-            Some("refusal") => part["refusal"].as_str(),
-            _ => None,
-        })
-        .collect::<String>();
-    (!text.is_empty()).then_some(text)
+fn responses_items(output: &[Value]) -> Result<Vec<AssistantItem>, ProviderError> {
+    let mut items = Vec::new();
+    for item in output {
+        match item["type"].as_str() {
+            Some("reasoning") => items.push(AssistantItem::Reasoning { text: None }),
+            Some("message") => {
+                for part in item["content"].as_array().into_iter().flatten() {
+                    let text = match part["type"].as_str() {
+                        Some("output_text") => part["text"].as_str(),
+                        Some("refusal") => part["refusal"].as_str(),
+                        _ => None,
+                    };
+                    if let Some(text) = text {
+                        items.push(AssistantItem::Text {
+                            text: text.to_string(),
+                        });
+                    }
+                }
+            }
+            Some("function_call") => {
+                let id = item["call_id"].as_str().unwrap_or("call");
+                let name = item["name"].as_str().unwrap_or("");
+                if name != "bash" {
+                    return Err(ProviderError::Protocol(format!(
+                        "Responses function call `{id}` calls unsupported tool `{name}`"
+                    )));
+                }
+                let arguments = item["arguments"].as_str().unwrap_or("");
+                let arguments = if arguments.trim().is_empty() {
+                    "{}".into()
+                } else {
+                    let value: Value = serde_json::from_str(arguments).map_err(|error| {
+                        ProviderError::Protocol(format!(
+                            "invalid completed Responses tool arguments for `{id}`: {error}"
+                        ))
+                    })?;
+                    if !value.is_object() {
+                        return Err(ProviderError::Protocol(format!(
+                            "completed Responses tool arguments for `{id}` must be a JSON object"
+                        )));
+                    }
+                    arguments.to_string()
+                };
+                items.push(AssistantItem::BashCall(ToolCall {
+                    id: id.to_string(),
+                    arguments,
+                }));
+            }
+            _ => {}
+        }
+    }
+    Ok(items)
 }
 
 #[cfg(test)]
@@ -615,14 +645,27 @@ mod tests {
                 ]
             },
             {"type": "reasoning", "content": [{"type": "output_text", "text": "private"}]},
+            {
+                "type": "function_call",
+                "call_id": "call-1",
+                "name": "bash",
+                "arguments": "{\"command\":\"true\"}"
+            },
             {"type": "message", "content": [{"type": "output_text", "text": " third"}]}
         ]);
 
-        assert_eq!(
-            responses_output_text(output.as_array().unwrap()).as_deref(),
-            Some("first second third")
-        );
-        assert_eq!(responses_output_text(&[]), None);
+        let items = responses_items(output.as_array().unwrap()).unwrap();
+        assert!(matches!(
+            items.as_slice(),
+            [
+                AssistantItem::Text { text: first },
+                AssistantItem::Text { text: second },
+                AssistantItem::Reasoning { text: None },
+                AssistantItem::BashCall(ToolCall { id, .. }),
+                AssistantItem::Text { text: third },
+            ] if first == "first" && second == " second" && id == "call-1" && third == " third"
+        ));
+        assert!(responses_items(&[]).unwrap().is_empty());
     }
 
     #[test]

@@ -452,55 +452,64 @@ fn replay_transcript(
     for event in events {
         match event {
             store::TranscriptEvent::User(text) => renderer.transcript_prompt(text)?,
-            store::TranscriptEvent::Assistant {
-                turn_state,
-                text,
-                reasoning_content,
-                bash_calls,
-            } => {
+            store::TranscriptEvent::Assistant { turn_state, items } => {
                 if output == OutputFormat::Final {
-                    if turn_state == "complete"
-                        && let Some(text) = text
-                    {
-                        renderer.transcript_final_text(text)?;
+                    if turn_state == "complete" {
+                        let text = items
+                            .iter()
+                            .filter_map(|item| match item {
+                                store::TranscriptAssistantItem::Text(text) => Some(text.as_str()),
+                                _ => None,
+                            })
+                            .collect::<String>();
+                        if !text.is_empty() {
+                            renderer.transcript_final_text(&text)?;
+                        }
                     }
                     continue;
                 }
-                if output == OutputFormat::Full
-                    && let Some(reasoning) = reasoning_content
-                    && !reasoning.is_empty()
-                {
-                    renderer.reasoning_start(provider::ReasoningVisibility::StreamedTrace)?;
-                    renderer.reasoning_delta(reasoning)?;
-                    renderer.reasoning_end(None)?;
-                }
-                if let Some(text) = text {
-                    renderer.assistant_text(text)?;
-                    renderer.assistant_end()?;
-                }
-                for call in bash_calls {
-                    let args: serde_json::Value = serde_json::from_str(&call.arguments)
-                        .context("parsing persisted Bash arguments")?;
-                    renderer.bash_header_full(&args)?;
-                    renderer.tool_start(&args, true)?;
-                    match &call.result {
-                        Some(result) if result.outcome == "completed" => {
-                            renderer.bash_output(&result.output)?;
-                            renderer.tool_finished(
-                                result
-                                    .exit_code
-                                    .context("completed Bash result has no exit code")?,
-                                Duration::from_millis(result.duration_ms.unwrap_or_default()),
-                            )?;
+                for item in items {
+                    match item {
+                        store::TranscriptAssistantItem::Reasoning(Some(reasoning))
+                            if output == OutputFormat::Full && !reasoning.is_empty() =>
+                        {
+                            renderer
+                                .reasoning_start(provider::ReasoningVisibility::StreamedTrace)?;
+                            renderer.reasoning_delta(reasoning)?;
+                            renderer.reasoning_end(None)?;
                         }
-                        Some(result) => renderer.tool_failed(
-                            result
-                                .output
-                                .strip_prefix("error: ")
-                                .unwrap_or(&result.outcome),
-                            Duration::from_millis(result.duration_ms.unwrap_or_default()),
-                        )?,
-                        None => renderer.tool_failed("incomplete", Duration::ZERO)?,
+                        store::TranscriptAssistantItem::Text(text) => {
+                            renderer.assistant_text(text)?;
+                            renderer.assistant_end()?;
+                        }
+                        store::TranscriptAssistantItem::BashCall { arguments, result } => {
+                            let args: serde_json::Value = serde_json::from_str(arguments)
+                                .context("parsing persisted Bash arguments")?;
+                            renderer.bash_header_full(&args)?;
+                            renderer.tool_start(&args, true)?;
+                            match result {
+                                Some(result) if result.outcome == "completed" => {
+                                    renderer.bash_output(&result.output)?;
+                                    renderer.tool_finished(
+                                        result
+                                            .exit_code
+                                            .context("completed Bash result has no exit code")?,
+                                        Duration::from_millis(
+                                            result.duration_ms.unwrap_or_default(),
+                                        ),
+                                    )?;
+                                }
+                                Some(result) => renderer.tool_failed(
+                                    result
+                                        .output
+                                        .strip_prefix("error: ")
+                                        .unwrap_or(&result.outcome),
+                                    Duration::from_millis(result.duration_ms.unwrap_or_default()),
+                                )?,
+                                None => renderer.tool_failed("incomplete", Duration::ZERO)?,
+                            }
+                        }
+                        _ => {}
                     }
                 }
             }
@@ -1508,15 +1517,15 @@ mod tests {
             store::TranscriptEvent::User("Question".into()),
             store::TranscriptEvent::Assistant {
                 turn_state: "continue".into(),
-                text: Some("Intermediate".into()),
-                reasoning_content: None,
-                bash_calls: Vec::new(),
+                items: vec![store::TranscriptAssistantItem::Text("Intermediate".into())],
             },
             store::TranscriptEvent::Assistant {
                 turn_state: "complete".into(),
-                text: Some("Final answer".into()),
-                reasoning_content: None,
-                bash_calls: Vec::new(),
+                items: vec![
+                    store::TranscriptAssistantItem::Text("Final ".into()),
+                    store::TranscriptAssistantItem::Reasoning(None),
+                    store::TranscriptAssistantItem::Text("answer".into()),
+                ],
             },
         ];
         let buffer = TranscriptBuffer::default();
@@ -1534,18 +1543,20 @@ mod tests {
             store::TranscriptEvent::User("Question".into()),
             store::TranscriptEvent::Assistant {
                 turn_state: "continue".into(),
-                text: Some("Running **now**.".into()),
-                reasoning_content: Some("Private trace".into()),
-                bash_calls: vec![store::TranscriptBashCall {
-                    arguments: r#"{"title":"Inspect","command":"printf all","risk":"readonly"}"#
-                        .into(),
-                    result: Some(store::TranscriptBashResult {
-                        outcome: "completed".into(),
-                        output: "line1\nline2\nline3\nline4\nline5\nline6\n".into(),
-                        exit_code: Some(0),
-                        duration_ms: Some(5),
-                    }),
-                }],
+                items: vec![
+                    store::TranscriptAssistantItem::Reasoning(Some("Private trace".into())),
+                    store::TranscriptAssistantItem::Text("Running **now**.".into()),
+                    store::TranscriptAssistantItem::BashCall {
+                        arguments:
+                            r#"{"title":"Inspect","command":"printf all","risk":"readonly"}"#.into(),
+                        result: Some(store::TranscriptBashResult {
+                            outcome: "completed".into(),
+                            output: "line1\nline2\nline3\nline4\nline5\nline6\n".into(),
+                            exit_code: Some(0),
+                            duration_ms: Some(5),
+                        }),
+                    },
+                ],
             },
         ];
         let buffer = TranscriptBuffer::default();

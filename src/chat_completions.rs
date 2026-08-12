@@ -4,10 +4,10 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use crate::provider::{
-    ContentPart, FinishReason, HttpProvider, Message, NativeReplay, NativeReplayPayload,
-    ProviderError, ReasoningVisibility, Request, SseEvent, StreamEvent, StreamResult, ToolCall,
-    ToolCallDelta as ProviderToolCallDelta, Usage, UserContent, base64_encode,
-    classify_stream_error,
+    AssistantItem, ContentPart, FinishReason, HttpProvider, Message, NativeReplay,
+    NativeReplayPayload, ProviderError, ReasoningVisibility, Request, SseEvent, StreamEvent,
+    StreamResult, ToolCall, ToolCallDelta as ProviderToolCallDelta, Usage, UserContent,
+    base64_encode, classify_stream_error,
 };
 
 #[derive(Debug, Deserialize)]
@@ -130,65 +130,55 @@ pub(crate) async fn stream(
     let tool_calls = has_tool_calls
         .then(|| completed_tool_calls(state.tool_accum, validate_arguments))
         .transpose()?;
-    let message = Message::Assistant {
-        content: (!state.content.is_empty()).then_some(state.content),
-        reasoning_content: state
-            .reasoning_content_present
-            .then_some(state.reasoning_content.clone()),
-        tool_calls,
-        native_replay: (state.reasoning_content_present && has_tool_calls).then(|| NativeReplay {
-            provider_id: request.model.provider_id.clone(),
-            endpoint: provider.endpoint.clone(),
-            model: request.model.model_id.clone(),
-            payload: NativeReplayPayload::ChatReasoning(state.reasoning_content),
-        }),
-    };
-    let native_response = match &message {
-        Message::Assistant {
-            content,
-            reasoning_content,
-            tool_calls,
-            ..
-        } => Some(serde_json::json!({
-            "object": "chat.completion",
-            "model": request.model.model_id,
-            "choices": [{
-                "index": 0,
-                "message": {
-                    "role": "assistant",
-                    "content": content,
-                    "reasoning_content": reasoning_content,
-                    "tool_calls": tool_calls.as_ref().map(|calls| calls.iter().map(|call| serde_json::json!({
-                        "id": &call.id,
-                        "type": "function",
-                        "function": {
-                            "name": "bash",
-                            "arguments": &call.arguments,
-                        },
-                    })).collect::<Vec<_>>()),
-                },
-                "finish_reason": match &state.finish_reason {
-                    FinishReason::Stop => "stop",
-                    FinishReason::ToolCalls => "tool_calls",
-                    FinishReason::Resume => "stop",
-                    FinishReason::Other(reason) => reason,
-                },
-            }],
-            "usage": state.usage.as_ref().map(|usage| serde_json::json!({
-                "prompt_tokens": usage.input_tokens,
-                "completion_tokens": usage.output_tokens,
-                "total_tokens": usage.total_tokens,
-                "prompt_tokens_details": {
-                    "cached_tokens": usage.cache_read_input_tokens,
-                    "cache_creation_tokens": usage.cache_write_input_tokens,
-                },
-                "completion_tokens_details": {
-                    "reasoning_tokens": usage.reasoning_output_tokens,
-                },
-            })),
+    let content = (!state.content.is_empty()).then_some(state.content);
+    let reasoning_content = state
+        .reasoning_content_present
+        .then_some(state.reasoning_content.clone());
+    let native_response = Some(serde_json::json!({
+        "object": "chat.completion",
+        "model": request.model.model_id,
+        "choices": [{
+            "index": 0,
+            "message": {
+                "role": "assistant",
+                "content": content,
+                "reasoning_content": reasoning_content,
+                "tool_calls": tool_calls.as_ref().map(|calls| calls.iter().map(|call| serde_json::json!({
+                    "id": &call.id,
+                    "type": "function",
+                    "function": {
+                        "name": "bash",
+                        "arguments": &call.arguments,
+                    },
+                })).collect::<Vec<_>>()),
+            },
+            "finish_reason": match &state.finish_reason {
+                FinishReason::Stop => "stop",
+                FinishReason::ToolCalls => "tool_calls",
+                FinishReason::Resume => "stop",
+                FinishReason::Other(reason) => reason,
+            },
+        }],
+        "usage": state.usage.as_ref().map(|usage| serde_json::json!({
+            "prompt_tokens": usage.input_tokens,
+            "completion_tokens": usage.output_tokens,
+            "total_tokens": usage.total_tokens,
+            "prompt_tokens_details": {
+                "cached_tokens": usage.cache_read_input_tokens,
+                "cache_creation_tokens": usage.cache_write_input_tokens,
+            },
+            "completion_tokens_details": {
+                "reasoning_tokens": usage.reasoning_output_tokens,
+            },
         })),
-        _ => None,
-    };
+    }));
+    let native_replay = (state.reasoning_content_present && has_tool_calls).then(|| NativeReplay {
+        provider_id: request.model.provider_id.clone(),
+        endpoint: provider.endpoint.clone(),
+        model: request.model.model_id.clone(),
+        payload: NativeReplayPayload::ChatReasoning(state.reasoning_content),
+    });
+    let message = Message::assistant(content, reasoning_content, tool_calls, native_replay);
     Ok(StreamResult {
         message,
         finish_reason: state.finish_reason,
@@ -245,11 +235,24 @@ fn chat_message_json(message: &Message) -> Vec<Value> {
             "content": user_content_json(content),
         })],
         Message::Assistant {
-            content,
-            reasoning_content: _,
-            tool_calls,
+            items,
             native_replay,
         } => {
+            let content = items
+                .iter()
+                .filter_map(|item| match item {
+                    AssistantItem::Text { text } => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect::<String>();
+            let content = items
+                .iter()
+                .any(|item| matches!(item, AssistantItem::Text { .. }))
+                .then_some(content);
+            let tool_calls = items.iter().filter_map(|item| match item {
+                AssistantItem::BashCall(call) => Some(call),
+                _ => None,
+            });
             let mut value = serde_json::json!({
                 "role": "assistant",
                 "content": content,
@@ -261,10 +264,11 @@ fn chat_message_json(message: &Message) -> Vec<Value> {
             {
                 value["reasoning_content"] = Value::String(reasoning.clone());
             }
-            if let Some(tool_calls) = tool_calls {
+            let tool_calls = tool_calls.collect::<Vec<_>>();
+            if !tool_calls.is_empty() {
                 value["tool_calls"] = Value::Array(
                     tool_calls
-                        .iter()
+                        .into_iter()
                         .map(|call| {
                             serde_json::json!({
                                 "id": call.id,
@@ -936,20 +940,20 @@ mod tests {
             serde_json::json!({"type":"reasoning","id":"rs_1","encrypted_content":"opaque"}),
             serde_json::json!({"type":"function_call","call_id":"call_1","name":"bash","arguments":"{}"}),
         ];
-        let assistant = Message::Assistant {
-            content: None,
-            reasoning_content: None,
-            tool_calls: Some(vec![ToolCall {
+        let assistant = Message::assistant(
+            None,
+            None,
+            Some(vec![ToolCall {
                 id: "call_1".into(),
                 arguments: "{}".into(),
             }]),
-            native_replay: Some(NativeReplay {
+            Some(NativeReplay {
                 provider_id: "test".into(),
                 endpoint: "https://api.test/v1/responses".into(),
                 model: "gpt-test".into(),
                 payload: NativeReplayPayload::ResponsesOutput(native_items.clone()),
             }),
-        };
+        );
         let messages = vec![
             assistant,
             Message::Tool {
@@ -1031,26 +1035,26 @@ mod tests {
             id: "call_1".into(),
             arguments: "{}".into(),
         };
-        let from_chat = Message::Assistant {
-            content: None,
-            reasoning_content: Some("private chat reasoning".into()),
-            tool_calls: Some(vec![call.clone()]),
-            native_replay: Some(NativeReplay {
+        let from_chat = Message::assistant(
+            None,
+            Some("private chat reasoning".into()),
+            Some(vec![call.clone()]),
+            Some(NativeReplay {
                 provider_id: "test".into(),
                 endpoint: CHAT_ENDPOINT.into(),
                 model: "gpt-test".into(),
                 payload: NativeReplayPayload::ChatReasoning("private chat reasoning".into()),
             }),
-        };
+        );
         let responses = body(ModelApi::Responses, None, vec![from_chat], false).unwrap();
         assert_eq!(responses["input"][0]["type"], "function_call");
         assert!(!responses.to_string().contains("private chat reasoning"));
 
-        let from_responses = Message::Assistant {
-            content: None,
-            reasoning_content: None,
-            tool_calls: Some(vec![call]),
-            native_replay: Some(NativeReplay {
+        let from_responses = Message::assistant(
+            None,
+            None,
+            Some(vec![call]),
+            Some(NativeReplay {
                 provider_id: "test".into(),
                 endpoint: "https://api.test/v1/responses".into(),
                 model: "gpt-test".into(),
@@ -1058,7 +1062,7 @@ mod tests {
                     "type": "reasoning", "encrypted_content": "opaque"
                 })]),
             }),
-        };
+        );
         let chat = body(ModelApi::ChatCompletions, None, vec![from_responses], false).unwrap();
         assert_eq!(chat["messages"][0]["tool_calls"][0]["id"], "call_1");
         assert_eq!(chat["messages"][0]["tool_calls"][0]["type"], "function");
@@ -1149,20 +1153,20 @@ mod tests {
     #[test]
     fn replays_chat_reasoning_verbatim_including_empty() {
         for reasoning in ["  exact\\ntrace  ", ""] {
-            let message = Message::Assistant {
-                content: None,
-                reasoning_content: Some(reasoning.into()),
-                tool_calls: Some(vec![ToolCall {
+            let message = Message::assistant(
+                None,
+                Some(reasoning.into()),
+                Some(vec![ToolCall {
                     id: "call_1".into(),
                     arguments: "{}".into(),
                 }]),
-                native_replay: Some(NativeReplay {
+                Some(NativeReplay {
                     provider_id: "test".into(),
                     endpoint: CHAT_ENDPOINT.into(),
                     model: "gpt-test".into(),
                     payload: NativeReplayPayload::ChatReasoning(reasoning.into()),
                 }),
-            };
+            );
             let body = body(ModelApi::ChatCompletions, None, vec![message], false).unwrap();
             assert_eq!(body["messages"][0]["reasoning_content"], reasoning);
             assert_eq!(body["messages"][0]["tool_calls"][0]["id"], "call_1");

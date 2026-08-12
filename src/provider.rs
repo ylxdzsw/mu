@@ -25,11 +25,7 @@ pub enum Message {
         content: UserContent,
     },
     Assistant {
-        content: Option<String>,
-        /// Opaque provider reasoning. This is persisted and replayed verbatim
-        /// only for models that require it (for example DeepSeek thinking mode).
-        reasoning_content: Option<String>,
-        tool_calls: Option<Vec<ToolCall>>,
+        items: Vec<AssistantItem>,
         /// Exact protocol-native continuation state. Request assembly filters
         /// this by current replay key and API before the adapter serializes it.
         native_replay: Option<NativeReplay>,
@@ -41,25 +37,87 @@ pub enum Message {
     },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AssistantItem {
+    Reasoning { text: Option<String> },
+    Text { text: String },
+    BashCall(ToolCall),
+}
+
 impl Message {
+    pub fn assistant(
+        content: Option<String>,
+        reasoning: Option<String>,
+        tool_calls: Option<Vec<ToolCall>>,
+        native_replay: Option<NativeReplay>,
+    ) -> Self {
+        let mut items = Vec::new();
+        if let Some(text) = reasoning {
+            items.push(AssistantItem::Reasoning { text: Some(text) });
+        }
+        if let Some(text) = content {
+            items.push(AssistantItem::Text { text });
+        }
+        items.extend(
+            tool_calls
+                .into_iter()
+                .flatten()
+                .map(AssistantItem::BashCall),
+        );
+        Self::Assistant {
+            items,
+            native_replay,
+        }
+    }
+
+    pub fn assistant_text(&self) -> Option<String> {
+        let Self::Assistant { items, .. } = self else {
+            return None;
+        };
+        let mut text = String::new();
+        let mut present = false;
+        for item in items {
+            if let AssistantItem::Text { text: part } = item {
+                text.push_str(part);
+                present = true;
+            }
+        }
+        present.then_some(text)
+    }
+
+    pub fn assistant_tool_calls(&self) -> Vec<&ToolCall> {
+        let Self::Assistant { items, .. } = self else {
+            return Vec::new();
+        };
+        items
+            .iter()
+            .filter_map(|item| match item {
+                AssistantItem::BashCall(call) => Some(call),
+                _ => None,
+            })
+            .collect()
+    }
+
     pub fn approx_tokens(&self) -> u64 {
         match self {
             Self::System { content } => approx_tokens(content),
             Self::User { content } => approx_tokens(&content.text()),
             Self::Assistant {
-                content,
-                reasoning_content,
-                tool_calls,
+                items,
                 native_replay,
             } => {
-                approx_tokens(content.as_deref().unwrap_or(""))
-                    + approx_tokens(reasoning_content.as_deref().unwrap_or(""))
-                    + tool_calls
-                        .as_ref()
-                        .map(|calls| {
-                            approx_tokens(&serde_json::to_string(calls).unwrap_or_default())
-                        })
-                        .unwrap_or(0)
+                items
+                    .iter()
+                    .map(|item| match item {
+                        AssistantItem::Reasoning { text } => {
+                            approx_tokens(text.as_deref().unwrap_or(""))
+                        }
+                        AssistantItem::Text { text } => approx_tokens(text),
+                        AssistantItem::BashCall(call) => {
+                            approx_tokens(&serde_json::to_string(call).unwrap_or_default())
+                        }
+                    })
+                    .sum::<u64>()
                     + native_replay
                         .as_ref()
                         .map(|native| {
@@ -603,7 +661,7 @@ pub struct ToolAttachment {
     pub(crate) object_sha256: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ToolCall {
     pub id: String,
     pub arguments: String,
@@ -1235,6 +1293,44 @@ mod tests {
     }
 
     #[test]
+    fn assistant_constructor_uses_chat_canonical_order() {
+        assert!(matches!(
+            Message::assistant(None, None, None, None),
+            Message::Assistant { items, .. } if items.is_empty()
+        ));
+        assert!(matches!(
+            Message::assistant(
+                Some("text".into()),
+                Some(String::new()),
+                Some(vec![
+                    ToolCall {
+                        id: "first".into(),
+                        arguments: "{}".into(),
+                    },
+                    ToolCall {
+                        id: "second".into(),
+                        arguments: "{}".into(),
+                    },
+                ]),
+                None,
+            ),
+            Message::Assistant { items, .. }
+                if matches!(
+                    items.as_slice(),
+                    [
+                        AssistantItem::Reasoning { text: Some(reasoning) },
+                        AssistantItem::Text { text },
+                        AssistantItem::BashCall(ToolCall { id: first, .. }),
+                        AssistantItem::BashCall(ToolCall { id: second, .. }),
+                    ] if reasoning.is_empty()
+                        && text == "text"
+                        && first == "first"
+                        && second == "second"
+                )
+        ));
+    }
+
+    #[test]
     fn request_boolean_controls_the_fixed_bash_schema() {
         for (api, name_pointer) in [
             (ModelApi::ChatCompletions, "/tools/0/function/name"),
@@ -1302,17 +1398,17 @@ mod tests {
     }
 
     fn replay_message(payload: NativeReplayPayload) -> Message {
-        Message::Assistant {
-            content: Some("semantic".into()),
-            reasoning_content: None,
-            tool_calls: None,
-            native_replay: Some(NativeReplay {
+        Message::assistant(
+            Some("semantic".into()),
+            None,
+            None,
+            Some(NativeReplay {
                 provider_id: "source".into(),
                 endpoint: "https://source.test/v1/chat/completions".into(),
                 model: "source-model".into(),
                 payload,
             }),
-        }
+        )
     }
 
     fn target_model() -> ResolvedModelRef {

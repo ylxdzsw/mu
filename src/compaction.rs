@@ -8,7 +8,7 @@ use crate::provider::{
     StreamEvent, advance_provider, effective_retry_delay, provider_retry_limit,
 };
 use crate::renderer::Renderer;
-use crate::store::{CompactionCompletion, ProviderOrigin, Store};
+use crate::store::{CompactionCompletion, MessageRecordItem, ProviderOrigin, Store};
 
 const SUMMARIZER_SYSTEM_PROMPT: &str = "\
 You compact an existing conversation into durable context for a future model. \
@@ -311,7 +311,11 @@ pub async fn run_compaction(
             "user" => turns.push((rec.seq, 1)),
             "assistant" => {
                 if let Some((_, request_count)) = turns.last_mut() {
-                    *request_count += rec.bash_calls.len();
+                    *request_count += rec
+                        .items
+                        .iter()
+                        .filter(|item| matches!(item, MessageRecordItem::BashCall(_)))
+                        .count();
                 }
             }
             _ => {}
@@ -350,21 +354,28 @@ pub async fn run_compaction(
                 "bash_result" => ("bash-result", MAX_SUMMARY_TOOL_CHARS),
                 _ => ("system", MAX_SUMMARY_ENTRY_CHARS),
             };
-            let mut text = if m.content.is_empty() {
+            let entries = m
+                .items
+                .iter()
+                .map(|item| match item {
+                    MessageRecordItem::Text(content) => {
+                        if content.is_empty() {
+                            format!("[{role}]: (no text content)")
+                        } else {
+                            format!("[{role}]: {}", clamp_for_summary(content, cap))
+                        }
+                    }
+                    MessageRecordItem::BashCall(call) => format!(
+                        "[toolcall bash]: {}",
+                        clamp_for_summary(&call.arguments, MAX_SUMMARY_TOOL_CHARS)
+                    ),
+                })
+                .collect::<Vec<_>>();
+            if entries.is_empty() {
                 format!("[{role}]: (no text content)")
             } else {
-                format!("[{role}]: {}", clamp_for_summary(&m.content, cap))
-            };
-            // Include toolcall requests so compaction sees what the assistant actually asked for
-            if m.kind == "assistant" {
-                for c in &m.bash_calls {
-                    text.push_str(&format!(
-                        "\n[toolcall bash]: {}",
-                        clamp_for_summary(&c.arguments, MAX_SUMMARY_TOOL_CHARS)
-                    ));
-                }
+                entries.join("\n")
             }
-            text
         })
         .collect();
 
@@ -375,7 +386,10 @@ pub async fn run_compaction(
     }
 
     let summarize_prompt = build_summarize_prompt(
-        prior_summary.map(|m| m.content.as_str()),
+        prior_summary.and_then(|m| match m.items.as_slice() {
+            [MessageRecordItem::Text(text)] => Some(text.as_str()),
+            _ => None,
+        }),
         &to_summarize.join("\n---\n"),
         custom_focus,
     );
@@ -462,11 +476,8 @@ pub async fn run_compaction(
             return Err(anyhow::Error::new(error).context("compaction failed"));
         }
     };
-    let content = match &result.message {
-        Message::Assistant {
-            content: Some(content),
-            ..
-        } if !content.trim().is_empty() => content.clone(),
+    let content = match result.message.assistant_text() {
+        Some(content) if !content.trim().is_empty() => content,
         _ => {
             store.fail_provider_exchange(
                 session_id,
@@ -555,12 +566,7 @@ mod tests {
             ));
             assert_eq!(request.messages.len(), 2);
             Ok(StreamResult {
-                message: Message::Assistant {
-                    content: Some("summary".into()),
-                    reasoning_content: None,
-                    native_replay: None,
-                    tool_calls: None,
-                },
+                message: Message::assistant(Some("summary".into()), None, None, None),
                 finish_reason: FinishReason::Stop,
                 usage: Some(Usage {
                     input_tokens: 1,
@@ -664,12 +670,7 @@ mod tests {
             store
                 .append_message(
                     &session.id,
-                    &Message::Assistant {
-                        content: Some(format!("assistant {n}")),
-                        reasoning_content: None,
-                        native_replay: None,
-                        tool_calls: None,
-                    },
+                    &Message::assistant(Some(format!("assistant {n}")), None, None, None),
                 )
                 .unwrap();
         }
@@ -733,12 +734,7 @@ mod tests {
             store
                 .append_message(
                     &session.id,
-                    &Message::Assistant {
-                        content: Some(format!("assistant {n}")),
-                        reasoning_content: None,
-                        native_replay: None,
-                        tool_calls: None,
-                    },
+                    &Message::assistant(Some(format!("assistant {n}")), None, None, None),
                 )
                 .unwrap();
         }
@@ -765,12 +761,7 @@ mod tests {
         store
             .append_message(
                 &session.id,
-                &Message::Assistant {
-                    content: Some("assistant 8".into()),
-                    reasoning_content: None,
-                    native_replay: None,
-                    tool_calls: None,
-                },
+                &Message::assistant(Some("assistant 8".into()), None, None, None),
             )
             .unwrap();
 
@@ -826,12 +817,7 @@ mod tests {
             store
                 .append_message(
                     &session.id,
-                    &Message::Assistant {
-                        content: Some("done".into()),
-                        reasoning_content: None,
-                        native_replay: None,
-                        tool_calls: None,
-                    },
+                    &Message::assistant(Some("done".into()), None, None, None),
                 )
                 .unwrap();
         }
@@ -846,11 +832,10 @@ mod tests {
         let (_, call_ids) = store
             .append_message_with_bash_calls(
                 &session.id,
-                &Message::Assistant {
-                    content: None,
-                    reasoning_content: None,
-                    native_replay: None,
-                    tool_calls: Some(
+                &Message::assistant(
+                    None,
+                    None,
+                    Some(
                         (1..=5)
                             .map(|n| ToolCall {
                                 id: format!("call-{n}"),
@@ -858,7 +843,8 @@ mod tests {
                             })
                             .collect(),
                     ),
-                },
+                    None,
+                ),
             )
             .unwrap();
         for call_id in call_ids {
@@ -941,12 +927,7 @@ mod tests {
             store
                 .append_message(
                     &session.id,
-                    &Message::Assistant {
-                        content: Some(format!("assistant {n}")),
-                        reasoning_content: None,
-                        native_replay: None,
-                        tool_calls: None,
-                    },
+                    &Message::assistant(Some(format!("assistant {n}")), None, None, None),
                 )
                 .unwrap();
         }
@@ -1034,12 +1015,7 @@ mod tests {
             store
                 .append_message(
                     &session.id,
-                    &Message::Assistant {
-                        content: Some(format!("assistant {n}")),
-                        reasoning_content: None,
-                        native_replay: None,
-                        tool_calls: None,
-                    },
+                    &Message::assistant(Some(format!("assistant {n}")), None, None, None),
                 )
                 .unwrap();
         }
@@ -1085,12 +1061,7 @@ mod tests {
             store
                 .append_message(
                     &session.id,
-                    &Message::Assistant {
-                        content: Some(format!("assistant {n}")),
-                        reasoning_content: None,
-                        native_replay: None,
-                        tool_calls: None,
-                    },
+                    &Message::assistant(Some(format!("assistant {n}")), None, None, None),
                 )
                 .unwrap();
         }

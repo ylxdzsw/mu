@@ -3,7 +3,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde_json::Value;
 
 use crate::provider::{
-    Attachment, ContentPart, FinishReason, HttpProvider, Message, NativeReplay,
+    AssistantItem, Attachment, ContentPart, FinishReason, HttpProvider, Message, NativeReplay,
     NativeReplayPayload, ProviderError, ReasoningVisibility, Request, SseEvent, StreamEvent,
     StreamResult, ToolCall, ToolCallDelta, Usage, UserContent, base64_encode,
     classify_stream_error,
@@ -61,9 +61,7 @@ pub(crate) async fn stream(
 
     Ok(StreamResult {
         message: Message::Assistant {
-            content: text_from_blocks(&blocks),
-            reasoning_content: None,
-            tool_calls: (!tool_calls.is_empty()).then_some(tool_calls),
+            items: items_from_blocks(&blocks)?,
             native_replay: Some(NativeReplay {
                 provider_id: request.model.provider_id.clone(),
                 endpoint: provider.endpoint.clone(),
@@ -100,17 +98,11 @@ pub(crate) fn build_request_body(
                 append_message(&mut wire_messages, "user", user_blocks(content)?)?;
             }
             Message::Assistant {
-                content,
-                tool_calls,
+                items,
                 native_replay,
-                ..
             } => {
                 saw_non_system = true;
-                let blocks = assistant_blocks(
-                    content.as_deref(),
-                    tool_calls.as_deref(),
-                    native_replay.as_ref(),
-                )?;
+                let blocks = assistant_blocks(items, native_replay.as_ref())?;
                 if !blocks.is_empty() {
                     append_message(&mut wire_messages, "assistant", blocks)?;
                 }
@@ -257,8 +249,7 @@ fn image_block(attachment: &Attachment) -> Value {
 }
 
 fn assistant_blocks(
-    content: Option<&str>,
-    tool_calls: Option<&[ToolCall]>,
+    items: &[AssistantItem],
     native_replay: Option<&NativeReplay>,
 ) -> Result<Vec<Value>, ProviderError> {
     if let Some(NativeReplay {
@@ -270,14 +261,24 @@ fn assistant_blocks(
     }
 
     let mut blocks = Vec::new();
-    if let Some(content) = content {
+    let content = items
+        .iter()
+        .filter_map(|item| match item {
+            AssistantItem::Text { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<String>();
+    if items
+        .iter()
+        .any(|item| matches!(item, AssistantItem::Text { .. }))
+    {
         blocks.push(serde_json::json!({
             "type": "text",
             "text": content,
         }));
     }
-    if let Some(tool_calls) = tool_calls {
-        for call in tool_calls {
+    for item in items {
+        if let AssistantItem::BashCall(call) = item {
             let input: Value = serde_json::from_str(&call.arguments).map_err(|error| {
                 ProviderError::Protocol(format!(
                     "invalid JSON arguments for Anthropic tool call `{}`: {error}",
@@ -570,43 +571,59 @@ fn stream_error(error: &Value) -> ProviderError {
     classify_stream_error(error)
 }
 
-fn text_from_blocks(blocks: &[Value]) -> Option<String> {
-    let text = blocks
-        .iter()
-        .filter(|block| block["type"] == "text")
-        .filter_map(|block| block["text"].as_str())
-        .collect::<String>();
-    (!text.is_empty()).then_some(text)
+fn items_from_blocks(blocks: &[Value]) -> Result<Vec<AssistantItem>, ProviderError> {
+    let mut items = Vec::new();
+    for block in blocks {
+        match block["type"].as_str() {
+            Some("thinking" | "redacted_thinking") => {
+                items.push(AssistantItem::Reasoning { text: None });
+            }
+            Some("text") => {
+                if let Some(text) = block["text"].as_str() {
+                    items.push(AssistantItem::Text {
+                        text: text.to_string(),
+                    });
+                }
+            }
+            Some("tool_use") => {
+                items.push(AssistantItem::BashCall(tool_call_from_block(block)?));
+            }
+            _ => {}
+        }
+    }
+    Ok(items)
+}
+
+fn tool_call_from_block(block: &Value) -> Result<ToolCall, ProviderError> {
+    let id = block["id"].as_str().ok_or_else(|| {
+        ProviderError::Protocol("Anthropic tool_use block is missing `id`".into())
+    })?;
+    let name = block["name"].as_str().ok_or_else(|| {
+        ProviderError::Protocol("Anthropic tool_use block is missing `name`".into())
+    })?;
+    if name != "bash" {
+        return Err(ProviderError::Protocol(format!(
+            "Anthropic tool_use block `{id}` calls unsupported tool `{name}`"
+        )));
+    }
+    let input = &block["input"];
+    if !input.is_object() {
+        return Err(ProviderError::Protocol(format!(
+            "Anthropic tool_use block `{id}` has non-object input"
+        )));
+    }
+    Ok(ToolCall {
+        id: id.to_string(),
+        arguments: serde_json::to_string(input)
+            .map_err(|error| ProviderError::Protocol(error.to_string()))?,
+    })
 }
 
 fn tool_calls_from_blocks(blocks: &[Value]) -> Result<Vec<ToolCall>, ProviderError> {
     blocks
         .iter()
         .filter(|block| block["type"] == "tool_use")
-        .map(|block| {
-            let id = block["id"].as_str().ok_or_else(|| {
-                ProviderError::Protocol("Anthropic tool_use block is missing `id`".into())
-            })?;
-            let name = block["name"].as_str().ok_or_else(|| {
-                ProviderError::Protocol("Anthropic tool_use block is missing `name`".into())
-            })?;
-            if name != "bash" {
-                return Err(ProviderError::Protocol(format!(
-                    "Anthropic tool_use block `{id}` calls unsupported tool `{name}`"
-                )));
-            }
-            let input = &block["input"];
-            if !input.is_object() {
-                return Err(ProviderError::Protocol(format!(
-                    "Anthropic tool_use block `{id}` has non-object input"
-                )));
-            }
-            Ok(ToolCall {
-                id: id.to_string(),
-                arguments: serde_json::to_string(input)
-                    .map_err(|error| ProviderError::Protocol(error.to_string()))?,
-            })
-        })
+        .map(tool_call_from_block)
         .collect()
 }
 
@@ -758,15 +775,15 @@ mod tests {
                         },
                     ]),
                 },
-                Message::Assistant {
-                    content: None,
-                    reasoning_content: None,
-                    tool_calls: Some(vec![ToolCall {
+                Message::assistant(
+                    None,
+                    None,
+                    Some(vec![ToolCall {
                         id: "toolu_1".into(),
                         arguments: r#"{"command":"pwd"}"#.into(),
                     }]),
-                    native_replay: None,
-                },
+                    None,
+                ),
                 Message::Tool {
                     content: "Viewed image".into(),
                     attachments: vec![ToolAttachment {
@@ -828,20 +845,20 @@ mod tests {
                 "input": { "command": "pwd" },
             }),
         ];
-        let message = Message::Assistant {
-            content: Some("semantic fallback".into()),
-            reasoning_content: None,
-            tool_calls: Some(vec![ToolCall {
+        let message = Message::assistant(
+            Some("semantic fallback".into()),
+            None,
+            Some(vec![ToolCall {
                 id: "toolu_1".into(),
                 arguments: r#"{"command":"pwd"}"#.into(),
             }]),
-            native_replay: Some(NativeReplay {
+            Some(NativeReplay {
                 provider_id: "anthropic".into(),
                 endpoint: ENDPOINT.into(),
                 model: "claude-opus-5".into(),
                 payload: NativeReplayPayload::AnthropicContent(native_blocks.clone()),
             }),
-        };
+        );
 
         let matching = request_body(None, vec![system(), message], false).unwrap();
         assert_eq!(
@@ -943,7 +960,14 @@ mod tests {
             tool_calls_from_blocks(&unsupported),
             Err(ProviderError::Protocol(message)) if message.contains("unsupported tool `python`")
         ));
-        assert_eq!(text_from_blocks(&blocks).as_deref(), Some("done"));
+        assert!(matches!(
+            items_from_blocks(&blocks).unwrap().as_slice(),
+            [
+                AssistantItem::Reasoning { text: None },
+                AssistantItem::BashCall(ToolCall { id, .. }),
+                AssistantItem::Text { text },
+            ] if id == "toolu_1" && text == "done"
+        ));
         assert!(matches!(
             finish_reason(state.stop_reason.as_deref(), &blocks, &calls),
             FinishReason::ToolCalls
@@ -1036,15 +1060,15 @@ mod tests {
         .unwrap_err();
         assert_eq!(error.disposition(), ProviderDisposition::Retry);
 
-        let malformed = Message::Assistant {
-            content: None,
-            reasoning_content: None,
-            tool_calls: Some(vec![ToolCall {
+        let malformed = Message::assistant(
+            None,
+            None,
+            Some(vec![ToolCall {
                 id: "toolu_bad".into(),
                 arguments: "{".into(),
             }]),
-            native_replay: None,
-        };
+            None,
+        );
         let error = request_body(None, vec![system(), malformed], false).unwrap_err();
         assert!(error.to_string().contains("toolu_bad"));
     }

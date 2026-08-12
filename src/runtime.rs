@@ -582,12 +582,7 @@ mod tests {
         let (_, call_ids) = store
             .append_message_with_bash_calls(
                 session_id,
-                &crate::provider::Message::Assistant {
-                    content: None,
-                    reasoning_content: None,
-                    native_replay: None,
-                    tool_calls: Some(vec![call]),
-                },
+                &crate::provider::Message::assistant(None, None, Some(vec![call]), None),
             )
             .unwrap();
         let resolved = resolve_model_choice(config, model).unwrap();
@@ -1061,12 +1056,7 @@ mod tests {
         store
             .append_message(
                 &session.id,
-                &crate::provider::Message::Assistant {
-                    content: Some("hello".into()),
-                    reasoning_content: None,
-                    native_replay: None,
-                    tool_calls: None,
-                },
+                &crate::provider::Message::assistant(Some("hello".into()), None, None, None),
             )
             .unwrap();
         let report = build_status_report(

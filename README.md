@@ -359,8 +359,11 @@ Mu keeps one append-only JSONL journal per session under
 `<scope>/.mu/sessions/`, with content-addressed attachment and provider objects
 under `<scope>/.mu/objects/`. `current-session` points to the last session
 selected in that scope, so `-c/--continue` and bare `mu retry` do not scan every
-session. Each active session journal is guarded by a nonblocking advisory lock;
-different sessions remain independent.
+session. Assistant reasoning, text blocks, and Bash calls retain their provider
+block order in new journals and transcript replay. Existing version-1 journals
+upgrade automatically and atomically only when touched; untouched sessions
+remain unchanged. Each active session journal is guarded by a nonblocking
+advisory lock; different sessions remain independent.
 
 Setting `"output": "concise"` in global or project `config.jsonc` changes the
 default output density; an explicit `-o`/`--output` always wins. Output density

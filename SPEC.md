@@ -322,11 +322,11 @@ accepts optional non-terminal stdin as a custom focus). The surface is small:
   redirected output is ANSI-free and preserves assistant Markdown. The replay
   contains user prompts, assistant text, and Bash calls/results, but not the
   system prompt, compaction summaries, native provider payloads, or session
-  metadata. Flattened assistant fields are displayed in
-  reasoning-then-text-then-tool-call order. Only open Chat Completions
-  `reasoning_content` is displayed, and only in `full`; opaque Responses and
-  Anthropic reasoning is omitted. `final` keeps the user prompts and the final
-  completed assistant message of each turn. `concise` uses one-line Bash
+  metadata. Assistant reasoning, text blocks, and Bash calls are displayed in
+  their persisted item order. Only open Chat Completions `reasoning_content` is
+  displayed, and only in `full`; opaque Responses and Anthropic reasoning is
+  omitted. `final` keeps the user prompts and concatenated text items from the
+  final completed assistant message of each turn. `concise` uses one-line Bash
   results, `detail` uses the normal capped preview, and `full` includes complete
   persisted redacted Bash output. `--html` emits one HTML file containing a
   fixed-width ANSI replay rendered by pinned xterm.js assets from jsDelivr, so
@@ -369,7 +369,10 @@ This is the exact sequence the binary follows for one turn invocation:
 2. **Load config** (§9): global first, then project config over it when a
    project is active.
 3. **Open the active-scope journal store:** project-local when inside a
-   project, global otherwise. Ensure `sessions/` and `objects/` exist.
+   project, global otherwise. Ensure `sessions/` and `objects/` exist. Do not
+   scan or eagerly upgrade session journals; a version-1 journal is upgraded
+   atomically only when an operation touches that session's semantic history
+   (§11).
 4. **Resolve the session:**
    - If `--session <id>` is given and its journal exists in the active scope → use
      it.
@@ -1100,9 +1103,11 @@ name. A gateway exposing multiple protocols is represented by one provider
 entry per endpoint.
 
 All adapters accept the semantic transcript and Mu's `bash` function schema,
-stream protocol-neutral text/reasoning/tool-call events, and return a semantic
-assistant result plus usage. The renderer, tool executor, guardrail, retries,
-and compaction remain protocol-neutral. Each request also receives a stable
+stream protocol-neutral text/reasoning/tool-call events, and return one ordered
+semantic assistant-item array plus usage. Its closed item kinds are reasoning,
+text, and Bash call; tool results remain later context entries. The renderer,
+tool executor, guardrail, retries, and compaction remain protocol-neutral. Each
+request also receives a stable
 cache-affinity key `mu:<session-id>:<purpose>`, where purpose is `agent`,
 `compaction`, or `guardrail`. Retries and provider/model fallback keep the same
 key. Chat Completions and Responses lower it to top-level `prompt_cache_key`;
@@ -1123,6 +1128,9 @@ heuristics.
 Mu distinguishes an omitted `reasoning_content` field from an explicitly empty
 string. An explicit empty string is persisted and replayed when attached to an
 assistant tool-call response; an omitted field remains omitted.
+Because Chat exposes separate fields rather than a heterogeneous output array,
+its semantic item order is reasoning when present, assistant text when present,
+then tool calls in provider index order.
 
 Completed Chat tool arguments are validated after the stream terminates and
 before constructing the successful response: empty/whitespace becomes `{}`, a
@@ -1150,7 +1158,9 @@ when both forms provide a field, while stream-only fields such as
 array is stored in the native response object and replayed as input when the
 current Responses model has the same effective `replay_key` as its origin.
 Semantic tool results become `function_call_output` items connected by
-`call_id`.
+`call_id`. Mu also walks the completed output array in order: reasoning items
+become opaque reasoning boundaries, each supported message content part becomes
+one text item, and accepted `bash` function calls become Bash-call items.
 
 **Anthropic Messages.** Mu posts directly to the configured endpoint using
 `x-api-key` and `anthropic-version:2023-06-01`, with `stream:true`,
@@ -1178,6 +1188,9 @@ or model-name heuristics. An `end_turn` response containing one or more
 `thinking` or `redacted_thinking` blocks and no text or tool use is classified
 as resumable. This is one concrete resumable-response classifier, not the
 definition of the general resume mechanism.
+The semantic projection walks that content array in order: thinking and
+redacted-thinking blocks become opaque reasoning boundaries, text blocks remain
+separate text items, and accepted `bash` tool-use blocks become Bash-call items.
 
 The semantic transcript remains authoritative for display, compaction, and
 cross-model continuation. Native replay requires the same API. Responses and
@@ -1192,6 +1205,14 @@ protocols keeps semantic messages and reconstructs function calls/results, but
 omits incompatible native payload variants. Compaction excludes native state
 before the active summary boundary and retains it with the recent semantic
 suffix.
+
+Provider lowering remains wire-compatible with version-1 history. Compatible
+Responses and Anthropic native replay is emitted unchanged. Without it, each
+assistant projection concatenates its text items before its Bash calls. Chat
+always concatenates text, preserves call order, and emits open reasoning only
+from its compatible Chat replay sidecar. This stable lowering is what lets the
+v1-to-v2 publication gate reconstruct historical request checksums without a
+second legacy serializer.
 
 Text and images are supported by all adapters. Images serialize as Chat
 `image_url`, Responses `input_image`, or Anthropic `image` blocks. Existing
@@ -1616,10 +1637,10 @@ flat `objects/<sha256>` store, and `current-session` is a relative symlink to
 the last selected journal.
 
 The first journal line is immutable metadata with format/version, scoped
-session ID, and creation time. Later lines have contiguous sequence numbers,
-timestamps, and a tagged event. Readers accept only the complete
-newline-terminated prefix. The next writer truncates an incomplete final line;
-malformed earlier data is corruption.
+session ID, and creation time. New journals use format version 2. Later lines
+have contiguous sequence numbers, timestamps, and a tagged event. Readers
+accept only the complete newline-terminated prefix. The next writer truncates
+an incomplete final line; malformed earlier data is corruption.
 
 Conceptual event model:
 
@@ -1637,14 +1658,18 @@ Conceptual event model:
   reuses that recorded key rather than deriving a current value; older keyless
   recipes remain keyless.
 - **`provider_completed`** stores one assembled native response object plus the
-  semantic projection accepted at that time. Assistant projections contain
-  text/reasoning/native replay, all immutable Bash claims, and a derived
-  `turn_state`: `continue` for tool use, `resume` for a preserved response that
-  needs continuation, or `complete` for a clean ending. Compaction projections
-  contain summary and boundary; guardrail projections contain the parsed
-  authorization decision. The stored projection is authoritative during normal
-  loading and recovery; Mu never reruns a newer provider parser while replaying
-  a journal.
+  semantic projection accepted at that time. An assistant projection contains
+  one ordered, tagged `items` array plus optional provider-native replay. The
+  closed item kinds are `reasoning` (optional open text), `text`, and
+  `bash_call`; each Bash call owns its Mu call ID, provider call ID, accepted
+  arguments, and optional declared risk. Array position is authoritative, so
+  there is no call-position or ordering-provenance field. The projection also
+  has a derived `turn_state`: `continue` for tool use, `resume` for a preserved
+  response that needs continuation, or `complete` for a clean ending.
+  Compaction projections contain summary and boundary; guardrail projections
+  contain the parsed authorization decision. The stored projection is
+  authoritative during normal loading and recovery; Mu never reruns a newer
+  provider parser while replaying a version-2 journal.
 - **`provider_failed`** and **`provider_interrupted`** terminate an exchange
   without adding semantic assistant history. A failure records a stable error
   class and may retain partial native JSON for audit.
@@ -1654,11 +1679,19 @@ Conceptual event model:
 
 There is no session row, message table, run/attempt entity, mutable title,
 updated timestamp, context-token cache, or owner PID. Session listing derives a
-short first-prompt preview and activity time by scanning journals. Version 1 is
-a fresh format: old SQLite files are neither inspected nor migrated.
-If a future parser defect is recoverable from retained native data, correcting
-the projection requires an explicit whole-session journal-format migration;
-ordinary open and recovery never reinterpret it.
+short first-prompt preview and activity time by scanning journals. Old SQLite
+files are neither inspected nor migrated.
+
+Version-1 JSONL journals are upgraded automatically, lazily, and per session
+when normal operation first loads their semantic history. `Store::open()` does
+not scan `sessions/`; untouched files remain byte-for-byte version 1, so v1 and
+v2 journals may coexist. `mu sessions` touches each journal it inspects and
+therefore upgrades those journals. Version-1 parsing and conversion exists only
+inside this migration path. It preserves all events and native replay, recovers
+Anthropic/Responses block order only when native data agrees with the old
+semantic projection, otherwise uses canonical reasoning/text/call order, and
+verifies every recorded request checksum before publication. There is no
+manual migration command, reverse/downgrade path, or backup journal.
 
 ### Session mapping
 
@@ -1752,9 +1785,21 @@ Two processes targeting one session are serialized by
 `flock(LOCK_EX | LOCK_NB)` on that journal itself. Contention fails immediately
 with `session busy`; the descriptor remains open for the active operation, and
 the kernel releases it on exit or crash. No lock file, PID, lease, or stale
-owner recovery exists. Read-only commands may parse the locked journal's
-complete prefix without taking the advisory lock. Different sessions use
-different files and do not contend.
+owner recovery exists. After taking an exclusive lock, Mu compares the opened
+file's device/inode with the current journal path and retries a stale
+descriptor. Read-only commands may parse an already-v2 journal's complete
+prefix without taking the advisory lock; first touch of v1 briefly needs the
+exclusive lock.
+
+Migration holds the locked v1 inode while writing and validating a mode-0600
+temporary file in the same directory. It locks the new inode before atomically
+renaming it over the journal, syncs the directory, then releases the old inode;
+a writer continues on the still-locked v2 descriptor without an unlock/reopen
+gap. Failure before rename leaves the v1 path untouched, and an incomplete
+final line is not copied. The narrow race with an already-running old binary
+that opened v1 but had not locked it is accepted; new binaries are protected by
+the post-lock inode check. Different sessions use different files and do not
+contend.
 
 There is no special atomic create-and-lock API. A freshly created session is
 not published through `current-session` before a turn owns its journal, and
@@ -1840,12 +1885,13 @@ The summarizer uses a small compaction-specific system prompt rather than the
 session's agent system prompt, so tool, skill, runtime, and service inventories
 are not duplicated into the summary unless the user's work made them relevant.
 The summarization *input* clamps each entry (tool results hardest) so a huge
-history cannot make the summarize request itself overflow; the stored
-transcript is untouched. The next context projection loads the latest summary
-plus later semantic events, so compacted history is naturally excluded without
-deleting anything. Earlier journal events remain available for audit. When a
-prior summary exists, only semantic events after its boundary and before the
-new cut are incorporated into the updated summary.
+history cannot make the summarize request itself overflow. Assistant text and
+Bash-call descriptions enter it in semantic item order; opaque reasoning is
+omitted. The stored transcript is untouched. The next context projection loads
+the latest summary plus later semantic events, so compacted history is
+naturally excluded without deleting anything. Earlier journal events remain
+available for audit. When a prior summary exists, only semantic events after
+its boundary and before the new cut are incorporated into the updated summary.
 
 **Manual compaction.** `mu compact` forces compaction of the current session on
 demand; `-s|--session <id>` selects another session in the active scope.
