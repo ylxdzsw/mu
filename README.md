@@ -169,21 +169,23 @@ mu -o detail prompt.md      # normal human transcript
 mu -o full prompt.md        # complete reasoning and tool details
 ```
 
-Inspect sessions and resolved state with `mu session list`, `mu session
-transcript --session <id>`, and `mu status --json`. Add `--include-git` or
-`--include-session-details` when those heavier status sections are needed. Run
-`mu --help` for the full CLI surface.
+Create an empty model-free session with `mu new`. Inspect sessions and resolved
+state with `mu sessions`, `mu transcript --session <id>`, and `mu status
+--json`. Add `--include-git` or `--include-session-details` when those heavier
+status sections are needed. Run `mu --help` for the full CLI surface.
 
 Replay or share a session without contacting a provider:
 
 ```sh
-mu session transcript -o full
-mu session transcript --session ses_... --html > session.html
+mu transcript -o full
+mu transcript --session ses_... --html > session.html
 ```
 
 Terminal replay uses the same Markdown and Bash renderer as a live turn;
 redirected output is ANSI-free. HTML export is a single file containing the
 terminal transcript and loads pinned xterm.js assets from jsDelivr when opened.
+`mu compact` compacts the current session; pass `-s <id>` to select another
+session in the active scope.
 
 ## How it works
 
@@ -341,7 +343,7 @@ configuration can override global defaults. The invoking working directory is
 preserved for the agent and its `bash` tool.
 
 Most repositories need no setup: `mu` discovers the project and creates only the
-runtime state it needs. Use `mu project init` when you explicitly want a local
+runtime state it needs. Use `mu init` when you explicitly want a local
 configuration scaffold, and keep project-specific guidance in `AGENTS.md` or
 `.mu` instruction files.
 

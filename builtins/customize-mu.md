@@ -47,7 +47,7 @@ the installed `mu` package or this repository's shipped defaults.
 
 `config.jsonc` accepts comments and trailing commas. Global config is created
 automatically with a starter provider if it does not exist. Project config from
-`mu project init` is only an overlay stub. Omitted non-provider fields inherit
+`mu init` is only an overlay stub. Omitted non-provider fields inherit
 from bundled defaults; bundled providers are used only to create a missing
 global config. Objects merge recursively across scopes; scalars and arrays
 replace inherited values.
@@ -289,7 +289,7 @@ the Bash tool's `stdin` argument. Keep it out of the command string and omit
 
 ## Project initialization
 
-`mu project init` creates a minimal project scope:
+`mu init` creates a minimal project scope:
 
 - `.mu/`
 - `.mu/config.jsonc`

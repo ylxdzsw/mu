@@ -100,7 +100,7 @@ begin
     printf '%s\n' '  fi'
     printf '%s\n' '  exit 0'
     printf '%s\n' fi
-    printf '%s\n' 'if [ "$1" = session ] && [ "$2" = new ]; then'
+    printf '%s\n' 'if [ "$1" = new ]; then'
     printf '%s\n' '  printf "%s\n" "$@" >"$TEST_CAPTURE_SESSION_ARGS"'
     printf '%s\n' '  printf "%s\n" ses_01234567'
     printf '%s\n' '  exit 0'
@@ -257,7 +257,7 @@ assert_equal "$MU_FISH_TRACKED_SCOPE" "project:$project_b" 'valid model action m
 rm -f "$capture_args" "$capture_stdin" "$capture_calls" "$capture_session_args"
 _mu_fish_submit_prompt 'project b prompt'
 set session_args (cat "$capture_session_args")
-assert_equal (string join \x1e -- $session_args) (string join \x1e -- session new) 'creates an empty session without forwarding model override'
+assert_equal (string join \x1e -- $session_args) new 'creates an empty session without forwarding model override'
 set submitted_args (cat "$capture_args")
 assert_equal (string join \x1e -- $submitted_args) (string join \x1e -- --output detail -s ses_01234567 --model openai/gpt) 'forwards model override on first real turn'
 

@@ -261,12 +261,12 @@ end
 
 function _mu_fish_create_session_for_scope --argument-names scope
     set -l command "$MU_FISH_BIN"
-    set -l id ($command session new | string collect)
+    set -l id ($command new | string collect)
     set -l command_status $pipestatus[1]
     test $command_status -eq 0; or return $command_status
     set id (string replace -a \n '' -- "$id")
     if not string match -qr '^ses_[0-9a-hjkmnpqrstvwxyz]{8}$' -- "$id"
-        printf '%s\n' 'mu: session new returned an invalid session id' >&2
+        printf '%s\n' 'mu: new returned an invalid session id' >&2
         return 1
     end
     _mu_fish_remember_session_for_scope "$id" "$scope"

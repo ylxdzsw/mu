@@ -272,10 +272,10 @@ _mu_zsh_create_session_for_scope() {
   local id
   local -a command
   command=("$MU_ZSH_BIN")
-  id=$("${command[@]}" session new) || return $?
+  id=$("${command[@]}" new) || return $?
   id=${id//$'\n'/}
   [[ "$id" =~ '^ses_[0-9a-hjkmnpqrstvwxyz]{8}$' ]] || {
-    print -u2 -- "mu: session new returned an invalid session id"
+    print -u2 -- "mu: new returned an invalid session id"
     return 1
   }
   _mu_zsh_activate_scope "$scope"

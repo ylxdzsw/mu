@@ -49,7 +49,12 @@ use runtime::{
 };
 
 #[derive(Parser, Debug)]
-#[command(name = "mu", about = "Fast terminal agent harness")]
+#[command(
+    name = "mu",
+    about = "Fast terminal agent harness",
+    args_conflicts_with_subcommands = true,
+    subcommand_precedence_over_arg = true
+)]
 struct Args {
     #[command(flatten)]
     turn: TurnArgs,
@@ -64,11 +69,11 @@ struct Args {
 
 #[derive(ClapArgs, Debug, Clone, Default)]
 struct SelectionArgs {
-    #[arg(short = 's', long)]
+    #[arg(short = 's', long, conflicts_with = "continue_current")]
     session: Option<String>,
 
     /// Continue the last selected session in this scope
-    #[arg(short = 'c', long = "continue")]
+    #[arg(short = 'c', long = "continue", conflicts_with = "session")]
     continue_current: bool,
 
     #[arg(short = 'm', long)]
@@ -110,15 +115,33 @@ pub enum OutputFormat {
 
 #[derive(Subcommand, Debug)]
 enum Command {
-    /// Project management
-    Project {
-        #[command(subcommand)]
-        sub: ProjectSub,
+    /// Explicitly create mu project metadata in a directory
+    Init {
+        #[arg(long)]
+        path: Option<PathBuf>,
+
+        #[arg(long)]
+        force: bool,
     },
-    /// Session management
-    Session {
-        #[command(subcommand)]
-        sub: SessionSub,
+    /// Create a new session and print its id
+    New,
+    /// List recent sessions
+    Sessions {
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+    },
+    /// Print a session transcript
+    Transcript {
+        #[arg(short = 's', long)]
+        session: Option<String>,
+
+        /// Output density
+        #[arg(short = 'o', long, value_enum, default_value = "detail")]
+        output: OutputFormat,
+
+        /// Emit a browser-viewable xterm.js document
+        #[arg(long)]
+        html: bool,
     },
     /// Inspect the resolved model and context state
     Status(StatusArgs),
@@ -137,10 +160,10 @@ enum Command {
     },
     /// Resume an interrupted (unclean) turn in a session
     Retry(RetryArgs),
-    /// Force compaction for a session
+    /// Force compaction for the current or selected session
     Compact {
-        #[arg(long)]
-        session: String,
+        #[arg(short = 's', long)]
+        session: Option<String>,
     },
 }
 
@@ -168,47 +191,6 @@ struct StatusArgs {
 
     #[arg(long)]
     include_skills: bool,
-}
-
-#[derive(Subcommand, Debug)]
-enum SessionSub {
-    /// Create a new session and print its id
-    New,
-    /// List recent sessions
-    List {
-        #[arg(long, default_value_t = 20)]
-        limit: usize,
-    },
-    /// Print a session transcript
-    Transcript {
-        #[arg(long)]
-        session: Option<String>,
-
-        /// Output density
-        #[arg(short = 'o', long, value_enum, default_value = "detail")]
-        output: OutputFormat,
-
-        /// Emit a browser-viewable xterm.js document
-        #[arg(long)]
-        html: bool,
-    },
-}
-
-#[derive(Subcommand, Debug)]
-enum ProjectSub {
-    /// Inspect whether a directory is an existing mu project
-    Inspect {
-        #[arg(long)]
-        path: PathBuf,
-    },
-    /// Explicitly create mu project metadata in a directory
-    Init {
-        #[arg(long)]
-        path: Option<PathBuf>,
-
-        #[arg(long)]
-        force: bool,
-    },
 }
 
 const MAX_SUBAGENT_TURN_DEPTH: u32 = 1;
@@ -423,7 +405,7 @@ fn resolve_existing_dir(base: &Path, path: &Path) -> Result<PathBuf> {
     Ok(path)
 }
 
-fn resolve_transcript_session(
+fn resolve_session_or_current(
     store: &store::Store,
     session: Option<&str>,
 ) -> Result<store::Session> {
@@ -565,6 +547,7 @@ term.write({transcript});
 
 async fn run() -> Result<()> {
     let args = Args::parse();
+    validate_cli_args(&args)?;
     let cwd = std::env::current_dir()?;
     let scope = paths::discover_scope(&cwd);
     let project_config_dir = scope.project().map(|p| p.root.join(".mu"));
@@ -572,106 +555,75 @@ async fn run() -> Result<()> {
     let prompt_file = args.prompt_file;
 
     match args.command {
-        Some(Command::Project { sub }) => {
-            match sub {
-                ProjectSub::Inspect { path } => {
-                    let path = resolve_existing_dir(&cwd, &path)?;
-                    let marker = if path.join(".mu").is_dir() {
-                        Some("mu")
-                    } else if path.join(".git").exists() {
-                        Some("git")
-                    } else {
-                        None
-                    };
-                    let project_root = paths::discover_project(&path);
-                    println!("path: {}", path.display());
-                    println!("is_project: {}", marker.is_some());
-                    println!("marker: {}", marker.unwrap_or("(none)"));
-                    println!(
-                        "project_root: {}",
-                        project_root
-                            .as_ref()
-                            .map_or("(none)".into(), |project| project
-                                .root
-                                .display()
-                                .to_string())
-                    );
+        Some(Command::Init { path, force }) => {
+            let root = resolve_existing_dir(&cwd, path.as_deref().unwrap_or(&cwd))?;
+            let result = paths::init_project_layout_at(&root, force)?;
+            println!("path: {}", result.root.display());
+            println!("project_root: {}", result.root.display());
+            println!("already_initialized: {}", result.already_initialized);
+            println!(
+                "created_files: {}",
+                if result.created_files.is_empty() {
+                    "(none)".into()
+                } else {
+                    result.created_files.join(", ")
                 }
-                ProjectSub::Init { path, force } => {
-                    let root = resolve_existing_dir(&cwd, path.as_deref().unwrap_or(&cwd))?;
-                    let result = paths::init_project_layout_at(&root, force)?;
-                    println!("path: {}", result.root.display());
-                    println!("project_root: {}", result.root.display());
-                    println!("already_initialized: {}", result.already_initialized);
-                    println!(
-                        "created_files: {}",
-                        if result.created_files.is_empty() {
-                            "(none)".into()
-                        } else {
-                            result.created_files.join(", ")
-                        }
-                    );
-                }
+            );
+            return Ok(());
+        }
+        Some(Command::New) => {
+            let store_path = scope.session_store_path();
+            paths::ensure_project_layout(&scope)?;
+            let store = store::Store::open(&store_path)?;
+            let session = store.create_session_seeded(&system_prompt::build_system_prompt(
+                &paths::global_dir(),
+                project_config_dir.as_deref(),
+            )?)?;
+            println!("{}", session.id);
+            return Ok(());
+        }
+        Some(Command::Sessions { limit }) => {
+            let store_path = scope.session_store_path();
+            if !store_path.join("sessions").exists() {
+                return Ok(());
+            }
+            let store = store::Store::open(&store_path)?;
+            let sessions = store.list_sessions(limit)?;
+            for (s, updated) in sessions {
+                let title = s.title.unwrap_or_else(|| "(untitled)".into());
+                let model = s.last_model.unwrap_or_else(|| "-".into());
+                println!("{}  {}  {}  {}", s.id, title, model, updated);
             }
             return Ok(());
         }
-        Some(Command::Session { sub }) => {
+        Some(Command::Transcript {
+            session,
+            output,
+            html,
+        }) => {
             let store_path = scope.session_store_path();
-            match sub {
-                SessionSub::New => {
-                    if default_turn.selection.model.is_some() {
-                        bail!("--model does not apply to `session new`; pass it to the first turn");
-                    }
-                    paths::ensure_project_layout(&scope)?;
-                    let store = store::Store::open(&store_path)?;
-                    let session =
-                        store.create_session_seeded(&system_prompt::build_system_prompt(
-                            &paths::global_dir(),
-                            project_config_dir.as_deref(),
-                        )?)?;
-                    println!("{}", session.id);
-                }
-                SessionSub::List { limit } => {
-                    if !store_path.join("sessions").exists() {
-                        return Ok(());
-                    }
-                    let store = store::Store::open(&store_path)?;
-                    let sessions = store.list_sessions(limit)?;
-                    for (s, updated) in sessions {
-                        let title = s.title.unwrap_or_else(|| "(untitled)".into());
-                        let model = s.last_model.unwrap_or_else(|| "-".into());
-                        println!("{}  {}  {}  {}", s.id, title, model, updated);
-                    }
-                }
-                SessionSub::Transcript {
-                    session,
+            if !store_path.exists() {
+                return Err(session.as_deref().map_or_else(
+                    || anyhow::anyhow!("no sessions found in active scope"),
+                    ExitError::session_not_found,
+                ));
+            }
+            let store = store::Store::open(&store_path)?;
+            let session = resolve_session_or_current(&store, session.as_deref())?;
+            let events = store.transcript_events(&session.id)?;
+            if html {
+                let buffer = TranscriptBuffer::default();
+                let mut renderer = Renderer::with_transcript_output(
                     output,
-                    html,
-                } => {
-                    if !store_path.exists() {
-                        return Err(session.as_deref().map_or_else(
-                            || anyhow::anyhow!("no sessions found in active scope"),
-                            ExitError::session_not_found,
-                        ));
-                    }
-                    let store = store::Store::open(&store_path)?;
-                    let session = resolve_transcript_session(&store, session.as_deref())?;
-                    let events = store.transcript_events(&session.id)?;
-                    if html {
-                        let buffer = TranscriptBuffer::default();
-                        let mut renderer = Renderer::with_transcript_output(
-                            output,
-                            Box::new(buffer.clone()),
-                            TRANSCRIPT_HTML_COLUMNS - 1,
-                        );
-                        replay_transcript(&mut renderer, &events, output)?;
-                        let html = transcript_html(&buffer.text()?)?;
-                        io::stdout().write_all(html.as_bytes())?;
-                    } else {
-                        let mut renderer = Renderer::with_format(output);
-                        replay_transcript(&mut renderer, &events, output)?;
-                    }
-                }
+                    Box::new(buffer.clone()),
+                    TRANSCRIPT_HTML_COLUMNS - 1,
+                );
+                replay_transcript(&mut renderer, &events, output)?;
+                let html = transcript_html(&buffer.text()?)?;
+                io::stdout().write_all(html.as_bytes())?;
+            } else {
+                let mut renderer = Renderer::with_format(output);
+                replay_transcript(&mut renderer, &events, output)?;
             }
             return Ok(());
         }
@@ -809,12 +761,14 @@ async fn run() -> Result<()> {
             let config = Config::load_for_scope(project_config_dir.as_deref())?;
             let store_path = scope.session_store_path();
             if !store_path.join("sessions").exists() {
-                return Err(ExitError::session_not_found(&session));
+                return Err(session.as_deref().map_or_else(
+                    || anyhow::anyhow!("no sessions found in active scope"),
+                    ExitError::session_not_found,
+                ));
             }
             let store = store::Store::open(&store_path)?;
-            let session_state = store
-                .get_session(&session)?
-                .ok_or_else(|| ExitError::session_not_found(&session))?;
+            let session_state = resolve_session_or_current(&store, session.as_deref())?;
+            let session = session_state.id.clone();
             let mut model = resolve_session_model(&store, &config, &session_state)?;
             let mut provider = build_provider(&config, &model.active_model().provider_id)?;
             let _lock = acquire_session_lock_or_exit(&store, &session, OutputFormat::Detail)?;
@@ -866,6 +820,23 @@ async fn run() -> Result<()> {
         prompt_source,
     )
     .await
+}
+
+fn validate_cli_args(args: &Args) -> Result<()> {
+    let has_turn_options = args.turn.selection.session.is_some()
+        || args.turn.selection.continue_current
+        || args.turn.selection.model.is_some()
+        || !args.turn.attachments.is_empty()
+        || args.turn.output.is_some();
+    let reserved_prompt = args
+        .prompt_file
+        .as_ref()
+        .and_then(|path| path.to_str())
+        .is_some_and(|path| path == "help" || Command::has_subcommand(path));
+    if has_turn_options && (args.command.is_some() || reserved_prompt) {
+        bail!("turn arguments must not precede a management command");
+    }
+    Ok(())
 }
 
 async fn run_turn_from_source(
@@ -926,7 +897,7 @@ async fn run_turn_from_source(
         &prompt_content,
     )?;
     // Publish the session only after its journal lock is held and its first
-    // turn is durable. Standalone `session new` deliberately does not select.
+    // turn is durable. Standalone `new` deliberately does not select.
     store.select_session(&session_id)?;
 
     run_turn(RunTurnArgs {
@@ -1341,6 +1312,45 @@ mod tests {
     }
 
     #[test]
+    fn flattened_commands_use_command_local_arguments() {
+        let compact = Args::try_parse_from(["mu", "compact"]).unwrap();
+        assert!(matches!(
+            compact.command,
+            Some(Command::Compact { session: None })
+        ));
+        let selected_compact =
+            Args::try_parse_from(["mu", "compact", "-s", "ses_example"]).unwrap();
+        assert!(matches!(
+            selected_compact.command,
+            Some(Command::Compact {
+                session: Some(ref session),
+            }) if session == "ses_example"
+        ));
+
+        let transcript =
+            Args::try_parse_from(["mu", "transcript", "-s", "ses_example", "-o", "full"]).unwrap();
+        assert!(matches!(
+            transcript.command,
+            Some(Command::Transcript {
+                session: Some(ref session),
+                output: OutputFormat::Full,
+                html: false,
+            }) if session == "ses_example"
+        ));
+
+        assert!(Args::try_parse_from(["mu", "session", "list"]).is_err());
+        assert!(Args::try_parse_from(["mu", "new", "--model", "gpt-5"]).is_err());
+        assert!(Args::try_parse_from(["mu", "-s", "ses_example", "-c"]).is_err());
+        assert!(
+            Args::try_parse_from(["mu", "status", "--session", "ses_example", "--continue"])
+                .is_err()
+        );
+
+        let misplaced = Args::try_parse_from(["mu", "-m", "gpt-5", "new"]).unwrap();
+        assert!(validate_cli_args(&misplaced).is_err());
+    }
+
+    #[test]
     fn prompt_file_appends_non_terminal_stdin_verbatim() {
         let path = temp_file_path("instruction");
         std::fs::write(&path, "Use the release-note format.\n").unwrap();
@@ -1473,19 +1483,19 @@ mod tests {
     }
 
     #[test]
-    fn transcript_defaults_to_current_session() {
+    fn session_selection_defaults_to_current_session() {
         let store = store::Store::open_memory().unwrap();
         let first = store.create_session("/tmp").unwrap();
         let second = store.create_session("/tmp").unwrap();
 
-        assert!(resolve_transcript_session(&store, None).is_err());
+        assert!(resolve_session_or_current(&store, None).is_err());
         store.select_session(&second.id).unwrap();
         assert_eq!(
-            resolve_transcript_session(&store, None).unwrap().id,
+            resolve_session_or_current(&store, None).unwrap().id,
             second.id
         );
         assert_eq!(
-            resolve_transcript_session(&store, Some(&first.id))
+            resolve_session_or_current(&store, Some(&first.id))
                 .unwrap()
                 .id,
             first.id

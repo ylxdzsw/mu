@@ -92,7 +92,7 @@ if [[ "$1" == "status" ]]; then
   fi
   exit 0
 fi
-if [[ "$1" == "session" && "$2" == "new" ]]; then
+if [[ "$1" == "new" ]]; then
   print -r -- "$*" >> "$MU_ZSH_FAKE_LOG"
   print -r -- "ses_01234567"
   exit 0
@@ -592,7 +592,7 @@ if [[ "$1" == "status" ]]; then
   print -r -- "{\"model\":{\"provider_id\":\"test\",\"model_id\":\"$model\",\"effort\":null,\"canonical\":\"$model\"},\"context_tokens\":10,\"context_window\":100,\"project_root\":\"$scope_root\"}"
   exit 0
 fi
-if [[ "$1" == "session" && "$2" == "new" ]]; then
+if [[ "$1" == "new" ]]; then
   print -r -- "$PWD :: $*" >> "$MU_ZSH_SCOPE_LOG"
   case "$scope_name" in
     project-a) print -r -- "ses_0000000a" ;;
@@ -663,7 +663,7 @@ _mu_zsh_run_slash_command "/model model-for-b"
 _mu_zsh_submit_prompt "project b prompt"
 [[ "$MU_ZSH_SESSION_ID" == "ses_0000000b" ]] || fail "creates a new scoped session after submitting in the second project"
 [[ "$MU_ZSH_TRACKED_SCOPE" == "project:$project_b" ]] || fail "keeps the tracked scope after starting in the second project"
-grep -Fxq -- "$project_b/subdir :: session new" "$MU_ZSH_SCOPE_LOG" || fail "creates an empty session without forwarding the model override"
+grep -Fxq -- "$project_b/subdir :: new" "$MU_ZSH_SCOPE_LOG" || fail "creates an empty session without forwarding the model override"
 grep -Fq -- "$project_b/subdir :: --output detail -s ses_0000000b --model model-for-b" "$MU_ZSH_SCOPE_LOG" || fail "forwards the model override on the first real turn"
 
 builtin cd "$project_a/subdir"
@@ -727,7 +727,7 @@ fi
 if [ "$1" = "--model" ]; then
   shift 2
 fi
-if [ "$1" = "session" ] && [ "$2" = "new" ]; then
+if [ "$1" = "new" ]; then
   printf '%s\n' "ses_01234567"
   exit 0
 fi

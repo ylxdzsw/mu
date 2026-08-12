@@ -201,7 +201,7 @@ turn runner remains the core unit.
                                         ▼
    ┌────────────────────────────── mu (single binary) ─────────────────────────┐
    │  default turn mode: one prompt in, one completed turn out                 │
-   │  management subcommands: project / session / status / compact / retry     │
+   │  management commands: init / new / sessions / transcript / status / …    │
    │  turn/management command modules: project/config/session resolution       │
    │                           provider client + agent loop                    │
    │                           tool registry: bash                             │
@@ -247,15 +247,19 @@ The core binary is invoked one of two ways: as a **turn** (default, reads a
 prompt on stdin) or as a **subcommand** (management; manual compaction alone
 accepts optional non-terminal stdin as a custom focus). The surface is small:
 
-- `mu [-s <id>] [-c] [-m|--model <id>] [-a <file>] [-o|--output final|concise|detail|full]`
+- `mu [-s|--session <id>] [-c|--continue] [-m|--model <id>]
+  [-a|--attach <file>] [-o|--output final|concise|detail|full]`
   — run one turn; prompt read from stdin. `-a/--attach` is repeatable and accepts
   supported image or audio files.
-- `mu [-s <id>] [-c] [-m|--model <id>] [-a <file>] [-o|--output final|concise|detail|full] <prompt-file>`
+- `mu [-s|--session <id>] [-c|--continue] [-m|--model <id>]
+  [-a|--attach <file>] [-o|--output final|concise|detail|full]
+  <prompt-file>`
   — run one turn from a prompt file; if the first line starts with `#!`, drop
   it before sending the prompt. A `mu` shebang may contain exactly
   `-m|--model <id>` as a turn-local default. Non-terminal stdin is appended as a
   custom instruction. `-a/--attach` is repeatable.
-- `mu [-s <id>] [-c] [-m|--model <id>] [-o|--output final|concise|detail|full] <custom-command>`
+- `mu [-s|--session <id>] [-c|--continue] [-m|--model <id>]
+  [-o|--output final|concise|detail|full] <custom-command>`
   — run a discovered shebang command from the active project/global `.mu`
   instruction index. Command names are relative `.mu` paths including
   extensions; built-in subcommands and explicit prompt paths win.
@@ -264,13 +268,12 @@ accepts optional non-terminal stdin as a custom focus). The surface is small:
   attachment to an existing session.
 - `mu.fish` — Fish 4 prompt mode with the same turn/session contract.
   `MU_FISH_SESSION_ID=<id>` seeds attachment to an existing session.
-- `mu project inspect --path <dir>` — report whether a directory resolves to a
-  project scope, and which marker (`.mu` or `.git`) was found.
-- `mu project init [--path <dir>] [--force]` — create minimal `.mu/` project
+- `mu init [--path <dir>] [--force]` — create minimal `.mu/` project
   metadata in the current directory by default, or in an explicitly chosen
   directory.
-- `mu status --json [--include-git] [--include-session-details]
-  [--include-models] [--include-commands] [--include-skills]` —
+- `mu status [-s|--session <id>] [-c|--continue] [-m|--model <id>] [--json]
+  [--include-git] [--include-session-details] [--include-models]
+  [--include-commands] [--include-skills]` —
   machine-readable shell state for prompt rendering and completion. The default
   projection omits Git and detailed session metadata because prompt rendering
   does not consume them; the corresponding `--include-*` flags add them.
@@ -309,11 +312,11 @@ accepts optional non-terminal stdin as a custom focus). The surface is small:
   stdin is left unread and non-terminal stdin is appended verbatim after
   `\n---\n\n`. Interactive stdout shows a resolved-source line and rendered
   Markdown; redirected stdout contains only the exact composed prompt text.
-- `mu session new` — create a model-free session and print its id. `--model` is
+- `mu new` — create a model-free session and print its id. `--model` is
   rejected; model selection belongs to an actual turn. Creation does not update
   `current-session`.
-- `mu session list` — list recent sessions.
-- `mu session transcript [--session <id>] [-o final|concise|detail|full]
+- `mu sessions [--limit <count>]` — list recent sessions.
+- `mu transcript [-s|--session <id>] [-o|--output final|concise|detail|full]
   [--html]` — replay a persisted session, defaulting to the last selected
   session and `detail` output. A terminal receives the normal styled renderer;
   redirected output is ANSI-free and preserves assistant Markdown. The replay
@@ -328,9 +331,11 @@ accepts optional non-terminal stdin as a custom focus). The surface is small:
   persisted redacted Bash output. `--html` emits one HTML file containing a
   fixed-width ANSI replay rendered by pinned xterm.js assets from jsDelivr, so
   the resulting file requires network access when opened.
-- `mu compact --session <id>` — force compaction. Terminal stdin is not read;
-  non-terminal stdin is an optional verbatim custom focus instruction.
-- `mu retry [-s <id>] [-c] [-m|--model <id>] [-o|--output final|concise|detail|full]`
+- `mu compact [-s|--session <id>]` — force compaction, defaulting to the last
+  selected session. Terminal stdin is not read; non-terminal stdin is an
+  optional verbatim custom focus instruction.
+- `mu retry [-s|--session <id>] [-c|--continue] [-m|--model <id>]
+  [-o|--output final|concise|detail|full]`
   — resume an interrupted (unclean) turn: normalize the tail and continue the
   agent loop with no new prompt. `--model` overrides the latest attempted model
   and `--output` overrides the merged config default for the retry. No-op on a
@@ -347,11 +352,10 @@ complete prompt.
 Exact subcommand names win at the top level, so a prompt file that collides with
 a subcommand name must be passed with a disambiguating path such as `./status`.
 `cat` is therefore also reserved as a top-level subcommand name.
-`mu session list`, `mu session transcript`, and project inspection/init do
-**not** require a configured provider. `mu session new` neither resolves nor
-stores a model and also does not require a configured provider. Turn invocation
-and `mu compact` require a configured provider because they can contact the
-provider (§7).
+`mu sessions`, `mu transcript`, and `mu init` do **not** require a configured
+provider. `mu new` neither resolves nor stores a model and also does not require
+a configured provider. Turn invocation and `mu compact` require a configured
+provider because they can contact the provider (§7).
 
 ### Turn lifecycle (authoritative end-to-end flow)
 
@@ -1062,7 +1066,7 @@ Consequences:
 
 Session lifecycle is exposed through CLI commands:
 
-- A shell plugin without a session explicitly runs `mu session new` before its
+- A shell plugin without a session explicitly runs `mu new` before its
   first submitted prompt, then passes any shell model override to the first
   actual turn and reuses that session for later prompts in the same shell.
 - Exporting the shell-specific `MU_ZSH_SESSION_ID=<id>` or
@@ -1070,9 +1074,10 @@ Session lifecycle is exposed through CLI commands:
   existing session.
 - `mu -c` continues the last selected session in the active scope for a
   one-shot turn.
-- `mu session new` creates a session and prints its id.
-- `mu session list` lists recent sessions.
-- `mu compact --session <id>` compacts a session on demand.
+- `mu new` creates a session and prints its id.
+- `mu sessions` lists recent sessions.
+- `mu compact` compacts the current session on demand; `-s|--session <id>`
+  selects another session in the active scope.
 
 ---
 
@@ -1388,7 +1393,7 @@ understandable by inspecting its `.mu` directory, while still avoiding committin
 volatile session state by default.
 
 Automatic project state creation writes only runtime state and `.gitignore`;
-it does not create project configuration. Explicit `mu project init` creates a
+it does not create project configuration. Explicit `mu init` creates a
 minimal config overlay and `.gitignore`, but no empty skills directory. It
 refuses to create a nested mu project inside another discovered project unless
 `--force` is supplied. Global configuration creation writes the full starter
@@ -1654,7 +1659,7 @@ ordinary open and recovery never reinterpret it.
 `mu` maps each interactive shell instance to at most one active session:
 
 - **First-turn creation.** When a shell plugin has no attached session, it first
-  invokes `mu session new`, captures and validates the single id printed by that
+  invokes `mu new`, captures and validates the single id printed by that
   management command, and remembers it for the current scope. It then invokes
   the first turn with `--session <id>` and any shell-owned model override. There
   is no rendezvous file or inherited descriptor, and the id is never printed by
@@ -1662,7 +1667,7 @@ ordinary open and recovery never reinterpret it.
 - **Attach / continue.** `MU_ZSH_SESSION_ID=<id>` and
   `MU_FISH_SESSION_ID=<id>` seed their respective plugins with an existing
   session, while `mu -s <id>` and `mu -c` handle one-shot re-entry from the
-  command line. `mu session list` lists recent candidates.
+  command line. `mu sessions` lists recent candidates.
 - **Per-turn lifecycle.** Each turn: open and nonblockingly lock the selected
   journal → normalize its interrupted tail → replay semantic context → append
   the turn and provider/tool events as they become durable → unlock on exit.
@@ -1747,7 +1752,7 @@ different files and do not contend.
 
 There is no special atomic create-and-lock API. A freshly created session is
 not published through `current-session` before a turn owns its journal, and
-standalone `session new` never selects it. Mu does not add coordination for the
+standalone `new` never selects it. Mu does not add coordination for the
 vanishingly rare case where another process scans and explicitly targets that
 otherwise unpublished ID between creation and the first lock.
 
@@ -1836,7 +1841,8 @@ deleting anything. Earlier journal events remain available for audit. When a
 prior summary exists, only semantic events after its boundary and before the
 new cut are incorporated into the updated summary.
 
-**Manual compaction.** `mu compact --session <id>` forces compaction on demand.
+**Manual compaction.** `mu compact` forces compaction of the current session on
+demand; `-s|--session <id>` selects another session in the active scope.
 Like a prompt file or custom command, it leaves terminal stdin alone and reads
 non-terminal stdin through EOF as an optional verbatim custom instruction. The
 instruction gives relevant material more of the available detail and summary

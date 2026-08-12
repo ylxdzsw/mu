@@ -314,9 +314,10 @@ mod tests {
             "<agents_md scope=\"global\" path=\"{}\">\nGlobal mu instructions.\n</agents_md>",
             agents_path.display()
         )));
-        assert!(context.contains(
-            "<skills>\nBefore responding, actively scan the available skills below."
-        ));
+        assert!(
+            context
+                .contains("<skills>\nBefore responding, actively scan the available skills below.")
+        );
         assert!(context.contains("\n## Available skills\n\n- brave-search:"));
         assert!(context.contains("\n</skills>"));
         assert!(context.contains("brave-search"));
