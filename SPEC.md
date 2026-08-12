@@ -1,14 +1,18 @@
 # mu — Product Specification
 
-`mu` is a small, composable agent runtime for the terminal: one prompt in, one
-completed agent turn out. The core `mu` binary reads a prompt on stdin, accepts
-attached image and audio inputs, runs an agent loop, streams turn events in the
-selected output format, persists completed messages, and exits. Interactive
-shell use builds around that simple turn unit instead of changing it.
+`mu` is a small, composable terminal agent runtime: one prompt in, one completed
+turn out. The core binary reads a prompt, runs an agent loop with one
+model-visible `bash` tool, streams the selected presentation, persists durable
+session events, and exits. The zsh and Fish integrations build an interactive
+experience from that turn primitive without replacing the user's shell.
 
-This document defines the product behavior and implementation architecture.
-Where a sequence is load-bearing (the per-turn lifecycle, streaming protocol,
-or config schema), it is spelled out concretely.
+This document defines durable product behavior, architectural boundaries, and
+the rationale for consequential design choices. It is not a changelog,
+implementation diary, release manifest, or migration record. Exact
+configuration defaults live in [`src/default_config.jsonc`](src/default_config.jsonc);
+user-facing command and configuration references live in
+[`builtins/cli.md`](builtins/cli.md) and
+[`builtins/config.md`](builtins/config.md).
 
 ---
 
@@ -16,487 +20,229 @@ or config schema), it is spelled out concretely.
 
 ### Goals
 
-- **Fast.** Per-invocation cold start in the single-digit-millisecond range.
-  Every agent turn spawns a fresh `mu` process, so startup cost is paid every
-  turn and must be negligible next to model latency.
-- **Responsive.** Output streams as it is produced. Control returns to the shell
-  immediately when a turn completes.
-- **Composable.** The main abstraction is a turn, not a chat app, daemon,
-  terminal UI, or project manager. The zsh and Fish plugins and shell scripts
-  coordinate turns; they do not host a separate agent loop.
-- **Non-magical.** No TUI. The shell owns the terminal and line editing; `mu`
-  just reads a prompt and appends output. Output streams as it is produced (a
-  tool line may appear before its output), but once a line is printed it is never
-  rewritten or erased.
-- **Minimal.** One model-visible function tool: `bash`, with a small Mu-owned
-  command suite available inside it. A flat config directory. A
-  per-session journal for state in the active scope. The core binary itself has no
-  interactive input handling.
-- **Unix-like terminal native.** `mu` runs as an ordinary foreground process in
-  a Unix-like shell environment. Completion, history, job control, aliases, and
-  interactive programs remain owned by the user's shell because `mu` never
-  replaces it.
-- **Day-to-day general purpose.** Coding is supported but not the focus. The
-  agent is a general terminal assistant.
+- **Fast startup.** A fresh process runs every turn, so native startup must be
+  negligible next to provider latency.
+- **Responsive output.** Human-facing modes stream stable output as it arrives
+  and return control as soon as the turn completes.
+- **Composable turns.** `mu` behaves as a Unix command. Shell scripts,
+  supervisors, and shell integrations compose turns rather than embedding a
+  separate agent runtime.
+- **Shell-native interaction.** The user's shell retains line editing,
+  completion, history, job control, aliases, and interactive programs.
+- **Visible behavior.** Committed terminal output is append-only. Mu may update
+  one trailing progress line, but it never rewrites scrollback.
+- **Small model surface.** The model sees exactly one function tool, `bash`.
+  Skills and Mu's editing/image helpers are files or shell commands, not extra
+  function tools.
+- **General terminal assistance.** Coding is supported, but Mu is not limited
+  to a coding workflow.
 
 ### Non-goals
 
-- **No TUI, no REPL inside core `mu`.** No alternate screen, no full-screen layout,
-  no widgets, no in-place history editing, no mouse, no line editor in the
-  turn binary. `mu` never puts the terminal into raw mode. Interactive
-  convenience layers live outside the core binary, and each submitted line is
-  still a separate `mu` turn.
-- **No re-rendering.** Lines are written once and never rewritten. Native
-  terminal scrollback is the history mechanism.
-- **No daemon in the core turn path.** Each turn is a fresh, stateless-on-exit
-  process that replays/appends session state from JSONL.
-- **No plugin SDK, MCP, or in-process subagent orchestrator.** Extensibility is
-  via skills (markdown) and `bash` (call any CLI tool, including another `mu`
-  process when independent delegation is useful).
-- **No core shell emulation.** The core `mu` binary does not ship shell behavior,
-  raw terminal editing, completion, or prompt rendering. The zsh and Fish
-  plugins are thin shell surfaces that own their native line editors and call
-  `mu` for each turn.
-- **No Windows support.** `mu` is Unix-ish-only. It expects Unix process
-  semantics, `bash -lc`, signals, process groups, and advisory file locks.
+- No TUI, alternate screen, mouse UI, or line editor in the core binary.
+- No long-lived daemon or server in the normal turn path.
+- No core shell emulation or PTY-based shell replacement.
+- No in-process plugin SDK, MCP client, or subagent orchestrator.
+- No dynamic model-visible tool registration.
+- No sandbox guarantee or per-command interactive approval prompt.
+- No support in this codebase for non-Unix process semantics.
 
 ---
 
-## 2. Key decisions
+## 2. Key decisions and rejected alternatives
 
-### 2.1 Language and runtime: Rust, single native binary
+### 2.1 Native, one-process-per-turn runtime
 
-The defining requirement is startup speed for a process spawned on every turn.
-Interpreted/JIT runtimes (Node, bun, Python) carry a 50–300 ms+ startup tax that
-is unacceptable here.
+**Decision.** Mu is a Rust native binary. Each invocation performs one turn or
+one management operation and exits.
 
-**Decision: implement `mu` in Rust as a single native binary.**
+This keeps startup fast, installation simple, failure containment ordinary, and
+CLI composition natural. Session continuity is durable state, not process
+memory.
 
-Rationale:
+**Rejected: an interpreted core.** Node, bun, and Python impose a recurring
+runtime startup cost on every turn.
 
-- Cold start in single-digit milliseconds. No runtime bootstrap, no JIT warmup.
-- One physical binary to install and update. Private `apply_patch`, `edit`, and
-  `view_image` symlinks dispatch back into it by `argv[0]`.
-- Mature ecosystem for everything needed: async runtime (`tokio`), HTTP/SSE
-  (`reqwest`), JSONC/serde, and Unix file locking.
-- Because the shell owns line editing, `mu` needs **no** terminal/line-editor
-  library at all — a further simplification over a REPL-owning design.
+**Rejected: a daemon-backed core.** A daemon would add lifecycle, upgrade,
+authentication, stale-state, and client/server failure modes to a product whose
+natural unit is already a short-lived command. Background services remain
+possible as ordinary external tools, but they are not part of Mu's turn path.
 
-Tradeoff accepted: slower iteration than TypeScript, and no off-the-shelf
-"AI SDK". Provider integration is hand-written against HTTP APIs (see §7); the
-surface is small (chat completions + streaming + tool calls).
+### 2.2 Interaction belongs to the shell
 
-### 2.2 Single binary + shell surface
+**Decision.** The zsh and Fish integrations own prompt mode, line editing,
+completion, and shell history. Each submitted prompt starts the same foreground
+turn runner used by scripts.
 
-`mu` is one executable with a default **turn runner** mode: prompt and attached
-inputs in, streamed turn events out, completed state persisted, exit. It also
-owns management subcommands for core state inspection and mutation. The turn
-path itself has no concept of prompts, key bindings, or long-lived UI state.
+The real shell already has mature job control and editing semantics. Keeping
+that ownership avoids a second, inevitably incomplete shell implementation.
 
-Interactive use is a thin shell layer around that unit:
+**Rejected: a core REPL or TUI.** It would have to reproduce shell completion,
+history, multiline editing, signals, PTYs, and plugin compatibility while
+making Mu less scriptable.
 
-- The zsh and Fish plugins are the preferred interactive surfaces. Each owns its
-  shell's line editing, prompt mode, and keybindings, then submits each entered
-  prompt by spawning `mu` for one foreground turn.
+### 2.3 One model-visible tool
 
-This single-binary shape is the central decision (see §3 for the full rationale
-recap). It keeps the agent semantics small and scriptable while leaving the
-shell responsible for interaction.
+**Decision.** The only function tool is `bash`. Mu-owned `apply_patch`, `edit`,
+and `view_image` applets are commands available inside Bash. Skills are
+Markdown files loaded through Bash.
 
-The default Cargo build is native and uses `native-tls`: system OpenSSL on
-Linux and Apple Security on macOS. For an executable at
-`<prefix>/bin/mu`, built-ins are always `<prefix>/share/mu/` and applets are
-always `<prefix>/libexec/mu/`. Native startup derives those paths without
-checking, creating, or modifying package-owned resources.
+One stable schema is easier for models to learn, works across providers, and
+retains the full Unix tool ecosystem without an adapter per command.
 
-The single additive `portable` feature enables `reqwest/native-tls-vendored`
-and compile-time `include_str!` entries for every
-shipped built-in. On OpenSSL platforms this replaces the system OpenSSL linkage
-with a vendored build; on macOS native TLS continues to use Apple Security.
-Portable resolution treats built-ins and applets independently. If the
-executable is under `bin/` and the corresponding native directory exists, that
-directory wins. Otherwise the resource uses a fixed directory under one
-selected cache root:
+**Rejected: a broad built-in tool catalog.** Separate read, write, search,
+process, web, and skill tools would duplicate shell capabilities and enlarge
+every provider request.
 
-- absolute `$XDG_CACHE_HOME/mu` when `XDG_CACHE_HOME` is set;
-- `$HOME/Library/Caches/mu` on macOS;
-- `$HOME/.cache/mu` on other Unix systems.
+**Rejected: dynamic plugins or MCP in the core.** External CLIs remain
+reachable through Bash. Protocol-specific plugin hosting would expand the
+trusted runtime and contradict the fixed-tool contract.
 
-A relative `XDG_CACHE_HOME`, missing usable home, conflicting object, or any
-creation/population error is fatal; `/tmp` is never a fallback. The fixed
-resource directories are `<cache-root>/builtins` and
-`<cache-root>/applets`. On first creation Mu writes the embedded built-in
-strings directly into the former and absolute symlinks to the current
-executable into the latter. Existing directories are authoritative regardless
-of their contents. Mu does not validate, refresh, repair, roll back, clean up,
-or atomically stage them; failed creation may therefore leave a partial
-directory that subsequent runs trust. Moving or upgrading the binary does not
-refresh cached paths. The user must remove the applicable resource directory
-to regenerate it. Applet `argv[0]` dispatch occurs before portable
-initialization.
+**Rejected: a dedicated skill tool.** Skills are ordinary files. A special
+loader would add a tool solely to read content already available through Bash.
 
-Version-tag artifacts publish standalone portable Linux x86-64 musl and macOS
-ARM64/Intel binaries, the root-level `mu.zsh` and `mu.fish` integrations, the
-native Arch package, and a Windows MSYS2 UCRT64 zip. Linux statically links
-musl and vendored OpenSSL with no dynamic library dependency; macOS retains
-only Apple system-library linkage. The Windows zip contains the portable
-`mu.exe`, the Windows branch's `mu.zsh`, `WINDOWS.md`, and `LICENSE`.
-`Cargo.lock` remains generated build state and is uploaded only as a normal CI
-artifact, never as a release asset.
+### 2.4 Semantic history plus compatible native replay
 
-### 2.3 Interactive mode lives in shell surfaces
+**Decision.** Mu persists a protocol-neutral semantic transcript for display,
+compaction, recovery, and cross-provider continuation. It also retains
+completed provider-native responses for exact replay when the current API and
+replay compatibility rules allow it.
 
-The zsh and Fish plugins are the built-in interactive surfaces. They own only
-line collection, prompt mode, keybindings, and session continuity; every
-non-empty submitted line still runs as a fresh foreground `mu` process.
+**Rejected: native payloads as the conversation model.** That would bind a
+session to one provider and make transcripts, compaction, and fallback depend
+on provider-specific object shapes.
 
-Consequences:
+**Rejected: semantic history only.** Responses and Anthropic may require opaque
+or signed reasoning state to continue correctly. Discarding all native state
+would needlessly weaken same-provider replay.
 
-- `mu` remains scriptable and stateless on exit.
-- Shell plugins never duplicate provider, tool, store, or agent-loop semantics.
-- Ctrl-C and terminal behavior remain ordinary Unix process behavior.
+Partial provider streams are audit evidence only. They never become semantic
+assistant history.
 
-### 2.4 Minimal fixed toolset
+### 2.5 Append-only, per-session persistence
 
-Exactly one model-visible tool, with no dynamic core registration: `bash`. See
-§4. All local search, file reads, writes, edits, web fetches, tests, and other
-CLI work are done through that shell tool. The `risk` field on a bash call is
-advisory UI/audit metadata only; it is not a sandbox or approval proof.
+**Decision.** Each session is an append-only JSONL journal with immutable large
+objects stored by content hash. Session cleanliness, current context, and
+retryability are derived from journal events.
 
-### 2.5 Skills via progressive disclosure, no skill tool
+Per-session files isolate concurrency, make crash boundaries explicit, and keep
+the authoritative record inspectable without a database service.
 
-Skill metadata (name + description + path) is injected into the system prompt.
-The agent loads a skill file on demand using `bash` (`sed`, `cat`, `rg`, etc.).
-No dedicated "skill" tool — this keeps the model-visible surface at one tool
-and makes skills "just files". Native built-ins live in
-`<prefix>/share/mu/`; portable builds use that directory when installed and
-otherwise materialize their embedded built-ins in the user cache. They have the
-lowest precedence. Shipped built-ins include skills such as `mu-doc` and
-`subagent` plus plain on-demand references such as `config.md` and `cli.md`;
-plain references have neither skill frontmatter nor a `mu` shebang and are not
-added to the instruction index. User and project instructions can shadow
-built-in skills or commands by name.
-Skills may declare optional `requires_env` and `requires_commands` frontmatter
-keys. Each key is a comma-separated list, and every listed requirement must be
-met before the skill is injected.
+**Rejected: mutable status rows.** Flags such as `turn_complete` or
+`tool_running` can disagree with message state precisely when a crash occurs.
+Deriving state from durable events avoids two sources of truth.
 
-### 2.6 Flat config, per-session append-only journals
+**Rejected: one mutable database for all sessions.** Mu does not need
+cross-session transactions or relational queries in its turn path. A shared
+database would couple unrelated sessions and obscure the append-only audit
+record.
 
-All user-facing configuration and instruction files live under a flat `.mu`
-directory (`config.jsonc`, `AGENTS.md`, prompt/skill/command files). Runtime
-state is one JSONL journal per session plus content-addressed objects in the
-active global/project scope. See §9, §10, and §11.
+### 2.6 Output density is independent of terminal capability
+
+**Decision.** `final`, `concise`, `detail`, and `full` select information
+density. TTY detection independently selects terminal styling and live
+presentation.
+
+**Rejected: separate `plain` and `terminal` modes.** They mixed two independent
+questions—how much information to show and whether the destination is a
+terminal. Removed names are rejected rather than kept as aliases.
+
+### 2.7 Unsandboxed execution with a narrow review gate
+
+**Decision.** Bash runs with the invoking user's permissions. Declared
+destructive calls are reviewed by the optional guardrail before execution, but
+declared risk and model review are not security boundaries.
+
+This matches Mu's role as a transparent terminal agent. A partial sandbox would
+create misleading assurance while breaking ordinary shell workflows.
+
+Rejected and deferred safety alternatives are recorded in §12.
 
 ---
 
 ## 3. Architecture overview
 
-`mu` has one executable and small zsh and Fish integrations around it. The CLI
-turn runner remains the core unit.
-
-```
-   ┌──────────────────────────── shell surfaces ────────────────────────────────┐
-   │  shell scripts: `mu [opts]` with PROMPT on stdin                          │
-   │  zsh/Fish plugins: prompt mode; each entry spawns one `mu` turn           │
-   └───────────────────────────────────┬───────────────────────────────────────┘
-                                        │ invokes the same executable / command path
-                                        ▼
-   ┌────────────────────────────── mu (single binary) ─────────────────────────┐
-   │  default turn mode: one prompt in, one completed turn out                 │
-   │  management commands: init / new / sessions / transcript / status / …    │
-   │  turn/management command modules: project/config/session resolution       │
-   │                           provider client + agent loop                    │
-   │                           tool registry: bash                             │
-   │                           renderer / event stream                         │
-   │                    store (JSONL journals in active global/project scope) │
-   └───────────────────────────────────────────────────────────────────────────┘
+```text
+shell script or zsh/Fish prompt mode
+                 │
+                 ▼
+          mu turn runner
+  scope/config/session resolution
+  semantic context + provider adapter
+  agent loop + Bash execution
+  renderer + append-only journal
 ```
 
-### Why this split (recap)
+The binary has these durable responsibilities:
 
-The hard part of "replace bash" is shell fidelity. Having the real shell own the
-terminal gives that for free and forever; a core binary that owns a long-lived
-REPL would have to reimplement completion, job control, and PTY handling
-behavior indefinitely. The cost is (a) session state must persist across process
-invocations — handled by append-only journals in the active scope, §11 — and (b)
-interactive shell commands are not automatically visible to the agent (§6.3).
-Shell integration is preferred because it is only a line-editing surface around
-repeated turn invocations, not a replacement runtime.
+- **Entry and management commands:** parse invocation, resolve scope and
+  session, compose prompt input, and dispatch one operation.
+- **Agent loop:** request a provider response, persist accepted assistant
+  items, execute Bash claims, and repeat until the assistant completes.
+- **Provider adapters:** translate between the semantic transcript and one of
+  the supported wire protocols.
+- **Bash executor:** run isolated shell calls, enforce time/output bounds,
+  capture attachments, and return durable results.
+- **Renderer:** remain the sole writer of user-facing turn output.
+- **Store:** append and replay session events and immutable objects.
 
-### Binary module responsibilities
+There is no input thread, line editor, or resident process in the turn runner.
 
-- **Entry.** Resolve project/config/session scope, parse args (`--session`,
-  `--continue`, `--attach`, `--output`, subcommands), read the prompt from
-  stdin, run one turn, persisting each completed message as it lands (§11), exit.
-- **Agent loop.** Send context to the provider, stream the response, execute
-  tool calls, loop until the model stops requesting tools, yield final text.
-  A configurable max-iterations guard bounds runaway loops (§11).
-- **Tool registry.** The built-in `bash` tool with a JSON-schema parameter
-  definition and an execute function.
-- **Provider client.** Streaming HTTP to the model API behind one internal
-  interface.
-- **Renderer.** Sole writer to output; apply the selected output density and
-  automatically detected interactivity (§5).
-- **Store.** JSONL replay/append in either project-local or global scope (§11).
+### 3.1 Authoritative turn lifecycle
 
-The binary runs on a single `tokio` runtime. There is no input thread or line
-editor. Bare `mu` reads stdin once as the prompt; file-backed turns read
-non-terminal stdin once as an optional custom instruction.
+One normal turn follows this sequence:
 
-### Binary CLI surface
+1. Parse arguments and resolve the active project or global scope from the
+   invoking working directory.
+2. Load merged configuration, environment values, instructions, and the prompt
+   source. Validate and load any image or audio attachments.
+3. Open the active-scope store and resolve a selected, continued, or new
+   session.
+4. Take a nonblocking exclusive lock on that session journal. Concurrent use of
+   the same session fails as `session busy`; different sessions remain
+   independent.
+5. Normalize any interrupted journal tail.
+6. Append the submitted turn, its working directory, its Git worktree root, and
+   attachment references. Only then select it as `current-session`.
+7. Build semantic provider context and run the new-turn compaction check when
+   applicable.
+8. Repeat the agent loop:
+   - persist a reconstructible provider request before network contact;
+   - stream and assemble one provider response;
+   - on failure, persist a classified failure while keeping partial content out
+     of semantic history;
+   - on success, persist the completed native response and ordered semantic
+     assistant projection before executing any Bash call;
+   - execute accepted Bash claims, persist one result for each started claim in
+     provider order, and request the provider again;
+   - stop on a completed assistant response.
+9. Emit the selected completion presentation, release the lock, and exit.
 
-The core binary is invoked one of two ways: as a **turn** (default, reads a
-prompt on stdin) or as a **subcommand** (management; manual compaction alone
-accepts optional non-terminal stdin as a custom focus). The surface is small:
+Only `bash` claims with valid object arguments and the provider's tool-use
+finish state are executable. Unknown functions, malformed arguments, or calls
+attached to another terminal finish state are protocol failures or audit-only
+content, never speculative execution.
 
-- `mu [-s|--session <id>] [-c|--continue] [-m|--model <id>]
-  [-a|--attach <file>] [-o|--output final|concise|detail|full]`
-  — run one turn; prompt read from stdin. `-a/--attach` is repeatable and accepts
-  supported image or audio files.
-- `mu [-s|--session <id>] [-c|--continue] [-m|--model <id>]
-  [-a|--attach <file>] [-o|--output final|concise|detail|full]
-  <prompt-file>`
-  — run one turn from a prompt file; if the first line starts with `#!`, drop
-  it before sending the prompt. A `mu` shebang may contain exactly
-  `-m|--model <id>` as a turn-local default. Non-terminal stdin is appended as a
-  custom instruction. `-a/--attach` is repeatable.
-- `mu [-s|--session <id>] [-c|--continue] [-m|--model <id>]
-  [-o|--output final|concise|detail|full] <custom-command>`
-  — run a discovered shebang command from the active project/global `.mu`
-  instruction index. Command names are relative `.mu` paths including
-  extensions; built-in subcommands and explicit prompt paths win.
-- `mu.zsh` — zsh prompt mode; each accepted prompt runs one foreground `mu`
-  turn and keeps using the same session. `MU_ZSH_SESSION_ID=<id>` seeds
-  attachment to an existing session.
-- `mu.fish` — Fish 4 prompt mode with the same turn/session contract.
-  `MU_FISH_SESSION_ID=<id>` seeds attachment to an existing session.
-- `mu init [--path <dir>] [--force]` — create minimal `.mu/` project
-  metadata in the current directory by default, or in an explicitly chosen
-  directory.
-- `mu status [-s|--session <id>] [-c|--continue] [-m|--model <id>] [--json]
-  [--include-git] [--include-session-details] [--include-models]
-  [--include-commands] [--include-skills]` —
-  machine-readable shell state for prompt rendering and completion. The default
-  projection omits Git and detailed session metadata because prompt rendering
-  does not consume them; the corresponding `--include-*` flags add them.
-  `context_tokens` is the latest provider-reported context size when
-  `context_usage_source` is `reported`. After later semantic input, mu adds only
-  that input's estimate to the latest compatible reported total and marks the
-  result `estimated`; without a compatible total it estimates the full active
-  projection. Consumers derive a percentage from
-  `context_tokens / context_window` and compare the raw count with
-  `compaction_soft_threshold_tokens` to render pending compaction. That
-  threshold is `null` when automatic compaction is disabled.
-  `output` is the resolved configured output density for consumers that do not
-  have an explicit invocation override.
-  The resolved model object includes its current effective `replay_key`;
-  `--include-models` adds the effective key for every configured model.
-- `mu context [--export]` — introspect the agent context. By default it prints
-  the assembled system prompt mu itself would use: the `<system_preamble>`,
-  `<runtime>`, and `<skills>` blocks plus the merged `<agents_md>` blocks — a
-  faithful mirror of the persisted system message, so it never contacts a
-  provider. `--export` instead prints a portable projection
-  for a *foreign* agent to ingest: an explanatory preamble (noting the content
-  was authored for mu, and pointing at the `mu-doc` reference when that
-  built-in is present, while listing the absolute paths of existing global and
-  active-project `.env` files and warning that they may contain API keys or
-  other secrets; the preamble lists paths as comment-safe JSON strings and
-  explains Mu's restricted shell-compatible `.env` syntax and global-to-project
-  precedence so a foreign agent can parse and load them when a skill needs their
-  values, without displaying the files or exposing secret values in output)
-  followed by the user's own merged `AGENTS.md` (each wrapped with its scope and
-  absolute source path) and non-built-in skills; the `<system_preamble>` and
-  `<runtime>` blocks and built-in skills are omitted. In `--export` mode, when
-  the user has no `AGENTS.md`, non-built-in skills, or `.env` files, the output
-  is empty (exit 0), so a `SessionStart`-style hook injects nothing in a project
-  with no mu configuration. Neither mode loads a provider; scope resolves from
-  the working directory like other introspection commands. See the README for a
-  Claude Code hook example.
-- `mu cat [<prompt-file-or-command>]` — resolve and load the same user-prompt
-  text as a turn without contacting a provider or creating session state. With
-  no target, stdin is the complete prompt. With a file-backed target, terminal
-  stdin is left unread and non-terminal stdin is appended verbatim after
-  `\n---\n\n`. Interactive stdout shows a resolved-source line and rendered
-  Markdown; redirected stdout contains only the exact composed prompt text.
-- `mu new` — create a model-free session and print its id. `--model` is
-  rejected; model selection belongs to an actual turn. Creation does not update
-  `current-session`.
-- `mu sessions [--limit <count>]` — list recent sessions.
-- `mu transcript [-s|--session <id>] [-o|--output final|concise|detail|full]
-  [--html]` — replay a persisted session, defaulting to the last selected
-  session and `detail` output. A terminal receives the normal styled renderer;
-  redirected output is ANSI-free and preserves assistant Markdown. The replay
-  synthesizes the shell prompt status before each submitted prompt from the
-  journal: the turn's requested model, the recorded cwd, and the context usage
-  immediately before that turn. Provider-reported usage is exact; reconstructed
-  usage is prefixed with `~`. Percentages use the historical model's context
-  window from current config and are omitted when that model is no longer
-  configured. The first prompt has no context percentage because the journal
-  cannot distinguish a newly created shell session from a preselected empty
-  session. The replay contains user prompts, assistant text, and Bash
-  calls/results, but not the system prompt, compaction summaries, native
-  provider payloads, or session metadata. Assistant reasoning, text blocks, and
-  Bash calls are displayed in their persisted item order. Only open Chat
-  Completions `reasoning_content` is displayed, and only in `full`; opaque
-  Responses and Anthropic reasoning is omitted. `final` keeps the user prompts
-  and concatenated text items from the final completed assistant message of
-  each turn. `concise` uses one-line Bash results, `detail` uses the normal
-  capped preview, and `full` includes complete persisted redacted Bash output.
-  `--html` emits one HTML file containing a fixed-width ANSI replay rendered by
-  pinned xterm.js assets from jsDelivr, so the resulting file requires network
-  access when opened.
-- `mu compact [-s|--session <id>]` — force compaction, defaulting to the last
-  selected session. Terminal stdin is not read; non-terminal stdin is an
-  optional verbatim custom focus instruction.
-- `mu retry [-s|--session <id>] [-c|--continue] [-m|--model <id>]
-  [-o|--output final|concise|detail|full]`
-  — resume an interrupted (unclean) turn: normalize the tail and continue the
-  agent loop with no new prompt. `--model` overrides the latest attempted model
-  and `--output` overrides the merged config default for the retry. No-op on a
-  clean session.
+Contiguous `risk:"readonly"` calls may execute concurrently. Their display,
+journal records, tool-result messages, and next provider request retain the
+provider's original call order. Any other call is an ordering barrier.
 
-The turn runner remains one completed turn per invocation. Bare `mu` reads the
-prompt from stdin; a positional name first resolves to a discovered custom
-command unless it is an explicit path such as `./prompt.md`, then falls back to
-prompt-file mode. Prompt-file mode trims a leading shebang line when present.
-For any file-backed turn, terminal stdin is left alone so the command does not
-block; non-terminal stdin is read through EOF and, when non-empty, appended to
-the loaded file body with `\n---\n\n`. Bare `mu` continues to use stdin as its
-complete prompt.
-Exact subcommand names win at the top level, so a prompt file that collides with
-a subcommand name must be passed with a disambiguating path such as `./status`.
-`cat` is therefore also reserved as a top-level subcommand name.
-`mu sessions`, `mu transcript`, and `mu init` do **not** require a configured
-provider. `mu new` neither resolves nor stores a model and also does not require
-a configured provider. Turn invocation and `mu compact` require a configured
-provider because they can contact the provider (§7).
+### 3.2 Interruption
 
-### Turn lifecycle (authoritative end-to-end flow)
+An interrupt stops new work, cancels the active provider request when possible,
+and terminates every active Bash process group. Mu drains available output and
+persists results for calls that began. Incomplete assistant streams do not enter
+semantic history.
 
-This is the exact sequence the binary follows for one turn invocation:
-
-1. **Parse args**, resolve the active scope from the invoking `pwd` (§9), read
-   the resolved prompt source (stdin, prompt file, or custom command), and load
-   any repeatable `-a/--attach` image or audio files. Each attachment must be at
-   most 20 MiB and must be PNG, JPEG, WebP, GIF, WAV, or MP3 content matching
-   its filename extension.
-2. **Load config** (§9): global first, then project config over it when a
-   project is active.
-3. **Open the active-scope journal store:** project-local when inside a
-   project, global otherwise. Ensure `sessions/` and `objects/` exist. Do not
-   scan or eagerly upgrade session journals; a version-1 journal is upgraded
-   atomically only when an operation touches that session's semantic history
-   (§11).
-4. **Resolve the session:**
-   - If `--session <id>` is given and its journal exists in the active scope → use
-     it.
-   - If `--session <id>` is given and its journal does **not** exist in the active
-     scope → print an error to stderr, exit non-zero (do *not* silently create
-     it or fall back to a global session).
-   - If `-c/--continue` is given → follow `current-session`, or create a session
-     if the pointer is absent or broken.
-   - Otherwise create `sessions/<id>.jsonl` atomically, retrying a fresh short
-     random ID on collision, then sync its meta and system-prompt records.
-   Resolve the model choice from an explicit `--model`, else the attached
-   session's latest agent/compaction provider request if it is still configured,
-   else the old `current-session` target's latest choice if it is still
-   configured, else the first configured model. An explicit unavailable model
-   is an error; an unavailable historical choice is skipped and reported when a
-   turn uses the fallback. An attached session restores its own floating
-   provider position. A new session inherits only the choice and starts at
-   candidate zero.
-5. **Acquire session ownership** (§11) with nonblocking exclusive `flock` on
-   the journal. If it is already held, print `session busy` and exit non-zero.
-6. **Normalize any interrupted tail, then build the context list.** If the
-   previous turn left an unmatched provider request or a Bash claim without a
-   result, append an interruption marker or conservative result. Then project
-   semantic context from the system prompt, latest compaction, turn prompts,
-   accepted assistant projections, and Bash results.
-7. **Append `turn_started`** with the submitted prompt, cwd, and current Git
-   worktree root. Persist attachment bytes in `objects/` before their journal
-   references. Only while still holding the journal lock, update
-   `current-session` by atomic symlink replacement after `turn_started` is
-   durable.
-   (`mu retry` skips this step, restores the original turn cwd, and resumes the
-   same turn.)
-8. **New-turn soft compaction check** (§11): use the latest still-current
-   reported usage, otherwise estimate the projected context including the new
-   prompt. If it exceeds the soft threshold, compact and rebuild. `mu retry`
-   resumes the same turn and skips this boundary check.
-9. **Agent loop** — repeat until the model returns `finish_reason: "stop"` or the
-   max-iterations cap is hit:
-   a. Persist and sync a reconstructible `provider_requested` recipe, then send
-      the context list + tool definitions to the provider (streaming).
-   b. Accumulate the streamed assistant message (text deltas and tool-call
-      deltas; see §7 for the delta-accumulation rules).
-   c. On failure, append `provider_failed`; partial content remains audit-only.
-   d. On success, persist assembled native response JSON in `objects/`, then
-      append one `provider_completed` event containing usage, the accepted
-      semantic assistant projection, and every Bash claim. Reject a response
-      naming any function other than `bash` before persisting it. Completed tool
-      arguments must be a JSON object; empty/whitespace arguments normalize to
-      `{}`, while malformed or non-object JSON is a protocol failure and creates
-      no semantic assistant message or Bash claim. Accumulated tool calls are
-      accepted as executable claims only when the provider finish reason is
-      `tool_calls`; calls present on a length, filtering, or other terminal
-      reason remain audit-only.
-   e. If `finish_reason` is `tool_calls`: split the calls into maximal
-      contiguous batches of eligible readonly work. All output densities may
-      execute contiguous `risk:"readonly"` `bash` calls concurrently, but
-      **persist `bash_completed` results** (serialized back to providers as
-      `role: "tool"`, with their provider `tool_call_id`) in the model's
-      original call order before looping back to (a). Any non-readonly call,
-      unknown tool, or call that requires guardrail review is a sequential
-      barrier.
-   f. If `finish_reason` is `stop`: the loop ends.
-   g. A provider adapter may instead classify a complete, replayable assistant
-      response as `resume`. With `auto_resume:false`, this is an ordinary clean
-      turn ending. With `auto_resume:true`, persist it with
-      `turn_state:"resume"`, append a derived user
-      `Continue the current task from where you stopped.` message to the
-      same-turn provider context, consume one automatic retry credit, and loop
-      back to (a) without consuming an agent iteration. If no credit remains,
-      advance a floating provider candidate under the normal fallback policy
-      and continue with the preserved response. If no candidate remains, abort
-      non-zero with the turn still resumable and direct the user to `/retry` or
-      a new prompt.
-10. **For `detail` and `full`, print the turn summary line** to stderr (§5),
-    release the journal lock, and exit 0. `concise` and
-    `final` omit it.
-
-**Usage accounting.** Each provider response in the loop carries its own `usage`.
-For the **context fullness** figure use only the latest still-current accepted
-agent response's `total_tokens` — because
-`prompt_tokens` already includes the entire prior context, the last response's
-`total_tokens` is the true current context size (summing across iterations would
-double-count). For the `in`/`out` token display, sum `prompt_tokens` and
-`completion_tokens` across all iterations of the turn. Subtract provider-reported
-cache reads and writes from `in`, and display those cache figures separately.
-Later semantic input makes the figure estimated rather than discarding it: mu
-adds an estimate of only the messages after that provider completion. The
-reported total remains a valid anchor across providers when API, model id, and
-effective `replay_key` match. Otherwise mu estimates the full active
-projection. A normal provider response with valid usage establishes a new exact
-anchor.
-
-**Interruption.** Step 9d persists only *after* a message is fully formed. If
-SIGINT / a dropped connection / a provider error occurs mid-stream, the partial
-assistant remains outside semantic history, although a partial native object may
-be retained for audit (§11).
-No tool call begins without first persisting its parent assistant message, and a
-result is persisted for every call that begins execution. Once tool execution
-has started, interrupts fan out to every active tool process group, stop
-launching new tools, drain partial output, and still persist tool results in
-request order, so Ctrl-C stops work without making already-produced tool output
-disappear. Nothing else is written on interruption: the process just exits. Any
-dangling claim left by the interruption is repaired by step 6 of the *next*
-invocation.
+The next invocation normalizes unmatched requests and result-less Bash claims
+before continuing. A new prompt may redirect the work; `mu retry` continues the
+interrupted turn without adding a new prompt.
 
 ---
 
 ## 4. Tools
 
-The model-visible tool surface is exactly:
+The complete model-visible schema is:
 
 ```ts
 bash({
@@ -504,1857 +250,733 @@ bash({
   risk: "readonly" | "reversible" | "destructive",
   command: string,
   cwd?: string,
-  timeout?: number, // seconds, default 120
+  timeout?: number,
   stdin?: string
 })
 ```
 
-`bash` prepends the resolved applet directory to its post-login `PATH`: always
-`<prefix>/libexec/mu/` in a native build; in a portable build, that installed
-directory when present or the cached `applets/` directory otherwise. Before
-normal CLI parsing or portable initialization, `mu` checks the basename of
-`argv[0]` and dispatches these applets:
+- `title` is concise human-facing action text.
+- `risk` is advisory audit/UI metadata. It selects guardrail review only for
+  `destructive`; it does not constrain the process.
+- `command` runs as `bash -lc`.
+- `cwd` applies to this call only. Calls do not share `cd`, shell variables, or
+  exported environment changes.
+- `stdin` is written literally to the child and is the preferred path for
+  multiline or escaping-sensitive data.
+- `timeout` is a positive number of seconds and defaults to 120.
 
-- **`apply_patch`** accepts one patch argument or reads it from stdin. Its
-  `*** Begin Patch` / `*** End Patch` format supports add, update, move, and
-  delete operations with context hunks. Relative paths resolve from the shell
-  call's working directory; absolute paths are used as written. It preflights
-  the whole patch, then applies validated file changes. Repeated non-moving
-  updates using the same path are applied sequentially to virtual content and
-  committed as one update. Deleting and then adding the same regular-file path
-  is likewise one in-place update, preserving its inode, permissions, and hard
-  links. Other repeated or aliased targets, repeated operations involving a
-  move, delete-add on a symlink, and existing add/move destinations are
-  rejected. Updating through a symlink edits its regular-file target while
-  preserving the link; deleting a symlink removes only the link; moving a
-  symlink renames the link. Dangling links can therefore be deleted or moved
-  but cannot be updated.
-- **`edit [--relaxed] FILE`** reads one or more replacement blocks from
-  stdin. Each block has marker-only framing lines and this shape:
-  ```text
-  <<<<<<< SEARCH
-  exact existing text
-  =======
-  replacement text
-  >>>>>>> REPLACE
-  ```
-  The line endings adjacent to the three marker lines are framing, not body
-  content; an additional empty body line represents a leading or trailing line
-  ending. Internal body line endings are preserved literally.
-  An empty SEARCH section is invalid; an empty REPLACE section deletes the
-  matched text. Matching is byte-exact by default. When an exact SEARCH has no
-  matches, strict mode probes the relaxed tiers without writing: line-ending
-  equivalence, ignored trailing line whitespace, then ignored leading and
-  trailing line whitespace. A unique relaxed candidate produces an actionable
-  error suggesting either exact text or `--relaxed`; ambiguous candidates ask
-  for more context. `--relaxed` applies the first tier that finds candidates.
-  It does not collapse or ignore internal whitespace, and it converts REPLACE
-  line endings to the dominant style around each matched range so an LF edit
-  does not introduce mixed endings into a CRLF file.
+The resolved Mu applet directory is prepended to the post-login `PATH`. Calls
+run in separate process groups. Timeout or interruption sends TERM, waits a
+short grace period, then sends KILL; Linux also requests a parent-death signal
+for the direct child. Ordinary calls are expected not to outlive their tool
+result.
 
-  Every SEARCH must occur exactly once at the selected tier. All matches are
-  calculated against the original UTF-8 file snapshot, and overlapping matches
-  between blocks are rejected. Relative paths resolve from the shell call's
-  working directory; absolute paths are used as written.
-  Updating through a symlink edits its regular-file target while preserving
-  the link and its target's permissions. The entire document is preflighted
-  before the target is opened; Mu then takes a non-blocking advisory lock on
-  the existing inode and revalidates the original snapshot before writing.
-  Mu syncs a transient random sibling backup, overwrites and syncs the same
-  inode, and removes the backup after success. Ordinary write failures attempt
-  to restore the original bytes into that inode; a crash or failed restoration
-  may leave the backup for manual recovery. This preserves inode-bound
-  metadata and hard links but cannot give atomic visibility to readers that
-  ignore the advisory lock. New-file creation still publishes a fully synced
-  sibling with a no-clobber operation. Success is reported compactly as
-  `Done!`, an `M PATH` line, and an applied block/replacement count; failures
-  identify the responsible block and corrective action. The updated file or a
-  full diff is not returned.
-- **`view_image [--detail auto|low|high|original] PATH`** loads a validated PNG,
-  JPEG, WebP, or GIF through the same attachment loader and 20 MiB limit used by
-  `mu -a`. `--detail` is optional and defaults to `auto`. The command writes a
-  text summary normally and, when invoked inside a live Mu tool call, stages
-  immutable bytes plus one entry in that session's private attachment manifest.
-  It fails outside a live tool call or after eight entries for that claim.
+Recursive Mu delegation is bounded by `MU_SUBAGENT_DEPTH`: management commands
+remain available, but recursive agent turns beyond one nested level are
+rejected.
 
-These are ordinary commands called through `bash`, not additional model-visible
-function tools. Mu passes only the private manifest path, object directory, and
-internal Bash-call id to the child. `view_image` locks the manifest across its
-limit check and append, snapshots the source bytes, makes the SHA-256 object
-durable, then appends and syncs one manifest entry. Mu verifies staged objects
-once before committing `bash_completed`; staging without a durable result is
-ignored during recovery.
-Responses adapters serialize images in the native `function_call_output`;
-Anthropic Messages adapters serialize them inside the native `tool_result`;
-Chat Completions adapters retain the tool text and add a labeled multimodal
-user-message projection on the wire only.
+### 4.1 Bash output
 
-`title` is the short human-readable action shown in the terminal. `risk` is
-advisory metadata for UI/audit and drives optional guardrail review for
-`destructive` calls; `mu` does not sandbox a call based on it. `command` is
-executed as `bash -lc <command>`. `cwd`, when
-present, applies only to that invocation; `cd`, shell variables, and exported
-environment do not persist to later bash calls. `stdin`, when present, is piped
-literally to the child process so the agent can pass bytes containing `$`, backticks,
-quotes, or heredoc delimiters without shell expansion.
+Stdout and stderr are combined, redacted, and streamed to human-facing modes.
+The model-visible and persisted result is bounded by:
 
-**Execution ordering.** Human-facing output may execute maximal contiguous
-batches of `risk:"readonly"` `bash` calls concurrently because each
-call runs in its own process group with isolated `cwd`, environment, timeout,
-and stdin. This is an execution optimization only: stored tool-call records,
-stored tool messages, and the next model request still see the original
-assistant tool-call order.
+- `limits.max_lines`;
+- `limits.max_bytes`;
+- `limits.max_line_bytes`.
 
-**Detailed visibility.** In `detail` output, while a tool call has started but
-its title has not begun streaming, interactive output shows a mutable
-`[preparing toolcall]` indicator. The indicator is cleared when `bash` begins
-committing its `# <title>` line, followed by a `$ <command>` line. In interactive
-output, `#` shares the title styling and `$` shares the command's risk color;
-redirected output instead includes an explicit `[risk]` label. If the call
-includes a `cwd` field whose
-resolved path differs from `mu`'s process working directory, it then prints an
-`@ <raw cwd>` line using the exact `cwd` string supplied by the agent. If the
-call includes a `stdin` field, it then prints a `< [stdin N bytes]` summary line
-before command output. It streams combined output and finishes with an exit
-status/duration line. Every tool error is visible.
+When a result exceeds a bound, Mu keeps a tail preview and an omission marker.
+It best-effort spills the complete redacted output to a private, randomly named
+file under `$TMPDIR/mu`; spill files are ephemeral and have no retention
+guarantee. A spill failure does not change the command result.
 
-**Output truncation policy.** Every bash output is
-capped before it enters the context window so a single large result cannot blow
-the budget:
+Timeouts, interruptions, and Mu's internal output ceiling use the same bounded
+partial-output policy. The failure reason remains separate and visible even
+when the partial output is truncated.
 
-- Default caps: **2000 lines** or **50 KB**, whichever is hit first
-  (`limits.max_lines` / `limits.max_bytes`). A per-line byte cap
-  (`limits.max_line_bytes`, default 10 KB) also applies, so a single pathological
-  line cannot dominate.
-- When output exceeds a cap, the model receives a **tail preview** plus a marker
-  stating how much was elided, and the full output is best-effort written to an
-  exclusive, randomly named file in the private flat `$TMPDIR/mu` runtime
-  directory. The marker points the model at that ephemeral path so it can
-  inspect the result with another `bash` call while it exists. Byte limiting is
-  applied backward from the actual tail so the final exit-status line is
-  retained; nothing is lost, it just is not forced into context.
-- The spill is **best-effort**: the command has already run by the time its
-  output is clamped, so a failed spill write (unavailable temporary directory,
-  permission error, or disk full) must never fail the tool result. The preview
-  is returned with a note that the full output could not be saved. Mu does not
-  actively remove spill files, and it makes no retention promise; the OS or an
-  administrator may remove one at any time. A missing spill is likewise
-  harmless — the model just gets a shell error when it tries to read the path.
-- Timeout, interruption, and internal output-limit failures apply the same caps
-  to their partial output. The failure reason remains outside the truncated
-  preview and therefore always remains visible. Partial output is redacted
-  before truncation or spill; failures without partial output remain
-  `error: <reason>`.
+### 4.2 Mu applets
 
-All local search, file reads, writes, edits, tests, and web fetches go through
-`bash`. The model should choose ordinary structured CLI patterns (`rg`, `find`,
-`sed`, `python - <<'PY'` only when appropriate, `curl`, `git diff`, etc.) and use
-literal `stdin` for content that should not be interpreted by the shell.
+These are shell commands, not function tools:
 
-**Process lifecycle.** Each call spawns one child process. On Unix it is placed
-in its own process group before `exec`, and on Linux `PR_SET_PDEATHSIG` asks the
-kernel to send SIGTERM if `mu` dies. On timeout or interrupt, `mu` sends SIGTERM
-to the process group, waits a short grace period, then sends SIGKILL; if group
-signaling fails it falls back to killing the direct child. Ordinary commands are
-expected not to outlive the tool call.
+- **`apply_patch`** applies add, update, move, and delete operations from one
+  structured patch. It preflights the complete patch before publication,
+  rejects conflicting targets and existing add/move destinations, and supports
+  repeated non-moving updates to one path as a single final update. Relative
+  paths resolve from the Bash call's working directory. Updating through a
+  symlink edits its regular-file target; moving or deleting a symlink acts on
+  the link.
+- **`edit [--relaxed] FILE`** applies one or more uniquely matching
+  SEARCH/REPLACE blocks to an existing UTF-8 regular file. Strict mode is
+  byte-exact and reports a unique relaxed match as guidance. `--relaxed`
+  progressively tolerates line-ending and line-edge whitespace differences,
+  never arbitrary internal whitespace. All matches are computed against one
+  snapshot and overlapping matches are rejected. The write preserves the
+  existing inode, permissions, hard links, and symlink target relationship,
+  using an advisory lock and a recoverable sibling backup.
+- **`view_image [--detail auto|low|high|original] PATH`** validates and attaches
+  a PNG, JPEG, WebP, or GIF to the current Bash result. It works only inside a
+  live Mu tool call, snapshots immutable bytes into the session object store,
+  and permits at most eight staged images per claim.
 
-For recursive `mu` delegation, the bash tool sets `MU_SUBAGENT_DEPTH` to one
-more than the current process depth. Normal management commands still work at
-any depth, but recursive agent turns are rejected once the process environment
-reports depth greater than `1`.
-
-`timeout` defaults to 120 seconds and must be greater than zero. `mu` does not
-pre-check command argv size; if `bash -lc <command>` fails with OS
-argument-list-too-long (`E2BIG`), the tool returns a clear error. `mu` does not
-fall back to temp scripts.
+User attachments and `view_image` use the same 20 MiB per-file limit. Turn
+attachments additionally support WAV and MP3. Provider-specific media support
+is defined in §7.
 
 ---
 
 ## 5. Output and rendering
 
-`mu` supports four output densities: `final`, `concise`, `detail`, and `full`.
-They are different renderings of the same agent turn and must not imply
-different agent behavior. The effective density is an explicit `--output`, then
-the merged `config.jsonc` `output` value, then `detail`.
-The removed `plain` and `terminal` values are rejected rather than retained as
-aliases.
+Output density changes presentation, not agent behavior:
 
-- **Final output** is for supervisor agents invoking `mu` as a subagent. It
-  does not stream. On success, stdout is exactly the final raw assistant message
-  content from the completed turn, written once after the turn finishes and
-  without an added newline. Tool output, intermediate assistant tool-call
-  messages, reasoning/progress, automatic retry notices, summaries, and bells
-  are suppressed. Automatic retries and per-completed-message persistence still
-  behave the same as in human-facing modes. On fatal failure after retry
-  exhaustion or any other unrecovered error, stdout is `error: <message>`
-  followed by one newline and the process exits non-zero.
-- **Concise output** keeps assistant text and ordinary notices but reduces every
-  bash call to one `=> <title> · exit <code>` line. Calls that fail without a
-  numeric exit code end in `· error`. Command, cwd, stdin, output, duration, and
-  successful guardrail detail are suppressed. Reasoning progress is ephemeral
-  and never becomes committed transcript output.
-- **Detail output** is the normal human transcript. It preserves the existing
-  thought line, streamed/capped tool header, output preview, and exit line.
-- **Full output** streams all provider-visible reasoning trace or reasoning
-  summary without a thought indicator, and shows the complete command, stdin,
-  and redacted tool output. Model-facing tool-result truncation remains in force.
+| Mode | Contract |
+|---|---|
+| `final` | Buffer the turn and write only the final assistant text on success, without an added newline. On unrecovered failure, write `error: ...\n` and exit nonzero. |
+| `concise` | Stream assistant text and notices; reduce each Bash call to one committed outcome line. Reasoning progress is ephemeral. |
+| `detail` | Normal human transcript: thought status, tool headers, bounded output previews, exits, and turn summary. |
+| `full` | Expose available reasoning/summary text and complete redacted tool presentation. Model-context truncation still applies. |
 
-Interactivity is independent from density. Whether stdout is interactive is
-always detected from its TTY status and is not configurable. Stdout TTY
-detection enables ANSI styling, parsed terminal Markdown, and the single mutable
-live line in every non-final density. Redirected stdout is sequential and
-ANSI-free. `final` ignores interactivity. Interactive rendering keeps normal
-scrollback and never uses an alternate screen, clears the screen, or requires
-mouse interaction.
+Resolution order is explicit `--output`, merged `config.jsonc`, then `detail` if
+no configuration supplied a value.
 
-The renderer samples the stdout terminal width once at turn startup, reserves
-the final terminal column, and uses 80 visible cells if width detection fails.
-It wraps assistant prose and bounds rendered tables to that ruler. Compact
-renderer-owned rows such as tool titles, command previews, and mutable live
-lines are ellipsized to the same ruler. Mu does not handle `SIGWINCH`, reflow
-committed output, or rewrite scrollback after a terminal resize. This does not
-change redirected output, `final` output, persisted messages, or model-visible
-content.
+### 5.1 Terminal and stream contract
 
-**Concurrency contract.** All output modes may run contiguous readonly
-`bash` calls concurrently. Interactive output keeps append-only scrollback and
-the one-live-line rule: at most one bash call owns live terminal presentation at
-a time, even while later readonly calls are already running in the background.
-Redirected output follows the same ordered display without live-line redraws.
-`final` suppresses the transcript while preserving execution, ordering, and
-persistence semantics.
+- `final` ignores terminal capability.
+- In other modes, stdout TTY detection enables ANSI styling, terminal Markdown,
+  width-aware wrapping, hyperlinks, and one mutable trailing progress line.
+- Redirected stdout is ANSI-free, sequential, and preserves raw assistant
+  Markdown.
+- The renderer is the sole stdout/stderr writer.
+- Committed transcript blocks remain append-only and in provider order.
+- Tables may be buffered until their layout is stable; ordinary prose streams
+  once its Markdown interpretation is unambiguous.
+- Terminal width is sampled at turn start. Mu does not reflow committed output
+  after resize.
 
-The renderer is the sole writer to stdout/stderr and independently enforces the
-selected density and detected interactivity.
+Assistant text, tool presentation, tool failures, and Bash output go to stdout.
+Fatal process diagnostics and the normal `detail`/`full` summary go to stderr.
+The summary is shown only for a successful turn when stderr is a terminal.
 
-Assistant Markdown is parsed on TTYs. The renderer commits only output whose
-terminal representation is stable: ordinary prose streams as soon as it is not
-being held for an inline span, while headings, quotes, and list items stream once
-their line prefix is unambiguous. The renderer retains at most seven visible
-cells: five so an approaching ruler can replace
-the most recent retained whitespace with a newline, plus one provisional
-overflow cell and its following whitespace. Prose normally wraps at the ruler,
-one cell short of the detected terminal width. When that cut would leave exactly
-one single-cell grapheme before whitespace, the grapheme may occupy the reserved
-final terminal column and the whitespace becomes a newline. Otherwise an
-unbroken run hard-wraps at a Unicode grapheme boundary. ANSI and hyperlink
-controls consume zero cells; combining sequences, emoji ZWJ sequences, and
-other extended graphemes are never split. CJK text therefore falls back to
-grapheme-boundary wrapping. This is intentionally not full Unicode line
-breaking, dictionary segmentation, or hyphenation.
+Top-level interactive transcript blocks have exactly one empty line between
+them. The shell integration owns spacing between the submitted `mu>` prompt and
+the child's first visible block; the renderer owns later boundaries. A Bash
+header, output, omission marker, and exit line form one block.
 
-A heading prefix waits for the space after the full opening `#` run, so `##` is
-not rendered as h2 until it cannot still become h3. Closing heading hashes are
-not special-cased and are rendered literally.
-Inline links, inline code, emphasis, strong text, and double-tilde
-strikethrough wait for the current span to complete; fenced code starts terminal
-code styling at the opening fence, streams code lines without printing fence
-markers, and resets styling at the closing fence or response boundary. Emphasis
-uses regular cyan, while strong text uses bold. Block quotes use gray italics
-without a visible gutter marker. Underscores within words remain literal, so
-identifiers such as `CAP_SYS_ADMIN` are not interpreted as emphasis. Markdown
-links in interactive `concise` output show only their labels while retaining
-their terminal hyperlinks; interactive `detail` and `full` output also show the
-full destination URL.
-tables are buffered until the table is complete enough to align and commit once,
-so columns never require rewriting prior output. With wrapping enabled, table
-layout counts every border and padding cell, caps any one content column at 80
-cells, and shrinks the widest columns until the complete grid fits the sampled
-terminal ruler. Cells wrap with the same five-cell whitespace heuristic as
-prose. If a grid cannot give every column three content cells, the table becomes
-a stacked header/value grid; terminals too narrow even for that use a linear
-header/value layout. Every emitted table row stays within the ruler unless one
-indivisible grapheme is itself wider than the terminal. With wrapping disabled,
-columns use their natural widths and cells remain on one renderer row.
+Interactive `detail` and `full` show complete link destinations; interactive
+`concise` shows labels while retaining hyperlinks. Redirected output preserves
+the model's Markdown in every non-final mode.
 
-While a confirmed table is buffered, interactive output shows a mutable
-`[table ~N tokens]` live indicator; the completed table clears and overwrites
-that indicator instead of committing a final table-status line. Markdown
-features outside this supported terminal subset are emitted as raw Markdown
-rather than partially rendered. When stdout is piped or redirected, assistant
-deltas pass through byte-for-byte as the model produced them, preserving raw
-Markdown for downstream consumers.
+When configured, a terminal bell sounds after a successful non-final
+interactive turn whose duration meets the configured minimum.
 
-### 5.1 TTY block-spacing contract
+### 5.2 Reasoning visibility
 
-Interactive output is structured as a sequence of top-level transcript blocks:
-the shell's `mu>` prompt, assistant text, committed thought lines, bash tool blocks,
-notices, and similar human-facing sections. Spacing has exactly one owner at
-each boundary: the active shell plugin owns the transition from a submitted
-`mu>` prompt to the child process's first visible block, and the renderer owns
-subsequent renderer-to-renderer block transitions.
+- Chat Completions `reasoning_content` is open text. `detail` commits a compact
+  thought status; `full` streams the text.
+- Responses and Anthropic reasoning may be opaque. `detail` may show duration
+  and a conservative provider summary title; `full` shows only summary text the
+  provider exposed.
+- `concise` may use a live reasoning indicator but does not commit it.
+- `final` suppresses all reasoning and progress.
 
-- Top-level transcript blocks are separated by exactly one empty line.
-- After submission, the canonical normalized prefix is
-  `mu> prompt\n\n[first visible block]`. Neither a missing empty line
-  (`mu> prompt\n[first visible block]`) nor two empty lines
-  (`mu> prompt\n\n\n[first visible block]`) are valid.
-- The renderer never adds leading spacing before its first visible block. That
-  block may be a live thought indicator, assistant text, a tool call, or a
-  notice. In styled TTY output, provider-emitted whitespace before it is
-  boundary noise: it does not render and does not mark a block as committed.
-  Blank lines inside visible assistant content remain intact, and redirected
-  output continues to preserve raw assistant deltas.
-- The *next* top-level block owns that separator. Committed block formatters
-  should end with exactly one newline; they must not rely on trailing blank
-  lines baked into their own text.
-- Starting a tool-call block first finishes the current assistant Markdown
-  stream, including any cells retained for wrapping, before reserving or
-  committing tool-call presentation.
-- Live status lines such as the updating `[thought ...]` line or the
-  `[preparing toolcall]` indicator may reserve the top separator on first
-  render, but subsequent ticks only redraw that one mutable trailing line. A
-  first live status line does not add spacing on behalf of a preceding shell
-  prompt.
-- A bash tool block includes its header, streamed preview/output, omission
-  marker, and final exit line; those pieces are not separated from each other by
-  extra blank lines.
-- In `detail` and `full`, the turn summary is its own final transcript block.
-  When a turn produced transcript output, it has exactly one empty line before
-  the summary and one empty line between the summary and the next shell prompt.
-  Concise omits the summary but keeps one empty line before the next shell
-  prompt.
-
-This contract applies to `concise`, `detail`, and `full` output.
-
-**Stream routing (explicit).** The conversation transcript goes to **stdout**:
-tool presentation, tool failures, Bash output, and assistant text. Fatal process
-errors and the `detail`/`full` turn summary go to **stderr**. Thus
-`mu <<< prompt > out.txt`
-captures the complete portable transcript while fatal diagnostics/summary
-remain visible. Stdout TTY detection selects rich versus portable rendering;
-stderr TTY detection suppresses the summary when redirected.
-
-- **Detail tool presentation.** Interactive output shows `[preparing toolcall]`
-  as its one mutable live line before title bytes arrive; redirected output
-  omits it. Bash then streams `# <title>` and `$ <command>` in order. Interactive
-  output colors the command by risk, while redirected output includes an
-  explicit label such as `[readonly]`. The command is capped to its first
-  decoded line, optional stdin is summarized as `< [stdin N bytes]`, command
-  output uses the ordered head/omission/tail preview, and completion prints the
-  matching exit line. Headers already streamed are not duplicated at execution.
-- **Concise tool presentation.** Interactive output replaces
-  `[preparing toolcall]` once both title and risk are complete with a risk-colored
-  live `=> <title>`, except that a call awaiting guardrail review transitions
-  directly from `[preparing toolcall]` to `[guardrail] <title>…`. Completion
-  clears it and commits exactly
-  `=> <title> · exit <code>` or `=> <title> · error`, without duration.
-  Redirected output emits only the completed ANSI-free line and does not add a
-  risk label. Risk colors are cyan for readonly, yellow for reversible, red for
-  destructive, and dim for missing/unknown risk. Command, cwd, stdin, output,
-  duration, and successful guardrail detail are suppressed. Consecutive calls
-  form one block with no empty lines between them.
-- **Full tool presentation.** Full retains the detailed title, risk, cwd, and
-  exit/error presentation, but `$ ` contains the complete decoded multiline
-  command, `< ` contains complete stdin instead of a byte summary, and every
-  redacted/sanitized output byte is displayed without a screen preview or
-  omission marker. Model-context truncation and spill files from §4 are
-  unchanged.
-- **Tool ordering.** Multiple calls are displayed in provider order. In
-  `detail` and `full`, concurrent readonly batches still present one active bash
-  stream at a time; later calls may already run in the background. Concise
-  buffers each outcome and commits its one-line record in the same order.
-- **Assistant text.** Redirected output streams raw Markdown deltas unchanged.
-  Interactive output commits parsed Markdown as soon as the relevant unit is
-  stable: prose streams token-by-token unless an inline span is open,
-  list/heading/quote content streams after the prefix is stable, tables wait for
-  completion, and unsupported Markdown stays raw.
-- **Reasoning progress.** Detail creates the interactive mutable thought line.
-  Chat reasoning uses `[thought <duration>, <tokens> tokens]`; opaque Responses
-  or Anthropic reasoning uses `[thought <duration>]` with an optional
-  conservative title from the first bold-only or ATX-heading summary line.
-  Detail commits that line when
-  reasoning finishes, including when no exposed reasoning text exists. Concise
-  uses the same interactive indicator but erases it at completion and is silent
-  when redirected. A Responses title received while reasoning continues appears
-  on the next periodic refresh, remains for that reasoning item, and does not
-  reset its timer. A title received only as reasoning completes is not briefly
-  flashed or committed. Immediately after a concise tool the indicator occupies
-  the next line without an empty separator, and ephemeral reasoning does not
-  break a consecutive tool block. Full streams Chat reasoning deltas and every
-  exposed Responses or Anthropic summary part directly in provider order,
-  without a live or committed thought indicator; providers exposing neither
-  produce no reasoning output.
-- **Errors.** Always printed and clearly prefixed, with TTY styling when
-  available. Fatal turn failure produces a non-zero process exit code so the
-  shell's `$?` is meaningful.
-
-**Turn summary line.** When `mu` exits normally (turn complete) in `detail` or
-`full`, it prints a single structured summary line to stderr:
-
-```
-[mu] tokens: 1234 in (567 cache read, 89 cache write) / 456 out  context: 12%
-```
-
-All figures come from the provider's reported `usage` for the turn: `in` is
-`prompt_tokens` excluding cache reads and writes, `out` is `completion_tokens`,
-and cache usage is shown parenthetically when reported. Cache write is omitted
-when the provider does not report it; `context` is the new
-`total_tokens` ÷ model context window. This is the *only* stderr output in the normal case. It appears after all
-stdout, and goes to stderr so it stays out of a captured stdout transcript. It
-is suppressed in `concise` and `final`, and when stderr is not a TTY
-(piped/redirected), since it would pollute log files. In `detail` and `full` it
-is followed by one blank line so the next shell prompt is visually separated
-from the completed turn.
-
-Redirected stdout avoids terminal-only control sequences so every density
-remains suitable for scripts. Interactive output may show progress for
-in-flight work, but committed transcript content is never erased from
-scrollback. When `terminal_bell.enabled` is true, interactive non-final output
-also emits a BEL (`\a`) after successful turn completion once total turn
-duration meets `terminal_bell.min_duration_ms` (default 10s). In `detail` and
-`full`, the summary is written before the bell.
+Opaque reasoning is never invented for display.
 
 ---
 
 ## 6. zsh and Fish shell surfaces
 
-The zsh and Fish plugins expose the same shell-native interaction contract.
-Each behaves like a shell editing mode: Tab with the cursor at the beginning of
-the line toggles the current prompt into or out of `mu>` mode while preserving
-the current buffer. Enter submits the current buffer as one `mu` turn when it
-contains non-whitespace text and otherwise just draws a fresh `mu>` prompt;
-Ctrl-C cancels the `mu>` draft but leaves the cancelled line in scrollback;
-Backspace remains an ordinary delete key; and Ctrl-D keeps normal shell EOF
-behavior even while `mu>` mode is active. Up and Down first move within the
-current multiline buffer, then browse tagged Mu submissions from shell history
-while skipping ordinary shell commands. Mu history is not project-scoped;
-recalled input runs against the current shell-managed session, model, and
-attachments. A plugin must not duplicate agent-loop, provider, store, or tool
-semantics.
+The plugins provide the same product contract:
 
-The zsh plugin requires zsh, `jq`, and the `mu` binary on `PATH`. Setting
-`MU_ZSH_BIN` to a specific executable overrides the binary name/path used by
-the plugin.
+- Tab at cursor zero toggles `mu>` mode while preserving the edit buffer.
+- Non-empty Enter submits one foreground Mu turn; empty Enter redraws the
+  prompt without creating a turn.
+- Ctrl-C cancels an edited draft or interrupts the foreground Mu process using
+  ordinary shell signal behavior.
+- Ctrl-D retains normal shell EOF behavior.
+- Up/Down navigate within multiline input and then browse Mu-tagged shell
+  history without mixing ordinary commands. Recalled prompts run with the
+  current session, model, scope, and attachment state.
+- Shift+Enter inserts a newline when the terminal provides a distinguishable
+  key sequence.
+- Slash commands and model names use native shell completion.
 
-### 6.1 Invocation pattern
+The plugins never implement provider, store, tool, guardrail, retry, or
+compaction semantics.
 
-Submitting a non-empty prompt runs `mu` as an ordinary foreground child process.
-When needed, the plugin first creates a session with the management command;
-every turn, including the first, receives `--session`. The plugin forwards an
-explicit shell output override when configured, writes the prompt to the child
-process's stdin, waits for the turn to finish, and then redraws `mu>` with the
-same session id.
-`MU_ZSH_OUTPUT` or `MU_FISH_OUTPUT` optionally overrides the density; when
-unset, the child inherits the active `config.jsonc` default. It does not control
-whether the child is interactive.
-The prompt omits the context field while no session is attached and the next
-turn will create one. Once a session exists, it shows the rounded context
-percentage, including `0%` for a short session.
-The status line always shows the invoking `pwd`. When the active project root
-is not literally the same path, it also shows that project root in parentheses;
-this keeps a repository or worktree checkout visible while working in one of
-its subdirectories. In global scope it shows `(global)` instead.
-Each plugin keeps one in-memory tracked bundle containing its scope, optional
-session id, optional sticky model override, and staged attachments. Merely
-changing directory masks a bundle owned by another scope; returning without a
-Mu action restores it. Prompt rendering plus status, command-discovery, and
-completion lookups are passive observations and do not invalidate it. An
-accepted prompt or slash action activates its current scope, atomically
-discarding a bundle owned by another scope before the action runs. Malformed or
-unknown slash input, an unsupported model, an unknown `/load` session, and an
-unreadable attachment are rejected before activation; a later runtime failure
-does not restore discarded state. Within the same scope, `/new` clears only the
-session id, while `/load` replaces only the session id; both preserve the model
-override and attachments.
-After the native line editor commits the submitted prompt line to scrollback,
-the plugin prints one empty line before child-process output starts, independent
-of whether the child uses `concise`, `detail`, or `full` output.
+### 6.1 Shell-owned session bundle
 
-Consequences:
+Each shell integration tracks one in-memory bundle:
 
-- `mu` owns the terminal while each turn is running; streaming output works
-  directly.
-- Ctrl-C while editing in `mu>` mode cancels the current draft, leaves that
-  prompt line visible in scrollback, and redraws `mu>` like a shell prompt
-  interrupt. Ctrl-C while a foreground `mu` turn is running uses ordinary Unix
-  signal behavior for the foreground process.
-- After each turn exits, the shell returns to `mu>` mode with the same session
-  id.
+- active scope;
+- optional session id;
+- optional sticky model override;
+- staged attachments.
 
-### 6.2 Entry and exit
+Changing directory temporarily masks a bundle from another scope. A submitted
+prompt or valid slash action activates the current scope and discards a bundle
+owned by another scope. Passive prompt/status/completion reads do not mutate
+state.
 
-- Press Tab with the cursor at the beginning of the line to enter `mu>` mode;
-  press Tab at the beginning of a `mu>` line to leave it again. In both
-  directions, keep the current buffer and cursor position intact.
-- Enter a non-whitespace line to run one turn. Empty or whitespace-only Enter
-  should draw a fresh `mu>` prompt without submitting anything.
-- Press Ctrl-C while editing to cancel the current draft, keep the cancelled
-  line in scrollback, clear the live buffer, and draw a fresh `mu>` prompt.
-- Backspace should always delete backward; it is not a mode-exit key.
-- Ctrl-D should keep normal shell EOF semantics even inside `mu>` mode, so an
-  empty `mu>` prompt exits the shell rather than merely leaving prompt mode.
-- Press Up or Down while editing in `mu>` mode to move within the current
-  multiline buffer. At its first or last line, respectively, browse only
-  version-tagged Mu submissions in shell history, skipping ordinary commands.
-  The first Up preserves the live draft and cursor; Down past the newest Mu
-  entry restores them. History recall is unscoped and does not change the
-  current session, model, or pending attachments.
-- Shift+Enter inserts a newline without submitting when the terminal sends the
-  CSI-u sequence `Esc [ 13 ; 2 u`. Terminals that send ordinary Enter for this
-  key combination cannot be distinguished by the shell and require a matching
-  key configuration.
-- Typing `/` at the start of a `mu>` line proactively lists slash commands.
-  After that, Tab performs shell-native candidate matching and listing.
-- When Tab completes the slash command itself to `/model`, it appends one space
-  and stops at `/model `. Once the buffer is already `/model `, later Tabs use
-  ordinary shell-native model completion, including candidate listing and
-  common-prefix insertion.
-- A buffer beginning with `/` is a slash command. Known custom commands take
-  everything after their name as a custom instruction, including inserted
-  newlines; `/compact` accepts the same instruction syntax as a custom focus.
-  Unknown names report a slash-command error. Other built-in slash commands keep
-  their own argument rules.
-- `/attach <file>` resolves and stages one readable regular file in shell
-  memory for the next user message and may be repeated. It creates no session
-  message itself. `/attach` lists pending files and `/attach --clear` discards
-  them. Attachments belong to the tracked scope, and the prompt shows the count
-  only while that scope is active. Empty Enter, draft cancellation,
-  mode changes, `/model`, `/load`, `/new`, `/retry`, and `/compact` do not
-  consume the queue; the next ordinary prompt or custom command passes every
-  staged file as a repeatable `-a` argument and clears the queue before
-  launching `mu`.
-- `/model <model>` validates and stores a shell-only sticky override in the
-  tracked bundle. It is forwarded as `--model` to later turns and `/retry`; it
-  does not mutate persisted session state.
-- `/load <session-id>` replays the selected active-scope session through
-  `mu transcript` and attaches the shell to it only after replay succeeds. The
-  transcript uses the explicit shell output override when present, otherwise
-  the configured `output` reported by `mu status --json`; it is not fixed to one
-  density. Missing, malformed, corrupt, or interrupted loads leave the tracked
-  bundle unchanged. Loading does not select the scope's `current-session`; the
-  next durable turn does that through the normal turn lifecycle.
-- Completing a bare or provider-qualified model appends a speculative `:` and
-  immediately opens its effort candidates when the completed reference is
-  exact, no other candidate of the same form has it as a strict prefix, and at
-  least one effort is configured. Provider-qualified references use that
-  provider's efforts; bare floating references use the deduplicated union from
-  every provider defining the model. The cursor follows the colon so effort
-  prefixes can be typed directly.
-- The speculative colon becomes explicit when the user types `:` (without
-  inserting a second colon), types another character, presses Tab, moves the
-  cursor, uses forward Delete, or performs another editing action. Backspace
-  while immediately after an unchanged speculative colon removes it. Enter
-  removes an unchanged speculative colon before submitting the bare model;
-  after the colon becomes explicit, Enter preserves it. Cancelling the whole
-  line discards its speculative state with the line.
-- Ctrl-D is the normal terminal EOT key (`^D`). xterm-style and browser-terminal
-  input paths forward it as input when the browser or OS has
-  not intercepted the key before the terminal receives it.
+An unattached plugin creates a model-free session with `mu new` before the first
+turn, then passes that id explicitly. `MU_ZSH_SESSION_ID` or
+`MU_FISH_SESSION_ID` may seed an existing active-scope session.
 
-### 6.2.1 zsh-specific integration
+### 6.2 Slash behavior
 
-- Source `mu.zsh` from `.zshrc`.
-- Tab completion delegates matching, candidate lists, and menu selection to the
-  user's normal zsh completion settings.
-- Once a bare or provider-qualified model reference transitions to its
-  speculative colon, zsh immediately displays only its effort names. A later
-  Tab uses the native effort menu, with the empty effort kept as a hidden
-  insertion anchor. Recognized effort names sort by increasing strength:
-  `minimum`, `low`, `medium`, `high`, `xhigh`, `max`; arbitrary provider-defined
-  names follow in declaration order.
-- While `mu>` mode is active, conflicting line-editor plugins should be
-  suspended. Common ZLE helpers such as syntax highlighting and autosuggestions
-  may be disabled automatically; additional plugin toggles may be attached with
-  mode enter/exit hooks. The arrays `MU_ZSH_ENTER_HOOKS` and
-  `MU_ZSH_EXIT_HOOKS` contain zsh function names; enter hooks run after prompt
-  mode is active, and exit hooks run after the normal shell prompt is restored.
+- `/new` clears the session id but preserves the shell model override and
+  staged attachments.
+- `/load <id>` replays a session and attaches only after successful replay.
+- `/model <ref>` stores a shell-only override for later turns and retries.
+- `/attach <file>` stages a readable attachment; `/attach` lists and
+  `/attach --clear` discards the queue. The next ordinary prompt or custom
+  command consumes the queue.
+- `/retry` and `/compact` call the corresponding management operation.
+- Discovered custom commands accept the remainder of the slash input as their
+  custom instruction.
 
-### 6.2.2 Fish-specific integration
+Unknown or malformed slash input does not activate a new scope or mutate the
+bundle.
 
-- Source `mu.fish` near the end of `config.fish`. A package may install it as
-  `vendor_conf.d/mu.fish`; sourcing it again after user prompt/key
-  configuration is supported.
-- Fish 4, `jq`, and `mu` on `PATH` are required. `MU_FISH_BIN` overrides the
-  executable and `MU_FISH_OUTPUT` overrides output density. On an older Fish,
-  the plugin reports the version requirement and does not install its
-  integration.
-- The plugin copies and wraps the active `fish_prompt`, `fish_right_prompt`, and
-  `fish_mode_prompt`. Normal shell mode continues to call those saved
-  functions with the prior command status intact; Mu mode replaces them with
-  its status and `mu>` prompt.
-- Mu editing uses a dedicated `mumode` initialized from Fish's complete default
-  editing bindings. On exit, the prior `$fish_bind_mode` is restored. The
-  arrays `MU_FISH_ENTER_HOOKS` and `MU_FISH_EXIT_HOOKS` provide additional
-  function hooks.
-- In normal shell mode, Tab at cursor zero remains the Mu-mode toggle. Away from
-  cursor zero, it delegates to the binding that was active when `mu.fish` was
-  last sourced, separately for Fish's `default` and `insert` modes.
-- Slash/model completion uses Mu's status candidates and Fish filename
-  completion. Multiple candidates are listed with Fish repaint semantics;
-  completion does not promise zsh `zstyle` behavior.
-- Each accepted prompt is added to shell history as a version-tagged entry whose
-  trailing `printf ... | mu ...` command remains directly replayable. Slash
-  commands use the same tag so prompt-mode history can recall them.
-- `MU_FISH_SESSION_ID=<id>` seeds an existing session. Session, model,
-  attachment, prompt color, hook, executable, and output state otherwise use
-  `MU_FISH_*` variables corresponding to the zsh variables.
-
-### 6.3 Context boundaries
-
-- **Full structured history:** `mu` records prompts, assistant responses, and
-  tool calls in the session journal (§11). Tool output is stored with the shared
-  truncation/spill policy, so the journal keeps the structured transcript and an
-  ephemeral temporary file may hold oversized raw command output.
-- **No shell-command sharing:** commands run outside `mu` or the shell
-  plugin are
-  not automatically fed to the agent. `mu` keeps the boundary explicit and
-  private.
-
-### 6.4 Session management
-
-Session lifecycle is exposed through CLI commands:
-
-- A shell plugin without a session explicitly runs `mu new` before its
-  first submitted prompt, then passes any shell model override to the first
-  actual turn and reuses that session for later prompts in the same shell.
-- Exporting the shell-specific `MU_ZSH_SESSION_ID=<id>` or
-  `MU_FISH_SESSION_ID=<id>` before entering `mu>` attaches the plugin to an
-  existing session.
-- `/load <session-id>` visibly replays and attaches an existing active-scope
-  session without starting a turn.
-- `mu -c` continues the last selected session in the active scope for a
-  one-shot turn.
-- `mu new` creates a session and prints its id.
-- `mu sessions` lists recent sessions.
-- `mu compact` compacts the current session on demand; `-s|--session <id>`
-  selects another session in the active scope.
+zsh requires `jq` and supports native ZLE completion/hooks. Fish integration
+requires Fish 4 and wraps the user's prompt and editing bindings without
+replacing normal shell mode.
 
 ---
 
-## 7. Provider / model integration
+## 7. Provider and model integration
 
-Mu supports exactly three hand-written HTTP/SSE protocols: OpenAI-compatible
-Chat Completions, OpenAI Responses, and Anthropic Messages. Each configured
-provider has a required complete `endpoint`. An endpoint is either an HTTP(S)
-POST URL or, on Unix, an
-`http+unix://<percent-encoded-absolute-socket-path>/<request-path>` URI. For
-example, `http+unix://%2Frun%2Flocal-ai.sock/v1/responses` connects to
-`/run/local-ai.sock` and sends plain HTTP to `/v1/responses` with
-`Host: localhost`; DNS and proxy configuration do not apply. After endpoint
-parsing and optional trailing-slash normalization, a case-sensitive request path ending in
-`/chat/completions` selects Chat Completions, `/responses` selects Responses,
-and `/messages` selects Anthropic Messages. Query parameters are preserved but
-do not affect classification. Every other path fails during configuration
-loading; Mu never infers a protocol from a hostname, provider id, or model
-name. A gateway exposing multiple protocols is represented by one provider
-entry per endpoint.
+Mu has three hand-written streaming adapters:
 
-All adapters accept the semantic transcript and Mu's `bash` function schema,
-stream protocol-neutral text/reasoning/tool-call events, and return one ordered
-semantic assistant-item array plus usage. Its closed item kinds are reasoning,
-text, and Bash call; tool results remain later context entries. The renderer,
-tool executor, guardrail, retries, and compaction remain protocol-neutral. Each
-request also receives a stable
-cache-affinity key `mu:<session-id>:<purpose>`, where purpose is `agent`,
-`compaction`, or `guardrail`. Retries and provider/model fallback keep the same
-key. Chat Completions and Responses lower it to top-level `prompt_cache_key`;
-Anthropic Messages ignores it and uses its native prompt-cache controls.
+- OpenAI-compatible Chat Completions;
+- OpenAI Responses;
+- Anthropic Messages.
 
-**Chat Completions.** Mu posts directly to the configured endpoint with
-`messages`, the Chat function wrapper, `stream:true`, and
-`stream_options:{include_usage:true}`, plus the request's
-`prompt_cache_key`. It accumulates indexed
-`delta.tool_calls`, assistant text, and optional `reasoning_content`. A resolved
-effort is sent as top-level `reasoning_effort`. Complete reasoning attached to
-an assistant tool-call response is persisted and replayed verbatim on every
-Chat Completions request, regardless of provider, model, endpoint, or
-`replay_key`. Chat reasoning is the open `reasoning_content` string, not an
-encrypted or signed continuation object. This supports DeepSeek thinking tool
-loops across provider fallback and model switches without model-name
-heuristics.
-Mu distinguishes an omitted `reasoning_content` field from an explicitly empty
-string. An explicit empty string is persisted and replayed when attached to an
-assistant tool-call response; an omitted field remains omitted.
-Because Chat exposes separate fields rather than a heterogeneous output array,
-its semantic item order is reasoning when present, assistant text when present,
-then tool calls in provider index order.
+Each provider has one complete endpoint. A request path ending in
+`/chat/completions`, `/responses`, or `/messages` selects the adapter. Any other
+path is invalid. HTTP(S) and `http+unix` endpoints are supported; Unix-socket
+paths are percent-encoded in the URI authority. Protocol selection never
+depends on provider or model names.
 
-Completed Chat tool arguments are validated after the stream terminates and
-before constructing the successful response: empty/whitespace becomes `{}`, a
-valid JSON object retains its original string byte-for-byte, and malformed or
-non-object JSON is a protocol failure. Usage objects and every numeric usage
-field tolerate omission or explicit `null`; missing prompt/completion counters
-become zero, input is the maximum of prompt tokens and cache hit plus miss,
-missing total is derived as input plus output, and missing cache-write remains
-absent. Present non-`u64` values remain protocol errors.
+Every adapter consumes the same semantic message list and Bash schema and
+returns ordered assistant items: reasoning, text, and Bash calls. The renderer,
+agent loop, tool executor, guardrail, retries, and compaction remain
+protocol-neutral.
 
-**Responses.** Mu posts directly to the configured endpoint with `stream:true`,
-`store:false`, `include:["reasoning.encrypted_content"]`, locally reconstructed
-`input`, the request's `prompt_cache_key`, and a flat Responses function-tool
-definition. It never sends
-`previous_response_id` or a conversation identifier. Every request opts into
-reasoning summaries with `reasoning:{summary:"auto"}` and adds `effort` to that
-object when one is resolved. Providers that reject the summary option fail the
-request normally; Mu does not retry without it. Typed SSE events provide
-reasoning-item boundaries, optional reasoning-summary text, output text, and
-function-call argument deltas. Mu accumulates complete output items from
-`response.output_item.added` and `response.output_item.done`, then merges them
-by `output_index` with the terminal response snapshot. Terminal fields win
-when both forms provide a field, while stream-only fields such as
-`encrypted_content` are retained. This assembled successful `response.output`
-array is stored in the native response object and replayed as input when the
-current Responses model has the same effective `replay_key` as its origin.
-Semantic tool results become `function_call_output` items connected by
-`call_id`. Mu also walks the completed output array in order: reasoning items
-become opaque reasoning boundaries, each supported message content part becomes
-one text item, and accepted `bash` function calls become Bash-call items.
+### 7.1 Replay boundaries
 
-**Anthropic Messages.** Mu posts directly to the configured endpoint using
-`x-api-key` and `anthropic-version:2023-06-01`, with `stream:true`,
-`max_tokens:64000`, adaptive thinking displayed as summaries, and automatic
-five-minute prompt caching. A resolved effort is sent as
-`output_config:{effort}`. The leading semantic system message becomes the
-top-level `system`; user text and images become content blocks; assistant Bash
-claims become `tool_use`; and consecutive Bash results become `tool_result`
-blocks in one user message. Image detail is intentionally omitted because
-Messages has no equivalent field. Audio is rejected while assembling the
-provider request, before network I/O.
+The semantic transcript is always authoritative. Native replay follows these
+additional rules:
 
-Anthropic text, thinking summaries, signatures, citations, tool input, usage,
-and stop reasons are accumulated from indexed SSE content-block events.
-A delta for a content block that is not currently open is rejected as a
-transient transport failure, so the regular bounded retry and provider fallback
-path applies without accepting or persisting the malformed partial response.
-Other malformed content-block sequencing remains a fatal protocol failure.
-Complete successful assistant content arrays are stored unchanged, including
-`thinking`, `redacted_thinking`, signatures, text, citations, and `tool_use`,
-and replayed when the current Anthropic Messages model has the same effective
-`replay_key` as its origin. The adapter assumes current adaptive-thinking
-models; it has no manual thinking-budget mode, old-model compatibility matrix,
-or model-name heuristics. An `end_turn` response containing one or more
-`thinking` or `redacted_thinking` blocks and no text or tool use is classified
-as resumable. This is one concrete resumable-response classifier, not the
-definition of the general resume mechanism.
-The semantic projection walks that content array in order: thinking and
-redacted-thinking blocks become opaque reasoning boundaries, text blocks remain
-separate text items, and accepted `bash` tool-use blocks become Bash-call items.
+- **Chat Completions:** completed open `reasoning_content` attached to tool-use
+  responses can replay across Chat providers and models. Empty and omitted
+  reasoning remain distinct.
+- **Responses:** requests are stateless (`store:false`; no
+  `previous_response_id`). Completed output items replay only under the same API
+  and effective `replay_key`.
+- **Anthropic Messages:** completed content blocks replay only under the same
+  API and effective `replay_key`.
 
-The semantic transcript remains authoritative for display, compaction, and
-cross-model continuation. Native replay requires the same API. Responses and
-Anthropic replay additionally require equal effective replay keys; Chat
-Completions ignores replay keys. A model's optional configured `replay_key` is
-resolved from the latest effective config for every request; omission means the
-literal `provider/model`, excluding effort. Changing config therefore changes
-how retained Responses and Anthropic history is interpreted without rewriting
-the session. Request recipes record the replay origins actually included,
-rather than keys, so historical request reconstruction remains exact. Switching
-protocols keeps semantic messages and reconstructs function calls/results, but
-omits incompatible native payload variants. Compaction excludes native state
-before the active summary boundary and retains it with the recent semantic
-suffix.
+A model's effective replay key is its configured non-secret `replay_key`, or
+`provider/model` when omitted. Switching API or an incompatible key falls back
+to the semantic transcript without rewriting history.
 
-Provider lowering remains wire-compatible with version-1 history. Compatible
-Responses and Anthropic native replay is emitted unchanged. Without it, each
-assistant projection concatenates its text items before its Bash calls. Chat
-always concatenates text, preserves call order, and emits open reasoning only
-from its compatible Chat replay sidecar. This stable lowering is what lets the
-v1-to-v2 publication gate reconstruct historical request checksums without a
-second legacy serializer.
+Images are supported by all adapters. Audio is supported only by Chat
+Completions; Responses and Anthropic reject it locally before network I/O.
 
-Text and images are supported by all adapters. Images serialize as Chat
-`image_url`, Responses `input_image`, or Anthropic `image` blocks. Existing
-audio inputs serialize as Chat `input_audio`; Responses and Anthropic endpoints
-reject audio locally with a clear error. Only successfully completed streams
-produce replay state, so retries never depend on a partial or remote response
-chain.
+### 7.2 Provider failures, retry, and fallback
 
-**Semantic provider failures.** Non-success HTTP responses and structured
-errors inside all three streams pass through one classifier. Durable failure
-classes and their actions are:
+Provider errors are classified by meaning rather than raw status text:
 
-| Class | Meaning | Action |
-|---|---|---|
-| `context_length` | genuine context overflow | context recovery |
-| `unavailable`, `auth` | model unavailable or authorization failure | advance a floating candidate immediately |
-| `overloaded`, `rate_limit`, `transport` | transient remote/delivery failure | retry, then advance |
-| `request_too_large`, `bad_request`, `protocol` | permanent request or invalid response | fail immediately |
+| Class | Action |
+|---|---|
+| `context_length` | Apply context recovery when enabled. |
+| `unavailable`, `auth` | Advance a floating provider candidate immediately. |
+| `overloaded`, `rate_limit`, `transport` | Retry the candidate, then advance if floating. |
+| `request_too_large`, `bad_request`, `protocol` | Fail immediately. |
 
-Structured `code`/`type` values are compared case-insensitively and take
-precedence over status/message heuristics. Known context, model-not-found,
-authentication, rate-limit, server, and overload codes map directly. Statuses
-401/404/429 are auth/unavailable/rate-limit; 403 is auth only with explicit
-auth, permission, model-access, or model-not-found evidence; 413 is
-`request_too_large` unless request-error text contains both an
-overflow/maximum verb and `context`, `prompt`, or `input length`. Qwen
-`range of input length` wording is context overflow, while generic `too many
-tokens`, `reduce the amount`, and `reduce the length` are not. Exact bracketed
-stream statuses such as `[503]` are recognized; arbitrary three-digit prose is
-not. Mu unwraps JSON encoded in known `error.metadata.raw` gateway envelopes
-before classifying the upstream cause.
+Classification uses structured provider codes before status/message
+heuristics. Invalid or malformed successful responses are protocol failures,
+not accepted partial progress.
 
-**Retry and fallback.** One logical call on a fixed `provider/model` permits
-five retries after its initial attempt. A floating model permits three retries
-per candidate, including the final candidate. Every wire attempt is its own
-durable exchange; counters reset after non-resumable text/tool progress and
-candidate advancement, and compaction has a separate budget from the following
-agent call. Retry delays are deterministic `1s, 2s, 4s, 4s, 4s` with no jitter.
+A fixed provider/model permits five retries after the initial attempt. A
+floating model permits three retries per candidate. Delays are deterministic
+`1s, 2s, 4s, 4s, 4s`; a valid standard `Retry-After` may increase the wait.
+Requests exceeding the 60-second retry-after ceiling advance a floating choice
+or fail a fixed/final choice.
 
-For HTTP rate-limit/overload responses Mu reads standard `Retry-After` integer
-seconds or HTTP-date before consuming the body and waits for the maximum of
-that hint and local backoff. Malformed/past hints add no delay; vendor reset
-headers are ignored. A requested wait over 60 seconds advances a floating
-choice immediately without consuming a retry, or fails if no candidate
-remains; a fixed choice fails and reports the duration. Retry notices include
-the retry ordinal, budget, effective delay, and semantic error.
+One known Anthropic delivery anomaly is intentionally narrow: a delta that
+references a content block no longer open is treated as transport failure so
+the bounded retry/fallback path can discard the malformed partial response.
+Other invalid content-block sequencing remains a fatal protocol error.
 
-**Automatic resume.** Resume is a retry-budgeted continuation that preserves a
-complete problematic assistant response instead of discarding it. With
-`auto_resume:true`, Mu persists the response as `turn_state:"resume"` and sends
-the same turn again with a derived user
-`Continue the current task from where you stopped.` message. It has no retry
-delay, shares the current logical call's retry counter with transient provider
-errors, and reports
-`[mu] auto-resuming [n/limit] after incomplete response`. Normal text or tool
-progress resets that counter. On exhaustion Mu advances a floating provider
-candidate under the normal fallback policy and continues from the preserved
-history. If the choice is fixed or no candidate remains, Mu exits non-zero,
-leaves the latest turn dirty, and reports that `/retry` resumes it while a
-normal new prompt moves on. `final` suppresses intermediate notices and reports
-the unrecovered error through its normal non-zero error contract.
+### 7.3 Model selection
 
-**Model context window.** Compaction thresholds need the model's max context size.
-Source it from `config.jsonc`: each configured model entry carries a
-`context_window` integer. mu does not fetch model cards. If a model has no
-configured `context_window`, the threshold-based tiers (Tier 1 new-turn and
-Tier 2 request-level) are skipped for it and the Tier 3 API-error fallback is
-the only guard.
+- `provider/model[:effort]` is fixed.
+- `model[:effort]` expands to providers defining that model in merged
+  configuration order.
+- Model ids cannot contain `:`; it separates the optional effort.
+- `supported_efforts` is an ordered status/completion hint, not validation of
+  manually entered effort strings.
+- A session remembers the forward-only provider position for each floating
+  model across agent, compaction, and guardrail requests.
+- Fixed choices do not mutate floating positions.
+- Missing historical candidates are skipped; Mu never adds compatibility
+  aliases or rewrites the journal to recover them.
 
-Model and provider selection come from `config.jsonc`: a complete HTTP(S) or
-`http+unix` `endpoint`, optional env var holding the API key, and ordered
-provider/model definitions. If the global config file is missing, `mu` creates
-a starter `~/.mu/config.jsonc` automatically before loading configuration. The
-starter's first provider contains keyless 200K-context OpenCode Zen DeepSeek
-and Mimo models (with `api_key_env` omitted), so a freshly built `mu` runs a
-turn with no additional setup; it also ships a commented keyed provider
-example.
+Without an invocation override, an attached session's latest configured choice
+wins, then the prior `current-session` choice for a new session, then the first
+configured model.
 
-`provider/model[:effort]` is fixed. A bare `model[:effort]` expands to every
-configured provider containing that model in literal merged config order.
-Model ids cannot contain `:`; it is reserved for the effort separator.
-Fallback is forward-only and per-session. Provider-request history derives one
-remembered position per floating model id across agent, compaction, and
-guardrail calls. Effort is request metadata and does not reset the provider;
-switching models and returning resumes that model's position, while fixed
-references neither update nor erase floating positions. A new session starts
-each floating model at candidate zero. If a remembered provider disappears,
-that history entry is ignored and the next older valid position for the model
-is used; if none exists, the rebuilt chain starts at candidate zero. If the
-model has no candidates, explicit resolution fails. A historical choice with
-no candidates is unavailable and model selection continues. Status and
-provider origins render floating choices as `(provider)/model[:effort]`.
+### 7.4 Automatic resume
 
-Without an explicit override, model selection follows the attached session's
-latest choice if still configured, then the `current-session` target's latest
-choice if still configured and without its floating position, then the first
-configured fixed model. Mu does not rewrite an unavailable historical choice
-during resolution; the next successful provider request naturally becomes the
-latest choice. API keys are read from environment variables and are never
-persisted.
+An adapter may classify a complete response as resumable. With
+`auto_resume:false`, that response is an ordinary clean ending. With
+`auto_resume:true`, Mu persists it, derives
+`Continue the current task from where you stopped.`, and continues the same
+turn using the current retry quota.
 
-**No provider, hard fail.** If no provider is configured, a provider has no
-valid supported endpoint, or a non-empty configured key env var is unset, a *turn* invocation
-exits immediately with a non-zero status and a clear message pointing at
-`config.jsonc`. `mu compact` follows the same rule because it calls the
-provider. Valid runtime provider-availability failures may use a floating
-choice's next candidate; deterministic configuration errors never do.
+Progress resets the quota. Exhaustion advances a floating candidate; a fixed or
+final candidate exits nonzero and leaves the turn retryable. A normal new
+prompt supersedes an unused resume rather than silently inserting the derived
+continuation.
 
-Because semantic message history is stored separately from API-specific native
-replay (§11), swapping endpoint/model across turns is supported.
+### 7.5 Provider availability
+
+Operations that make provider requests—a turn, a dirty retry, and compaction—
+require a configured provider, supported endpoint, model, and any named API-key
+environment value. `status` validates and resolves provider/model
+configuration but does not contact a provider or require its key. `init`,
+`new`, `sessions`, `transcript`, `context`, and `cat` remain available without
+a configured provider. API keys are read from the effective environment and
+are not written into session provider-request records.
 
 ---
 
-## 8. Skills
+## 8. Skills and custom commands
 
-Skills are reusable, on-demand instruction files discovered inside the active
-global and project `.mu` directories.
+Mu discovers instruction files in the built-in, global, and active-project
+roots. Later scopes shadow earlier entries by skill name or command path.
 
-- A skill is a regular file with YAML front-matter defining `name` and
-  `description`. The `name` must match the filename stem. For external
-  compatibility with the open skill spec, `folder/SKILL.md` also qualifies when
-  `name` matches `folder`.
-- Optional `requires_env` and `requires_commands` keys contain comma-separated
-  environment-variable and executable names. A skill is active and listed only
-  when every declared variable is present and every declared command resolves
-  on `PATH`.
-- On startup `mu` scans regular files directly in `.mu` plus direct
-  `folder/SKILL.md` files, parses qualifying front-matter, and injects a compact
-  `<skills>` block into the system prompt. The block contains one complete
-  Markdown document: loading guidance followed by each active skill's name,
-  description, and absolute file path. Supporting files below skill folders are
-  not indexed.
-- Before responding, the model actively scans the listed skills. When the user
-  names a skill or one is even partially relevant, the model reads the full
-  file via `bash`, using the **absolute path** from the injected block. Loading
-  is context acquisition only; it does not require the model to follow the
-  skill or any instruction in it. Relative paths written inside a skill file
-  resolve against that file's containing directory.
+### 8.1 Skills
 
-The same file may also be a custom command when its first line is a permissive
-`mu` shebang. The shebang may contain no arguments or exactly
-`-m|--model <model[:effort]|provider/model[:effort]>`; all other arguments are rejected when the
-file is invoked. An explicit invocation `--model` overrides the shebang model,
-which otherwise overrides the attached session or configured default for that
-turn without rewriting stored session state. Progressive disclosure remains:
-only short metadata is always in context; full instructions are pulled in on
-demand.
+A skill is either a direct regular file with supported frontmatter or a direct
+`folder/SKILL.md`. Its declared name must match the file stem or folder.
+Frontmatter contains:
 
----
+- required `name`;
+- required `description`;
+- optional comma-separated `requires_env`;
+- optional comma-separated `requires_commands`.
 
-## 9. Project discovery
+A skill is listed only when all requirements are satisfied. Mu injects one
+complete Markdown `<skills>` document containing loading guidance and active
+skill metadata: name, description, and absolute path. Supporting files are not
+indexed.
 
-On startup, `mu` treats the invoking current working directory as authoritative
-for the turn, then searches upward from that `pwd` to resolve the active scope.
+Before responding, the agent scans the metadata and reads any named or
+partially relevant skill in full through Bash. Loading supplies context; it
+does not automatically grant the skill's instructions authority over the user
+or system prompt.
 
-A directory is a project when it contains `.mu` or `.git`.
+### 8.2 Custom commands
 
-If a directory contains only a `.git` marker, `.mu` is created there only when
-`mu` needs to write project state. Merely discovering or reading project
-information must not mutate the filesystem.
+A regular instruction file becomes a custom command when its first line is a
+supported Mu shebang. The shebang accepts no arguments or exactly
+`-m|--model <model-ref>`. Command names are relative instruction-root paths,
+including extensions.
 
-If the search reaches the user's home directory or the filesystem root without
-finding a project, `mu` uses the global scope rooted at `~/.mu`.
-
-Nested project merging is not supported. The first project found while walking
-upward is the active project.
-
-Standard linked Git worktrees share the primary checkout's project scope. If
-the discovered `.git` marker is a worktree pointer file and there is no closer
-`.mu`, Mu resolves its `commondir`; when that is the primary checkout's `.git`
-directory, the primary checkout is the project root. Project configuration,
-instructions, sessions, and runtime state therefore come from the primary
-checkout's `.mu`, while the invoking `pwd` and Git branch/dirty state remain
-tied to the linked checkout. The stable prompt names the Mu project root; each
-turn records and exposes its active Git worktree root and working directory.
-
-A `.mu` directory always wins over Git discovery, including at a linked
-worktree root; this provides an explicit independent project scope. Bare
-repositories, separate Git directories, malformed pointers, and other layouts
-without a standard primary `<project>/.git` fall back to the linked checkout as
-their project root without invoking Git to resolve it.
-
-The shell tool's working directory defaults to the process working directory,
-not the project root.
-
-The project-local directory is `.mu`. It may contain:
-
-- `config.jsonc`, optional project configuration.
-- `.env`, optional local environment values.
-- `AGENTS.md`, the project-local agent instructions.
-- optional instruction files that may be plain references, custom commands,
-  skills, or both.
-- `sessions/`, containing one append-only `<session-id>.jsonl` journal per
-  session.
-- `objects/`, containing immutable SHA-256-addressed attachments, native
-  provider JSON, and large semantic content.
-- `current-session`, a relative symlink to the last selected journal.
-- `.gitignore`, which ignores those runtime paths.
-
-Applet attachment staging and oversized-output spills use private paths under
-`$TMPDIR/mu`; they are ephemeral and have no retention promise.
-
-Project state is private to the project. A project should be movable and
-understandable by inspecting its `.mu` directory, while still avoiding committing
-volatile session state by default.
-
-Automatic project state creation writes only runtime state and `.gitignore`;
-it does not create project configuration. Explicit `mu init` creates a
-minimal config overlay and `.gitignore`, but no empty skills directory. It
-refuses to create a nested mu project inside another discovered project unless
-`--force` is supplied. Global configuration creation writes the full starter
-`config.jsonc` and no `.gitignore`.
+A file may be both a command and a skill. Command invocation strips the shebang
+and supported frontmatter before submitting the prompt. An explicit invocation
+model overrides the shebang model; otherwise the shebang is turn-local and does
+not rewrite session model state.
 
 ---
 
-## 10. Configuration
+## 9. Project discovery and resource layout
 
-`mu` has global configuration and optional project configuration. The global
-configuration directory is `~/.mu` by default (or `$MU_CONFIG_DIR` when set).
-Project configuration lives in the active project's `.mu` directory.
+Mu searches upward from the invoking working directory. The nearest directory
+containing `.mu` or `.git` is the active project. If none is found before the
+home/root boundary, Mu uses global scope.
 
-The global and project directories have the same conceptual shape:
+A `.mu` marker always wins. Standard linked Git worktrees without a closer
+`.mu` share the primary checkout's Mu scope while retaining the linked
+worktree's working directory and Git state. Unusual Git layouts fall back to
+the discovered checkout without invoking Git solely to resolve scope.
 
-```
-~/.mu/ or <project>/.mu/
-  config.jsonc      # provider endpoint + key env var + model; optional tuning
-  .env              # optional environment values for provider lookup + bash
-  AGENTS.md         # agent instructions, appended to system prompt
-  review.md         # optional command/skill/reference instruction file
-  sessions/         # one append-only JSONL journal per session
-  objects/          # immutable content-addressed bytes
-  current-session   # last selected session
-```
-
-When a project is active, global configuration is loaded first and project
-configuration is merged over it. Project values take precedence. Parent project
-configuration is not merged because nested projects are not supported. When the
-upwalk reaches home or root without finding a project, only global
-configuration is used.
-
-Optional `.env` files are loaded with the same scope precedence:
-process environment first, then global `.env`, then active-project `.env`.
-The resulting effective environment is used for provider API-key lookup and is
-passed to every `bash` tool process. Each file is parsed completely before any
-of its assignments are applied; duplicate assignments use the last value.
-
-The `.env` format is a restricted, source-compatible subset of shell assignment
-syntax. It is parsed as data and never executed:
+Project configuration, instructions, sessions, and objects are private to the
+active scope. Nested project configuration is not merged.
 
 ```text
-LINE       := BLANK | COMMENT | ASSIGNMENT
-ASSIGNMENT := ("export" [ \t]+)? NAME "=" VALUE
-NAME       := [A-Za-z_][A-Za-z0-9_]*
-VALUE      := BARE | SINGLE_QUOTED | DOUBLE_QUOTED
-BARE       := [A-Za-z0-9_./:@%+,=-]*
+<scope>/.mu/ or global config root
+  config.jsonc
+  .env
+  AGENTS.md
+  instruction files and skill folders
+  sessions/<session-id>.jsonl
+  objects/<sha256>
+  current-session
 ```
 
-Blank lines may contain spaces or tabs. Comments are full lines whose first
-non-whitespace character is `#`. Assignments cannot be indented and cannot have
-whitespace around `=`, trailing whitespace, inline comments, or trailing
-tokens. Bare values cover common tokens and paths; other values must be quoted.
-Single quotes preserve their contents literally and have no escape syntax.
-Double quotes support only `\"`, `\\`, `\$`, and ``\` ``; unescaped `$` and
-backticks are rejected. Quoting forms cannot be concatenated. Expansion,
-multiline values, line continuation, tilde expansion, globbing, shell operators,
-and ANSI-C quoting are unsupported. Invalid UTF-8, NUL, lone carriage returns,
-and all unsupported syntax are errors. LF and CRLF line endings are accepted,
-and the final line need not end in a newline.
+Discovery and read-only inspection do not create project files. Runtime paths
+appear only when needed. `mu init` explicitly creates minimal project metadata
+and refuses an already nested Mu project unless `--force` is supplied.
 
-Every accepted assignment produces the same string value when the file is
-sourced by Bash or Zsh. Mu treats `export` as an accepted, source-friendly prefix
-but otherwise ignores it because every loaded value is passed to child
-processes. A shell reader can use `set -a` while sourcing to export assignments
-that omit the prefix.
+### 9.1 Installed and portable resources
 
-Configuration and session storage are related but separate concepts. Config is
-merged across scopes; sessions live in exactly one scope under the discovered
-project's `.mu/sessions/` or global `~/.mu/sessions/`. Sessions from one scope
-are not visible in another.
+For an executable under `<prefix>/bin`, native resources live under
+`<prefix>/share/mu` and applet links under `<prefix>/libexec/mu`.
 
-- **config.jsonc** — JSON with comments and trailing commas. Concrete shape
-  (field names are normative):
-
-  ```jsonc
-  {
-    "output": "concise",                        // optional default density
-    "auto_resume": false,                       // continue resumable responses
-    "providers": {
-      "openai": {
-        "endpoint": "https://api.openai.com/v1/responses", // HTTP(S) URL or http+unix URI
-        "api_key_env": "OPENAI_API_KEY",         // optional: env var NAME, not the key
-        "models": {
-          "gpt-5.6-terra": {
-            "context_window": 1050000,           // needed for Tier-1 compaction & context%
-            // Optional ordered suggestions for status output and shell completion.
-            "supported_efforts": ["none", "low", "medium", "high", "xhigh", "max"],
-            // Optional non-secret native-replay compatibility group.
-            // Defaults to "openai/gpt-5.6-terra".
-            "replay_key": "openai-gpt-5.6"
-          }
-        }
-      }
-    },
-    "terminal_bell": {                           // optional terminal notification policy
-      "enabled": true,
-      "min_duration_ms": 10000
-    },
-    "compaction": {                         // optional
-      "enabled": true,
-      "soft_fraction": 0.70,
-      "hard_fraction": 0.85,
-      "hard_headroom_tokens": 48000
-    },
-    "limits": { "max_iterations": 50, "max_lines": 2000, "max_bytes": 51200, "max_line_bytes": 10240 },
-    "redaction": {
-      "env": ["*_API_KEY", "*_API_TOKEN", "*_AUTH_TOKEN"] // optional; these are the defaults
-    }
-  }
-  ```
-
-  At least one provider and one model are required; everything else has the
-  defaults shown. `output` accepts `final`, `concise`, `detail`, or `full`; an
-  explicit CLI `--output` overrides it. `auto_resume` is a boolean, defaults to
-  `false`, and has no CLI override. When enabled, complete provider responses
-  classified as resumable are preserved and continued within the same turn
-  using the automatic retry quota. When disabled, the same responses are
-  ordinary clean turn endings.
-  Provider and model order is meaningful:
-  project config entries are listed before inherited global entries, and model
-  suggestions and bare-model fallback candidates follow that order.
-  `supported_efforts` contains arbitrary
-  provider-defined strings and is advisory: it drives status output and shell
-  completion but does not restrict manually entered effort suffixes.
-  `replay_key` is an optional, non-empty, non-secret compatibility label for
-  opaque or signed protocol-native replay. Responses and Anthropic models share
-  native replay only when their APIs and current effective keys match; Chat
-  Completions ignores the key and always replays Chat `reasoning_content`.
-  Omission defaults to the literal `provider/model`. If global
-  `config.jsonc` is missing, `mu` creates a starter file automatically. `mu`
-  hard-fails on a turn if the required fields are missing or the API-key env var
-  is unset (§7). Effective configuration is a recursive overlay of bundled
-  defaults, global config, then project config. Bundled provider entries are
-  starter examples only and are not inherited by an existing global config.
-- **.env** — optional restricted shell-compatible assignment data. Values are
-  visible to `bash`; this is
-  convenience, not sandboxing. Values from provider `api_key_env` and
-  `redaction.env` are exact-value redacted from bash output before the output is
-  stored or shown to the model. Each `redaction.env` selector is either an exact
-  environment-variable name or a leading `*` followed by a non-empty literal
-  suffix, such as `*_TOKEN`. The suffix form matches all effective environment
-  variable names ending in that suffix. Other wildcard placements, multiple or
-  consecutive wildcards, and wildcard-only selectors are invalid. Matching is
-  case-sensitive. The default selectors are `*_API_KEY`, `*_API_TOKEN`, and
-  `*_AUTH_TOKEN`; an explicit empty list disables these defaults. Empty
-  redaction values are ignored with a warning. Short
-  redaction values are still redacted with a warning.
-- **AGENTS.md** — system-prompt addendum. Global instructions are loaded first;
-  active-project instructions are appended after them when a project is active.
-  Each file is wrapped in an `<agents_md>` element whose `scope` is `global` or
-  `project` and whose `path` is the absolute source path. Both are included;
-  "project overrides global" means later text wins by convention, not that
-  global instructions are dropped.
-
-The system prompt is intentionally minimal. It is assembled once when a session
-is created, persisted as the first message, and then loaded from session history
-for later turns. Existing sessions do not rebuild it when files or config change.
-The assembled prompt has this fixed order:
-
-1. A `<system_preamble>` block containing a short role/behavior preamble (a few
-   sentences). Illustrative:
-   ```
-   <system_preamble>
-   You are mu, a terminal agent. Exactly one function tool is available:
-   `bash`; do not call any other function tool. Inside `bash`, Mu provides
-   `apply_patch` for structured file edits, `edit` for exact replacements,
-   and `view_image` for loading an image into the tool result. These are shell
-   commands, not function tools.
-   Each bash call is isolated; pass `cwd` explicitly when needed. Keep
-   responses concise.
-   </system_preamble>
-   ```
-   The exact wording lives in `src/system_preamble.md`; keep it short.
-2. A `<runtime>` block of host-stable facts only, as plain `key: value` lines:
-   ```
-   <runtime>
-   os: linux (Ubuntu 24.04.2 LTS)
-   date: 2026-06-18
-   user: alice (uid 1000)
-   mu project root: /work/project
-   </runtime>
-   ```
-   On Linux, Mu appends the distribution's `PRETTY_NAME` from the standard
-   `os-release` file when available, falling back to `NAME`, then `ID`.
-   The Mu project root is included when project-scoped. Current working
-   directory and active Git worktree root are turn-level facts; semantic replay
-   derives the first location block and later change reminders from
-   `turn_started` (§11, "Agent environment context").
-3. The `<skills>` block (§8), or omitted if there are no skills. Its contents
-   form a complete Markdown document, with the loading instructions as leading
-   paragraphs and the skill metadata under an `Available skills` heading.
-   Metadata is merged from built-in, global, and active-project instruction
-   indexes. Priority is project > global/user > built-in for same-name skills
-   and commands.
-4. The global `AGENTS.md`, wrapped in `<agents_md scope="global"
-   path="/absolute/path/to/AGENTS.md">`, if the file exists.
-5. The project-local `AGENTS.md`, wrapped in `<agents_md scope="project"
-   path="/absolute/path/to/AGENTS.md">`, if a project is active and the file
-   exists.
-
-Tool definitions are **not** part of this prompt; they go in the API `tools`
-parameter (§7). Frontier models need little scaffolding, so the fixed parts (1–2)
-stay terse and `AGENTS.md` carries user customization.
+The optional `portable` build embeds built-ins. Each resource independently
+uses a valid installed directory when present; otherwise Mu materializes it
+under the platform user cache. Existing cache directories are authoritative
+and are not refreshed or repaired automatically. Mu never falls back to `/tmp`
+for package resources.
 
 ---
 
-## 11. State and persistence
+## 10. Configuration and prompt construction
 
-State is stored in exactly one active scope: `<project>/.mu` when a project is
-active, or `$MU_CONFIG_DIR` (normally `~/.mu`) otherwise. Each session is one
-append-only `sessions/<session-id>.jsonl` journal. Immutable bytes live in the
-flat `objects/<sha256>` store, and `current-session` is a relative symlink to
-the last selected journal.
+Global configuration lives in `~/.mu` or `$MU_CONFIG_DIR`; project
+configuration lives in the active project's `.mu`.
 
-The first journal line is immutable metadata with format/version, scoped
-session ID, and creation time. New journals use format version 2. Later lines
-have contiguous sequence numbers, timestamps, and a tagged event. Readers
-accept only the complete newline-terminated prefix. The next writer truncates
-an incomplete final line; malformed earlier data is corruption.
+Precedence is:
 
-Conceptual event model:
+1. bundled non-provider defaults;
+2. global `config.jsonc`;
+3. project `config.jsonc`.
 
-- **`system_prompt`** stores the exact initial model-visible prompt. Its runtime
-  block includes the stable Mu project root; there is no environment seed.
-- **`turn_started`** creates one submitted turn and owns its prompt, cwd, and
-  current Git worktree root. Retry reuses this turn and location.
-- **`provider_requested`** is synced before contact and identifies the turn,
-  purpose (`agent`, `compaction`, or `guardrail`), exchange, canonical model
-  reference, provider/API/endpoint/wire model, effort, and a versioned request
-  recipe. Agent recipes reference semantic context by sequence; their request
-  format versions the complete wire contract, including the fixed Bash schema.
-  The envelope retains the exact `prompt_cache_key` when the protocol sends one,
-  and the checksum verifies reconstructed native request JSON. Reconstruction
-  reuses that recorded key rather than deriving a current value; older keyless
-  recipes remain keyless.
-- **`provider_completed`** stores one assembled native response object plus the
-  semantic projection accepted at that time. An assistant projection contains
-  one ordered, tagged `items` array plus optional provider-native replay. The
-  closed item kinds are `reasoning` (optional open text), `text`, and
-  `bash_call`; each Bash call owns its Mu call ID, provider call ID, accepted
-  arguments, and optional declared risk. Array position is authoritative, so
-  there is no call-position or ordering-provenance field. The projection also
-  has a derived `turn_state`: `continue` for tool use, `resume` for a preserved
-  response that needs continuation, or `complete` for a clean ending.
-  Compaction projections contain summary and boundary; guardrail projections
-  contain the parsed authorization decision. The stored projection is
-  authoritative during normal loading and recovery; Mu never reruns a newer
-  provider parser while replaying a version-2 journal.
-- **`provider_failed`** and **`provider_interrupted`** terminate an exchange
-  without adding semantic assistant history. A failure records a stable error
-  class and may retain partial native JSON for audit.
-- **`bash_completed`** is the unique result for a durable Bash claim, including
-  outcome, output, exit code/duration where applicable, and ordered attachment
-  references.
+Objects merge recursively; scalar and array values replace inherited values.
+Provider/model object order is meaningful for defaults, fallback, status, and
+completion. Bundled provider entries seed a missing global config but do not
+silently merge into an existing one.
 
-There is no session row, message table, run/attempt entity, mutable title,
-updated timestamp, context-token cache, or owner PID. Session listing derives a
-short first-prompt preview and activity time by scanning journals. Old SQLite
-files are neither inspected nor migrated.
+[`src/default_config.jsonc`](src/default_config.jsonc) is the source of truth
+for field defaults. The durable field groups are:
 
-Version-1 JSONL journals are upgraded automatically, lazily, and per session
-when normal operation first loads their semantic history. `Store::open()` does
-not scan `sessions/`; untouched files remain byte-for-byte version 1, so v1 and
-v2 journals may coexist. `mu sessions` touches each journal it inspects and
-therefore upgrades those journals. Version-1 parsing and conversion exists only
-inside this migration path. It preserves all events and native replay, recovers
-Anthropic/Responses block order only when native data agrees with the old
-semantic projection, otherwise uses canonical reasoning/text/call order, and
-verifies every recorded request checksum before publication. There is no
-manual migration command, reverse/downgrade path, or backup journal.
+- `output` and `auto_resume`;
+- ordered `providers`, each with `endpoint`, optional `api_key_env`, and
+  ordered `models`;
+- per-model `context_window`, optional `supported_efforts`, and optional
+  `replay_key`;
+- `terminal_bell`;
+- `compaction`;
+- `limits`;
+- `redaction`;
+- `guardrail`.
 
-### Session mapping
+Unknown output names and removed aliases are configuration errors.
 
-`mu` maps each interactive shell instance to at most one active session:
+### 10.1 Environment overlay and redaction
 
-- **First-turn creation.** When a shell plugin has no attached session, it first
-  invokes `mu new`, captures and validates the single id printed by that
-  management command, and remembers it for the current scope. It then invokes
-  the first turn with `--session <id>` and any shell-owned model override. There
-  is no rendezvous file or inherited descriptor, and the id is never printed by
-  the turn itself.
-- **Attach / continue.** `MU_ZSH_SESSION_ID=<id>` and
-  `MU_FISH_SESSION_ID=<id>` seed their respective plugins with an existing
-  session, while `mu -s <id>` and `mu -c` handle one-shot re-entry from the
-  command line. `mu sessions` lists recent candidates.
-- **Per-turn lifecycle.** Each turn: open and nonblockingly lock the selected
-  journal → normalize its interrupted tail → replay semantic context → append
-  the turn and provider/tool events as they become durable → unlock on exit.
+Environment precedence is process, global `.env`, then project `.env`.
+Assignments from a later source replace earlier values. Mu parses `.env` as
+data and never executes it.
 
-Sessions are append-only logs; resuming replays events into the context window.
-Multiple shells holding different session files run concurrently.
+Accepted assignments have an optional `export` prefix, a shell identifier,
+`=`, and a bare, single-quoted, or restricted double-quoted value. Blank lines
+and full-line comments are allowed. Expansion, command substitution,
+multiline values, concatenated quoting, indentation, whitespace around `=`,
+inline comments, and other shell syntax are rejected. A file is fully parsed
+before any of its assignments apply.
 
-### Agent environment context
+The effective environment supplies provider keys, skill requirements, and Bash
+children. Values selected by provider `api_key_env` or `redaction.env` are
+exact-value redacted from captured Bash output before it is persisted or shown
+to the model. Selectors are exact names or one leading `*` suffix match.
 
-The stable system prompt names the Mu project root when project-scoped. Every
-`turn_started` records the submitted cwd and current Git worktree root.
-Context projection renders a full location block before the first retained
-turn and an XML system reminder whenever either value changes between retained
-turns. These reminders are derived model input, not stored messages, so
-compaction cannot split a prompt from its location. Retry restores the original
-turn cwd before provider or Bash work.
+This redaction is deliberately narrow. Mu cannot promise that arbitrary secrets
+printed by commands, embedded in prompts, or stored in unrelated files will
+never enter a journal.
 
-### Message-level persistence and interruption
+### 10.2 System prompt
 
-Persistence is at domain-event granularity. A completed assistant projection
-and every Bash claim it creates share one synced event before any claim
-executes. Each Bash result is a later synced event. Partial/in-flight assistant
-content may be retained only on a failed audit exchange and is never projected
-into semantic history.
+The system prompt is assembled when a session is created and then persisted.
+Existing sessions do not silently rebuild it after instruction/config changes.
+Its fixed order is:
 
-### Interrupted turns and retry
+1. `<system_preamble>` from `src/system_preamble.md`;
+2. `<runtime>` with stable host and project facts;
+3. one complete Markdown `<skills>` document when active skills exist;
+4. global `<agents_md>`;
+5. project `<agents_md>`.
 
-There is no separate stored turn-status flag. A latest turn is clean only when
-its latest accepted assistant projection has `turn_state:"complete"` and all of
-its Bash claims have results. A `turn_started` with no provider exchange, a
-failed/unmatched request, a latest `turn_state:"resume"`, or an unresolved claim
-is dirty.
+Current working directory and Git worktree root are turn facts, not permanent
+system facts. Context projection adds location information when retained turns
+move between directories.
 
-**Rationale — derive, don't store.** A separate boolean can drift out of sync
-with the messages (precisely in the crash cases that matter) and would risk
-"retrying" a turn that actually completed. The log is the single source of
-truth, so cleanliness is read from it and cannot desync.
+Tool definitions are sent through the provider's tool parameter, not copied
+into the system prompt.
 
-**Normalizing an interrupted tail.** Before any turn or retry runs, Mu truncates
-an incomplete final line, appends `provider_interrupted` for each unmatched
-request, and resolves every result-less Bash claim. A durable guardrail denial
-gets a deterministic error result; every other claim gets a conservative
-interrupted result. Calls that finished remain untouched. This is idempotent.
+### 10.3 Prompt sources and CLI surface
 
-**Rationale — treat result-less calls uniformly.** We do **not** try to tell a
-call that "never started" from one "started but killed": the window between
-persisting a tool-call request and spawning the process is sub-millisecond, and
-a write may have realized side effects. Assuming "maybe executed" and asking the
-agent to verify is the safe, simple choice — it removes the need for any
-per-call running marker.
+A default invocation runs one turn:
 
-**Recovery is not a special mode.** On the next invocation:
+```text
+mu [-s ID | -c] [-m MODEL] [-a FILE ...]
+   [-o final|concise|detail|full] [PROMPT_FILE_OR_COMMAND]
+```
 
-- A **new prompt** normalizes the tail, then appends on top and runs. This makes
-  the common "Ctrl-C to redirect" flow work: after interrupting, the user can
-  just type the next instruction; the agent sees the interrupted results and the
-  new prompt and continues or redirects. No forced retry, no stuck session.
-- **`mu retry`** normalizes the tail and re-runs the loop with *no* new prompt,
-  so the model continues the interrupted turn. `--model` overrides the latest
-  attempted model and `--output` overrides the merged config default for that
-  retry; each shell plugin's `/retry` command forwards active shell overrides.
-  Without an override, retry uses the session's latest requested canonical
-  model. It restores the original submitted cwd and refuses on a clean session
-  ("nothing to retry").
+Without a positional target, stdin is the complete prompt. A positional name
+first resolves to a discovered custom command unless it is an explicit path,
+then falls back to a prompt file. Exact management subcommand names win.
 
-A latest `turn_state:"resume"` is also retryable. Automatic resume and explicit
-`mu retry` add the derived user continuation only while resuming that same
-turn. For completed historical resume steps, context projection infers whether
-the continuation was actually used from a following same-turn agent request.
-If the user submits a normal prompt while the latest resume remains unused, the
-new `turn_started` supersedes it and no synthetic continuation is inserted.
+File-backed prompts strip a supported shebang. Terminal stdin is left unread;
+non-terminal stdin, when non-empty, is appended after `\n---\n\n` as a custom
+instruction.
 
-### Session concurrency ownership
+Management commands:
 
-Two processes targeting one session are serialized by
-`flock(LOCK_EX | LOCK_NB)` on that journal itself. Contention fails immediately
-with `session busy`; the descriptor remains open for the active operation, and
-the kernel releases it on exit or crash. No lock file, PID, lease, or stale
-owner recovery exists. After taking an exclusive lock, Mu compares the opened
-file's device/inode with the current journal path and retries a stale
-descriptor. Read-only commands may parse an already-v2 journal's complete
-prefix without taking the advisory lock; first touch of v1 briefly needs the
-exclusive lock.
+| Command | Durable behavior |
+|---|---|
+| `mu init` | Create minimal project metadata. |
+| `mu new` | Create a model-free session without selecting it. |
+| `mu sessions` | List recent active-scope sessions. |
+| `mu transcript` | Replay the persisted semantic transcript without contacting a provider; `--html` emits an xterm.js document that loads pinned assets when opened. |
+| `mu status` | Report resolved scope, selection, model, context, and optional expensive indexes. |
+| `mu context` | Show the system prompt Mu would assemble; `--export` emits user instructions and non-built-in skill guidance for a foreign agent. |
+| `mu cat` | Resolve and preview exact prompt input without provider contact or session creation. |
+| `mu retry` | Normalize and continue an interrupted turn without a new prompt; a clean session reports a no-op. |
+| `mu compact` | Force compaction, optionally using non-terminal stdin as a focus instruction. |
 
-Migration holds the locked v1 inode while writing and validating a mode-0600
-temporary file in the same directory. It locks the new inode before atomically
-renaming it over the journal, syncs the directory, then releases the old inode;
-a writer continues on the still-locked v2 descriptor without an unlock/reopen
-gap. Failure before rename leaves the v1 path untouched, and an incomplete
-final line is not copied. The narrow race with an already-running old binary
-that opened v1 but had not locked it is accepted; new binaries are protected by
-the post-lock inode check. Different sessions use different files and do not
-contend.
+Provider-free management commands do not contact a provider.
 
-There is no special atomic create-and-lock API. A freshly created session is
-not published through `current-session` before a turn owns its journal, and
-standalone `new` never selects it. Mu does not add coordination for the
-vanishingly rare case where another process scans and explicitly targets that
-otherwise unpublished ID between creation and the first lock.
+---
 
-### Context window and compaction
+## 11. State, recovery, and context
 
-**Token counting (source of truth).** Mu does not run a tokenizer. Adapters map
-native usage into input, output, total, cache-read, optional cache-write, and
-reasoning-output fields on each provider completion. A valid latest accepted
-agent total anchors context accounting; when total is omitted, reported input
-plus output is used. A total below those components is invalid. Later semantic
-messages add only their estimates to that anchor. An unchanged anchor is
-reported exactly; an anchor plus a suffix is estimated.
+State lives in one active scope. A session journal begins with immutable
+metadata and then contiguous, timestamped events. Readers accept only the
+complete newline-terminated prefix; the next writer may truncate an incomplete
+final line, while malformed earlier content is corruption.
 
-A `bytes ÷ 4` approximation (`approx_tokens(s) = ceil(len_bytes(s) / 4)`) is
-used for text where no API figure exists yet. Media receives a bounded nonzero
-estimate. Fallback estimation follows the active API's replay lowering, so
-Responses and Anthropic native replay replaces its semantic assistant
-projection rather than being counted in addition to it. The reported anchor is
-compatible across providers only when API, model id, and effective `replay_key`
-match; otherwise mu estimates the full active projection.
+The durable event model is:
 
-Context management then uses a **three-tier strategy**, from most to least
-graceful:
+- **`system_prompt`** — exact initial model-visible prompt.
+- **`turn_started`** — submitted prompt, working directory, Git worktree root,
+  and attachment references.
+- **`provider_requested`** — request purpose, resolved provider/model origin,
+  and a checksummed recipe sufficient to reconstruct the native request.
+- **`provider_completed`** — completed native response and accepted semantic
+  projection.
+- **`provider_failed` / `provider_interrupted`** — terminal audit outcome with
+  no semantic assistant message.
+- **`bash_completed`** — unique result and attachment references for one
+  durable Bash claim.
 
-Setting `compaction.enabled` to `false` disables all three automatic tiers:
-thresholds are ignored and a provider context-length failure aborts the turn.
+Assistant projections contain one ordered item array and a derived turn state:
+continue for tool use, resume for preserved incomplete work, or complete.
+Array position is authoritative.
+
+There is no mutable session row, title, cached status flag, owner PID, or
+separate run entity. Session listings and status are projections of journal
+events.
+
+### 11.1 Session selection and ownership
+
+- `--session ID` selects an existing active-scope journal or exits with code 2.
+- `--continue` follows `current-session`, creating a session only when the
+  pointer is absent or broken.
+- No selection creates a fresh session for a turn.
+- `mu new` creates but does not select a session.
+- `current-session` changes only after a submitted turn is durable.
+
+An exclusive, nonblocking advisory lock on the journal owns a mutable
+operation. The descriptor remains open for the operation and the kernel
+releases it on exit. Mu does not use PID leases or stale-owner recovery.
+
+### 11.2 Cleanliness and interrupted-tail normalization
+
+A latest turn is clean only when its latest accepted assistant state is
+complete and all Bash claims have results. Unmatched provider requests,
+resume states, and result-less claims make it dirty.
+
+Before a turn or retry, Mu:
+
+- removes an incomplete final record;
+- appends interruption outcomes for unmatched provider requests;
+- gives each result-less Bash claim a deterministic denied result or a
+  conservative interrupted result.
+
+This normalization is idempotent.
+
+Mu deliberately does not guess whether a result-less claim began execution.
+Side effects may occur between durable claim publication and process tracking,
+so recovery says "possibly executed" and lets the agent verify rather than
+risk repeating work.
+
+### 11.3 Semantic context and transcripts
+
+Context projection uses:
+
+- the persisted system prompt;
+- the latest committed compaction summary;
+- retained turn prompts and derived location reminders;
+- accepted assistant items;
+- Bash results.
+
+Provider failures and partial native responses remain audit-only.
+
+`mu transcript` is a semantic session transcript, not a dump of the journal.
+It includes user prompts, assistant text, and paired Bash calls/results, while
+omitting system prompts, compaction internals, provider payloads, and metadata.
+Only open Chat reasoning is displayable, and only in `full`; opaque Responses
+and Anthropic reasoning remains omitted. Stored redaction is authoritative.
+
+Transcript output reuses the normal output densities. It reconstructs the
+historical prompt model, working directory, and prior context usage when the
+journal contains enough information. HTML output is a renderer replay, not a
+second transcript model.
+
+### 11.4 Usage accounting
+
+Provider-reported usage is authoritative when available. Context fullness uses
+the latest compatible accepted agent response's total, not a sum of every
+iteration. Turn input/output figures sum the exchanges in that turn and account
+for provider-reported cache reads/writes separately.
+
+Later semantic input adds an estimate to a compatible reported anchor. If API,
+model id, or effective replay key changes, Mu estimates the complete active
+projection. Text estimation uses a simple bytes/4 approximation; media has a
+bounded nonzero estimate. Mu does not ship a tokenizer.
+
+### 11.5 Compaction
+
+Setting `compaction.enabled:false` disables every automatic compaction tier.
 Manual `mu compact` remains available.
 
-**Tier 1 — graceful new-turn compaction.** After a new prompt is durably
-appended but before its first provider request, Mu compares current reported
-usage or the projected bytes÷4 estimate against:
+Automatic context management has three tiers:
 
-```text
-floor(context_window * configured_soft_fraction)
-```
+1. **Soft new-turn threshold.** Before a new turn's first provider request,
+   compact when context is strictly above
+   `floor(context_window * soft_fraction)`.
+2. **Hard request threshold.** Before a changed semantic agent request, compact
+   when context is strictly above the lower of the configured hard fraction and
+   configured headroom boundary.
+3. **Reactive overflow.** On a classified provider context-length error,
+   compact once and retry when recovery is enabled and useful.
 
-Compaction runs only when context tokens are strictly greater than this
-threshold. At the default 70%, a 1,000,000-token window triggers above 700,000
-and a 200,000-token window above 140,000. `mu retry` resumes an existing turn
-and does not run this soft boundary check. While an idle attached session is
-over the soft threshold, the zsh and Fish prompts append `[to compact]`; sending
-the next prompt performs the compaction.
+An unchanged retry of the same provider request does not repeatedly compact.
+Provider advancement returns through the hard-threshold gate because context
+windows may differ.
 
-**Tier 2 — hard request-level compaction.** A single turn can add many large
-tool results, so every new semantic agent request also checks:
+Compaction:
 
-```text
-min(floor(context_window * configured_hard_fraction),
-    context_window.saturating_sub(configured_hard_headroom_tokens))
-```
+- cuts only before whole turns;
+- keeps the smallest suffix containing at least five user/Bash requests;
+- summarizes only history before that cut;
+- uses a compaction-specific prompt rather than the session system prompt;
+- preserves semantic item order while omitting opaque reasoning;
+- retains images and uses protocol-appropriate handling for unsupported audio;
+- appends a summary projection without deleting earlier audit events;
+- rejects an empty summary or candidate context still above the soft target.
 
-With the defaults of 85% and 48,000 tokens, a 1,000,000-token window has a hard
-threshold of 850,000 and a 200,000-token window has a threshold of 152,000. It
-applies to the first request, each request after tool results or assistant
-content changed context, and the first request after candidate advancement
-changed the active context window. An unchanged retry on the same candidate
-bypasses the gate. Provider advancement returns to this gate rather than
-contacting the next candidate directly.
+Manual compaction accepts an optional focus instruction but must still preserve
+all material needed to continue correctly. A failed or inapplicable compaction
+does not replace the prior summary boundary.
 
-**Tier 3 — one reactive compaction on API overflow.** If the provider returns a
-context-length error and the current semantic context has not already been
-compacted, mu compacts once and retries. If compaction cannot remove history,
-the compaction request itself overflows, or the unchanged post-compaction
-request still overflows, the turn aborts without provider fallback. New
-assistant/tool content permits a later recovery cycle. The latest compaction
-result is tracked until semantic context changes: `Inapplicable` reports
-`context length exceeded and no history can be compacted` without another
-attempt; `Applied` followed by another overflow reports `context length
-exceeded immediately after compaction`.
+### 11.6 Bounds and exit status
 
-**Compaction algorithm** (same in all tiers): summarize everything up to a cut
-point into one compaction projection, keeping the smallest suffix of whole
-turns containing at least five requests. Each submitted turn prompt and each
-Bash tool call counts as one request. Five turns without tool calls are
-therefore retained, while a current turn with five tool calls satisfies the
-budget by itself. Derived location reminders do not consume the retention
-budget. If there is no history before the retained turns, the outcome is
-`Inapplicable`; only `Applied` changes context. The cut is always immediately
-before a turn, so a prompt/location pair or tool claim/result pair is never
-split.
+`limits.max_iterations` bounds tool round-trips in one turn. Reaching it exits
+nonzero while retaining every completed message and Bash result.
 
-The summarizer uses a small compaction-specific system prompt rather than the
-session's agent system prompt, so tool, skill, runtime, and service inventories
-are not duplicated into the summary unless the user's work made them relevant.
-The summarization *input* clamps each text entry (tool results hardest), reducing
-the risk that one large entry makes the request overflow without globally
-bounding the request. Assistant text and Bash-call descriptions enter it in
-semantic item order; opaque reasoning is omitted. Images retain their semantic
-positions and are sent through every API. Audio is sent through Chat
-Completions; Responses and Anthropic instead receive an in-place text note with
-its filename, media type, and byte size because those APIs do not support audio
-input. The stored transcript is untouched. The next context projection loads
-the latest summary plus later semantic events, so compacted history is naturally
-excluded without deleting anything. Earlier journal events remain available
-for audit. When a prior summary exists, only semantic events after its boundary
-and before the new cut are incorporated into the updated summary.
-The soft threshold is also the post-compaction target. A useful summary is
-normally expected to reduce context well below it; the target check is primarily
-a safety net against ineffective compaction. Before committing the summary
-projection, mu builds that candidate context and estimates its tokens. If the
-estimate is strictly greater than the active model's soft threshold, the
-compaction exchange is recorded as failed with class
-`insufficient_compaction`; the candidate summary and boundary are not
-committed, so the prior semantic context and context-usage status remain
-authoritative. This validation is shared by manual, soft, hard, and reactive
-compaction. When the active model has no configured context window, no soft
-threshold exists and this sufficiency check is unavailable.
+Exit status:
 
-**Manual compaction.** `mu compact` forces compaction of the current session on
-demand; `-s|--session <id>` selects another session in the active scope.
-Like a prompt file or custom command, it leaves terminal stdin alone and reads
-non-terminal stdin through EOF as an optional verbatim custom instruction. The
-instruction gives relevant material more of the available detail and summary
-budget, while the summarizer must still preserve every important fact needed to
-continue correctly. In either shell prompt mode, `/compact <instruction>` pipes
-the text after the command through this same stdin path. Automatic compaction
-never supplies a custom focus. Interactive compaction shows one mutable
-`[compacting <duration>]` line. Successful automatic and manual compaction
-replace it with one committed result line containing the reported
-pre-compaction percentage, estimated post-compaction percentage, and elapsed
-time. Redirected output emits one plain status line. Provider failure, an empty
-summary, or an insufficient candidate context exits non-zero and never reports
-success. An inapplicable manual request reports `compaction inapplicable: no
-history exists before the N retained turns`, where `N` is the retained suffix
-size selected by the request budget.
+- `0`: success, including a clean `mu retry` no-op;
+- `1`: general, configuration, or unrecovered provider error;
+- `2`: session busy or explicit session not found;
+- `128 + signal`: forwarded terminating signal, commonly 130 for SIGINT and
+  143 for SIGTERM.
 
-### Agent-loop bounds
-
-The agent loop runs until the model stops requesting tools. A configurable
-**max-iterations** cap (default **50** tool round-trips, `limits.max_iterations`)
-bounds a runaway loop: on reaching it, `mu` stops, emits a clear notice, and
-exits non-zero, leaving all completed messages persisted so the user can inspect
-and re-prompt.
-
-**Exit codes.** `0` success; `1` general/config/provider error; `2` session busy
-(lock held) or `--session` not found; `128 + signal` when a forwarded
-terminating signal ends the turn — most commonly `130` for SIGINT (the shell's
-default for Ctrl-C), and `143` for SIGTERM. A signalled exit takes precedence
-over the generic error code even when the interruption first surfaces as a turn
-error. When enabled by the output density, the summary line is printed only on
-exit `0`.
-
-### Abort, pause, and resume
-
-Abort means the current language-model request or tool execution is cancelled
-when possible, the turn stops, and `mu` exits. Abort is an explicit interruption
-of work in progress; completed messages remain persisted and partial messages
-are discarded as described above. The interrupted turn leaves the session
-"unclean"; it is resumed by `mu retry` (continue with no new prompt) or
-superseded by simply sending the next prompt (§11, "Interrupted turns and
-retry").
-
-Pausing at arbitrary points and resuming a partially completed model stream are
-not supported: resume always restarts from the last completed message, with any
-in-flight tool call recorded as interrupted.
+Mu cannot pause and resume a partial provider stream. Resume always restarts
+from the last completed semantic boundary.
 
 ---
 
 ## 12. Safety posture
 
-`mu` is deliberately **unsandboxed**. Commands execute directly through `bash`,
-and files can be read or modified with the user's permissions. There are no
-interactive per-action confirmation prompts. The `risk` field drives the
-destructive-action guardrail described below, but it is not a sandbox boundary.
+Mu is deliberately unsandboxed. Bash has the invoking user's filesystem,
+network, process, and credential access. The terminal transcript and journal
+improve visibility and recovery; they do not make execution safe.
 
-The protections that remain are cheap and non-intrusive:
+Durable safeguards are:
 
-- **Visibility is the safeguard.** Output is non-magical and append-only. The
-  transcript records what ran and its captured result; terminal scrollback and
-  the session journal provide the audit trail.
-- **Interruptibility.** Because `mu` runs as a foreground job, Ctrl-C is the
-  practical "stop" button: it stops launching new work, interrupts every active
-  tool process group, drains visible output where possible, persists completed
-  messages/tool results, and exits non-zero.
-- **Secrets** are never persisted by `mu`; provider keys come from the
-  environment or `config.jsonc`, never the session journal.
-- **External content** (file contents, command output, fetched pages, web search
-  results from CLIs, etc.) is treated as untrusted data, not as instructions to
-  follow.
+- append-only visibility of accepted assistant actions and captured results;
+- foreground interruptibility and process-group termination;
+- output bounds and exact-value redaction for configured environment values;
+- a review gate for calls declared `destructive`;
+- treating external content as untrusted data in the agent prompt.
 
-Sandboxing and interactive approvals are not part of the product. Guardrail
-review can prevent a declared destructive action from executing, but it does
-not constrain commands declared at other risk levels and is not a sandbox.
+The agent can misclassify risk, the reviewer can be wrong, commands can hide
+effects, and unselected secrets can enter output. Users must treat Mu as code
+execution with their own authority.
 
 ### 12.1 Guardrail
 
-An opt-out review gate for destructive commands. Unless disabled, a separate
-model call assesses each `bash` call whose declared `risk` is `"destructive"`
-before execution. The reviewer returns `risk_level`, `user_auth_level`, and
-`reason`; the action executes only if `user_auth_level >= risk_level` on a fixed
-ordinal scale. There is no interactive y/n prompt — denied actions return as
-tool errors so the agent can adapt or ask the user.
+When enabled, each Bash call declared `destructive` receives a separate
+provider request before execution. The reviewer has no tools and sees a
+budgeted semantic transcript plus bounded action JSON. It returns `risk_level`,
+`user_auth_level`, and a reason.
 
-**Ordinal scale.** Risk ranks are `low`(0), `medium`(1), `high`(2), and
-`critical`(4). Authorization ranks are `unknown`(0), `low`(1), `medium`(2),
-`high`(3), and `explicit`(4). The gap before `critical` ensures only explicit
-authorization can approve a critical-risk action.
+Execution requires authorization rank at least risk rank:
 
-`user_auth_level >= risk_level` yields:
-- `low`(0): allowed by any auth level including `unknown`(0).
-- `medium`(1): requires at least `low`.
-- `high`(2): requires at least `medium`.
-- `critical`(4): requires `explicit` — the only level that can approve it.
+| Risk | Rank | Minimum authorization |
+|---|---:|---|
+| `low` | 0 | `unknown` |
+| `medium` | 1 | `low` |
+| `high` | 2 | `medium` |
+| `critical` | 4 | `explicit` |
 
-**Reviewer call.** A separate non-streaming chat-completions call inside the
-turn process (mu is per-turn, so there is no persistent reviewer session). The
-reviewer uses the same provider and API key as the primary agent; the model
-defaults to the active turn model but can be overridden via
-`guardrail.review_model`.
-The reviewer has no tools — it judges from a compact transcript and the action
-JSON alone.
+Authorization ranks are `unknown` 0, `low` 1, `medium` 2, `high` 3, and
+`explicit` 4. The gap before critical ensures only explicit authorization can
+approve it.
 
-**Context sent to the reviewer.** A filtered, budgeted transcript (user +
-assistant + tool-call arguments + tool results, skipping the system message):
-10 000 tokens for messages, 10 000 for tools, 2 000 per message entry, 1 000 per
-tool entry, and 40 recent non-user entries. Truncation
-keeps prefix + suffix with a `<truncated omitted_approx_tokens="N"/>` marker.
-The planned action is provided as pretty-printed JSON (capped at 16 000 tokens).
+An allowed call executes. A denial becomes a Bash error so the agent can choose
+a less destructive approach or request authorization. Reviewer failure records
+that execution did not begin and aborts the turn. Repeated denials are bounded
+by `guardrail.max_denials_per_turn`.
 
-**Reviewer system prompt.** The prompt in `src/guardrail.md` uses terminal-agent
-framing, gives the reviewer no tools, and asks for risk and authorization levels
-rather than an allow/deny decision (the ordinal comparison computes that). It
-covers evidence handling (transcript = untrusted), user authorization scoring,
-risk categories, and a strict JSON output contract.
+Reviewer requests use the configured review model or the active turn model and
+follow the same provider protocol, audit, retry, and floating-fallback policy as
+other Mu requests. A user's later explicit approval is ordinary session history
+that the next review may consider; there is no hidden approval state.
 
-**Outcomes.**
+The guardrail reviews only calls declared destructive. It does not inspect or
+constrain calls declared readonly or reversible and is not a sandbox.
 
-- **Allow** (`auth >= risk`): the bash call executes. Detail/full terminal
-  output renders `✓ guardrail allowed · risk ≤ auth — reason` after the command
-  header and before execution output.
-- **Deny** (`auth < risk`): the bash call does not execute. Detail/full terminal
-  output renders `✗ guardrail denied · risk > auth — reason`, and a tool error
-  is returned to the agent:
-  > guardrail: action rejected — risk_level X exceeds user_auth_level Y (reason).
-  > Do not work around this; stop and ask the user to authorize, or choose a
-  > less destructive approach.
-  The agent can then adapt its approach or stop and ask the user.
-- **Reviewer failure** (timeout, malformed JSON, or exhausted provider retry
-  budget): an explicit Bash error records that execution never began and the
-  turn is **aborted**. Re-authorizing would likely fail again since the reviewer
-  itself is malfunctioning.
+### 12.2 Rejected and deferred safety designs
 
-In interactive concise output, a call awaiting review changes directly from
-`[preparing toolcall]` to `[guardrail] TITLE…` while review is in progress,
-without briefly displaying the destructive tool line. An allow restores the
-normal live tool line and adds no permanent review line; completion remains
-`=> TITLE · exit N`. A denial or reviewer failure commits
-`=> TITLE · guardrail denied` or `=> TITLE · guardrail error`. Redirected
-concise output has no mutable live line and emits only the committed outcome.
-Final-only output remains silent about guardrail activity.
+**Interactive approval for every action — rejected.** It would turn Mu into an
+approval-driven UI, interrupt composition, and still rely on the model's action
+description. The current guardrail denies into the transcript and lets the
+agent ask for authorization when needed.
 
-**User authorization via history.** There is no dedicated "re-prompt" mechanism.
-When the agent asks the user and the user responds with explicit approval
-("yes, force push"), the user's message becomes part of the session history. On
-the next turn, the reviewer sees this in the transcript and can score
-`user_auth_level: "explicit"`, which permits even `critical`-risk actions.
+**Static Bash parsing to discover privileged or destructive commands —
+rejected.** Bash permits variables, functions, aliases, sourced files, nested
+interpreters, and generated commands. A partial parser would be complex and
+would still miss the cases where confidence matters.
 
-**Denial limit.** The turn counts all guardrail denials and aborts with a clear
-notice when `guardrail.max_denials_per_turn` is reached. The default is 3. This
-prevents repeated destructive attempts without a second sliding-window policy;
-the general iteration limit remains an independent bound.
+**A syscall-triggered seccomp reviewer — deferred, with no implementation
+commitment.** It is attractive because review could occur immediately before a
+watched effect, but it does not provide a coherent general Bash boundary:
 
-**Retry.** Reviewer provider calls use the same availability policy as agent
-calls: five transient retries for a fixed model or three per candidate for a
-floating model, with the shared deterministic delay and `Retry-After` policy.
-Parse failures retain a separate three-attempt semantic budget. Context-length
-errors are not retried. A floating guardrail request reads and advances the
-same per-session, per-model position as agent and compaction requests; a fixed
-review model leaves every floating position unchanged.
+- syscall names do not reliably classify intent, and important effects bypass
+  any practical finite trigger list;
+- unprivileged filter installation normally requires irreversible
+  `no_new_privs`, breaking later setuid/file-capability elevation such as
+  `sudo`;
+- every descendant inheriting the filter depends on a live notification
+  listener, including background and detached descendants that outlive a turn;
+- nested Mu processes cannot independently stack notification listeners in the
+  simple model;
+- a persistent broker adds supervision and recovery, while a privileged broker
+  creates a new high-value security boundary.
 
-**Config.**
+Approval cannot remove an inherited seccomp filter, and restarting a command
+outside the filter after a trigger could repeat earlier side effects. These are
+architectural conflicts, not missing edge-case patches.
 
-```jsonc
-"guardrail": {
-  "enabled": true,                           // default on; set false to opt out
-  "review_model": null,                      // null -> same as active turn model
-  "timeout_seconds": 120,
-  "max_denials_per_turn": 3
-}
-```
-
-**Audit.** Before each reviewer request, Mu syncs a `provider_requested` event
-with purpose `guardrail`, the Bash call ID and attempt, canonical model origin,
-and a checksummed request recipe. Completion stores assembled native response
-JSON and the parsed risk/auth/outcome/reason in one `provider_completed` event;
-failure stores a classified terminal event. An unmatched request remains
-visible and is normalized as interrupted on the next open.
-
-**Concurrency.** Guardrail only targets `destructive` calls, which are always
-sequential (concurrent batches only run `readonly` tools). There is no
-interaction with the concurrent execution path.
-
-**Undecided design — runtime-triggered review.** This is a design note, not
-current behavior or an implementation commitment. A possible extension would
-keep the declared-risk gate above while also running Linux Bash children under
-a seccomp user-notification filter. When a selected syscall is attempted, the
-kernel would block it and notify `mu`; the reviewer would assess the original,
-already-persisted Bash tool call and conversation context, not the syscall or
-its pointer arguments. An allow would approve the whole tool call, resume the
-blocked syscall, and automatically pass later watched syscalls from that call.
-A deny or reviewer failure would stop the running tool call before the
-triggering syscall executes. Effects completed before the first watched
-syscall would remain and must be reported as possible partial effects.
-
-Candidate triggers include destructive filesystem operations, host-control
-operations, and `setsid`. Watching `setsid` would review the supported
-background-task recipe immediately before it detaches. It would not identify
-every possible daemonization technique, and syscall selection remains a
-coverage-versus-false-trigger tradeoff: for example, `connect` cannot
-distinguish a read-only HTTP request from an upload, while unlink and rename
-also occur in benign compiler and atomic-save workflows. Only the first
-watched syscall would invoke the reviewer for a tool call.
-
-Seccomp user notification is Linux-only but does not inherently require root:
-an unprivileged child can install the filter after setting `no_new_privs`.
-That setting prevents later privilege gain through setuid/setgid executables
-and file capabilities, so it can change commands such as `sudo`. Any design
-must be optional, compile to the existing behavior on unsupported platforms,
-and define whether an explicitly enabled but unavailable runtime trigger fails
-open or closed. Detached descendants inherit the filter, so approved
-background calls also require a listener process that remains available to
-pass later notifications after the per-turn `mu` process exits.
-
-**Candidate review-policy map.** Instead of combining the current
-`guardrail.enabled` switch with a second deferred-review switch, configuration
-could map each declared risk independently to one of three timings:
-
-```jsonc
-"guardrail": {
-  "policy": {
-    "readonly": "skip",
-    "reversible": "skip",
-    "destructive": "immediate"
-  },
-  "review_model": null,
-  "timeout_seconds": 120,
-  "max_denials_per_turn": 3
-}
-```
-
-`skip` means no review or notification filter, `defer` means review only after
-a selected runtime trigger, and `immediate` means review before execution and
-then run without the filter. Setting every class to `skip` could replace the
-global disable switch. Open questions are whether this should replace
-`enabled` outright, what bundled defaults should be, and whether an unavailable
-`defer` policy should promote to `immediate`, fail the call, or weaken to
-`skip`. Promotion preserves protection and cross-platform behavior but can add
-unexpected latency; weakening to `skip` can silently defeat the user's intent.
-
-**Candidate per-call escalation.** Some commands must avoid the deferred path
-even when their declared risk maps to `defer`: privilege-changing commands can
-be broken by `no_new_privs`, and detached processes inherit the filter. One
-candidate is an optional `review_before_execution` Boolean on the Bash call. It
-would default false and only promote `defer` to `immediate`; it could not relax
-an `immediate` policy or override a user-selected `skip`. This keeps the
-declared risk accurate, but adds a niche, platform-motivated field to every Bash
-schema. Its name is also misleading when the configured policy is `skip`,
-because setting it would still not cause review.
-
-Another candidate is a fourth Bash `risk` value such as `needs-review` or
-`review-required`. It would request immediate review and filter-free execution
-without calling the action destructive. This keeps the common call shape to
-one classification field and works independently of deferred-review platform
-support. The tradeoff is semantic impurity: `readonly`, `reversible`, and
-`destructive` describe recoverability, while `needs-review` describes routing
-and loses the agent's recoverability assessment. The reviewer can still record
-the assessed risk. Audit storage could project this as `declared_risk = NULL`
-plus a review-request marker rather than treating it as a fourth risk rank.
-
-If `needs-review` is configurable, its policy should accept only `skip` or
-`immediate`; `defer` contradicts why the value exists. If it is hard-coded to
-`immediate`, an all-`skip` policy no longer fully disables reviews. That
-authority question remains open. `unsandbox` is a poor candidate name: this
-feature is not a sandbox, the term exposes an implementation detail, and it
-frames the value as a general escape hatch rather than a request for review.
-
-**Candidate automatic routing.** Mu could statically match or parse explicit
-commands such as `sudo`, `doas`, `pkexec`, and `setsid` and promote them to
-immediate review. This avoids a tool-schema addition, and false positives only
-cause earlier review. It cannot reliably cover dynamic Bash (`"$runner"`,
-functions, aliases, or nested scripts), adds a shell-analysis subsystem for
-niche cases, and has been identified as an undesirable direction. It must not
-be presented as complete enforcement.
-
-**`sudo` and privilege elevation.** Once an unprivileged child sets
-`no_new_privs`, it cannot clear the flag, and setuid/setgid executables and file
-capabilities cannot elevate it. A deferred command therefore cannot encounter
-`sudo` and then transparently switch to an unfiltered execution path. Candidate
-approaches are:
-
-- route the whole call to immediate review before spawn via a Boolean or
-  `needs-review` sentinel;
-- use best-effort static command detection, accepting missed dynamic cases;
-- let missed cases fail under `no_new_privs` with a targeted diagnostic;
-- introduce an unfiltered execution broker that recreates the command's cwd,
-  environment, stdio, process group, and exit status outside the filtered
-  process tree.
-
-The broker is substantially more complex and creates a deliberate filter escape
-surface. Killing and automatically restarting the whole Bash call after
-discovering `sudo` is also unsafe: effects may already have occurred and would
-be repeated. A privileged helper that installs seccomp without `no_new_privs`
-would be an even larger security and deployment commitment.
-
-**`setsid` and detached descendants.** `setsid` can itself be watched and
-reviewed immediately before detachment, but allow cannot remove an inherited
-seccomp filter. Candidate outcomes are:
-
-- route known background launches to immediate review before spawn;
-- reject a deferred `setsid` call before detachment and require a new
-  immediate-review call;
-- hand the listener to a persistent drainer/broker that outlives the Bash tool
-  call and automatically continues later notifications after the one whole-call
-  approval.
-
-The first two keep listener lifetime bounded but require an explicit routing
-mechanism. The broker supports transparent detachment but adds process
-supervision, cleanup, crash recovery, and shutdown concerns. Watching `setsid`
-does not identify every daemonization technique.
-
-**Candidate observe mode.** A continue-only mode can measure syscall frequency,
-latency, and false-trigger rates without invoking the reviewer. It is not truly
-behavior-neutral: it still installs seccomp, sets `no_new_privs`, exercises the
-supervisor, and can break commands if the implementation is wrong. It could be
-a user-visible `shadow` configuration, but that adds permanent configuration and
-audit surface. A narrower candidate is a standalone spike or development-only
-observe harness that is removed or kept out of the product after measurement.
-
-**Reframed fundamental constraints.** Two constraints define the realistic
-scope of deferred review:
-
-1. An ordinary unprivileged child must set `no_new_privs` before installing a
-   seccomp filter. A caller with `CAP_SYS_ADMIN` in its user namespace can
-   install the filter without that flag, so `no_new_privs` is not an intrinsic
-   seccomp-notification requirement; it is the normal unprivileged deployment
-   requirement. The flag is irreversible and inherited, so it prevents later
-   privilege gain through all setuid/setgid and file-capability programs, not
-   only `sudo` and `pkexec`.
-2. A listener must remain available until every task inheriting the filter has
-   exited. It need not be the original Mu thread or process—the fd can be handed
-   to a broker—but approval does not remove or weaken the filter. Every later
-   watched syscall still needs a response, and listener loss makes it fail with
-   `ENOSYS`.
-
-The second constraint is broader than `setsid`. A descendant can outlive the
-launching shell through ordinary backgrounding with redirected stdio,
-double-forking, process-group changes, or another daemonization technique. A
-tool call can therefore appear complete while a filtered descendant remains
-dependent on the listener.
-
-**Additional kernel and lifecycle edge cases.**
-
-- Only one filter installed with `SECCOMP_FILTER_FLAG_NEW_LISTENER` can exist
-  in a thread's inherited filter tree. A synchronous inner Mu that inherits an
-  outer Mu notification filter cannot simply install its own independent
-  listener; the second installation fails with `EBUSY`. This invalidates the
-  simple stacked-supervisor model. Candidates are to review the whole outer
-  delegation and let that listener drain inner work, route delegation outside
-  deferred review, or design explicit listener handoff/cooperation.
-- Closing the last listener does not cleanly cancel descendants; their later
-  watched syscalls receive `ENOSYS`. Conversely, a blocking notification
-  receive can remain blocked after a target exits, so supervisor shutdown needs
-  pollable cancellation and explicit reaping rather than relying on cross-thread
-  fd close.
-- A signal can interrupt a notified syscall, invalidate the notification, and
-  restart the syscall, producing another notification for the same logical
-  operation. One-review semantics must tolerate `ENOENT`, revalidate ids, and
-  drain duplicate/restarted notifications without reviewing twice.
-- Reviewer latency occurs while the target is suspended. Command deadlines must
-  define whether review time counts, and concurrent triggers can leave several
-  commands blocked while reviews are serialized.
-- Existing container or service-manager seccomp filters can deny installation
-  or return a higher-precedence action for a watched syscall. Capability probing
-  must occur in the actual child execution environment and cannot promise that
-  Mu's notification action wins every filter stack.
-- Syscall coverage remains incomplete independently of these lifecycle issues.
-  `io_uring`, inherited writable descriptors, shared mappings, device `ioctl`s,
-  local IPC, alternate syscall variants, and future interfaces can produce side
-  effects without a selected notification trigger.
-
-**Resulting architecture candidates.**
-
-1. **Scoped in-process deferred review.** Support only non-privilege-changing
-   process trees whose descendants are guaranteed to end with the tool call.
-   Exceptional, detached, and recursive Mu calls use immediate review or skip.
-   This is the smallest design but requires a reliable routing contract and
-   deliberately does not support arbitrary Bash.
-2. **Persistent unprivileged broker.** Transfer listener fds to a process that
-   can outlive tool calls and turns. This solves descendant lifetime, including
-   approved detached work, but does not solve `no_new_privs`, privilege
-   elevation, or the inherited-listener conflict for independently reviewing
-   nested Mu calls.
-3. **Privileged persistent launcher/broker.** A tightly controlled launcher with
-   `CAP_SYS_ADMIN` could install the filter without `no_new_privs`, drop to the
-   invoking user, spawn Bash, and retain the listener. This is the only
-   candidate that addresses both fundamental constraints generally, but it
-   introduces a privileged service/helper, authentication and command-binding
-   requirements, deployment and upgrade concerns, and a substantially larger
-   security boundary than Mu currently has.
-
-The existing size estimate applies only to a scoped in-process design. Either
-broker architecture would require a new estimate and a separate threat model.
-
-Open decisions therefore include the policy-map shape and defaults, whether
-per-call routing uses a Boolean or a `needs-review` sentinel, the authority of an
-all-`skip` configuration, unsupported-platform promotion, the initial syscall
-set, Linux dependency strategy (libseccomp versus direct BPF), `sudo`
-compatibility, listener lifetime for every surviving descendant, nested Mu
-semantics, interaction with concurrent readonly calls and command timeouts,
-audit fields, whether observe mode exists only for development, and whether the
-feature's benefit justifies a persistent or privileged broker. A scoped
-in-process implementation is estimated at roughly 780–1,220 production lines
-plus 530–890 lines of tests and documentation; a narrow proof of concept would
-be smaller but would not establish the complete runtime contract.
+**Special routing around seccomp limitations — not selected.** Detecting
+`sudo`, `setsid`, or delegation textually is incomplete; adding a special Bash
+field or fourth "risk" value would mix recoverability classification with
+execution routing. A persistent or privileged broker would require a separate
+product and threat model before reconsideration.
 
 ---
