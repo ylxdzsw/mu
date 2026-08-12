@@ -431,6 +431,8 @@ turn, then passes that id explicitly. `MU_ZSH_SESSION_ID` or
 - `/retry` and `/compact` call the corresponding management operation.
 - Discovered custom commands accept the remainder of the slash input as their
   custom instruction.
+- `/goal <goal>` invokes the built-in `goal` custom command. Its required
+  custom instruction is the goal.
 
 Unknown or malformed slash input does not activate a new scope or mutate the
 bundle.
@@ -587,6 +589,15 @@ A file may be both a command and a skill. Command invocation strips the shebang
 and supported frontmatter before submitting the prompt. An explicit invocation
 model overrides the shebang model; otherwise the shebang is turn-local and does
 not rewrite session model state.
+
+The extensionless built-in `goal` is a custom command, not a skill. It requires
+a goal as its custom instruction. The command agent acts only as supervisor: it
+creates one fresh worker session, repeatedly continues that same session, and
+judges completion without planning, diagnosing, or performing the work. The
+worker owns current-state inspection, planning, execution, and verification.
+Every continuation repeats the original goal verbatim to the worker. The loop
+ends when the supervisor verifies the goal or finds a genuine blocker requiring
+user input, permission, credentials, or unavailable external state.
 
 ---
 

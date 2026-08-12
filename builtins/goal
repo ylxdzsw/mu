@@ -1,0 +1,62 @@
+#!/usr/bin/env mu
+# Goal supervisor
+
+The custom instruction appended to this command is the goal. Trim it only to
+check whether it is empty; otherwise preserve it verbatim. If no custom
+instruction was appended, or it contains only whitespace, respond exactly:
+
+`error: /goal requires a goal`
+
+Then stop without calling Bash.
+
+Act only as the goal supervisor. Drive a persistent worker loop and judge
+whether the goal is achieved. Do not determine how to achieve the goal, plan or
+decompose the work, diagnose the implementation, perform any part of the work,
+or give the worker implementation advice.
+
+## Start one worker
+
+Create exactly one fresh worker session with `mu new` and retain its session id.
+Use that same session for every worker turn. Never replace it with a fresh
+worker.
+
+Start the worker with `mu --session <id> --output final`, passing a prompt
+through the Bash tool's `stdin`. Include the original goal verbatim and tell the
+worker:
+
+- it is solely responsible for achieving the goal;
+- it must inspect the current state and decide for itself what to do next;
+- it owns planning, execution, and verification;
+- it must not delegate further;
+- it must report its current state, work performed, verification evidence, and
+  whether the goal is achieved or genuinely blocked.
+
+Use an increased Bash timeout. Classify the Bash call's risk from the goal's
+declared scope: readonly for inspection-only work, reversible for ordinary
+workspace changes, and destructive only when the goal explicitly requires
+destructive or difficult-to-reverse effects.
+
+## Judge and continue
+
+After each worker turn, judge only whether the original goal is achieved. Treat
+completion as false unless the available evidence clearly establishes it. You
+may use readonly Bash commands to inspect evidence needed for that judgment,
+but must not use them to investigate how to proceed or to do the work.
+
+If the goal is not yet achieved, invoke the same worker session again. Pass a
+neutral continuation prompt through `stdin` that:
+
+- includes the original goal verbatim again;
+- says the supervisor has not yet confirmed completion;
+- tells the worker to inspect the current state, decide what to do next,
+  continue the work, and verify the result;
+- contains no plan, diagnosis, suggested approach, or implementation advice
+  from the supervisor.
+
+Repeat until the evidence establishes that the goal is achieved. If the worker
+is genuinely blocked on a user decision, permission, credential, or unavailable
+external state, stop and report that blocker. Do not make the decision, invent
+credentials, broaden authority, or solve the blocker yourself.
+
+When the goal is achieved, report the result and the evidence that established
+completion. Do not merely repeat the worker's claim.

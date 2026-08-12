@@ -106,6 +106,9 @@ Type `/` to list prompt-mode commands. The common ones:
 - `/compact` compacts older turns in a long session, optionally with a focus
   instruction. It reports when all history is already inside the configured
   recent-turn retention window.
+- `/goal <goal>` starts a supervisor that drives one persistent worker session
+  until the supplied goal is verified as achieved or genuinely blocked. The
+  goal argument is required.
 
 Both plugins require `jq` and `mu` on `PATH`, plus their respective shell. The
 Fish integration requires Fish 4 because it records replayable turns with

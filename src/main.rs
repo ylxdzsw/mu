@@ -1478,6 +1478,25 @@ mod tests {
     }
 
     #[test]
+    fn builtin_goal_receives_its_required_custom_instruction() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("builtins/goal");
+        let source = || PromptSource::Command {
+            path: path.clone(),
+            scope: skills::InstructionScope::Builtin,
+        };
+
+        let mut terminal_stdin = Cursor::new("must not be read");
+        let without_goal = load_prompt_with_stdin(source(), true, &mut terminal_stdin).unwrap();
+        assert!(without_goal.text.contains("error: /goal requires a goal"));
+        assert_eq!(terminal_stdin.position(), 0);
+
+        let goal = "Finish the migration.\nKeep all tests green.";
+        let mut piped_stdin = Cursor::new(goal);
+        let with_goal = load_prompt_with_stdin(source(), false, &mut piped_stdin).unwrap();
+        assert!(with_goal.text.ends_with(&format!("\n---\n\n{goal}")));
+    }
+
+    #[test]
     fn explicit_prompt_paths_bypass_command_lookup() {
         let scope = paths::Scope::Global;
         for path in ["./review.md", "../review.md", "/tmp/review.md"] {

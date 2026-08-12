@@ -80,6 +80,15 @@ printf 'Focus on authentication.' | mu review.md
 In zsh and Fish prompt mode, a discovered command is invoked by its relative
 path, including extension, such as `/review.md`.
 
+### Built-in `/goal`
+
+`/goal <goal>` invokes the extensionless built-in `goal` custom command. The
+goal argument is required. Its agent acts only as a supervisor: it creates one
+fresh worker session, continues that same session until completion, and judges
+the result without planning or performing the work. The worker owns state
+inspection, planning, execution, and verification. Each continuation repeats
+the original goal verbatim to the worker to prevent drift.
+
 ## Management commands
 
 ### `mu init [--path <dir>] [--force]`

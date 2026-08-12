@@ -727,11 +727,25 @@ mod tests {
         assert!(index.skills.iter().any(|skill| skill.name == "mu-doc"));
         assert!(!index.skills.iter().any(|skill| skill.name == "config"));
         assert!(!index.skills.iter().any(|skill| skill.name == "cli"));
+        assert!(!index.skills.iter().any(|skill| skill.name == "goal"));
         assert!(
             !index
                 .commands
                 .iter()
                 .any(|command| { matches!(command.name.as_str(), "config.md" | "cli.md") })
+        );
+        let goal = index
+            .commands
+            .iter()
+            .find(|command| command.name == "goal")
+            .expect("built-in goal command");
+        assert_eq!(goal.scope, InstructionScope::Builtin);
+        let prompt = command_prompt(Path::new(&goal.path)).unwrap();
+        assert!(prompt.text.contains("error: /goal requires a goal"));
+        assert!(
+            prompt
+                .text
+                .contains("includes the original goal verbatim again")
         );
         fs::remove_dir_all(global).unwrap();
     }
