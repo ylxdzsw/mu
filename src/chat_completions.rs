@@ -1223,4 +1223,72 @@ mod tests {
             other => panic!("expected transport idle-timeout error, got {other:?}"),
         }
     }
+
+    #[tokio::test]
+    async fn streams_over_http_unix_endpoint() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::UnixListener;
+
+        let tmp = std::env::temp_dir().join(format!("mu-http-unix-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let socket_path = tmp.join("provider.sock");
+        let listener = UnixListener::bind(&socket_path).unwrap();
+
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            loop {
+                let mut chunk = [0; 4096];
+                let read = socket.read(&mut chunk).await.unwrap();
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&chunk[..read]);
+                if request.windows(4).any(|part| part == b"\r\n\r\n") {
+                    break;
+                }
+            }
+
+            let body = concat!(
+                "data: {\"choices\":[{\"delta\":{\"content\":\"socket ok\"},",
+                "\"finish_reason\":\"stop\"}]}\n\n",
+                "data: [DONE]\n\n"
+            );
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\
+                 Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+            String::from_utf8(request).unwrap()
+        });
+
+        let encoded_socket = socket_path.to_str().unwrap().replace('/', "%2F");
+        let endpoint = format!("http+unix://{encoded_socket}/chat/completions?route=local");
+        let provider = HttpProvider::new(endpoint.clone(), None).unwrap();
+        assert_eq!(provider.endpoint, endpoint);
+
+        let mut text = String::new();
+        let mut on_event = |event| {
+            if let StreamEvent::TextDelta(delta) = event {
+                text.push_str(&delta);
+            }
+            Ok(())
+        };
+        provider
+            .stream(&request(None, vec![], false), &mut on_event)
+            .await
+            .unwrap();
+
+        let wire_request = server.await.unwrap();
+        assert!(wire_request.starts_with("POST /chat/completions?route=local HTTP/1.1\r\n"));
+        assert!(
+            wire_request
+                .to_ascii_lowercase()
+                .contains("\r\nhost: localhost\r\n")
+        );
+        assert_eq!(text, "socket ok");
+
+        std::fs::remove_dir_all(tmp).unwrap();
+    }
 }

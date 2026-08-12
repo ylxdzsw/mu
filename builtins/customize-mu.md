@@ -60,7 +60,7 @@ Complete shape, with default values where applicable:
   "auto_resume": false,           // continue replayable incomplete responses
   "providers": {
     "openai": {
-      "endpoint": "https://api.openai.com/v1/responses", // complete POST URL
+      "endpoint": "https://api.openai.com/v1/responses", // HTTP(S) URL or http+unix URI
       "api_key_env": "OPENAI_API_KEY",                   // empty means no key
       "models": {
         "gpt-5.6-terra": {
@@ -97,8 +97,13 @@ Complete shape, with default values where applicable:
 At least one provider and model are required. Endpoint paths must end in
 `/chat/completions`, `/responses`, or `/messages`; the suffix selects the API.
 `endpoint` is required; `api_key_env` and all model metadata are optional.
-Without `context_window`, percentage reporting and proactive compaction are
-unavailable. `output` is overridden by CLI `--output`.
+On Unix, HTTP over a Unix socket uses one endpoint string with the socket path
+percent-encoded as the authority:
+`http+unix://%2Frun%2Flocal-ai.sock/v1/responses`. This connects to
+`/run/local-ai.sock`, requests `/v1/responses` with `Host: localhost`, and
+ignores DNS and proxy configuration. Without `context_window`, percentage
+reporting and proactive compaction are unavailable. `output` is overridden by
+CLI `--output`.
 `auto_resume` preserves provider responses classified as resumable and
 continues the same turn with a derived user `Continue` message. Attempts share
 the provider retry quota. Exhaustion advances a floating provider candidate;

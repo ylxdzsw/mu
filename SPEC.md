@@ -1085,8 +1085,13 @@ Session lifecycle is exposed through CLI commands:
 
 Mu supports exactly three hand-written HTTP/SSE protocols: OpenAI-compatible
 Chat Completions, OpenAI Responses, and Anthropic Messages. Each configured
-provider has a required complete `endpoint`. After URL parsing and optional
-trailing-slash normalization, a case-sensitive path ending in
+provider has a required complete `endpoint`. An endpoint is either an HTTP(S)
+POST URL or, on Unix, an
+`http+unix://<percent-encoded-absolute-socket-path>/<request-path>` URI. For
+example, `http+unix://%2Frun%2Flocal-ai.sock/v1/responses` connects to
+`/run/local-ai.sock` and sends plain HTTP to `/v1/responses` with
+`Host: localhost`; DNS and proxy configuration do not apply. After endpoint
+parsing and optional trailing-slash normalization, a case-sensitive request path ending in
 `/chat/completions` selects Chat Completions, `/responses` selects Responses,
 and `/messages` selects Anthropic Messages. Query parameters are preserved but
 do not affect classification. Every other path fails during configuration
@@ -1256,13 +1261,14 @@ configured `context_window`, the threshold-based tiers (Tier 1 new-turn and
 Tier 2 request-level) are skipped for it and the Tier 3 API-error fallback is
 the only guard.
 
-Model and provider selection come from `config.jsonc`: a complete `endpoint`, optional
-env var holding the API key, and ordered provider/model definitions. If the
-global config file is missing, `mu` creates a starter `~/.mu/config.jsonc`
-automatically before loading configuration. The starter's first provider
-contains keyless 200K-context OpenCode Zen DeepSeek and Mimo models (with
-`api_key_env` omitted), so a freshly built `mu` runs a turn with no additional
-setup; it also ships a commented keyed provider example.
+Model and provider selection come from `config.jsonc`: a complete HTTP(S) or
+`http+unix` `endpoint`, optional env var holding the API key, and ordered
+provider/model definitions. If the global config file is missing, `mu` creates
+a starter `~/.mu/config.jsonc` automatically before loading configuration. The
+starter's first provider contains keyless 200K-context OpenCode Zen DeepSeek
+and Mimo models (with `api_key_env` omitted), so a freshly built `mu` runs a
+turn with no additional setup; it also ships a commented keyed provider
+example.
 
 `provider/model[:effort]` is fixed. A bare `model[:effort]` expands to every
 configured provider containing that model in literal merged config order.
@@ -1475,7 +1481,7 @@ are not visible in another.
     "auto_resume": false,                       // continue resumable responses
     "providers": {
       "openai": {
-        "endpoint": "https://api.openai.com/v1/responses", // required complete POST URL
+        "endpoint": "https://api.openai.com/v1/responses", // HTTP(S) URL or http+unix URI
         "api_key_env": "OPENAI_API_KEY",         // optional: env var NAME, not the key
         "models": {
           "gpt-5.6-terra": {

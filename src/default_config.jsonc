@@ -8,7 +8,7 @@
     // Default provider: OpenCode Zen's free DeepSeek and Mimo models. They need
     // no API key, so mu works out of the box.
     "opencode": {
-      // Complete API request URL.
+      // Complete HTTP(S) URL or http+unix API request endpoint.
       "endpoint": "https://opencode.ai/zen/v1/chat/completions",
       // Environment variable containing the API key; omit for keyless access.
       // "api_key_env": "OPENCODE_API_KEY",

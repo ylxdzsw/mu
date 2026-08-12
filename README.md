@@ -326,6 +326,14 @@ instead; an explicit unavailable `--model` remains an error. Any
 OpenAI-compatible endpoint works; edit the endpoint, API-key environment
 variable, and model list to match your provider.
 
+On Unix, a provider served over a Unix socket uses an `http+unix` endpoint.
+Percent-encode the absolute socket path as the authority and leave the API path
+ordinary:
+
+```jsonc
+"endpoint": "http+unix://%2Frun%2Flocal-ai.sock/v1/responses"
+```
+
 Chat Completions `reasoning_content` is replayed between all Chat Completions
 models. Opaque Responses and signed Anthropic continuation state is replayed
 only between models using the same API and effective `replay_key`. A model entry

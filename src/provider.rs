@@ -1,11 +1,13 @@
 use std::{
     fmt,
+    path::PathBuf,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use async_trait::async_trait;
 use chrono::{DateTime, NaiveDateTime};
 use clap::ValueEnum;
+use percent_encoding::percent_decode_str;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -274,9 +276,17 @@ const DEFAULT_STREAM_IDLE_TIMEOUT: Duration = Duration::from_mins(10);
 pub struct HttpProvider {
     client: Client,
     pub(crate) endpoint: String,
+    request_url: String,
     api: ModelApi,
     api_key: Option<String>,
     pub(crate) idle_timeout: Duration,
+}
+
+struct ParsedEndpoint {
+    endpoint: String,
+    request_url: String,
+    api: ModelApi,
+    unix_socket: Option<PathBuf>,
 }
 
 pub(crate) enum SseEvent {
@@ -286,16 +296,17 @@ pub(crate) enum SseEvent {
 
 impl HttpProvider {
     pub fn new(endpoint: String, api_key: Option<String>) -> anyhow::Result<Self> {
-        let mut url = reqwest::Url::parse(&endpoint)?;
-        let path = url.path().trim_end_matches('/').to_string();
-        url.set_path(&path);
-        let endpoint = url.to_string();
-        let api = classify_endpoint(&endpoint)?;
-        let client = Client::builder().connect_timeout(CONNECT_TIMEOUT).build()?;
+        let parsed = parse_endpoint(&endpoint)?;
+        let mut client = Client::builder().connect_timeout(CONNECT_TIMEOUT);
+        if let Some(socket) = parsed.unix_socket.as_ref() {
+            client = client.unix_socket(socket.as_path());
+        }
+        let client = client.build()?;
         Ok(Self {
             client,
-            endpoint,
-            api,
+            endpoint: parsed.endpoint,
+            request_url: parsed.request_url,
+            api: parsed.api,
             api_key,
             idle_timeout: DEFAULT_STREAM_IDLE_TIMEOUT,
         })
@@ -374,7 +385,7 @@ impl HttpProvider {
     }
 
     fn post_request(&self, body: &Value) -> reqwest::RequestBuilder {
-        let mut request = self.client.post(&self.endpoint).json(body);
+        let mut request = self.client.post(&self.request_url).json(body);
         if let Some(key) = &self.api_key {
             request = match self.api {
                 ModelApi::AnthropicMessages => request.header("x-api-key", key),
@@ -385,6 +396,110 @@ impl HttpProvider {
             request = request.header("anthropic-version", "2023-06-01");
         }
         request
+    }
+}
+
+fn parse_endpoint(endpoint: &str) -> anyhow::Result<ParsedEndpoint> {
+    if endpoint.starts_with("http+unix://") {
+        return parse_http_unix_endpoint(endpoint);
+    }
+
+    let url = normalized_url(endpoint, endpoint)?;
+    let api = classify_endpoint_path(endpoint, url.path())?;
+    let endpoint = url.to_string();
+    Ok(ParsedEndpoint {
+        request_url: endpoint.clone(),
+        endpoint,
+        api,
+        unix_socket: None,
+    })
+}
+
+fn parse_http_unix_endpoint(endpoint: &str) -> anyhow::Result<ParsedEndpoint> {
+    let rest = endpoint
+        .strip_prefix("http+unix://")
+        .expect("http+unix prefix checked");
+    let (encoded_socket, request_path) = rest.split_once('/').ok_or_else(|| {
+        anyhow::anyhow!("invalid provider endpoint `{endpoint}`: http+unix requires a request path")
+    })?;
+    if encoded_socket.is_empty() || !valid_encoded_socket(encoded_socket) {
+        anyhow::bail!(
+            "invalid provider endpoint `{endpoint}`: socket path must be percent-encoded"
+        );
+    }
+    let socket = percent_decode_str(encoded_socket)
+        .decode_utf8()
+        .map_err(|error| {
+            anyhow::anyhow!(
+                "invalid provider endpoint `{endpoint}`: socket path is not UTF-8: {error}"
+            )
+        })?
+        .into_owned();
+    if socket.contains('\0') || !std::path::Path::new(&socket).is_absolute() {
+        anyhow::bail!(
+            "invalid provider endpoint `{endpoint}`: socket path must decode to an absolute path"
+        );
+    }
+
+    let request_url = normalized_url(&format!("http://localhost/{request_path}"), endpoint)?;
+    let api = classify_endpoint_path(endpoint, request_url.path())?;
+    let mut suffix = request_url.path().to_string();
+    if let Some(query) = request_url.query() {
+        suffix.push('?');
+        suffix.push_str(query);
+    }
+    if let Some(fragment) = request_url.fragment() {
+        suffix.push('#');
+        suffix.push_str(fragment);
+    }
+    Ok(ParsedEndpoint {
+        endpoint: format!("http+unix://{encoded_socket}{suffix}"),
+        request_url: request_url.to_string(),
+        api,
+        unix_socket: Some(PathBuf::from(socket)),
+    })
+}
+
+fn valid_encoded_socket(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        match bytes[index] {
+            byte if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') => {
+                index += 1;
+            }
+            b'%' if bytes
+                .get(index + 1..index + 3)
+                .is_some_and(|pair| pair.iter().all(u8::is_ascii_hexdigit)) =>
+            {
+                index += 3;
+            }
+            _ => return false,
+        }
+    }
+    true
+}
+
+fn normalized_url(url: &str, endpoint: &str) -> anyhow::Result<reqwest::Url> {
+    let mut url = reqwest::Url::parse(url)
+        .map_err(|error| anyhow::anyhow!("invalid provider endpoint `{endpoint}`: {error}"))?;
+    let path = url.path().trim_end_matches('/').to_string();
+    url.set_path(&path);
+    Ok(url)
+}
+
+fn classify_endpoint_path(endpoint: &str, path: &str) -> anyhow::Result<ModelApi> {
+    let path = path.trim_end_matches('/');
+    if path.ends_with("/chat/completions") {
+        Ok(ModelApi::ChatCompletions)
+    } else if path.ends_with("/responses") {
+        Ok(ModelApi::Responses)
+    } else if path.ends_with("/messages") {
+        Ok(ModelApi::AnthropicMessages)
+    } else {
+        anyhow::bail!(
+            "unsupported provider endpoint `{endpoint}`; path must end in `/chat/completions`, `/responses`, or `/messages`"
+        )
     }
 }
 
@@ -409,20 +524,7 @@ fn consume_sse_events(
 }
 
 pub fn classify_endpoint(endpoint: &str) -> anyhow::Result<ModelApi> {
-    let parsed = reqwest::Url::parse(endpoint)
-        .map_err(|error| anyhow::anyhow!("invalid provider endpoint `{endpoint}`: {error}"))?;
-    let path = parsed.path().trim_end_matches('/');
-    if path.ends_with("/chat/completions") {
-        Ok(ModelApi::ChatCompletions)
-    } else if path.ends_with("/responses") {
-        Ok(ModelApi::Responses)
-    } else if path.ends_with("/messages") {
-        Ok(ModelApi::AnthropicMessages)
-    } else {
-        anyhow::bail!(
-            "unsupported provider endpoint `{endpoint}`; path must end in `/chat/completions`, `/responses`, or `/messages`"
-        )
-    }
+    Ok(parse_endpoint(endpoint)?.api)
 }
 
 #[derive(Debug, Clone)]
@@ -1236,6 +1338,10 @@ mod tests {
             classify_endpoint("https://gateway.test/v1/messages?route=a").unwrap(),
             ModelApi::AnthropicMessages
         );
+        assert_eq!(
+            classify_endpoint("http+unix://%2Frun%2Fprovider.sock/v1/responses?route=a").unwrap(),
+            ModelApi::Responses
+        );
         for endpoint in [
             "https://gateway.test/v1",
             "https://gateway.test/v1/Responses",
@@ -1243,6 +1349,32 @@ mod tests {
             "https://gateway.test/v1/chat/completions/extra",
         ] {
             assert!(classify_endpoint(endpoint).is_err(), "accepted {endpoint}");
+        }
+    }
+
+    #[test]
+    fn parses_http_unix_endpoint() {
+        use std::path::Path;
+
+        let endpoint = "http+unix://%2Frun%2Fprovider.sock/v1/responses/?route=a";
+        let parsed = parse_endpoint(endpoint).unwrap();
+
+        assert_eq!(
+            parsed.endpoint,
+            "http+unix://%2Frun%2Fprovider.sock/v1/responses?route=a"
+        );
+        assert_eq!(parsed.request_url, "http://localhost/v1/responses?route=a");
+        assert_eq!(
+            parsed.unix_socket.as_deref(),
+            Some(Path::new("/run/provider.sock"))
+        );
+
+        for endpoint in [
+            "http+unix://%2Frun%2Fprovider.sock",
+            "http+unix://run%2Fprovider.sock/v1/responses",
+            "http+unix://%2Grun%2Fprovider.sock/v1/responses",
+        ] {
+            assert!(parse_endpoint(endpoint).is_err(), "accepted {endpoint}");
         }
     }
 
