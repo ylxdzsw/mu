@@ -51,7 +51,7 @@
   "compaction": {
     // Enable automatic compaction.
     "enabled": true,
-    // Compact before a new turn at this fraction.
+    // Compact before a new turn and target at most this fraction afterward.
     "soft_fraction": 0.70,
     // Compact before any request at this fraction.
     "hard_fraction": 0.85,

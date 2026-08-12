@@ -278,11 +278,13 @@ accepts optional non-terminal stdin as a custom focus). The surface is small:
   projection omits Git and detailed session metadata because prompt rendering
   does not consume them; the corresponding `--include-*` flags add them.
   `context_tokens` is the latest provider-reported context size when
-  `context_usage_source` is `reported`, or the bytes÷4 projection when it is
-  `estimated` before a first turn or immediately after compaction. Consumers
-  derive a percentage from `context_tokens / context_window` and compare the
-  raw count with `compaction_soft_threshold_tokens` to render pending
-  compaction. That threshold is `null` when automatic compaction is disabled.
+  `context_usage_source` is `reported`. After later semantic input, mu adds only
+  that input's estimate to the latest compatible reported total and marks the
+  result `estimated`; without a compatible total it estimates the full active
+  projection. Consumers derive a percentage from
+  `context_tokens / context_window` and compare the raw count with
+  `compaction_soft_threshold_tokens` to render pending compaction. That
+  threshold is `null` when automatic compaction is disabled.
   The resolved model object includes its current effective `replay_key`;
   `--include-models` adds the effective key for every configured model.
 - `mu context [--export]` — introspect the agent context. By default it prints
@@ -466,9 +468,12 @@ agent response's `total_tokens` — because
 double-count). For the `in`/`out` token display, sum `prompt_tokens` and
 `completion_tokens` across all iterations of the turn. Subtract provider-reported
 cache reads and writes from `in`, and display those cache figures separately.
-Any later semantic event invalidates that exact figure. Until another normal
-provider response supplies an exact total, status uses the bytes÷4 projection
-and marks the value as estimated.
+Later semantic input makes the figure estimated rather than discarding it: mu
+adds an estimate of only the messages after that provider completion. The
+reported total remains a valid anchor across providers when API, model id, and
+effective `replay_key` match. Otherwise mu estimates the full active
+projection. A normal provider response with valid usage establishes a new exact
+anchor.
 
 **Interruption.** Step 9d persists only *after* a message is fully formed. If
 SIGINT / a dropped connection / a provider error occurs mid-stream, the partial
@@ -1829,15 +1834,19 @@ otherwise unpublished ID between creation and the first lock.
 
 **Token counting (source of truth).** Mu does not run a tokenizer. Adapters map
 native usage into input, output, total, cache-read, optional cache-write, and
-reasoning-output fields on each provider completion. The latest accepted agent
-completion's `total_tokens` is reported exactly only while no later semantic
-event has changed the projected context; otherwise Mu estimates.
+reasoning-output fields on each provider completion. A valid latest accepted
+agent total anchors context accounting; when total is omitted, reported input
+plus output is used. A total below those components is invalid. Later semantic
+messages add only their estimates to that anchor. An unchanged anchor is
+reported exactly; an anchor plus a suffix is estimated.
 
 A `bytes ÷ 4` approximation (`approx_tokens(s) = ceil(len_bytes(s) / 4)`) is
-used only where no API figure exists yet:
-- before any still-current agent usage exists;
-- estimating the size of **not-yet-sent** content (e.g. which messages to keep
-  when building a compaction), where the provider has not yet returned a count.
+used for text where no API figure exists yet. Media receives a bounded nonzero
+estimate. Fallback estimation follows the active API's replay lowering, so
+Responses and Anthropic native replay replaces its semantic assistant
+projection rather than being counted in addition to it. The reported anchor is
+compatible across providers only when API, model id, and effective `replay_key`
+match; otherwise mu estimates the full active projection.
 
 Context management then uses a **three-tier strategy**, from most to least
 graceful:
@@ -1902,18 +1911,25 @@ split.
 The summarizer uses a small compaction-specific system prompt rather than the
 session's agent system prompt, so tool, skill, runtime, and service inventories
 are not duplicated into the summary unless the user's work made them relevant.
-The summarization *input* clamps each entry (tool results hardest) so a huge
-history cannot make the summarize request itself overflow. Assistant text and
-Bash-call descriptions enter it in semantic item order; opaque reasoning is
-omitted. The stored transcript is untouched. The next context projection loads
-the latest summary plus later semantic events, so compacted history is
-naturally excluded without deleting anything. Earlier journal events remain
-available for audit. When a prior summary exists, only semantic events after
-its boundary and before the new cut are incorporated into the updated summary.
-Before committing the summary projection, mu builds that candidate context and
-estimates its tokens. If the estimate is strictly greater than the active
-model's soft threshold, the compaction exchange is recorded as failed with
-class `insufficient_compaction`; the candidate summary and boundary are not
+The summarization *input* clamps each text entry (tool results hardest), reducing
+the risk that one large entry makes the request overflow without globally
+bounding the request. Assistant text and Bash-call descriptions enter it in
+semantic item order; opaque reasoning is omitted. Images retain their semantic
+positions and are sent through every API. Audio is sent through Chat
+Completions; Responses and Anthropic instead receive an in-place text note with
+its filename, media type, and byte size because those APIs do not support audio
+input. The stored transcript is untouched. The next context projection loads
+the latest summary plus later semantic events, so compacted history is naturally
+excluded without deleting anything. Earlier journal events remain available
+for audit. When a prior summary exists, only semantic events after its boundary
+and before the new cut are incorporated into the updated summary.
+The soft threshold is also the post-compaction target. A useful summary is
+normally expected to reduce context well below it; the target check is primarily
+a safety net against ineffective compaction. Before committing the summary
+projection, mu builds that candidate context and estimates its tokens. If the
+estimate is strictly greater than the active model's soft threshold, the
+compaction exchange is recorded as failed with class
+`insufficient_compaction`; the candidate summary and boundary are not
 committed, so the prior semantic context and context-usage status remain
 authoritative. This validation is shared by manual, soft, hard, and reactive
 compaction. When the active model has no configured context window, no soft

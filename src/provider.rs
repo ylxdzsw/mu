@@ -99,35 +99,74 @@ impl Message {
     }
 
     pub fn approx_tokens(&self) -> u64 {
-        match self {
-            Self::System { content } => approx_tokens(content),
-            Self::User { content } => approx_tokens(&content.text()),
-            Self::Assistant {
-                items,
-                native_replay,
-            } => {
-                items
-                    .iter()
-                    .map(|item| match item {
-                        AssistantItem::Reasoning { text } => {
-                            approx_tokens(text.as_deref().unwrap_or(""))
-                        }
-                        AssistantItem::Text { text } => approx_tokens(text),
-                        AssistantItem::BashCall(call) => {
-                            approx_tokens(&serde_json::to_string(call).unwrap_or_default())
-                        }
-                    })
-                    .sum::<u64>()
-                    + native_replay
-                        .as_ref()
-                        .map(|native| {
-                            approx_tokens(&serde_json::to_string(native).unwrap_or_default())
-                        })
-                        .unwrap_or(0)
-            }
-            Self::Tool { content, .. } => approx_tokens(content),
-        }
+        message_approx_tokens(self, true)
     }
+}
+
+fn message_approx_tokens(message: &Message, keep_native_replay: bool) -> u64 {
+    match message {
+        Message::System { content } => approx_tokens(content),
+        Message::User { content } => user_content_approx_tokens(content),
+        Message::Assistant {
+            items,
+            native_replay,
+        } => {
+            let semantic = items
+                .iter()
+                .map(|item| match item {
+                    AssistantItem::Reasoning { .. } => 0,
+                    AssistantItem::Text { text } => approx_tokens(text),
+                    AssistantItem::BashCall(call) => {
+                        approx_tokens(&serde_json::to_string(call).unwrap_or_default())
+                    }
+                })
+                .sum::<u64>();
+            match native_replay
+                .as_ref()
+                .filter(|_| keep_native_replay)
+                .map(|native| &native.payload)
+            {
+                Some(NativeReplayPayload::ChatReasoning(reasoning)) => {
+                    semantic.saturating_add(approx_tokens(reasoning))
+                }
+                Some(NativeReplayPayload::ResponsesOutput(items))
+                | Some(NativeReplayPayload::AnthropicContent(items)) => {
+                    approx_tokens(&serde_json::to_string(items).unwrap_or_default())
+                }
+                None => semantic,
+            }
+        }
+        Message::Tool {
+            content,
+            attachments,
+            ..
+        } => attachments
+            .iter()
+            .fold(approx_tokens(content), |tokens, item| {
+                tokens.saturating_add(attachment_approx_tokens(&item.attachment))
+            }),
+    }
+}
+
+fn user_content_approx_tokens(content: &UserContent) -> u64 {
+    match content {
+        UserContent::Text(text) => approx_tokens(text),
+        UserContent::Parts(parts) => parts.iter().fold(0u64, |tokens, part| {
+            tokens.saturating_add(match part {
+                ContentPart::Text { text } => approx_tokens(text),
+                ContentPart::Attachment { attachment } => attachment_approx_tokens(attachment),
+            })
+        }),
+    }
+}
+
+fn attachment_approx_tokens(attachment: &Attachment) -> u64 {
+    // Media tokenization is provider- and model-specific. Charge a bounded,
+    // nonzero amount based on compressed bytes until a provider reports the
+    // actual request total.
+    (attachment.data.len() as u64)
+        .div_ceil(256)
+        .clamp(1_024, 16_384)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -195,14 +234,44 @@ pub fn filter_native_replay_for_config(
     target: &ResolvedModelRef,
     target_api: ModelApi,
 ) -> Vec<Message> {
-    if target_api == ModelApi::ChatCompletions {
-        return filter_native_replay(messages, |native| native.api() == target_api);
-    }
-    let target_key = config.replay_key(&target.provider_id, &target.model_id);
     filter_native_replay(messages, |native| {
-        native.api() == target_api
-            && config.replay_key(&native.provider_id, &native.model) == target_key
+        native_replay_compatible_for_config(native, config, target, target_api)
     })
+}
+
+pub fn estimate_messages_tokens(
+    messages: &[Message],
+    config: &Config,
+    target: &ResolvedModelRef,
+    target_api: ModelApi,
+) -> u64 {
+    messages
+        .iter()
+        .map(|message| {
+            let keep_native = match message {
+                Message::Assistant {
+                    native_replay: Some(native),
+                    ..
+                } => native_replay_compatible_for_config(native, config, target, target_api),
+                _ => true,
+            };
+            message_approx_tokens(message, keep_native)
+        })
+        .sum()
+}
+
+fn native_replay_compatible_for_config(
+    native: &NativeReplay,
+    config: &Config,
+    target: &ResolvedModelRef,
+    target_api: ModelApi,
+) -> bool {
+    if native.api() != target_api {
+        return false;
+    }
+    target_api == ModelApi::ChatCompletions
+        || config.replay_key(&native.provider_id, &native.model)
+            == config.replay_key(&target.provider_id, &target.model_id)
 }
 
 pub fn filter_native_replay_for_origins(
@@ -679,6 +748,14 @@ pub struct Usage {
 }
 
 impl Usage {
+    pub fn context_total(&self) -> Option<u64> {
+        let component_total = self.input_tokens.saturating_add(self.output_tokens);
+        if self.total_tokens == 0 {
+            return (component_total > 0).then_some(component_total);
+        }
+        (self.total_tokens >= component_total).then_some(self.total_tokens)
+    }
+
     pub fn visible_input_tokens(&self) -> u64 {
         self.input_tokens
             .saturating_sub(self.cache_read_input_tokens)
@@ -1418,6 +1495,106 @@ mod tests {
             model_id: "target-model".into(),
             effort: None,
         }
+    }
+
+    #[test]
+    fn context_estimation_uses_native_replay_instead_of_duplicate_semantics() {
+        let native = vec![serde_json::json!({
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type":"output_text","text":"native"}]
+        })];
+        let message = replay_message(NativeReplayPayload::ResponsesOutput(native.clone()));
+        assert_eq!(
+            message.approx_tokens(),
+            approx_tokens(&serde_json::to_string(&native).unwrap())
+        );
+
+        let shared = replay_config(Some("shared"), Some("shared"));
+        assert_eq!(
+            estimate_messages_tokens(
+                std::slice::from_ref(&message),
+                &shared,
+                &target_model(),
+                ModelApi::Responses,
+            ),
+            message.approx_tokens()
+        );
+
+        let incompatible = replay_config(Some("source"), Some("target"));
+        assert_eq!(
+            estimate_messages_tokens(
+                &[message],
+                &incompatible,
+                &target_model(),
+                ModelApi::Responses,
+            ),
+            approx_tokens("semantic")
+        );
+
+        let chat = Message::assistant(
+            Some("semantic".into()),
+            Some("reasoning".into()),
+            None,
+            Some(NativeReplay {
+                provider_id: "source".into(),
+                endpoint: "https://source.test/v1/chat/completions".into(),
+                model: "source-model".into(),
+                payload: NativeReplayPayload::ChatReasoning("reasoning".into()),
+            }),
+        );
+        assert_eq!(
+            chat.approx_tokens(),
+            approx_tokens("semantic") + approx_tokens("reasoning")
+        );
+    }
+
+    #[test]
+    fn media_has_a_nonzero_bounded_fallback_estimate() {
+        let message = Message::User {
+            content: UserContent::Parts(vec![ContentPart::Attachment {
+                attachment: Attachment {
+                    filename: "image.png".into(),
+                    media_type: "image/png".into(),
+                    data: vec![0; 20 * 1024 * 1024],
+                },
+            }]),
+        };
+        assert_eq!(message.approx_tokens(), 16_384);
+    }
+
+    #[test]
+    fn context_total_rejects_missing_or_inconsistent_usage() {
+        assert_eq!(Usage::default().context_total(), None);
+        assert_eq!(
+            Usage {
+                input_tokens: 10,
+                output_tokens: 5,
+                ..Usage::default()
+            }
+            .context_total(),
+            Some(15)
+        );
+        assert_eq!(
+            Usage {
+                input_tokens: 10,
+                output_tokens: 5,
+                total_tokens: 14,
+                ..Usage::default()
+            }
+            .context_total(),
+            None
+        );
+        assert_eq!(
+            Usage {
+                input_tokens: 10,
+                output_tokens: 5,
+                total_tokens: 15,
+                ..Usage::default()
+            }
+            .context_total(),
+            Some(15)
+        );
     }
 
     #[test]

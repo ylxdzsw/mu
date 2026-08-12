@@ -14,10 +14,11 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 use crate::bash::BashRisk;
+use crate::config::Config;
 use crate::models::ResolvedModelRef;
 use crate::provider::{
     AssistantItem, Attachment, ContentPart, ImageDetail, Message, ModelApi, NativeReplay, Request,
-    ToolAttachment, ToolCall, Usage, UserContent,
+    ToolAttachment, ToolCall, Usage, UserContent, estimate_messages_tokens,
 };
 
 pub const BASH_CALL_ID_ENV: &str = "MU_BASH_CALL_ID";
@@ -37,7 +38,12 @@ pub struct Session {
     pub cwd: String,
     pub last_model: Option<String>,
     pub title: Option<String>,
-    pub reported_context_tokens: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ContextTokenEstimate {
+    pub tokens: u64,
+    pub reported: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -100,6 +106,7 @@ pub struct MessageRecord {
 pub enum MessageRecordItem {
     Text(String),
     BashCall(ToolCall),
+    Attachment(Attachment),
 }
 
 pub struct BashResultRecord<'a> {
@@ -468,7 +475,6 @@ impl Store {
                 cwd: String::new(),
                 last_model: None,
                 title: None,
-                reported_context_tokens: None,
             });
         }
         bail!("could not allocate a unique session id")
@@ -1173,21 +1179,42 @@ impl Store {
         )
     }
 
-    pub fn estimate_context_tokens(&self, session_id: &str) -> Result<u64> {
-        Ok(self
-            .load_context_messages(session_id)?
-            .iter()
-            .map(Message::approx_tokens)
-            .sum())
+    pub fn context_tokens(
+        &self,
+        session_id: &str,
+        config: &Config,
+        target: &ResolvedModelRef,
+        api: ModelApi,
+    ) -> Result<ContextTokenEstimate> {
+        let journal = self.load(session_id)?;
+        let context = self.context(&journal)?;
+        if let Some((seq, reported)) =
+            latest_compatible_context_anchor(&journal, config, target, api)
+        {
+            let anchored = self.context_until(&journal, seq)?;
+            if context.len() >= anchored.len() {
+                let suffix = &context[anchored.len()..];
+                return Ok(ContextTokenEstimate {
+                    tokens: reported
+                        .saturating_add(estimate_messages_tokens(suffix, config, target, api)),
+                    reported: suffix.is_empty(),
+                });
+            }
+        }
+        Ok(ContextTokenEstimate {
+            tokens: estimate_messages_tokens(&context, config, target, api),
+            reported: false,
+        })
     }
 
     pub(crate) fn estimate_compaction_context_tokens(
         &self,
         session_id: &str,
         exchange_id: &str,
-        summary: &str,
-        through_seq: i64,
-        retained_turn_ids: &[String],
+        completion: &CompactionCompletion<'_>,
+        config: &Config,
+        target: &ResolvedModelRef,
+        api: ModelApi,
     ) -> Result<u64> {
         let mut journal = self.load(session_id)?;
         let seq = journal.events.last().map_or(1, |line| line.seq + 1);
@@ -1199,17 +1226,18 @@ impl Store {
                 response_json: None,
                 usage: None,
                 projection: Projection::Compaction {
-                    summary: summary.to_string(),
-                    through_seq,
-                    retained_turn_ids: retained_turn_ids.to_vec(),
+                    summary: completion.summary.to_string(),
+                    through_seq: completion.through_seq,
+                    retained_turn_ids: completion.retained_turn_ids.clone(),
                 },
             },
         });
-        Ok(self
-            .context(&journal)?
-            .iter()
-            .map(Message::approx_tokens)
-            .sum())
+        Ok(estimate_messages_tokens(
+            &self.context(&journal)?,
+            config,
+            target,
+            api,
+        ))
     }
 
     pub fn acquire_session_lock(&self, session_id: &str) -> Result<SessionLock<'_>> {
@@ -1702,7 +1730,6 @@ impl Store {
             cwd,
             last_model,
             title,
-            reported_context_tokens: reported_context_tokens(journal),
         })
     }
 
@@ -1862,7 +1889,7 @@ impl Store {
                 }),
                 Event::TurnStarted { prompt, .. } => records.push(MessageRecord {
                     kind: "user".into(),
-                    items: vec![MessageRecordItem::Text(user_text(prompt))],
+                    items: self.message_record_user_items(prompt)?,
                     seq: line.seq,
                 }),
                 Event::ProviderCompleted {
@@ -1897,15 +1924,60 @@ impl Store {
                     items: vec![MessageRecordItem::Text(summary.clone())],
                     seq: line.seq,
                 }),
-                Event::BashCompleted { output, .. } => records.push(MessageRecord {
-                    kind: "bash_result".into(),
-                    items: vec![MessageRecordItem::Text(self.hydrate_text(output)?)],
-                    seq: line.seq,
-                }),
+                Event::BashCompleted {
+                    output,
+                    attachments,
+                    ..
+                } => {
+                    let mut items = vec![MessageRecordItem::Text(self.hydrate_text(output)?)];
+                    items.extend(
+                        attachments
+                            .iter()
+                            .map(|attachment| {
+                                self.hydrate_tool_attachment(attachment).map(|attachment| {
+                                    MessageRecordItem::Attachment(attachment.attachment)
+                                })
+                            })
+                            .collect::<Result<Vec<_>>>()?,
+                    );
+                    records.push(MessageRecord {
+                        kind: "bash_result".into(),
+                        items,
+                        seq: line.seq,
+                    });
+                }
                 _ => {}
             }
         }
         Ok(records)
+    }
+
+    fn message_record_user_items(
+        &self,
+        content: &PersistedUserContent,
+    ) -> Result<Vec<MessageRecordItem>> {
+        Ok(match content {
+            PersistedUserContent::Text { text } => {
+                vec![MessageRecordItem::Text(text.clone())]
+            }
+            PersistedUserContent::Parts { parts } => parts
+                .iter()
+                .map(|part| match part {
+                    PersistedContentPart::Text { text } => {
+                        Ok(MessageRecordItem::Text(text.clone()))
+                    }
+                    PersistedContentPart::Attachment {
+                        object,
+                        filename,
+                        media_type,
+                    } => Ok(MessageRecordItem::Attachment(Attachment {
+                        filename: filename.clone(),
+                        media_type: media_type.clone(),
+                        data: self.read_object(object)?,
+                    })),
+                })
+                .collect::<Result<Vec<_>>>()?,
+        })
     }
 
     fn persist_user_content(&self, content: &UserContent) -> Result<PersistedUserContent> {
@@ -3122,10 +3194,6 @@ fn is_semantic(event: &Event) -> bool {
     )
 }
 
-fn reported_context_tokens(journal: &Journal) -> Option<u64> {
-    reported_context_tokens_before(journal, i64::MAX)
-}
-
 fn reported_context_tokens_before(journal: &Journal, max_seq: i64) -> Option<u64> {
     let mut request_formats = HashMap::new();
     let mut latest = None;
@@ -3150,7 +3218,7 @@ fn reported_context_tokens_before(journal: &Journal, max_seq: i64) -> Option<u64
             } => {
                 latest = request_formats
                     .get(exchange_id.as_str())
-                    .map(|current| (usage.total_tokens, *current));
+                    .and_then(|current| usage.context_total().map(|tokens| (tokens, *current)));
                 semantic_after = false;
             }
             Event::ProviderCompleted {
@@ -3169,6 +3237,85 @@ fn reported_context_tokens_before(journal: &Journal, max_seq: i64) -> Option<u64
     latest
         .filter(|(_, current)| !semantic_after && *current)
         .map(|(tokens, _)| tokens)
+}
+
+fn latest_compatible_context_anchor(
+    journal: &Journal,
+    config: &Config,
+    target: &ResolvedModelRef,
+    api: ModelApi,
+) -> Option<(i64, u64)> {
+    let mut requests = HashMap::new();
+    let mut anchor = None;
+    for line in journal.events.iter() {
+        match &line.event {
+            Event::ProviderRequested {
+                exchange_id,
+                purpose,
+                origin,
+                request_recipe,
+                ..
+            } if purpose == "agent" => {
+                requests.insert(
+                    exchange_id.as_str(),
+                    (
+                        origin,
+                        request_format_is_current(&origin.api, &request_recipe.format),
+                    ),
+                );
+            }
+            Event::ProviderCompleted {
+                exchange_id,
+                usage: Some(usage),
+                projection: Projection::Assistant { .. },
+                ..
+            } => {
+                let Some((origin, current_format)) = requests.get(exchange_id.as_str()) else {
+                    continue;
+                };
+                if *current_format
+                    && context_origin_compatible(config, origin, target, api)
+                    && let Some(tokens) = usage.context_total()
+                {
+                    anchor = Some((line.seq, tokens));
+                }
+            }
+            Event::ProviderCompleted {
+                projection: Projection::Compaction { .. },
+                ..
+            } => anchor = None,
+            _ => {}
+        }
+    }
+    anchor
+}
+
+fn context_origin_compatible(
+    config: &Config,
+    origin: &ProviderOrigin,
+    target: &ResolvedModelRef,
+    api: ModelApi,
+) -> bool {
+    #[cfg(test)]
+    let same_api = if origin.api == "test" {
+        api == ModelApi::ChatCompletions
+    } else {
+        origin.api == api.name()
+    };
+    #[cfg(not(test))]
+    let same_api = origin.api == api.name();
+    if !same_api || origin.wire_model != target.model_id {
+        return false;
+    }
+    if config
+        .model_config(&origin.provider_id, &origin.wire_model)
+        .is_some()
+    {
+        config.replay_key(&origin.provider_id, &origin.wire_model)
+            == config.replay_key(&target.provider_id, &target.model_id)
+    } else {
+        origin.provider_id == target.provider_id
+    }
 }
 
 fn request_format_is_current(api: &str, format: &str) -> bool {
@@ -3337,7 +3484,200 @@ fn canonical_json(value: &Value) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::{
+        CompactionConfig, GuardrailConfig, LimitsConfig, ModelConfig, OrderedMap, ProviderConfig,
+        RedactionConfig, TerminalBellConfig,
+    };
     use crate::provider::{Message, NativeReplayPayload};
+
+    fn context_test_config(source_key: Option<&str>, target_key: Option<&str>) -> Config {
+        let provider = |replay_key: Option<&str>| ProviderConfig {
+            endpoint: "http://localhost/chat/completions".into(),
+            api_key_env: String::new(),
+            models: OrderedMap::from_iter([(
+                "model".into(),
+                ModelConfig {
+                    context_window: Some(200_000),
+                    supported_efforts: None,
+                    replay_key: replay_key.map(str::to_string),
+                },
+            )]),
+        };
+        Config {
+            providers: OrderedMap::from_iter([
+                ("source".into(), provider(source_key)),
+                ("target".into(), provider(target_key)),
+            ]),
+            output: Default::default(),
+            auto_resume: false,
+            compaction: CompactionConfig::default(),
+            limits: LimitsConfig::default(),
+            guardrail: GuardrailConfig::default(),
+            terminal_bell: TerminalBellConfig::default(),
+            redaction: RedactionConfig::default(),
+            env: Default::default(),
+        }
+    }
+
+    #[test]
+    fn context_tokens_prefer_compatible_provider_anchor_and_estimate_only_the_suffix() {
+        let store = Store::open_memory().unwrap();
+        let session = store.create_session_seeded("system").unwrap();
+        store
+            .append_test_agent_exchange(&session.id, "source/model", "completed", 100)
+            .unwrap();
+        let config = context_test_config(Some("shared"), Some("shared"));
+        let target = crate::models::resolve_model_ref(&config, "target/model").unwrap();
+
+        assert_eq!(
+            store
+                .context_tokens(&session.id, &config, &target, ModelApi::ChatCompletions)
+                .unwrap(),
+            ContextTokenEstimate {
+                tokens: 100,
+                reported: true
+            }
+        );
+        assert!(
+            !store
+                .context_tokens(&session.id, &config, &target, ModelApi::Responses)
+                .unwrap()
+                .reported
+        );
+
+        let incompatible = context_test_config(Some("source"), Some("target"));
+        let incompatible_target =
+            crate::models::resolve_model_ref(&incompatible, "target/model").unwrap();
+        assert!(
+            !store
+                .context_tokens(
+                    &session.id,
+                    &incompatible,
+                    &incompatible_target,
+                    ModelApi::ChatCompletions,
+                )
+                .unwrap()
+                .reported
+        );
+
+        store
+            .start_turn(&session.id, "/tmp", None, &"12345678".into())
+            .unwrap();
+        assert_eq!(
+            store
+                .context_tokens(&session.id, &config, &target, ModelApi::ChatCompletions)
+                .unwrap(),
+            ContextTokenEstimate {
+                tokens: 102,
+                reported: false
+            }
+        );
+    }
+
+    #[test]
+    fn invalid_provider_context_total_falls_back_to_projection() {
+        let store = Store::open_memory().unwrap();
+        let session = store.create_session_seeded("system").unwrap();
+        store
+            .append_test_agent_exchange(&session.id, "source/model", "completed", 0)
+            .unwrap();
+        let config = context_test_config(None, None);
+        let target = crate::models::resolve_model_ref(&config, "source/model").unwrap();
+        let estimate = store
+            .context_tokens(&session.id, &config, &target, ModelApi::ChatCompletions)
+            .unwrap();
+        assert!(!estimate.reported);
+        assert!(estimate.tokens > 0);
+    }
+
+    #[test]
+    fn compaction_records_preserve_user_and_tool_attachments() {
+        let store = Store::open_memory().unwrap();
+        let session = store.create_session_seeded("system").unwrap();
+        store
+            .append_message(
+                &session.id,
+                &Message::User {
+                    content: UserContent::Parts(vec![
+                        ContentPart::Text {
+                            text: "before".into(),
+                        },
+                        ContentPart::Attachment {
+                            attachment: Attachment {
+                                filename: "image.png".into(),
+                                media_type: "image/png".into(),
+                                data: vec![1, 2, 3],
+                            },
+                        },
+                        ContentPart::Text {
+                            text: "after".into(),
+                        },
+                    ]),
+                },
+            )
+            .unwrap();
+
+        let records = store.message_records_from_seq(&session.id, 0).unwrap();
+        assert!(matches!(
+            records.last().unwrap().items.as_slice(),
+            [
+                MessageRecordItem::Text(before),
+                MessageRecordItem::Attachment(Attachment { filename, data, .. }),
+                MessageRecordItem::Text(after),
+            ] if before == "before"
+                && filename == "image.png"
+                && data == &[1, 2, 3]
+                && after == "after"
+        ));
+
+        let (_, call_ids) = store
+            .append_message_with_bash_calls(
+                &session.id,
+                &Message::assistant(
+                    None,
+                    None,
+                    Some(vec![ToolCall {
+                        id: "call".into(),
+                        arguments: r#"{"title":"view","risk":"readonly","command":"true"}"#.into(),
+                    }]),
+                    None,
+                ),
+            )
+            .unwrap();
+        store
+            .persist_bash_result(
+                &session.id,
+                BashResultRecord {
+                    bash_call_id: call_ids[0],
+                    outcome: "completed",
+                    exit_code: Some(0),
+                    duration_ms: Some(1),
+                },
+                "result",
+                &[ToolAttachment {
+                    attachment: Attachment {
+                        filename: "result.png".into(),
+                        media_type: "image/png".into(),
+                        data: vec![4, 5, 6],
+                    },
+                    detail: ImageDetail::High,
+                    object_sha256: None,
+                }],
+            )
+            .unwrap();
+        let records = store.message_records_from_seq(&session.id, 0).unwrap();
+        let result = records
+            .iter()
+            .find(|record| record.kind == "bash_result")
+            .unwrap();
+        assert!(matches!(
+            result.items.as_slice(),
+            [
+                MessageRecordItem::Text(text),
+                MessageRecordItem::Attachment(Attachment { filename, data, .. }),
+            ] if text == "result" && filename == "result.png" && data == &[4, 5, 6]
+        ));
+    }
 
     fn v1_journal(store: &Store, session_id: &str, prompt: &str, projection: Value) -> Vec<Value> {
         let native = serde_json::json!({"model":"model","messages":[]});
@@ -4360,11 +4700,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            store
-                .get_session(&session.id)
-                .unwrap()
-                .unwrap()
-                .reported_context_tokens,
+            reported_context_tokens_before(&store.load(&session.id).unwrap(), i64::MAX),
             None
         );
     }

@@ -394,9 +394,14 @@ During compaction, interactive output uses one mutable
 completed result marks its rebuilt context percentage with `~` because it is
 estimated until the next provider response; the shell prompt uses the same
 marker and returns to an unprefixed percentage after that response supplies
-exact usage. If the rebuilt context would still exceed the model's soft
-threshold, compaction exits nonzero and records a failed attempt without
-changing the conversation's prior summary, boundary, or context status.
+exact usage. The soft threshold is also the post-compaction target, though a
+useful summary is normally expected to reduce context well below it. The target
+check is primarily a safety net: if the rebuilt context would still exceed it,
+compaction exits nonzero and records a failed attempt without changing the
+conversation's prior summary, boundary, or context status. Compaction includes
+images in its summarizer input. Audio is included for Chat Completions; for
+Responses and Anthropic it is replaced in place by a metadata-only omission
+note.
 
 ## Native installation and portable builds
 

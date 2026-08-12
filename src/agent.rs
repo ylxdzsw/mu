@@ -162,16 +162,7 @@ impl<'a> AgentLoop<'a> {
         let mut live_provider_retries = 0;
         while iteration < max_iter {
             let (exchange_id, stream_result, mut command_headers) = 'request_gate: loop {
-                if self.config.compaction.enabled
-                    && latest_compaction_since_change.is_none()
-                    && let Some(context_window) = self.model_context_window
-                    && compaction::exceeds_hard_compaction_threshold(
-                        context.iter().map(Message::approx_tokens).sum(),
-                        context_window,
-                        self.config.compaction.hard_fraction,
-                        self.config.compaction.hard_headroom_tokens,
-                    )
-                {
+                if self.config.compaction.enabled && latest_compaction_since_change.is_none() {
                     let started = Instant::now();
                     let provider_before_compaction = self.model.active_model().provider_id.clone();
                     let outcome = compaction::maybe_compact_routed(
@@ -190,9 +181,9 @@ impl<'a> AgentLoop<'a> {
                     }
                     if let Some(outcome) = outcome {
                         self.report_compaction(outcome, started)?;
+                        context = self.load_context()?;
+                        latest_compaction_since_change = Some(outcome);
                     }
-                    context = self.load_context()?;
-                    latest_compaction_since_change = outcome;
                     if matches!(
                         latest_compaction_since_change,
                         Some(compaction::CompactionOutcome::Applied { .. })
@@ -448,7 +439,9 @@ impl<'a> AgentLoop<'a> {
                 total_usage.output_tokens += u.output_tokens;
                 total_usage.reasoning_output_tokens += u.reasoning_output_tokens;
                 total_usage.total_tokens += u.total_tokens;
-                context_tokens = u.total_tokens;
+                if let Some(tokens) = u.context_total() {
+                    context_tokens = tokens;
+                }
             }
 
             // Only a provider-declared tool-call completion makes streamed calls
@@ -2719,6 +2712,19 @@ mod tests {
         let mut config = test_config();
         config.limits.max_bytes = 700_000;
         config.limits.max_line_bytes = 700_000;
+        config.compaction.soft_fraction = 0.80;
+        config
+            .providers
+            .iter_mut()
+            .find(|(provider_id, _)| provider_id.as_str() == "test")
+            .map(|(_, provider)| provider)
+            .unwrap()
+            .models
+            .iter_mut()
+            .find(|(model_id, _)| model_id.as_str() == "fake-model")
+            .map(|(_, model)| model)
+            .unwrap()
+            .context_window = Some(200_000);
         let request_model = crate::models::resolve_model_ref(&config, "test/fake-model").unwrap();
         store
             .append_message(
@@ -2776,7 +2782,8 @@ mod tests {
             session_id: &session.id,
             cache_key: None,
             // At 200K, the hard threshold is 152K tokens. The ~620KB tool result
-            // pushes the bytes/4 estimate past it without crossing soft at the boundary.
+            // pushes the anchored estimate past it while the test's 80% soft
+            // target still accepts the retained current turn.
             model_context_window: Some(200_000),
             renderer: &mut renderer,
         };

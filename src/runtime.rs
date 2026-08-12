@@ -340,7 +340,12 @@ pub fn build_status_report(
         .transpose()?
         .unwrap_or(true);
     let model = status_model(config, resolved.model.active_model());
-    let context_usage = context_usage(store, resolved.attached_session.as_ref())?;
+    let context_usage = context_usage(
+        store,
+        config,
+        resolved.model.active_model(),
+        resolved.attached_session.as_ref(),
+    )?;
 
     Ok(StatusReport {
         model,
@@ -383,20 +388,24 @@ fn status_model(config: &Config, model: &ResolvedModelRef) -> StatusModel {
 
 fn context_usage(
     store: &Store,
+    config: &Config,
+    model: &ResolvedModelRef,
     session: Option<&Session>,
 ) -> Result<Option<(u64, ContextUsageSource)>> {
     let Some(session) = session else {
         return Ok(None);
     };
-    let (tokens, source) = if let Some(tokens) = session.reported_context_tokens {
-        (tokens, ContextUsageSource::Reported)
-    } else {
-        (
-            store.estimate_context_tokens(&session.id)?,
-            ContextUsageSource::Estimated,
-        )
-    };
-    Ok(Some((tokens, source)))
+    let provider = config.provider(&model.provider_id)?;
+    let api = crate::provider::classify_endpoint(&provider.endpoint)?;
+    let estimate = store.context_tokens(&session.id, config, model, api)?;
+    Ok(Some((
+        estimate.tokens,
+        if estimate.reported {
+            ContextUsageSource::Reported
+        } else {
+            ContextUsageSource::Estimated
+        },
+    )))
 }
 
 fn status_session(summary: crate::store::SessionSummary) -> StatusSession {
@@ -1119,6 +1128,25 @@ mod tests {
         assert_eq!(
             reported.context_usage_source,
             Some(ContextUsageSource::Reported)
+        );
+
+        store
+            .start_turn(&session.id, "/tmp", None, &"12345678".into())
+            .unwrap();
+        let anchored = build_status_report(
+            &store,
+            &test_config(),
+            &overrides,
+            None,
+            StatusIncludes::default(),
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(anchored.context_tokens, Some(27));
+        assert_eq!(
+            anchored.context_usage_source,
+            Some(ContextUsageSource::Estimated)
         );
 
         let mut disabled_config = test_config();

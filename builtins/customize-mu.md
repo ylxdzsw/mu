@@ -116,14 +116,21 @@ abort the turn, while explicit `mu compact` remains available.
 Compaction requires a model `context_window` and runs only when context tokens
 are strictly greater than the applicable threshold. Before a new turn's first
 provider request, `compaction.soft_fraction` sets the graceful threshold to
-`floor(context_window * soft_fraction)`. Before each semantic request within a
-turn, the hard threshold is the lower of
+`floor(context_window * soft_fraction)`. It is also the post-compaction target:
+mu rejects a candidate context that remains above it. This check is primarily a
+safety net; a useful summary is normally expected to reduce context well below
+the target. Before each semantic request within a turn, the hard threshold is
+the lower of
 `floor(context_window * hard_fraction)` and
 `context_window.saturating_sub(hard_headroom_tokens)`. Compaction keeps the
 smallest suffix of whole turns containing at least five requests, counting each
 submitted prompt and each Bash tool call as one request. This retains five
 tool-free turns, while a current turn with five tool calls satisfies the budget
-by itself.
+by itself. Context accounting keeps a compatible provider-reported total and
+estimates only later prompts or tool results; providers are compatible when
+their API, model id, and effective `replay_key` match. Compaction sends images
+through every API. It sends audio through Chat Completions and substitutes a
+metadata-only omission note for Responses and Anthropic.
 `limits.max_iterations` caps one agent turn; the other limits bound the
 model-visible preview of bash output by lines, total bytes, and bytes per line.
 The bell sounds only for turns lasting at least `min_duration_ms`. The guardrail
