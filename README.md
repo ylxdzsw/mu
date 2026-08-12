@@ -203,7 +203,8 @@ messages, and exits. A few ideas follow from that:
 - **One universal tool.** The model sees `bash`; existing command-line tools
   provide search, editing, testing, web access, and specialized workflows. Mu's
   `edit [--relaxed] FILE` applet requires every SEARCH block to match exactly
-  once.
+  once. Its `apply_patch` applet preflights structured changes and combines
+  repeated updates to the same path into one file write.
 - **Streaming, durable sessions.** Output appears as it is produced, while
   completed events are appended to per-session journals and survive separate
   invocations.

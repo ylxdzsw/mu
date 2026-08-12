@@ -26,7 +26,7 @@ pub fn dispatch(applet: Applet) -> i32 {
 }
 
 mod apply_patch {
-    use std::collections::HashSet;
+    use std::collections::HashMap;
     use std::fs::{self, OpenOptions};
     use std::io::{Read, Seek, SeekFrom, Write};
     use std::path::{Component, Path, PathBuf};
@@ -71,26 +71,33 @@ mod apply_patch {
         },
         Delete {
             path: PathBuf,
+            regular: bool,
         },
         Update {
             path: PathBuf,
             reported_path: PathBuf,
-            original: String,
+            original: Vec<u8>,
             content: String,
             permissions: fs::Permissions,
         },
         Move {
             from: PathBuf,
             to: PathBuf,
-            original: String,
+            original: Vec<u8>,
             content: String,
             permissions: fs::Permissions,
         },
         MoveSymlink {
             from: PathBuf,
             to: PathBuf,
-            target_update: Option<(PathBuf, String, String, fs::Permissions)>,
+            target_update: Option<(PathBuf, Vec<u8>, String, fs::Permissions)>,
         },
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum Repeatable {
+        No,
+        Update,
     }
 
     pub fn main() -> i32 {
@@ -276,29 +283,71 @@ mod apply_patch {
     }
 
     fn preflight(cwd: &Path, operations: Vec<Operation>) -> Result<Vec<PlannedChange>> {
-        let mut touched = HashSet::new();
-        let mut changes = Vec::new();
+        let mut claims = HashMap::new();
+        let mut changes: Vec<PlannedChange> = Vec::new();
+        let mut reported_entries = Vec::new();
+        let mut repeatable = Vec::new();
         for operation in operations {
             match operation {
                 Operation::Add { path, content } => {
                     let full = resolve_path(cwd, &path);
-                    claim_path(&mut touched, &full, &path)?;
+                    if let Some(&owner) = claims.get(&normalize_path(&full)) {
+                        if reported_entries[owner] != path {
+                            conflicting_operation(&path)?;
+                        }
+                        let replaceable =
+                            matches!(changes[owner], PlannedChange::Delete { regular: true, .. });
+                        if !replaceable {
+                            return conflicting_operation(&path);
+                        };
+                        let metadata = fs::symlink_metadata(&full).with_context(|| {
+                            format!("cannot replace missing file {}", path.display())
+                        })?;
+                        if !metadata.is_file() {
+                            return conflicting_operation(&path);
+                        }
+                        let original = fs::read(&full).with_context(|| {
+                            format!("reading file to replace {}", path.display())
+                        })?;
+                        changes[owner] = PlannedChange::Update {
+                            path: full.clone(),
+                            reported_path: full,
+                            original,
+                            content,
+                            permissions: metadata.permissions(),
+                        };
+                        repeatable[owner] = Repeatable::No;
+                        continue;
+                    }
                     if fs::symlink_metadata(&full).is_ok() {
                         bail!(
                             "add destination already exists: {}; inspect it first, then use bash to move or remove the existing file if necessary before retrying apply_patch",
                             path.display()
                         );
                     }
+                    let owner = changes.len();
+                    claim_path(&mut claims, &full, &path, owner)?;
                     changes.push(PlannedChange::Add {
                         path: full,
                         content,
                     });
+                    reported_entries.push(path);
+                    repeatable.push(Repeatable::No);
                 }
                 Operation::Delete { path } => {
                     let full = resolve_path(cwd, &path);
-                    claim_path(&mut touched, &full, &path)?;
-                    file_or_symlink_metadata(&full, "delete")?;
-                    changes.push(PlannedChange::Delete { path: full });
+                    if claims.contains_key(&normalize_path(&full)) {
+                        conflicting_operation(&path)?;
+                    }
+                    let metadata = file_or_symlink_metadata(&full, "delete")?;
+                    let owner = changes.len();
+                    claim_path(&mut claims, &full, &path, owner)?;
+                    changes.push(PlannedChange::Delete {
+                        path: full,
+                        regular: metadata.is_file(),
+                    });
+                    reported_entries.push(path);
+                    repeatable.push(Repeatable::No);
                 }
                 Operation::Update {
                     path,
@@ -306,14 +355,28 @@ mod apply_patch {
                     chunks,
                 } => {
                     let full = resolve_path(cwd, &path);
-                    claim_path(&mut touched, &full, &path)?;
+                    if let Some(&owner) = claims.get(&normalize_path(&full)) {
+                        if reported_entries[owner] != path
+                            || move_to.is_some()
+                            || repeatable[owner] != Repeatable::Update
+                        {
+                            conflicting_operation(&path)?;
+                        }
+                        let PlannedChange::Update { content, .. } = &mut changes[owner] else {
+                            return conflicting_operation(&path);
+                        };
+                        *content = apply_chunks(content, &path, &chunks)?;
+                        continue;
+                    }
+                    let owner = changes.len();
+                    claim_path(&mut claims, &full, &path, owner)?;
                     let destination_full = move_to
                         .as_ref()
                         .map(|destination| resolve_path(cwd, destination));
                     if let (Some(destination), Some(destination_full)) =
                         (&move_to, &destination_full)
                     {
-                        claim_path(&mut touched, destination_full, destination)?;
+                        claim_path(&mut claims, destination_full, destination, owner)?;
                         if fs::symlink_metadata(destination_full).is_ok() {
                             bail!(
                                 "move destination already exists: {}; inspect it first, then use bash to move or remove the existing file if necessary before retrying apply_patch",
@@ -334,12 +397,14 @@ mod apply_patch {
                                 to: destination,
                                 target_update: None,
                             });
+                            reported_entries.push(path);
+                            repeatable.push(Repeatable::No);
                             continue;
                         }
                         let target = fs::canonicalize(&full).with_context(|| {
                             format!("resolving symlink to update {}", path.display())
                         })?;
-                        claim_path(&mut touched, &target, &path)?;
+                        claim_path(&mut claims, &target, &path, owner)?;
                         let metadata = regular_file_metadata(&target, "update symlink target")?;
                         let original = fs::read_to_string(&target).with_context(|| {
                             format!("reading symlink target to update {}", path.display())
@@ -351,7 +416,7 @@ mod apply_patch {
                                 to: destination,
                                 target_update: Some((
                                     target,
-                                    original,
+                                    original.into_bytes(),
                                     content,
                                     metadata.permissions(),
                                 )),
@@ -360,11 +425,17 @@ mod apply_patch {
                             changes.push(PlannedChange::Update {
                                 path: target,
                                 reported_path: full,
-                                original,
+                                original: original.into_bytes(),
                                 content,
                                 permissions: metadata.permissions(),
                             });
                         }
+                        reported_entries.push(path);
+                        repeatable.push(if move_to.is_some() {
+                            Repeatable::No
+                        } else {
+                            Repeatable::Update
+                        });
                         continue;
                     }
                     if !entry_metadata.is_file() {
@@ -381,7 +452,7 @@ mod apply_patch {
                         changes.push(PlannedChange::Move {
                             from: full,
                             to: destination_full,
-                            original,
+                            original: original.into_bytes(),
                             content,
                             permissions: entry_metadata.permissions(),
                         });
@@ -389,25 +460,39 @@ mod apply_patch {
                         changes.push(PlannedChange::Update {
                             reported_path: full.clone(),
                             path: full,
-                            original,
+                            original: original.into_bytes(),
                             content,
                             permissions: entry_metadata.permissions(),
                         });
                     }
+                    reported_entries.push(path);
+                    repeatable.push(if move_to.is_some() {
+                        Repeatable::No
+                    } else {
+                        Repeatable::Update
+                    });
                 }
             }
         }
         Ok(changes)
     }
 
-    fn claim_path(touched: &mut HashSet<PathBuf>, resolved: &Path, reported: &Path) -> Result<()> {
-        if !touched.insert(normalize_path(resolved)) {
-            bail!(
-                "patch contains conflicting operations for {}",
-                reported.display()
-            );
+    fn claim_path(
+        claims: &mut HashMap<PathBuf, usize>,
+        resolved: &Path,
+        reported: &Path,
+        owner: usize,
+    ) -> Result<()> {
+        let normalized = normalize_path(resolved);
+        if claims.contains_key(&normalized) {
+            conflicting_operation(reported)?;
         }
+        claims.insert(normalized, owner);
         Ok(())
+    }
+
+    fn conflicting_operation<T>(reported: &Path) -> Result<T> {
+        bail!("multiple operations target {}", reported.display())
     }
 
     fn normalize_path(path: &Path) -> PathBuf {
@@ -582,7 +667,7 @@ mod apply_patch {
                 PlannedChange::Add { path, content } => {
                     atomic_write(path, content, None, false, None)
                 }
-                PlannedChange::Delete { path } => {
+                PlannedChange::Delete { path, .. } => {
                     fs::remove_file(path).with_context(|| format!("deleting {}", path.display()))
                 }
                 PlannedChange::Update {
@@ -596,7 +681,7 @@ mod apply_patch {
                     content,
                     Some(permissions.clone()),
                     true,
-                    Some(original),
+                    Some(original.as_slice()),
                 ),
                 PlannedChange::Move {
                     from,
@@ -608,9 +693,13 @@ mod apply_patch {
                     fs::rename(from, to).with_context(|| {
                         format!("moving {} to {}", from.display(), to.display())
                     })?;
-                    if let Err(error) =
-                        atomic_write(to, content, Some(permissions.clone()), true, Some(original))
-                    {
+                    if let Err(error) = atomic_write(
+                        to,
+                        content,
+                        Some(permissions.clone()),
+                        true,
+                        Some(original.as_slice()),
+                    ) {
                         return match fs::rename(to, from) {
                             Ok(()) => Err(error.context(format!(
                                 "updating moved file {}; move rolled back",
@@ -644,7 +733,7 @@ mod apply_patch {
                             content,
                             Some(permissions.clone()),
                             true,
-                            Some(original),
+                            Some(original.as_slice()),
                         )
                     {
                         return match fs::rename(to, from) {
@@ -681,7 +770,7 @@ mod apply_patch {
         content: &str,
         permissions: Option<fs::Permissions>,
         replace: bool,
-        expected: Option<&str>,
+        expected: Option<&[u8]>,
     ) -> Result<()> {
         let parent = path.parent().unwrap_or_else(|| Path::new("."));
         fs::create_dir_all(parent)
@@ -717,7 +806,7 @@ mod apply_patch {
     fn overwrite_existing(
         path: &Path,
         content: &[u8],
-        expected: Option<&str>,
+        expected: Option<&[u8]>,
         _permissions: Option<fs::Permissions>,
     ) -> Result<()> {
         let mut target = OpenOptions::new()
@@ -732,7 +821,7 @@ mod apply_patch {
         let mut old = Vec::new();
         target.read_to_end(&mut old)?;
         if let Some(expected) = expected
-            && old != expected.as_bytes()
+            && old != expected
         {
             bail!(
                 "file changed while the edit was being prepared; re-read {} and retry",
@@ -800,7 +889,7 @@ mod apply_patch {
         let relative = |path: &Path| path.strip_prefix(cwd).unwrap_or(path).display().to_string();
         match change {
             PlannedChange::Add { path, .. } => format!("A {}", relative(path)),
-            PlannedChange::Delete { path } => format!("D {}", relative(path)),
+            PlannedChange::Delete { path, .. } => format!("D {}", relative(path)),
             PlannedChange::Update { reported_path, .. } => {
                 format!("M {}", relative(reported_path))
             }
@@ -816,7 +905,7 @@ mod apply_patch {
     fn change_label(change: &PlannedChange) -> String {
         match change {
             PlannedChange::Add { path, .. } => format!("A {}", path.display()),
-            PlannedChange::Delete { path } => format!("D {}", path.display()),
+            PlannedChange::Delete { path, .. } => format!("D {}", path.display()),
             PlannedChange::Update { reported_path, .. } => {
                 format!("M {}", reported_path.display())
             }
@@ -890,7 +979,7 @@ mod apply_patch {
             fs::hard_link(&path, &hardlink).unwrap();
             let before = fs::metadata(&path).unwrap();
 
-            atomic_write(&path, "new\n", None, true, Some("old\n")).unwrap();
+            atomic_write(&path, "new\n", None, true, Some(b"old\n")).unwrap();
 
             let after = fs::metadata(&path).unwrap();
             assert_eq!((after.dev(), after.ino()), (before.dev(), before.ino()));
@@ -912,7 +1001,7 @@ mod apply_patch {
             let path = dir.join("file.txt");
             fs::write(&path, "changed\n").unwrap();
 
-            let error = atomic_write(&path, "new\n", None, true, Some("old\n")).unwrap_err();
+            let error = atomic_write(&path, "new\n", None, true, Some(b"old\n")).unwrap_err();
 
             assert!(
                 error
@@ -959,7 +1048,7 @@ mod apply_patch {
                     }
                     std::thread::sleep(std::time::Duration::from_millis(10));
                 }
-                let error = atomic_write(&path, "new\n", None, true, Some("old\n")).unwrap_err();
+                let error = atomic_write(&path, "new\n", None, true, Some(b"old\n")).unwrap_err();
                 assert!(error.to_string().contains("file is busy"));
                 assert_eq!(fs::read_to_string(&path).unwrap(), "old\n");
                 Ok(())
@@ -968,7 +1057,7 @@ mod apply_patch {
             let _ = holder.kill();
             let _ = holder.wait();
             contention.unwrap();
-            atomic_write(&path, "new\n", None, true, Some("old\n")).unwrap();
+            atomic_write(&path, "new\n", None, true, Some(b"old\n")).unwrap();
             assert_eq!(fs::read_to_string(&path).unwrap(), "new\n");
             fs::remove_dir_all(dir).unwrap();
         }
@@ -987,6 +1076,95 @@ mod apply_patch {
                 fs::read_to_string(dir.join("exists.txt")).unwrap(),
                 "keep\n"
             );
+            fs::remove_dir_all(dir).unwrap();
+        }
+
+        #[test]
+        fn applies_repeated_updates_to_virtual_content() {
+            let dir = temp_dir();
+            fs::write(dir.join("file.txt"), "alpha\nmiddle\nomega\n").unwrap();
+            let patch = "*** Begin Patch\n*** Update File: file.txt\n@@\n-alpha\n+ALPHA\n*** Update File: file.txt\n@@\n-omega\n+OMEGA\n*** End Patch\n";
+            let changes = preflight(&dir, parse_patch(patch).unwrap()).unwrap();
+
+            assert_eq!(changes.len(), 1);
+            commit(&changes).unwrap();
+            assert_eq!(
+                fs::read_to_string(dir.join("file.txt")).unwrap(),
+                "ALPHA\nmiddle\nOMEGA\n"
+            );
+            assert_eq!(format_summary(&changes, &dir), "Done!\nM file.txt\n");
+            fs::remove_dir_all(dir).unwrap();
+        }
+
+        #[test]
+        fn repeated_update_sections_reset_their_hunk_cursor() {
+            let dir = temp_dir();
+            fs::write(dir.join("file.txt"), "alpha\nmiddle\nomega\n").unwrap();
+            let patch = "*** Begin Patch\n*** Update File: file.txt\n@@\n-omega\n+OMEGA\n*** Update File: file.txt\n@@\n-alpha\n+ALPHA\n*** End Patch\n";
+            let changes = preflight(&dir, parse_patch(patch).unwrap()).unwrap();
+
+            commit(&changes).unwrap();
+            assert_eq!(
+                fs::read_to_string(dir.join("file.txt")).unwrap(),
+                "ALPHA\nmiddle\nOMEGA\n"
+            );
+            fs::remove_dir_all(dir).unwrap();
+        }
+
+        #[test]
+        fn failed_repeated_update_leaves_every_file_unchanged() {
+            let dir = temp_dir();
+            fs::write(dir.join("one.txt"), "alpha\nomega\n").unwrap();
+            fs::write(dir.join("two.txt"), "old\n").unwrap();
+            let patch = "*** Begin Patch\n*** Update File: two.txt\n@@\n-old\n+new\n*** Update File: one.txt\n@@\n-alpha\n+ALPHA\n*** Update File: one.txt\n@@\n-missing\n+OMEGA\n*** End Patch\n";
+            let error = preflight(&dir, parse_patch(patch).unwrap()).unwrap_err();
+
+            assert!(error.to_string().contains("failed to find expected lines"));
+            assert_eq!(
+                fs::read_to_string(dir.join("one.txt")).unwrap(),
+                "alpha\nomega\n"
+            );
+            assert_eq!(fs::read_to_string(dir.join("two.txt")).unwrap(), "old\n");
+            fs::remove_dir_all(dir).unwrap();
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn delete_then_add_rewrites_regular_file_in_place() {
+            use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+            let dir = temp_dir();
+            let path = dir.join("file.txt");
+            let hardlink = dir.join("hardlink.txt");
+            fs::write(&path, "old\n").unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o640)).unwrap();
+            fs::hard_link(&path, &hardlink).unwrap();
+            let before = fs::metadata(&path).unwrap();
+            let patch = "*** Begin Patch\n*** Delete File: file.txt\n*** Add File: file.txt\n+new\n*** End Patch\n";
+            let changes = preflight(&dir, parse_patch(patch).unwrap()).unwrap();
+
+            assert_eq!(changes.len(), 1);
+            commit(&changes).unwrap();
+            let after = fs::metadata(&path).unwrap();
+            assert_eq!((after.dev(), after.ino()), (before.dev(), before.ino()));
+            assert_eq!(after.permissions().mode() & 0o777, 0o640);
+            assert_eq!(fs::read_to_string(&hardlink).unwrap(), "new\n");
+            assert_eq!(format_summary(&changes, &dir), "Done!\nM file.txt\n");
+            fs::remove_dir_all(dir).unwrap();
+        }
+
+        #[test]
+        fn delete_then_add_revalidates_original_bytes() {
+            let dir = temp_dir();
+            let path = dir.join("file.txt");
+            fs::write(&path, [0xff, 0x00]).unwrap();
+            let patch = "*** Begin Patch\n*** Delete File: file.txt\n*** Add File: file.txt\n+text\n*** End Patch\n";
+            let changes = preflight(&dir, parse_patch(patch).unwrap()).unwrap();
+            fs::write(&path, [0xfe, 0x00]).unwrap();
+
+            let error = commit(&changes).unwrap_err();
+            assert!(format!("{error:#}").contains("changed while the edit was being prepared"));
+            assert_eq!(fs::read(&path).unwrap(), [0xfe, 0x00]);
             fs::remove_dir_all(dir).unwrap();
         }
 
@@ -1024,7 +1202,7 @@ mod apply_patch {
             let dir = temp_dir();
             let patch = "*** Begin Patch\n*** Add File: sub/../same.txt\n+one\n*** Add File: same.txt\n+two\n*** End Patch\n";
             let error = preflight(&dir, parse_patch(patch).unwrap()).unwrap_err();
-            assert!(error.to_string().contains("conflicting operations"));
+            assert!(error.to_string().contains("multiple operations target"));
             fs::remove_dir_all(dir).unwrap();
         }
 
@@ -1047,6 +1225,56 @@ mod apply_patch {
                     .is_symlink()
             );
             assert_eq!(fs::read_to_string(dir.join("target.txt")).unwrap(), "new\n");
+            fs::remove_dir_all(dir).unwrap();
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn repeated_updates_through_same_symlink_preserve_link() {
+            use std::os::unix::fs::symlink;
+
+            let dir = temp_dir();
+            fs::write(dir.join("target.txt"), "alpha\nomega\n").unwrap();
+            symlink("target.txt", dir.join("link.txt")).unwrap();
+            let patch = "*** Begin Patch\n*** Update File: link.txt\n@@\n-alpha\n+ALPHA\n*** Update File: link.txt\n@@\n-omega\n+OMEGA\n*** End Patch\n";
+            let changes = preflight(&dir, parse_patch(patch).unwrap()).unwrap();
+
+            commit(&changes).unwrap();
+            assert!(
+                fs::symlink_metadata(dir.join("link.txt"))
+                    .unwrap()
+                    .file_type()
+                    .is_symlink()
+            );
+            assert_eq!(
+                fs::read_to_string(dir.join("target.txt")).unwrap(),
+                "ALPHA\nOMEGA\n"
+            );
+            fs::remove_dir_all(dir).unwrap();
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn delete_then_add_symlink_is_rejected() {
+            use std::os::unix::fs::symlink;
+
+            let dir = temp_dir();
+            fs::write(dir.join("target.txt"), "keep\n").unwrap();
+            symlink("target.txt", dir.join("link.txt")).unwrap();
+            let patch = "*** Begin Patch\n*** Delete File: link.txt\n*** Add File: link.txt\n+replacement\n*** End Patch\n";
+            let error = preflight(&dir, parse_patch(patch).unwrap()).unwrap_err();
+
+            assert!(error.to_string().contains("multiple operations target"));
+            assert!(
+                fs::symlink_metadata(dir.join("link.txt"))
+                    .unwrap()
+                    .file_type()
+                    .is_symlink()
+            );
+            assert_eq!(
+                fs::read_to_string(dir.join("target.txt")).unwrap(),
+                "keep\n"
+            );
             fs::remove_dir_all(dir).unwrap();
         }
 
@@ -1149,9 +1377,55 @@ mod apply_patch {
             symlink("target.txt", dir.join("two.txt")).unwrap();
             let patch = "*** Begin Patch\n*** Update File: one.txt\n@@\n-old\n+one\n*** Update File: two.txt\n@@\n-old\n+two\n*** End Patch\n";
             let error = preflight(&dir, parse_patch(patch).unwrap()).unwrap_err();
-            assert!(error.to_string().contains("conflicting operations"));
+            assert!(error.to_string().contains("multiple operations target"));
             assert_eq!(fs::read_to_string(dir.join("target.txt")).unwrap(), "old\n");
             fs::remove_dir_all(dir).unwrap();
+        }
+
+        #[test]
+        fn repeated_operation_involving_move_is_rejected() {
+            let dir = temp_dir();
+            fs::write(dir.join("file.txt"), "old\n").unwrap();
+            let patch = "*** Begin Patch\n*** Update File: file.txt\n@@\n-old\n+new\n*** Update File: file.txt\n*** Move to: moved.txt\n*** End Patch\n";
+            let error = preflight(&dir, parse_patch(patch).unwrap()).unwrap_err();
+
+            assert!(error.to_string().contains("multiple operations target"));
+            assert_eq!(fs::read_to_string(dir.join("file.txt")).unwrap(), "old\n");
+            assert!(!dir.join("moved.txt").exists());
+            fs::remove_dir_all(dir).unwrap();
+        }
+
+        #[test]
+        fn unsupported_repeated_operation_sequences_are_rejected() {
+            let cases = [
+                (
+                    "*** Add File: file.txt\n+new\n*** Update File: file.txt\n@@\n-new\n+newer\n",
+                    false,
+                ),
+                (
+                    "*** Update File: file.txt\n@@\n-old\n+new\n*** Delete File: file.txt\n",
+                    true,
+                ),
+                (
+                    "*** Delete File: file.txt\n*** Add File: file.txt\n+new\n*** Update File: file.txt\n@@\n-new\n+newer\n",
+                    true,
+                ),
+            ];
+            for (operations, exists) in cases {
+                let dir = temp_dir();
+                if exists {
+                    fs::write(dir.join("file.txt"), "old\n").unwrap();
+                }
+                let patch = format!("*** Begin Patch\n{operations}*** End Patch\n");
+                let error = preflight(&dir, parse_patch(&patch).unwrap()).unwrap_err();
+
+                assert!(error.to_string().contains("multiple operations target"));
+                assert_eq!(dir.join("file.txt").exists(), exists);
+                if exists {
+                    assert_eq!(fs::read_to_string(dir.join("file.txt")).unwrap(), "old\n");
+                }
+                fs::remove_dir_all(dir).unwrap();
+            }
         }
     }
 }
@@ -1278,7 +1552,7 @@ mod edit {
             &planned.content,
             Some(planned.permissions.clone()),
             true,
-            Some(&planned.original),
+            Some(planned.original.as_bytes()),
         )?;
         Ok(format_summary(&planned, &cwd))
     }
@@ -1881,7 +2155,7 @@ mod edit {
                 &planned.content,
                 Some(planned.permissions.clone()),
                 true,
-                Some(&planned.original),
+                Some(planned.original.as_bytes()),
             )
             .unwrap();
             assert_eq!(
@@ -2063,7 +2337,7 @@ mod edit {
                 &planned.content,
                 Some(planned.permissions.clone()),
                 true,
-                Some(&planned.original),
+                Some(planned.original.as_bytes()),
             )
             .unwrap();
 

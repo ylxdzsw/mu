@@ -293,6 +293,7 @@ mod tests {
             role_preamble()
         )));
         assert!(prompt.contains("Exactly one tool is available: `bash`"));
+        assert!(prompt.contains("Codex `*** Begin Patch` / `*** End Patch` syntax"));
         assert!(prompt.contains("</system_preamble>\n\n<runtime>"));
         assert!(prompt.contains("\nuser: "));
         assert!(prompt.contains(" (uid "));

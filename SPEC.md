@@ -510,11 +510,16 @@ normal CLI parsing or portable initialization, `mu` checks the basename of
   `*** Begin Patch` / `*** End Patch` format supports add, update, move, and
   delete operations with context hunks. Relative paths resolve from the shell
   call's working directory; absolute paths are used as written. It preflights
-  the whole patch, rejects conflicting operations and existing add/move
-  destinations, then applies validated file changes. Updating through a
-  symlink edits its regular-file target while preserving the link; deleting a
-  symlink removes only the link; moving a symlink renames the link. Dangling
-  links can therefore be deleted or moved but cannot be updated.
+  the whole patch, then applies validated file changes. Repeated non-moving
+  updates using the same path are applied sequentially to virtual content and
+  committed as one update. Deleting and then adding the same regular-file path
+  is likewise one in-place update, preserving its inode, permissions, and hard
+  links. Other repeated or aliased targets, repeated operations involving a
+  move, delete-add on a symlink, and existing add/move destinations are
+  rejected. Updating through a symlink edits its regular-file target while
+  preserving the link; deleting a symlink removes only the link; moving a
+  symlink renames the link. Dangling links can therefore be deleted or moved
+  but cannot be updated.
 - **`edit [--relaxed] FILE`** reads one or more replacement blocks from
   stdin. Each block has marker-only framing lines and this shape:
   ```text
