@@ -285,6 +285,8 @@ accepts optional non-terminal stdin as a custom focus). The surface is small:
   `context_tokens / context_window` and compare the raw count with
   `compaction_soft_threshold_tokens` to render pending compaction. That
   threshold is `null` when automatic compaction is disabled.
+  `output` is the resolved configured output density for consumers that do not
+  have an explicit invocation override.
   The resolved model object includes its current effective `replay_key`;
   `--include-models` adds the effective key for every configured model.
 - `mu context [--export]` — introspect the agent context. By default it prints
@@ -948,10 +950,11 @@ Mu action restores it. Prompt rendering plus status, command-discovery, and
 completion lookups are passive observations and do not invalidate it. An
 accepted prompt or slash action activates its current scope, atomically
 discarding a bundle owned by another scope before the action runs. Malformed or
-unknown slash input, an unsupported model, and an unreadable attachment are
-rejected before activation; a later runtime failure does not restore discarded
-state. Within the same scope, `/new` clears only the session id and preserves the
-model override and attachments.
+unknown slash input, an unsupported model, an unknown `/load` session, and an
+unreadable attachment are rejected before activation; a later runtime failure
+does not restore discarded state. Within the same scope, `/new` clears only the
+session id, while `/load` replaces only the session id; both preserve the model
+override and attachments.
 After the native line editor commits the submitted prompt line to scrollback,
 the plugin prints one empty line before child-process output starts, independent
 of whether the child uses `concise`, `detail`, or `full` output.
@@ -1005,12 +1008,20 @@ Consequences:
   message itself. `/attach` lists pending files and `/attach --clear` discards
   them. Attachments belong to the tracked scope, and the prompt shows the count
   only while that scope is active. Empty Enter, draft cancellation,
-  mode changes, `/model`, `/new`, `/retry`, and `/compact` do not consume the
-  queue; the next ordinary prompt or custom command passes every staged file as
-  a repeatable `-a` argument and clears the queue before launching `mu`.
+  mode changes, `/model`, `/load`, `/new`, `/retry`, and `/compact` do not
+  consume the queue; the next ordinary prompt or custom command passes every
+  staged file as a repeatable `-a` argument and clears the queue before
+  launching `mu`.
 - `/model <model>` validates and stores a shell-only sticky override in the
   tracked bundle. It is forwarded as `--model` to later turns and `/retry`; it
   does not mutate persisted session state.
+- `/load <session-id>` replays the selected active-scope session through
+  `mu transcript` and attaches the shell to it only after replay succeeds. The
+  transcript uses the explicit shell output override when present, otherwise
+  the configured `output` reported by `mu status --json`; it is not fixed to one
+  density. Missing, malformed, corrupt, or interrupted loads leave the tracked
+  bundle unchanged. Loading does not select the scope's `current-session`; the
+  next durable turn does that through the normal turn lifecycle.
 - Completing a bare or provider-qualified model appends a speculative `:` and
   immediately opens its effort candidates when the completed reference is
   exact, no other candidate of the same form has it as a strict prefix, and at
@@ -1098,6 +1109,8 @@ Session lifecycle is exposed through CLI commands:
 - Exporting the shell-specific `MU_ZSH_SESSION_ID=<id>` or
   `MU_FISH_SESSION_ID=<id>` before entering `mu>` attaches the plugin to an
   existing session.
+- `/load <session-id>` visibly replays and attaches an existing active-scope
+  session without starting a turn.
 - `mu -c` continues the last selected session in the active scope for a
   one-shot turn.
 - `mu new` creates a session and prints its id.

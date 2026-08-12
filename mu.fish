@@ -470,7 +470,7 @@ function _mu_fish_has_custom_slash_command --argument-names requested_command
 end
 
 function _mu_fish_slash_command_candidates
-    printf '%s\n' /attach /model
+    printf '%s\n' /attach /load /model
     _mu_fish_has_effective_session; and printf '%s\n' /new /retry /compact
     _mu_fish_custom_slash_commands 2>/dev/null
 end
@@ -635,6 +635,22 @@ function _mu_fish_validate_model_ref --argument-names model
     test -n "$_MU_FISH_VALIDATED_MODEL"; or set -g _MU_FISH_VALIDATED_MODEL "$model"
 end
 
+function _mu_fish_resolve_load_output --argument-names session_id
+    if set -q MU_FISH_OUTPUT[1]; and test -n "$MU_FISH_OUTPUT"
+        set -g _MU_FISH_LOAD_OUTPUT "$MU_FISH_OUTPUT"
+        return 0
+    end
+
+    set -l json ("$MU_FISH_BIN" status --json -s "$session_id" | string collect)
+    set -l command_status $pipestatus[1]
+    test $command_status -eq 0; or return $command_status
+    set -g _MU_FISH_LOAD_OUTPUT (printf '%s' "$json" | jq -r '.output // empty' 2>/dev/null)
+    contains -- "$_MU_FISH_LOAD_OUTPUT" final concise detail full; or begin
+        printf '%s\n' 'mu mu.fish: status returned an invalid output density' >&2
+        return 1
+    end
+end
+
 function _mu_fish_run_custom_slash_command --argument-names slash_command instruction
     set -l scope (_mu_fish_current_scope)
     _mu_fish_activate_scope "$scope"
@@ -727,6 +743,24 @@ function _mu_fish_run_slash_command --argument-names line
             set -g MU_FISH_MODEL "$_MU_FISH_VALIDATED_MODEL"
             set -g MU_FISH_EFFECTIVE_MODEL "$_MU_FISH_VALIDATED_MODEL"
             _mu_fish_print_block_message "[mu] next turns in this scope will use $_MU_FISH_VALIDATED_MODEL"
+
+        case /load
+            if test -z "$rest"
+                _mu_fish_print_block_message '[mu] usage: /load <session-id>'
+                return 1
+            end
+            if string match -qr '[[:space:]]' -- "$rest"
+                _mu_fish_print_block_message '[mu] /load accepts exactly one session id'
+                return 1
+            end
+            _mu_fish_resolve_load_output "$rest"; or return $status
+            "$MU_FISH_BIN" transcript --session "$rest" --output "$_MU_FISH_LOAD_OUTPUT"
+            set exit_status $status
+            test $exit_status -eq 0; or return $exit_status
+            _mu_fish_activate_scope "$scope"
+            set -g MU_FISH_SESSION_ID "$rest"
+            set -g MU_FISH_EFFECTIVE_SESSION_ID "$rest"
+            _mu_fish_print_block_message "[mu] loaded session $rest"
 
         case /new
             if test -n "$rest"

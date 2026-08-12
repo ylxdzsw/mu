@@ -79,25 +79,35 @@ begin
     printf '%s\n' '#!/bin/sh'
     printf '%s\n' 'if [ "$1" = status ]; then'
     printf '%s\n' '  model=local/test'
+    printf '%s\n' '  session='
     printf '%s\n' '  include_commands=0'
     printf '%s\n' '  include_models=0'
     printf '%s\n' '  while [ "$#" -gt 0 ]; do'
     printf '%s\n' '    case "$1" in'
     printf '%s\n' '      --model) shift; model=$1 ;;'
+    printf '%s\n' '      -s|--session) shift; session=$1 ;;'
     printf '%s\n' '      --include-commands) include_commands=1 ;;'
     printf '%s\n' '      --include-models) include_models=1 ;;'
     printf '%s\n' '    esac'
     printf '%s\n' '    shift'
     printf '%s\n' '  done'
+    printf '%s\n' '  [ "$session" = ses_missing ] && exit 1'
     printf '%s\n' '  [ "$model" = unknown ] && exit 1'
     printf '%s\n' '  [ "$model" = gpt ] && model=openai/gpt'
     printf '%s\n' '  if [ "$include_models" -eq 1 ]; then'
-    printf '%s\n' '    printf "%s\n" "{\"model\":{\"canonical\":\"$model\"},\"context_tokens\":25,\"context_window\":100,\"project_root\":\"$TEST_PROJECT_ROOT\",\"clean\":true,\"available_models\":{\"providers\":[{\"id\":\"local\",\"models\":[{\"id\":\"local/solo\",\"model_id\":\"solo\",\"supported_efforts\":[\"max\"]},{\"id\":\"local/shared\",\"model_id\":\"shared\",\"supported_efforts\":[]}]},{\"id\":\"openai\",\"models\":[{\"id\":\"openai/gpt\",\"model_id\":\"gpt\",\"supported_efforts\":[\"low\",\"high\"]},{\"id\":\"openai/shared\",\"model_id\":\"shared\",\"supported_efforts\":[\"medium\"]}]}]}}"'
+    printf '%s\n' '    printf "%s\n" "{\"model\":{\"canonical\":\"$model\"},\"output\":\"concise\",\"context_tokens\":25,\"context_window\":100,\"project_root\":\"$TEST_PROJECT_ROOT\",\"clean\":true,\"available_models\":{\"providers\":[{\"id\":\"local\",\"models\":[{\"id\":\"local/solo\",\"model_id\":\"solo\",\"supported_efforts\":[\"max\"]},{\"id\":\"local/shared\",\"model_id\":\"shared\",\"supported_efforts\":[]}]},{\"id\":\"openai\",\"models\":[{\"id\":\"openai/gpt\",\"model_id\":\"gpt\",\"supported_efforts\":[\"low\",\"high\"]},{\"id\":\"openai/shared\",\"model_id\":\"shared\",\"supported_efforts\":[\"medium\"]}]}]}}"'
     printf '%s\n' '  elif [ "$include_commands" -eq 1 ]; then'
-    printf '%s\n' '    printf "%s\n" "{\"model\":{\"canonical\":\"$model\"},\"context_tokens\":25,\"context_window\":100,\"project_root\":\"$TEST_PROJECT_ROOT\",\"clean\":true,\"commands\":[{\"name\":\"review.md\"}]}"'
+    printf '%s\n' '    printf "%s\n" "{\"model\":{\"canonical\":\"$model\"},\"output\":\"concise\",\"context_tokens\":25,\"context_window\":100,\"project_root\":\"$TEST_PROJECT_ROOT\",\"clean\":true,\"commands\":[{\"name\":\"review.md\"}]}"'
     printf '%s\n' '  else'
-    printf '%s\n' '    printf "%s\n" "{\"model\":{\"canonical\":\"$model\"},\"context_tokens\":75,\"context_window\":100,\"compaction_soft_threshold_tokens\":70,\"context_usage_source\":\"estimated\",\"project_root\":\"$TEST_PROJECT_ROOT\",\"clean\":true}"'
+    printf '%s\n' '    printf "%s\n" "{\"model\":{\"canonical\":\"$model\"},\"output\":\"concise\",\"context_tokens\":75,\"context_window\":100,\"compaction_soft_threshold_tokens\":70,\"context_usage_source\":\"estimated\",\"project_root\":\"$TEST_PROJECT_ROOT\",\"clean\":true}"'
     printf '%s\n' '  fi'
+    printf '%s\n' '  exit 0'
+    printf '%s\n' fi
+    printf '%s\n' 'if [ "$1" = transcript ]; then'
+    printf '%s\n' '  printf x >>"$TEST_CAPTURE_CALLS"'
+    printf '%s\n' '  printf "%s\n" "$@" >"$TEST_CAPTURE_ARGS"'
+    printf '%s\n' '  case "$*" in *ses_missing*) exit 1 ;; esac'
+    printf '%s\n' '  printf "%s\n" "Loaded transcript."'
     printf '%s\n' '  exit 0'
     printf '%s\n' fi
     printf '%s\n' 'if [ "$1" = new ]; then'
@@ -139,6 +149,34 @@ assert_equal (string join \x1e -- $command) (string join \x1e -- "$fake_bin/mu" 
 
 set attachment "$TEST_TMPDIR/file with spaces.png"
 printf image >"$attachment"
+set -g MU_FISH_MODEL openai/gpt
+set -g MU_FISH_EFFECTIVE_MODEL openai/gpt
+set -g MU_FISH_PENDING_ATTACHMENTS "$attachment"
+set -g MU_FISH_EFFECTIVE_ATTACHMENT_COUNT 1
+set -g MU_FISH_OUTPUT
+rm -f "$capture_args" "$capture_calls"
+set load_output (_mu_fish_run_slash_command '/load ses_0000000b' | string collect)
+assert_equal "$MU_FISH_SESSION_ID" ses_0000000b '/load attaches the selected session'
+assert_equal "$MU_FISH_MODEL" openai/gpt '/load preserves the model override'
+set -q MU_FISH_PENDING_ATTACHMENTS[1]; or fail '/load preserves pending attachments'
+assert_contains "$load_output" 'Loaded transcript.' '/load renders the selected transcript'
+assert_contains "$load_output" '[mu] loaded session ses_0000000b' '/load confirms the selected session'
+set load_args (cat "$capture_args")
+assert_equal (string join \x1e -- $load_args) (string join \x1e -- transcript --session ses_0000000b --output concise) '/load uses the configured output density'
+set -g MU_FISH_OUTPUT full
+rm -f "$capture_args" "$capture_calls"
+_mu_fish_run_slash_command '/load ses_0000000c' >/dev/null
+set load_args (cat "$capture_args")
+assert_equal (string join \x1e -- $load_args) (string join \x1e -- transcript --session ses_0000000c --output full) '/load uses the shell output override'
+_mu_fish_run_slash_command '/load ses_missing' >/dev/null 2>&1; and fail '/load should reject a missing session'
+assert_equal "$MU_FISH_SESSION_ID" ses_0000000c 'failed load preserves the attached session'
+_mu_fish_run_slash_command '/load' >/dev/null; and fail '/load should require a session id'
+_mu_fish_run_slash_command '/load ses_0000000b extra' >/dev/null; and fail '/load should accept exactly one session id'
+set -g MU_FISH_SESSION_ID ses_0000000a
+set -g MU_FISH_EFFECTIVE_SESSION_ID ses_0000000a
+set -g MU_FISH_OUTPUT detail
+_mu_fish_clear_model_state
+set -g MU_FISH_PENDING_ATTACHMENTS
 set -g MU_FISH_PENDING_ATTACHMENTS "$attachment"
 rm -f "$capture_args" "$capture_stdin" "$capture_calls"
 _mu_fish_submit_prompt 'inspect this'
@@ -241,6 +279,7 @@ assert_equal "$MU_FISH_EFFECTIVE_ATTACHMENT_COUNT" 1 'returning without an actio
 cd "$project_b/subdir"
 _mu_fish_run_slash_command '/model unknown'; and fail 'invalid model elsewhere should fail'
 _mu_fish_run_slash_command "/attach $TEST_TMPDIR/missing-scope-file"; and fail 'invalid attachment elsewhere should fail'
+_mu_fish_run_slash_command '/load ses_missing'; and fail 'invalid load elsewhere should fail'
 cd "$project_a/subdir"
 _mu_fish_sync_state
 assert_equal "$MU_FISH_SESSION_ID" ses_0000000a 'invalid actions elsewhere preserve parked session'

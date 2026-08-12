@@ -92,6 +92,8 @@ runs against the current Mu session and shell state.
 Type `/` to list prompt-mode commands. The common ones:
 
 - `/new` starts a new session while keeping the current model and attachments.
+- `/load <session-id>` renders an existing session's transcript and attaches
+  the shell to it for later turns. It uses the current output density.
 - `/model` selects a configured model for later turns in this shell scope.
   Completing an unambiguous model appends a temporary `:` and lists its effort
   variants; type an effort prefix directly, or press Enter to select the model
@@ -111,7 +113,8 @@ Fish integration requires Fish 4 because it records replayable turns with
 The plugin keeps its session, model choice, and pending attachments together in
 one project scope. Changing directories only hides that state, so returning is
 non-destructive. Running a Mu prompt or slash action in another scope discards
-the old bundle; invalid model and attachment input leaves it untouched.
+the old bundle; invalid model, session, and attachment input leaves it
+untouched.
 
 ## More ways to run a turn
 

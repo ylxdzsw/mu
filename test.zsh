@@ -60,6 +60,7 @@ cat > "$prompt_fake_bin/mu" <<'EOF'
 #!/usr/bin/env zsh
 if [[ "$1" == "status" ]]; then
   model=prompt-test-model
+  session=
   include_models=0
   include_commands=0
   while (( $# )); do
@@ -67,6 +68,10 @@ if [[ "$1" == "status" ]]; then
       --model)
         shift
         model=$1
+        ;;
+      -s|--session)
+        shift
+        session=$1
         ;;
       --include-models)
         include_models=1
@@ -77,6 +82,7 @@ if [[ "$1" == "status" ]]; then
     esac
     shift
   done
+  [[ "$session" == ses_missing ]] && exit 1
   [[ "$model" == gpt ]] && model=openai/gpt
   [[ "$model" == invalid/* ]] && exit 1
   provider=${model%%/*}
@@ -84,11 +90,11 @@ if [[ "$1" == "status" ]]; then
   [[ "$provider" == "$model" ]] && provider=test
   model_json="\"model\":{\"provider_id\":\"$provider\",\"model_id\":\"$model_id\",\"effort\":null,\"canonical\":\"$model\"}"
   if (( include_models )); then
-    print -r -- "{$model_json,\"context_tokens\":25,\"context_window\":100,\"project_root\":\"$MU_ZSH_TEST_PROJECT_ROOT\",\"available_models\":{\"providers\":[{\"id\":\"local\",\"models\":[{\"id\":\"local/solo\",\"model_id\":\"solo\",\"supported_efforts\":[\"max\"]},{\"id\":\"local/shared\",\"model_id\":\"shared\",\"supported_efforts\":[\"low\"]}]},{\"id\":\"openai\",\"models\":[{\"id\":\"openai/gpt\",\"model_id\":\"gpt\",\"supported_efforts\":[\"provider-custom\",\"high\",\"minimum\",\"low\",\"max\",\"medium\",\"xhigh\"]},{\"id\":\"openai/gpt-5.6-luna\",\"model_id\":\"gpt-5.6-luna\",\"supported_efforts\":[\"none\",\"max\"]},{\"id\":\"openai/shared\",\"model_id\":\"shared\",\"supported_efforts\":[\"medium\"]}]}]}}"
+    print -r -- "{$model_json,\"output\":\"concise\",\"context_tokens\":25,\"context_window\":100,\"project_root\":\"$MU_ZSH_TEST_PROJECT_ROOT\",\"available_models\":{\"providers\":[{\"id\":\"local\",\"models\":[{\"id\":\"local/solo\",\"model_id\":\"solo\",\"supported_efforts\":[\"max\"]},{\"id\":\"local/shared\",\"model_id\":\"shared\",\"supported_efforts\":[\"low\"]}]},{\"id\":\"openai\",\"models\":[{\"id\":\"openai/gpt\",\"model_id\":\"gpt\",\"supported_efforts\":[\"provider-custom\",\"high\",\"minimum\",\"low\",\"max\",\"medium\",\"xhigh\"]},{\"id\":\"openai/gpt-5.6-luna\",\"model_id\":\"gpt-5.6-luna\",\"supported_efforts\":[\"none\",\"max\"]},{\"id\":\"openai/shared\",\"model_id\":\"shared\",\"supported_efforts\":[\"medium\"]}]}]}}"
   elif (( include_commands )); then
-    print -r -- "{$model_json,\"context_tokens\":25,\"context_window\":100,\"project_root\":\"$MU_ZSH_TEST_PROJECT_ROOT\",\"commands\":[{\"name\":\"review.md\",\"path\":\"$MU_ZSH_TEST_PROJECT_ROOT/.mu/review.md\",\"scope\":\"project\"}]}"
+    print -r -- "{$model_json,\"output\":\"concise\",\"context_tokens\":25,\"context_window\":100,\"project_root\":\"$MU_ZSH_TEST_PROJECT_ROOT\",\"commands\":[{\"name\":\"review.md\",\"path\":\"$MU_ZSH_TEST_PROJECT_ROOT/.mu/review.md\",\"scope\":\"project\"}]}"
   else
-    print -r -- "{$model_json,\"context_tokens\":25,\"context_window\":100,\"project_root\":\"$MU_ZSH_TEST_PROJECT_ROOT\"}"
+    print -r -- "{$model_json,\"output\":\"concise\",\"context_tokens\":25,\"context_window\":100,\"project_root\":\"$MU_ZSH_TEST_PROJECT_ROOT\"}"
   fi
   exit 0
 fi
@@ -115,6 +121,12 @@ if [[ "$1" == "compact" ]]; then
 fi
 if [[ "$1" == "retry" ]]; then
   print -r -- "$*" >> "$MU_ZSH_FAKE_LOG"
+  exit 0
+fi
+if [[ "$1" == "transcript" ]]; then
+  print -r -- "$*" >> "$MU_ZSH_FAKE_LOG"
+  [[ "$*" == *ses_missing* ]] && exit 1
+  print -r -- "Loaded transcript."
   exit 0
 fi
 print -r -- "$*" >> "$MU_ZSH_FAKE_LOG"
@@ -394,23 +406,23 @@ MU_ZSH_OUTPUT=detail
 MU_ZSH_SESSION_ID=
 MU_ZSH_TRACKED_SCOPE=
 command_candidates=("${(@f)$(_mu_zsh_slash_command_candidates)}")
-[[ "${(j:,:)command_candidates}" == "/attach,/model,/review.md" ]] || fail "hides session commands without a valid session"
+[[ "${(j:,:)command_candidates}" == "/attach,/load,/model,/review.md" ]] || fail "hides session commands without a valid session"
 MU_ZSH_SESSION_ID=tracked-session
 MU_ZSH_TRACKED_SCOPE=$(current_scope_key)
 command_candidates=("${(@f)$(_mu_zsh_slash_command_candidates)}")
-[[ "${(j:,:)command_candidates}" == "/attach,/model,/new,/retry,/compact,/review.md" ]] || fail "shows session commands with a valid session: ${(j:,:)command_candidates}"
+[[ "${(j:,:)command_candidates}" == "/attach,/load,/model,/new,/retry,/compact,/review.md" ]] || fail "shows session commands with a valid session: ${(j:,:)command_candidates}"
 BUFFER="/ret"
 CURSOR=${#BUFFER}
 completion_candidates=("${(@f)$(_mu_zsh_completion_candidates)}")
-[[ "${(j:,:)completion_candidates}" == "/attach,/model,/new,/retry,/compact,/review.md" ]] || fail "offers zsh the complete slash-command set: ${(j:,:)completion_candidates}"
+[[ "${(j:,:)completion_candidates}" == "/attach,/load,/model,/new,/retry,/compact,/review.md" ]] || fail "offers zsh the complete slash-command set: ${(j:,:)completion_candidates}"
 BUFFER="/M"
 CURSOR=${#BUFFER}
 completion_candidates=("${(@f)$(_mu_zsh_completion_candidates)}")
-[[ "${(j:,:)completion_candidates}" == "/attach,/model,/new,/retry,/compact,/review.md" ]] || fail "leaves case matching to zsh: ${(j:,:)completion_candidates}"
+[[ "${(j:,:)completion_candidates}" == "/attach,/load,/model,/new,/retry,/compact,/review.md" ]] || fail "leaves case matching to zsh: ${(j:,:)completion_candidates}"
 BUFFER="/unknown"
 CURSOR=${#BUFFER}
 completion_candidates=("${(@f)$(_mu_zsh_completion_candidates)}")
-[[ "${(j:,:)completion_candidates}" == "/attach,/model,/new,/retry,/compact,/review.md" ]] || fail "keeps freeform slash input advisory: ${(j:,:)completion_candidates}"
+[[ "${(j:,:)completion_candidates}" == "/attach,/load,/model,/new,/retry,/compact,/review.md" ]] || fail "keeps freeform slash input advisory: ${(j:,:)completion_candidates}"
 model_candidates=("${(@f)$(_mu_zsh_model_completion_candidates "")}")
 [[ " ${(j: :)model_candidates} " == *" openai/gpt "* ]] || fail "offers provider-qualified model"
 [[ " ${(j: :)model_candidates} " == *" gpt "* ]] || fail "offers unique unqualified model"
@@ -474,6 +486,39 @@ completion_candidates=("${(@f)$(_mu_zsh_completion_candidates)}")
 attachment_one=$tmpdir/screenshot.png
 attachment_two=$tmpdir/recording.wav
 touch -- "$attachment_one" "$attachment_two"
+MU_ZSH_MODEL=openai/gpt
+MU_ZSH_EFFECTIVE_MODEL=openai/gpt
+MU_ZSH_PENDING_ATTACHMENTS=("$attachment_one")
+MU_ZSH_EFFECTIVE_ATTACHMENT_COUNT=1
+MU_ZSH_OUTPUT=
+rm -f "$MU_ZSH_FAKE_LOG"
+load_output=$tmpdir/load-output
+_mu_zsh_run_slash_command "/load ses_0000000b" > "$load_output"
+[[ "$MU_ZSH_SESSION_ID" == ses_0000000b ]] || fail "load attaches the selected session"
+[[ "$MU_ZSH_MODEL" == openai/gpt ]] || fail "load preserves the model override"
+(( ${#MU_ZSH_PENDING_ATTACHMENTS[@]} == 1 )) || fail "load preserves pending attachments"
+grep -Fq -- "Loaded transcript." "$load_output" || fail "load renders the selected transcript"
+grep -Fq -- "[mu] loaded session ses_0000000b" "$load_output" || fail "load confirms the selected session"
+grep -Fq -- "transcript --session ses_0000000b --output concise" "$MU_ZSH_FAKE_LOG" ||
+  fail "load uses the configured output density"
+MU_ZSH_OUTPUT=full
+rm -f "$MU_ZSH_FAKE_LOG"
+_mu_zsh_run_slash_command "/load ses_0000000c" >/dev/null
+grep -Fq -- "transcript --session ses_0000000c --output full" "$MU_ZSH_FAKE_LOG" ||
+  fail "load uses the shell output override"
+if _mu_zsh_run_slash_command "/load ses_missing" >/dev/null 2>&1; then
+  fail "load should reject a missing session"
+fi
+[[ "$MU_ZSH_SESSION_ID" == ses_0000000c ]] || fail "failed load preserves the attached session"
+if _mu_zsh_run_slash_command "/load" >/dev/null; then
+  fail "load should require a session id"
+fi
+if _mu_zsh_run_slash_command "/load ses_0000000b extra" >/dev/null; then
+  fail "load should accept exactly one session id"
+fi
+MU_ZSH_SESSION_ID=tracked-session
+MU_ZSH_EFFECTIVE_SESSION_ID=tracked-session
+MU_ZSH_OUTPUT=detail
 MU_ZSH_PENDING_ATTACHMENTS=()
 _mu_zsh_run_slash_command "/attach $attachment_one"
 _mu_zsh_run_slash_command "/attach $attachment_two"
@@ -601,6 +646,11 @@ if [[ "$1" == "new" ]]; then
   esac
   exit 0
 fi
+if [[ "$1" == "transcript" ]]; then
+  [[ "$*" == *ses_missing* ]] && exit 1
+  print -r -- "Loaded transcript."
+  exit 0
+fi
 print -r -- "$PWD :: $*" >> "$MU_ZSH_SCOPE_LOG"
 prompt=$(cat)
 print -r -- "prompt=$prompt" >> "$MU_ZSH_SCOPE_LOG"
@@ -646,6 +696,9 @@ if _mu_zsh_run_slash_command "/model invalid/model"; then
 fi
 if _mu_zsh_run_slash_command "/attach $tmpdir/missing-scope-file"; then
   fail "invalid attachment in another scope should fail"
+fi
+if _mu_zsh_run_slash_command "/load ses_missing"; then
+  fail "invalid load in another scope should fail"
 fi
 builtin cd "$project_a/subdir"
 _mu_zsh_sync_state

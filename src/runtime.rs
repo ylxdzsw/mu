@@ -54,6 +54,7 @@ pub struct StatusModel {
 #[derive(Debug, Clone, Serialize)]
 pub struct StatusReport {
     pub model: StatusModel,
+    pub output: crate::OutputFormat,
     pub session_id: Option<String>,
     pub context_tokens: Option<u64>,
     pub context_usage_source: Option<ContextUsageSource>,
@@ -349,6 +350,7 @@ pub fn build_status_report(
 
     Ok(StatusReport {
         model,
+        output: config.output,
         session_id: resolved
             .attached_session
             .as_ref()
@@ -1202,6 +1204,7 @@ mod tests {
         )
         .unwrap();
         let lean_json = serde_json::to_value(&lean).unwrap();
+        assert_eq!(lean_json["output"], "detail");
         assert!(lean.session.is_none());
         assert!(lean.active.is_none());
         assert!(lean.compaction.is_none());

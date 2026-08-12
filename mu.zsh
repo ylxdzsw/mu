@@ -443,7 +443,7 @@ _mu_zsh_reset_mode_prompt() {
 _mu_zsh_slash_command_candidates() {
   local -a commands
 
-  commands=(/attach /model)
+  commands=(/attach /load /model)
   _mu_zsh_sync_state
   [[ -n "$MU_ZSH_EFFECTIVE_SESSION_ID" ]] && commands+=(/new /retry /compact)
   commands+=("${(@f)$(_mu_zsh_custom_slash_commands 2>/dev/null || true)}")
@@ -818,6 +818,28 @@ _mu_zsh_validate_model_ref() {
   return 0
 }
 
+_mu_zsh_resolve_load_output() {
+  local session_id=$1
+  local status_json output
+
+  if [[ -n "$MU_ZSH_OUTPUT" ]]; then
+    REPLY=$MU_ZSH_OUTPUT
+    return 0
+  fi
+
+  status_json=$("$MU_ZSH_BIN" status --json -s "$session_id") || return $?
+  output=$(jq -r '.output // empty' <<< "$status_json" 2>/dev/null) || output=
+  case "$output" in
+    final|concise|detail|full)
+      REPLY=$output
+      ;;
+    *)
+      print -u2 -- "mu mu.zsh: status returned an invalid output density"
+      return 1
+      ;;
+  esac
+}
+
 _mu_zsh_run_custom_slash_command() {
   local slash_command=$1
   local instruction=${2-}
@@ -855,7 +877,7 @@ _mu_zsh_run_custom_slash_command() {
 
 _mu_zsh_run_slash_command() {
   local line=$1
-  local command instruction rest session_id scope resolved_model
+  local command instruction rest session_id scope resolved_model load_output
   local exit_status=0
 
   command=${line%%[[:space:]]*}
@@ -933,6 +955,23 @@ _mu_zsh_run_slash_command() {
       MU_ZSH_MODEL=$resolved_model
       MU_ZSH_EFFECTIVE_MODEL=$resolved_model
       _mu_zsh_print_block_message "[mu] next turns in this scope will use $resolved_model"
+      ;;
+    /load)
+      if [[ -z "$rest" ]]; then
+        _mu_zsh_print_block_message "[mu] usage: /load <session-id>"
+        return 1
+      fi
+      if [[ "$rest" == *[[:space:]]* ]]; then
+        _mu_zsh_print_block_message "[mu] /load accepts exactly one session id"
+        return 1
+      fi
+      _mu_zsh_resolve_load_output "$rest" || return $?
+      load_output=$REPLY
+      "$MU_ZSH_BIN" transcript --session "$rest" --output "$load_output" || return $?
+      _mu_zsh_activate_scope "$scope"
+      MU_ZSH_SESSION_ID=$rest
+      MU_ZSH_EFFECTIVE_SESSION_ID=$rest
+      _mu_zsh_print_block_message "[mu] loaded session $rest"
       ;;
     /new)
       _mu_zsh_validate_no_args "$command" "$rest" || return 1
