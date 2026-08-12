@@ -9,7 +9,7 @@ const ROLE_PREAMBLE: &str = include_str!("system_preamble.md");
 /// Preamble emitted by `mu context --export`. It tells a foreign agent (e.g.
 /// Claude Code, which has a richer toolset than mu's single `bash`) that the
 /// instructions and skills below were authored for mu and should be adapted in
-/// intent rather than followed literally. A pointer to the `customize-mu`
+/// intent rather than followed literally. A pointer to the `mu-doc`
 /// reference is appended at runtime when that built-in file is present.
 const EXPORT_PREAMBLE: &str = "\
 <!-- Injected by `mu context --export`. The instructions and skills below were authored
@@ -105,9 +105,9 @@ pub fn build_context(
     })
 }
 
-/// Assemble the `--export` preamble, appending a pointer to the `customize-mu`
-/// reference when that built-in file is present so a foreign agent can read
-/// mu's full configuration/skill/command contract on demand.
+/// Assemble the `--export` preamble, appending a pointer to the `mu-doc`
+/// reference when that built-in file is present so a foreign agent can find
+/// Mu's documentation on demand.
 fn existing_env_paths(
     global_config_dir: &Path,
     project_config_dir: Option<&Path>,
@@ -121,11 +121,11 @@ fn existing_env_paths(
 
 fn export_preamble(env_paths: &[std::path::PathBuf]) -> anyhow::Result<String> {
     let mut preamble = EXPORT_PREAMBLE.to_string();
-    let customize = crate::paths::builtins_dir()?.join("customize-mu.md");
-    if customize.is_file() {
+    let mu_doc = crate::paths::builtins_dir()?.join("mu-doc.md");
+    if mu_doc.is_file() {
         preamble.push_str(&format!(
-            "\nTo understand mu's configuration, skills, and command contract, read {}.",
-            customize.display()
+            "\nTo understand Mu, its configuration, and its CLI, read {}.",
+            mu_doc.display()
         ));
     }
     if !env_paths.is_empty() {
@@ -371,7 +371,7 @@ mod tests {
     }
 
     #[test]
-    fn export_preamble_points_at_customize_mu_and_existing_env_files() {
+    fn export_preamble_points_at_mu_doc_and_existing_env_files() {
         let global = temp_dir("export-env-global");
         let project = temp_dir("export-env-project");
         fs::write(global.join(".env"), "GLOBAL_KEY=secret\n").unwrap();
@@ -397,11 +397,11 @@ mod tests {
         // pointer is appended; otherwise the preamble is just opened and closed.
         if crate::paths::builtins_dir()
             .unwrap()
-            .join("customize-mu.md")
+            .join("mu-doc.md")
             .is_file()
         {
-            assert!(preamble.contains("customize-mu.md"));
-            assert!(preamble.contains("mu's configuration, skills, and command contract"));
+            assert!(preamble.contains("mu-doc.md"));
+            assert!(preamble.contains("Mu, its configuration, and its CLI"));
         }
     }
 
@@ -440,8 +440,8 @@ mod tests {
     fn build_context_excludes_builtin_skills() {
         let global = temp_dir("build-global");
         fs::write(
-            global.join("customize-mu.md"),
-            "---\nname: customize-mu\ndescription: Customize mu.\n---\nUse config files.\n",
+            global.join("mu-doc.md"),
+            "---\nname: mu-doc\ndescription: Document Mu.\n---\nUse reference files.\n",
         )
         .unwrap();
         fs::write(
@@ -461,7 +461,7 @@ mod tests {
         assert!(context.contains("(path: "));
         assert!(context.contains("brave-search"));
         assert!(context.contains(&env_path.display().to_string()));
-        // `subagent` is a built-in skill; only the preamble's customize-mu
+        // `subagent` is a built-in skill; only the preamble's mu-doc
         // pointer may mention a built-in path, never the skills index.
         assert!(!context.contains("subagent"));
     }

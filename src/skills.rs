@@ -670,8 +670,8 @@ mod tests {
         )
         .unwrap();
         fs::write(
-            builtins.join("customize-mu.md"),
-            "---\nname: customize-mu\ndescription: Customize mu.\n---\nUse config files.\n",
+            builtins.join("mu-doc.md"),
+            "---\nname: mu-doc\ndescription: Document Mu.\n---\nUse reference files.\n",
         )
         .unwrap();
         fs::write(
@@ -692,7 +692,7 @@ mod tests {
 
         assert_eq!(index.skills.len(), 3);
         assert_eq!(index.skills[0].name, "background-task");
-        assert_eq!(index.skills[1].name, "customize-mu");
+        assert_eq!(index.skills[1].name, "mu-doc");
         let review = index
             .skills
             .iter()
@@ -712,6 +712,28 @@ mod tests {
         fs::remove_dir_all(builtins).unwrap();
         fs::remove_dir_all(global).unwrap();
         fs::remove_dir_all(project).unwrap();
+    }
+
+    #[test]
+    fn repository_reference_files_are_not_indexed_as_instructions() {
+        let builtins = Path::new(env!("CARGO_MANIFEST_DIR")).join("builtins");
+        let global = temp_root("repository-builtins-global");
+        fs::create_dir_all(&global).unwrap();
+
+        let env = env_map(&[("PATH", "/usr/bin:/bin")]);
+        let index =
+            scan_instruction_index_with_builtins(Some(&builtins), &global, None, &env).unwrap();
+
+        assert!(index.skills.iter().any(|skill| skill.name == "mu-doc"));
+        assert!(!index.skills.iter().any(|skill| skill.name == "config"));
+        assert!(!index.skills.iter().any(|skill| skill.name == "cli"));
+        assert!(
+            !index
+                .commands
+                .iter()
+                .any(|command| { matches!(command.name.as_str(), "config.md" | "cli.md") })
+        );
+        fs::remove_dir_all(global).unwrap();
     }
 
     #[test]

@@ -171,9 +171,11 @@ No dedicated "skill" tool — this keeps the model-visible surface at one tool
 and makes skills "just files". Native built-ins live in
 `<prefix>/share/mu/`; portable builds use that directory when installed and
 otherwise materialize their embedded built-ins in the user cache. They have the
-lowest precedence; shipped built-ins may include self-customization guidance
-such as `customize-mu` or delegation guidance such as `subagent`, but user and
-project instructions can shadow them by name.
+lowest precedence. Shipped built-ins include skills such as `mu-doc` and
+`subagent` plus plain on-demand references such as `config.md` and `cli.md`;
+plain references have neither skill frontmatter nor a `mu` shebang and are not
+added to the instruction index. User and project instructions can shadow
+built-in skills or commands by name.
 Skills may declare optional `requires_env` and `requires_commands` frontmatter
 keys. Each key is a comma-separated list, and every listed requirement must be
 met before the skill is injected.
@@ -295,7 +297,7 @@ accepts optional non-terminal stdin as a custom focus). The surface is small:
   faithful mirror of the persisted system message, so it never contacts a
   provider. `--export` instead prints a portable projection
   for a *foreign* agent to ingest: an explanatory preamble (noting the content
-  was authored for mu, and pointing at the `customize-mu` reference when that
+  was authored for mu, and pointing at the `mu-doc` reference when that
   built-in is present, while listing the absolute paths of existing global and
   active-project `.env` files and warning that they may contain API keys or
   other secrets; the preamble lists paths as comment-safe JSON strings and

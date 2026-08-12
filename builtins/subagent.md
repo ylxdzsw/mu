@@ -9,6 +9,8 @@ Use this when a task benefits from independent `mu` turns with narrower instruct
 broad reviews, parallel audits, focused investigation, or long-running async checks.
 
 Subagents are ordinary `mu` processes. They run in fresh sessions by default.
+Read [the Mu CLI reference](cli.md) before invoking one; this skill adds the
+delegation-specific conventions.
 
 ## Synchronous Delegation
 

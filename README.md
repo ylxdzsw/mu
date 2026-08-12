@@ -18,8 +18,9 @@ export PATH="$HOME/.local/bin:$PATH"
 ```
 
 Add `$HOME/.local/bin` to your shell startup file if it is not already on
-`PATH`. The release binary embeds Mu's built-in skills and writes them plus
-three applet symlinks into your user cache on its first normal invocation.
+`PATH`. The release binary embeds Mu's built-in skills and reference files and
+writes them plus three applet symlinks into your user cache on its first normal
+invocation.
 
 Now ask it something:
 
@@ -303,7 +304,8 @@ your mu context. Add to `~/.claude/settings.json`:
 The export preamble tells the agent the guidance was written for mu (whose only
 tool is `bash`) so it adapts the intent to its own richer toolset — for example,
 reading a skill file with its file tools rather than a shell — and points it at
-mu's `customize-mu` reference if it wants the full configuration contract.
+Mu's concise `mu-doc` reference, which links to the full configuration and CLI
+references.
 
 ## Using your own provider
 

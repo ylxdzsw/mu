@@ -1,14 +1,8 @@
----
-name: customize-mu
-description: Use ONLY when editing mu setup files: ~/.mu/*, custom commands, skills, or built-in/global/project instructions. Do not use for application code.
----
+# Mu configuration
 
-# Customizing mu
-
-Use this when the task is to change how `mu` itself behaves for the user:
-configuration, environment overlays, durable instructions, custom commands, or
-skills. Do not use it for ordinary application-code changes unless the user is
-also changing `mu` setup files.
+This is the reference for Mu configuration, environment overlays, durable
+instructions, custom commands, skills, scope, and precedence. For turn and
+management-command invocation, read [the CLI reference](cli.md).
 
 ## First steps
 
@@ -23,7 +17,8 @@ Then read the relevant files from the active scopes:
 - Global config directory: `~/.mu`, or `$MU_CONFIG_DIR` when set.
 - Project config directory: `<project>/.mu` when the current directory resolves
   to a project.
-- Built-ins: `/usr/share/mu`.
+- Built-ins: the directory containing `mu-doc.md`, normally `/usr/share/mu`;
+  portable builds may materialize it in the user cache.
 
 `mu` discovers a project by walking upward from the invoking `pwd` until it
 finds `.mu` or `.git`. The walk stops before the user's home directory and
@@ -184,7 +179,7 @@ other guidance that should apply on every turn in that project.
 
 Keep `AGENTS.md` short. Put reusable task workflows in skills instead.
 
-## Commands
+## Custom commands
 
 A custom command is a regular instruction file whose first line contains a
 common `mu` shebang:
@@ -196,46 +191,13 @@ Summarize the current checkout and suggest the next release note.
 
 The shebang accepts no arguments or exactly `-m|--model <model-ref>` as separate
 tokens; other arguments and `--model=value` are rejected on invocation. Use
-`env -S` with a model. An invocation `--model` overrides the shebang, which
-otherwise overrides the attached session or configured default for that turn
-without rewriting session model state.
+`env -S` with a model. Commands are discovered by their relative `.mu` path,
+including the extension. A file may be both a command and a skill; command
+execution strips the shebang and skill frontmatter. Command files need not have
+executable permission.
 
-Commands are invoked by their relative `.mu` path, including extension, for
-example `mu review.md` or `/review.md` in zsh or Fish prompt mode. They accept
-the normal turn options for session, model, attachments, and output. Built-in
-subcommands win exact name collisions. Absolute, `./`, and `../` targets are
-explicit prompt files and bypass command lookup.
-
-Use `mu cat review.md` to inspect the resolved command or prompt without a
-provider or session mutation. Interactive output includes provenance; redirected
-output is the exact composed prompt.
-
-Every prompt file can take an optional custom instruction from non-terminal
-stdin. When calling it through the Bash tool, prefer the tool's `stdin` argument
-over shell redirection:
-
-```ts
-bash({
-  title: "Run custom review command",
-  risk: "readonly",
-  command: "mu review.md",
-  stdin: "Focus on authentication and authorization."
-})
-```
-
-For a human invoking `mu` directly from a terminal, a quoted heredoc remains
-appropriate for multiline input.
-
-For file-backed turns, terminal stdin is not read, and an empty pipe leaves the
-file prompt unchanged. Non-empty stdin is appended verbatim after
-`\n---\n\n`. In shell prompt mode, `/review.md Focus on authentication` passes
-the trailing text as that instruction; Shift+Enter may add lines. Pending shell
-attachments are forwarded and consumed by a custom command.
-
-Prompt-file mode strips the shebang before sending the prompt. A `mu` shebang's
-model default applies equally to an explicit prompt path and a discovered
-command. A file may be both command and skill; command execution strips both
-headers. Command files need not have executable permission.
+See [the CLI reference](cli.md) for invocation, argument precedence, prompt
+input, and `mu cat`.
 
 ## Skills
 
