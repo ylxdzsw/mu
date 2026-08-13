@@ -297,6 +297,54 @@ impl PersistedAssistantItem {
             _ => None,
         }
     }
+
+    fn assistant_item(&self) -> AssistantItem {
+        match self {
+            Self::Reasoning { text } => AssistantItem::Reasoning { text: text.clone() },
+            Self::Text { text } => AssistantItem::Text { text: text.clone() },
+            Self::BashCall {
+                provider_call_id,
+                arguments,
+                ..
+            } => AssistantItem::BashCall(ToolCall {
+                id: provider_call_id.clone(),
+                arguments: arguments.clone(),
+            }),
+        }
+    }
+
+    fn message_record_item(&self) -> Option<MessageRecordItem> {
+        match self {
+            Self::Text { text } => Some(MessageRecordItem::Text(text.clone())),
+            Self::BashCall {
+                provider_call_id,
+                arguments,
+                ..
+            } => Some(MessageRecordItem::BashCall(ToolCall {
+                id: provider_call_id.clone(),
+                arguments: arguments.clone(),
+            })),
+            Self::Reasoning { .. } => None,
+        }
+    }
+
+    fn from_assistant(item: &AssistantItem, next_call_id: &mut i64) -> Self {
+        match item {
+            AssistantItem::Reasoning { text } => Self::Reasoning { text: text.clone() },
+            AssistantItem::Text { text } => Self::Text { text: text.clone() },
+            AssistantItem::BashCall(call) => {
+                let call_id = *next_call_id;
+                *next_call_id += 1;
+                Self::BashCall {
+                    call_id,
+                    provider_call_id: call.id.clone(),
+                    arguments: call.arguments.clone(),
+                    declared_risk: BashRisk::from_args_json(&call.arguments)
+                        .map(|risk| risk.as_str().to_string()),
+                }
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -349,6 +397,12 @@ struct Journal {
     events: Arc<Vec<EventLine>>,
 }
 
+impl Journal {
+    fn next_seq(&self) -> i64 {
+        self.events.last().map_or(1, |line| line.seq + 1)
+    }
+}
+
 pub struct Store {
     root: PathBuf,
     attachment_scope: PathBuf,
@@ -373,6 +427,7 @@ impl std::fmt::Display for SessionBusy {
 impl std::error::Error for SessionBusy {}
 
 impl Store {
+    // Store setup and session discovery.
     pub fn open(root: &Path) -> Result<Self> {
         ensure_private_dir(root)?;
         ensure_private_dir(&root.join("sessions"))?;
@@ -685,6 +740,7 @@ impl Store {
         Ok(())
     }
 
+    // Recovery and read-only projections.
     pub fn is_session_clean(&self, session_id: &str) -> Result<bool> {
         let journal = self.load(session_id)?;
         let Some(turn_seq) =
@@ -985,6 +1041,7 @@ impl Store {
         self.context(&journal)
     }
 
+    // Append-only turn, tool, and provider events.
     pub fn start_turn(
         &self,
         session_id: &str,
@@ -1151,10 +1208,13 @@ impl Store {
                 output,
                 exit_code: record.exit_code,
                 duration_ms: record.duration_ms,
-                attachments,
+                attachments: attachments.clone(),
             },
         )?;
-        let hydrated = self.load_tool_attachments(session_id, record.bash_call_id)?;
+        let hydrated = attachments
+            .iter()
+            .map(|attachment| self.hydrate_tool_attachment(attachment))
+            .collect::<Result<_>>()?;
         if let Ok((manifest, _)) = self.attachment_paths(session_id) {
             let _ = cleanup_bash_attachments(&manifest, record.bash_call_id);
         }
@@ -1217,7 +1277,7 @@ impl Store {
         api: ModelApi,
     ) -> Result<u64> {
         let mut journal = self.load(session_id)?;
-        let seq = journal.events.last().map_or(1, |line| line.seq + 1);
+        let seq = journal.next_seq();
         Arc::make_mut(&mut journal.events).push(EventLine {
             seq,
             at: now(),
@@ -1321,6 +1381,25 @@ impl Store {
         })
     }
 
+    fn complete_provider_exchange(
+        &self,
+        session_id: &str,
+        exchange_id: &str,
+        native_response: Option<&Value>,
+        usage: Option<&Usage>,
+        projection: Projection,
+    ) -> Result<i64> {
+        self.append(
+            session_id,
+            Event::ProviderCompleted {
+                exchange_id: exchange_id.to_string(),
+                response_json: self.persist_json(native_response)?,
+                usage: usage.cloned(),
+                projection,
+            },
+        )
+    }
+
     pub fn complete_assistant_exchange(
         &self,
         session_id: &str,
@@ -1406,48 +1485,27 @@ impl Store {
             bail!("duplicate provider tool call id: {}", call.id)
         }
         let mut next_call = self.with_journal(session_id, |journal| Ok(next_call_id(journal)))?;
-        let mut ids = Vec::new();
         let items = items
             .iter()
-            .map(|item| match item {
-                AssistantItem::Reasoning { text } => {
-                    PersistedAssistantItem::Reasoning { text: text.clone() }
-                }
-                AssistantItem::Text { text } => PersistedAssistantItem::Text { text: text.clone() },
-                AssistantItem::BashCall(call) => {
-                    let call_id = next_call;
-                    next_call += 1;
-                    ids.push(call_id);
-                    PersistedAssistantItem::BashCall {
-                        call_id,
-                        provider_call_id: call.id.clone(),
-                        arguments: call.arguments.clone(),
-                        declared_risk: BashRisk::from_args_json(&call.arguments)
-                            .map(|risk| risk.as_str().to_string()),
-                    }
-                }
-            })
+            .map(|item| PersistedAssistantItem::from_assistant(item, &mut next_call))
             .collect::<Vec<_>>();
-        let response_json = native_response
-            .map(serde_json::to_vec)
-            .transpose()?
-            .map(|bytes| self.write_object(&bytes))
-            .transpose()?;
-        let seq = self.append(
+        let ids: Vec<i64> = items
+            .iter()
+            .filter_map(|item| item.bash_call().map(|call| call.0))
+            .collect();
+        let seq = self.complete_provider_exchange(
             session_id,
-            Event::ProviderCompleted {
-                exchange_id: exchange_id.to_string(),
-                response_json,
-                usage: usage.cloned(),
-                projection: Projection::Assistant {
-                    turn_state: if ids.is_empty() {
-                        if resumable { "resume" } else { "complete" }.into()
-                    } else {
-                        "continue".into()
-                    },
-                    native_replay: native_replay.clone(),
-                    items,
+            exchange_id,
+            native_response,
+            usage,
+            Projection::Assistant {
+                turn_state: if ids.is_empty() {
+                    if resumable { "resume" } else { "complete" }.into()
+                } else {
+                    "continue".into()
                 },
+                native_replay: native_replay.clone(),
+                items,
             },
         )?;
         Ok((seq, ids))
@@ -1459,26 +1517,18 @@ impl Store {
         exchange_id: &str,
         completion: CompactionCompletion<'_>,
     ) -> Result<()> {
-        let response_json = completion
-            .native_response
-            .map(serde_json::to_vec)
-            .transpose()?
-            .map(|bytes| self.write_object(&bytes))
-            .transpose()?;
-        self.append(
+        self.complete_provider_exchange(
             session_id,
-            Event::ProviderCompleted {
-                exchange_id: exchange_id.to_string(),
-                response_json,
-                usage: completion.usage.cloned(),
-                projection: Projection::Compaction {
-                    summary: completion.summary.to_string(),
-                    through_seq: completion.through_seq,
-                    retained_turn_ids: completion.retained_turn_ids,
-                },
+            exchange_id,
+            completion.native_response,
+            completion.usage,
+            Projection::Compaction {
+                summary: completion.summary.to_string(),
+                through_seq: completion.through_seq,
+                retained_turn_ids: completion.retained_turn_ids,
             },
-        )?;
-        Ok(())
+        )
+        .map(|_| ())
     }
 
     pub fn complete_guardrail_exchange(
@@ -1487,29 +1537,21 @@ impl Store {
         exchange_id: &str,
         completion: GuardrailCompletion<'_>,
     ) -> Result<()> {
-        let response_json = completion
-            .native_response
-            .map(serde_json::to_vec)
-            .transpose()?
-            .map(|bytes| self.write_object(&bytes))
-            .transpose()?;
-        self.append(
+        self.complete_provider_exchange(
             session_id,
-            Event::ProviderCompleted {
-                exchange_id: exchange_id.to_string(),
-                response_json,
-                usage: completion.usage.cloned(),
-                projection: Projection::Guardrail {
-                    call_id: completion.call_id,
-                    attempt: completion.attempt,
-                    outcome: completion.outcome.to_string(),
-                    risk_level: completion.risk_level.map(str::to_string),
-                    auth_level: completion.auth_level.map(str::to_string),
-                    reason: completion.reason.map(str::to_string),
-                },
+            exchange_id,
+            completion.native_response,
+            completion.usage,
+            Projection::Guardrail {
+                call_id: completion.call_id,
+                attempt: completion.attempt,
+                outcome: completion.outcome.to_string(),
+                risk_level: completion.risk_level.map(str::to_string),
+                auth_level: completion.auth_level.map(str::to_string),
+                reason: completion.reason.map(str::to_string),
             },
-        )?;
-        Ok(())
+        )
+        .map(|_| ())
     }
 
     pub fn turn_ids_after(&self, session_id: &str, through_seq: i64) -> Result<Vec<String>> {
@@ -1535,11 +1577,7 @@ impl Store {
         partial_response: Option<&Value>,
         usage: Option<&Usage>,
     ) -> Result<()> {
-        let partial_response_json = partial_response
-            .map(serde_json::to_vec)
-            .transpose()?
-            .map(|bytes| self.write_object(&bytes))
-            .transpose()?;
+        let partial_response_json = self.persist_json(partial_response)?;
         self.append(
             session_id,
             Event::ProviderFailed {
@@ -1697,6 +1735,7 @@ impl Store {
         Ok(())
     }
 
+    // Semantic projections over the durable event stream.
     fn project_session(&self, journal: &Journal) -> Result<Session> {
         let cwd = journal
             .events
@@ -1828,22 +1867,7 @@ impl Store {
                     messages.push(Message::Assistant {
                         items: items
                             .iter()
-                            .map(|item| match item {
-                                PersistedAssistantItem::Reasoning { text } => {
-                                    AssistantItem::Reasoning { text: text.clone() }
-                                }
-                                PersistedAssistantItem::Text { text } => {
-                                    AssistantItem::Text { text: text.clone() }
-                                }
-                                PersistedAssistantItem::BashCall {
-                                    provider_call_id,
-                                    arguments,
-                                    ..
-                                } => AssistantItem::BashCall(ToolCall {
-                                    id: provider_call_id.clone(),
-                                    arguments: arguments.clone(),
-                                }),
-                            })
+                            .map(PersistedAssistantItem::assistant_item)
                             .collect(),
                         native_replay,
                     });
@@ -1899,20 +1923,7 @@ impl Store {
                     kind: "assistant".into(),
                     items: items
                         .iter()
-                        .filter_map(|item| match item {
-                            PersistedAssistantItem::Text { text } => {
-                                Some(MessageRecordItem::Text(text.clone()))
-                            }
-                            PersistedAssistantItem::BashCall {
-                                provider_call_id,
-                                arguments,
-                                ..
-                            } => Some(MessageRecordItem::BashCall(ToolCall {
-                                id: provider_call_id.clone(),
-                                arguments: arguments.clone(),
-                            })),
-                            _ => None,
-                        })
+                        .filter_map(PersistedAssistantItem::message_record_item)
                         .collect(),
                     seq: line.seq,
                 }),
@@ -1980,6 +1991,7 @@ impl Store {
         })
     }
 
+    // Object-backed content persistence.
     fn persist_user_content(&self, content: &UserContent) -> Result<PersistedUserContent> {
         Ok(match content {
             UserContent::Text(text) => PersistedUserContent::Text { text: text.clone() },
@@ -2062,26 +2074,6 @@ impl Store {
         })
     }
 
-    fn load_tool_attachments(&self, session_id: &str, call_id: i64) -> Result<Vec<ToolAttachment>> {
-        let journal = self.load(session_id)?;
-        let attachments = journal
-            .events
-            .iter()
-            .find_map(|line| match &line.event {
-                Event::BashCompleted {
-                    call_id: candidate,
-                    attachments,
-                    ..
-                } if *candidate == call_id => Some(attachments),
-                _ => None,
-            })
-            .context("Bash result not found")?;
-        attachments
-            .iter()
-            .map(|attachment| self.hydrate_tool_attachment(attachment))
-            .collect()
-    }
-
     fn persist_text(&self, text: &str) -> Result<PersistedText> {
         if text.len() > EXTERNAL_TEXT_BYTES {
             Ok(PersistedText::Object {
@@ -2107,13 +2099,22 @@ impl Store {
         write_object_to(&self.objects_dir(), bytes)
     }
 
+    fn persist_json(&self, value: Option<&Value>) -> Result<Option<ObjectRef>> {
+        value
+            .map(serde_json::to_vec)
+            .transpose()?
+            .map(|bytes| self.write_object(&bytes))
+            .transpose()
+    }
+
     fn read_object(&self, object: &ObjectRef) -> Result<Vec<u8>> {
         read_object_from(&self.objects_dir(), &object.sha256)
     }
 
+    // Journal I/O and locking.
     fn append(&self, session_id: &str, event: Event) -> Result<i64> {
         self.with_writer(session_id, |locked| {
-            let seq = locked.journal.events.last().map_or(1, |line| line.seq + 1);
+            let seq = locked.journal.next_seq();
             let line = EventLine {
                 seq,
                 at: now(),
@@ -2133,9 +2134,7 @@ impl Store {
     }
 
     fn next_seq(&self, session_id: &str) -> Result<i64> {
-        self.with_journal(session_id, |journal| {
-            Ok(journal.events.last().map_or(1, |line| line.seq + 1))
-        })
+        self.with_journal(session_id, |journal| Ok(journal.next_seq()))
     }
 
     fn with_writer<T>(
@@ -2289,7 +2288,7 @@ pub fn stage_bash_attachment(
     options.read(true).write(true).create(true).mode(0o600);
     let mut file = options.open(manifest)?;
     flock(&file, libc::LOCK_EX)?;
-    let prefix = complete_prefix(&mut file)?;
+    let prefix = complete_prefix(&mut file, true)?;
     let entries = parse_manifest(&prefix)?;
     if entries
         .iter()
@@ -2328,7 +2327,7 @@ pub fn read_bash_attachments(
         Err(error) => return Err(error.into()),
     };
     flock(&file, libc::LOCK_EX)?;
-    let entries = parse_manifest(&complete_prefix(&mut file)?)?
+    let entries = parse_manifest(&complete_prefix(&mut file, true)?)?
         .into_iter()
         .filter(|entry| entry.call_id == call_id)
         .collect::<Vec<_>>();
@@ -2369,7 +2368,7 @@ fn cleanup_bash_attachments(manifest: &Path, call_id: i64) -> Result<()> {
         Err(error) => return Err(error.into()),
     };
     flock(&file, libc::LOCK_EX)?;
-    let entries = parse_manifest(&complete_prefix(&mut file)?)?;
+    let entries = parse_manifest(&complete_prefix(&mut file, true)?)?;
     file.seek(SeekFrom::Start(0))?;
     file.set_len(0)?;
     for entry in entries.into_iter().filter(|entry| entry.call_id != call_id) {
@@ -2380,7 +2379,7 @@ fn cleanup_bash_attachments(manifest: &Path, call_id: i64) -> Result<()> {
     Ok(())
 }
 
-fn complete_prefix(file: &mut File) -> Result<Vec<u8>> {
+fn complete_prefix(file: &mut File, truncate: bool) -> Result<Vec<u8>> {
     file.seek(SeekFrom::Start(0))?;
     let mut bytes = Vec::new();
     file.read_to_end(&mut bytes)?;
@@ -2388,10 +2387,11 @@ fn complete_prefix(file: &mut File) -> Result<Vec<u8>> {
         .iter()
         .rposition(|byte| *byte == b'\n')
         .map_or(0, |position| position + 1);
-    if complete < bytes.len() {
+    if truncate && complete < bytes.len() {
         file.set_len(complete as u64)?;
     }
-    Ok(bytes[..complete].to_vec())
+    bytes.truncate(complete);
+    Ok(bytes)
 }
 
 fn parse_manifest(bytes: &[u8]) -> Result<Vec<ManifestEntry>> {
@@ -2488,20 +2488,11 @@ fn read_journal(
     expected_id: Option<&str>,
     truncate_incomplete_tail: bool,
 ) -> Result<Journal> {
-    file.seek(SeekFrom::Start(0))?;
-    let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes)?;
-    let complete = bytes
-        .iter()
-        .rposition(|byte| *byte == b'\n')
-        .map_or(0, |position| position + 1);
-    if complete == 0 {
+    let bytes = complete_prefix(file, truncate_incomplete_tail)?;
+    if bytes.is_empty() {
         bail!("session journal has no complete meta line")
     }
-    if truncate_incomplete_tail && complete < bytes.len() {
-        file.set_len(complete as u64)?;
-    }
-    let text = std::str::from_utf8(&bytes[..complete]).context("session journal is not UTF-8")?;
+    let text = std::str::from_utf8(&bytes).context("session journal is not UTF-8")?;
     let mut lines = text.lines();
     let meta: Meta = serde_json::from_str(lines.next().context("missing session meta")?)
         .context("decoding session meta")?;
@@ -2540,25 +2531,14 @@ fn read_journal(
 
 mod migration {
     use super::*;
+
     use crate::provider::NativeReplayPayload;
 
     pub(super) const LEGACY_VERSION: u32 = 1;
 
     #[derive(Deserialize)]
-    struct LegacyMeta {
-        #[serde(rename = "type")]
-        kind: String,
-        format: String,
-        version: u32,
-        session_id: String,
-        created_at: String,
-    }
-
-    #[derive(Deserialize)]
     struct LegacyEventLine {
         seq: i64,
-        #[serde(rename = "at")]
-        _at: String,
         #[serde(rename = "type")]
         kind: String,
     }
@@ -2614,32 +2594,21 @@ mod migration {
     }
 
     fn convert(file: &mut File, expected_id: Option<&str>) -> Result<(Meta, Vec<EventLine>)> {
-        file.seek(SeekFrom::Start(0))?;
-        let mut bytes = Vec::new();
-        file.read_to_end(&mut bytes)?;
-        let complete = bytes
-            .iter()
-            .rposition(|byte| *byte == b'\n')
-            .map_or(0, |position| position + 1);
-        if complete == 0 {
+        let bytes = complete_prefix(file, false)?;
+        if bytes.is_empty() {
             bail!("session journal has no complete meta line")
         }
-        let text =
-            std::str::from_utf8(&bytes[..complete]).context("session journal is not UTF-8")?;
+        let text = std::str::from_utf8(&bytes).context("session journal is not UTF-8")?;
         let mut lines = text.lines();
-        let legacy: LegacyMeta =
-            serde_json::from_str(lines.next().context("missing session meta")?)
-                .context("decoding session meta")?;
-        if legacy.kind != "meta"
-            || legacy.format != "mu-session"
-            || legacy.version != LEGACY_VERSION
-        {
+        let mut meta: Meta = serde_json::from_str(lines.next().context("missing session meta")?)
+            .context("decoding session meta")?;
+        if meta.kind != "meta" || meta.format != "mu-session" || meta.version != LEGACY_VERSION {
             bail!("unsupported session journal format")
         }
-        if !valid_session_id(&legacy.session_id) {
+        if !valid_session_id(&meta.session_id) {
             bail!("invalid session id in journal meta")
         }
-        if expected_id.is_some_and(|expected| expected != legacy.session_id) {
+        if expected_id.is_some_and(|expected| expected != meta.session_id) {
             bail!("session filename does not match meta id")
         }
 
@@ -2674,16 +2643,8 @@ mod migration {
             })?);
         }
         validate_events(&events)?;
-        Ok((
-            Meta {
-                kind: legacy.kind,
-                format: legacy.format,
-                version: FORMAT_VERSION,
-                session_id: legacy.session_id,
-                created_at: legacy.created_at,
-            },
-            events,
-        ))
+        meta.version = FORMAT_VERSION;
+        Ok((meta, events))
     }
 
     fn convert_assistant(mut assistant: LegacyAssistant) -> Result<Projection> {
@@ -3490,6 +3451,12 @@ mod tests {
     };
     use crate::provider::{Message, NativeReplayPayload};
 
+    fn test_session() -> (Store, Session) {
+        let store = Store::open_memory().unwrap();
+        let session = store.create_session_seeded("system").unwrap();
+        (store, session)
+    }
+
     fn context_test_config(source_key: Option<&str>, target_key: Option<&str>) -> Config {
         let provider = |replay_key: Option<&str>| ProviderConfig {
             endpoint: "http://localhost/chat/completions".into(),
@@ -3521,8 +3488,7 @@ mod tests {
 
     #[test]
     fn context_tokens_prefer_compatible_provider_anchor_and_estimate_only_the_suffix() {
-        let store = Store::open_memory().unwrap();
-        let session = store.create_session_seeded("system").unwrap();
+        let (store, session) = test_session();
         store
             .append_test_agent_exchange(&session.id, "source/model", "completed", 100)
             .unwrap();
@@ -3576,8 +3542,7 @@ mod tests {
 
     #[test]
     fn invalid_provider_context_total_falls_back_to_projection() {
-        let store = Store::open_memory().unwrap();
-        let session = store.create_session_seeded("system").unwrap();
+        let (store, session) = test_session();
         store
             .append_test_agent_exchange(&session.id, "source/model", "completed", 0)
             .unwrap();
@@ -3592,8 +3557,7 @@ mod tests {
 
     #[test]
     fn compaction_records_preserve_user_and_tool_attachments() {
-        let store = Store::open_memory().unwrap();
-        let session = store.create_session_seeded("system").unwrap();
+        let (store, session) = test_session();
         store
             .append_message(
                 &session.id,
@@ -3900,8 +3864,7 @@ mod tests {
 
     #[test]
     fn v1_migration_preserves_historical_request_checksums() {
-        let store = Store::open_memory().unwrap();
-        let session = store.create_session_seeded("system").unwrap();
+        let (store, session) = test_session();
         let endpoint = "https://example.test/v1/chat/completions";
         let replay = NativeReplay {
             provider_id: "test".into(),
@@ -4117,8 +4080,7 @@ mod tests {
 
     #[test]
     fn transcript_projection_pairs_bash_results_without_native_state() {
-        let store = Store::open_memory().unwrap();
-        let session = store.create_session_seeded("system").unwrap();
+        let (store, session) = test_session();
         store
             .start_turn(&session.id, "/tmp", None, &"Run it".into())
             .unwrap();
@@ -4207,8 +4169,7 @@ mod tests {
 
     #[test]
     fn transcript_projection_reconstructs_prompt_model_and_context_state() {
-        let store = Store::open_memory().unwrap();
-        let session = store.create_session_seeded("system").unwrap();
+        let (store, session) = test_session();
         store
             .start_turn(&session.id, "/first", None, &"First".into())
             .unwrap();
@@ -4269,8 +4230,7 @@ mod tests {
 
     #[test]
     fn interrupted_claim_gets_one_synthetic_result() {
-        let store = Store::open_memory().unwrap();
-        let session = store.create_session_seeded("system").unwrap();
+        let (store, session) = test_session();
         store
             .start_turn(&session.id, "/tmp", None, &"run".into())
             .unwrap();
@@ -4337,8 +4297,7 @@ mod tests {
 
     #[test]
     fn committed_bash_result_cleans_its_manifest_entries() {
-        let store = Store::open_memory().unwrap();
-        let session = store.create_session_seeded("system").unwrap();
+        let (store, session) = test_session();
         store
             .start_turn(&session.id, "/tmp", None, &"run".into())
             .unwrap();
@@ -4386,7 +4345,7 @@ mod tests {
 
         let mut file = File::open(manifest).unwrap();
         assert!(
-            parse_manifest(&complete_prefix(&mut file).unwrap())
+            parse_manifest(&complete_prefix(&mut file, true).unwrap())
                 .unwrap()
                 .is_empty()
         );
@@ -4401,8 +4360,7 @@ mod tests {
 
     #[test]
     fn agent_request_reconstructs_from_semantic_history() {
-        let store = Store::open_memory().unwrap();
-        let session = store.create_session_seeded("system").unwrap();
+        let (store, session) = test_session();
         let turn = store
             .start_turn(&session.id, "/tmp", Some("/repo"), &"hello".into())
             .unwrap();
@@ -4462,8 +4420,7 @@ mod tests {
 
     #[test]
     fn resumed_anthropic_request_reconstructs_derived_continuation() {
-        let store = Store::open_memory().unwrap();
-        let session = store.create_session_seeded("system").unwrap();
+        let (store, session) = test_session();
         let turn = store
             .start_turn(&session.id, "/tmp", None, &"work".into())
             .unwrap();
@@ -4553,8 +4510,7 @@ mod tests {
 
     #[test]
     fn legacy_replay_origin_and_recorded_selection_reconstruct_exactly() {
-        let store = Store::open_memory().unwrap();
-        let session = store.create_session_seeded("system").unwrap();
+        let (store, session) = test_session();
         store
             .start_turn(&session.id, "/tmp", None, &"run".into())
             .unwrap();
@@ -4661,8 +4617,7 @@ mod tests {
 
     #[test]
     fn reported_context_is_invalidated_when_the_request_format_is_not_current() {
-        let store = Store::open_memory().unwrap();
-        let session = store.create_session_seeded("system").unwrap();
+        let (store, session) = test_session();
         let turn = store
             .start_turn(&session.id, "/tmp", None, &"hello".into())
             .unwrap();
@@ -4707,8 +4662,7 @@ mod tests {
 
     #[test]
     fn duplicate_provider_tool_call_ids_are_rejected_before_persistence() {
-        let store = Store::open_memory().unwrap();
-        let session = store.create_session_seeded("system").unwrap();
+        let (store, session) = test_session();
         let turn = store
             .start_turn(&session.id, "/tmp", None, &"hello".into())
             .unwrap();
@@ -4765,8 +4719,7 @@ mod tests {
 
     #[test]
     fn incomplete_tail_is_ignored_then_truncated_by_the_next_writer() {
-        let store = Store::open_memory().unwrap();
-        let session = store.create_session_seeded("system").unwrap();
+        let (store, session) = test_session();
         let path = store.session_path(&session.id);
         OpenOptions::new()
             .append(true)
@@ -4793,8 +4746,7 @@ mod tests {
 
     #[test]
     fn reopening_validates_events_written_by_the_typed_append_path() {
-        let store = Store::open_memory().unwrap();
-        let session = store.create_session_seeded("system").unwrap();
+        let (store, session) = test_session();
         store
             .append(
                 &session.id,
@@ -4847,8 +4799,7 @@ mod tests {
 
     #[test]
     fn manifest_preserves_duplicates_and_enforces_the_limit() {
-        let store = Store::open_memory().unwrap();
-        let session = store.create_session_seeded("system").unwrap();
+        let (store, session) = test_session();
         let (manifest, objects) = store.attachment_paths(&session.id).unwrap();
         let attachment = Attachment {
             filename: "same.png".into(),
@@ -4871,8 +4822,7 @@ mod tests {
 
     #[test]
     fn recovery_closes_unmatched_requests_and_durable_denials() {
-        let store = Store::open_memory().unwrap();
-        let session = store.create_session_seeded("system").unwrap();
+        let (store, session) = test_session();
         let turn = store
             .start_turn(&session.id, "/tmp", None, &"remove it".into())
             .unwrap();
@@ -4974,8 +4924,7 @@ mod tests {
 
     #[test]
     fn resumable_completion_is_dirty_and_projects_a_used_resume_prompt() {
-        let store = Store::open_memory().unwrap();
-        let session = store.create_session_seeded("system").unwrap();
+        let (store, session) = test_session();
         let turn = store
             .start_turn(&session.id, "/tmp", None, &"work".into())
             .unwrap();
@@ -5013,8 +4962,7 @@ mod tests {
 
     #[test]
     fn new_prompt_supersedes_unused_resume_without_synthetic_message() {
-        let store = Store::open_memory().unwrap();
-        let session = store.create_session_seeded("system").unwrap();
+        let (store, session) = test_session();
         let turn = store
             .start_turn(&session.id, "/tmp", None, &"work".into())
             .unwrap();
