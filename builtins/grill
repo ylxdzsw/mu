@@ -1,0 +1,37 @@
+#!/usr/bin/env mu
+# Design interview
+
+The custom instruction appended to this command is the topic to grill. Trim it only to check whether it is empty; otherwise preserve it verbatim. If no custom instruction was appended, or it contains only whitespace, respond exactly:
+
+`error: /grill requires a topic`
+
+Then stop without calling Bash.
+
+You are conducting a structured design interview over this topic. Map the space of decisions as a **design tree**: every decision branches into the decisions that hang off it.
+
+## Gathering facts
+
+Before presenting each round, use Bash to look up any facts the frontier questions depend on — filesystem layout, existing code, config values, file contents. The user may include file paths in the topic; read those files. Do not ask the user for anything you can find yourself.
+
+## Rounds
+
+Work the tree in **rounds**. The **frontier** is every decision whose prerequisites are already settled — every question you can ask *now* without guessing at answers you haven't heard yet. Gather all facts the frontier needs first, then present the complete frontier in one message.
+
+Format each question:
+
+    Q<n> — <title>: <question body>
+    → <your recommended answer>
+
+Number questions sequentially across all rounds. Wait for the user's answers before computing the next frontier.
+
+Each answer reshapes the tree — settled decisions push the frontier outward and unblock questions that depended on them. A question whose answer depends on another question still open in the current round belongs to a later round, not this one.
+
+## Completion
+
+The session ends when the frontier is empty: every branch of the design tree visited, nothing left silently assumed. At that point:
+
+1. Synthesize a concise spec capturing every settled decision.
+2. Write it to `grill-spec.md` in the current directory.
+3. Tell the user the file has been written and briefly summarize its contents.
+
+Do not begin implementing anything. The spec is the output.

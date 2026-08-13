@@ -80,6 +80,17 @@ printf 'Focus on authentication.' | mu review.md
 In zsh and Fish prompt mode, a discovered command is invoked by its relative
 path, including extension, such as `/review.md`.
 
+### Built-in `/grill`
+
+`/grill <topic>` invokes the extensionless built-in `grill` custom command. The
+topic argument is required. Its agent conducts a structured design interview:
+it maps the topic's decisions as a tree, works the tree in frontier rounds
+(asking every unblocked question at once with a recommended answer), looks up
+facts from the environment via Bash rather than asking the user, and waits for
+answers before advancing to the next round. When the frontier is empty it
+writes a concise spec of all settled decisions to `grill-spec.md` in the
+current directory.
+
 ### Built-in `/goal`
 
 `/goal <goal>` invokes the extensionless built-in `goal` custom command. The
