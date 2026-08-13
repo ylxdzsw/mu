@@ -1,5 +1,6 @@
 use std::fs::{File, OpenOptions};
 use std::io::Read;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
@@ -52,11 +53,7 @@ pub fn create_temp_file(directory: &Path, prefix: &str, suffix: &str) -> Result<
         let path = directory.join(format!("{prefix}{token}{suffix}"));
         let mut options = OpenOptions::new();
         options.write(true).read(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
-        }
+        options.mode(0o600);
         match options.open(&path) {
             Ok(file) => return Ok((file, path)),
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
@@ -94,7 +91,6 @@ mod tests {
         assert!(seen.len() > 120);
     }
 
-    #[cfg(unix)]
     #[test]
     fn temporary_files_are_exclusive_private_and_distinct() {
         use std::os::unix::fs::MetadataExt;

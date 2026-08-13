@@ -169,23 +169,20 @@ pub fn runtime_dir() -> Result<PathBuf> {
     let metadata = match std::fs::symlink_metadata(&directory) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::DirBuilderExt;
+            use std::os::unix::fs::DirBuilderExt;
 
-                let mut builder = std::fs::DirBuilder::new();
-                builder.mode(0o700);
-                match builder.create(&directory) {
-                    Ok(()) => {}
-                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-                    Err(error) => {
-                        return Err(error).with_context(|| {
-                            format!(
-                                "creating private Mu temporary directory {}",
-                                directory.display()
-                            )
-                        });
-                    }
+            let mut builder = std::fs::DirBuilder::new();
+            builder.mode(0o700);
+            match builder.create(&directory) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!(
+                            "creating private Mu temporary directory {}",
+                            directory.display()
+                        )
+                    });
                 }
             }
             std::fs::symlink_metadata(&directory).with_context(|| {
@@ -204,17 +201,14 @@ pub fn runtime_dir() -> Result<PathBuf> {
             directory.display()
         );
     }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        let mode = metadata.mode() & 0o777;
-        let uid = unsafe { libc::geteuid() };
-        if metadata.uid() != uid || mode & 0o077 != 0 {
-            bail!(
-                "Mu temporary directory is not private to this user: {}",
-                directory.display()
-            );
-        }
+    use std::os::unix::fs::MetadataExt;
+    let mode = metadata.mode() & 0o777;
+    let uid = unsafe { libc::geteuid() };
+    if metadata.uid() != uid || mode & 0o077 != 0 {
+        bail!(
+            "Mu temporary directory is not private to this user: {}",
+            directory.display()
+        );
     }
     Ok(directory)
 }
@@ -392,7 +386,6 @@ fn absolutize(base: &Path, path: &Path) -> PathBuf {
 mod tests {
     use super::*;
 
-    #[cfg(unix)]
     #[test]
     fn runtime_directory_is_private_and_owned_by_the_current_user() {
         use std::os::unix::fs::MetadataExt;

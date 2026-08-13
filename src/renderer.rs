@@ -1,5 +1,4 @@
 use std::io::{self, IsTerminal, Write};
-#[cfg(unix)]
 use std::os::fd::AsRawFd;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -85,26 +84,16 @@ impl TerminalLayout {
 }
 
 fn stdout_terminal_width(stdout: &io::Stdout) -> Option<usize> {
-    #[cfg(unix)]
-    {
-        let mut size = std::mem::MaybeUninit::<libc::winsize>::zeroed();
-        // SAFETY: TIOCGWINSZ initializes the winsize pointed to by the third
-        // argument and does not retain that pointer.
-        let result =
-            unsafe { libc::ioctl(stdout.as_raw_fd(), libc::TIOCGWINSZ, size.as_mut_ptr()) };
-        if result != 0 {
-            return None;
-        }
-        // SAFETY: A successful TIOCGWINSZ call initialized the structure.
-        let columns = unsafe { size.assume_init() }.ws_col as usize;
-        (columns > 0).then_some(columns.saturating_sub(TERMINAL_RIGHT_MARGIN).max(1))
+    let mut size = std::mem::MaybeUninit::<libc::winsize>::zeroed();
+    // SAFETY: TIOCGWINSZ initializes the winsize pointed to by the third
+    // argument and does not retain that pointer.
+    let result = unsafe { libc::ioctl(stdout.as_raw_fd(), libc::TIOCGWINSZ, size.as_mut_ptr()) };
+    if result != 0 {
+        return None;
     }
-
-    #[cfg(not(unix))]
-    {
-        let _ = stdout;
-        None
-    }
+    // SAFETY: A successful TIOCGWINSZ call initialized the structure.
+    let columns = unsafe { size.assume_init() }.ws_col as usize;
+    (columns > 0).then_some(columns.saturating_sub(TERMINAL_RIGHT_MARGIN).max(1))
 }
 
 #[cfg(test)]

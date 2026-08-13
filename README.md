@@ -39,7 +39,8 @@ Continue the last selected session for another turn:
 mu -c <<< 'Now identify the riskiest change.'
 ```
 
-`mu` targets Unix-like systems and expects `bash` on `PATH`.
+`mu` targets Unix-like systems and expects `bash` on `PATH`. An unmaintained
+Windows port remains available on the [`msys2`](../../tree/msys2) branch.
 
 ## Interactive shell usage
 
@@ -338,7 +339,7 @@ instead; an explicit unavailable `--model` remains an error. Any
 OpenAI-compatible endpoint works; edit the endpoint, API-key environment
 variable, and model list to match your provider.
 
-On Unix, a provider served over a Unix socket uses an `http+unix` endpoint.
+A provider served over a Unix socket uses an `http+unix` endpoint.
 Percent-encode the absolute socket path as the authority and leave the API path
 ordinary:
 
@@ -455,14 +456,13 @@ population may leave a partial directory that later runs deliberately trust.
 Moving or upgrading the binary does not update either cache: remove the
 applicable cache subdirectory manually to regenerate it.
 
-Version tags publish the three standalone portable Unix binaries, the zsh and
-Fish integrations, the native Arch package, and a Windows MSYS2 UCRT64 zip.
+Version tags publish the three standalone portable binaries, the zsh and Fish
+integrations, and the native Arch package.
 The Linux binary statically links musl and vendored OpenSSL. The macOS binaries
-retain only Apple system-library linkage. The Windows zip contains the
-portable `mu.exe`, the Windows zsh integration, `WINDOWS.md`, and `LICENSE`.
-The generated `Cargo.lock` is uploaded as a normal CI artifact but is not part
-of a release. Unix binaries downloaded directly from a release may need their
-executable bit restored with `chmod +x`.
+retain only Apple system-library linkage. The generated `Cargo.lock` is
+uploaded as a normal CI artifact but is not part of a release. Binaries
+downloaded directly from a release may need their executable bit restored with
+`chmod +x`.
 
 ## Reference
 

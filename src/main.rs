@@ -10,9 +10,6 @@ use anyhow::{Context, Result, bail};
 use clap::{Args as ClapArgs, Parser, Subcommand, ValueEnum};
 use serde::{Deserialize, Serialize};
 
-#[cfg(not(unix))]
-compile_error!("mu is supported only on Unix-like systems");
-
 mod agent;
 mod anthropic;
 mod applets;

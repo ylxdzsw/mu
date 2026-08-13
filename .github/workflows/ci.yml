@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [master, msys2]
+    branches: [master]
     tags: ["v*"]
   pull_request:
     branches: [master]
@@ -324,130 +324,10 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
-  windows:
-    name: Windows MSYS2 UCRT64
-    if: github.ref_type == 'tag' || github.ref == 'refs/heads/msys2'
-    runs-on: windows-latest
-
-    defaults:
-      run:
-        shell: msys2 {0}
-
-    steps:
-      - name: Configure Git line endings
-        shell: pwsh
-        run: git config --global core.autocrlf input
-
-      - uses: actions/checkout@v6
-        with:
-          fetch-depth: 0
-
-      - uses: msys2/setup-msys2@v2
-        with:
-          msystem: UCRT64
-          update: true
-          install: >-
-            git
-            zip
-            zsh
-            mingw-w64-ucrt-x86_64-curl
-            mingw-w64-ucrt-x86_64-jq
-            mingw-w64-ucrt-x86_64-pkgconf
-            mingw-w64-ucrt-x86_64-python
-            mingw-w64-ucrt-x86_64-ripgrep
-            mingw-w64-ucrt-x86_64-rust
-
-      - name: Select the maintained Windows revision for the tag
-        if: github.ref_type == 'tag'
-        run: |
-          set -euo pipefail
-          git fetch --no-tags origin \
-            +refs/heads/msys2:refs/remotes/origin/msys2
-          git checkout -B ci-msys2 origin/msys2
-
-      - name: Select the pushed Windows revision for packaging
-        if: github.ref == 'refs/heads/msys2'
-        run: git checkout -B ci-msys2 "$GITHUB_SHA"
-
-      - name: Verify the native toolchain
-        run: |
-          test "$MSYSTEM" = UCRT64
-          rustc -vV | grep -F 'host: x86_64-pc-windows-gnu'
-
-      - name: Check formatting
-        run: cargo fmt --check
-
-      - name: Lint
-        run: cargo clippy --all-targets -- -D warnings
-
-      - name: Build portable binary
-        run: cargo build --release --features portable
-
-      - name: Build and test the MSYS2 package
-        id: package
-        run: |
-          set -euo pipefail
-          package_root=$(cygpath -u "$RUNNER_TEMP")/mu-package-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}
-          mkdir "$package_root"
-          cp packaging/msys2/PKGBUILD "$package_root/PKGBUILD"
-          source_url="file://$PWD"
-          (
-            cd "$package_root"
-            MU_SOURCE_URL="$source_url" \
-            MU_SOURCE_BRANCH=ci-msys2 \
-              makepkg-mingw --noconfirm --cleanbuild --clean --force
-          )
-          package=$(find "$package_root" -maxdepth 1 \
-            -name 'mingw-w64-ucrt-x86_64-mu-*.pkg.tar.zst' -print -quit)
-          test -n "$package"
-          mkdir dist
-          cp "$package" dist/
-          printf 'package_path=%s\n' "$package" >> "$GITHUB_OUTPUT"
-
-      - name: Install and smoke-test the package
-        run: |
-          set -euo pipefail
-          pacman --noconfirm -U '${{ steps.package.outputs.package_path }}'
-          /ucrt64/bin/mu.exe --help >/dev/null
-          test -f /ucrt64/share/mu/customize-mu.md
-          test -f /ucrt64/share/doc/mu/WINDOWS.md
-          smoke=$(mktemp -d)
-          printf '%s\n' \
-            '*** Begin Patch' \
-            '*** Add File: smoke.txt' \
-            '+works' \
-            '*** End Patch' \
-            | (cd "$smoke" && /ucrt64/libexec/mu/apply_patch.exe)
-          grep -qx works "$smoke/smoke.txt"
-
-      - name: Smoke-test the portable binary
-        run: |
-          set -euo pipefail
-          smoke=$(mktemp -d)
-          XDG_CACHE_HOME="$smoke/cache" target/release/mu.exe --help >/dev/null
-          test -f "$smoke/cache/mu/builtins/customize-mu.md"
-
-      - name: Assemble Windows release zip
-        run: |
-          set -euo pipefail
-          archive=dist/mu-windows-msys2-ucrt64
-          mkdir -p "$archive"
-          cp target/release/mu.exe "$archive/"
-          cp mu.zsh LICENSE WINDOWS.md "$archive/"
-          (cd dist && zip -qr mu-windows-msys2-ucrt64.zip mu-windows-msys2-ucrt64)
-
-      - name: Upload Windows artifacts
-        uses: actions/upload-artifact@v7
-        with:
-          name: windows-msys2-ucrt64
-          path: dist/mu-windows-msys2-ucrt64.zip
-          if-no-files-found: error
-          retention-days: 14
-
   release:
     name: Publish release artifacts
     if: github.ref_type == 'tag'
-    needs: [linux, linux-package, portable-linux, portable-macos, windows]
+    needs: [linux, linux-package, portable-linux, portable-macos]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -463,11 +343,6 @@ jobs:
         with:
           name: native-arch-package
           path: dist
-      - uses: actions/download-artifact@v8
-        with:
-          name: windows-msys2-ucrt64
-          path: dist
-
       - name: Stage shell integrations and verify release assets
         run: |
           set -euo pipefail
@@ -478,7 +353,6 @@ jobs:
             mu-macos-x86_64
             mu.zsh
             mu.fish
-            mu-windows-msys2-ucrt64.zip
           )
           package=$(find dist -maxdepth 1 \
             -name 'mu-*.pkg.tar.zst' -print -quit)

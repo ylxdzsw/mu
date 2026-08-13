@@ -967,7 +967,6 @@ mod apply_patch {
             fs::remove_dir_all(dir).unwrap();
         }
 
-        #[cfg(unix)]
         #[test]
         fn existing_file_update_preserves_inode_and_hardlinks_and_removes_backup() {
             use std::os::unix::fs::MetadataExt;
@@ -1128,7 +1127,6 @@ mod apply_patch {
             fs::remove_dir_all(dir).unwrap();
         }
 
-        #[cfg(unix)]
         #[test]
         fn delete_then_add_rewrites_regular_file_in_place() {
             use std::os::unix::fs::{MetadataExt, PermissionsExt};
@@ -1206,7 +1204,6 @@ mod apply_patch {
             fs::remove_dir_all(dir).unwrap();
         }
 
-        #[cfg(unix)]
         #[test]
         fn update_through_symlink_preserves_link_and_updates_target() {
             use std::os::unix::fs::symlink;
@@ -1228,7 +1225,6 @@ mod apply_patch {
             fs::remove_dir_all(dir).unwrap();
         }
 
-        #[cfg(unix)]
         #[test]
         fn repeated_updates_through_same_symlink_preserve_link() {
             use std::os::unix::fs::symlink;
@@ -1253,7 +1249,6 @@ mod apply_patch {
             fs::remove_dir_all(dir).unwrap();
         }
 
-        #[cfg(unix)]
         #[test]
         fn delete_then_add_symlink_is_rejected() {
             use std::os::unix::fs::symlink;
@@ -1278,7 +1273,6 @@ mod apply_patch {
             fs::remove_dir_all(dir).unwrap();
         }
 
-        #[cfg(unix)]
         #[test]
         fn delete_symlink_removes_only_the_link() {
             use std::os::unix::fs::symlink;
@@ -1297,7 +1291,6 @@ mod apply_patch {
             fs::remove_dir_all(dir).unwrap();
         }
 
-        #[cfg(unix)]
         #[test]
         fn pure_move_renames_symlink_without_touching_target() {
             use std::os::unix::fs::symlink;
@@ -1322,7 +1315,6 @@ mod apply_patch {
             fs::remove_dir_all(dir).unwrap();
         }
 
-        #[cfg(unix)]
         #[test]
         fn move_with_update_edits_target_and_renames_symlink() {
             use std::os::unix::fs::symlink;
@@ -1344,7 +1336,6 @@ mod apply_patch {
             fs::remove_dir_all(dir).unwrap();
         }
 
-        #[cfg(unix)]
         #[test]
         fn failed_symlink_move_does_not_update_target() {
             use std::os::unix::fs::symlink;
@@ -1366,7 +1357,6 @@ mod apply_patch {
             fs::remove_dir_all(dir).unwrap();
         }
 
-        #[cfg(unix)]
         #[test]
         fn rejects_updates_through_two_symlinks_to_the_same_target() {
             use std::os::unix::fs::symlink;
@@ -2320,7 +2310,6 @@ mod edit {
             fs::remove_dir_all(dir).unwrap();
         }
 
-        #[cfg(unix)]
         #[test]
         fn preserves_permissions_and_updates_through_symlink() {
             use std::os::unix::fs::{PermissionsExt, symlink};

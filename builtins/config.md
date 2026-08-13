@@ -92,7 +92,7 @@ Complete shape, with default values where applicable:
 At least one provider and model are required. Endpoint paths must end in
 `/chat/completions`, `/responses`, or `/messages`; the suffix selects the API.
 `endpoint` is required; `api_key_env` and all model metadata are optional.
-On Unix, HTTP over a Unix socket uses one endpoint string with the socket path
+HTTP over a Unix socket uses one endpoint string with the socket path
 percent-encoded as the authority:
 `http+unix://%2Frun%2Flocal-ai.sock/v1/responses`. This connects to
 `/run/local-ai.sock`, requests `/v1/responses` with `Host: localhost`, and
