@@ -423,7 +423,8 @@ turn, then passes that id explicitly. `MU_ZSH_SESSION_ID` or
 
 - `/new` clears the session id but preserves the shell model override and
   staged attachments.
-- `/load <id>` replays a session and attaches only after successful replay.
+- `/load [<id>]` replays a session and attaches only after successful replay.
+  Without an id, it selects the active scope's persisted `current-session`.
 - `/model <ref>` stores a shell-only override for later turns and retries.
 - `/attach <file>` stages a readable attachment; `/attach` lists and
   `/attach --clear` discards the queue. The next ordinary prompt or custom

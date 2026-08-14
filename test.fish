@@ -86,6 +86,7 @@ begin
     printf '%s\n' '    case "$1" in'
     printf '%s\n' '      --model) shift; model=$1 ;;'
     printf '%s\n' '      -s|--session) shift; session=$1 ;;'
+    printf '%s\n' '      -c|--continue) [ "${MU_FISH_TEST_NO_CURRENT:-0}" = 1 ] || session=ses_0000000d ;;'
     printf '%s\n' '      --include-commands) include_commands=1 ;;'
     printf '%s\n' '      --include-models) include_models=1 ;;'
     printf '%s\n' '    esac'
@@ -94,12 +95,14 @@ begin
     printf '%s\n' '  [ "$session" = ses_missing ] && exit 1'
     printf '%s\n' '  [ "$model" = unknown ] && exit 1'
     printf '%s\n' '  [ "$model" = gpt ] && model=openai/gpt'
+    printf '%s\n' '  session_json=null'
+    printf '%s\n' '  [ -n "$session" ] && session_json="\"$session\""'
     printf '%s\n' '  if [ "$include_models" -eq 1 ]; then'
-    printf '%s\n' '    printf "%s\n" "{\"model\":{\"canonical\":\"$model\"},\"output\":\"concise\",\"context_tokens\":25,\"context_window\":100,\"project_root\":\"$TEST_PROJECT_ROOT\",\"clean\":true,\"available_models\":{\"providers\":[{\"id\":\"local\",\"models\":[{\"id\":\"local/solo\",\"model_id\":\"solo\",\"supported_efforts\":[\"max\"]},{\"id\":\"local/shared\",\"model_id\":\"shared\",\"supported_efforts\":[]}]},{\"id\":\"openai\",\"models\":[{\"id\":\"openai/gpt\",\"model_id\":\"gpt\",\"supported_efforts\":[\"low\",\"high\"]},{\"id\":\"openai/shared\",\"model_id\":\"shared\",\"supported_efforts\":[\"medium\"]}]}]}}"'
+    printf '%s\n' '    printf "%s\n" "{\"model\":{\"canonical\":\"$model\"},\"output\":\"concise\",\"session_id\":$session_json,\"context_tokens\":25,\"context_window\":100,\"project_root\":\"$TEST_PROJECT_ROOT\",\"clean\":true,\"available_models\":{\"providers\":[{\"id\":\"local\",\"models\":[{\"id\":\"local/solo\",\"model_id\":\"solo\",\"supported_efforts\":[\"max\"]},{\"id\":\"local/shared\",\"model_id\":\"shared\",\"supported_efforts\":[]}]},{\"id\":\"openai\",\"models\":[{\"id\":\"openai/gpt\",\"model_id\":\"gpt\",\"supported_efforts\":[\"low\",\"high\"]},{\"id\":\"openai/shared\",\"model_id\":\"shared\",\"supported_efforts\":[\"medium\"]}]}]}}"'
     printf '%s\n' '  elif [ "$include_commands" -eq 1 ]; then'
-    printf '%s\n' '    printf "%s\n" "{\"model\":{\"canonical\":\"$model\"},\"output\":\"concise\",\"context_tokens\":25,\"context_window\":100,\"project_root\":\"$TEST_PROJECT_ROOT\",\"clean\":true,\"commands\":[{\"name\":\"review.md\"}]}"'
+    printf '%s\n' '    printf "%s\n" "{\"model\":{\"canonical\":\"$model\"},\"output\":\"concise\",\"session_id\":$session_json,\"context_tokens\":25,\"context_window\":100,\"project_root\":\"$TEST_PROJECT_ROOT\",\"clean\":true,\"commands\":[{\"name\":\"review.md\"}]}"'
     printf '%s\n' '  else'
-    printf '%s\n' '    printf "%s\n" "{\"model\":{\"canonical\":\"$model\"},\"output\":\"concise\",\"context_tokens\":75,\"context_window\":100,\"compaction_soft_threshold_tokens\":70,\"context_usage_source\":\"estimated\",\"project_root\":\"$TEST_PROJECT_ROOT\",\"clean\":true}"'
+    printf '%s\n' '    printf "%s\n" "{\"model\":{\"canonical\":\"$model\"},\"output\":\"concise\",\"session_id\":$session_json,\"context_tokens\":75,\"context_window\":100,\"compaction_soft_threshold_tokens\":70,\"context_usage_source\":\"estimated\",\"project_root\":\"$TEST_PROJECT_ROOT\",\"clean\":true}"'
     printf '%s\n' '  fi'
     printf '%s\n' '  exit 0'
     printf '%s\n' fi
@@ -168,9 +171,18 @@ rm -f "$capture_args" "$capture_calls"
 _mu_fish_run_slash_command '/load ses_0000000c' >/dev/null
 set load_args (cat "$capture_args")
 assert_equal (string join \x1e -- $load_args) (string join \x1e -- transcript --session ses_0000000c --output full) '/load uses the shell output override'
+rm -f "$capture_args" "$capture_calls"
+set load_output (_mu_fish_run_slash_command '/load' | string collect)
+assert_equal "$MU_FISH_SESSION_ID" ses_0000000d 'argument-free /load attaches current-session'
+set load_args (cat "$capture_args")
+assert_equal (string join \x1e -- $load_args) (string join \x1e -- transcript --session ses_0000000d --output full) 'argument-free /load replays current-session explicitly'
+assert_contains "$load_output" '[mu] loaded session ses_0000000d' 'argument-free /load confirms the resolved session'
+set -gx MU_FISH_TEST_NO_CURRENT 1
+_mu_fish_run_slash_command '/load' >/dev/null; and fail 'argument-free /load should reject a missing current-session'
+set -e MU_FISH_TEST_NO_CURRENT
+assert_equal "$MU_FISH_SESSION_ID" ses_0000000d 'failed current load preserves the attached session'
 _mu_fish_run_slash_command '/load ses_missing' >/dev/null 2>&1; and fail '/load should reject a missing session'
-assert_equal "$MU_FISH_SESSION_ID" ses_0000000c 'failed load preserves the attached session'
-_mu_fish_run_slash_command '/load' >/dev/null; and fail '/load should require a session id'
+assert_equal "$MU_FISH_SESSION_ID" ses_0000000d 'failed load preserves the attached session'
 _mu_fish_run_slash_command '/load ses_0000000b extra' >/dev/null; and fail '/load should accept exactly one session id'
 set -g MU_FISH_SESSION_ID ses_0000000a
 set -g MU_FISH_EFFECTIVE_SESSION_ID ses_0000000a

@@ -840,6 +840,31 @@ _mu_zsh_resolve_load_output() {
   esac
 }
 
+_mu_zsh_resolve_load_session() {
+  local requested_session=$1
+  local status_json session_id
+
+  if [[ -n "$requested_session" ]]; then
+    REPLY=$requested_session
+    return 0
+  fi
+
+  status_json=$("$MU_ZSH_BIN" status --json --continue) || return $?
+  session_id=$(jq -r '.session_id // empty' <<< "$status_json" 2>/dev/null) || {
+    print -u2 -- "mu mu.zsh: could not resolve current session from status"
+    return 1
+  }
+  if [[ -z "$session_id" ]]; then
+    _mu_zsh_print_block_message "[mu] no sessions found in active scope"
+    return 1
+  fi
+  if [[ ! "$session_id" =~ '^ses_[0-9a-hjkmnpqrstvwxyz]{8}$' ]]; then
+    print -u2 -- "mu mu.zsh: status returned an invalid session id"
+    return 1
+  fi
+  REPLY=$session_id
+}
+
 _mu_zsh_run_custom_slash_command() {
   local slash_command=$1
   local instruction=${2-}
@@ -957,21 +982,19 @@ _mu_zsh_run_slash_command() {
       _mu_zsh_print_block_message "[mu] next turns in this scope will use $resolved_model"
       ;;
     /load)
-      if [[ -z "$rest" ]]; then
-        _mu_zsh_print_block_message "[mu] usage: /load <session-id>"
-        return 1
-      fi
       if [[ "$rest" == *[[:space:]]* ]]; then
         _mu_zsh_print_block_message "[mu] /load accepts exactly one session id"
         return 1
       fi
-      _mu_zsh_resolve_load_output "$rest" || return $?
+      _mu_zsh_resolve_load_session "$rest" || return $?
+      session_id=$REPLY
+      _mu_zsh_resolve_load_output "$session_id" || return $?
       load_output=$REPLY
-      "$MU_ZSH_BIN" transcript --session "$rest" --output "$load_output" || return $?
+      "$MU_ZSH_BIN" transcript --session "$session_id" --output "$load_output" || return $?
       _mu_zsh_activate_scope "$scope"
-      MU_ZSH_SESSION_ID=$rest
-      MU_ZSH_EFFECTIVE_SESSION_ID=$rest
-      _mu_zsh_print_block_message "[mu] loaded session $rest"
+      MU_ZSH_SESSION_ID=$session_id
+      MU_ZSH_EFFECTIVE_SESSION_ID=$session_id
+      _mu_zsh_print_block_message "[mu] loaded session $session_id"
       ;;
     /new)
       _mu_zsh_validate_no_args "$command" "$rest" || return 1

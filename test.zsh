@@ -73,6 +73,9 @@ if [[ "$1" == "status" ]]; then
         shift
         session=$1
         ;;
+      -c|--continue)
+        [[ "${MU_ZSH_TEST_NO_CURRENT:-0}" == 1 ]] || session=ses_0000000d
+        ;;
       --include-models)
         include_models=1
         ;;
@@ -88,7 +91,9 @@ if [[ "$1" == "status" ]]; then
   provider=${model%%/*}
   model_id=${model#*/}
   [[ "$provider" == "$model" ]] && provider=test
-  model_json="\"model\":{\"provider_id\":\"$provider\",\"model_id\":\"$model_id\",\"effort\":null,\"canonical\":\"$model\"}"
+  session_json=null
+  [[ -n "$session" ]] && session_json="\"$session\""
+  model_json="\"model\":{\"provider_id\":\"$provider\",\"model_id\":\"$model_id\",\"effort\":null,\"canonical\":\"$model\"},\"session_id\":$session_json"
   if (( include_models )); then
     print -r -- "{$model_json,\"output\":\"concise\",\"context_tokens\":25,\"context_window\":100,\"project_root\":\"$MU_ZSH_TEST_PROJECT_ROOT\",\"available_models\":{\"providers\":[{\"id\":\"local\",\"models\":[{\"id\":\"local/solo\",\"model_id\":\"solo\",\"supported_efforts\":[\"max\"]},{\"id\":\"local/shared\",\"model_id\":\"shared\",\"supported_efforts\":[\"low\"]}]},{\"id\":\"openai\",\"models\":[{\"id\":\"openai/gpt\",\"model_id\":\"gpt\",\"supported_efforts\":[\"provider-custom\",\"high\",\"minimum\",\"low\",\"max\",\"medium\",\"xhigh\"]},{\"id\":\"openai/gpt-5.6-luna\",\"model_id\":\"gpt-5.6-luna\",\"supported_efforts\":[\"none\",\"max\"]},{\"id\":\"openai/shared\",\"model_id\":\"shared\",\"supported_efforts\":[\"medium\"]}]}]}}"
   elif (( include_commands )); then
@@ -506,13 +511,24 @@ rm -f "$MU_ZSH_FAKE_LOG"
 _mu_zsh_run_slash_command "/load ses_0000000c" >/dev/null
 grep -Fq -- "transcript --session ses_0000000c --output full" "$MU_ZSH_FAKE_LOG" ||
   fail "load uses the shell output override"
+rm -f "$MU_ZSH_FAKE_LOG"
+load_output=$tmpdir/load-current-output
+_mu_zsh_run_slash_command "/load" > "$load_output"
+[[ "$MU_ZSH_SESSION_ID" == ses_0000000d ]] || fail "argument-free load attaches current-session"
+grep -Fq -- "transcript --session ses_0000000d --output full" "$MU_ZSH_FAKE_LOG" ||
+  fail "argument-free load replays current-session explicitly"
+grep -Fq -- "[mu] loaded session ses_0000000d" "$load_output" ||
+  fail "argument-free load confirms the resolved session"
+export MU_ZSH_TEST_NO_CURRENT=1
+if _mu_zsh_run_slash_command "/load" >/dev/null; then
+  fail "argument-free load should reject a missing current-session"
+fi
+unset MU_ZSH_TEST_NO_CURRENT
+[[ "$MU_ZSH_SESSION_ID" == ses_0000000d ]] || fail "failed current load preserves the attached session"
 if _mu_zsh_run_slash_command "/load ses_missing" >/dev/null 2>&1; then
   fail "load should reject a missing session"
 fi
-[[ "$MU_ZSH_SESSION_ID" == ses_0000000c ]] || fail "failed load preserves the attached session"
-if _mu_zsh_run_slash_command "/load" >/dev/null; then
-  fail "load should require a session id"
-fi
+[[ "$MU_ZSH_SESSION_ID" == ses_0000000d ]] || fail "failed load preserves the attached session"
 if _mu_zsh_run_slash_command "/load ses_0000000b extra" >/dev/null; then
   fail "load should accept exactly one session id"
 fi

@@ -94,8 +94,9 @@ runs against the current Mu session and shell state.
 Type `/` to list prompt-mode commands. The common ones:
 
 - `/new` starts a new session while keeping the current model and attachments.
-- `/load <session-id>` renders an existing session's transcript and attaches
-  the shell to it for later turns. It uses the current output density.
+- `/load [<session-id>]` renders an existing session's transcript and attaches
+  the shell to it for later turns. Without an id, it loads the active scope's
+  last selected session. It uses the current output density.
 - `/model` selects a configured model for later turns in this shell scope.
   Completing an unambiguous model appends a temporary `:` and lists its effort
   variants; type an effort prefix directly, or press Enter to select the model

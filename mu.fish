@@ -651,6 +651,31 @@ function _mu_fish_resolve_load_output --argument-names session_id
     end
 end
 
+function _mu_fish_resolve_load_session --argument-names requested_session
+    if test -n "$requested_session"
+        set -g _MU_FISH_LOAD_SESSION "$requested_session"
+        return 0
+    end
+
+    set -l json ("$MU_FISH_BIN" status --json --continue | string collect)
+    set -l command_status $pipestatus[1]
+    test $command_status -eq 0; or return $command_status
+    set -g _MU_FISH_LOAD_SESSION (printf '%s' "$json" | jq -r '.session_id // empty' 2>/dev/null)
+    set -l jq_status $pipestatus[2]
+    if test $jq_status -ne 0
+        printf '%s\n' 'mu mu.fish: could not resolve current session from status' >&2
+        return 1
+    end
+    if test -z "$_MU_FISH_LOAD_SESSION"
+        _mu_fish_print_block_message '[mu] no sessions found in active scope'
+        return 1
+    end
+    if not string match -qr '^ses_[0-9a-hjkmnpqrstvwxyz]{8}$' -- "$_MU_FISH_LOAD_SESSION"
+        printf '%s\n' 'mu mu.fish: status returned an invalid session id' >&2
+        return 1
+    end
+end
+
 function _mu_fish_run_custom_slash_command --argument-names slash_command instruction
     set -l scope (_mu_fish_current_scope)
     _mu_fish_activate_scope "$scope"
@@ -745,22 +770,20 @@ function _mu_fish_run_slash_command --argument-names line
             _mu_fish_print_block_message "[mu] next turns in this scope will use $_MU_FISH_VALIDATED_MODEL"
 
         case /load
-            if test -z "$rest"
-                _mu_fish_print_block_message '[mu] usage: /load <session-id>'
-                return 1
-            end
             if string match -qr '[[:space:]]' -- "$rest"
                 _mu_fish_print_block_message '[mu] /load accepts exactly one session id'
                 return 1
             end
-            _mu_fish_resolve_load_output "$rest"; or return $status
-            "$MU_FISH_BIN" transcript --session "$rest" --output "$_MU_FISH_LOAD_OUTPUT"
+            _mu_fish_resolve_load_session "$rest"; or return $status
+            set -l session_id "$_MU_FISH_LOAD_SESSION"
+            _mu_fish_resolve_load_output "$session_id"; or return $status
+            "$MU_FISH_BIN" transcript --session "$session_id" --output "$_MU_FISH_LOAD_OUTPUT"
             set exit_status $status
             test $exit_status -eq 0; or return $exit_status
             _mu_fish_activate_scope "$scope"
-            set -g MU_FISH_SESSION_ID "$rest"
-            set -g MU_FISH_EFFECTIVE_SESSION_ID "$rest"
-            _mu_fish_print_block_message "[mu] loaded session $rest"
+            set -g MU_FISH_SESSION_ID "$session_id"
+            set -g MU_FISH_EFFECTIVE_SESSION_ID "$session_id"
+            _mu_fish_print_block_message "[mu] loaded session $session_id"
 
         case /new
             if test -n "$rest"
