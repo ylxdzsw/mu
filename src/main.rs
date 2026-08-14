@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::fmt;
 use std::io::{self, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
@@ -441,6 +442,27 @@ impl Write for TranscriptBuffer {
     }
 }
 
+fn bash_output_for_transcript(output: &str, exit_code: i32) -> Cow<'_, str> {
+    let marker = format!("\n[exit code: {exit_code}]");
+    if let Some(output) = output.strip_suffix(&marker) {
+        return Cow::Borrowed(output);
+    }
+
+    let Some(note_start) = output.rfind("\n[… ") else {
+        return Cow::Borrowed(output);
+    };
+    let (preview, note) = output.split_at(note_start);
+    let Some(preview) = preview.strip_suffix(&marker) else {
+        return Cow::Borrowed(output);
+    };
+    let note = if preview.is_empty() {
+        note.trim_start_matches('\n')
+    } else {
+        note
+    };
+    Cow::Owned(format!("{preview}{note}"))
+}
+
 fn replay_transcript(
     renderer: &mut Renderer,
     events: &[store::TranscriptEvent],
@@ -504,11 +526,15 @@ fn replay_transcript(
                             renderer.tool_start(&args, true)?;
                             match result {
                                 Some(result) if result.outcome == "completed" => {
-                                    renderer.bash_output(&result.output)?;
+                                    let exit_code = result
+                                        .exit_code
+                                        .context("completed Bash result has no exit code")?;
+                                    renderer.bash_output(&bash_output_for_transcript(
+                                        &result.output,
+                                        exit_code,
+                                    ))?;
                                     renderer.tool_finished(
-                                        result
-                                            .exit_code
-                                            .context("completed Bash result has no exit code")?,
+                                        exit_code,
                                         Duration::from_millis(
                                             result.duration_ms.unwrap_or_default(),
                                         ),
@@ -1635,7 +1661,7 @@ mod tests {
     }
 
     #[test]
-    fn full_transcript_replays_reasoning_and_complete_bash_output() {
+    fn detailed_transcripts_replay_bash_output_without_model_exit_marker() {
         let events = vec![
             store::TranscriptEvent::User {
                 text: "Question".into(),
@@ -1653,7 +1679,8 @@ mod tests {
                             r#"{"title":"Inspect","command":"printf all","risk":"readonly"}"#.into(),
                         result: Some(store::TranscriptBashResult {
                             outcome: "completed".into(),
-                            output: "line1\nline2\nline3\nline4\nline5\nline6\n".into(),
+                            output: "line1\nline2\nline3\nline4\nline5\nline6\n\n[exit code: 0]"
+                                .into(),
                             exit_code: Some(0),
                             duration_ms: Some(5),
                         }),
@@ -1661,17 +1688,44 @@ mod tests {
                 ],
             },
         ];
-        let buffer = TranscriptBuffer::default();
-        let mut renderer =
-            Renderer::with_transcript_output(OutputFormat::Full, Box::new(buffer.clone()), 79);
+        for output in [OutputFormat::Detail, OutputFormat::Full] {
+            let buffer = TranscriptBuffer::default();
+            let mut renderer =
+                Renderer::with_transcript_output(output, Box::new(buffer.clone()), 79);
 
-        replay_transcript(&mut renderer, &events, OutputFormat::Full, |_| None).unwrap();
+            replay_transcript(&mut renderer, &events, output, |_| None).unwrap();
 
-        let transcript = buffer.text().unwrap();
-        assert!(transcript.contains("Private trace"));
-        assert!(transcript.contains("Running "));
-        assert!(transcript.contains("line1\nline2\nline3\nline4\nline5\nline6\n"));
-        assert!(!transcript.contains("omitted"));
+            let transcript = buffer.text().unwrap();
+            assert_eq!(transcript.matches("✓ exit 0").count(), 1, "{transcript:?}");
+            assert!(!transcript.contains("[exit code: 0]"), "{transcript:?}");
+            assert!(transcript.contains("Running "));
+            if output == OutputFormat::Full {
+                assert!(transcript.contains("line1\nline2\nline3\nline4\nline5\nline6\n"));
+                assert!(!transcript.contains("omitted"));
+                assert!(transcript.contains("Private trace"));
+            } else {
+                assert!(transcript.contains("line1\nline2\nline3\n"));
+                assert!(transcript.contains("line5\nline6\n"));
+                assert!(transcript.contains("omitted"));
+                assert!(!transcript.contains("Private trace"));
+            }
+        }
+    }
+
+    #[test]
+    fn transcript_exit_marker_removal_preserves_truncation_note() {
+        let note = "[… 3 lines elided; full output was written to temporary file /tmp/result.txt]";
+        let output = format!("tail\n[exit code: 7]\n{note}");
+        assert_eq!(
+            bash_output_for_transcript(&output, 7),
+            format!("tail\n{note}")
+        );
+
+        let marker_only = format!("\n[exit code: 7]\n{note}");
+        assert_eq!(bash_output_for_transcript(&marker_only, 7), note);
+
+        let mismatched = "tail\n[exit code: 9]";
+        assert_eq!(bash_output_for_transcript(mismatched, 7), mismatched);
     }
 
     #[test]
