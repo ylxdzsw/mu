@@ -63,6 +63,7 @@ pub struct Renderer {
     live_line: Option<LiveLine>,
     live_line_rendered: bool,
     reasoning: Option<ReasoningState>,
+    reasoning_run_started: Option<Instant>,
     bash_preview: Option<BashPreviewState>,
     concise_tool: Option<ConciseToolState>,
     last_committed_was_tool: bool,
@@ -195,6 +196,7 @@ impl Renderer {
             live_line: None,
             live_line_rendered: false,
             reasoning: None,
+            reasoning_run_started: None,
             bash_preview: None,
             concise_tool: None,
             last_committed_was_tool: false,
@@ -226,6 +228,7 @@ impl Renderer {
     }
 
     pub fn markdown_document(&mut self, provenance: &str, text: &str) -> io::Result<()> {
+        self.end_reasoning_run()?;
         if !self.styled {
             return self.write_stdout_committed(text);
         }
@@ -248,7 +251,7 @@ impl Renderer {
         text: &str,
     ) -> io::Result<()> {
         self.assistant_end()?;
-        self.reasoning_end(None)?;
+        self.end_reasoning_run()?;
         self.ensure_block_separator_if_needed()?;
         let model = model.unwrap_or("mu");
         if self.styled {
@@ -280,6 +283,7 @@ impl Renderer {
         if text.is_empty() {
             return Ok(());
         }
+        self.end_reasoning_run()?;
         self.ensure_block_separator_if_needed()?;
         self.write_stdout_committed(text)?;
         self.ensure_line_start()
@@ -292,6 +296,7 @@ impl Renderer {
         if text.is_empty() {
             return Ok(());
         }
+        self.end_reasoning_run()?;
         if !self.styled {
             if !self.assistant_block_open {
                 self.ensure_block_separator_if_needed()?;
@@ -351,8 +356,16 @@ impl Renderer {
             return Ok(());
         }
         self.assistant_end()?;
+        let started = match self.reasoning_run_started {
+            Some(started) => started,
+            None => {
+                let started = Instant::now();
+                self.reasoning_run_started = Some(started);
+                started
+            }
+        };
         self.reasoning = Some(ReasoningState {
-            started: Instant::now(),
+            started,
             visibility,
             reasoning_chars: 0,
             summary: String::new(),
@@ -487,12 +500,18 @@ impl Renderer {
         self.write_committed(&line)
     }
 
+    fn end_reasoning_run(&mut self) -> io::Result<()> {
+        self.reasoning_end(None)?;
+        self.reasoning_run_started = None;
+        Ok(())
+    }
+
     pub fn bash_header_start(&mut self) -> io::Result<bool> {
         if self.format == OutputFormat::Final {
             return Ok(true);
         }
         self.assistant_end()?;
-        self.reasoning_end(None)?;
+        self.end_reasoning_run()?;
         self.concise_tool = None;
         if self.styled {
             self.live_line = Some(LiveLine::ToolComposition);
@@ -694,6 +713,7 @@ impl Renderer {
         self.clear_live_line()?;
         self.live_line = None;
         self.reasoning = None;
+        self.reasoning_run_started = None;
         self.bash_preview = None;
         self.concise_tool = None;
         Ok(())
@@ -708,7 +728,7 @@ impl Renderer {
             return Ok(());
         }
         self.assistant_block_open = false;
-        self.reasoning_end(None)?;
+        self.end_reasoning_run()?;
         self.live_line = None;
         self.bash_preview = (self.format == OutputFormat::Detail).then(BashPreviewState::default);
         if header_already_rendered {
@@ -868,6 +888,7 @@ impl Renderer {
         if self.format == OutputFormat::Final {
             return Ok(());
         }
+        self.end_reasoning_run()?;
         self.assistant_block_open = false;
         self.ensure_block_separator_if_needed()?;
         self.write_stdout_committed(&terminal_trim_committed_text(&format!("{msg}\n")))?;
@@ -878,6 +899,7 @@ impl Renderer {
         if self.format == OutputFormat::Final {
             return Ok(());
         }
+        self.end_reasoning_run()?;
         self.assistant_block_open = false;
         self.live_line = Some(LiveLine::Compacting {
             started: Instant::now(),
@@ -997,6 +1019,7 @@ impl Renderer {
             return Ok(());
         }
         self.assistant_end()?;
+        self.end_reasoning_run()?;
         self.ensure_line_start()?;
         if self.format == OutputFormat::Concise && self.styled && self.has_committed_stdout {
             self.stdout.write_all(b"\n")?;
@@ -4760,6 +4783,64 @@ mod tests {
         assert!(transcript.starts_with("[thought "), "{transcript:?}");
         assert!(transcript.ends_with("]\n"), "{transcript:?}");
         assert!(!transcript.contains("token"), "{transcript:?}");
+    }
+
+    #[test]
+    fn consecutive_reasoning_blocks_share_timer_until_assistant_text() {
+        for format in [OutputFormat::Concise, OutputFormat::Detail] {
+            for visibility in [
+                ReasoningVisibility::Opaque,
+                ReasoningVisibility::StreamedTrace,
+            ] {
+                let (mut renderer, _, _) = Renderer::with_test_output(format, true, true, None);
+                renderer.reasoning_start(visibility).unwrap();
+                let started = Instant::now() - Duration::from_secs(3);
+                renderer.reasoning_run_started = Some(started);
+                renderer.reasoning.as_mut().unwrap().started = started;
+                renderer.reasoning_end(None).unwrap();
+
+                renderer.reasoning_start(visibility).unwrap();
+                assert_eq!(renderer.reasoning.as_ref().unwrap().started, started);
+
+                renderer.reasoning_end(None).unwrap();
+                renderer.assistant_text("answer").unwrap();
+                renderer.reasoning_start(visibility).unwrap();
+                assert!(renderer.reasoning.as_ref().unwrap().started > started);
+            }
+        }
+    }
+
+    #[test]
+    fn consecutive_opaque_reasoning_updates_title_without_resetting_timer() {
+        let (mut renderer, _, _) =
+            Renderer::with_test_output(OutputFormat::Concise, true, true, None);
+        renderer
+            .reasoning_start(ReasoningVisibility::Opaque)
+            .unwrap();
+        let started = Instant::now() - Duration::from_secs(3);
+        renderer.reasoning_run_started = Some(started);
+        renderer.reasoning.as_mut().unwrap().started = started;
+        renderer
+            .reasoning_summary_delta(0, "**First title**\n")
+            .unwrap();
+        renderer.reasoning_end(None).unwrap();
+
+        renderer
+            .reasoning_start(ReasoningVisibility::Opaque)
+            .unwrap();
+        let long_title = format!("**{}**\n", "x".repeat(100));
+        renderer.reasoning_summary_delta(0, &long_title).unwrap();
+
+        let reasoning = renderer.reasoning.as_ref().unwrap();
+        assert_eq!(reasoning.started, started);
+        let title = reasoning.title.as_deref().unwrap();
+        assert_eq!(UnicodeWidthStr::width(title), REASONING_TITLE_MAX_WIDTH);
+        assert!(title.ends_with(ELLIPSIS));
+        let live = strip_ansi(&renderer.format_live_line().unwrap());
+        assert!(live.starts_with("[thought 3."), "{live:?}");
+        assert!(live.contains(" x"), "{live:?}");
+        assert!(live.ends_with(ELLIPSIS), "{live:?}");
+        assert!(UnicodeWidthStr::width(live.as_str()) <= DEFAULT_TERMINAL_WIDTH);
     }
 
     #[test]
