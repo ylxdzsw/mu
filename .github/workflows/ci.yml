@@ -144,7 +144,7 @@ jobs:
             -name 'mu-*.pkg.tar.zst' ! -name 'mu-debug-*' -print -quit)
           test -n "$package"
           pacman --noconfirm -U "$package"
-          test -f /usr/share/mu/customize-mu.md
+          test -f /usr/share/mu/config.md
           test -f /usr/share/fish/vendor_conf.d/mu.fish
           test -L /usr/libexec/mu/apply_patch
           test ! -e /usr/bin/applets
@@ -195,7 +195,7 @@ jobs:
           smoke=$(mktemp -d)
           cp "$binary" "$smoke/mu"
           XDG_CACHE_HOME="$smoke/cache" "$smoke/mu" --help >/dev/null
-          test -f "$smoke/cache/mu/builtins/customize-mu.md"
+          test -f "$smoke/cache/mu/builtins/config.md"
           for applet in apply_patch edit view_image; do
             test -L "$smoke/cache/mu/applets/$applet"
             test "$(readlink "$smoke/cache/mu/applets/$applet")" = "$smoke/mu"
@@ -277,7 +277,7 @@ jobs:
           smoke=$(mktemp -d)
           cp target/release/mu "$smoke/mu"
           XDG_CACHE_HOME="$smoke/cache" "$smoke/mu" --help >/dev/null
-          test -f "$smoke/cache/mu/builtins/customize-mu.md"
+          test -f "$smoke/cache/mu/builtins/config.md"
           for applet in apply_patch edit view_image; do
             test -L "$smoke/cache/mu/applets/$applet"
             test "$(readlink "$smoke/cache/mu/applets/$applet")" = "$smoke/mu"
