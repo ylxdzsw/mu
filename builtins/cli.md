@@ -116,11 +116,16 @@ as `current-session`.
 
 List recent sessions in the active scope. The default limit is 20.
 
-### `mu transcript [-s <id>] [-o <format>] [--html]`
+### `mu transcript [-s <id>] [-o <format>] [--epoch <n>] [--html]`
 
 Replay a persisted session without contacting a provider, defaulting to the
 last selected session and `detail` output. `--html` emits a browser-viewable
 xterm.js document whose pinned assets are loaded from jsDelivr when opened.
+The default replay includes synthetic compaction turns and their derived
+trigger/result lines; `final` omits those internals. `--epoch` limits replay to
+activity sent under one context-epoch cache key. A compaction request and its
+result remain in the old epoch; its checkpoint and continuation use the new
+epoch.
 
 ### `mu status [selection options] [--json] [--include-*]`
 
@@ -152,5 +157,9 @@ without a new user prompt. A clean session is a no-op.
 
 Force compaction for a session, defaulting to `current-session`. Non-terminal
 stdin is an optional custom focus instruction.
+
+Compaction itself is a persisted synthetic agent turn. If it is interrupted,
+that session rejects new prompts and another `mu compact`; use `mu retry` to
+finish the pending epoch transition.
 
 Turn options must not precede a management subcommand.

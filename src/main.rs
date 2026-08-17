@@ -40,7 +40,7 @@ use config::Config;
 use models::ResolvedModelChoice;
 use provider::build_provider;
 use provider::{ContentPart, UserContent};
-use renderer::Renderer;
+use renderer::{CompactionReport, Renderer};
 use runtime::{
     InvocationOverrides, StatusIncludes, StatusReport, build_status_report, resolve_invocation,
     resolve_retry_model_selection, resolve_session_model,
@@ -140,6 +140,10 @@ enum Command {
         /// Emit a browser-viewable xterm.js document
         #[arg(long)]
         html: bool,
+
+        /// Show only activity sent under one context epoch
+        #[arg(long)]
+        epoch: Option<u64>,
     },
     /// Inspect the resolved model and context state
     Status(StatusArgs),
@@ -252,7 +256,13 @@ struct RunTurnArgs<'a> {
     /// A short notice rendered before the turn (e.g. "resuming interrupted turn").
     preamble_notice: Option<&'a str>,
     model_fallback: Option<runtime::ModelFallback>,
-    compact_at_turn_boundary: bool,
+    mode: RunTurnMode<'a>,
+}
+
+enum RunTurnMode<'a> {
+    QueuedPrompt,
+    Resume,
+    ManualCompaction(Option<&'a str>),
 }
 
 fn main() {
@@ -476,7 +486,11 @@ fn replay_transcript(
                 cwd,
                 model,
                 context,
+                internal,
             } => {
+                if output == OutputFormat::Final && *internal {
+                    continue;
+                }
                 let context_percent = context.as_ref().and_then(|context| {
                     context_window(model.as_deref()?)
                         .filter(|window| *window > 0)
@@ -489,9 +503,13 @@ fn replay_transcript(
                 });
                 renderer.transcript_prompt(model.as_deref(), context_percent, cwd, text)?;
             }
-            store::TranscriptEvent::Assistant { turn_state, items } => {
+            store::TranscriptEvent::Assistant {
+                turn_state,
+                items,
+                internal,
+            } => {
                 if output == OutputFormat::Final {
-                    if turn_state == "complete" {
+                    if !internal && turn_state == "complete" {
                         let text = items
                             .iter()
                             .filter_map(|item| match item {
@@ -552,6 +570,42 @@ fn replay_transcript(
                         }
                         _ => {}
                     }
+                }
+            }
+            store::TranscriptEvent::CompactionTriggered {
+                trigger,
+                context_tokens,
+                context_window,
+                reason,
+            } => {
+                if output != OutputFormat::Final {
+                    renderer.compaction_trigger(
+                        *trigger,
+                        *context_tokens,
+                        *context_window,
+                        reason.as_deref(),
+                    )?;
+                }
+            }
+            store::TranscriptEvent::CompactionApplied {
+                from_epoch,
+                to_epoch,
+                before_context_tokens,
+                before_context_window,
+                after_context_tokens_estimate,
+                after_context_window,
+                elapsed_ms,
+            } => {
+                if output != OutputFormat::Final {
+                    renderer.transcript_compaction_result(&CompactionReport {
+                        from_epoch: *from_epoch,
+                        to_epoch: *to_epoch,
+                        before_context_tokens: *before_context_tokens,
+                        before_context_window: *before_context_window,
+                        after_context_tokens_estimate: *after_context_tokens_estimate,
+                        after_context_window: *after_context_window,
+                        elapsed: Duration::from_millis(*elapsed_ms),
+                    })?;
                 }
             }
         }
@@ -665,6 +719,7 @@ async fn run() -> Result<()> {
             session,
             output,
             html,
+            epoch,
         }) => {
             let store_path = scope.session_store_path();
             if !store_path.exists() {
@@ -675,7 +730,7 @@ async fn run() -> Result<()> {
             }
             let store = store::Store::open(&store_path)?;
             let session = resolve_session_or_current(&store, session.as_deref())?;
-            let events = store.transcript_events(&session.id)?;
+            let events = store.transcript_events_for_epoch(&session.id, epoch)?;
             let config = paths::global_dir()
                 .join("config.jsonc")
                 .exists()
@@ -801,7 +856,7 @@ async fn run() -> Result<()> {
             store.normalize_interrupted_tail(&session.id)?;
 
             // Nothing to resume on a session whose last turn already finished.
-            if store.is_session_clean(&session.id)? {
+            if store.is_session_clean(&session.id)? && store.queued_prompt(&session.id)?.is_none() {
                 if output != OutputFormat::Final {
                     println!("session is already complete; nothing to retry");
                 }
@@ -831,7 +886,7 @@ async fn run() -> Result<()> {
                 output,
                 preamble_notice: Some("[mu] resuming incomplete turn"),
                 model_fallback: selection.fallback,
-                compact_at_turn_boundary: false,
+                mode: RunTurnMode::Resume,
             })
             .await?;
 
@@ -850,37 +905,29 @@ async fn run() -> Result<()> {
             let store = store::Store::open(&store_path)?;
             let session_state = resolve_session_or_current(&store, session.as_deref())?;
             let session = session_state.id.clone();
-            let mut model = resolve_session_model(&store, &config, &session_state)?;
-            let mut provider = build_provider(&config, &model.active_model().provider_id)?;
+            let model = resolve_session_model(&store, &config, &session_state)?;
             let _lock = acquire_session_lock_or_exit(&store, &session, OutputFormat::Detail)?;
-            store.normalize_interrupted_tail(&session)?;
-            let mut renderer = Renderer::with_terminal_bell(OutputFormat::Detail, None);
-            let started = Instant::now();
-            let outcome = compaction::run_compaction_routed(
-                &store,
-                &config,
-                &session,
-                &mut model,
-                &mut provider,
-                custom_focus.as_deref(),
-                Some(&mut renderer),
-            )
-            .await?;
-            let model_info = models::resolve_model_info(&config, model.active_model());
-            match outcome {
-                compaction::CompactionOutcome::Applied {
-                    before_context_tokens,
-                    after_context_tokens_estimate,
-                } => renderer.compaction_result(
-                    before_context_tokens,
-                    after_context_tokens_estimate,
-                    model_info.context_window,
-                    started.elapsed(),
-                )?,
-                compaction::CompactionOutcome::Inapplicable { keep_recent_turns } => {
-                    renderer.compaction_inapplicable(keep_recent_turns)?
-                }
+            if store.pending_compaction(&session)?.is_some() {
+                bail!("session compaction is incomplete; run `mu retry -s {session}`")
             }
+            store.normalize_interrupted_tail(&session)?;
+            if !store.has_user_turn(&session)? {
+                Renderer::with_terminal_bell(OutputFormat::Detail, None)
+                    .notice("[mu] compaction inapplicable: session has no conversation history")?;
+                return Ok(());
+            }
+            store.select_session(&session)?;
+            run_turn(RunTurnArgs {
+                config: &config,
+                store: &store,
+                session_id: &session,
+                model,
+                output: OutputFormat::Detail,
+                preamble_notice: None,
+                model_fallback: None,
+                mode: RunTurnMode::ManualCompaction(custom_focus.as_deref()),
+            })
+            .await?;
             return Ok(());
         }
         None => {}
@@ -931,7 +978,6 @@ async fn run_turn_from_source(
 ) -> Result<()> {
     let loaded_prompt = load_prompt(prompt_source)?;
     let prompt = loaded_prompt.text;
-    let attachments = load_attachments(&turn.attachments)?;
 
     paths::ensure_project_layout(scope)?;
     let state_dir = scope.state_dir();
@@ -960,6 +1006,12 @@ async fn run_turn_from_source(
 
     let _lock = acquire_session_lock_or_exit(&store, &session_id, output)?;
 
+    if store.pending_compaction(&session_id)?.is_some() {
+        bail!("session compaction is incomplete; run `mu retry -s {session_id}`")
+    }
+
+    let attachments = load_attachments(&turn.attachments)?;
+
     // If the previous turn was interrupted, normalize its tail (synthesize
     // interrupted results for any dangling tool calls) so history is valid.
     // The new prompt then lands on top of that valid history — the user can
@@ -971,7 +1023,7 @@ async fn run_turn_from_source(
         .project()
         .and_then(|project| project.worktree.as_ref())
         .map(|worktree| worktree.root.display().to_string());
-    store.start_turn(
+    store.queue_prompt(
         &session_id,
         &cwd.display().to_string(),
         git_worktree_root.as_deref(),
@@ -989,7 +1041,7 @@ async fn run_turn_from_source(
         output,
         preamble_notice: None,
         model_fallback: resolved.model_fallback,
-        compact_at_turn_boundary: true,
+        mode: RunTurnMode::QueuedPrompt,
     })
     .await?;
 
@@ -1165,7 +1217,7 @@ async fn run_turn(args: RunTurnArgs<'_>) -> Result<()> {
         output,
         preamble_notice,
         model_fallback,
-        compact_at_turn_boundary,
+        mode,
     } = args;
     let active_model = model.active_model();
     let model_context_window = models::resolve_model_info(config, active_model).context_window;
@@ -1192,15 +1244,14 @@ async fn run_turn(args: RunTurnArgs<'_>) -> Result<()> {
         provider,
         store,
         session_id,
-        cache_key: Some(format!("mu:{session_id}:agent")),
         model_context_window,
         renderer: &mut renderer,
     };
 
-    let result = if compact_at_turn_boundary {
-        agent.run_turn().await
-    } else {
-        agent.resume_turn().await
+    let result = match mode {
+        RunTurnMode::QueuedPrompt => agent.run_queued_turn().await,
+        RunTurnMode::Resume => agent.resume_turn().await,
+        RunTurnMode::ManualCompaction(focus) => agent.run_manual_compaction(focus).await,
     };
 
     match &result {
@@ -1416,6 +1467,7 @@ mod tests {
                 session: Some(ref session),
                 output: OutputFormat::Full,
                 html: false,
+                epoch: None,
             }) if session == "ses_example"
         ));
 
@@ -1613,10 +1665,12 @@ mod tests {
                     tokens: 42,
                     estimated: true,
                 }),
+                internal: false,
             },
             store::TranscriptEvent::Assistant {
                 turn_state: "continue".into(),
                 items: vec![store::TranscriptAssistantItem::Text("Intermediate".into())],
+                internal: false,
             },
             store::TranscriptEvent::Assistant {
                 turn_state: "complete".into(),
@@ -1625,6 +1679,7 @@ mod tests {
                     store::TranscriptAssistantItem::Reasoning(None),
                     store::TranscriptAssistantItem::Text("answer".into()),
                 ],
+                internal: false,
             },
         ];
         let buffer = TranscriptBuffer::default();
@@ -1646,6 +1701,7 @@ mod tests {
             cwd: "/work".into(),
             model: None,
             context: None,
+            internal: false,
         }];
         let mut terminal = Vec::new();
         write_terminal_transcript_separator(&mut terminal, true, &events).unwrap();
@@ -1668,6 +1724,7 @@ mod tests {
                 cwd: "/work".into(),
                 model: Some("test/model".into()),
                 context: None,
+                internal: false,
             },
             store::TranscriptEvent::Assistant {
                 turn_state: "continue".into(),
@@ -1686,6 +1743,7 @@ mod tests {
                         }),
                     },
                 ],
+                internal: false,
             },
         ];
         for output in [OutputFormat::Detail, OutputFormat::Full] {

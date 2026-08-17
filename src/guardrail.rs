@@ -169,13 +169,9 @@ impl Guardrail {
         loop {
             attempt += 1;
             let request_model = model.active_model().clone();
-            let request = Request::for_session(
-                request_model.clone(),
-                session_id,
-                "guardrail",
-                msgs.clone(),
-                false,
-            );
+            let epoch = store.context_epoch(session_id)?;
+            let request =
+                Request::for_guardrail(request_model.clone(), session_id, epoch, msgs.clone());
             let native_request = request.json(provider.api())?;
             let recipe = store.request_recipe(
                 provider.api().request_format(),
@@ -185,6 +181,7 @@ impl Guardrail {
                     "call_id": bash_call_id,
                     "attempt": attempt,
                     "context_through_seq": store.current_context_seq(session_id)?,
+                    "context_epoch": epoch,
                     "policy_version": 1,
                 }),
             )?;

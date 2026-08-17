@@ -201,11 +201,14 @@ One normal turn follows this sequence:
 4. Take a nonblocking exclusive lock on that session journal. Concurrent use of
    the same session fails as `session busy`; different sessions remain
    independent.
-5. Normalize any interrupted journal tail.
-6. Append the submitted turn, its working directory, its Git worktree root, and
-   attachment references. Only then select it as `current-session`.
-7. Build semantic provider context and run the new-turn compaction check when
-   applicable.
+5. Reject the submission if that session has an unfinished compaction;
+   otherwise normalize any interrupted journal tail.
+6. Durably queue the submitted prompt, working directory, Git worktree root,
+   and attachment references. Only then select the session as
+   `current-session`.
+7. Build the candidate semantic provider context. If it exceeds the soft
+   threshold, complete an out-of-turn compaction before materializing the
+   queued prompt as a turn; otherwise materialize it immediately.
 8. Repeat the agent loop:
    - persist a reconstructible provider request before network contact;
    - stream and assemble one provider response;
@@ -819,16 +822,20 @@ risk repeating work.
 Context projection uses:
 
 - the persisted system prompt;
-- the latest committed compaction summary;
-- retained turn prompts and derived location reminders;
+- the latest committed session checkpoint;
+- turn prompts and derived location reminders after that checkpoint;
 - accepted assistant items;
 - Bash results.
 
 Provider failures and partial native responses remain audit-only.
 
 `mu transcript` is a semantic session transcript, not a dump of the journal.
-It includes user prompts, assistant text, and paired Bash calls/results, while
-omitting system prompts, compaction internals, provider payloads, and metadata.
+It includes user prompts, assistant text, paired Bash calls/results, and
+derived compaction trigger/result lines. The default transcript also replays
+the ordinary synthetic compaction turns, including their prompts and any tool
+activity. `--epoch N` limits replay to provider activity in one context epoch.
+`final` output omits compaction turns and status lines. All formats omit system
+prompts, provider payloads, and journal metadata.
 Only open Chat reasoning is displayable, and only in `full`; opaque Responses
 and Anthropic reasoning remains omitted. Stored redaction is authoritative.
 
@@ -854,35 +861,72 @@ bounded nonzero estimate. Mu does not ship a tokenizer.
 Setting `compaction.enabled:false` disables every automatic compaction tier.
 Manual `mu compact` remains available.
 
-Automatic context management has three tiers:
+Automatic context management has three triggers:
 
 1. **Soft new-turn threshold.** Before a new turn's first provider request,
    compact when context is strictly above
    `floor(context_window * soft_fraction)`.
-2. **Hard request threshold.** Before a changed semantic agent request, compact
-   when context is strictly above the lower of the configured hard fraction and
-   configured headroom boundary.
-3. **Reactive overflow.** On a classified provider context-length error,
-   compact once and retry when recovery is enabled and useful.
+2. **Hard tool-result threshold.** After every concurrently issued Bash call
+   has reached a result, and before sending those results back to the model,
+   compact when context is strictly above the lower of the configured hard
+   fraction and configured headroom boundary.
+3. **Emergency overflow.** A classified provider context-length error starts
+   emergency compaction. A context-length error during soft or hard compaction
+   upgrades that attempt to emergency; the same error during emergency
+   compaction is fatal.
 
-An unchanged retry of the same provider request does not repeatedly compact.
-Provider advancement returns through the hard-threshold gate because context
-windows may differ.
+Compaction is an ordinary synthetic turn in the current context. Its request
+uses the same model context, native replay, Bash tool, guardrail, streaming,
+fallback, persistence, and retry machinery as any other agent request. Mu asks
+for a plain Markdown checkpoint, accepts the final assistant text without
+parsing section syntax, and then appends a structured `compaction_applied`
+event containing the complete summary. The event advances the session context
+epoch and projects only the original system prompt plus:
 
-Compaction:
+```xml
+<session_checkpoint mode="await_user|continue_turn" epoch="N">
+...
+</session_checkpoint>
+```
 
-- cuts only before whole turns;
-- keeps the smallest suffix containing at least five user/Bash requests;
-- summarizes only history before that cut;
-- uses a compaction-specific prompt rather than the session system prompt;
-- preserves semantic item order while omitting opaque reasoning;
-- retains images and uses protocol-appropriate handling for unsupported audio;
-- appends a summary projection without deleting earlier audit events;
-- rejects an empty summary or candidate context still above the soft target.
+Out-of-turn compaction uses `await_user`, then materializes the previously
+queued prompt. In-turn compaction uses `continue_turn`; its requested summary
+ends with an `Immediate next step` section and the agent loop continues
+immediately from the checkpoint. Manual compaction chooses the mode from
+whether the selected session is clean, and optional non-terminal stdin becomes
+an additional focus instruction.
 
-Manual compaction accepts an optional focus instruction but must still preserve
-all material needed to continue correctly. A failed or inapplicable compaction
-does not replace the prior summary boundary.
+The displayed and persisted “before” size is the estimated provider input that
+triggered compaction; for a soft trigger it therefore includes the queued
+prompt. The “after” estimate is the immediate next provider input. Automatic
+`await_user` compaction includes the queued prompt because Mu materializes it
+immediately, while `continue_turn` measures the checkpoint continuation.
+
+Every provider request uses cache key `mu:<session>:epoch:<N>`. The compaction
+request remains in the old epoch; only a successfully applied checkpoint
+advances the epoch. Once a compaction turn is durable, new prompts and another
+manual compaction for that session are rejected until `/retry` completes it.
+If the final summary was durable but the applied event was not, `/retry`
+commits that existing summary without contacting the provider again.
+
+Epoch-filtered transcripts place a compaction request, its streamed activity,
+and its result in `from_epoch`, matching the cache key used for that request.
+The checkpoint and subsequent provider activity appear in `to_epoch`.
+
+Emergency compaction makes a request-only projection that replaces oldest Bash
+results first with `[Bash output unavailable during emergency compaction.]`
+and removes their attachments until the estimated reduction reaches the
+configured hard headroom.
+Calls, arguments, stdin, and journal data are unchanged. The applied event
+records the elided durable call IDs. If pruning every Bash result is
+insufficient, Mu still makes one emergency request; a context-length error from
+that request is fatal.
+
+The summary request output limit is capped by the configured hard headroom.
+Mu rejects an empty summary, but it does not apply a post-compaction soft-limit
+test. A failed compaction leaves its ordinary turn and provider records
+available for `/retry` and does not advance the epoch. Manual compaction of a
+session with no conversation history is inapplicable.
 
 ### 11.6 Bounds and exit status
 

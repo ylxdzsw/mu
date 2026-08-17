@@ -433,6 +433,9 @@ impl Config {
         if self.guardrail.timeout_seconds == 0 {
             bail!("`guardrail.timeout_seconds` must be greater than zero");
         }
+        if self.compaction.hard_headroom_tokens == 0 {
+            bail!("`compaction.hard_headroom_tokens` must be greater than zero");
+        }
         for (provider_id, provider) in &self.providers {
             if provider.endpoint.trim().is_empty() {
                 bail!(
@@ -807,6 +810,22 @@ mod tests {
             .to_string();
             assert!(error.contains("must be greater than zero"), "{error}");
         }
+    }
+
+    #[test]
+    fn compaction_headroom_must_be_positive() {
+        let error = config_from_value(serde_json::json!({
+            "providers": {
+                "openai": {
+                    "endpoint": "http://localhost/chat/completions",
+                    "models": {"gpt-4o": {"context_window": 128000}}
+                }
+            },
+            "compaction": {"hard_headroom_tokens": 0},
+        }))
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("must be greater than zero"), "{error}");
     }
 
     #[test]

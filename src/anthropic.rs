@@ -154,7 +154,7 @@ pub(crate) fn build_request_body(
         "messages": wire_messages,
         "tools": anthropic_tools,
         "stream": true,
-        "max_tokens": MAX_OUTPUT_TOKENS,
+        "max_tokens": request.max_output_tokens.unwrap_or(MAX_OUTPUT_TOKENS),
         "thinking": {
             "type": "adaptive",
             "display": "summarized",
@@ -666,6 +666,7 @@ mod tests {
                 effort: effort.map(str::to_owned),
             },
             cache_key: None,
+            max_output_tokens: None,
             messages,
             bash,
         }

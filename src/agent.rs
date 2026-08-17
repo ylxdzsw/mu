@@ -1,6 +1,7 @@
 use std::time::{Duration, Instant};
 
 use anyhow::{Result, bail};
+use chrono::{DateTime, Utc};
 use serde_json::Value;
 use tokio::time::sleep;
 use unicode_segmentation::UnicodeSegmentation;
@@ -17,9 +18,12 @@ use crate::provider::{
     ProviderError, Request, StreamEvent, ToolCall, ToolCallDelta, Usage, advance_provider,
     effective_retry_delay, provider_retry_limit,
 };
-use crate::renderer::Renderer;
+use crate::renderer::{CompactionReport, Renderer};
 use crate::runtime::resume_session_fallback;
-use crate::store::{BashResultRecord, ProviderOrigin, RESUME_PROMPT, Store};
+use crate::store::{
+    BashResultRecord, CompactionApplication, CompactionMode, CompactionStart, CompactionTrigger,
+    PendingCompaction, ProviderOrigin, RESUME_PROMPT, Store,
+};
 use bash::RunningBash;
 
 #[derive(Debug)]
@@ -54,6 +58,20 @@ pub struct TurnResult {
     pub context_tokens: u64,
     pub context_window: Option<u64>,
     pub final_assistant: Option<String>,
+    pub awaiting_user: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NextRequest {
+    User,
+    ToolResults,
+    Continue,
+}
+
+struct ActiveCompaction {
+    pending: PendingCompaction,
+    emergency: bool,
+    elided_provider_call_ids: Vec<String>,
 }
 
 struct ConcurrentBashExecution<'a> {
@@ -96,54 +114,126 @@ pub struct AgentLoop<'a> {
     pub provider: Box<dyn Provider>,
     pub store: &'a Store,
     pub session_id: &'a str,
-    pub cache_key: Option<String>,
     pub model_context_window: Option<u64>,
     pub renderer: &'a mut Renderer,
 }
 
 impl<'a> AgentLoop<'a> {
+    #[cfg(test)]
     pub async fn run_turn(&mut self) -> Result<TurnResult> {
-        self.run_turn_inner(&mut String::new(), true).await
+        self.run_turn_inner(&mut String::new(), NextRequest::User)
+            .await
+    }
+
+    pub async fn run_queued_turn(&mut self) -> Result<TurnResult> {
+        let mut compaction_usage = Usage::default();
+        let queued = self
+            .store
+            .queued_prompt(self.session_id)?
+            .ok_or_else(|| anyhow::anyhow!("session has no queued prompt"))?;
+        let context = self.load_context()?;
+        let candidate_tokens = context
+            .iter()
+            .map(Message::approx_tokens)
+            .sum::<u64>()
+            .saturating_add(
+                Message::User {
+                    content: queued.content.clone(),
+                }
+                .approx_tokens(),
+            );
+        if queued.epoch == self.store.context_epoch(self.session_id)?
+            && compaction::should_compact(
+                self.config,
+                CompactionTrigger::Soft,
+                candidate_tokens,
+                self.model_context_window,
+            )
+        {
+            self.begin_compaction(
+                CompactionTrigger::Soft,
+                CompactionMode::AwaitUser,
+                candidate_tokens,
+                None,
+            )?;
+            let compacted = self
+                .run_turn_inner(&mut String::new(), NextRequest::User)
+                .await?;
+            if !compacted.awaiting_user {
+                return Ok(compacted);
+            }
+            compaction_usage = compacted.usage;
+        }
+        self.store
+            .materialize_queued_prompt(self.session_id)?
+            .ok_or_else(|| anyhow::anyhow!("queued prompt disappeared"))?;
+        let mut result = self
+            .run_turn_inner(&mut String::new(), NextRequest::User)
+            .await?;
+        merge_usage(&mut result.usage, &compaction_usage);
+        Ok(result)
     }
 
     pub async fn resume_turn(&mut self) -> Result<TurnResult> {
-        self.run_turn_inner(&mut String::new(), false).await
+        if let Some(pending) = self.store.pending_compaction(self.session_id)? {
+            let compacted = if let Some(summary) = self
+                .store
+                .pending_compaction_summary(self.session_id, &pending.turn_id)?
+            {
+                let state = self.active_compaction(pending)?;
+                let mode = state.pending.mode;
+                self.finish_compaction(&state, &summary)?;
+                TurnResult {
+                    usage: Usage::default(),
+                    context_tokens: self.current_context_tokens()?,
+                    context_window: self.model_context_window,
+                    final_assistant: Some(summary),
+                    awaiting_user: mode == CompactionMode::AwaitUser,
+                }
+            } else {
+                self.run_turn_inner(&mut String::new(), NextRequest::Continue)
+                    .await?
+            };
+            if !compacted.awaiting_user {
+                return Ok(compacted);
+            }
+            if self.store.queued_prompt(self.session_id)?.is_none() {
+                return Ok(compacted);
+            }
+        }
+        if self.store.queued_prompt(self.session_id)?.is_some() {
+            return self.run_queued_turn().await;
+        }
+        self.run_turn_inner(&mut String::new(), NextRequest::Continue)
+            .await
+    }
+
+    pub async fn run_manual_compaction(&mut self, focus: Option<&str>) -> Result<TurnResult> {
+        if self.store.pending_compaction(self.session_id)?.is_some() {
+            bail!(
+                "session compaction is incomplete; run `mu retry -s {}`",
+                self.session_id
+            )
+        }
+        let clean = self.store.is_session_clean(self.session_id)?;
+        let mode = if clean {
+            CompactionMode::AwaitUser
+        } else {
+            CompactionMode::ContinueTurn
+        };
+        let before = self.current_context_tokens()?;
+        self.begin_compaction(CompactionTrigger::Manual, mode, before, focus)?;
+        self.run_turn_inner(&mut String::new(), NextRequest::Continue)
+            .await
     }
 
     async fn run_turn_inner(
         &mut self,
         current_partial_output: &mut String,
-        compact_at_turn_boundary: bool,
+        mut next_request: NextRequest,
     ) -> Result<TurnResult> {
         bash::reset_cancellation_state();
         bash::install_signal_forwarder();
-        let provider_before_compaction = self.model.active_model().provider_id.clone();
-        let pre_turn_compaction = if compact_at_turn_boundary && self.config.compaction.enabled {
-            let started = Instant::now();
-            compaction::maybe_compact_routed(
-                self.store,
-                self.config,
-                self.session_id,
-                &mut self.model,
-                &mut self.provider,
-                self.model_context_window,
-                compaction::CompactionThreshold::Soft,
-                self.renderer,
-            )
-            .await?
-            .map(|outcome| (outcome, started))
-        } else {
-            None
-        };
-        if self.model.active_model().provider_id != provider_before_compaction {
-            self.update_model_context_window();
-        }
-        let mut latest_compaction_since_change = None;
-        if let Some((outcome, started)) = pre_turn_compaction {
-            self.report_compaction(outcome, started)?;
-            latest_compaction_since_change = Some(outcome);
-        }
-
         let mut guardrail = if self.config.guardrail.enabled {
             Some(Guardrail::new(self.config, self.model.active_model()))
         } else {
@@ -151,45 +241,52 @@ impl<'a> AgentLoop<'a> {
         };
 
         let mut context = self.load_context()?;
+        let mut active_compaction =
+            self.store
+                .pending_compaction(self.session_id)?
+                .map(|pending| ActiveCompaction {
+                    emergency: self.compaction_is_emergency(&pending),
+                    pending,
+                    elided_provider_call_ids: Vec::new(),
+                });
 
         let max_iter = self.config.limits.max_iterations;
 
         let mut total_usage = Usage::default();
         let mut context_tokens = 0;
         let mut final_assistant = None;
+        let mut awaiting_user = false;
 
         let mut iteration = 0;
         let mut live_provider_retries = 0;
         while iteration < max_iter {
             let (exchange_id, stream_result, mut command_headers) = 'request_gate: loop {
-                if self.config.compaction.enabled && latest_compaction_since_change.is_none() {
-                    let started = Instant::now();
-                    let provider_before_compaction = self.model.active_model().provider_id.clone();
-                    let outcome = compaction::maybe_compact_routed(
-                        self.store,
+                if active_compaction.is_none()
+                    && next_request == NextRequest::ToolResults
+                    && compaction::should_compact(
                         self.config,
-                        self.session_id,
-                        &mut self.model,
-                        &mut self.provider,
+                        CompactionTrigger::Hard,
+                        self.current_context_tokens()?,
                         self.model_context_window,
-                        compaction::CompactionThreshold::Hard,
-                        self.renderer,
                     )
-                    .await?;
-                    if self.model.active_model().provider_id != provider_before_compaction {
-                        self.update_model_context_window();
-                    }
-                    if let Some(outcome) = outcome {
-                        self.report_compaction(outcome, started)?;
-                        context = self.load_context()?;
-                        latest_compaction_since_change = Some(outcome);
-                    }
-                    if matches!(
-                        latest_compaction_since_change,
-                        Some(compaction::CompactionOutcome::Applied { .. })
-                    ) {
-                        continue 'request_gate;
-                    }
+                {
+                    let before = self.current_context_tokens()?;
+                    self.begin_compaction(
+                        CompactionTrigger::Hard,
+                        CompactionMode::ContinueTurn,
+                        before,
+                        None,
+                    )?;
+                    active_compaction =
+                        self.store
+                            .pending_compaction(self.session_id)?
+                            .map(|pending| ActiveCompaction {
+                                pending,
+                                emergency: false,
+                                elided_provider_call_ids: Vec::new(),
+                            });
+                    context = self.load_context()?;
+                    next_request = NextRequest::User;
                 }
 
                 let mut command_headers = StreamingCommandHeaders::default();
@@ -201,11 +298,29 @@ impl<'a> AgentLoop<'a> {
                         self.model.active_model(),
                         self.provider.api(),
                     );
+                    let (request_context, elided_provider_call_ids) = if active_compaction
+                        .as_ref()
+                        .is_some_and(|state| state.emergency)
+                    {
+                        compaction::emergency_projection(
+                            &request_context,
+                            self.config.compaction.hard_headroom_tokens,
+                        )
+                    } else {
+                        (request_context, Vec::new())
+                    };
+                    if let Some(state) = active_compaction.as_mut() {
+                        state.elided_provider_call_ids = elided_provider_call_ids;
+                    }
+                    let epoch = self.store.context_epoch(self.session_id)?;
                     let request = Request {
                         model: self.model.active_model().clone(),
-                        cache_key: self.cache_key.clone(),
+                        cache_key: Some(format!("mu:{}:epoch:{epoch}", self.session_id)),
                         messages: request_context,
                         bash: true,
+                        max_output_tokens: active_compaction
+                            .as_ref()
+                            .map(|_| self.config.compaction.hard_headroom_tokens),
                     };
                     let native_request = request.json(self.provider.api())?;
                     let recipe = self.store.request_recipe(
@@ -216,6 +331,18 @@ impl<'a> AgentLoop<'a> {
                             "context_through_seq": self.store.current_context_seq(self.session_id)?,
                             "native_replay_origins":
                                 crate::provider::native_replay_origins(&request.messages),
+                            "context_epoch": epoch,
+                            "compaction_attempt": active_compaction.as_ref().map(|state| {
+                                if state.emergency {
+                                    "emergency"
+                                } else {
+                                    state.pending.trigger.as_str()
+                                }
+                            }),
+                            "emergency_elided_provider_call_ids": active_compaction
+                                .as_ref()
+                                .map(|state| state.elided_provider_call_ids.as_slice())
+                                .unwrap_or_default(),
                         }),
                     )?;
                     let exchange_id = self.store.start_provider_request(
@@ -319,52 +446,40 @@ impl<'a> AgentLoop<'a> {
                                 None,
                             )?;
                             current_partial_output.clear();
-                            if !self.config.compaction.enabled {
+                            if !self.config.compaction.enabled && active_compaction.is_none() {
                                 return Err(error.into());
                             }
-                            match latest_compaction_since_change {
-                                None => {
-                                    let started = Instant::now();
-                                    let provider_before_compaction =
-                                        self.model.active_model().provider_id.clone();
-                                    let outcome = compaction::run_compaction_routed(
-                                        self.store,
-                                        self.config,
-                                        self.session_id,
-                                        &mut self.model,
-                                        &mut self.provider,
-                                        None,
-                                        Some(self.renderer),
-                                    )
-                                    .await?;
-                                    if self.model.active_model().provider_id
-                                        != provider_before_compaction
-                                    {
-                                        self.update_model_context_window();
-                                    }
-                                    self.report_compaction(outcome, started)?;
-                                    context = self.load_context()?;
-                                    match outcome {
-                                        compaction::CompactionOutcome::Applied { .. } => {
-                                            latest_compaction_since_change = Some(outcome);
-                                            continue 'request_gate;
-                                        }
-                                        compaction::CompactionOutcome::Inapplicable { .. } => {
-                                            bail!(
-                                                "context length exceeded and no history can be compacted"
-                                            );
-                                        }
-                                    }
+                            if let Some(state) = active_compaction.as_mut() {
+                                if state.emergency {
+                                    bail!("context length exceeded during emergency compaction");
                                 }
-                                Some(compaction::CompactionOutcome::Inapplicable { .. }) => {
-                                    bail!(
-                                        "context length exceeded and no history can be compacted"
-                                    );
-                                }
-                                Some(compaction::CompactionOutcome::Applied { .. }) => {
-                                    bail!("context length exceeded immediately after compaction");
-                                }
+                                state.emergency = true;
+                                self.renderer.compaction_trigger(
+                                    CompactionTrigger::Emergency,
+                                    state.pending.before_context_tokens,
+                                    state.pending.before_context_window,
+                                    Some("compaction request exceeded provider context"),
+                                )?;
+                                continue 'request_gate;
                             }
+                            let before = self.current_context_tokens()?;
+                            self.begin_compaction(
+                                CompactionTrigger::Emergency,
+                                CompactionMode::ContinueTurn,
+                                before,
+                                None,
+                            )?;
+                            active_compaction = self
+                                .store
+                                .pending_compaction(self.session_id)?
+                                .map(|pending| ActiveCompaction {
+                                    pending,
+                                    emergency: true,
+                                    elided_provider_call_ids: Vec::new(),
+                                });
+                            context = self.load_context()?;
+                            next_request = NextRequest::User;
+                            continue 'request_gate;
                         }
                         Err(error)
                             if error.disposition() == ProviderDisposition::Retry
@@ -482,14 +597,38 @@ impl<'a> AgentLoop<'a> {
             };
             current_partial_output.clear();
             context.push(accepted_message.clone());
-            latest_compaction_since_change = None;
 
             match stream_result.finish_reason {
                 FinishReason::Stop => {
-                    final_assistant = accepted_message.assistant_text();
-                    break;
+                    if let Some(state) = active_compaction.take() {
+                        let summary = accepted_message
+                            .assistant_text()
+                            .filter(|summary| !summary.trim().is_empty())
+                            .ok_or_else(|| {
+                                anyhow::anyhow!(
+                                    "compaction ended without a nonempty assistant summary"
+                                )
+                            })?;
+                        let mode = state.pending.mode;
+                        self.finish_compaction(&state, &summary)?;
+                        context = self.load_context()?;
+                        live_provider_retries = 0;
+                        iteration = 0;
+                        if mode == CompactionMode::AwaitUser {
+                            awaiting_user = true;
+                            break;
+                        }
+                        next_request = NextRequest::Continue;
+                        continue;
+                    } else {
+                        final_assistant = accepted_message.assistant_text();
+                        break;
+                    }
                 }
                 FinishReason::Resume if !resumable => {
+                    if active_compaction.is_some() {
+                        bail!("compaction response ended before producing a final summary");
+                    }
                     final_assistant = accepted_message.assistant_text();
                     break;
                 }
@@ -509,6 +648,7 @@ impl<'a> AgentLoop<'a> {
                     self.renderer
                         .turn_auto_resume(live_provider_retries as u64, retry_limit as u64)?;
                     context.push(resume_message());
+                    next_request = NextRequest::Continue;
                     continue;
                 }
                 FinishReason::ToolCalls => {
@@ -697,8 +837,12 @@ impl<'a> AgentLoop<'a> {
                         }
                         cursor = end;
                     }
+                    next_request = NextRequest::ToolResults;
                 }
                 FinishReason::Other(reason) => {
+                    if active_compaction.is_some() {
+                        bail!("compaction stopped before a final summary: {reason}");
+                    }
                     final_assistant = accepted_message.assistant_text();
                     self.renderer
                         .notice(&format!("[mu] stopped: finish_reason={reason}"))?;
@@ -720,6 +864,7 @@ impl<'a> AgentLoop<'a> {
             context_tokens,
             context_window: self.model_context_window,
             final_assistant,
+            awaiting_user,
         })
     }
 
@@ -740,23 +885,139 @@ impl<'a> AgentLoop<'a> {
             resolve_model_info(self.config, self.model.active_model()).context_window;
     }
 
-    fn report_compaction(
+    fn current_context_tokens(&self) -> Result<u64> {
+        Ok(self
+            .store
+            .context_tokens(
+                self.session_id,
+                self.config,
+                self.model.active_model(),
+                self.provider.api(),
+            )?
+            .tokens)
+    }
+
+    fn begin_compaction(
         &mut self,
-        outcome: compaction::CompactionOutcome,
-        started: Instant,
+        trigger: CompactionTrigger,
+        mode: CompactionMode,
+        before_context_tokens: u64,
+        focus: Option<&str>,
     ) -> Result<()> {
-        if let compaction::CompactionOutcome::Applied {
-            before_context_tokens,
-            after_context_tokens_estimate,
-        } = outcome
-        {
-            self.renderer.compaction_result(
-                before_context_tokens,
-                after_context_tokens_estimate,
-                self.model_context_window,
-                started.elapsed(),
-            )?;
+        if self.store.pending_compaction(self.session_id)?.is_some() {
+            bail!(
+                "cannot begin compaction while session compaction is incomplete: {}",
+                self.session_id
+            )
         }
+        let cwd = self
+            .store
+            .get_session(self.session_id)?
+            .ok_or_else(|| anyhow::anyhow!("session not found: {}", self.session_id))?
+            .cwd;
+        self.store.start_compaction_turn(
+            self.session_id,
+            CompactionStart {
+                cwd: &cwd,
+                prompt: &compaction::compaction_prompt(mode, focus),
+                trigger,
+                mode,
+                before_context_tokens,
+                before_context_window: self.model_context_window,
+            },
+        )?;
+        self.renderer.compaction_trigger(
+            trigger,
+            before_context_tokens,
+            self.model_context_window,
+            None,
+        )?;
+        Ok(())
+    }
+
+    fn compaction_is_emergency(&self, pending: &PendingCompaction) -> bool {
+        pending.trigger == CompactionTrigger::Emergency
+            || self
+                .store
+                .pending_compaction_is_emergency(self.session_id, &pending.turn_id)
+                .unwrap_or(false)
+    }
+
+    fn active_compaction(&self, pending: PendingCompaction) -> Result<ActiveCompaction> {
+        let emergency = self.compaction_is_emergency(&pending);
+        let elided_provider_call_ids = if emergency {
+            let context = self.load_context()?;
+            compaction::emergency_projection(&context, self.config.compaction.hard_headroom_tokens)
+                .1
+        } else {
+            Vec::new()
+        };
+        Ok(ActiveCompaction {
+            pending,
+            emergency,
+            elided_provider_call_ids,
+        })
+    }
+
+    fn finish_compaction(&mut self, state: &ActiveCompaction, summary: &str) -> Result<()> {
+        let to_epoch = state.pending.from_epoch.saturating_add(1);
+        let checkpoint = compaction::checkpoint(summary, state.pending.mode, to_epoch);
+        let mut projected = self.store.load_context_messages(self.session_id)?;
+        let system = projected
+            .drain(..1)
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("compaction context has no system message"))?;
+        let mut next_context = vec![
+            system,
+            Message::User {
+                content: checkpoint.clone().into(),
+            },
+        ];
+        if state.pending.mode == CompactionMode::AwaitUser
+            && let Some(queued) = self.store.queued_prompt(self.session_id)?
+        {
+            next_context.push(Message::User {
+                content: queued.content,
+            });
+        }
+        let after_context_tokens_estimate =
+            next_context.iter().map(Message::approx_tokens).sum::<u64>();
+        let elapsed = DateTime::parse_from_rfc3339(&state.pending.started_at)
+            .ok()
+            .and_then(|started| (Utc::now() - started.with_timezone(&Utc)).to_std().ok())
+            .unwrap_or_default();
+        let elided_call_ids = self
+            .store
+            .call_ids_for_provider_call_ids(self.session_id, &state.elided_provider_call_ids)?;
+        let new_epoch = self.store.apply_compaction(
+            self.session_id,
+            CompactionApplication {
+                source_turn_id: &state.pending.turn_id,
+                trigger: if state.emergency {
+                    CompactionTrigger::Emergency
+                } else {
+                    state.pending.trigger
+                },
+                mode: state.pending.mode,
+                summary,
+                checkpoint: &checkpoint,
+                before_context_tokens: state.pending.before_context_tokens,
+                before_context_window: state.pending.before_context_window,
+                after_context_tokens_estimate,
+                after_context_window: self.model_context_window,
+                elapsed_ms: elapsed.as_millis().min(u128::from(u64::MAX)) as u64,
+                emergency_elided_call_ids: &elided_call_ids,
+            },
+        )?;
+        self.renderer.compaction_result(&CompactionReport {
+            from_epoch: state.pending.from_epoch,
+            to_epoch: new_epoch,
+            before_context_tokens: state.pending.before_context_tokens,
+            before_context_window: state.pending.before_context_window,
+            after_context_tokens_estimate,
+            after_context_window: self.model_context_window,
+            elapsed,
+        })?;
         Ok(())
     }
 
@@ -945,6 +1206,22 @@ impl<'a> AgentLoop<'a> {
 
 fn partial_response(text: &str) -> Option<Value> {
     (!text.is_empty()).then(|| serde_json::json!({"output_text":text}))
+}
+
+fn merge_usage(total: &mut Usage, addition: &Usage) {
+    total.input_tokens = total.input_tokens.saturating_add(addition.input_tokens);
+    total.cache_read_input_tokens = total
+        .cache_read_input_tokens
+        .saturating_add(addition.cache_read_input_tokens);
+    if let Some(cache_write_tokens) = addition.cache_write_input_tokens {
+        let current = total.cache_write_input_tokens.unwrap_or_default();
+        total.cache_write_input_tokens = Some(current.saturating_add(cache_write_tokens));
+    }
+    total.output_tokens = total.output_tokens.saturating_add(addition.output_tokens);
+    total.reasoning_output_tokens = total
+        .reasoning_output_tokens
+        .saturating_add(addition.reasoning_output_tokens);
+    total.total_tokens = total.total_tokens.saturating_add(addition.total_tokens);
 }
 
 fn resume_message() -> Message {
@@ -1986,7 +2263,6 @@ mod tests {
             provider,
             store: &store,
             session_id: &session.id,
-            cache_key: None,
             model_context_window: None,
             renderer: &mut renderer,
         };
@@ -2057,7 +2333,6 @@ mod tests {
             provider,
             store: &store,
             session_id: &session.id,
-            cache_key: None,
             model_context_window: None,
             renderer: &mut renderer,
         };
@@ -2116,7 +2391,6 @@ mod tests {
             provider,
             store: &store,
             session_id: &session.id,
-            cache_key: None,
             model_context_window: None,
             renderer: &mut renderer,
         };
@@ -2159,7 +2433,6 @@ mod tests {
             provider,
             store: &store,
             session_id: &session.id,
-            cache_key: None,
             model_context_window: None,
             renderer: &mut renderer,
         };
@@ -2194,7 +2467,6 @@ mod tests {
             provider,
             store: &store,
             session_id: &session.id,
-            cache_key: None,
             model_context_window: None,
             renderer: &mut renderer,
         };
@@ -2261,7 +2533,6 @@ mod tests {
             provider,
             store: &store,
             session_id: &session.id,
-            cache_key: None,
             model_context_window: None,
             renderer: &mut renderer,
         };
@@ -2316,7 +2587,6 @@ mod tests {
             }),
             store: &store,
             session_id: &session.id,
-            cache_key: None,
             model_context_window: None,
             renderer: &mut renderer,
         };
@@ -2329,9 +2599,9 @@ mod tests {
         assert!(
             error
                 .to_string()
-                .contains("context length exceeded immediately after compaction")
+                .contains("context length exceeded during emergency compaction")
         );
-        assert_eq!(*counts.lock().unwrap(), (2, 1));
+        assert_eq!(*counts.lock().unwrap(), (2, 0));
     }
 
     #[tokio::test]
@@ -2375,7 +2645,6 @@ mod tests {
             }),
             store: &store,
             session_id: &session.id,
-            cache_key: None,
             model_context_window: None,
             renderer: &mut renderer,
         };
@@ -2424,7 +2693,6 @@ mod tests {
             provider: Box::new(PartialFailureProvider),
             store: &store,
             session_id: &session.id,
-            cache_key: None,
             model_context_window: None,
             renderer: &mut renderer,
         };
@@ -2491,7 +2759,6 @@ mod tests {
             provider,
             store: &store,
             session_id: &session.id,
-            cache_key: None,
             model_context_window: None,
             renderer: &mut renderer,
         };
@@ -2557,7 +2824,6 @@ mod tests {
             provider,
             store: &store,
             session_id: &session.id,
-            cache_key: None,
             model_context_window: None,
             renderer: &mut renderer,
         };
@@ -2608,8 +2874,7 @@ mod tests {
                 matches!(
                     message,
                     Message::User { content }
-                        if content.text().contains("Summarize this conversation")
-                            || content.text().contains("Update this conversation summary")
+                        if content.text().contains("We are replacing the current model context")
                 )
             });
             Ok(StreamResult {
@@ -2631,6 +2896,50 @@ mod tests {
         }
     }
 
+    #[test]
+    fn begin_compaction_rejects_an_existing_pending_compaction() {
+        let store = Store::open_memory().unwrap();
+        let session = store.create_session_seeded("system").unwrap();
+        let config = test_config();
+        let request_model = crate::models::resolve_model_ref(&config, "test/fake-model").unwrap();
+        store
+            .start_compaction_turn(
+                &session.id,
+                CompactionStart {
+                    cwd: "/tmp",
+                    prompt: &"checkpoint".into(),
+                    trigger: CompactionTrigger::Manual,
+                    mode: CompactionMode::AwaitUser,
+                    before_context_tokens: 10,
+                    before_context_window: Some(100),
+                },
+            )
+            .unwrap();
+        let mut renderer = Renderer::with_format(OutputFormat::Final);
+        let mut agent = AgentLoop {
+            config: &config,
+            model: ResolvedModelChoice::fixed(request_model),
+            provider: Box::new(BoundaryCompactionProvider),
+            store: &store,
+            session_id: &session.id,
+            model_context_window: Some(100),
+            renderer: &mut renderer,
+        };
+
+        assert!(
+            agent
+                .begin_compaction(
+                    CompactionTrigger::Hard,
+                    CompactionMode::ContinueTurn,
+                    90,
+                    None,
+                )
+                .unwrap_err()
+                .to_string()
+                .contains("compaction is incomplete")
+        );
+    }
+
     #[async_trait(?Send)]
     impl Provider for GrowThenStopProvider {
         async fn stream(
@@ -2641,8 +2950,7 @@ mod tests {
             let is_summarize = request.messages.iter().any(|message| match message {
                 Message::User { content } => {
                     let text = content.text();
-                    text.contains("Summarize this conversation")
-                        || text.contains("Update this conversation summary")
+                    text.contains("We are replacing the current model context")
                 }
                 _ => false,
             });
@@ -2780,7 +3088,6 @@ mod tests {
             provider,
             store: &store,
             session_id: &session.id,
-            cache_key: None,
             // At 200K, the hard threshold is 152K tokens. The ~620KB tool result
             // pushes the anchored estimate past it while the test's 80% soft
             // target still accepts the retained current turn.
@@ -2849,11 +3156,19 @@ mod tests {
             provider: Box::new(BoundaryCompactionProvider),
             store: &store,
             session_id: &new_turn_session.id,
-            cache_key: None,
             model_context_window: Some(200_000),
             renderer: &mut renderer,
         };
-        new_turn_agent.run_turn().await.unwrap();
+        new_turn_agent
+            .store
+            .queue_prompt(
+                &new_turn_session.id,
+                "/tmp",
+                None,
+                &UserContent::Text("new request".into()),
+            )
+            .unwrap();
+        new_turn_agent.run_queued_turn().await.unwrap();
         assert!(
             store
                 .latest_summary_sequence(&new_turn_session.id)
@@ -2870,7 +3185,6 @@ mod tests {
             provider: Box::new(BoundaryCompactionProvider),
             store: &store,
             session_id: &retry_session.id,
-            cache_key: None,
             model_context_window: Some(200_000),
             renderer: &mut renderer,
         };
@@ -2972,7 +3286,6 @@ mod tests {
             provider,
             store: &store,
             session_id: &session.id,
-            cache_key: None,
             model_context_window: None,
             renderer: &mut renderer,
         };
@@ -3062,7 +3375,6 @@ mod tests {
             provider,
             store: &store,
             session_id: &session.id,
-            cache_key: None,
             model_context_window: None,
             renderer: &mut renderer,
         };

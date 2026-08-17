@@ -113,6 +113,9 @@ pub(crate) fn build_request_body(
     if let Some(cache_key) = request.cache_key.as_deref() {
         body["prompt_cache_key"] = Value::String(cache_key.to_string());
     }
+    if let Some(max_output_tokens) = request.max_output_tokens {
+        body["max_output_tokens"] = Value::from(max_output_tokens);
+    }
     let mut reasoning = serde_json::Map::new();
     reasoning.insert("summary".into(), Value::String("auto".into()));
     if let Some(effort) = request.model.effort.as_deref() {

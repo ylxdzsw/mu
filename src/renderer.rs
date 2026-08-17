@@ -9,6 +9,7 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::OutputFormat;
 use crate::provider::ReasoningVisibility;
+use crate::store::CompactionTrigger;
 
 const RESET: &str = "\x1b[0m";
 const BOLD: &str = "\x1b[1m";
@@ -48,6 +49,16 @@ const BASH_TAIL_LINE_RESERVE: usize = 2;
 const BASH_TAIL_FALLBACK_BYTES: usize = 512;
 const BASH_TAIL_LINE_CAP_BYTES: usize = 120;
 pub(crate) const ELLIPSIS: &str = "…";
+
+pub struct CompactionReport {
+    pub from_epoch: u64,
+    pub to_epoch: u64,
+    pub before_context_tokens: u64,
+    pub before_context_window: Option<u64>,
+    pub after_context_tokens_estimate: u64,
+    pub after_context_window: Option<u64>,
+    pub elapsed: Duration,
+}
 
 pub struct Renderer {
     stdout: Box<dyn Write + Send>,
@@ -895,47 +906,31 @@ impl Renderer {
         Ok(())
     }
 
-    pub fn compaction_start(&mut self) -> io::Result<()> {
-        if self.format == OutputFormat::Final {
-            return Ok(());
-        }
-        self.end_reasoning_run()?;
-        self.assistant_block_open = false;
-        self.live_line = Some(LiveLine::Compacting {
-            started: Instant::now(),
-        });
-        self.render_live_line()
-    }
-
-    pub fn compaction_tick(&mut self) -> io::Result<()> {
-        if !matches!(self.live_line, Some(LiveLine::Compacting { .. })) {
-            return Ok(());
-        }
-        self.render_live_line()
-    }
-
-    pub fn compaction_end(&mut self) -> io::Result<()> {
-        if matches!(self.live_line, Some(LiveLine::Compacting { .. })) {
-            self.clear_live_line()?;
-            self.live_line = None;
-        }
-        Ok(())
-    }
-
-    pub fn compaction_result(
+    pub fn compaction_trigger(
         &mut self,
-        before_context_tokens: u64,
-        after_context_tokens_estimate: u64,
+        trigger: CompactionTrigger,
+        context_tokens: u64,
         context_window: Option<u64>,
-        elapsed: Duration,
+        reason: Option<&str>,
     ) -> io::Result<()> {
-        self.compaction_end()?;
-        let line = format_compaction_result(
-            before_context_tokens,
-            after_context_tokens_estimate,
-            context_window,
-            elapsed,
+        let context = context_window.map_or_else(
+            || format!("{} context tokens", format_number(context_tokens)),
+            |window| {
+                format!(
+                    "{:.1}% context",
+                    context_tokens as f64 / window as f64 * 100.0
+                )
+            },
         );
+        let reason = reason.map_or(String::new(), |reason| format!(" — {reason}"));
+        self.notice(&format!(
+            "[mu] {} compaction triggered at {context}{reason}",
+            trigger.as_str()
+        ))
+    }
+
+    pub fn compaction_result(&mut self, report: &CompactionReport) -> io::Result<()> {
+        let line = format_compaction_result(report);
         if self.styled {
             self.notice(&line)
         } else {
@@ -944,17 +939,8 @@ impl Renderer {
         }
     }
 
-    pub fn compaction_inapplicable(&mut self, keep_recent_turns: usize) -> io::Result<()> {
-        self.compaction_end()?;
-        let line = format!(
-            "[mu] compaction inapplicable: no history exists before the {keep_recent_turns} retained turns"
-        );
-        if self.styled {
-            self.notice(&line)
-        } else {
-            writeln!(self.stderr, "{line}")?;
-            self.stderr.flush()
-        }
+    pub fn transcript_compaction_result(&mut self, report: &CompactionReport) -> io::Result<()> {
+        self.notice(&format_compaction_result(report))
     }
 
     pub fn turn_retry(
@@ -1193,7 +1179,6 @@ impl Renderer {
             Some(
                 LiveLine::Thinking
                     | LiveLine::ToolComposition
-                    | LiveLine::Compacting { .. }
                     | LiveLine::ConciseTool
                     | LiveLine::Guardrail
             )
@@ -1236,10 +1221,6 @@ impl Renderer {
                 ))
             }
             Some(LiveLine::ToolComposition) => Some(format!("{GRAY}[preparing toolcall]{RESET}")),
-            Some(LiveLine::Compacting { started }) => Some(format!(
-                "{GRAY}[compacting {}]{RESET}",
-                format_duration(started.elapsed())
-            )),
             Some(LiveLine::ConciseTool) => {
                 let tool = self.concise_tool.as_ref()?;
                 Some(format_concise_tool_live(
@@ -1727,9 +1708,6 @@ impl InlineStream {
 enum LiveLine {
     Thinking,
     ToolComposition,
-    Compacting {
-        started: Instant,
-    },
     ConciseTool,
     Guardrail,
     TableBuffering {
@@ -4292,26 +4270,32 @@ fn format_turn_summary(
     )
 }
 
-fn format_compaction_result(
-    before_context_tokens: u64,
-    after_context_tokens_estimate: u64,
-    context_window: Option<u64>,
-    elapsed: Duration,
-) -> String {
-    let context = if let Some(context_window) = context_window {
-        format!(
-            "{:.1}% → ~{:.1}%",
-            before_context_tokens as f64 / context_window as f64 * 100.0,
-            after_context_tokens_estimate as f64 / context_window as f64 * 100.0,
-        )
-    } else {
-        format!(
-            "{} → ~{} context tokens",
-            format_number(before_context_tokens),
-            format_number(after_context_tokens_estimate),
-        )
-    };
-    format!("[mu] compacted {context} in {}", format_duration(elapsed))
+fn format_compaction_result(report: &CompactionReport) -> String {
+    let before = report.before_context_window.map_or_else(
+        || format_number(report.before_context_tokens),
+        |window| {
+            format!(
+                "{:.1}%",
+                report.before_context_tokens as f64 / window as f64 * 100.0
+            )
+        },
+    );
+    let after = report.after_context_window.map_or_else(
+        || format!("~{}", format_number(report.after_context_tokens_estimate)),
+        |window| {
+            format!(
+                "~{:.1}%",
+                report.after_context_tokens_estimate as f64 / window as f64 * 100.0
+            )
+        },
+    );
+    format!(
+        "[mu] compacted epoch {} → {}: context {before} → {after} (~{} tokens) · {}",
+        report.from_epoch,
+        report.to_epoch,
+        format_number(report.after_context_tokens_estimate),
+        format_duration(report.elapsed)
+    )
 }
 
 fn format_number(number: u64) -> String {
@@ -4844,21 +4828,34 @@ mod tests {
     }
 
     #[test]
-    fn compaction_uses_one_mutable_live_line_and_commits_estimated_result() {
+    fn compaction_trigger_and_result_are_separate_committed_lines() {
         let (mut renderer, output, _) =
             Renderer::with_test_output(OutputFormat::Detail, true, true, None);
 
-        renderer.compaction_start().unwrap();
-        renderer.compaction_tick().unwrap();
         renderer
-            .compaction_result(12_826, 10_582, Some(200_000), Duration::from_millis(2_400))
+            .compaction_trigger(CompactionTrigger::Hard, 170_800, Some(200_000), None)
+            .unwrap();
+        renderer
+            .compaction_result(&CompactionReport {
+                from_epoch: 3,
+                to_epoch: 4,
+                before_context_tokens: 170_800,
+                before_context_window: Some(200_000),
+                after_context_tokens_estimate: 37_200,
+                after_context_window: Some(200_000),
+                elapsed: Duration::from_millis(2_400),
+            })
             .unwrap();
 
-        let raw = output.transcript();
-        assert!(raw.contains("[compacting "), "{raw:?}");
-        assert!(raw.matches("\r\x1b[2K").count() >= 2, "{raw:?}");
+        let raw = strip_ansi(&output.transcript());
         assert!(
-            strip_ansi(&raw).ends_with("[mu] compacted 6.4% → ~5.3% in 2.4s\n"),
+            raw.contains("[mu] hard compaction triggered at 85.4% context\n"),
+            "{raw:?}"
+        );
+        assert!(
+            raw.ends_with(
+                "[mu] compacted epoch 3 → 4: context 85.4% → ~18.6% (~37,200 tokens) · 2.4s\n"
+            ),
             "{raw:?}"
         );
         assert!(renderer.live_line.is_none());
@@ -4868,42 +4865,88 @@ mod tests {
     fn compaction_result_is_committed_for_concise_interactive_and_redirected_output() {
         let (mut interactive, stdout, _stderr) =
             Renderer::with_test_output(OutputFormat::Concise, true, true, None);
-        interactive.compaction_start().unwrap();
         interactive
-            .compaction_result(12_826, 10_582, Some(200_000), Duration::from_millis(2_400))
+            .compaction_result(&CompactionReport {
+                from_epoch: 3,
+                to_epoch: 4,
+                before_context_tokens: 12_826,
+                before_context_window: Some(200_000),
+                after_context_tokens_estimate: 10_582,
+                after_context_window: Some(200_000),
+                elapsed: Duration::from_millis(2_400),
+            })
             .unwrap();
         let interactive_text = strip_ansi(&stdout.transcript());
         assert!(
-            interactive_text.contains("[compacting "),
-            "{interactive_text:?}"
-        );
-        assert!(
-            interactive_text.ends_with("[mu] compacted 6.4% → ~5.3% in 2.4s\n"),
+            interactive_text.ends_with(
+                "[mu] compacted epoch 3 → 4: context 6.4% → ~5.3% (~10,582 tokens) · 2.4s\n"
+            ),
             "{interactive_text:?}"
         );
 
         let (mut redirected, redirected_stdout, redirected_stderr) =
             Renderer::with_test_output(OutputFormat::Concise, false, false, None);
-        redirected.compaction_start().unwrap();
         redirected
-            .compaction_result(12_826, 10_582, Some(200_000), Duration::from_millis(2_400))
+            .compaction_result(&CompactionReport {
+                from_epoch: 3,
+                to_epoch: 4,
+                before_context_tokens: 12_826,
+                before_context_window: Some(200_000),
+                after_context_tokens_estimate: 10_582,
+                after_context_window: Some(200_000),
+                elapsed: Duration::from_millis(2_400),
+            })
             .unwrap();
         assert_eq!(redirected_stdout.transcript(), "");
         assert_eq!(
             redirected_stderr.transcript(),
-            "[mu] compacted 6.4% → ~5.3% in 2.4s\n"
+            "[mu] compacted epoch 3 → 4: context 6.4% → ~5.3% (~10,582 tokens) · 2.4s\n"
         );
 
         let (mut detail_redirected, detail_stdout, detail_stderr) =
             Renderer::with_test_output(OutputFormat::Detail, false, false, None);
-        detail_redirected.compaction_start().unwrap();
         detail_redirected
-            .compaction_result(12_826, 10_582, Some(200_000), Duration::from_millis(2_400))
+            .compaction_result(&CompactionReport {
+                from_epoch: 3,
+                to_epoch: 4,
+                before_context_tokens: 12_826,
+                before_context_window: Some(200_000),
+                after_context_tokens_estimate: 10_582,
+                after_context_window: Some(200_000),
+                elapsed: Duration::from_millis(2_400),
+            })
             .unwrap();
         assert_eq!(detail_stdout.transcript(), "");
         assert_eq!(
             detail_stderr.transcript(),
-            "[mu] compacted 6.4% → ~5.3% in 2.4s\n"
+            "[mu] compacted epoch 3 → 4: context 6.4% → ~5.3% (~10,582 tokens) · 2.4s\n"
+        );
+    }
+
+    #[test]
+    fn transcript_compaction_result_has_one_block_gap_on_each_side() {
+        let (mut renderer, output, stderr) =
+            Renderer::with_test_output(OutputFormat::Detail, true, true, None);
+        renderer.assistant_text("Summary.").unwrap();
+        renderer.assistant_end().unwrap();
+        renderer
+            .transcript_compaction_result(&CompactionReport {
+                from_epoch: 3,
+                to_epoch: 4,
+                before_context_tokens: 170_800,
+                before_context_window: Some(200_000),
+                after_context_tokens_estimate: 37_200,
+                after_context_window: Some(200_000),
+                elapsed: Duration::from_millis(2_400),
+            })
+            .unwrap();
+        renderer.assistant_text("Continued.").unwrap();
+        renderer.assistant_end().unwrap();
+
+        assert_eq!(stderr.transcript(), "");
+        assert_eq!(
+            strip_ansi(&output.transcript()),
+            "Summary.\n\n[mu] compacted epoch 3 → 4: context 85.4% → ~18.6% (~37,200 tokens) · 2.4s\n\nContinued.\n"
         );
     }
 

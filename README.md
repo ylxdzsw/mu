@@ -105,9 +105,9 @@ Type `/` to list prompt-mode commands. The common ones:
 - `/attach <file>` adds an image or audio file to the next turn.
 - `/retry` resumes a turn interrupted by Ctrl-C, a crash, a lost connection, or
   exhausted automatic resume attempts.
-- `/compact` compacts older turns in a long session, optionally with a focus
-  instruction. It reports when all history is already inside the configured
-  recent-turn retention window.
+- `/compact` checkpoints a long session through a synthetic summary turn,
+  optionally with a focus instruction. An interrupted checkpoint is resumed
+  with `/retry` before that session accepts another prompt.
 - `/goal <goal>` starts a supervisor that drives one persistent worker session
   until the supplied goal is verified as achieved or genuinely blocked. The
   goal argument is required.
@@ -188,6 +188,7 @@ Replay or share a session without contacting a provider:
 ```sh
 mu transcript -o full
 mu transcript --session ses_... --html > session.html
+mu transcript --session ses_... --epoch 2
 ```
 
 Terminal replay uses the same Markdown and Bash renderer as a live turn;
@@ -398,20 +399,20 @@ and continues from the preserved history. A fixed or final candidate exits
 incomplete and `/retry` resumes it; entering a normal prompt instead starts a
 new turn without Mu's synthetic continuation.
 
-During compaction, interactive output uses one mutable
-`[compacting <duration>]` line, followed by a committed
-`[mu] compacted ...` result when automatic or manual compaction succeeds. The
-completed result marks its rebuilt context percentage with `~` because it is
-estimated until the next provider response; the shell prompt uses the same
-marker and returns to an unprefixed percentage after that response supplies
-exact usage. The soft threshold is also the post-compaction target, though a
-useful summary is normally expected to reduce context well below it. The target
-check is primarily a safety net: if the rebuilt context would still exceed it,
-compaction exits nonzero and records a failed attempt without changing the
-conversation's prior summary, boundary, or context status. Compaction includes
-images in its summarizer input. Audio is included for Chat Completions; for
-Responses and Anthropic it is replaced in place by a metadata-only omission
-note.
+Compaction first prints a committed trigger line, then streams its synthetic
+summary turn with the normal reasoning, text, and Bash rendering. A committed
+result such as
+`[mu] compacted epoch 3 → 4: context 85.4% → ~18.6% (~37,200 tokens) · 2.4s`
+follows. The rebuilt percentage remains estimated until a later provider
+response supplies exact usage.
+
+Soft compaction runs before a queued new prompt is materialized. Hard
+compaction runs between completed Bash results and their model continuation.
+Provider context-length errors use an emergency attempt that may omit oldest
+Bash outputs and attachments from that one summary request while preserving
+the journal. A successful summary starts the next context epoch and therefore
+the next provider cache key. If compaction is interrupted, that session accepts
+only `mu retry` until the epoch transition completes.
 
 ## Native installation and portable builds
 

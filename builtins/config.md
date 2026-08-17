@@ -111,21 +111,28 @@ abort the turn, while explicit `mu compact` remains available.
 Compaction requires a model `context_window` and runs only when context tokens
 are strictly greater than the applicable threshold. Before a new turn's first
 provider request, `compaction.soft_fraction` sets the graceful threshold to
-`floor(context_window * soft_fraction)`. It is also the post-compaction target:
-mu rejects a candidate context that remains above it. This check is primarily a
-safety net; a useful summary is normally expected to reduce context well below
-the target. Before each semantic request within a turn, the hard threshold is
+`floor(context_window * soft_fraction)`. The submitted prompt is queued while
+Mu generates that out-of-turn checkpoint, then materialized afterward. After
+all concurrent Bash calls finish and before their results are sent back, the
+hard threshold is
 the lower of
 `floor(context_window * hard_fraction)` and
-`context_window.saturating_sub(hard_headroom_tokens)`. Compaction keeps the
-smallest suffix of whole turns containing at least five requests, counting each
-submitted prompt and each Bash tool call as one request. This retains five
-tool-free turns, while a current turn with five tool calls satisfies the budget
-by itself. Context accounting keeps a compatible provider-reported total and
-estimates only later prompts or tool results; providers are compatible when
-their API, model id, and effective `replay_key` match. Compaction sends images
-through every API. It sends audio through Chat Completions and substitutes a
-metadata-only omission note for Responses and Anthropic.
+`context_window.saturating_sub(hard_headroom_tokens)`.
+
+Compaction asks the active model to summarize the exact current context as a
+normal persisted agent turn, then replaces the model-facing history with the
+system prompt and a session checkpoint. Each successful checkpoint increments
+the session context epoch; provider cache keys have the form
+`mu:<session>:epoch:<N>`. A context-length error starts emergency compaction,
+which temporarily replaces oldest Bash outputs and removes their attachments
+until their estimated reduction reaches the configured headroom. The journal,
+Bash requests, commands, and stdin remain intact. The same error during an
+emergency attempt is fatal. Compaction output is capped at
+`hard_headroom_tokens`, which must be greater than zero.
+
+Context accounting keeps a compatible provider-reported total and estimates
+only later prompts or tool results; providers are compatible when their API,
+model id, and effective `replay_key` match.
 `limits.max_iterations` caps one agent turn; the other limits bound the
 model-visible preview of bash output by lines, total bytes, and bytes per line.
 The bell sounds only for turns lasting at least `min_duration_ms`. The guardrail

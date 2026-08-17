@@ -204,6 +204,9 @@ pub(crate) fn build_request_body(request: &Request, tools: &[Value]) -> Value {
         // is rejected by real OpenAI `/chat/completions`.)
         body["reasoning_effort"] = Value::String(effort.to_string());
     }
+    if let Some(max_output_tokens) = request.max_output_tokens {
+        body["max_completion_tokens"] = Value::from(max_output_tokens);
+    }
     body
 }
 
@@ -616,6 +619,7 @@ mod tests {
         Request {
             model: test_model(effort),
             cache_key: None,
+            max_output_tokens: None,
             messages,
             bash,
         }
@@ -836,20 +840,18 @@ mod tests {
     }
 
     #[test]
-    fn chat_and_responses_requests_include_stable_session_cache_key() {
-        let request = Request::for_session(test_model(None), "ses_test", "agent", vec![], false);
-        let same =
-            Request::for_session(test_model(Some("high")), "ses_test", "agent", vec![], false);
-        let compaction =
-            Request::for_session(test_model(None), "ses_test", "compaction", vec![], false);
+    fn chat_and_responses_requests_include_context_epoch_cache_key() {
+        let request = Request::for_guardrail(test_model(None), "ses_test", 3, vec![]);
+        let same = Request::for_guardrail(test_model(Some("high")), "ses_test", 3, vec![]);
+        let next_epoch = Request::for_guardrail(test_model(None), "ses_test", 4, vec![]);
 
-        assert_eq!(request.cache_key.as_deref(), Some("mu:ses_test:agent"));
+        assert_eq!(request.cache_key.as_deref(), Some("mu:ses_test:epoch:3"));
         assert_eq!(request.cache_key, same.cache_key);
-        assert_ne!(request.cache_key, compaction.cache_key);
+        assert_ne!(request.cache_key, next_epoch.cache_key);
         let chat = request.json(ModelApi::ChatCompletions).unwrap();
         let responses = request.json(ModelApi::Responses).unwrap();
-        assert_eq!(chat["prompt_cache_key"], "mu:ses_test:agent");
-        assert_eq!(responses["prompt_cache_key"], "mu:ses_test:agent");
+        assert_eq!(chat["prompt_cache_key"], "mu:ses_test:epoch:3");
+        assert_eq!(responses["prompt_cache_key"], "mu:ses_test:epoch:3");
     }
 
     #[test]
