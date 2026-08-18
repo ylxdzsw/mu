@@ -123,6 +123,7 @@ last selected session and `detail` output. `--html` emits a browser-viewable
 xterm.js document whose pinned assets are loaded from jsDelivr when opened. The
 browser terminal keeps a centered 100-column width, scrolls horizontally on
 narrower viewports, and debounces vertical fitting while the page is resized.
+Its scrollbars use a thin dark theme instead of the browser default.
 The default replay includes synthetic compaction turns and their derived
 trigger/result lines; `final` omits those internals. `--epoch` limits replay to
 activity sent under one context-epoch cache key. A compaction request and its

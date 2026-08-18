@@ -641,10 +641,38 @@ fn transcript_html(ansi: &str) -> Result<String> {
 <title>Mu transcript</title>
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/css/xterm.css">
 <style>
+:root {{
+  color-scheme:dark;
+  --scroll-thumb:rgba(255,255,255,.2);
+  --scroll-thumb-hover:rgba(255,255,255,.4);
+}}
 html,body,#terminal-scroll,#terminal {{ height:100%; margin:0 }}
 body {{ box-sizing:border-box; padding:16px; background:#000 }}
-#terminal-scroll {{ overflow-x:auto; overflow-y:hidden }}
+#terminal-scroll {{
+  overflow-x:auto; overflow-y:hidden;
+  scrollbar-width:thin; scrollbar-color:var(--scroll-thumb) transparent;
+}}
 #terminal {{ margin:0 auto; overflow:hidden }}
+.xterm .xterm-viewport {{
+  overflow-y:auto;
+  scrollbar-width:thin; scrollbar-color:var(--scroll-thumb) transparent;
+}}
+.xterm .xterm-viewport::-webkit-scrollbar {{ width:7px }}
+#terminal-scroll::-webkit-scrollbar {{ height:7px }}
+.xterm .xterm-viewport::-webkit-scrollbar-track,
+#terminal-scroll::-webkit-scrollbar-track {{ background:transparent }}
+.xterm .xterm-viewport::-webkit-scrollbar-thumb,
+#terminal-scroll::-webkit-scrollbar-thumb {{
+  background:var(--scroll-thumb);
+  border:2px solid transparent; border-radius:999px;
+  background-clip:padding-box;
+}}
+.xterm .xterm-viewport:hover {{
+  scrollbar-color:var(--scroll-thumb-hover) transparent;
+}}
+#terminal-scroll:hover {{ scrollbar-color:var(--scroll-thumb-hover) transparent }}
+.xterm .xterm-viewport::-webkit-scrollbar-thumb:hover,
+#terminal-scroll::-webkit-scrollbar-thumb:hover {{ background:var(--scroll-thumb-hover) }}
 </style>
 </head>
 <body>
@@ -1824,6 +1852,10 @@ mod tests {
         assert!(html.contains("term.resize(columns, dimensions.rows)"));
         assert!(html.contains("fitTimer = setTimeout(fitVertically, 50)"));
         assert!(html.contains("new ResizeObserver(scheduleFit).observe(scrollElement)"));
+        assert!(html.contains("color-scheme:dark"));
+        assert!(html.contains("overflow-y:auto"));
+        assert!(html.contains("scrollbar-width:thin"));
+        assert!(html.contains("::-webkit-scrollbar"));
         assert!(html.contains(r#"term.write("\u003c/script>\n")"#));
     }
 

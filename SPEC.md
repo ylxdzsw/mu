@@ -848,7 +848,8 @@ journal contains enough information. HTML output is a renderer replay, not a
 second transcript model. Its xterm viewport remains 100 columns wide, centers
 when space permits, scrolls horizontally on narrower viewports, and debounces
 vertical fitting during resizing. Line breaks produced by the fixed-width
-renderer are not reflowed after export.
+renderer are not reflowed after export. Both scroll surfaces use a thin dark
+theme rather than the browser default.
 
 ### 11.4 Usage accounting
 
