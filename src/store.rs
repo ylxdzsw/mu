@@ -17,8 +17,9 @@ use crate::bash::BashRisk;
 use crate::config::Config;
 use crate::models::ResolvedModelRef;
 use crate::provider::{
-    AssistantItem, Attachment, ContentPart, ImageDetail, Message, ModelApi, NativeReplay, Request,
-    ToolAttachment, ToolCall, Usage, UserContent, estimate_messages_tokens,
+    AssistantItem, Attachment, ContentPart, ImageDetail, Message, ModelApi, NativeReplay,
+    ReplayOrigin, Request, ToolAttachment, ToolCall, Usage, UserContent, estimate_messages_tokens,
+    filter_native_replay_for_config, native_replay_origins,
 };
 
 pub const BASH_CALL_ID_ENV: &str = "MU_BASH_CALL_ID";
@@ -202,6 +203,14 @@ pub struct QueuedPrompt {
     pub cwd: String,
     pub git_worktree_root: Option<String>,
     pub content: UserContent,
+}
+
+pub(crate) struct AssistantCompletion<'a> {
+    pub message: &'a Message,
+    pub native_response: Option<&'a Value>,
+    pub usage: Option<&'a Usage>,
+    pub resumable: bool,
+    pub context_output_complete: bool,
 }
 
 pub struct CompactionApplication<'a> {
@@ -407,6 +416,14 @@ fn is_zero(value: &u64) -> bool {
     *value == 0
 }
 
+fn true_value() -> bool {
+    true
+}
+
+fn is_true(value: &bool) -> bool {
+    *value
+}
+
 fn normal_turn_kind() -> String {
     "user".into()
 }
@@ -420,6 +437,8 @@ fn is_normal_turn_kind(value: &String) -> bool {
 enum Projection {
     Assistant {
         turn_state: String,
+        #[serde(default = "true_value", skip_serializing_if = "is_true")]
+        context_output_complete: bool,
         #[serde(skip_serializing_if = "Option::is_none")]
         native_replay: Option<NativeReplay>,
         items: Vec<PersistedAssistantItem>,
@@ -874,7 +893,20 @@ impl Store {
         let (wire_model, effort) = wire_model
             .split_once(':')
             .map_or((wire_model, None), |(model, effort)| (model, Some(effort)));
-        let native = serde_json::json!({"model":wire_model});
+        let context_through_seq = self.current_context_seq(session_id)?;
+        let request = Request {
+            model: ResolvedModelRef {
+                canonical: model.to_string(),
+                provider_id: provider_id.to_string(),
+                model_id: wire_model.to_string(),
+                effort: effort.map(str::to_string),
+            },
+            cache_key: None,
+            messages: self.load_context_messages(session_id)?,
+            bash: true,
+            max_output_tokens: None,
+        };
+        let native = request.json(ModelApi::ChatCompletions)?;
         let exchange_id = self.start_provider_request(
             session_id,
             &turn_id,
@@ -882,12 +914,20 @@ impl Store {
             ProviderOrigin {
                 canonical_model_ref: model.to_string(),
                 provider_id: provider_id.to_string(),
-                api: "test".into(),
-                endpoint: String::new(),
+                api: ModelApi::ChatCompletions.name().into(),
+                endpoint: "http://localhost/chat/completions".into(),
                 wire_model: wire_model.to_string(),
                 effort: effort.map(str::to_string),
             },
-            self.request_recipe("test.v1", &native, serde_json::json!({"kind":"agent"}))?,
+            self.request_recipe(
+                ModelApi::ChatCompletions.request_format(),
+                &native,
+                serde_json::json!({
+                    "kind": "agent",
+                    "context_through_seq": context_through_seq,
+                    "native_replay_origins": native_replay_origins(&request.messages),
+                }),
+            )?,
             None,
         )?;
         if outcome == "completed" {
@@ -1931,24 +1971,210 @@ impl Store {
         api: ModelApi,
     ) -> Result<ContextTokenEstimate> {
         let journal = self.load(session_id)?;
-        let context = self.context(&journal)?;
-        if let Some((seq, reported)) =
-            latest_compatible_context_anchor(&journal, config, target, api)
+        self.context_tokens_for_journal(&journal, config, target, api)
+    }
+
+    pub fn queued_context_tokens(
+        &self,
+        session_id: &str,
+        config: &Config,
+        target: &ResolvedModelRef,
+        api: ModelApi,
+    ) -> Result<ContextTokenEstimate> {
+        let mut journal = self.load(session_id)?;
+        append_queued_turn_projection(&mut journal)?;
+        self.context_tokens_for_journal(&journal, config, target, api)
+    }
+
+    pub fn projected_compaction_context_tokens(
+        &self,
+        session_id: &str,
+        mode: CompactionMode,
+        checkpoint: &str,
+        config: &Config,
+        target: &ResolvedModelRef,
+        api: ModelApi,
+    ) -> Result<u64> {
+        let mut journal = self.load(session_id)?;
+        let from_epoch = context_epoch(&journal, i64::MAX);
+        let seq = journal.next_seq();
+        Arc::make_mut(&mut journal.events).push(EventLine {
+            seq,
+            at: now(),
+            event: Event::CompactionApplied {
+                source_turn_id: String::new(),
+                from_epoch,
+                to_epoch: from_epoch.saturating_add(1),
+                trigger: CompactionTrigger::Manual,
+                mode,
+                summary: String::new(),
+                checkpoint: checkpoint.to_string(),
+                continuation_turn_id: None,
+                before_context_tokens: 0,
+                before_context_window: None,
+                after_context_tokens_estimate: 0,
+                after_context_window: None,
+                elapsed_ms: 0,
+                emergency_elided_call_ids: Vec::new(),
+            },
+        });
+        if mode == CompactionMode::AwaitUser {
+            append_queued_turn_projection(&mut journal)?;
+        }
+        Ok(estimate_messages_tokens(
+            &self.context(&journal)?,
+            config,
+            target,
+            api,
+        ))
+    }
+
+    fn context_tokens_for_journal(
+        &self,
+        journal: &Journal,
+        config: &Config,
+        target: &ResolvedModelRef,
+        api: ModelApi,
+    ) -> Result<ContextTokenEstimate> {
+        let context = self.context(journal)?;
+        if let Some((message_count, reported)) =
+            self.latest_compatible_context_anchor(journal, config, target, api)?
+            && context.len() >= message_count
         {
-            let anchored = self.context_until(&journal, seq)?;
-            if context.len() >= anchored.len() {
-                let suffix = &context[anchored.len()..];
-                return Ok(ContextTokenEstimate {
-                    tokens: reported
-                        .saturating_add(estimate_messages_tokens(suffix, config, target, api)),
-                    reported: suffix.is_empty(),
-                });
-            }
+            let suffix = &context[message_count..];
+            return Ok(ContextTokenEstimate {
+                tokens: reported
+                    .saturating_add(estimate_messages_tokens(suffix, config, target, api)),
+                reported: suffix.is_empty(),
+            });
         }
         Ok(ContextTokenEstimate {
             tokens: estimate_messages_tokens(&context, config, target, api),
             reported: false,
         })
+    }
+
+    fn latest_compatible_context_anchor(
+        &self,
+        journal: &Journal,
+        config: &Config,
+        target: &ResolvedModelRef,
+        api: ModelApi,
+    ) -> Result<Option<(usize, u64)>> {
+        let mut requests = HashMap::new();
+        let mut anchor = None;
+        for line in journal.events.iter() {
+            match &line.event {
+                Event::ProviderRequested {
+                    exchange_id,
+                    purpose,
+                    origin,
+                    request_recipe,
+                    ..
+                } if purpose == "agent" => {
+                    requests.insert(exchange_id.as_str(), (origin, request_recipe));
+                }
+                Event::ProviderCompleted {
+                    exchange_id,
+                    usage: Some(usage),
+                    projection:
+                        Projection::Assistant {
+                            context_output_complete,
+                            native_replay,
+                            items,
+                            ..
+                        },
+                    ..
+                } => {
+                    let Some((origin, recipe)) = requests.get(exchange_id.as_str()) else {
+                        continue;
+                    };
+                    if !self
+                        .request_context_compatible(journal, origin, recipe, config, target, api)?
+                    {
+                        continue;
+                    }
+                    let through_seq = recipe.input["context_through_seq"]
+                        .as_i64()
+                        .context("agent request recipe has no context boundary")?;
+                    let input_message_count = self.context_until(journal, through_seq)?.len();
+                    let output_complete = *context_output_complete
+                        && (native_replay.is_some()
+                            || !items.iter().any(|item| {
+                                matches!(item, PersistedAssistantItem::Reasoning { .. })
+                            }))
+                        && native_replay.as_ref().is_none_or(|native| {
+                            let mut native = native.clone();
+                            if native.provider_id.is_empty() {
+                                native.provider_id = origin.provider_id.clone();
+                            }
+                            let message = Message::Assistant {
+                                items: items
+                                    .iter()
+                                    .map(PersistedAssistantItem::assistant_item)
+                                    .collect(),
+                                native_replay: Some(native),
+                            };
+                            matches!(
+                                filter_native_replay_for_config(&[message], config, target, api)
+                                    .as_slice(),
+                                [Message::Assistant {
+                                    native_replay: Some(_),
+                                    ..
+                                }]
+                            )
+                        });
+                    if output_complete && let Some(tokens) = usage.context_total() {
+                        anchor = Some((input_message_count.saturating_add(1), tokens));
+                    } else if usage.input_tokens > 0 {
+                        anchor = Some((input_message_count, usage.input_tokens));
+                    }
+                }
+                Event::ProviderCompleted {
+                    projection: Projection::Compaction { .. },
+                    ..
+                }
+                | Event::CompactionApplied { .. } => anchor = None,
+                _ => {}
+            }
+        }
+        Ok(anchor)
+    }
+
+    fn request_context_compatible(
+        &self,
+        journal: &Journal,
+        origin: &ProviderOrigin,
+        recipe: &RequestRecipe,
+        config: &Config,
+        target: &ResolvedModelRef,
+        api: ModelApi,
+    ) -> Result<bool> {
+        if !request_format_is_current(&origin.api, &recipe.format)
+            || !context_origin_compatible(config, origin, target, api)
+            || recipe.input.get("native_fields").is_some()
+        {
+            return Ok(false);
+        }
+        let Some(through_seq) = recipe.input["context_through_seq"].as_i64() else {
+            return Ok(false);
+        };
+        if let Some(elided) = recipe.input.get("emergency_elided_provider_call_ids") {
+            let elided = serde_json::from_value::<Vec<String>>(elided.clone())
+                .context("invalid emergency Bash elision ids in request recipe")?;
+            if !elided.is_empty() {
+                return Ok(false);
+            }
+        }
+        let Some(origins) = recipe.input.get("native_replay_origins") else {
+            return Ok(true);
+        };
+        let recorded = serde_json::from_value::<Vec<ReplayOrigin>>(origins.clone())
+            .context("invalid native replay origins in request recipe")?;
+        let historical_context = self.context_until(journal, through_seq)?;
+        let current_projection =
+            filter_native_replay_for_config(&historical_context, config, target, api);
+        Ok(native_replay_origins(&current_projection) == recorded)
     }
 
     pub fn acquire_session_lock(&self, session_id: &str) -> Result<SessionLock<'_>> {
@@ -2054,6 +2280,7 @@ impl Store {
         )
     }
 
+    #[cfg(test)]
     pub fn complete_assistant_exchange(
         &self,
         session_id: &str,
@@ -2065,13 +2292,17 @@ impl Store {
         self.complete_assistant_exchange_inner(
             session_id,
             exchange_id,
-            message,
-            native_response,
-            usage,
-            false,
+            AssistantCompletion {
+                message,
+                native_response,
+                usage,
+                resumable: false,
+                context_output_complete: true,
+            },
         )
     }
 
+    #[cfg(test)]
     pub fn complete_resumable_assistant_exchange(
         &self,
         session_id: &str,
@@ -2083,22 +2314,38 @@ impl Store {
         self.complete_assistant_exchange_inner(
             session_id,
             exchange_id,
-            message,
-            native_response,
-            usage,
-            true,
+            AssistantCompletion {
+                message,
+                native_response,
+                usage,
+                resumable: true,
+                context_output_complete: true,
+            },
         )
+    }
+
+    pub(crate) fn complete_assistant_exchange_record(
+        &self,
+        session_id: &str,
+        exchange_id: &str,
+        completion: AssistantCompletion<'_>,
+    ) -> Result<(i64, Vec<i64>)> {
+        self.complete_assistant_exchange_inner(session_id, exchange_id, completion)
     }
 
     fn complete_assistant_exchange_inner(
         &self,
         session_id: &str,
         exchange_id: &str,
-        message: &Message,
-        native_response: Option<&Value>,
-        usage: Option<&Usage>,
-        resumable: bool,
+        completion: AssistantCompletion<'_>,
     ) -> Result<(i64, Vec<i64>)> {
+        let AssistantCompletion {
+            message,
+            native_response,
+            usage,
+            resumable,
+            context_output_complete,
+        } = completion;
         if !matches!(message, Message::Assistant { .. }) {
             self.fail_provider_exchange(
                 session_id,
@@ -2158,6 +2405,7 @@ impl Store {
                 } else {
                     "continue".into()
                 },
+                context_output_complete,
                 native_replay: native_replay.clone(),
                 items,
             },
@@ -3352,6 +3600,7 @@ mod migration {
         let items = recover_native(&assistant).unwrap_or_else(|| canonical_items(&assistant));
         Ok(Projection::Assistant {
             turn_state: assistant.turn_state,
+            context_output_complete: true,
             native_replay: assistant.native_replay,
             items,
         })
@@ -3873,6 +4122,57 @@ fn resume_was_requested(journal: &Journal, turn_id: &str, after_seq: i64) -> boo
     false
 }
 
+fn append_queued_turn_projection(journal: &mut Journal) -> Result<()> {
+    let consumed = journal
+        .events
+        .iter()
+        .filter_map(|line| match &line.event {
+            Event::TurnStarted {
+                queued_prompt_id: Some(id),
+                ..
+            } => Some(id.as_str()),
+            _ => None,
+        })
+        .collect::<HashSet<_>>();
+    let queued = journal
+        .events
+        .iter()
+        .rev()
+        .find_map(|line| match &line.event {
+            Event::PromptQueued {
+                prompt_id,
+                cwd,
+                git_worktree_root,
+                prompt,
+                ..
+            } if !consumed.contains(prompt_id.as_str()) => Some((
+                prompt_id.clone(),
+                cwd.clone(),
+                git_worktree_root.clone(),
+                prompt.clone(),
+            )),
+            _ => None,
+        })
+        .context("session has no queued prompt")?;
+    let seq = journal.next_seq();
+    let epoch = context_epoch(journal, i64::MAX);
+    Arc::make_mut(&mut journal.events).push(EventLine {
+        seq,
+        at: now(),
+        event: Event::TurnStarted {
+            turn_id: format!("projected-t{seq}"),
+            cwd: queued.1,
+            git_worktree_root: queued.2,
+            prompt: queued.3,
+            epoch,
+            turn_kind: normal_turn_kind(),
+            compaction: None,
+            queued_prompt_id: Some(queued.0),
+        },
+    });
+    Ok(())
+}
+
 fn next_call_id(journal: &Journal) -> i64 {
     journal
         .events
@@ -3979,13 +4279,30 @@ fn reported_context_tokens_before(journal: &Journal, max_seq: i64) -> Option<u64
             Event::ProviderCompleted {
                 exchange_id,
                 usage: Some(usage),
-                projection: Projection::Assistant { .. },
+                projection:
+                    Projection::Assistant {
+                        context_output_complete,
+                        native_replay,
+                        items,
+                        ..
+                    },
                 ..
             } => {
-                latest = request_formats
-                    .get(exchange_id.as_str())
-                    .and_then(|current| usage.context_total().map(|tokens| (tokens, *current)));
-                semantic_after = false;
+                let output_complete = *context_output_complete
+                    && (native_replay.is_some()
+                        || !items
+                            .iter()
+                            .any(|item| matches!(item, PersistedAssistantItem::Reasoning { .. })));
+                latest = output_complete
+                    .then(|| {
+                        request_formats
+                            .get(exchange_id.as_str())
+                            .and_then(|current| {
+                                usage.context_total().map(|tokens| (tokens, *current))
+                            })
+                    })
+                    .flatten();
+                semantic_after = !output_complete;
             }
             Event::ProviderCompleted {
                 projection: Projection::Assistant { .. },
@@ -4004,58 +4321,6 @@ fn reported_context_tokens_before(journal: &Journal, max_seq: i64) -> Option<u64
     latest
         .filter(|(_, current)| !semantic_after && *current)
         .map(|(tokens, _)| tokens)
-}
-
-fn latest_compatible_context_anchor(
-    journal: &Journal,
-    config: &Config,
-    target: &ResolvedModelRef,
-    api: ModelApi,
-) -> Option<(i64, u64)> {
-    let mut requests = HashMap::new();
-    let mut anchor = None;
-    for line in journal.events.iter() {
-        match &line.event {
-            Event::ProviderRequested {
-                exchange_id,
-                purpose,
-                origin,
-                request_recipe,
-                ..
-            } if purpose == "agent" => {
-                requests.insert(
-                    exchange_id.as_str(),
-                    (
-                        origin,
-                        request_format_is_current(&origin.api, &request_recipe.format),
-                    ),
-                );
-            }
-            Event::ProviderCompleted {
-                exchange_id,
-                usage: Some(usage),
-                projection: Projection::Assistant { .. },
-                ..
-            } => {
-                let Some((origin, current_format)) = requests.get(exchange_id.as_str()) else {
-                    continue;
-                };
-                if *current_format
-                    && context_origin_compatible(config, origin, target, api)
-                    && let Some(tokens) = usage.context_total()
-                {
-                    anchor = Some((line.seq, tokens));
-                }
-            }
-            Event::ProviderCompleted {
-                projection: Projection::Compaction { .. },
-                ..
-            }
-            | Event::CompactionApplied { .. } => anchor = None,
-            _ => {}
-        }
-    }
-    anchor
 }
 
 fn context_origin_compatible(
@@ -4360,6 +4625,341 @@ mod tests {
             .unwrap();
         assert!(!estimate.reported);
         assert!(estimate.tokens > 0);
+    }
+
+    #[test]
+    fn queued_context_projection_matches_materialized_turn() {
+        let (store, session) = test_session();
+        store
+            .append_test_agent_exchange(&session.id, "source/model", "completed", 100)
+            .unwrap();
+        store
+            .queue_prompt(&session.id, "/other", Some("/repo"), &"12345678".into())
+            .unwrap();
+        let config = context_test_config(Some("shared"), Some("shared"));
+        let target = crate::models::resolve_model_ref(&config, "target/model").unwrap();
+
+        let projected = store
+            .queued_context_tokens(&session.id, &config, &target, ModelApi::ChatCompletions)
+            .unwrap();
+        assert!(!projected.reported);
+        assert!(projected.tokens > 102, "{projected:?}");
+
+        store.materialize_queued_prompt(&session.id).unwrap();
+        assert_eq!(
+            projected,
+            store
+                .context_tokens(&session.id, &config, &target, ModelApi::ChatCompletions,)
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn incomplete_retained_output_anchors_at_reported_input() {
+        let (store, session) = test_session();
+        let turn = store
+            .start_turn(&session.id, "/tmp", None, &"test".into())
+            .unwrap();
+        let request = Request {
+            model: ResolvedModelRef {
+                canonical: "source/model".into(),
+                provider_id: "source".into(),
+                model_id: "model".into(),
+                effort: None,
+            },
+            cache_key: None,
+            messages: store.load_context_messages(&session.id).unwrap(),
+            bash: true,
+            max_output_tokens: None,
+        };
+        let native = request.json(ModelApi::ChatCompletions).unwrap();
+        let exchange = store
+            .start_provider_request(
+                &session.id,
+                &turn,
+                "agent",
+                ProviderOrigin {
+                    canonical_model_ref: "source/model".into(),
+                    provider_id: "source".into(),
+                    api: "chat_completions".into(),
+                    endpoint: "http://localhost/chat/completions".into(),
+                    wire_model: "model".into(),
+                    effort: None,
+                },
+                store
+                    .request_recipe(
+                        "openai.chat_completions.v1",
+                        &native,
+                        serde_json::json!({
+                            "kind": "agent",
+                            "context_through_seq":
+                                store.current_context_seq(&session.id).unwrap(),
+                            "native_replay_origins": [],
+                        }),
+                    )
+                    .unwrap(),
+                None,
+            )
+            .unwrap();
+        store
+            .complete_assistant_exchange_record(
+                &session.id,
+                &exchange,
+                AssistantCompletion {
+                    message: &Message::assistant(Some("12345678".into()), None, None, None),
+                    native_response: None,
+                    usage: Some(&Usage {
+                        input_tokens: 80,
+                        output_tokens: 20,
+                        total_tokens: 100,
+                        ..Usage::default()
+                    }),
+                    resumable: false,
+                    context_output_complete: false,
+                },
+            )
+            .unwrap();
+        let config = context_test_config(None, None);
+        let target = crate::models::resolve_model_ref(&config, "source/model").unwrap();
+
+        assert_eq!(
+            store
+                .context_tokens(&session.id, &config, &target, ModelApi::ChatCompletions,)
+                .unwrap(),
+            ContextTokenEstimate {
+                tokens: 82,
+                reported: false,
+            }
+        );
+    }
+
+    #[test]
+    fn context_anchor_uses_recorded_replay_selection_after_config_drift() {
+        let (store, session) = test_session();
+        store
+            .start_turn(&session.id, "/tmp", None, &"test".into())
+            .unwrap();
+        store
+            .append_message(
+                &session.id,
+                &Message::assistant(
+                    Some("answer".into()),
+                    None,
+                    None,
+                    Some(NativeReplay {
+                        provider_id: "legacy".into(),
+                        endpoint: "http://localhost/responses".into(),
+                        model: "model".into(),
+                        payload: NativeReplayPayload::ResponsesOutput(vec![
+                            serde_json::json!({
+                                "type": "reasoning",
+                                "encrypted_content": "x".repeat(1_000_000),
+                            }),
+                            serde_json::json!({
+                                "type": "message",
+                                "content": [{"type": "output_text", "text": "answer"}],
+                            }),
+                        ]),
+                    }),
+                ),
+            )
+            .unwrap();
+        let mut config = context_test_config(Some("shared"), Some("shared"));
+        config.providers = OrderedMap::from_iter([
+            (
+                "source".into(),
+                ProviderConfig {
+                    endpoint: "http://localhost/responses".into(),
+                    api_key_env: String::new(),
+                    models: OrderedMap::from_iter([(
+                        "model".into(),
+                        ModelConfig {
+                            context_window: Some(200_000),
+                            supported_efforts: None,
+                            replay_key: Some("shared".into()),
+                        },
+                    )]),
+                },
+            ),
+            (
+                "legacy".into(),
+                ProviderConfig {
+                    endpoint: "http://localhost/responses".into(),
+                    api_key_env: String::new(),
+                    models: OrderedMap::from_iter([(
+                        "model".into(),
+                        ModelConfig {
+                            context_window: Some(200_000),
+                            supported_efforts: None,
+                            replay_key: Some("shared".into()),
+                        },
+                    )]),
+                },
+            ),
+        ]);
+        let target = crate::models::resolve_model_ref(&config, "source/model").unwrap();
+        let messages = filter_native_replay_for_config(
+            &store.load_context_messages(&session.id).unwrap(),
+            &config,
+            &target,
+            ModelApi::Responses,
+        );
+        let request = Request {
+            model: target.clone(),
+            cache_key: None,
+            messages: messages.clone(),
+            bash: true,
+            max_output_tokens: None,
+        };
+        let native = request.json(ModelApi::Responses).unwrap();
+        let exchange = store
+            .start_provider_request(
+                &session.id,
+                &store.current_turn_id(&session.id).unwrap(),
+                "agent",
+                ProviderOrigin {
+                    canonical_model_ref: target.canonical.clone(),
+                    provider_id: target.provider_id.clone(),
+                    api: ModelApi::Responses.name().into(),
+                    endpoint: "http://localhost/responses".into(),
+                    wire_model: target.model_id.clone(),
+                    effort: None,
+                },
+                store
+                    .request_recipe(
+                        ModelApi::Responses.request_format(),
+                        &native,
+                        serde_json::json!({
+                            "kind": "agent",
+                            "context_through_seq":
+                                store.current_context_seq(&session.id).unwrap(),
+                            "native_replay_origins": native_replay_origins(&messages),
+                        }),
+                    )
+                    .unwrap(),
+                None,
+            )
+            .unwrap();
+        store
+            .complete_assistant_exchange(
+                &session.id,
+                &exchange,
+                &Message::assistant(Some("done".into()), None, None, None),
+                None,
+                Some(&Usage {
+                    input_tokens: 180,
+                    output_tokens: 20,
+                    total_tokens: 200,
+                    ..Usage::default()
+                }),
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .context_tokens(&session.id, &config, &target, ModelApi::Responses)
+                .unwrap(),
+            ContextTokenEstimate {
+                tokens: 200,
+                reported: true,
+            }
+        );
+
+        config
+            .providers
+            .iter_mut()
+            .find(|(provider, _)| provider.as_str() == "source")
+            .unwrap()
+            .1
+            .models
+            .iter_mut()
+            .find(|(model, _)| model.as_str() == "model")
+            .unwrap()
+            .1
+            .replay_key = Some("changed".into());
+        let target = crate::models::resolve_model_ref(&config, "source/model").unwrap();
+        assert!(
+            !store
+                .context_tokens(&session.id, &config, &target, ModelApi::Responses)
+                .unwrap()
+                .reported
+        );
+    }
+
+    #[test]
+    fn projected_compaction_context_matches_applied_journal() {
+        let (store, session) = test_session();
+        store
+            .start_turn(&session.id, "/tmp", None, &"test".into())
+            .unwrap();
+        store
+            .queue_prompt(&session.id, "/other", Some("/repo"), &"queued".into())
+            .unwrap();
+        let source_turn_id = store
+            .start_compaction_turn(
+                &session.id,
+                CompactionStart {
+                    cwd: "/tmp",
+                    prompt: &"compact".into(),
+                    trigger: CompactionTrigger::Manual,
+                    mode: CompactionMode::AwaitUser,
+                    before_context_tokens: 100,
+                    before_context_window: Some(200_000),
+                },
+            )
+            .unwrap();
+        let exchange = store
+            .start_test_provider_request(&session.id, &source_turn_id, "agent")
+            .unwrap();
+        store
+            .complete_assistant_exchange(
+                &session.id,
+                &exchange,
+                &Message::assistant(Some("summary".into()), None, None, None),
+                None,
+                None,
+            )
+            .unwrap();
+        let config = context_test_config(None, None);
+        let target = crate::models::resolve_model_ref(&config, "source/model").unwrap();
+        let checkpoint = crate::compaction::checkpoint("summary", CompactionMode::AwaitUser, 1);
+        let projected = store
+            .projected_compaction_context_tokens(
+                &session.id,
+                CompactionMode::AwaitUser,
+                &checkpoint,
+                &config,
+                &target,
+                ModelApi::ChatCompletions,
+            )
+            .unwrap();
+
+        store
+            .apply_compaction(
+                &session.id,
+                CompactionApplication {
+                    source_turn_id: &source_turn_id,
+                    trigger: CompactionTrigger::Manual,
+                    mode: CompactionMode::AwaitUser,
+                    summary: "summary",
+                    checkpoint: &checkpoint,
+                    before_context_tokens: 100,
+                    before_context_window: Some(200_000),
+                    after_context_tokens_estimate: projected,
+                    after_context_window: Some(200_000),
+                    elapsed_ms: 1,
+                    emergency_elided_call_ids: &[],
+                },
+            )
+            .unwrap();
+        store.materialize_queued_prompt(&session.id).unwrap();
+
+        assert_eq!(
+            projected,
+            store
+                .context_tokens(&session.id, &config, &target, ModelApi::ChatCompletions,)
+                .unwrap()
+                .tokens
+        );
     }
 
     #[test]

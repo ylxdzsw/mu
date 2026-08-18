@@ -405,6 +405,9 @@ result such as
 `[mu] compacted epoch 3 → 4: context 85.4% → ~18.6% (~37,200 tokens) · 2.4s`
 follows. The rebuilt percentage remains estimated until a later provider
 response supplies exact usage.
+Context gauges and compaction thresholds use the latest compatible
+provider-reported usage, estimating only messages added afterward. A `~`
+prefix marks a percentage that still includes estimated tokens.
 
 Soft compaction runs before a queued new prompt is materialized. Hard
 compaction runs between completed Bash results and their model continuation.

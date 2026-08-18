@@ -118,6 +118,7 @@ hard threshold is
 the lower of
 `floor(context_window * hard_fraction)` and
 `context_window.saturating_sub(hard_headroom_tokens)`.
+Both fractions must be greater than zero and at most one.
 
 Compaction asks the active model to summarize the exact current context as a
 normal persisted agent turn, then replaces the model-facing history with the
@@ -130,9 +131,15 @@ Bash requests, commands, and stdin remain intact. The same error during an
 emergency attempt is fatal. Compaction output is capped at
 `hard_headroom_tokens`, which must be greater than zero.
 
-Context accounting keeps a compatible provider-reported total and estimates
-only later prompts or tool results; providers are compatible when their API,
-model id, and effective `replay_key` match.
+Context accounting uses the latest compatible provider-reported usage and
+estimates only later messages. Compatibility requires the same API and model
+id, a compatible effective `replay_key`, and the same native replay selection
+as the historical request. A reported total is used only when the accepted
+assistant output is fully represented in replay; otherwise Mu anchors at the
+reported input and estimates retained output and later messages. With no
+compatible report, Mu estimates the full context. Estimated percentages have a
+`~` prefix.
+
 `limits.max_iterations` caps one agent turn; the other limits bound the
 model-visible preview of bash output by lines, total bytes, and bytes per line.
 The bell sounds only for turns lasting at least `min_duration_ms`. The guardrail

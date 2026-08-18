@@ -1021,7 +1021,7 @@ impl Renderer {
         cache_read_input_tokens: u64,
         cache_write_input_tokens: Option<u64>,
         output_tokens: u64,
-        context_pct: Option<f64>,
+        context_pct: Option<(f64, bool)>,
         elapsed: Duration,
     ) -> io::Result<()> {
         if matches!(self.format, OutputFormat::Final | OutputFormat::Concise) {
@@ -4238,11 +4238,11 @@ fn format_turn_summary(
     cache_read_input_tokens: u64,
     cache_write_input_tokens: Option<u64>,
     output_tokens: u64,
-    context_pct: Option<f64>,
+    context_pct: Option<(f64, bool)>,
     elapsed: Duration,
 ) -> String {
     let ctx = context_pct
-        .map(|p| format!("{p:.0}%"))
+        .map(|(percent, estimated)| format!("{}{percent:.0}%", if estimated { "~" } else { "" }))
         .unwrap_or_else(|| "?".into());
     let mut cache = Vec::new();
     if cache_read_input_tokens > 0 {
@@ -4958,18 +4958,43 @@ mod tests {
                 567,
                 Some(89),
                 12_345,
-                Some(12.0),
+                Some((12.0, false)),
                 Duration::from_millis(4200),
             ),
             "[mu] tokens: 1,234 in (+567 cache read, +89 cache write) / 12,345 out  context: 12%  time: 4.2s"
         );
         assert_eq!(
-            format_turn_summary(600, 500, None, 456, Some(12.0), Duration::from_millis(932),),
+            format_turn_summary(
+                600,
+                500,
+                None,
+                456,
+                Some((12.0, false)),
+                Duration::from_millis(932),
+            ),
             "[mu] tokens: 600 in (+500 cache read) / 456 out  context: 12%  time: 932ms"
         );
         assert_eq!(
-            format_turn_summary(600, 0, None, 456, Some(12.0), Duration::from_millis(1100),),
+            format_turn_summary(
+                600,
+                0,
+                None,
+                456,
+                Some((12.0, false)),
+                Duration::from_millis(1100),
+            ),
             "[mu] tokens: 600 in / 456 out  context: 12%  time: 1.1s"
+        );
+        assert_eq!(
+            format_turn_summary(
+                600,
+                0,
+                None,
+                456,
+                Some((38.0, true)),
+                Duration::from_secs(1),
+            ),
+            "[mu] tokens: 600 in / 456 out  context: ~38%  time: 1.0s"
         );
     }
 

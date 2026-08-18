@@ -21,8 +21,8 @@ use crate::provider::{
 use crate::renderer::{CompactionReport, Renderer};
 use crate::runtime::resume_session_fallback;
 use crate::store::{
-    BashResultRecord, CompactionApplication, CompactionMode, CompactionStart, CompactionTrigger,
-    PendingCompaction, ProviderOrigin, RESUME_PROMPT, Store,
+    AssistantCompletion, BashResultRecord, CompactionApplication, CompactionMode, CompactionStart,
+    CompactionTrigger, PendingCompaction, ProviderOrigin, RESUME_PROMPT, Store,
 };
 use bash::RunningBash;
 
@@ -51,11 +51,11 @@ impl std::error::Error for AutoResumeExhausted {}
 
 pub struct TurnResult {
     pub usage: Usage,
-    /// Total tokens reported by the *last* model call of the turn — i.e. the
-    /// current context size. Distinct from `usage.total_tokens`, which is
-    /// cumulative across every call in the turn. Drives the context-fullness
-    /// gauge; unlike cumulative turn usage, this is the latest request size.
+    /// Current model-facing context size. This uses the latest compatible
+    /// provider-reported request/response usage as an anchor and estimates only
+    /// the later suffix, falling back to a full estimate when no anchor exists.
     pub context_tokens: u64,
+    pub context_estimated: bool,
     pub context_window: Option<u64>,
     pub final_assistant: Option<String>,
     pub awaiting_user: bool,
@@ -131,17 +131,15 @@ impl<'a> AgentLoop<'a> {
             .store
             .queued_prompt(self.session_id)?
             .ok_or_else(|| anyhow::anyhow!("session has no queued prompt"))?;
-        let context = self.load_context()?;
-        let candidate_tokens = context
-            .iter()
-            .map(Message::approx_tokens)
-            .sum::<u64>()
-            .saturating_add(
-                Message::User {
-                    content: queued.content.clone(),
-                }
-                .approx_tokens(),
-            );
+        let candidate_tokens = self
+            .store
+            .queued_context_tokens(
+                self.session_id,
+                self.config,
+                self.model.active_model(),
+                self.provider.api(),
+            )?
+            .tokens;
         if queued.epoch == self.store.context_epoch(self.session_id)?
             && compaction::should_compact(
                 self.config,
@@ -183,9 +181,11 @@ impl<'a> AgentLoop<'a> {
                 let state = self.active_compaction(pending)?;
                 let mode = state.pending.mode;
                 self.finish_compaction(&state, &summary)?;
+                let context = self.current_context_estimate()?;
                 TurnResult {
                     usage: Usage::default(),
-                    context_tokens: self.current_context_tokens()?,
+                    context_tokens: context.tokens,
+                    context_estimated: !context.reported,
                     context_window: self.model_context_window,
                     final_assistant: Some(summary),
                     awaiting_user: mode == CompactionMode::AwaitUser,
@@ -253,7 +253,6 @@ impl<'a> AgentLoop<'a> {
         let max_iter = self.config.limits.max_iterations;
 
         let mut total_usage = Usage::default();
-        let mut context_tokens = 0;
         let mut final_assistant = None;
         let mut awaiting_user = false;
 
@@ -261,32 +260,31 @@ impl<'a> AgentLoop<'a> {
         let mut live_provider_retries = 0;
         while iteration < max_iter {
             let (exchange_id, stream_result, mut command_headers) = 'request_gate: loop {
-                if active_compaction.is_none()
-                    && next_request == NextRequest::ToolResults
-                    && compaction::should_compact(
+                if active_compaction.is_none() && next_request == NextRequest::ToolResults {
+                    let before = self.current_context_tokens()?;
+                    if compaction::should_compact(
                         self.config,
                         CompactionTrigger::Hard,
-                        self.current_context_tokens()?,
-                        self.model_context_window,
-                    )
-                {
-                    let before = self.current_context_tokens()?;
-                    self.begin_compaction(
-                        CompactionTrigger::Hard,
-                        CompactionMode::ContinueTurn,
                         before,
-                        None,
-                    )?;
-                    active_compaction =
-                        self.store
-                            .pending_compaction(self.session_id)?
-                            .map(|pending| ActiveCompaction {
-                                pending,
-                                emergency: false,
-                                elided_provider_call_ids: Vec::new(),
-                            });
-                    context = self.load_context()?;
-                    next_request = NextRequest::User;
+                        self.model_context_window,
+                    ) {
+                        self.begin_compaction(
+                            CompactionTrigger::Hard,
+                            CompactionMode::ContinueTurn,
+                            before,
+                            None,
+                        )?;
+                        active_compaction =
+                            self.store
+                                .pending_compaction(self.session_id)?
+                                .map(|pending| ActiveCompaction {
+                                    pending,
+                                    emergency: false,
+                                    elided_provider_call_ids: Vec::new(),
+                                });
+                        context = self.load_context()?;
+                        next_request = NextRequest::User;
+                    }
                 }
 
                 let mut command_headers = StreamingCommandHeaders::default();
@@ -554,9 +552,6 @@ impl<'a> AgentLoop<'a> {
                 total_usage.output_tokens += u.output_tokens;
                 total_usage.reasoning_output_tokens += u.reasoning_output_tokens;
                 total_usage.total_tokens += u.total_tokens;
-                if let Some(tokens) = u.context_total() {
-                    context_tokens = tokens;
-                }
             }
 
             // Only a provider-declared tool-call completion makes streamed calls
@@ -564,6 +559,7 @@ impl<'a> AgentLoop<'a> {
             // accumulated call; retain its native response for audit, but do not
             // turn that partial call into semantic history or execution authority.
             let mut accepted_message = stream_result.message.clone();
+            let mut context_output_complete = true;
             if !matches!(stream_result.finish_reason, FinishReason::ToolCalls)
                 && let Message::Assistant {
                     items,
@@ -574,27 +570,32 @@ impl<'a> AgentLoop<'a> {
                 items.retain(|item| !matches!(item, AssistantItem::BashCall(_)));
                 if items.len() != before {
                     *native_replay = None;
+                    context_output_complete = false;
                 }
+            }
+            if let Message::Assistant {
+                items,
+                native_replay: None,
+            } = &accepted_message
+                && items
+                    .iter()
+                    .any(|item| matches!(item, AssistantItem::Reasoning { .. }))
+            {
+                context_output_complete = false;
             }
             let resumable =
                 self.config.auto_resume && stream_result.finish_reason == FinishReason::Resume;
-            let (_message_id, bash_call_ids) = if resumable {
-                self.store.complete_resumable_assistant_exchange(
-                    self.session_id,
-                    &exchange_id,
-                    &accepted_message,
-                    stream_result.native_response.as_ref(),
-                    stream_result.usage.as_ref(),
-                )?
-            } else {
-                self.store.complete_assistant_exchange(
-                    self.session_id,
-                    &exchange_id,
-                    &accepted_message,
-                    stream_result.native_response.as_ref(),
-                    stream_result.usage.as_ref(),
-                )?
-            };
+            let (_message_id, bash_call_ids) = self.store.complete_assistant_exchange_record(
+                self.session_id,
+                &exchange_id,
+                AssistantCompletion {
+                    message: &accepted_message,
+                    native_response: stream_result.native_response.as_ref(),
+                    usage: stream_result.usage.as_ref(),
+                    resumable,
+                    context_output_complete,
+                },
+            )?;
             current_partial_output.clear();
             context.push(accepted_message.clone());
 
@@ -859,9 +860,11 @@ impl<'a> AgentLoop<'a> {
             live_provider_retries = 0;
         }
 
+        let context_estimate = self.current_context_estimate()?;
         Ok(TurnResult {
             usage: total_usage,
-            context_tokens,
+            context_tokens: context_estimate.tokens,
+            context_estimated: !context_estimate.reported,
             context_window: self.model_context_window,
             final_assistant,
             awaiting_user,
@@ -886,15 +889,16 @@ impl<'a> AgentLoop<'a> {
     }
 
     fn current_context_tokens(&self) -> Result<u64> {
-        Ok(self
-            .store
-            .context_tokens(
-                self.session_id,
-                self.config,
-                self.model.active_model(),
-                self.provider.api(),
-            )?
-            .tokens)
+        Ok(self.current_context_estimate()?.tokens)
+    }
+
+    fn current_context_estimate(&self) -> Result<crate::store::ContextTokenEstimate> {
+        self.store.context_tokens(
+            self.session_id,
+            self.config,
+            self.model.active_model(),
+            self.provider.api(),
+        )
     }
 
     fn begin_compaction(
@@ -962,26 +966,14 @@ impl<'a> AgentLoop<'a> {
     fn finish_compaction(&mut self, state: &ActiveCompaction, summary: &str) -> Result<()> {
         let to_epoch = state.pending.from_epoch.saturating_add(1);
         let checkpoint = compaction::checkpoint(summary, state.pending.mode, to_epoch);
-        let mut projected = self.store.load_context_messages(self.session_id)?;
-        let system = projected
-            .drain(..1)
-            .next()
-            .ok_or_else(|| anyhow::anyhow!("compaction context has no system message"))?;
-        let mut next_context = vec![
-            system,
-            Message::User {
-                content: checkpoint.clone().into(),
-            },
-        ];
-        if state.pending.mode == CompactionMode::AwaitUser
-            && let Some(queued) = self.store.queued_prompt(self.session_id)?
-        {
-            next_context.push(Message::User {
-                content: queued.content,
-            });
-        }
-        let after_context_tokens_estimate =
-            next_context.iter().map(Message::approx_tokens).sum::<u64>();
+        let after_context_tokens_estimate = self.store.projected_compaction_context_tokens(
+            self.session_id,
+            state.pending.mode,
+            &checkpoint,
+            self.config,
+            self.model.active_model(),
+            self.provider.api(),
+        )?;
         let elapsed = DateTime::parse_from_rfc3339(&state.pending.started_at)
             .ok()
             .and_then(|started| (Utc::now() - started.with_timezone(&Utc)).to_std().ok())
@@ -2831,6 +2823,8 @@ mod tests {
         let result = agent.run_turn().await.unwrap();
 
         assert_eq!(result.final_assistant.as_deref(), Some("recovered"));
+        assert!(result.context_tokens > 0);
+        assert!(result.context_estimated);
         let tool_messages: Vec<_> = store
             .load_context_messages(&session.id)
             .unwrap()
@@ -3300,6 +3294,7 @@ mod tests {
         assert!(result.usage.total_tokens >= result.usage.input_tokens);
         // context_tokens reflects only the final call — the current context size.
         assert_eq!(result.context_tokens, 140);
+        assert!(!result.context_estimated);
 
         let _ = std::fs::remove_dir_all(tmp);
     }
@@ -3384,6 +3379,8 @@ mod tests {
         // A `length` finish still surfaces the streamed assistant text to
         // `--output final`, rather than emitting nothing.
         assert_eq!(result.final_assistant.as_deref(), Some("partial answer"));
+        assert_eq!(result.context_tokens, 9);
+        assert!(result.context_estimated);
         assert!(store.is_session_clean(&session.id).unwrap());
         let messages = store.load_context_messages(&session.id).unwrap();
         assert!(

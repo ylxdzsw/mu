@@ -1256,9 +1256,12 @@ async fn run_turn(args: RunTurnArgs<'_>) -> Result<()> {
 
     match &result {
         Ok(r) => {
-            let ctx_pct = r
-                .context_window
-                .map(|cw| (r.context_tokens as f64 / cw as f64) * 100.0);
+            let ctx_pct = r.context_window.map(|cw| {
+                (
+                    (r.context_tokens as f64 / cw as f64) * 100.0,
+                    r.context_estimated,
+                )
+            });
             renderer.finish_turn()?;
             if output == OutputFormat::Final {
                 write_final_stdout(r.final_assistant.as_deref())?;

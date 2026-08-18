@@ -436,6 +436,14 @@ impl Config {
         if self.compaction.hard_headroom_tokens == 0 {
             bail!("`compaction.hard_headroom_tokens` must be greater than zero");
         }
+        for (name, fraction) in [
+            ("soft_fraction", self.compaction.soft_fraction),
+            ("hard_fraction", self.compaction.hard_fraction),
+        ] {
+            if !fraction.is_finite() || !(0.0..=1.0).contains(&fraction) || fraction == 0.0 {
+                bail!("`compaction.{name}` must be greater than zero and at most one");
+            }
+        }
         for (provider_id, provider) in &self.providers {
             if provider.endpoint.trim().is_empty() {
                 bail!(
@@ -826,6 +834,25 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(error.contains("must be greater than zero"), "{error}");
+    }
+
+    #[test]
+    fn compaction_fractions_must_be_valid_proportions() {
+        for (name, value) in [("soft_fraction", 0.0), ("hard_fraction", 1.01)] {
+            let error = config_from_value(serde_json::json!({
+                "providers": {
+                    "openai": {
+                        "endpoint": "http://localhost/chat/completions",
+                        "models": {"gpt-4o": {"context_window": 128000}}
+                    }
+                },
+                "compaction": {name: value},
+            }))
+            .unwrap_err()
+            .to_string();
+            assert!(error.contains(name), "{error}");
+            assert!(error.contains("at most one"), "{error}");
+        }
     }
 
     #[test]

@@ -53,7 +53,7 @@ pub fn checkpoint(summary: &str, mode: CompactionMode, epoch: u64) -> String {
 }
 
 pub fn soft_compaction_threshold(context_window: u64, soft_fraction: f64) -> u64 {
-    (context_window as f64 * soft_fraction).floor() as u64
+    fraction_threshold(context_window, soft_fraction)
 }
 
 pub fn hard_compaction_threshold(
@@ -61,9 +61,20 @@ pub fn hard_compaction_threshold(
     hard_fraction: f64,
     hard_headroom_tokens: u64,
 ) -> u64 {
-    let fraction_threshold = (context_window as f64 * hard_fraction).floor() as u64;
+    let fraction_threshold = fraction_threshold(context_window, hard_fraction);
     let fixed_headroom_threshold = context_window.saturating_sub(hard_headroom_tokens);
     fraction_threshold.min(fixed_headroom_threshold)
+}
+
+fn fraction_threshold(context_window: u64, fraction: f64) -> u64 {
+    let product = context_window as f64 * fraction;
+    let integer = product.round();
+    let tolerance = f64::EPSILON * product.abs().max(1.0) * 4.0;
+    if (product - integer).abs() <= tolerance {
+        integer as u64
+    } else {
+        product.floor() as u64
+    }
 }
 
 pub fn should_compact(
@@ -156,6 +167,8 @@ mod tests {
     fn threshold_math_preserves_fixed_headroom() {
         assert_eq!(soft_compaction_threshold(200_000, 0.70), 140_000);
         assert_eq!(hard_compaction_threshold(200_000, 0.85, 48_000), 152_000);
+        assert_eq!(soft_compaction_threshold(353_000, 0.70), 247_100);
+        assert_eq!(hard_compaction_threshold(353_000, 0.85, 1), 300_050);
     }
 
     #[test]
