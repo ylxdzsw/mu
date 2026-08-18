@@ -121,8 +121,8 @@ List recent sessions in the active scope. The default limit is 20.
 Replay a persisted session without contacting a provider, defaulting to the
 last selected session and `detail` output. `--html` emits a browser-viewable
 xterm.js document whose pinned assets are loaded from jsDelivr when opened. The
-browser terminal fits its available viewport and debounces size updates while
-the page is resized.
+browser terminal keeps a centered 100-column width, scrolls horizontally on
+narrower viewports, and debounces vertical fitting while the page is resized.
 The default replay includes synthetic compaction turns and their derived
 trigger/result lines; `final` omits those internals. `--epoch` limits replay to
 activity sent under one context-epoch cache key. A compaction request and its

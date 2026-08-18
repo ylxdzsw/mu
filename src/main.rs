@@ -641,19 +641,22 @@ fn transcript_html(ansi: &str) -> Result<String> {
 <title>Mu transcript</title>
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/css/xterm.css">
 <style>
-html,body,#terminal {{ height:100%; margin:0 }}
+html,body,#terminal-scroll,#terminal {{ height:100%; margin:0 }}
 body {{ box-sizing:border-box; padding:16px; background:#000 }}
-#terminal {{ width:100%; max-width:100%; overflow:hidden }}
+#terminal-scroll {{ overflow-x:auto; overflow-y:hidden }}
+#terminal {{ margin:0 auto; overflow:hidden }}
 </style>
 </head>
 <body>
-<div id="terminal"></div>
+<div id="terminal-scroll"><div id="terminal"></div></div>
 <script src="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/lib/xterm.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/@xterm/addon-fit@0.10.0/lib/addon-fit.js"></script>
 <script>
+const columns = {TRANSCRIPT_HTML_COLUMNS};
+const scrollElement = document.getElementById("terminal-scroll");
 const terminalElement = document.getElementById("terminal");
 const term = new Terminal({{
-  cols:{TRANSCRIPT_HTML_COLUMNS}, rows:30, convertEol:true, disableStdin:true, scrollback:100000,
+  cols:columns, rows:30, convertEol:true, disableStdin:true, scrollback:100000,
   fontFamily:"ui-monospace,SFMono-Regular,Menlo,Consolas,monospace",
   theme:{{background:"#000000"}}
 }});
@@ -661,12 +664,21 @@ const fitAddon = new FitAddon.FitAddon();
 term.loadAddon(fitAddon);
 term.open(terminalElement);
 fitAddon.fit();
+const screenElement = terminalElement.querySelector(".xterm-screen");
+const horizontalGutter = Math.max(0, terminalElement.clientWidth - screenElement.clientWidth);
+term.resize(columns, term.rows);
+terminalElement.style.width = Math.ceil(screenElement.getBoundingClientRect().width + horizontalGutter) + "px";
+const fitVertically = () => {{
+  const dimensions = fitAddon.proposeDimensions();
+  if (dimensions) term.resize(columns, dimensions.rows);
+}};
+fitVertically();
 let fitTimer;
 const scheduleFit = () => {{
   clearTimeout(fitTimer);
-  fitTimer = setTimeout(() => fitAddon.fit(), 50);
+  fitTimer = setTimeout(fitVertically, 50);
 }};
-new ResizeObserver(scheduleFit).observe(terminalElement);
+new ResizeObserver(scheduleFit).observe(scrollElement);
 term.write({transcript});
 </script>
 </body>
@@ -1808,8 +1820,10 @@ mod tests {
         assert!(html.contains("@xterm/addon-fit@0.10.0"));
         assert!(html.contains("new FitAddon.FitAddon()"));
         assert!(html.contains("term.loadAddon(fitAddon)"));
-        assert!(html.contains("fitTimer = setTimeout(() => fitAddon.fit(), 50)"));
-        assert!(html.contains("new ResizeObserver(scheduleFit).observe(terminalElement)"));
+        assert!(html.contains("const columns = 100"));
+        assert!(html.contains("term.resize(columns, dimensions.rows)"));
+        assert!(html.contains("fitTimer = setTimeout(fitVertically, 50)"));
+        assert!(html.contains("new ResizeObserver(scheduleFit).observe(scrollElement)"));
         assert!(html.contains(r#"term.write("\u003c/script>\n")"#));
     }
 

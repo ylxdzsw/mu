@@ -196,8 +196,9 @@ redirected output is ANSI-free. Each user turn includes a synthesized shell
 status line with its requested model, recorded cwd, and historical context
 percentage when the model remains configured. HTML export is a single file
 containing the terminal transcript and loads pinned xterm.js assets from
-jsDelivr when opened. The browser terminal fits its available viewport and
-debounces size updates while the page is resized.
+jsDelivr when opened. The browser terminal keeps a centered 100-column width,
+scrolls horizontally on narrower viewports, and debounces vertical fitting
+while the page is resized.
 `mu compact` compacts the current session; pass `-s <id>` to select another
 session in the active scope.
 
