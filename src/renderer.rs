@@ -75,6 +75,7 @@ pub struct Renderer {
     live_line_rendered: bool,
     reasoning: Option<ReasoningState>,
     reasoning_run_started: Option<Instant>,
+    reasoning_run_title: Option<String>,
     bash_preview: Option<BashPreviewState>,
     concise_tool: Option<ConciseToolState>,
     last_committed_was_tool: bool,
@@ -208,6 +209,7 @@ impl Renderer {
             live_line_rendered: false,
             reasoning: None,
             reasoning_run_started: None,
+            reasoning_run_title: None,
             bash_preview: None,
             concise_tool: None,
             last_committed_was_tool: false,
@@ -428,17 +430,23 @@ impl Renderer {
         if part_index != 0 {
             return Ok(());
         }
-        let Some(reasoning) = self.reasoning.as_mut() else {
-            return Ok(());
+        let new_title = {
+            let Some(reasoning) = self.reasoning.as_mut() else {
+                return Ok(());
+            };
+            if reasoning.committed || reasoning.visibility != ReasoningVisibility::Opaque {
+                return Ok(());
+            }
+            reasoning.summary.push_str(text);
+            if reasoning.title.is_none() {
+                reasoning.title = extract_reasoning_summary_title(&reasoning.summary, false);
+            }
+            reasoning.title.clone()
         };
-        if reasoning.committed || reasoning.visibility != ReasoningVisibility::Opaque {
-            return Ok(());
+        if let Some(title) = new_title {
+            self.reasoning_run_title = Some(title);
         }
-        reasoning.summary.push_str(text);
-        if reasoning.title.is_none() {
-            reasoning.title = extract_reasoning_summary_title(&reasoning.summary, false);
-        }
-        if self.styled && self.format != OutputFormat::Concise {
+        if self.styled {
             self.live_line = Some(LiveLine::Thinking);
             self.render_live_line()?;
         }
@@ -466,6 +474,12 @@ impl Renderer {
         if reasoning.committed {
             return Ok(());
         }
+        if self.format != OutputFormat::Full && reasoning.title.is_none() {
+            reasoning.title = extract_reasoning_summary_title(&reasoning.summary, true);
+        }
+        if let Some(title) = reasoning.title.clone() {
+            self.reasoning_run_title = Some(title);
+        }
         if self.format == OutputFormat::Concise {
             reasoning.committed = true;
             self.clear_live_line()?;
@@ -479,9 +493,6 @@ impl Renderer {
                 self.ensure_line_start()?;
             }
             return Ok(());
-        }
-        if reasoning.title.is_none() {
-            reasoning.title = extract_reasoning_summary_title(&reasoning.summary, true);
         }
         let tokens = match reasoning.visibility {
             ReasoningVisibility::StreamedTrace => Some(
@@ -514,6 +525,7 @@ impl Renderer {
     fn end_reasoning_run(&mut self) -> io::Result<()> {
         self.reasoning_end(None)?;
         self.reasoning_run_started = None;
+        self.reasoning_run_title = None;
         Ok(())
     }
 
@@ -725,6 +737,7 @@ impl Renderer {
         self.live_line = None;
         self.reasoning = None;
         self.reasoning_run_started = None;
+        self.reasoning_run_title = None;
         self.bash_preview = None;
         self.concise_tool = None;
         Ok(())
@@ -1216,7 +1229,10 @@ impl Renderer {
                     (reasoning.visibility == ReasoningVisibility::StreamedTrace).then(|| {
                         format!("~{}", approx_tokens_from_chars(reasoning.reasoning_chars))
                     }),
-                    reasoning.title.as_deref(),
+                    reasoning
+                        .title
+                        .as_deref()
+                        .or(self.reasoning_run_title.as_deref()),
                     true,
                 ))
             }
@@ -4754,6 +4770,7 @@ mod tests {
             transcript.contains("] Inspecting renderer state\n"),
             "{transcript:?}"
         );
+        assert!(!transcript.contains("Details"), "{transcript:?}");
         assert!(!transcript.contains("token"), "{transcript:?}");
 
         // Without summary: timer only, still no token count
@@ -4796,7 +4813,7 @@ mod tests {
 
     #[test]
     fn consecutive_opaque_reasoning_updates_title_without_resetting_timer() {
-        let (mut renderer, _, _) =
+        let (mut renderer, output, _) =
             Renderer::with_test_output(OutputFormat::Concise, true, true, None);
         renderer
             .reasoning_start(ReasoningVisibility::Opaque)
@@ -4805,13 +4822,29 @@ mod tests {
         renderer.reasoning_run_started = Some(started);
         renderer.reasoning.as_mut().unwrap().started = started;
         renderer
-            .reasoning_summary_delta(0, "**First title**\n")
+            .reasoning_summary_delta(0, "**First title**\n\nIgnored detail")
             .unwrap();
+        assert!(output.transcript().contains("\r\x1b[2K"));
+        assert!(
+            strip_ansi(&output.transcript()).ends_with("[thought 3.0s] First title"),
+            "{:?}",
+            output.transcript()
+        );
+        assert!(!output.transcript().contains("Ignored detail"));
+        renderer.thinking_tick().unwrap();
+        assert!(
+            strip_ansi(&renderer.format_live_line().unwrap()).ends_with(" First title"),
+            "{:?}",
+            renderer.format_live_line()
+        );
         renderer.reasoning_end(None).unwrap();
 
         renderer
             .reasoning_start(ReasoningVisibility::Opaque)
             .unwrap();
+        let live = strip_ansi(&renderer.format_live_line().unwrap());
+        assert!(live.ends_with(" First title"), "{live:?}");
+
         let long_title = format!("**{}**\n", "x".repeat(100));
         renderer.reasoning_summary_delta(0, &long_title).unwrap();
 
@@ -4825,6 +4858,15 @@ mod tests {
         assert!(live.contains(" x"), "{live:?}");
         assert!(live.ends_with(ELLIPSIS), "{live:?}");
         assert!(UnicodeWidthStr::width(live.as_str()) <= DEFAULT_TERMINAL_WIDTH);
+
+        renderer.reasoning_end(None).unwrap();
+        renderer.assistant_text("answer").unwrap();
+        renderer
+            .reasoning_start(ReasoningVisibility::Opaque)
+            .unwrap();
+        let live = strip_ansi(&renderer.format_live_line().unwrap());
+        assert!(!live.contains("title"), "{live:?}");
+        assert!(!live.contains('x'), "{live:?}");
     }
 
     #[test]

@@ -377,7 +377,10 @@ interactive turn whose duration meets the configured minimum.
 - Responses and Anthropic reasoning may be opaque. `detail` may show duration
   and a conservative provider summary title; `full` shows only summary text the
   provider exposed.
-- `concise` may use a live reasoning indicator but does not commit it.
+- `concise` may use a live reasoning indicator but does not commit it. A
+  summary title appears as soon as it is identified and remains on timer
+  updates and adjacent reasoning items until another title replaces it or a
+  semantic boundary discards the indicator.
 - `final` suppresses all reasoning and progress.
 
 Opaque reasoning is never invented for display.
