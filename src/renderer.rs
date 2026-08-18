@@ -1425,6 +1425,7 @@ struct DisplayUnit {
 enum OverflowLaneDecision {
     Inapplicable,
     AwaitingWhitespace,
+    AtEnd,
     FollowedByWhitespace(usize),
 }
 
@@ -1480,6 +1481,10 @@ impl TerminalLineWrapper {
             }
 
             match overflow_lane_decision(&units, hard_end, self.column, self.width, complete) {
+                OverflowLaneDecision::AtEnd => {
+                    self.emit_raw_prefix(units.last().unwrap().end, out);
+                    return;
+                }
                 OverflowLaneDecision::FollowedByWhitespace(boundary) => {
                     self.break_at_whitespace(&units, boundary, out);
                     continue;
@@ -1585,7 +1590,7 @@ fn overflow_lane_decision(
                 OverflowLaneDecision::Inapplicable
             }
         }
-        None if complete => OverflowLaneDecision::Inapplicable,
+        None if complete => OverflowLaneDecision::AtEnd,
         None => OverflowLaneDecision::AwaitingWhitespace,
     }
 }
@@ -4420,8 +4425,19 @@ mod tests {
         );
         assert_eq!(
             wrap_terminal_chunks(&["abcdefghij,\nnext"], 10),
-            "abcdefghij\n,\nnext"
+            "abcdefghij,\nnext"
         );
+        let final_text = "abcdefghij.";
+        let final_chunks = final_text.graphemes(true).collect::<Vec<_>>();
+        assert_eq!(wrap_terminal_chunks(&[final_text], 10), final_text);
+        assert_eq!(wrap_terminal_chunks(&final_chunks, 10), final_text);
+        assert_eq!(
+            wrap_terminal_chunks(&["abcdefghij.\nnext"], 10),
+            "abcdefghij.\nnext"
+        );
+
+        let styled_final = format!("abcdefghij,{RESET}");
+        assert_eq!(wrap_terminal_chunks(&[&styled_final], 10), styled_final);
     }
 
     #[test]
