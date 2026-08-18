@@ -643,19 +643,30 @@ fn transcript_html(ansi: &str) -> Result<String> {
 <style>
 html,body,#terminal {{ height:100%; margin:0 }}
 body {{ box-sizing:border-box; padding:16px; background:#000 }}
-#terminal {{ max-width:100%; overflow:hidden }}
+#terminal {{ width:100%; max-width:100%; overflow:hidden }}
 </style>
 </head>
 <body>
 <div id="terminal"></div>
 <script src="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/lib/xterm.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@xterm/addon-fit@0.10.0/lib/addon-fit.js"></script>
 <script>
+const terminalElement = document.getElementById("terminal");
 const term = new Terminal({{
   cols:{TRANSCRIPT_HTML_COLUMNS}, rows:30, convertEol:true, disableStdin:true, scrollback:100000,
   fontFamily:"ui-monospace,SFMono-Regular,Menlo,Consolas,monospace",
   theme:{{background:"#000000"}}
 }});
-term.open(document.getElementById("terminal"));
+const fitAddon = new FitAddon.FitAddon();
+term.loadAddon(fitAddon);
+term.open(terminalElement);
+fitAddon.fit();
+let fitTimer;
+const scheduleFit = () => {{
+  clearTimeout(fitTimer);
+  fitTimer = setTimeout(() => fitAddon.fit(), 50);
+}};
+new ResizeObserver(scheduleFit).observe(terminalElement);
 term.write({transcript});
 </script>
 </body>
@@ -1794,6 +1805,11 @@ mod tests {
         let html = transcript_html("</script>\n").unwrap();
 
         assert!(html.contains("@xterm/xterm@5.5.0"));
+        assert!(html.contains("@xterm/addon-fit@0.10.0"));
+        assert!(html.contains("new FitAddon.FitAddon()"));
+        assert!(html.contains("term.loadAddon(fitAddon)"));
+        assert!(html.contains("fitTimer = setTimeout(() => fitAddon.fit(), 50)"));
+        assert!(html.contains("new ResizeObserver(scheduleFit).observe(terminalElement)"));
         assert!(html.contains(r#"term.write("\u003c/script>\n")"#));
     }
 

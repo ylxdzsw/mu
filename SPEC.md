@@ -845,7 +845,9 @@ and Anthropic reasoning remains omitted. Stored redaction is authoritative.
 Transcript output reuses the normal output densities. It reconstructs the
 historical prompt model, working directory, and prior context usage when the
 journal contains enough information. HTML output is a renderer replay, not a
-second transcript model.
+second transcript model. Its xterm viewport fits the available browser space
+and debounces size updates during resizing; line breaks produced by the
+fixed-width renderer are not reflowed after export.
 
 ### 11.4 Usage accounting
 
