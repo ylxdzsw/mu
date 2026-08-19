@@ -378,9 +378,11 @@ Mu keeps one append-only JSONL journal per session under
 under `<scope>/.mu/objects/`. `current-session` points to the last session
 selected in that scope, so `-c/--continue` and bare `mu retry` do not scan every
 session. Assistant reasoning, text blocks, and Bash calls retain their provider
-block order in new journals and transcript replay. Existing version-1 journals
-upgrade automatically and atomically only when touched; untouched sessions
-remain unchanged. Each active session journal is guarded by a nonblocking
+block order in new journals and transcript replay. Mu reads only its current
+journal version and never migrates session files. Explicitly selected
+incompatible sessions fail; listings skip them with a warning, and an
+incompatible `current-session` is ignored with a warning when a new session can
+be created instead. Each active session journal is guarded by a nonblocking
 advisory lock; different sessions remain independent.
 
 Setting `"output": "concise"` in global or project `config.jsonc` changes the

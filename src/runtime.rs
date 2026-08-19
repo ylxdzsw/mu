@@ -9,7 +9,7 @@ use crate::models::{
     first_model_choice, resolve_model_choice, resolve_model_info,
 };
 use crate::skills::{CommandMeta, SkillMeta};
-use crate::store::{Session, Store};
+use crate::store::{Session, Store, UnsupportedSessionVersion};
 
 #[derive(Debug, Clone, Default)]
 pub struct InvocationOverrides {
@@ -23,6 +23,7 @@ pub struct ResolvedInvocation {
     pub attached_session: Option<Session>,
     pub model: ResolvedModelChoice,
     pub model_fallback: Option<ModelFallback>,
+    pub ignored_current_session: Option<UnsupportedSessionVersion>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -80,6 +81,8 @@ pub struct StatusReport {
     pub commands: Option<Vec<CommandMeta>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub skills: Option<Vec<SkillMeta>>,
+    #[serde(skip)]
+    pub ignored_current_session: Option<UnsupportedSessionVersion>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
@@ -133,18 +136,35 @@ pub fn resolve_invocation(
         bail!("use either -s/--session or -c/--continue, not both");
     }
 
-    let attached_session = if let Some(id) = overrides.session.as_deref() {
-        Some(
-            store
-                .get_session(id)?
-                .ok_or_else(|| crate::ExitError::session_not_found(id))?,
-        )
-    } else if overrides.continue_current {
-        store.current_session()?
+    let (attached_session, mut ignored_current_session) =
+        if let Some(id) = overrides.session.as_deref() {
+            (
+                Some(
+                    store
+                        .get_session(id)?
+                        .ok_or_else(|| crate::ExitError::session_not_found(id))?,
+                ),
+                None,
+            )
+        } else if overrides.continue_current {
+            match store.current_session() {
+                Ok(session) => (session, None),
+                Err(error) => (None, Some(error.downcast::<UnsupportedSessionVersion>()?)),
+            }
+        } else {
+            (None, None)
+        };
+
+    let remembered = if attached_session.is_none()
+        && ignored_current_session.is_none()
+        && overrides.model.is_none()
+    {
+        let (remembered, ignored) = remembered_scope_model(store)?;
+        ignored_current_session = ignored;
+        remembered
     } else {
         None
     };
-
     let mut selection = if let Some(model_ref) = overrides.model.as_deref() {
         RememberedModelSelection {
             model: resolve_model_choice(config, model_ref)?,
@@ -153,7 +173,7 @@ pub fn resolve_invocation(
     } else if let Some(session) = attached_session.as_ref() {
         resolve_session_selection(store, config, session)?
     } else {
-        resolve_scope_selection(store, config)?
+        resolve_scope_selection(config, remembered)?
     };
     if attached_session.is_none() {
         selection.model.reset();
@@ -168,13 +188,26 @@ pub fn resolve_invocation(
         attached_session,
         model: selection.model,
         model_fallback: selection.fallback,
+        ignored_current_session,
     })
 }
 
-fn resolve_scope_selection(store: &Store, config: &Config) -> Result<RememberedModelSelection> {
-    let remembered = store
-        .current_session()?
-        .and_then(|session| session.last_model);
+fn remembered_scope_model(
+    store: &Store,
+) -> Result<(Option<String>, Option<UnsupportedSessionVersion>)> {
+    match store.current_session() {
+        Ok(session) => Ok((session.and_then(|session| session.last_model), None)),
+        Err(error) => match error.downcast::<UnsupportedSessionVersion>() {
+            Ok(unsupported) => Ok((None, Some(unsupported))),
+            Err(error) => Err(error),
+        },
+    }
+}
+
+fn resolve_scope_selection(
+    config: &Config,
+    remembered: Option<String>,
+) -> Result<RememberedModelSelection> {
     if let Some(model_ref) = remembered.as_deref()
         && let Ok(mut model) = resolve_model_choice(config, model_ref)
     {
@@ -210,12 +243,13 @@ fn resolve_session_selection(
                 unavailable: None,
             },
             Err(_) => {
-                let mut selection = resolve_scope_selection(store, config)?;
+                let mut selection =
+                    resolve_scope_selection(config, remembered_scope_model(store)?.0)?;
                 selection.unavailable = Some(model_ref.to_string());
                 selection
             }
         },
-        None => resolve_scope_selection(store, config)?,
+        None => resolve_scope_selection(config, remembered_scope_model(store)?.0)?,
     };
     resume_session_fallback(store, config, &session.id, &mut selection.model)?;
     Ok(selection)
@@ -375,6 +409,7 @@ pub fn build_status_report(
         available_models: includes.models.then(|| available_models(config)),
         commands,
         skills,
+        ignored_current_session: resolved.ignored_current_session,
     })
 }
 
@@ -656,6 +691,49 @@ mod tests {
         assert_eq!(
             resolved.model.active_model().canonical,
             "alpha/default-model"
+        );
+    }
+
+    #[test]
+    fn unsupported_current_session_is_ignored_only_for_implicit_new_session() {
+        let store = Store::open_memory().unwrap();
+        let session = store.create_session("/tmp").unwrap();
+        store.select_session(&session.id).unwrap();
+        store.set_session_version_for_test(&session.id, 1);
+
+        let resolved =
+            resolve_invocation(&store, &test_config(), &InvocationOverrides::default()).unwrap();
+        assert!(resolved.attached_session.is_none());
+        assert_eq!(
+            resolved.ignored_current_session,
+            Some(UnsupportedSessionVersion {
+                session_id: Some(session.id.clone()),
+                found: 1,
+                supported: 2,
+            })
+        );
+
+        let continued = resolve_invocation(
+            &store,
+            &test_config(),
+            &InvocationOverrides {
+                continue_current: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(continued.attached_session.is_none());
+        assert!(continued.ignored_current_session.is_some());
+
+        let explicit = InvocationOverrides {
+            session: Some(session.id),
+            ..Default::default()
+        };
+        assert!(
+            resolve_invocation(&store, &test_config(), &explicit)
+                .unwrap_err()
+                .downcast_ref::<UnsupportedSessionVersion>()
+                .is_some()
         );
     }
 

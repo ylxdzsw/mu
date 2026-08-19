@@ -58,6 +58,11 @@ pub struct SessionSummary {
     pub turn_count: u64,
 }
 
+pub struct SessionListing {
+    pub sessions: Vec<(Session, String)>,
+    pub skipped: Vec<UnsupportedSessionVersion>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TranscriptEvent {
     User {
@@ -298,6 +303,14 @@ struct Meta {
     version: u32,
     session_id: String,
     created_at: String,
+}
+
+#[derive(Deserialize)]
+struct MetaVersion {
+    #[serde(rename = "type")]
+    kind: String,
+    format: String,
+    version: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -622,6 +635,33 @@ impl std::fmt::Display for SessionBusy {
 
 impl std::error::Error for SessionBusy {}
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnsupportedSessionVersion {
+    pub session_id: Option<String>,
+    pub found: u32,
+    pub supported: u32,
+}
+
+impl std::fmt::Display for UnsupportedSessionVersion {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if let Some(session_id) = &self.session_id {
+            write!(
+                f,
+                "session {session_id} uses journal version {}; this Mu supports version {}",
+                self.found, self.supported
+            )
+        } else {
+            write!(
+                f,
+                "session uses journal version {}; this Mu supports version {}",
+                self.found, self.supported
+            )
+        }
+    }
+}
+
+impl std::error::Error for UnsupportedSessionVersion {}
+
 impl Store {
     // Store setup and session discovery.
     pub fn open(root: &Path) -> Result<Self> {
@@ -683,6 +723,20 @@ impl Store {
         self.create_session_with(system_prompt, crate::random::session_id)
     }
 
+    #[cfg(test)]
+    pub fn set_session_version_for_test(&self, session_id: &str, version: u32) {
+        let path = self.session_path(session_id);
+        let text = std::fs::read_to_string(&path).unwrap();
+        let (meta, events) = text.split_once('\n').unwrap();
+        let mut meta: Value = serde_json::from_str(meta).unwrap();
+        meta["version"] = version.into();
+        std::fs::write(
+            path,
+            format!("{}\n{events}", serde_json::to_string(&meta).unwrap()),
+        )
+        .unwrap();
+    }
+
     fn create_session_with(
         &self,
         system_prompt: &str,
@@ -738,8 +792,9 @@ impl Store {
         Ok(Some(self.project_session(&journal)?))
     }
 
-    pub fn list_sessions(&self, limit: usize) -> Result<Vec<(Session, String)>> {
+    pub fn list_sessions(&self, limit: usize) -> Result<SessionListing> {
         let mut sessions = Vec::new();
+        let mut skipped = Vec::new();
         for entry in std::fs::read_dir(self.root.join("sessions"))? {
             let entry = entry?;
             let path = entry.path();
@@ -749,6 +804,15 @@ impl Store {
             let journal = match self.load_path(&path) {
                 Ok(journal) => journal,
                 Err(_) if incomplete_session_initialization(&path)? => continue,
+                Err(error) if error.downcast_ref::<UnsupportedSessionVersion>().is_some() => {
+                    skipped.push(
+                        error
+                            .downcast_ref::<UnsupportedSessionVersion>()
+                            .expect("checked unsupported session version")
+                            .clone(),
+                    );
+                    continue;
+                }
                 Err(error) => return Err(error),
             };
             if !journal
@@ -764,7 +828,8 @@ impl Store {
         }
         sessions.sort_by(|left, right| right.1.cmp(&left.1));
         sessions.truncate(limit);
-        Ok(sessions)
+        skipped.sort_by(|left, right| left.session_id.cmp(&right.session_id));
+        Ok(SessionListing { sessions, skipped })
     }
 
     pub fn session_summary(&self, id: &str) -> Result<Option<SessionSummary>> {
@@ -2637,19 +2702,6 @@ impl Store {
         Ok(request)
     }
 
-    fn verify_request_recipes(&self, journal: &Journal) -> Result<()> {
-        for exchange_id in journal.events.iter().filter_map(|line| match &line.event {
-            Event::ProviderRequested { exchange_id, .. } => Some(exchange_id.as_str()),
-            _ => None,
-        }) {
-            self.reconstruct_provider_request_from(journal, exchange_id)
-                .with_context(|| {
-                    format!("verifying migrated provider request recipe: {exchange_id}")
-                })?;
-        }
-        Ok(())
-    }
-
     // Semantic projections over the durable event stream.
     fn project_session(&self, journal: &Journal) -> Result<Session> {
         let cwd = journal
@@ -3141,14 +3193,11 @@ impl Store {
             .map(str::to_string);
         match journal_version(&mut file)? {
             FORMAT_VERSION => read_journal(&mut file, expected.as_deref(), false),
-            migration::LEGACY_VERSION => {
-                drop(file);
-                let locked = self.open_locked_path(path, expected.as_deref())?;
-                let journal = locked.journal.clone();
-                flock(&locked.file, libc::LOCK_UN)?;
-                Ok(journal)
-            }
-            _ => bail!("unsupported session journal format"),
+            version => Err(anyhow::Error::new(UnsupportedSessionVersion {
+                session_id: expected,
+                found: version,
+                supported: FORMAT_VERSION,
+            })),
         }
     }
 
@@ -3167,8 +3216,11 @@ impl Store {
                 let journal = read_journal(&mut file, expected_id, true)?;
                 Ok(LockedSession { file, journal })
             }
-            migration::LEGACY_VERSION => migration::migrate(self, path, file, expected_id),
-            _ => bail!("unsupported session journal format"),
+            version => Err(anyhow::Error::new(UnsupportedSessionVersion {
+                session_id: expected_id.map(str::to_string),
+                found: version,
+                supported: FORMAT_VERSION,
+            })),
         }
     }
 }
@@ -3394,7 +3446,7 @@ fn journal_version(file: &mut File) -> Result<u32> {
     if !line.ends_with('\n') {
         bail!("session journal has no complete meta line")
     }
-    let meta: Meta = serde_json::from_str(&line).context("decoding session meta")?;
+    let meta: MetaVersion = serde_json::from_str(&line).context("decoding session meta")?;
     if meta.kind != "meta" || meta.format != "mu-session" {
         bail!("unsupported session journal format")
     }
@@ -3464,273 +3516,6 @@ fn read_journal(
         meta,
         events: events.into(),
     })
-}
-
-mod migration {
-    use super::*;
-
-    use crate::provider::NativeReplayPayload;
-
-    pub(super) const LEGACY_VERSION: u32 = 1;
-
-    #[derive(Deserialize)]
-    struct LegacyEventLine {
-        seq: i64,
-        #[serde(rename = "type")]
-        kind: String,
-    }
-
-    #[derive(Deserialize)]
-    struct LegacyAssistant {
-        turn_state: String,
-        #[serde(default)]
-        text: Option<String>,
-        #[serde(default)]
-        reasoning_content: Option<String>,
-        #[serde(default)]
-        native_replay: Option<NativeReplay>,
-        bash_calls: Vec<LegacyBashCall>,
-    }
-
-    #[derive(Clone, Deserialize)]
-    struct LegacyBashCall {
-        call_id: i64,
-        provider_call_id: String,
-        position: usize,
-        arguments: String,
-        #[serde(default)]
-        declared_risk: Option<String>,
-    }
-
-    pub(super) fn migrate(
-        store: &Store,
-        path: &Path,
-        mut old_file: File,
-        expected_id: Option<&str>,
-    ) -> Result<LockedSession> {
-        let (meta, events) = convert(&mut old_file, expected_id)?;
-        let parent = path.parent().context("session journal has no parent")?;
-        let (temporary, mut file) = create_temporary(parent, &meta.session_id)?;
-        let result = (|| {
-            flock(&file, libc::LOCK_EX)?;
-            write_json_line(&mut file, &meta)?;
-            for event in &events {
-                write_json_line(&mut file, event)?;
-            }
-            file.sync_all()?;
-            let journal = read_journal(&mut file, expected_id, false)?;
-            store.verify_request_recipes(&journal)?;
-            std::fs::rename(&temporary, path)?;
-            sync_dir(parent)?;
-            Ok(LockedSession { file, journal })
-        })();
-        if result.is_err() {
-            let _ = std::fs::remove_file(&temporary);
-        }
-        result
-    }
-
-    fn convert(file: &mut File, expected_id: Option<&str>) -> Result<(Meta, Vec<EventLine>)> {
-        let bytes = complete_prefix(file, false)?;
-        if bytes.is_empty() {
-            bail!("session journal has no complete meta line")
-        }
-        let text = std::str::from_utf8(&bytes).context("session journal is not UTF-8")?;
-        let mut lines = text.lines();
-        let mut meta: Meta = serde_json::from_str(lines.next().context("missing session meta")?)
-            .context("decoding session meta")?;
-        if meta.kind != "meta" || meta.format != "mu-session" || meta.version != LEGACY_VERSION {
-            bail!("unsupported session journal format")
-        }
-        if !valid_session_id(&meta.session_id) {
-            bail!("invalid session id in journal meta")
-        }
-        if expected_id.is_some_and(|expected| expected != meta.session_id) {
-            bail!("session filename does not match meta id")
-        }
-
-        let mut events = Vec::new();
-        for (index, line) in lines.enumerate() {
-            let mut value: Value = serde_json::from_str(line)
-                .with_context(|| format!("decoding session event at line {}", index + 2))?;
-            let legacy_line: LegacyEventLine = serde_json::from_value(value.clone())
-                .with_context(|| format!("decoding session event at line {}", index + 2))?;
-            let expected = events
-                .last()
-                .map_or(1, |previous: &EventLine| previous.seq + 1);
-            if legacy_line.seq != expected {
-                bail!(
-                    "noncontiguous session sequence at line {}: expected {}, found {}",
-                    index + 2,
-                    expected,
-                    legacy_line.seq
-                )
-            }
-            if legacy_line.kind == "provider_completed"
-                && value["projection"]["kind"] == "assistant"
-            {
-                let assistant: LegacyAssistant =
-                    serde_json::from_value(value["projection"].clone()).with_context(|| {
-                        format!("decoding v1 assistant projection at line {}", index + 2)
-                    })?;
-                value["projection"] = serde_json::to_value(convert_assistant(assistant)?)?;
-            }
-            events.push(serde_json::from_value(value).with_context(|| {
-                format!("decoding migrated session event at line {}", index + 2)
-            })?);
-        }
-        validate_events(&events)?;
-        meta.version = FORMAT_VERSION;
-        Ok((meta, events))
-    }
-
-    fn convert_assistant(mut assistant: LegacyAssistant) -> Result<Projection> {
-        assistant
-            .bash_calls
-            .sort_unstable_by_key(|call| call.position);
-        let mut provider_ids = HashSet::new();
-        for (position, call) in assistant.bash_calls.iter().enumerate() {
-            if call.position != position {
-                bail!("noncontiguous Bash claim position: {}", call.position)
-            }
-            if !provider_ids.insert(call.provider_call_id.as_str()) {
-                bail!("duplicate Bash claim provider call id")
-            }
-        }
-        let items = recover_native(&assistant).unwrap_or_else(|| canonical_items(&assistant));
-        Ok(Projection::Assistant {
-            turn_state: assistant.turn_state,
-            context_output_complete: true,
-            native_replay: assistant.native_replay,
-            items,
-        })
-    }
-
-    fn canonical_items(assistant: &LegacyAssistant) -> Vec<PersistedAssistantItem> {
-        let mut items = Vec::new();
-        if let Some(text) = &assistant.reasoning_content {
-            items.push(PersistedAssistantItem::Reasoning {
-                text: Some(text.clone()),
-            });
-        }
-        if let Some(text) = &assistant.text {
-            items.push(PersistedAssistantItem::Text { text: text.clone() });
-        }
-        items.extend(assistant.bash_calls.iter().cloned().map(persisted_call));
-        items
-    }
-
-    fn recover_native(assistant: &LegacyAssistant) -> Option<Vec<PersistedAssistantItem>> {
-        if assistant.reasoning_content.is_some() {
-            return None;
-        }
-        match &assistant.native_replay.as_ref()?.payload {
-            NativeReplayPayload::AnthropicContent(blocks) => {
-                recover_blocks(assistant, blocks, true)
-            }
-            NativeReplayPayload::ResponsesOutput(output) => {
-                recover_blocks(assistant, output, false)
-            }
-            NativeReplayPayload::ChatReasoning(_) => None,
-        }
-    }
-
-    fn recover_blocks(
-        assistant: &LegacyAssistant,
-        values: &[Value],
-        anthropic: bool,
-    ) -> Option<Vec<PersistedAssistantItem>> {
-        let claims = assistant
-            .bash_calls
-            .iter()
-            .map(|call| (call.provider_call_id.as_str(), call))
-            .collect::<HashMap<_, _>>();
-        let mut items = Vec::new();
-        let mut matched = Vec::new();
-        let mut text = String::new();
-        let mut text_present = false;
-        for value in values {
-            match (anthropic, value["type"].as_str()) {
-                (true, Some("thinking" | "redacted_thinking")) | (false, Some("reasoning")) => {
-                    items.push(PersistedAssistantItem::Reasoning { text: None });
-                }
-                (true, Some("text")) => {
-                    let part = value["text"].as_str()?;
-                    text.push_str(part);
-                    text_present = true;
-                    items.push(PersistedAssistantItem::Text {
-                        text: part.to_string(),
-                    });
-                }
-                (false, Some("message")) => {
-                    for part in value["content"].as_array().into_iter().flatten() {
-                        let part = match part["type"].as_str() {
-                            Some("output_text") => part["text"].as_str(),
-                            Some("refusal") => part["refusal"].as_str(),
-                            _ => continue,
-                        }?;
-                        text.push_str(part);
-                        text_present = true;
-                        items.push(PersistedAssistantItem::Text {
-                            text: part.to_string(),
-                        });
-                    }
-                }
-                (true, Some("tool_use")) => {
-                    recover_call(value["id"].as_str(), &claims, &mut matched, &mut items);
-                }
-                (false, Some("function_call")) => {
-                    recover_call(value["call_id"].as_str(), &claims, &mut matched, &mut items);
-                }
-                _ => {}
-            }
-        }
-        let expected = assistant
-            .bash_calls
-            .iter()
-            .map(|call| call.provider_call_id.clone())
-            .collect::<Vec<_>>();
-        ((text_present.then_some(text) == assistant.text) && matched == expected).then_some(items)
-    }
-
-    fn recover_call(
-        id: Option<&str>,
-        claims: &HashMap<&str, &LegacyBashCall>,
-        matched: &mut Vec<String>,
-        items: &mut Vec<PersistedAssistantItem>,
-    ) {
-        let Some(id) = id else {
-            return;
-        };
-        if let Some(call) = claims.get(id) {
-            matched.push(call.provider_call_id.clone());
-            items.push(persisted_call((*call).clone()));
-        }
-    }
-
-    fn persisted_call(call: LegacyBashCall) -> PersistedAssistantItem {
-        PersistedAssistantItem::BashCall {
-            call_id: call.call_id,
-            provider_call_id: call.provider_call_id,
-            arguments: call.arguments,
-            declared_risk: call.declared_risk,
-        }
-    }
-
-    fn create_temporary(parent: &Path, session_id: &str) -> Result<(PathBuf, File)> {
-        for _ in 0..SESSION_ID_RETRIES {
-            let suffix = hex(crate::random::random_bytes::<8>()?);
-            let path = parent.join(format!(".{session_id}.migrate-{suffix}"));
-            let mut options = OpenOptions::new();
-            options.read(true).write(true).create_new(true).mode(0o600);
-            match options.open(&path) {
-                Ok(file) => return Ok((path, file)),
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-                Err(error) => return Err(error.into()),
-            }
-        }
-        bail!("could not allocate migration temporary file")
-    }
 }
 
 fn validate_events(events: &[EventLine]) -> Result<()> {
@@ -5050,426 +4835,6 @@ mod tests {
         ));
     }
 
-    fn v1_journal(store: &Store, session_id: &str, prompt: &str, projection: Value) -> Vec<Value> {
-        let native = serde_json::json!({"model":"model","messages":[]});
-        let recipe = store
-            .request_recipe("test.v1", &native, serde_json::json!({"kind":"agent"}))
-            .unwrap();
-        vec![
-            serde_json::json!({
-                "type":"meta",
-                "format":"mu-session",
-                "version":1,
-                "session_id":session_id,
-                "created_at":"2026-01-01T00:00:00.000Z"
-            }),
-            serde_json::json!({
-                "seq":1,
-                "at":"2026-01-01T00:00:00.000Z",
-                "type":"system_prompt",
-                "content":"system"
-            }),
-            serde_json::json!({
-                "seq":2,
-                "at":"2026-01-01T00:00:01.000Z",
-                "type":"turn_started",
-                "turn_id":"t2",
-                "cwd":"/tmp",
-                "prompt":{"kind":"text","text":prompt}
-            }),
-            serde_json::json!({
-                "seq":3,
-                "at":"2026-01-01T00:00:02.000Z",
-                "type":"provider_requested",
-                "turn_id":"t2",
-                "exchange_id":"e3",
-                "purpose":"agent",
-                "origin":{
-                    "canonical_model_ref":"test/model",
-                    "provider_id":"test",
-                    "api":"test",
-                    "endpoint":"",
-                    "wire_model":"model"
-                },
-                "request_recipe":recipe
-            }),
-            serde_json::json!({
-                "seq":4,
-                "at":"2026-01-01T00:00:03.000Z",
-                "type":"provider_completed",
-                "exchange_id":"e3",
-                "projection":projection
-            }),
-        ]
-    }
-
-    fn write_journal(path: &Path, lines: Vec<Value>, tail: &[u8]) {
-        let mut bytes = lines
-            .into_iter()
-            .map(|line| serde_json::to_string(&line).unwrap())
-            .collect::<Vec<_>>()
-            .join("\n")
-            .into_bytes();
-        bytes.push(b'\n');
-        bytes.extend_from_slice(tail);
-        std::fs::write(path, bytes).unwrap();
-    }
-
-    fn write_v1_journal(store: &Store, session_id: &str, projection: Value, tail: &[u8]) {
-        write_journal(
-            &store.session_path(session_id),
-            v1_journal(store, session_id, "go", projection),
-            tail,
-        );
-    }
-
-    fn journal_json(path: &Path) -> Vec<Value> {
-        std::fs::read_to_string(path)
-            .unwrap()
-            .lines()
-            .map(|line| serde_json::from_str(line).unwrap())
-            .collect()
-    }
-
-    #[test]
-    fn v1_migration_is_lazy_ordered_atomic_and_inode_locked() {
-        let store = Store::open_memory().unwrap();
-        let first = store.create_session_seeded("system").unwrap();
-        let untouched = store.create_session_seeded("system").unwrap();
-        let busy = store.create_session_seeded("system").unwrap();
-        let replay = NativeReplay {
-            provider_id: "test".into(),
-            endpoint: String::new(),
-            model: "model".into(),
-            payload: NativeReplayPayload::AnthropicContent(vec![
-                serde_json::json!({"type":"thinking","thinking":"trace","signature":"sig"}),
-                serde_json::json!({"type":"text","text":"before"}),
-                serde_json::json!({"type":"tool_use","id":"audit","name":"other","input":{}}),
-                serde_json::json!({
-                    "type":"tool_use",
-                    "id":"call-1",
-                    "name":"bash",
-                    "input":{"command":"true","risk":"readonly"}
-                }),
-                serde_json::json!({"type":"redacted_thinking","data":"secret"}),
-                serde_json::json!({"type":"text","text":"after"}),
-            ]),
-        };
-        write_v1_journal(
-            &store,
-            &first.id,
-            serde_json::json!({
-                "kind":"assistant",
-                "turn_state":"continue",
-                "text":"beforeafter",
-                "native_replay":replay,
-                "bash_calls":[{
-                    "call_id":1,
-                    "provider_call_id":"call-1",
-                    "position":0,
-                    "arguments":"{\"command\":\"true\",\"risk\":\"readonly\"}",
-                    "declared_risk":"readonly"
-                }]
-            }),
-            br#"{"seq":5,"#,
-        );
-        for session in [&untouched, &busy] {
-            write_v1_journal(
-                &store,
-                &session.id,
-                serde_json::json!({
-                    "kind":"assistant",
-                    "turn_state":"complete",
-                    "text":"",
-                    "reasoning_content":"",
-                    "bash_calls":[]
-                }),
-                &[],
-            );
-        }
-        let untouched_path = store.session_path(&untouched.id);
-        let untouched_bytes = std::fs::read(&untouched_path).unwrap();
-        let untouched_inode = std::fs::metadata(&untouched_path).unwrap().ino();
-        let first_path = store.session_path(&first.id);
-        let first_inode = std::fs::metadata(&first_path).unwrap().ino();
-        store.select_session(&first.id).unwrap();
-
-        let lock = store.acquire_session_lock(&first.id).unwrap();
-        let other = Store::open(&store.root).unwrap();
-        assert!(
-            other
-                .acquire_session_lock(&first.id)
-                .unwrap_err()
-                .downcast_ref::<SessionBusy>()
-                .is_some()
-        );
-        let migrated = journal_json(&first_path);
-        assert_eq!(migrated[0]["version"], 2);
-        assert_eq!(
-            migrated[4]["projection"]["items"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .map(|item| item["type"].as_str().unwrap())
-                .collect::<Vec<_>>(),
-            ["reasoning", "text", "bash_call", "reasoning", "text"]
-        );
-        assert_ne!(std::fs::metadata(&first_path).unwrap().ino(), first_inode);
-        assert_eq!(std::fs::read(&untouched_path).unwrap(), untouched_bytes);
-        assert_eq!(
-            std::fs::metadata(&untouched_path).unwrap().ino(),
-            untouched_inode
-        );
-        drop(lock);
-        assert_eq!(store.current_session().unwrap().unwrap().id, first.id);
-
-        assert_eq!(
-            store.transcript_events(&first.id).unwrap()[1],
-            TranscriptEvent::Assistant {
-                turn_state: "continue".into(),
-                items: vec![
-                    TranscriptAssistantItem::Reasoning(None),
-                    TranscriptAssistantItem::Text("before".into()),
-                    TranscriptAssistantItem::BashCall {
-                        arguments: "{\"command\":\"true\",\"risk\":\"readonly\"}".into(),
-                        result: None,
-                    },
-                    TranscriptAssistantItem::Reasoning(None),
-                    TranscriptAssistantItem::Text("after".into()),
-                ],
-                internal: false,
-            }
-        );
-
-        let busy_path = store.session_path(&busy.id);
-        let busy_bytes = std::fs::read(&busy_path).unwrap();
-        let busy_file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(&busy_path)
-            .unwrap();
-        flock(&busy_file, libc::LOCK_EX).unwrap();
-        assert!(
-            store
-                .get_session(&busy.id)
-                .unwrap_err()
-                .downcast_ref::<SessionBusy>()
-                .is_some()
-        );
-        assert_eq!(std::fs::read(&busy_path).unwrap(), busy_bytes);
-        flock(&busy_file, libc::LOCK_UN).unwrap();
-
-        store.get_session(&untouched.id).unwrap();
-        let canonical = journal_json(&untouched_path);
-        assert_eq!(
-            canonical[4]["projection"]["items"],
-            serde_json::json!([
-                {"type":"reasoning","text":""},
-                {"type":"text","text":""}
-            ])
-        );
-    }
-
-    #[test]
-    fn v1_migration_preserves_historical_request_checksums() {
-        let (store, session) = test_session();
-        let endpoint = "https://example.test/v1/chat/completions";
-        let replay = NativeReplay {
-            provider_id: "test".into(),
-            endpoint: endpoint.into(),
-            model: "model".into(),
-            payload: NativeReplayPayload::ChatReasoning("trace".into()),
-        };
-        let assistant = Message::assistant(
-            Some("running".into()),
-            Some("trace".into()),
-            Some(vec![ToolCall {
-                id: "call-1".into(),
-                arguments: r#"{"command":"true","risk":"readonly"}"#.into(),
-            }]),
-            Some(replay.clone()),
-        );
-        let request = Request {
-            model: ResolvedModelRef {
-                canonical: "test/model".into(),
-                provider_id: "test".into(),
-                model_id: "model".into(),
-                effort: None,
-            },
-            cache_key: None,
-            max_output_tokens: None,
-            messages: vec![
-                Message::System {
-                    content: "system".into(),
-                },
-                Message::User {
-                    content: "[environment]\ncurrent working directory: /tmp".into(),
-                },
-                Message::User {
-                    content: "work".into(),
-                },
-                assistant,
-                Message::Tool {
-                    content: "ok".into(),
-                    attachments: Vec::new(),
-                    tool_call_id: "call-1".into(),
-                },
-            ],
-            bash: true,
-        };
-        let native = request.json(ModelApi::ChatCompletions).unwrap();
-        let recipe = store
-            .request_recipe(
-                "openai.chat_completions.v1",
-                &native,
-                serde_json::json!({
-                    "kind":"agent",
-                    "context_through_seq":5
-                }),
-            )
-            .unwrap();
-        let path = store.session_path(&session.id);
-        let projection = serde_json::json!({
-            "kind":"assistant",
-            "turn_state":"continue",
-            "text":"running",
-            "reasoning_content":"trace",
-            "native_replay":replay,
-            "bash_calls":[{
-                "call_id":1,
-                "provider_call_id":"call-1",
-                "position":0,
-                "arguments":"{\"command\":\"true\",\"risk\":\"readonly\"}",
-                "declared_risk":"readonly"
-            }]
-        });
-        let mut lines = v1_journal(&store, &session.id, "work", projection);
-        lines.extend([
-            serde_json::json!({
-                "seq":5,
-                "at":"2026-01-01T00:00:04.000Z",
-                "type":"bash_completed",
-                "turn_id":"t2",
-                "call_id":1,
-                "outcome":"completed",
-                "output":{"kind":"inline","text":"ok"},
-                "exit_code":0,
-                "duration_ms":1,
-                "attachments":[]
-            }),
-            serde_json::json!({
-                "seq":6,
-                "at":"2026-01-01T00:00:05.000Z",
-                "type":"provider_requested",
-                "turn_id":"t2",
-                "exchange_id":"e6",
-                "purpose":"agent",
-                "origin":{
-                    "canonical_model_ref":"test/model",
-                    "provider_id":"test",
-                    "api":"chat_completions",
-                    "endpoint":endpoint,
-                    "wire_model":"model"
-                },
-                "request_recipe":recipe
-            }),
-        ]);
-        write_journal(&path, lines, &[]);
-
-        let reopened = Store::open(&store.root).unwrap();
-        assert_eq!(
-            reopened
-                .reconstruct_provider_request(&session.id, "e6")
-                .unwrap(),
-            native
-        );
-        assert_eq!(journal_json(&path)[0]["version"], 2);
-    }
-
-    #[test]
-    fn v1_migration_recovers_responses_item_order() {
-        let store = Store::open_memory().unwrap();
-        let session = store.create_session_seeded("system").unwrap();
-        let fallback = store.create_session_seeded("system").unwrap();
-        write_v1_journal(
-            &store,
-            &session.id,
-            serde_json::json!({
-                "kind":"assistant",
-                "turn_state":"continue",
-                "text":"before denied after",
-                "native_replay":NativeReplay {
-                    provider_id:"test".into(),
-                    endpoint:String::new(),
-                    model:"model".into(),
-                    payload:NativeReplayPayload::ResponsesOutput(vec![
-                        serde_json::json!({"type":"reasoning","encrypted_content":"opaque"}),
-                        serde_json::json!({"type":"message","content":[
-                            {"type":"output_text","text":"before"},
-                            {"type":"refusal","refusal":" denied"}
-                        ]}),
-                        serde_json::json!({
-                            "type":"function_call",
-                            "call_id":"call-1",
-                            "name":"bash",
-                            "arguments":"{\"command\":\"true\",\"risk\":\"readonly\"}"
-                        }),
-                        serde_json::json!({"type":"message","content":[
-                            {"type":"output_text","text":" after"}
-                        ]})
-                    ]),
-                },
-                "bash_calls":[{
-                    "call_id":1,
-                    "provider_call_id":"call-1",
-                    "position":0,
-                    "arguments":"{\"command\":\"true\",\"risk\":\"readonly\"}",
-                    "declared_risk":"readonly"
-                }]
-            }),
-            &[],
-        );
-
-        store.get_session(&session.id).unwrap();
-        assert_eq!(
-            journal_json(&store.session_path(&session.id))[4]["projection"]["items"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .map(|item| item["type"].as_str().unwrap())
-                .collect::<Vec<_>>(),
-            ["reasoning", "text", "text", "bash_call", "text"]
-        );
-
-        write_v1_journal(
-            &store,
-            &fallback.id,
-            serde_json::json!({
-                "kind":"assistant",
-                "turn_state":"complete",
-                "text":"authoritative",
-                "native_replay":NativeReplay {
-                    provider_id:"test".into(),
-                    endpoint:String::new(),
-                    model:"model".into(),
-                    payload:NativeReplayPayload::ResponsesOutput(vec![
-                        serde_json::json!({"type":"reasoning","encrypted_content":"opaque"}),
-                        serde_json::json!({"type":"message","content":[
-                            {"type":"output_text","text":"different"}
-                        ]})
-                    ]),
-                },
-                "bash_calls":[]
-            }),
-            &[],
-        );
-        store.get_session(&fallback.id).unwrap();
-        assert_eq!(
-            journal_json(&store.session_path(&fallback.id))[4]["projection"]["items"],
-            serde_json::json!([{"type":"text","text":"authoritative"}])
-        );
-    }
-
     #[test]
     fn short_id_collision_retries_and_journal_replays() {
         let store = Store::open_memory().unwrap();
@@ -5485,6 +4850,41 @@ mod tests {
             .unwrap();
         assert!(turn.starts_with('t'));
         assert_eq!(store.load_context_messages(&session.id).unwrap().len(), 3);
+    }
+
+    #[test]
+    fn unsupported_session_versions_are_reported_without_rewriting() {
+        let store = Store::open_memory().unwrap();
+        let supported = store.create_session_seeded("system").unwrap();
+        let unsupported = store.create_session_seeded("system").unwrap();
+        store.select_session(&unsupported.id).unwrap();
+        store.set_session_version_for_test(&unsupported.id, 1);
+        let path = store.session_path(&unsupported.id);
+        let before = std::fs::read(&path).unwrap();
+
+        let error = store.get_session(&unsupported.id).unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<UnsupportedSessionVersion>(),
+            Some(&UnsupportedSessionVersion {
+                session_id: Some(unsupported.id.clone()),
+                found: 1,
+                supported: FORMAT_VERSION,
+            })
+        );
+        assert!(store.current_session().is_err());
+        assert_eq!(std::fs::read(path).unwrap(), before);
+
+        let listing = store.list_sessions(20).unwrap();
+        assert_eq!(listing.sessions.len(), 1);
+        assert_eq!(listing.sessions[0].0.id, supported.id);
+        assert_eq!(
+            listing.skipped,
+            vec![UnsupportedSessionVersion {
+                session_id: Some(unsupported.id),
+                found: 1,
+                supported: FORMAT_VERSION,
+            }]
+        );
     }
 
     #[test]

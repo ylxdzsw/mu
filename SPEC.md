@@ -765,6 +765,14 @@ metadata and then contiguous, timestamped events. Readers accept only the
 complete newline-terminated prefix; the next writer may truncate an incomplete
 final line, while malformed earlier content is corruption.
 
+Mu accepts only the current journal version and contains no session migration
+path. Explicit selection and management operations that require a session fail
+on an unsupported version. Listing skips incompatible journals with warnings.
+When an unselected turn consults `current-session` only to inherit scope state,
+it may warn, ignore an incompatible target, and create a new session.
+`--continue` uses the same fallback because it does not name a specific
+journal.
+
 The durable event model is:
 
 - **`system_prompt`** — exact initial model-visible prompt.
@@ -790,8 +798,8 @@ events.
 ### 11.1 Session selection and ownership
 
 - `--session ID` selects an existing active-scope journal or exits with code 2.
-- `--continue` follows `current-session`, creating a session only when the
-  pointer is absent or broken.
+- `--continue` follows `current-session`, creating a session when the pointer is
+  absent, broken, or targets an unsupported journal version.
 - No selection creates a fresh session for a turn.
 - `mu new` creates but does not select a session.
 - `current-session` changes only after a submitted turn is durable.

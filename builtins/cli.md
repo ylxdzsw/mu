@@ -114,7 +114,8 @@ as `current-session`.
 
 ### `mu sessions [--limit <count>]`
 
-List recent sessions in the active scope. The default limit is 20.
+List recent sessions in the active scope. The default limit is 20. Sessions
+written in an unsupported journal version are skipped with a warning.
 
 ### `mu transcript [-s <id>] [-o <format>] [--epoch <n>] [--html]`
 
@@ -164,5 +165,11 @@ stdin is an optional custom focus instruction.
 Compaction itself is a persisted synthetic agent turn. If it is interrupted,
 that session rejects new prompts and another `mu compact`; use `mu retry` to
 finish the pending epoch transition.
+
+Mu does not migrate session journals. An explicitly selected session, or a
+management command that requires `current-session`, fails when that journal
+uses an unsupported version. A normal unselected turn can ignore an
+incompatible `current-session`, warn, and create a new session; `--continue`
+uses the same fallback because it does not name a specific journal.
 
 Turn options must not precede a management subcommand.

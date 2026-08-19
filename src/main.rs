@@ -427,6 +427,10 @@ fn resolve_session_or_current(
         .ok_or_else(|| anyhow::anyhow!("no sessions found in active scope"))
 }
 
+fn warn_unsupported_session(error: &store::UnsupportedSessionVersion, action: &str) {
+    eprintln!("[mu] warning: {error}; {action}");
+}
+
 #[derive(Clone, Default)]
 struct TranscriptBuffer(Arc<Mutex<Vec<u8>>>);
 
@@ -758,8 +762,11 @@ async fn run() -> Result<()> {
                 return Ok(());
             }
             let store = store::Store::open(&store_path)?;
-            let sessions = store.list_sessions(limit)?;
-            for (s, updated) in sessions {
+            let listing = store.list_sessions(limit)?;
+            for error in &listing.skipped {
+                warn_unsupported_session(error, "skipping it");
+            }
+            for (s, updated) in listing.sessions {
                 let title = s.title.unwrap_or_else(|| "(untitled)".into());
                 let model = s.last_model.unwrap_or_else(|| "-".into());
                 println!("{}  {}  {}  {}", s.id, title, model, updated);
@@ -856,6 +863,9 @@ async fn run() -> Result<()> {
                 commands,
                 skills,
             )?;
+            if let Some(error) = &report.ignored_current_session {
+                warn_unsupported_session(error, "ignoring current-session");
+            }
             if status_args.json {
                 println!("{}", serde_json::to_string(&report)?);
             } else {
@@ -1045,6 +1055,9 @@ async fn run_turn_from_source(
             model: turn.selection.model.clone().or(loaded_prompt.model),
         },
     )?;
+    if let Some(error) = &resolved.ignored_current_session {
+        warn_unsupported_session(error, "starting a new session");
+    }
     let session = if let Some(session) = resolved.attached_session.clone() {
         session
     } else {
