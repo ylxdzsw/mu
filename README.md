@@ -373,14 +373,14 @@ runtime state it needs. Use `mu init` when you explicitly want a local
 configuration scaffold, and keep project-specific guidance in `AGENTS.md` or
 `.mu` instruction files.
 
-Mu keeps one append-only JSONL journal per session under
+Mu keeps one append-only version-3 JSONL journal per session under
 `<scope>/.mu/sessions/`, with content-addressed attachment and provider objects
 under `<scope>/.mu/objects/`. `current-session` points to the last session
 selected in that scope, so `-c/--continue` and bare `mu retry` do not scan every
 session. Assistant reasoning, text blocks, and Bash calls retain their provider
-block order in new journals and transcript replay. Mu reads only its current
-journal version and never migrates session files. Explicitly selected
-incompatible sessions fail; listings skip them with a warning, and an
+block order in new journals and transcript replay. Mu reads only journal version
+3 and never migrates session files; version-2 journals are unsupported.
+Explicitly selected incompatible sessions fail; listings skip them with a warning, and an
 incompatible `current-session` is ignored with a warning when a new session can
 be created instead. Each active session journal is guarded by a nonblocking
 advisory lock; different sessions remain independent.

@@ -638,7 +638,6 @@ mod tests {
             .start_provider_request(
                 session_id,
                 &turn_id,
-                "guardrail",
                 crate::store::ProviderOrigin {
                     canonical_model_ref: model.into(),
                     provider_id: request_model.provider_id.clone(),
@@ -648,12 +647,12 @@ mod tests {
                     effort: request_model.effort.clone(),
                 },
                 store
-                    .request_recipe("test.v1", &native, serde_json::json!({"kind":"guardrail"}))
+                    .request_recipe("test.v1", &native, serde_json::json!({}))
                     .unwrap(),
-                Some(crate::store::RequestSubject {
+                crate::store::RequestSubject::Guardrail {
                     call_id: call_ids[0],
                     attempt: 1,
-                }),
+                },
             )
             .unwrap();
         store
@@ -709,7 +708,7 @@ mod tests {
             Some(UnsupportedSessionVersion {
                 session_id: Some(session.id.clone()),
                 found: 1,
-                supported: 2,
+                supported: 3,
             })
         );
 
@@ -1243,7 +1242,7 @@ mod tests {
         .unwrap();
         assert_eq!(disabled.compaction_soft_threshold_tokens, None);
 
-        store.append_summary(&session.id, "summary").unwrap();
+        store.apply_test_compaction(&session.id, "summary").unwrap();
         let estimated = build_status_report(
             &store,
             &test_config(),

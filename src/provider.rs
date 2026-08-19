@@ -171,7 +171,6 @@ fn attachment_approx_tokens(attachment: &Attachment) -> u64 {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct NativeReplay {
-    #[serde(default)]
     pub provider_id: String,
     pub endpoint: String,
     pub model: String,
@@ -195,14 +194,22 @@ pub enum NativeReplayPayload {
 }
 
 impl NativeReplay {
-    fn api(&self) -> ModelApi {
-        match &self.payload {
+    pub(crate) fn api(&self) -> ModelApi {
+        self.payload.api()
+    }
+}
+
+impl NativeReplayPayload {
+    pub(crate) fn api(&self) -> ModelApi {
+        match self {
             NativeReplayPayload::ChatReasoning(_) => ModelApi::ChatCompletions,
             NativeReplayPayload::ResponsesOutput(_) => ModelApi::Responses,
             NativeReplayPayload::AnthropicContent(_) => ModelApi::AnthropicMessages,
         }
     }
+}
 
+impl NativeReplay {
     fn origin(&self) -> ReplayOrigin {
         ReplayOrigin {
             api: self.api().name().to_string(),
@@ -281,21 +288,6 @@ pub fn filter_native_replay_for_origins(
 ) -> Vec<Message> {
     filter_native_replay(messages, |native| {
         native.api() == target_api && origins.contains(&native.origin())
-    })
-}
-
-pub fn filter_native_replay_for_legacy_origin(
-    messages: &[Message],
-    target_api: ModelApi,
-    provider_id: &str,
-    endpoint: &str,
-    model: &str,
-) -> Vec<Message> {
-    filter_native_replay(messages, |native| {
-        native.api() == target_api
-            && native.provider_id == provider_id
-            && native.endpoint == endpoint
-            && native.model == model
     })
 }
 

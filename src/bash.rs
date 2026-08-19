@@ -269,11 +269,6 @@ impl BashRisk {
     pub fn from_value(value: &Value) -> Option<Self> {
         value.get("risk")?.as_str()?.parse().ok()
     }
-
-    pub fn from_args_json(args: &str) -> Option<Self> {
-        let value: Value = serde_json::from_str(args).ok()?;
-        Self::from_value(&value)
-    }
 }
 
 impl std::str::FromStr for BashRisk {

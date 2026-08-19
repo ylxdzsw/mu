@@ -1,5 +1,3 @@
-use std::collections::HashSet;
-
 use crate::config::Config;
 use crate::provider::{Message, UserContent};
 use crate::store::{CompactionMode, CompactionTrigger};
@@ -139,23 +137,6 @@ pub fn emergency_projection(
         }
     }
     (projected, elided)
-}
-
-pub fn apply_emergency_elisions(messages: &mut [Message], provider_call_ids: &HashSet<String>) {
-    for message in messages {
-        let Message::Tool {
-            content,
-            attachments,
-            tool_call_id,
-        } = message
-        else {
-            continue;
-        };
-        if provider_call_ids.contains(tool_call_id) {
-            *content = EMERGENCY_OUTPUT_UNAVAILABLE.into();
-            attachments.clear();
-        }
-    }
 }
 
 #[cfg(test)]

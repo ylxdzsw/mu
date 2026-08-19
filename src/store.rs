@@ -13,13 +13,12 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
-use crate::bash::BashRisk;
 use crate::config::Config;
 use crate::models::ResolvedModelRef;
 use crate::provider::{
     AssistantItem, Attachment, ContentPart, ImageDetail, Message, ModelApi, NativeReplay,
-    ReplayOrigin, Request, ToolAttachment, ToolCall, Usage, UserContent, estimate_messages_tokens,
-    filter_native_replay_for_config, native_replay_origins,
+    NativeReplayPayload, ReplayOrigin, Request, ToolAttachment, ToolCall, Usage, UserContent,
+    estimate_messages_tokens, filter_native_replay_for_config, native_replay_origins,
 };
 
 pub const BASH_CALL_ID_ENV: &str = "MU_BASH_CALL_ID";
@@ -28,7 +27,7 @@ pub const OBJECTS_DIR_ENV: &str = "MU_OBJECTS_DIR";
 pub const INTERRUPTED_TOOL_RESULT: &str = "error: interrupted — this command may have started and not completed; its effects are unknown. Verify the resulting state before relying on it.";
 pub const RESUME_PROMPT: &str = "Continue the current task from where you stopped.";
 
-const FORMAT_VERSION: u32 = 2;
+const FORMAT_VERSION: u32 = 3;
 const SESSION_ID_RETRIES: usize = 16;
 const EXTERNAL_TEXT_BYTES: usize = 256 * 1024;
 const MAX_BASH_ATTACHMENTS: usize = 8;
@@ -118,37 +117,11 @@ pub struct TranscriptBashResult {
     pub duration_ms: Option<u64>,
 }
 
-#[cfg(test)]
-#[derive(Debug, Clone)]
-pub struct MessageRecord {
-    pub kind: String,
-    pub items: Vec<MessageRecordItem>,
-    pub seq: i64,
-}
-
-#[cfg(test)]
-#[allow(dead_code)]
-#[derive(Debug, Clone)]
-pub enum MessageRecordItem {
-    Text(String),
-    BashCall(ToolCall),
-    Attachment(Attachment),
-}
-
 pub struct BashResultRecord<'a> {
     pub bash_call_id: i64,
     pub outcome: &'a str,
     pub exit_code: Option<i32>,
     pub duration_ms: Option<u64>,
-}
-
-#[cfg(test)]
-pub struct CompactionCompletion<'a> {
-    pub summary: &'a str,
-    pub through_seq: i64,
-    pub retained_turn_ids: Vec<String>,
-    pub native_response: Option<&'a Value>,
-    pub usage: Option<&'a Usage>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -205,9 +178,6 @@ pub struct PendingCompaction {
 pub struct QueuedPrompt {
     pub prompt_id: String,
     pub epoch: u64,
-    pub cwd: String,
-    pub git_worktree_root: Option<String>,
-    pub content: UserContent,
 }
 
 pub(crate) struct AssistantCompletion<'a> {
@@ -215,24 +185,15 @@ pub(crate) struct AssistantCompletion<'a> {
     pub native_response: Option<&'a Value>,
     pub usage: Option<&'a Usage>,
     pub resumable: bool,
+    pub response_complete: bool,
     pub context_output_complete: bool,
 }
 
-pub struct CompactionApplication<'a> {
-    pub source_turn_id: &'a str,
-    pub trigger: CompactionTrigger,
-    pub mode: CompactionMode,
-    pub summary: &'a str,
-    pub checkpoint: &'a str,
-    /// Estimated triggering provider input, including a queued soft prompt.
-    pub before_context_tokens: u64,
-    pub before_context_window: Option<u64>,
+pub struct CompactionApplication {
     /// Estimated immediate next provider input after applying the checkpoint.
     /// Automatic await-user compaction includes its queued prompt here.
     pub after_context_tokens_estimate: u64,
     pub after_context_window: Option<u64>,
-    pub elapsed_ms: u64,
-    pub emergency_elided_call_ids: &'a [i64],
 }
 
 pub struct CompactionStart<'a> {
@@ -244,18 +205,7 @@ pub struct CompactionStart<'a> {
     pub before_context_window: Option<u64>,
 }
 
-struct TurnStart<'a> {
-    cwd: &'a str,
-    git_worktree_root: Option<&'a str>,
-    prompt: &'a UserContent,
-    turn_kind: &'a str,
-    compaction: Option<PersistedCompactionTurn>,
-    queued_prompt_id: Option<String>,
-}
-
 pub struct GuardrailCompletion<'a> {
-    pub call_id: i64,
-    pub attempt: u32,
     pub outcome: &'a str,
     pub risk_level: Option<&'a str>,
     pub auth_level: Option<&'a str>,
@@ -284,9 +234,23 @@ pub struct RequestRecipe {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RequestSubject {
-    pub call_id: i64,
-    pub attempt: u32,
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum RequestSubject {
+    Agent,
+    Guardrail { call_id: i64, attempt: u32 },
+}
+
+impl RequestSubject {
+    fn is_agent(&self) -> bool {
+        matches!(self, Self::Agent)
+    }
+
+    fn guardrail(&self) -> Option<(i64, u32)> {
+        match self {
+            Self::Guardrail { call_id, attempt } => Some((*call_id, *attempt)),
+            Self::Agent => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -302,7 +266,6 @@ struct Meta {
     format: String,
     version: u32,
     session_id: String,
-    created_at: String,
 }
 
 #[derive(Deserialize)]
@@ -327,23 +290,19 @@ enum Event {
     SystemPrompt {
         content: String,
     },
-    TurnStarted {
+    PromptMaterialized {
+        prompt_id: String,
+        turn_id: String,
+    },
+    CompactionStarted {
         turn_id: String,
         cwd: String,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        git_worktree_root: Option<String>,
         prompt: PersistedUserContent,
-        #[serde(default, skip_serializing_if = "is_zero")]
-        epoch: u64,
-        #[serde(
-            default = "normal_turn_kind",
-            skip_serializing_if = "is_normal_turn_kind"
-        )]
-        turn_kind: String,
+        trigger: CompactionTrigger,
+        mode: CompactionMode,
+        before_context_tokens: u64,
         #[serde(skip_serializing_if = "Option::is_none")]
-        compaction: Option<PersistedCompactionTurn>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        queued_prompt_id: Option<String>,
+        before_context_window: Option<u64>,
     },
     PromptQueued {
         prompt_id: String,
@@ -351,18 +310,13 @@ enum Event {
         #[serde(skip_serializing_if = "Option::is_none")]
         git_worktree_root: Option<String>,
         prompt: PersistedUserContent,
-        epoch: u64,
     },
     ProviderRequested {
         turn_id: String,
         exchange_id: String,
-        purpose: String,
+        subject: RequestSubject,
         origin: ProviderOrigin,
         request_recipe: RequestRecipe,
-        #[serde(default, skip_serializing_if = "is_zero")]
-        epoch: u64,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        subject: Option<RequestSubject>,
     },
     ProviderCompleted {
         exchange_id: String,
@@ -385,7 +339,6 @@ enum Event {
         exchange_id: String,
     },
     BashCompleted {
-        turn_id: String,
         call_id: i64,
         outcome: String,
         output: PersistedText,
@@ -393,40 +346,31 @@ enum Event {
         exit_code: Option<i32>,
         #[serde(skip_serializing_if = "Option::is_none")]
         duration_ms: Option<u64>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
         attachments: Vec<PersistedToolAttachment>,
     },
     CompactionApplied {
-        source_turn_id: String,
-        from_epoch: u64,
-        to_epoch: u64,
-        trigger: CompactionTrigger,
-        mode: CompactionMode,
-        summary: String,
-        checkpoint: String,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        continuation_turn_id: Option<String>,
-        before_context_tokens: u64,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        before_context_window: Option<u64>,
         after_context_tokens_estimate: u64,
         #[serde(skip_serializing_if = "Option::is_none")]
         after_context_window: Option<u64>,
-        elapsed_ms: u64,
-        emergency_elided_call_ids: Vec<i64>,
     },
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct PersistedCompactionTurn {
-    trigger: CompactionTrigger,
-    mode: CompactionMode,
-    before_context_tokens: u64,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    before_context_window: Option<u64>,
-}
-
-fn is_zero(value: &u64) -> bool {
-    *value == 0
+fn agent_compaction_attempt(event: &Event) -> Option<(&str, &str, Option<&str>)> {
+    match event {
+        Event::ProviderRequested {
+            turn_id,
+            exchange_id,
+            request_recipe,
+            subject,
+            ..
+        } if subject.is_agent() => Some((
+            turn_id,
+            exchange_id,
+            request_recipe.input["compaction_attempt"].as_str(),
+        )),
+        _ => None,
+    }
 }
 
 fn true_value() -> bool {
@@ -437,33 +381,21 @@ fn is_true(value: &bool) -> bool {
     *value
 }
 
-fn normal_turn_kind() -> String {
-    "user".into()
-}
-
-fn is_normal_turn_kind(value: &String) -> bool {
-    value == "user"
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 enum Projection {
     Assistant {
-        turn_state: String,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        resumable: bool,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        incomplete: bool,
         #[serde(default = "true_value", skip_serializing_if = "is_true")]
         context_output_complete: bool,
         #[serde(skip_serializing_if = "Option::is_none")]
-        native_replay: Option<NativeReplay>,
+        native_replay: Option<NativeReplayPayload>,
         items: Vec<PersistedAssistantItem>,
     },
-    Compaction {
-        summary: String,
-        through_seq: i64,
-        retained_turn_ids: Vec<String>,
-    },
     Guardrail {
-        call_id: i64,
-        attempt: u32,
         outcome: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         risk_level: Option<String>,
@@ -488,8 +420,6 @@ enum PersistedAssistantItem {
         call_id: i64,
         provider_call_id: String,
         arguments: String,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        declared_risk: Option<String>,
     },
 }
 
@@ -521,22 +451,6 @@ impl PersistedAssistantItem {
         }
     }
 
-    #[cfg(test)]
-    fn message_record_item(&self) -> Option<MessageRecordItem> {
-        match self {
-            Self::Text { text } => Some(MessageRecordItem::Text(text.clone())),
-            Self::BashCall {
-                provider_call_id,
-                arguments,
-                ..
-            } => Some(MessageRecordItem::BashCall(ToolCall {
-                id: provider_call_id.clone(),
-                arguments: arguments.clone(),
-            })),
-            Self::Reasoning { .. } => None,
-        }
-    }
-
     fn from_assistant(item: &AssistantItem, next_call_id: &mut i64) -> Self {
         match item {
             AssistantItem::Reasoning { text } => Self::Reasoning { text: text.clone() },
@@ -548,12 +462,41 @@ impl PersistedAssistantItem {
                     call_id,
                     provider_call_id: call.id.clone(),
                     arguments: call.arguments.clone(),
-                    declared_risk: BashRisk::from_args_json(&call.arguments)
-                        .map(|risk| risk.as_str().to_string()),
                 }
             }
         }
     }
+}
+
+fn assistant_turn_state(resumable: bool, items: &[PersistedAssistantItem]) -> &'static str {
+    if items
+        .iter()
+        .any(|item| matches!(item, PersistedAssistantItem::BashCall { .. }))
+    {
+        "continue"
+    } else if resumable {
+        "resume"
+    } else {
+        "complete"
+    }
+}
+
+fn assistant_summary(
+    resumable: bool,
+    incomplete: bool,
+    items: &[PersistedAssistantItem],
+) -> Option<String> {
+    if incomplete || assistant_turn_state(resumable, items) != "complete" {
+        return None;
+    }
+    let summary = items
+        .iter()
+        .filter_map(|item| match item {
+            PersistedAssistantItem::Text { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<String>();
+    (!summary.trim().is_empty()).then_some(summary)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -759,7 +702,6 @@ impl Store {
                 format: "mu-session".into(),
                 version: FORMAT_VERSION,
                 session_id: id.clone(),
-                created_at: created_at.clone(),
             };
             write_json_line(&mut file, &meta)?;
             write_json_line(
@@ -804,24 +746,14 @@ impl Store {
             let journal = match self.load_path(&path) {
                 Ok(journal) => journal,
                 Err(_) if incomplete_session_initialization(&path)? => continue,
-                Err(error) if error.downcast_ref::<UnsupportedSessionVersion>().is_some() => {
-                    skipped.push(
-                        error
-                            .downcast_ref::<UnsupportedSessionVersion>()
-                            .expect("checked unsupported session version")
-                            .clone(),
-                    );
-                    continue;
-                }
-                Err(error) => return Err(error),
+                Err(error) => match error.downcast_ref::<UnsupportedSessionVersion>() {
+                    Some(unsupported) => {
+                        skipped.push(unsupported.clone());
+                        continue;
+                    }
+                    None => return Err(error),
+                },
             };
-            if !journal
-                .events
-                .iter()
-                .any(|line| matches!(line.event, Event::SystemPrompt { .. }))
-            {
-                continue;
-            }
             let session = self.project_session(&journal)?;
             let updated = activity_at(&journal).to_string();
             sessions.push((session, updated));
@@ -839,7 +771,12 @@ impl Store {
         let session = self.project_session(&journal)?;
         Ok(Some(SessionSummary {
             id: id.to_string(),
-            created_at: journal.meta.created_at.clone(),
+            created_at: journal
+                .events
+                .first()
+                .expect("validated journal has a system prompt")
+                .at
+                .clone(),
             updated_at: activity_at(&journal).to_string(),
             cwd: session.cwd,
             title: session.title,
@@ -851,7 +788,12 @@ impl Store {
             turn_count: journal
                 .events
                 .iter()
-                .filter(|line| matches!(line.event, Event::TurnStarted { .. }))
+                .filter(|line| {
+                    matches!(
+                        line.event,
+                        Event::PromptMaterialized { .. } | Event::CompactionStarted { .. }
+                    )
+                })
                 .count() as u64,
         }))
     }
@@ -905,10 +847,8 @@ impl Store {
                 .rev()
                 .find_map(|line| match &line.event {
                     Event::ProviderRequested {
-                        purpose, origin, ..
-                    } if purpose == "agent" || purpose == "compaction" => {
-                        Some(origin.canonical_model_ref.clone())
-                    }
+                        subject, origin, ..
+                    } if subject.is_agent() => Some(origin.canonical_model_ref.clone()),
                     _ => None,
                 }))
         })
@@ -958,7 +898,6 @@ impl Store {
         let (wire_model, effort) = wire_model
             .split_once(':')
             .map_or((wire_model, None), |(model, effort)| (model, Some(effort)));
-        let context_through_seq = self.current_context_seq(session_id)?;
         let request = Request {
             model: ResolvedModelRef {
                 canonical: model.to_string(),
@@ -975,7 +914,6 @@ impl Store {
         let exchange_id = self.start_provider_request(
             session_id,
             &turn_id,
-            "agent",
             ProviderOrigin {
                 canonical_model_ref: model.to_string(),
                 provider_id: provider_id.to_string(),
@@ -988,12 +926,10 @@ impl Store {
                 ModelApi::ChatCompletions.request_format(),
                 &native,
                 serde_json::json!({
-                    "kind": "agent",
-                    "context_through_seq": context_through_seq,
                     "native_replay_origins": native_replay_origins(&request.messages),
                 }),
             )?,
-            None,
+            RequestSubject::Agent,
         )?;
         if outcome == "completed" {
             self.complete_assistant_exchange(
@@ -1034,10 +970,15 @@ impl Store {
                 .iter()
                 .rev()
                 .find_map(|line| match &line.event {
-                    Event::TurnStarted { .. } => Some((line.seq, false)),
-                    Event::CompactionApplied { mode, .. } => {
-                        Some((line.seq, *mode == CompactionMode::AwaitUser))
+                    Event::PromptMaterialized { .. } | Event::CompactionStarted { .. } => {
+                        Some((line.seq, false))
                     }
+                    Event::CompactionApplied { .. } => Some((
+                        line.seq,
+                        compaction_start_before(&journal, line.seq.saturating_sub(1)).is_some_and(
+                            |(_, _, compaction)| compaction.mode == CompactionMode::AwaitUser,
+                        ),
+                    )),
                     _ => None,
                 })
         else {
@@ -1045,30 +986,42 @@ impl Store {
         };
         let mut calls = HashSet::new();
         let mut results = HashSet::new();
+        let mut requested = HashSet::new();
+        let mut terminal = HashSet::new();
         let mut complete = initially_complete;
         for line in journal.events.iter().filter(|line| line.seq > turn_seq) {
             match &line.event {
+                Event::ProviderRequested { exchange_id, .. } => {
+                    requested.insert(exchange_id.as_str());
+                }
                 Event::ProviderCompleted {
+                    exchange_id,
                     projection:
                         Projection::Assistant {
-                            turn_state, items, ..
+                            resumable, items, ..
                         },
                     ..
                 } => {
+                    terminal.insert(exchange_id.as_str());
                     calls.extend(
                         items
                             .iter()
                             .filter_map(|item| item.bash_call().map(|call| call.0)),
                     );
-                    complete = turn_state == "complete";
+                    complete = assistant_turn_state(*resumable, items) == "complete";
                 }
                 Event::BashCompleted { call_id, .. } => {
                     results.insert(*call_id);
                 }
+                Event::ProviderCompleted { exchange_id, .. }
+                | Event::ProviderFailed { exchange_id, .. }
+                | Event::ProviderInterrupted { exchange_id } => {
+                    terminal.insert(exchange_id.as_str());
+                }
                 _ => {}
             }
         }
-        Ok(complete && calls.is_subset(&results))
+        Ok(complete && calls.is_subset(&results) && requested.is_subset(&terminal))
     }
 
     pub fn resume_reminder_needed(&self, session_id: &str) -> Result<bool> {
@@ -1084,10 +1037,10 @@ impl Store {
             .find_map(|line| match &line.event {
                 Event::ProviderCompleted {
                     exchange_id,
-                    projection: Projection::Assistant { turn_state, .. },
+                    projection: Projection::Assistant { resumable, .. },
                     ..
                 } if exchange_turns.get(exchange_id.as_str()) == Some(&turn_id) => {
-                    Some((line.seq, turn_state == "resume"))
+                    Some((line.seq, *resumable))
                 }
                 _ => None,
             });
@@ -1099,19 +1052,21 @@ impl Store {
         let journal = self.load(session_id)?;
         let mut terminal = HashSet::new();
         let mut requested = Vec::new();
-        let mut exchange_turns = HashMap::new();
-        let mut calls = HashMap::new();
+        let mut guardrail_calls = HashMap::new();
+        let mut calls = HashSet::new();
         let mut results = HashSet::new();
         let mut denied = HashMap::new();
         for line in journal.events.iter() {
             match &line.event {
                 Event::ProviderRequested {
                     exchange_id,
-                    turn_id,
+                    subject,
                     ..
                 } => {
                     requested.push(exchange_id.clone());
-                    exchange_turns.insert(exchange_id.clone(), turn_id.clone());
+                    if let Some((call_id, _)) = subject.guardrail() {
+                        guardrail_calls.insert(exchange_id.clone(), call_id);
+                    }
                 }
                 Event::ProviderCompleted {
                     exchange_id,
@@ -1121,24 +1076,19 @@ impl Store {
                     terminal.insert(exchange_id.clone());
                     match projection {
                         Projection::Assistant { items, .. } => {
-                            let turn_id = exchange_turns
-                                .get(exchange_id)
-                                .cloned()
-                                .or_else(|| latest_turn_before(&journal.events, line.seq))
-                                .context("assistant completion has no request turn")?;
                             for call_id in items
                                 .iter()
                                 .filter_map(|item| item.bash_call().map(|call| call.0))
                             {
-                                calls.insert(call_id, turn_id.clone());
+                                calls.insert(call_id);
                             }
                         }
                         Projection::Guardrail {
-                            call_id,
-                            outcome,
-                            reason,
-                            ..
+                            outcome, reason, ..
                         } if outcome == "deny" => {
+                            let call_id = guardrail_calls
+                                .get(exchange_id)
+                                .context("guardrail completion has no request subject")?;
                             denied.insert(*call_id, reason.clone().unwrap_or_default());
                         }
                         _ => {}
@@ -1162,12 +1112,12 @@ impl Store {
         }
         let mut unresolved = calls
             .iter()
-            .filter(|(call_id, _)| !results.contains(call_id))
-            .map(|(call_id, turn_id)| (*call_id, turn_id.clone()))
+            .filter(|call_id| !results.contains(call_id))
+            .copied()
             .collect::<Vec<_>>();
-        unresolved.sort_unstable_by_key(|(call_id, _)| *call_id);
+        unresolved.sort_unstable();
         let mut normalized = 0;
-        for (call_id, turn_id) in unresolved {
+        for call_id in unresolved {
             let (outcome, output) = if let Some(reason) = denied.get(&call_id) {
                 (
                     "error",
@@ -1179,7 +1129,6 @@ impl Store {
             self.append(
                 session_id,
                 Event::BashCompleted {
-                    turn_id,
                     call_id,
                     outcome: outcome.into(),
                     output: PersistedText::Inline { text: output },
@@ -1194,19 +1143,6 @@ impl Store {
     }
 
     #[cfg(test)]
-    pub fn message_records_from_seq(
-        &self,
-        session_id: &str,
-        start_seq: i64,
-    ) -> Result<Vec<MessageRecord>> {
-        Ok(self
-            .records(&self.load(session_id)?)?
-            .into_iter()
-            .filter(|record| record.seq >= start_seq)
-            .collect())
-    }
-
-    #[cfg(test)]
     pub fn transcript_events(&self, session_id: &str) -> Result<Vec<TranscriptEvent>> {
         self.transcript_events_for_epoch(session_id, None)
     }
@@ -1217,59 +1153,38 @@ impl Store {
         selected_epoch: Option<u64>,
     ) -> Result<Vec<TranscriptEvent>> {
         let journal = self.load(session_id)?;
+        let prompts = queued_prompt_records(&journal);
         let mut results = HashMap::new();
         let mut turn_models = HashMap::new();
         let turn_epochs = journal
             .events
             .iter()
             .filter_map(|line| match &line.event {
-                Event::TurnStarted { turn_id, epoch, .. } => Some((turn_id.as_str(), *epoch)),
-                Event::CompactionApplied {
-                    continuation_turn_id: Some(turn_id),
-                    to_epoch,
-                    ..
-                } => Some((turn_id.as_str(), *to_epoch)),
-                _ => None,
+                Event::CompactionApplied { .. } => continuation_turn_id(&journal, line.seq)
+                    .map(|turn_id| (turn_id, context_epoch(&journal, line.seq))),
+                event => project_turn(event, &prompts).map(|turn| {
+                    (
+                        turn.turn_id.to_string(),
+                        context_epoch(&journal, line.seq.saturating_sub(1)),
+                    )
+                }),
             })
             .collect::<HashMap<_, _>>();
-        let compaction_turns = journal
-            .events
-            .iter()
-            .filter_map(|line| match &line.event {
-                Event::TurnStarted {
-                    turn_id,
-                    compaction: Some(_),
-                    ..
-                } => Some(turn_id.as_str()),
-                _ => None,
-            })
-            .collect::<HashSet<_>>();
         let compaction_metadata = journal
             .events
             .iter()
-            .filter_map(|line| match &line.event {
-                Event::TurnStarted {
-                    turn_id,
-                    compaction: Some(compaction),
-                    ..
-                } => Some((turn_id.as_str(), compaction)),
-                _ => None,
+            .filter_map(|line| {
+                let turn = project_turn(&line.event, &prompts)?;
+                turn.compaction.map(|compaction| (turn.turn_id, compaction))
             })
             .collect::<HashMap<_, _>>();
         let exchange_turns = provider_exchange_turns(&journal);
         let exchange_attempts = journal
             .events
             .iter()
-            .filter_map(|line| match &line.event {
-                Event::ProviderRequested {
-                    exchange_id,
-                    request_recipe,
-                    ..
-                } => Some((
-                    exchange_id.as_str(),
-                    request_recipe.input["compaction_attempt"].as_str(),
-                )),
-                _ => None,
+            .filter_map(|line| {
+                agent_compaction_attempt(&line.event)
+                    .map(|(_, exchange_id, attempt)| (exchange_id, attempt))
             })
             .collect::<HashMap<_, _>>();
         for line in journal.events.iter() {
@@ -1294,10 +1209,10 @@ impl Store {
                 }
                 Event::ProviderRequested {
                     turn_id,
-                    purpose,
+                    subject,
                     origin,
                     ..
-                } if purpose == "agent" => {
+                } if subject.is_agent() => {
                     turn_models
                         .entry(turn_id.as_str())
                         .or_insert_with(|| origin.canonical_model_ref.clone());
@@ -1311,18 +1226,14 @@ impl Store {
         let mut seen_turn = false;
         for line in journal.events.iter() {
             match &line.event {
-                Event::TurnStarted {
-                    turn_id,
-                    cwd,
-                    prompt,
-                    epoch,
-                    compaction,
-                    ..
-                } => {
-                    if selected_epoch.is_some_and(|selected| selected != *epoch) {
+                event @ (Event::PromptMaterialized { .. } | Event::CompactionStarted { .. }) => {
+                    let turn = project_turn(event, &prompts)
+                        .context("turn references an unknown queued prompt")?;
+                    let epoch = context_epoch(&journal, line.seq.saturating_sub(1));
+                    if selected_epoch.is_some_and(|selected| selected != epoch) {
                         continue;
                     }
-                    if let Some(compaction) = compaction {
+                    if let Some(compaction) = turn.compaction {
                         events.push(TranscriptEvent::CompactionTriggered {
                             trigger: compaction.trigger,
                             context_tokens: compaction.before_context_tokens,
@@ -1349,27 +1260,27 @@ impl Store {
                         None
                     };
                     events.push(TranscriptEvent::User {
-                        text: user_text(prompt),
-                        cwd: cwd.clone(),
+                        text: user_text(turn.prompt),
+                        cwd: turn.cwd.to_string(),
                         model: turn_models
-                            .get(turn_id.as_str())
+                            .get(turn.turn_id)
                             .cloned()
                             .or_else(|| remembered_model.clone()),
                         context,
-                        internal: compaction.is_some(),
+                        internal: turn.compaction.is_some(),
                     });
                     seen_turn = true;
                 }
                 Event::ProviderRequested {
-                    purpose, origin, ..
-                } if purpose == "agent" || purpose == "compaction" => {
+                    subject, origin, ..
+                } if subject.is_agent() => {
                     remembered_model = Some(origin.canonical_model_ref.clone());
                 }
                 Event::ProviderCompleted {
                     exchange_id,
                     projection:
                         Projection::Assistant {
-                            turn_state, items, ..
+                            resumable, items, ..
                         },
                     ..
                 } => {
@@ -1379,7 +1290,7 @@ impl Store {
                         continue;
                     }
                     events.push(TranscriptEvent::Assistant {
-                        turn_state: turn_state.clone(),
+                        turn_state: assistant_turn_state(*resumable, items).into(),
                         items: items
                             .iter()
                             .map(|item| match item {
@@ -1397,7 +1308,8 @@ impl Store {
                                 },
                             })
                             .collect(),
-                        internal: turn_id.is_some_and(|turn_id| compaction_turns.contains(turn_id)),
+                        internal: turn_id
+                            .is_some_and(|turn_id| compaction_metadata.contains_key(turn_id)),
                     });
                 }
                 Event::ProviderFailed {
@@ -1425,23 +1337,25 @@ impl Store {
                     }
                 }
                 Event::CompactionApplied {
-                    from_epoch,
-                    to_epoch,
-                    before_context_tokens,
-                    before_context_window,
                     after_context_tokens_estimate,
                     after_context_window,
-                    elapsed_ms,
                     ..
-                } if selected_epoch.is_none_or(|selected| selected == *from_epoch) => {
+                } => {
+                    let (start, _, compaction) =
+                        compaction_start_before(&journal, line.seq.saturating_sub(1))
+                            .context("compaction application has no start")?;
+                    let from_epoch = context_epoch(&journal, line.seq.saturating_sub(1));
+                    if selected_epoch.is_some_and(|selected| selected != from_epoch) {
+                        continue;
+                    }
                     events.push(TranscriptEvent::CompactionApplied {
-                        from_epoch: *from_epoch,
-                        to_epoch: *to_epoch,
-                        before_context_tokens: *before_context_tokens,
-                        before_context_window: *before_context_window,
+                        from_epoch,
+                        to_epoch: from_epoch.saturating_add(1),
+                        before_context_tokens: compaction.before_context_tokens,
+                        before_context_window: compaction.before_context_window,
                         after_context_tokens_estimate: *after_context_tokens_estimate,
                         after_context_window: *after_context_window,
-                        elapsed_ms: *elapsed_ms,
+                        elapsed_ms: elapsed_ms_between(&journal, start.seq, line.seq),
                     });
                 }
                 _ => {}
@@ -1473,17 +1387,9 @@ impl Store {
         git_worktree_root: Option<&str>,
         prompt: &UserContent,
     ) -> Result<String> {
-        self.start_turn_inner(
-            session_id,
-            TurnStart {
-                cwd,
-                git_worktree_root,
-                prompt,
-                turn_kind: "user",
-                compaction: None,
-                queued_prompt_id: None,
-            },
-        )
+        self.queue_prompt(session_id, cwd, git_worktree_root, prompt)?;
+        self.materialize_queued_prompt(session_id)?
+            .context("queued prompt was not materialized")
     }
 
     pub fn start_compaction_turn(
@@ -1491,39 +1397,18 @@ impl Store {
         session_id: &str,
         start: CompactionStart<'_>,
     ) -> Result<String> {
-        self.start_turn_inner(
-            session_id,
-            TurnStart {
-                cwd: start.cwd,
-                git_worktree_root: None,
-                prompt: start.prompt,
-                turn_kind: "compaction",
-                compaction: Some(PersistedCompactionTurn {
-                    trigger: start.trigger,
-                    mode: start.mode,
-                    before_context_tokens: start.before_context_tokens,
-                    before_context_window: start.before_context_window,
-                }),
-                queued_prompt_id: None,
-            },
-        )
-    }
-
-    fn start_turn_inner(&self, session_id: &str, start: TurnStart<'_>) -> Result<String> {
         let turn_id = format!("t{}", self.next_seq(session_id)?);
         let prompt = self.persist_user_content(start.prompt)?;
-        let epoch = self.context_epoch(session_id)?;
         self.append(
             session_id,
-            Event::TurnStarted {
+            Event::CompactionStarted {
                 turn_id: turn_id.clone(),
                 cwd: start.cwd.to_string(),
-                git_worktree_root: start.git_worktree_root.map(str::to_string),
                 prompt,
-                epoch,
-                turn_kind: start.turn_kind.to_string(),
-                compaction: start.compaction,
-                queued_prompt_id: start.queued_prompt_id,
+                trigger: start.trigger,
+                mode: start.mode,
+                before_context_tokens: start.before_context_tokens,
+                before_context_window: start.before_context_window,
             },
         )?;
         Ok(turn_id)
@@ -1550,7 +1435,6 @@ impl Store {
                 cwd: cwd.to_string(),
                 git_worktree_root: git_worktree_root.map(str::to_string),
                 prompt: self.persist_user_content(prompt)?,
-                epoch: self.context_epoch(session_id)?,
             },
         )?;
         Ok(prompt_id)
@@ -1562,10 +1446,7 @@ impl Store {
             .events
             .iter()
             .filter_map(|line| match &line.event {
-                Event::TurnStarted {
-                    queued_prompt_id: Some(id),
-                    ..
-                } => Some(id.as_str()),
+                Event::PromptMaterialized { prompt_id, .. } => Some(prompt_id.as_str()),
                 _ => None,
             })
             .collect::<HashSet<_>>();
@@ -1574,30 +1455,15 @@ impl Store {
             .iter()
             .rev()
             .find_map(|line| match &line.event {
-                Event::PromptQueued {
-                    prompt_id,
-                    cwd,
-                    git_worktree_root,
-                    prompt,
-                    epoch,
-                } if !consumed.contains(prompt_id.as_str()) => Some((
-                    prompt_id.clone(),
-                    *epoch,
-                    cwd.clone(),
-                    git_worktree_root.clone(),
-                    prompt,
-                )),
+                Event::PromptQueued { prompt_id, .. } if !consumed.contains(prompt_id.as_str()) => {
+                    Some(QueuedPrompt {
+                        prompt_id: prompt_id.clone(),
+                        epoch: context_epoch(&journal, line.seq.saturating_sub(1)),
+                    })
+                }
                 _ => None,
             })
-            .map(|(prompt_id, epoch, cwd, git_worktree_root, prompt)| {
-                Ok(QueuedPrompt {
-                    prompt_id,
-                    epoch,
-                    cwd,
-                    git_worktree_root,
-                    content: self.hydrate_user_content(prompt)?,
-                })
-            })
+            .map(Ok)
             .transpose()
     }
 
@@ -1605,18 +1471,15 @@ impl Store {
         let Some(queued) = self.queued_prompt(session_id)? else {
             return Ok(None);
         };
-        self.start_turn_inner(
+        let turn_id = format!("t{}", self.next_seq(session_id)?);
+        self.append(
             session_id,
-            TurnStart {
-                cwd: &queued.cwd,
-                git_worktree_root: queued.git_worktree_root.as_deref(),
-                prompt: &queued.content,
-                turn_kind: "user",
-                compaction: None,
-                queued_prompt_id: Some(queued.prompt_id),
+            Event::PromptMaterialized {
+                prompt_id: queued.prompt_id,
+                turn_id: turn_id.clone(),
             },
-        )
-        .map(Some)
+        )?;
+        Ok(Some(turn_id))
     }
 
     pub fn context_epoch(&self, session_id: &str) -> Result<u64> {
@@ -1625,54 +1488,28 @@ impl Store {
 
     pub fn has_user_turn(&self, session_id: &str) -> Result<bool> {
         self.with_journal(session_id, |journal| {
-            Ok(journal.events.iter().any(|line| {
-                matches!(
-                    &line.event,
-                    Event::TurnStarted {
-                        compaction: None,
-                        ..
-                    }
-                )
-            }))
+            Ok(journal
+                .events
+                .iter()
+                .any(|line| matches!(&line.event, Event::PromptMaterialized { .. })))
         })
     }
 
     pub fn pending_compaction(&self, session_id: &str) -> Result<Option<PendingCompaction>> {
         self.with_journal(session_id, |journal| {
-            let applied = journal
-                .events
-                .iter()
-                .filter_map(|line| match &line.event {
-                    Event::CompactionApplied { source_turn_id, .. } => {
-                        Some(source_turn_id.as_str())
+            Ok(
+                compaction_start_before(journal, i64::MAX).map(|(line, turn_id, compaction)| {
+                    PendingCompaction {
+                        turn_id: turn_id.to_string(),
+                        trigger: compaction.trigger,
+                        mode: compaction.mode,
+                        from_epoch: context_epoch(journal, line.seq.saturating_sub(1)),
+                        started_at: line.at.clone(),
+                        before_context_tokens: compaction.before_context_tokens,
+                        before_context_window: compaction.before_context_window,
                     }
-                    _ => None,
-                })
-                .collect::<HashSet<_>>();
-            Ok(journal
-                .events
-                .iter()
-                .rev()
-                .find_map(|line| match &line.event {
-                    Event::TurnStarted {
-                        turn_id,
-                        epoch,
-                        turn_kind,
-                        compaction: Some(compaction),
-                        ..
-                    } if turn_kind == "compaction" && !applied.contains(turn_id.as_str()) => {
-                        Some(PendingCompaction {
-                            turn_id: turn_id.clone(),
-                            trigger: compaction.trigger,
-                            mode: compaction.mode,
-                            from_epoch: *epoch,
-                            started_at: line.at.clone(),
-                            before_context_tokens: compaction.before_context_tokens,
-                            before_context_window: compaction.before_context_window,
-                        })
-                    }
-                    _ => None,
-                }))
+                }),
+            )
         })
     }
 
@@ -1681,17 +1518,12 @@ impl Store {
             let exchanges = journal
                 .events
                 .iter()
-                .filter_map(|line| match &line.event {
-                    Event::ProviderRequested {
-                        turn_id: request_turn,
-                        exchange_id,
-                        request_recipe,
-                        ..
-                    } if request_turn == turn_id => Some((
-                        exchange_id.as_str(),
-                        request_recipe.input["compaction_attempt"].as_str(),
-                    )),
-                    _ => None,
+                .filter_map(|line| {
+                    agent_compaction_attempt(&line.event).and_then(
+                        |(request_turn, exchange_id, attempt)| {
+                            (request_turn == turn_id).then_some((exchange_id, attempt))
+                        },
+                    )
                 })
                 .collect::<HashMap<_, _>>();
             Ok(journal
@@ -1724,34 +1556,7 @@ impl Store {
         turn_id: &str,
     ) -> Result<Option<String>> {
         self.with_journal(session_id, |journal| {
-            let exchange_turns = provider_exchange_turns(journal);
-            Ok(journal
-                .events
-                .iter()
-                .rev()
-                .find_map(|line| match &line.event {
-                    Event::ProviderCompleted {
-                        exchange_id,
-                        projection:
-                            Projection::Assistant {
-                                turn_state, items, ..
-                            },
-                        ..
-                    } if exchange_turns.get(exchange_id.as_str()).map(String::as_str)
-                        == Some(turn_id)
-                        && turn_state == "complete" =>
-                    {
-                        let summary = items
-                            .iter()
-                            .filter_map(|item| match item {
-                                PersistedAssistantItem::Text { text } => Some(text.as_str()),
-                                _ => None,
-                            })
-                            .collect::<String>();
-                        (!summary.trim().is_empty()).then_some(summary)
-                    }
-                    _ => None,
-                }))
+            Ok(compaction_summary_before(journal, turn_id, i64::MAX))
         })
     }
 
@@ -1768,15 +1573,6 @@ impl Store {
                 .find_map(|line| match &line.event {
                     Event::CompactionApplied { .. } => Some(line.seq),
                     _ => None,
-                })
-                .or_else(|| {
-                    latest_compaction_before(journal, i64::MAX).and_then(|line| match &line.event {
-                        Event::ProviderCompleted {
-                            projection: Projection::Compaction { through_seq, .. },
-                            ..
-                        } => Some(*through_seq),
-                        _ => None,
-                    })
                 })
                 .unwrap_or(0);
             let completed = journal
@@ -1824,32 +1620,20 @@ impl Store {
     pub fn apply_compaction(
         &self,
         session_id: &str,
-        application: CompactionApplication<'_>,
+        application: CompactionApplication,
     ) -> Result<u64> {
-        let from_epoch = self.context_epoch(session_id)?;
-        let to_epoch = from_epoch.saturating_add(1);
-        let continuation_turn_id = if application.mode == CompactionMode::ContinueTurn {
-            Some(format!("t{}", self.next_seq(session_id)?))
-        } else {
-            None
-        };
+        let to_epoch = self.with_journal(session_id, |journal| {
+            let (_, turn_id, _) = compaction_start_before(journal, i64::MAX)
+                .context("session has no pending compaction")?;
+            compaction_summary_before(journal, turn_id, i64::MAX)
+                .context("pending compaction has no accepted summary")?;
+            Ok(context_epoch(journal, i64::MAX).saturating_add(1))
+        })?;
         self.append(
             session_id,
             Event::CompactionApplied {
-                source_turn_id: application.source_turn_id.to_string(),
-                from_epoch,
-                to_epoch,
-                trigger: application.trigger,
-                mode: application.mode,
-                summary: application.summary.to_string(),
-                checkpoint: application.checkpoint.to_string(),
-                continuation_turn_id,
-                before_context_tokens: application.before_context_tokens,
-                before_context_window: application.before_context_window,
                 after_context_tokens_estimate: application.after_context_tokens_estimate,
                 after_context_window: application.after_context_window,
-                elapsed_ms: application.elapsed_ms,
-                emergency_elided_call_ids: application.emergency_elided_call_ids.to_vec(),
             },
         )?;
         Ok(to_epoch)
@@ -1881,7 +1665,7 @@ impl Store {
                         .events
                         .iter()
                         .find_map(|line| match &line.event {
-                            Event::TurnStarted { turn_id: id, .. } if id == &turn_id => {
+                            Event::PromptMaterialized { turn_id: id, .. } if id == &turn_id => {
                                 Some(line.seq)
                             }
                             _ => None,
@@ -1892,8 +1676,7 @@ impl Store {
             }
             Message::Assistant { .. } => {
                 let turn_id = self.current_turn_id(session_id)?;
-                let exchange_id =
-                    self.start_test_provider_request(session_id, &turn_id, "agent")?;
+                let exchange_id = self.start_test_provider_request(session_id, &turn_id)?;
                 self.complete_assistant_exchange(session_id, &exchange_id, message, None, None)
             }
             Message::System { .. } => Ok((1, Vec::new())),
@@ -1902,57 +1685,45 @@ impl Store {
     }
 
     #[cfg(test)]
-    pub fn append_summary(&self, session_id: &str, content: &str) -> Result<()> {
-        let through_seq = self
-            .records(&self.load(session_id)?)?
-            .last()
-            .map_or(0, |record| record.seq);
-        self.append_compaction(session_id, content, through_seq)
-    }
-
-    #[cfg(test)]
-    fn append_compaction(&self, session_id: &str, content: &str, through_seq: i64) -> Result<()> {
-        let turn_id = self.current_turn_id(session_id)?;
-        let retained_turn_ids = self.turn_ids_after(session_id, through_seq)?;
-        let exchange_id = self.start_test_provider_request(session_id, &turn_id, "compaction")?;
-        self.complete_compaction_exchange(
+    pub fn apply_test_compaction(&self, session_id: &str, summary: &str) -> Result<()> {
+        let source_turn_id = self.start_compaction_turn(
+            session_id,
+            CompactionStart {
+                cwd: "/tmp",
+                prompt: &"compact".into(),
+                trigger: CompactionTrigger::Manual,
+                mode: CompactionMode::AwaitUser,
+                before_context_tokens: 0,
+                before_context_window: None,
+            },
+        )?;
+        let exchange_id = self.start_test_provider_request(session_id, &source_turn_id)?;
+        self.complete_assistant_exchange(
             session_id,
             &exchange_id,
-            CompactionCompletion {
-                summary: content,
-                through_seq,
-                retained_turn_ids,
-                native_response: None,
-                usage: None,
+            &Message::assistant(Some(summary.to_string()), None, None, None),
+            None,
+            None,
+        )?;
+        self.apply_compaction(
+            session_id,
+            CompactionApplication {
+                after_context_tokens_estimate: 0,
+                after_context_window: None,
             },
         )
+        .map(|_| ())
     }
 
     #[cfg(test)]
-    fn start_test_provider_request(
-        &self,
-        session_id: &str,
-        turn_id: &str,
-        purpose: &str,
-    ) -> Result<String> {
-        let canonical_model_ref = if purpose == "compaction" {
-            self.latest_attempt_model(session_id)?
-                .unwrap_or_else(|| "test/model".into())
-        } else {
-            "test/model".into()
-        };
+    fn start_test_provider_request(&self, session_id: &str, turn_id: &str) -> Result<String> {
         let native_request = serde_json::json!({"model":"test"});
-        let recipe = self.request_recipe(
-            "test.v1",
-            &native_request,
-            serde_json::json!({"kind":purpose}),
-        )?;
+        let recipe = self.request_recipe("test.v1", &native_request, serde_json::json!({}))?;
         self.start_provider_request(
             session_id,
             turn_id,
-            purpose,
             ProviderOrigin {
-                canonical_model_ref,
+                canonical_model_ref: "test/model".into(),
                 provider_id: "test".into(),
                 api: "test".into(),
                 endpoint: String::new(),
@@ -1960,7 +1731,7 @@ impl Store {
                 effort: None,
             },
             recipe,
-            None,
+            RequestSubject::Agent,
         )
     }
 
@@ -1971,17 +1742,15 @@ impl Store {
         content: &str,
         attachments: &[ToolAttachment],
     ) -> Result<(i64, Vec<ToolAttachment>)> {
-        let (turn_id, already_completed) = self.with_journal(session_id, |journal| {
-            Ok((
-                call_turn_id(journal, record.bash_call_id)
-                    .context("locating Bash claim for result persistence")?,
-                journal.events.iter().any(|line| {
-                    matches!(
-                        line.event,
-                        Event::BashCompleted { call_id, .. } if call_id == record.bash_call_id
-                    )
-                }),
-            ))
+        let already_completed = self.with_journal(session_id, |journal| {
+            find_call(journal, record.bash_call_id)
+                .context("locating Bash claim for result persistence")?;
+            Ok(journal.events.iter().any(|line| {
+                matches!(
+                    line.event,
+                    Event::BashCompleted { call_id, .. } if call_id == record.bash_call_id
+                )
+            }))
         })?;
         if already_completed {
             bail!("Bash result already exists")
@@ -1994,7 +1763,6 @@ impl Store {
         let seq = self.append(
             session_id,
             Event::BashCompleted {
-                turn_id,
                 call_id: record.bash_call_id,
                 outcome: record.outcome.to_string(),
                 output,
@@ -2016,15 +1784,7 @@ impl Store {
     pub fn latest_summary_sequence(&self, session_id: &str) -> Result<Option<i64>> {
         let journal = self.load(session_id)?;
         Ok(journal.events.iter().rev().find_map(|line| {
-            matches!(
-                line.event,
-                Event::CompactionApplied { .. }
-                    | Event::ProviderCompleted {
-                        projection: Projection::Compaction { .. },
-                        ..
-                    }
-            )
-            .then_some(line.seq)
+            matches!(line.event, Event::CompactionApplied { .. }).then_some(line.seq)
         }))
     }
 
@@ -2054,33 +1814,22 @@ impl Store {
     pub fn projected_compaction_context_tokens(
         &self,
         session_id: &str,
-        mode: CompactionMode,
-        checkpoint: &str,
         config: &Config,
         target: &ResolvedModelRef,
         api: ModelApi,
     ) -> Result<u64> {
         let mut journal = self.load(session_id)?;
-        let from_epoch = context_epoch(&journal, i64::MAX);
+        let mode = compaction_start_before(&journal, i64::MAX)
+            .context("session has no pending compaction")?
+            .2
+            .mode;
         let seq = journal.next_seq();
         Arc::make_mut(&mut journal.events).push(EventLine {
             seq,
             at: now(),
             event: Event::CompactionApplied {
-                source_turn_id: String::new(),
-                from_epoch,
-                to_epoch: from_epoch.saturating_add(1),
-                trigger: CompactionTrigger::Manual,
-                mode,
-                summary: String::new(),
-                checkpoint: checkpoint.to_string(),
-                continuation_turn_id: None,
-                before_context_tokens: 0,
-                before_context_window: None,
                 after_context_tokens_estimate: 0,
                 after_context_window: None,
-                elapsed_ms: 0,
-                emergency_elided_call_ids: Vec::new(),
             },
         });
         if mode == CompactionMode::AwaitUser {
@@ -2126,18 +1875,23 @@ impl Store {
         target: &ResolvedModelRef,
         api: ModelApi,
     ) -> Result<Option<(usize, u64)>> {
+        let replay_target = ReplayTarget {
+            config,
+            model: target,
+            api,
+        };
         let mut requests = HashMap::new();
         let mut anchor = None;
         for line in journal.events.iter() {
             match &line.event {
                 Event::ProviderRequested {
                     exchange_id,
-                    purpose,
+                    subject,
                     origin,
                     request_recipe,
                     ..
-                } if purpose == "agent" => {
-                    requests.insert(exchange_id.as_str(), (origin, request_recipe));
+                } if subject.is_agent() => {
+                    requests.insert(exchange_id.as_str(), (line.seq, origin, request_recipe));
                 }
                 Event::ProviderCompleted {
                     exchange_id,
@@ -2151,17 +1905,20 @@ impl Store {
                         },
                     ..
                 } => {
-                    let Some((origin, recipe)) = requests.get(exchange_id.as_str()) else {
+                    let Some((request_seq, origin, recipe)) = requests.get(exchange_id.as_str())
+                    else {
                         continue;
                     };
-                    if !self
-                        .request_context_compatible(journal, origin, recipe, config, target, api)?
-                    {
+                    if !self.request_context_compatible(
+                        journal,
+                        *request_seq,
+                        origin,
+                        recipe,
+                        replay_target,
+                    )? {
                         continue;
                     }
-                    let through_seq = recipe.input["context_through_seq"]
-                        .as_i64()
-                        .context("agent request recipe has no context boundary")?;
+                    let through_seq = request_seq.saturating_sub(1);
                     let input_message_count = self.context_until(journal, through_seq)?.len();
                     let output_complete = *context_output_complete
                         && (native_replay.is_some()
@@ -2169,16 +1926,12 @@ impl Store {
                                 matches!(item, PersistedAssistantItem::Reasoning { .. })
                             }))
                         && native_replay.as_ref().is_none_or(|native| {
-                            let mut native = native.clone();
-                            if native.provider_id.is_empty() {
-                                native.provider_id = origin.provider_id.clone();
-                            }
                             let message = Message::Assistant {
                                 items: items
                                     .iter()
                                     .map(PersistedAssistantItem::assistant_item)
                                     .collect(),
-                                native_replay: Some(native),
+                                native_replay: Some(hydrate_native_replay(native, origin)),
                             };
                             matches!(
                                 filter_native_replay_for_config(&[message], config, target, api)
@@ -2195,11 +1948,7 @@ impl Store {
                         anchor = Some((input_message_count, usage.input_tokens));
                     }
                 }
-                Event::ProviderCompleted {
-                    projection: Projection::Compaction { .. },
-                    ..
-                }
-                | Event::CompactionApplied { .. } => anchor = None,
+                Event::CompactionApplied { .. } => anchor = None,
                 _ => {}
             }
         }
@@ -2209,36 +1958,37 @@ impl Store {
     fn request_context_compatible(
         &self,
         journal: &Journal,
+        request_seq: i64,
         origin: &ProviderOrigin,
         recipe: &RequestRecipe,
-        config: &Config,
-        target: &ResolvedModelRef,
-        api: ModelApi,
+        target: ReplayTarget<'_>,
     ) -> Result<bool> {
         if !request_format_is_current(&origin.api, &recipe.format)
-            || !context_origin_compatible(config, origin, target, api)
+            || !context_origin_compatible(target.config, origin, target.model, target.api)
             || recipe.input.get("native_fields").is_some()
         {
             return Ok(false);
         }
-        let Some(through_seq) = recipe.input["context_through_seq"].as_i64() else {
-            return Ok(false);
-        };
-        if let Some(elided) = recipe.input.get("emergency_elided_provider_call_ids") {
-            let elided = serde_json::from_value::<Vec<String>>(elided.clone())
+        let through_seq = request_seq.saturating_sub(1);
+        if let Some(elided) = recipe.input.get("emergency_elided_call_ids") {
+            let elided = serde_json::from_value::<Vec<i64>>(elided.clone())
                 .context("invalid emergency Bash elision ids in request recipe")?;
             if !elided.is_empty() {
                 return Ok(false);
             }
         }
         let Some(origins) = recipe.input.get("native_replay_origins") else {
-            return Ok(true);
+            return Ok(false);
         };
         let recorded = serde_json::from_value::<Vec<ReplayOrigin>>(origins.clone())
             .context("invalid native replay origins in request recipe")?;
         let historical_context = self.context_until(journal, through_seq)?;
-        let current_projection =
-            filter_native_replay_for_config(&historical_context, config, target, api);
+        let current_projection = filter_native_replay_for_config(
+            &historical_context,
+            target.config,
+            target.model,
+            target.api,
+        );
         Ok(native_replay_origins(&current_projection) == recorded)
     }
 
@@ -2284,22 +2034,30 @@ impl Store {
         &self,
         session_id: &str,
         turn_id: &str,
-        purpose: &str,
         origin: ProviderOrigin,
         recipe: RequestRecipe,
-        subject: Option<RequestSubject>,
+        subject: RequestSubject,
     ) -> Result<String> {
+        self.with_journal(session_id, |journal| {
+            if latest_active_turn_id(journal).as_deref() != Some(turn_id) {
+                bail!("provider request does not reference the active turn")
+            }
+            if let RequestSubject::Guardrail { call_id, .. } = &subject
+                && call_turn_id(journal, *call_id).as_deref() != Some(turn_id)
+            {
+                bail!("guardrail request does not match its Bash call turn")
+            }
+            Ok(())
+        })?;
         let exchange_id = format!("e{}", self.next_seq(session_id)?);
         self.append(
             session_id,
             Event::ProviderRequested {
                 turn_id: turn_id.to_string(),
                 exchange_id: exchange_id.clone(),
-                purpose: purpose.to_string(),
+                subject,
                 origin,
                 request_recipe: recipe,
-                epoch: self.context_epoch(session_id)?,
-                subject,
             },
         )?;
         self.reconstruct_provider_request(session_id, &exchange_id)
@@ -2312,17 +2070,6 @@ impl Store {
     pub fn current_turn_id(&self, session_id: &str) -> Result<String> {
         self.with_journal(session_id, |journal| {
             latest_active_turn_id(journal).context("session has no submitted turn")
-        })
-    }
-
-    pub fn current_context_seq(&self, session_id: &str) -> Result<i64> {
-        self.with_journal(session_id, |journal| {
-            Ok(journal
-                .events
-                .iter()
-                .rev()
-                .find(|line| is_semantic(&line.event))
-                .map_or(1, |line| line.seq))
         })
     }
 
@@ -2362,6 +2109,7 @@ impl Store {
                 native_response,
                 usage,
                 resumable: false,
+                response_complete: true,
                 context_output_complete: true,
             },
         )
@@ -2384,6 +2132,7 @@ impl Store {
                 native_response,
                 usage,
                 resumable: true,
+                response_complete: false,
                 context_output_complete: true,
             },
         )
@@ -2409,6 +2158,7 @@ impl Store {
             native_response,
             usage,
             resumable,
+            response_complete,
             context_output_complete,
         } = completion;
         if !matches!(message, Message::Assistant { .. }) {
@@ -2429,6 +2179,40 @@ impl Store {
         else {
             unreachable!()
         };
+        let request_origin = self.with_journal(session_id, |journal| {
+            journal
+                .events
+                .iter()
+                .find_map(|line| match &line.event {
+                    Event::ProviderRequested {
+                        exchange_id: requested_exchange,
+                        subject,
+                        origin,
+                        ..
+                    } if requested_exchange == exchange_id && subject.is_agent() => {
+                        Some(origin.clone())
+                    }
+                    _ => None,
+                })
+                .context("assistant completion has no agent request")
+        })?;
+        if let Some(native) = native_replay
+            && (native.provider_id != request_origin.provider_id
+                || native.model != request_origin.wire_model
+                || request_origin.api != "test"
+                    && (native.endpoint != request_origin.endpoint
+                        || native.api().name() != request_origin.api))
+        {
+            self.fail_provider_exchange(
+                session_id,
+                exchange_id,
+                "invalid_response",
+                serde_json::json!({"message":"native replay origin does not match provider request"}),
+                native_response,
+                usage,
+            )?;
+            bail!("native replay origin does not match provider request")
+        }
         let mut provider_call_ids = HashSet::new();
         if let Some(call) = items
             .iter()
@@ -2465,38 +2249,14 @@ impl Store {
             native_response,
             usage,
             Projection::Assistant {
-                turn_state: if ids.is_empty() {
-                    if resumable { "resume" } else { "complete" }.into()
-                } else {
-                    "continue".into()
-                },
+                resumable: ids.is_empty() && resumable,
+                incomplete: !response_complete,
                 context_output_complete,
-                native_replay: native_replay.clone(),
+                native_replay: native_replay.as_ref().map(|native| native.payload.clone()),
                 items,
             },
         )?;
         Ok((seq, ids))
-    }
-
-    #[cfg(test)]
-    pub fn complete_compaction_exchange(
-        &self,
-        session_id: &str,
-        exchange_id: &str,
-        completion: CompactionCompletion<'_>,
-    ) -> Result<()> {
-        self.complete_provider_exchange(
-            session_id,
-            exchange_id,
-            completion.native_response,
-            completion.usage,
-            Projection::Compaction {
-                summary: completion.summary.to_string(),
-                through_seq: completion.through_seq,
-                retained_turn_ids: completion.retained_turn_ids,
-            },
-        )
-        .map(|_| ())
     }
 
     pub fn complete_guardrail_exchange(
@@ -2511,8 +2271,6 @@ impl Store {
             completion.native_response,
             completion.usage,
             Projection::Guardrail {
-                call_id: completion.call_id,
-                attempt: completion.attempt,
                 outcome: completion.outcome.to_string(),
                 risk_level: completion.risk_level.map(str::to_string),
                 auth_level: completion.auth_level.map(str::to_string),
@@ -2520,21 +2278,6 @@ impl Store {
             },
         )
         .map(|_| ())
-    }
-
-    #[cfg(test)]
-    pub fn turn_ids_after(&self, session_id: &str, through_seq: i64) -> Result<Vec<String>> {
-        Ok(self
-            .load(session_id)?
-            .events
-            .iter()
-            .filter_map(|line| match &line.event {
-                Event::TurnStarted { turn_id, .. } if line.seq > through_seq => {
-                    Some(turn_id.clone())
-                }
-                _ => None,
-            })
-            .collect())
     }
 
     pub fn fail_provider_exchange(
@@ -2585,7 +2328,7 @@ impl Store {
                 }
             }
         }
-        if (input["kind"] != "agent" || format.starts_with("test."))
+        if (input.get("native_replay_origins").is_none() || format.starts_with("test."))
             && let Some(object) = input.as_object_mut()
         {
             object.insert("native_fields".into(), Value::Object(native_fields));
@@ -2612,7 +2355,7 @@ impl Store {
         journal: &Journal,
         exchange_id: &str,
     ) -> Result<Value> {
-        let (origin, recipe) = journal
+        let (request_seq, origin, recipe) = journal
             .events
             .iter()
             .find_map(|line| match &line.event {
@@ -2621,7 +2364,7 @@ impl Store {
                     origin,
                     request_recipe,
                     ..
-                } if id == exchange_id => Some((origin, request_recipe)),
+                } if id == exchange_id => Some((line.seq, origin, request_recipe)),
                 _ => None,
             })
             .with_context(|| format!("provider request not found: {exchange_id}"))?;
@@ -2644,29 +2387,23 @@ impl Store {
                 "anthropic.messages.v1" => ModelApi::AnthropicMessages,
                 format => bail!("unsupported provider request format: {format}"),
             };
-            let through_seq = recipe.input["context_through_seq"]
-                .as_i64()
-                .context("agent request recipe has no context boundary")?;
-            let messages = self.context_until(journal, through_seq)?;
-            let mut messages = if let Some(origins) = recipe.input.get("native_replay_origins") {
-                let origins: Vec<crate::provider::ReplayOrigin> =
-                    serde_json::from_value(origins.clone())
-                        .context("invalid native replay origins in request recipe")?;
-                crate::provider::filter_native_replay_for_origins(&messages, api, &origins)
-            } else {
-                crate::provider::filter_native_replay_for_legacy_origin(
-                    &messages,
-                    api,
-                    &origin.provider_id,
-                    &origin.endpoint,
-                    &origin.wire_model,
-                )
-            };
-            if let Some(call_ids) = recipe.input.get("emergency_elided_provider_call_ids") {
-                let call_ids = serde_json::from_value::<HashSet<String>>(call_ids.clone())
-                    .context("invalid emergency Bash elision ids in request recipe")?;
-                crate::compaction::apply_emergency_elisions(&mut messages, &call_ids);
-            }
+            let through_seq = request_seq.saturating_sub(1);
+            let elided_call_ids = recipe
+                .input
+                .get("emergency_elided_call_ids")
+                .map(|call_ids| {
+                    serde_json::from_value::<HashSet<i64>>(call_ids.clone())
+                        .context("invalid emergency Bash elision ids in request recipe")
+                })
+                .transpose()?
+                .unwrap_or_default();
+            let messages =
+                self.context_until_with_elisions(journal, through_seq, &elided_call_ids)?;
+            let origins: Vec<crate::provider::ReplayOrigin> =
+                serde_json::from_value(recipe.input["native_replay_origins"].clone())
+                    .context("agent request recipe has no valid native replay origins")?;
+            let messages =
+                crate::provider::filter_native_replay_for_origins(&messages, api, &origins);
             let cache_key = recipe
                 .envelope
                 .get("prompt_cache_key")
@@ -2704,26 +2441,21 @@ impl Store {
 
     // Semantic projections over the durable event stream.
     fn project_session(&self, journal: &Journal) -> Result<Session> {
+        let prompts = queued_prompt_records(journal);
         let cwd = journal
             .events
             .iter()
             .rev()
-            .find_map(|line| match &line.event {
-                Event::TurnStarted {
-                    cwd,
-                    compaction: None,
-                    ..
-                } => Some(cwd.clone()),
-                _ => None,
+            .find_map(|line| {
+                project_turn(&line.event, &prompts)
+                    .filter(|turn| turn.compaction.is_none())
+                    .map(|turn| turn.cwd.to_string())
             })
             .unwrap_or_default();
-        let title = journal.events.iter().find_map(|line| match &line.event {
-            Event::TurnStarted {
-                prompt,
-                compaction: None,
-                ..
-            } => Some(user_text(prompt).chars().take(60).collect::<String>()),
-            _ => None,
+        let title = journal.events.iter().find_map(|line| {
+            project_turn(&line.event, &prompts)
+                .filter(|turn| turn.compaction.is_none())
+                .map(|turn| user_text(turn.prompt).chars().take(60).collect::<String>())
         });
         let last_model = journal
             .events
@@ -2731,10 +2463,8 @@ impl Store {
             .rev()
             .find_map(|line| match &line.event {
                 Event::ProviderRequested {
-                    purpose, origin, ..
-                } if purpose == "agent" || purpose == "compaction" => {
-                    Some(origin.canonical_model_ref.clone())
-                }
+                    subject, origin, ..
+                } if subject.is_agent() => Some(origin.canonical_model_ref.clone()),
                 _ => None,
             });
         Ok(Session {
@@ -2750,6 +2480,15 @@ impl Store {
     }
 
     fn context_until(&self, journal: &Journal, max_seq: i64) -> Result<Vec<Message>> {
+        self.context_until_with_elisions(journal, max_seq, &HashSet::new())
+    }
+
+    fn context_until_with_elisions(
+        &self,
+        journal: &Journal,
+        max_seq: i64,
+        elided_call_ids: &HashSet<i64>,
+    ) -> Result<Vec<Message>> {
         let system = journal
             .events
             .iter()
@@ -2761,20 +2500,9 @@ impl Store {
         let applied = journal.events.iter().rev().find(|line| {
             line.seq <= max_seq && matches!(line.event, Event::CompactionApplied { .. })
         });
-        let legacy_compaction = applied
-            .is_none()
-            .then(|| latest_compaction_before(journal, max_seq))
-            .flatten();
-        let through_seq = applied.map(|line| line.seq).or_else(|| {
-            legacy_compaction.and_then(|line| match &line.event {
-                Event::ProviderCompleted {
-                    projection: Projection::Compaction { through_seq, .. },
-                    ..
-                } => Some(*through_seq),
-                _ => None,
-            })
-        });
+        let through_seq = applied.map(|line| line.seq);
         let mut messages = vec![Message::System { content: system }];
+        let prompts = queued_prompt_records(journal);
         let exchange_origins = journal
             .events
             .iter()
@@ -2788,20 +2516,10 @@ impl Store {
             })
             .collect::<HashMap<_, _>>();
         let exchange_turns = provider_exchange_turns(journal);
-        if let Some(line) = applied
-            && let Event::CompactionApplied { checkpoint, .. } = &line.event
-        {
+        let mut found_elisions = HashSet::new();
+        if let Some(line) = applied {
             messages.push(Message::User {
-                content: checkpoint.clone().into(),
-            });
-        } else if let Some(line) = legacy_compaction
-            && let Event::ProviderCompleted {
-                projection: Projection::Compaction { summary, .. },
-                ..
-            } = &line.event
-        {
-            messages.push(Message::User {
-                content: format!("[summary of earlier conversation]\n{summary}").into(),
+                content: compaction_checkpoint_for_application(journal, line.seq)?.into(),
             });
         }
         let mut previous_location: Option<(String, Option<String>)> = None;
@@ -2813,44 +2531,46 @@ impl Store {
                 continue;
             }
             match &line.event {
-                Event::TurnStarted {
-                    cwd,
-                    git_worktree_root,
-                    prompt,
-                    ..
-                } => {
+                event @ (Event::PromptMaterialized { .. } | Event::CompactionStarted { .. }) => {
+                    let turn = project_turn(event, &prompts)
+                        .context("turn references an unknown queued prompt")?;
                     if let Some(location) = location_context(
                         previous_location.as_ref(),
-                        cwd,
-                        git_worktree_root.as_deref(),
+                        turn.cwd,
+                        turn.git_worktree_root,
                     ) {
                         messages.push(Message::User {
                             content: location.into(),
                         });
                     }
-                    previous_location = Some((cwd.clone(), git_worktree_root.clone()));
+                    previous_location = Some((
+                        turn.cwd.to_string(),
+                        turn.git_worktree_root.map(str::to_string),
+                    ));
                     messages.push(Message::User {
-                        content: self.hydrate_user_content(prompt)?,
+                        content: self.hydrate_user_content(turn.prompt)?,
                     });
                 }
                 Event::ProviderCompleted {
                     exchange_id,
                     projection:
                         Projection::Assistant {
-                            turn_state,
+                            resumable,
                             native_replay,
                             items,
                             ..
                         },
                     ..
                 } => {
-                    let mut native_replay = native_replay.clone();
-                    if let Some(native) = &mut native_replay
-                        && native.provider_id.is_empty()
-                        && let Some(origin) = exchange_origins.get(exchange_id.as_str())
-                    {
-                        native.provider_id = origin.provider_id.clone();
-                    }
+                    let native_replay = native_replay
+                        .as_ref()
+                        .map(|payload| {
+                            exchange_origins
+                                .get(exchange_id.as_str())
+                                .map(|origin| hydrate_native_replay(payload, origin))
+                                .context("assistant completion has no request origin")
+                        })
+                        .transpose()?;
                     messages.push(Message::Assistant {
                         items: items
                             .iter()
@@ -2858,7 +2578,7 @@ impl Store {
                             .collect(),
                         native_replay,
                     });
-                    if turn_state == "resume"
+                    if *resumable
                         && let Some(turn_id) = exchange_turns.get(exchange_id.as_str())
                         && resume_was_requested(journal, turn_id, line.seq)
                     {
@@ -2874,6 +2594,15 @@ impl Store {
                     ..
                 } => {
                     let call = find_call(journal, *call_id).context("Bash result claim missing")?;
+                    if elided_call_ids.contains(call_id) {
+                        found_elisions.insert(*call_id);
+                        messages.push(Message::Tool {
+                            content: crate::compaction::EMERGENCY_OUTPUT_UNAVAILABLE.into(),
+                            attachments: Vec::new(),
+                            tool_call_id: call.0.to_string(),
+                        });
+                        continue;
+                    }
                     messages.push(Message::Tool {
                         content: self.hydrate_text(output)?,
                         attachments: attachments
@@ -2886,98 +2615,10 @@ impl Store {
                 _ => {}
             }
         }
-        Ok(messages)
-    }
-
-    #[cfg(test)]
-    fn records(&self, journal: &Journal) -> Result<Vec<MessageRecord>> {
-        let mut records = Vec::new();
-        for line in journal.events.iter() {
-            match &line.event {
-                Event::SystemPrompt { content } => records.push(MessageRecord {
-                    kind: "system".into(),
-                    items: vec![MessageRecordItem::Text(content.clone())],
-                    seq: line.seq,
-                }),
-                Event::TurnStarted { prompt, .. } => records.push(MessageRecord {
-                    kind: "user".into(),
-                    items: self.message_record_user_items(prompt)?,
-                    seq: line.seq,
-                }),
-                Event::ProviderCompleted {
-                    projection: Projection::Assistant { items, .. },
-                    ..
-                } => records.push(MessageRecord {
-                    kind: "assistant".into(),
-                    items: items
-                        .iter()
-                        .filter_map(PersistedAssistantItem::message_record_item)
-                        .collect(),
-                    seq: line.seq,
-                }),
-                Event::ProviderCompleted {
-                    projection: Projection::Compaction { summary, .. },
-                    ..
-                } => records.push(MessageRecord {
-                    kind: "summary".into(),
-                    items: vec![MessageRecordItem::Text(summary.clone())],
-                    seq: line.seq,
-                }),
-                Event::BashCompleted {
-                    output,
-                    attachments,
-                    ..
-                } => {
-                    let mut items = vec![MessageRecordItem::Text(self.hydrate_text(output)?)];
-                    items.extend(
-                        attachments
-                            .iter()
-                            .map(|attachment| {
-                                self.hydrate_tool_attachment(attachment).map(|attachment| {
-                                    MessageRecordItem::Attachment(attachment.attachment)
-                                })
-                            })
-                            .collect::<Result<Vec<_>>>()?,
-                    );
-                    records.push(MessageRecord {
-                        kind: "bash_result".into(),
-                        items,
-                        seq: line.seq,
-                    });
-                }
-                _ => {}
-            }
+        if &found_elisions != elided_call_ids {
+            bail!("emergency Bash elision references no visible tool result")
         }
-        Ok(records)
-    }
-
-    #[cfg(test)]
-    fn message_record_user_items(
-        &self,
-        content: &PersistedUserContent,
-    ) -> Result<Vec<MessageRecordItem>> {
-        Ok(match content {
-            PersistedUserContent::Text { text } => {
-                vec![MessageRecordItem::Text(text.clone())]
-            }
-            PersistedUserContent::Parts { parts } => parts
-                .iter()
-                .map(|part| match part {
-                    PersistedContentPart::Text { text } => {
-                        Ok(MessageRecordItem::Text(text.clone()))
-                    }
-                    PersistedContentPart::Attachment {
-                        object,
-                        filename,
-                        media_type,
-                    } => Ok(MessageRecordItem::Attachment(Attachment {
-                        filename: filename.clone(),
-                        media_type: media_type.clone(),
-                        data: self.read_object(object)?,
-                    })),
-                })
-                .collect::<Result<Vec<_>>>()?,
-        })
+        Ok(messages)
     }
 
     // Object-backed content persistence.
@@ -3205,19 +2846,15 @@ impl Store {
         if !valid_session_id(session_id) {
             bail!("session not found: {session_id}")
         }
-        self.open_locked_path(&self.session_path(session_id), Some(session_id))
-            .with_context(|| format!("opening session journal: {session_id}"))
-    }
-
-    fn open_locked_path(&self, path: &Path, expected_id: Option<&str>) -> Result<LockedSession> {
-        let mut file = open_current_locked(path)?;
+        let mut file = open_current_locked(&self.session_path(session_id))
+            .with_context(|| format!("opening session journal: {session_id}"))?;
         match journal_version(&mut file)? {
             FORMAT_VERSION => {
-                let journal = read_journal(&mut file, expected_id, true)?;
+                let journal = read_journal(&mut file, Some(session_id), true)?;
                 Ok(LockedSession { file, journal })
             }
             version => Err(anyhow::Error::new(UnsupportedSessionVersion {
-                session_id: expected_id.map(str::to_string),
+                session_id: Some(session_id.to_string()),
                 found: version,
                 supported: FORMAT_VERSION,
             })),
@@ -3525,116 +3162,106 @@ fn validate_events(events: &[EventLine]) -> Result<()> {
     ) {
         bail!("session journal is missing its initial system prompt")
     }
-    let mut turns = HashMap::new();
+    let mut turns = HashSet::new();
     let mut exchanges = HashMap::new();
     let mut terminal = HashSet::new();
     let mut calls = HashMap::new();
     let mut results = HashSet::new();
     let mut guardrail_attempts = HashSet::new();
-    let mut latest_compaction_through = None;
     let mut queued_prompts = HashSet::new();
-    let mut consumed_prompts = HashSet::new();
-    let mut pending_compactions = HashSet::new();
-    let mut epoch = 0_u64;
+    let mut unresolved_prompt = None;
+    let mut pending_compaction: Option<(String, CompactionMode, bool)> = None;
+    let mut active_turn = None;
     for line in events {
         match &line.event {
             Event::SystemPrompt { .. } if line.seq != 1 => {
                 bail!("system prompt must be the first event")
             }
-            Event::TurnStarted {
-                turn_id,
-                epoch: turn_epoch,
-                turn_kind,
-                compaction,
-                queued_prompt_id,
-                ..
-            } => {
+            Event::PromptMaterialized { prompt_id, turn_id } => {
                 if calls.keys().any(|call_id| !results.contains(call_id)) {
                     bail!("new turn starts before prior Bash claims are resolved")
                 }
-                if (turn_kind == "compaction") != compaction.is_some() {
-                    bail!("turn kind does not match compaction metadata")
-                }
-                if (compaction.is_some() || queued_prompt_id.is_some()) && *turn_epoch != epoch {
-                    bail!("new-style turn epoch does not match the active context epoch")
-                }
-                if compaction.is_some() && !pending_compactions.is_empty() {
-                    bail!("compaction starts before the prior compaction is applied")
-                }
-                if compaction.is_none() && !pending_compactions.is_empty() {
+                if pending_compaction.is_some() {
                     bail!("normal turn starts while compaction is incomplete")
                 }
-                if let Some(prompt_id) = queued_prompt_id
-                    && (!queued_prompts.contains(prompt_id)
-                        || !consumed_prompts.insert(prompt_id.clone()))
-                {
+                if unresolved_prompt.as_ref() != Some(prompt_id) {
                     bail!("turn references an unknown or consumed queued prompt")
                 }
-                if turns.insert(turn_id.clone(), line.seq).is_some() {
+                unresolved_prompt = None;
+                if !turns.insert(turn_id.clone()) {
                     bail!("duplicate turn id: {turn_id}")
                 }
-                if compaction.is_some() {
-                    pending_compactions.insert(turn_id.clone());
-                }
+                active_turn = Some(turn_id.clone());
             }
-            Event::PromptQueued {
-                prompt_id,
-                epoch: prompt_epoch,
-                ..
-            } => {
-                if !pending_compactions.is_empty() {
+            Event::CompactionStarted { turn_id, mode, .. } => {
+                if calls.keys().any(|call_id| !results.contains(call_id)) {
+                    bail!("new turn starts before prior Bash claims are resolved")
+                }
+                if pending_compaction.is_some() {
+                    bail!("compaction starts before the prior compaction is applied")
+                }
+                if !turns.insert(turn_id.clone()) {
+                    bail!("duplicate turn id: {turn_id}")
+                }
+                pending_compaction = Some((turn_id.clone(), *mode, false));
+                active_turn = Some(turn_id.clone());
+            }
+            Event::PromptQueued { prompt_id, .. } => {
+                if pending_compaction.is_some() {
                     bail!("prompt is queued while compaction is incomplete")
                 }
-                if *prompt_epoch != epoch {
-                    bail!("queued prompt epoch does not match the active context epoch")
-                }
-                if queued_prompts
-                    .iter()
-                    .any(|queued| !consumed_prompts.contains(queued))
-                {
+                if unresolved_prompt.is_some() {
                     bail!("multiple unresolved queued prompts")
                 }
                 if !queued_prompts.insert(prompt_id.clone()) {
                     bail!("duplicate queued prompt id: {prompt_id}")
                 }
+                unresolved_prompt = Some(prompt_id.clone());
             }
             Event::ProviderRequested {
                 turn_id,
                 exchange_id,
-                purpose,
+                request_recipe,
                 subject,
-                ..
+                origin,
             } => {
-                if !turns.contains_key(turn_id) {
-                    bail!("provider request references unknown turn: {turn_id}")
+                if active_turn.as_ref() != Some(turn_id) {
+                    bail!("provider request does not reference the active turn")
                 }
-                if !matches!(purpose.as_str(), "agent" | "compaction" | "guardrail") {
-                    bail!("unknown provider request purpose: {purpose}")
+                if subject.is_agent() && request_recipe.input.get("native_fields").is_none() {
+                    serde_json::from_value::<Vec<ReplayOrigin>>(
+                        request_recipe.input["native_replay_origins"].clone(),
+                    )
+                    .context("agent request recipe has no valid native replay origins")?;
                 }
-                if purpose == "guardrail" && subject.is_none()
-                    || purpose != "guardrail" && subject.is_some()
+                if subject.is_agent()
+                    && let Some((pending_turn, _, accepted)) = &mut pending_compaction
+                    && pending_turn == turn_id
                 {
-                    bail!("provider request subject does not match purpose: {purpose}")
+                    *accepted = false;
                 }
-                if let Some(subject) = subject {
-                    if !calls.contains_key(&subject.call_id) {
+                if let Some((call_id, attempt)) = subject.guardrail() {
+                    if !calls.contains_key(&call_id) {
                         bail!(
                             "guardrail request references unknown Bash call: {}",
-                            subject.call_id
+                            call_id
                         )
                     }
-                    if !guardrail_attempts.insert((subject.call_id, subject.attempt)) {
+                    if !guardrail_attempts.insert((call_id, attempt)) {
                         bail!(
                             "duplicate guardrail attempt {} for Bash call {}",
-                            subject.attempt,
-                            subject.call_id
+                            attempt,
+                            call_id
                         )
+                    }
+                    if calls.get(&call_id) != Some(turn_id) {
+                        bail!("guardrail request does not match its Bash call turn")
                     }
                 }
                 if exchanges
                     .insert(
                         exchange_id.clone(),
-                        (purpose.clone(), turn_id.clone(), subject.clone()),
+                        (subject.clone(), turn_id.clone(), origin.api.clone()),
                     )
                     .is_some()
                 {
@@ -3646,27 +3273,35 @@ fn validate_events(events: &[EventLine]) -> Result<()> {
                 projection,
                 ..
             } => {
-                let exchange = exchanges.get(exchange_id);
-                if exchange.is_none() {
+                let Some(exchange) = exchanges.get(exchange_id) else {
                     bail!("provider completion references unknown exchange: {exchange_id}")
-                }
+                };
                 if !terminal.insert(exchange_id) {
                     bail!("duplicate terminal provider event: {exchange_id}")
                 }
                 match projection {
                     Projection::Assistant {
-                        turn_state, items, ..
+                        resumable,
+                        incomplete,
+                        native_replay,
+                        items,
+                        ..
                     } => {
-                        if exchange.is_some_and(|(purpose, _, _)| purpose != "agent") {
+                        if !exchange.0.is_agent() {
                             bail!("assistant projection does not complete an agent request")
+                        }
+                        if exchange.2 != "test"
+                            && native_replay
+                                .as_ref()
+                                .is_some_and(|native| native.api().name() != exchange.2)
+                        {
+                            bail!("native replay protocol does not match provider request")
                         }
                         let has_calls = items
                             .iter()
                             .any(|item| matches!(item, PersistedAssistantItem::BashCall { .. }));
-                        if !matches!(turn_state.as_str(), "continue" | "resume" | "complete")
-                            || (turn_state == "continue") != has_calls
-                        {
-                            bail!("assistant turn state does not match its Bash claims")
+                        if *resumable && has_calls {
+                            bail!("resumable assistant projection has Bash claims")
                         }
                         let mut provider_ids = HashSet::new();
                         for item in items {
@@ -3674,7 +3309,6 @@ fn validate_events(events: &[EventLine]) -> Result<()> {
                                 call_id,
                                 provider_call_id,
                                 arguments,
-                                declared_risk,
                             } = item
                             else {
                                 continue;
@@ -3682,75 +3316,25 @@ fn validate_events(events: &[EventLine]) -> Result<()> {
                             if !provider_ids.insert(provider_call_id) {
                                 bail!("duplicate provider call id")
                             }
-                            if let Some(risk) = declared_risk
-                                && risk.parse::<BashRisk>().is_err()
-                            {
-                                bail!("invalid declared Bash risk: {risk}")
-                            }
                             if !serde_json::from_str::<Value>(arguments)
                                 .is_ok_and(|arguments| arguments.is_object())
                             {
                                 bail!("Bash claim arguments are not a JSON object")
                             }
-                            let turn_id = exchange
-                                .map(|(_, turn_id, _)| turn_id.clone())
-                                .or_else(|| latest_turn_before(events, line.seq))
-                                .context("assistant projection has no turn")?;
+                            let turn_id = exchange.1.clone();
                             if calls.insert(*call_id, turn_id).is_some() {
                                 bail!("duplicate Bash call id: {call_id}")
                             }
                         }
+                        if let Some((turn_id, _, accepted)) = &mut pending_compaction
+                            && turn_id == &exchange.1
+                            && assistant_summary(*resumable, *incomplete, items).is_some()
+                        {
+                            *accepted = true;
+                        }
                     }
-                    Projection::Compaction {
-                        through_seq,
-                        retained_turn_ids,
-                        ..
-                    } => {
-                        if exchange.is_some_and(|(purpose, _, _)| purpose != "compaction") {
-                            bail!("compaction projection does not complete a compaction request")
-                        }
-                        if *through_seq < 1 || *through_seq >= line.seq {
-                            bail!("compaction boundary is not before its completion")
-                        }
-                        if latest_compaction_through
-                            .is_some_and(|previous| *through_seq <= previous)
-                        {
-                            bail!("compaction boundary did not advance")
-                        }
-                        latest_compaction_through = Some(*through_seq);
-                        let retained = turns
-                            .iter()
-                            .filter(|(_, seq)| **seq > *through_seq)
-                            .map(|(id, seq)| (*seq, id.clone()))
-                            .collect::<Vec<_>>();
-                        let mut retained = retained;
-                        retained.sort_by_key(|(seq, _)| *seq);
-                        let expected = retained.into_iter().map(|(_, id)| id).collect::<Vec<_>>();
-                        if &expected != retained_turn_ids {
-                            bail!("compaction retained turns do not match its boundary")
-                        }
-                        if let Some(first) = retained_turn_ids.first()
-                            && turns[first] != through_seq.saturating_add(1)
-                        {
-                            bail!("compaction boundary is not immediately before a turn")
-                        }
-                        epoch = epoch.saturating_add(1);
-                    }
-                    Projection::Guardrail {
-                        call_id,
-                        attempt,
-                        outcome,
-                        ..
-                    } => {
-                        let Some((purpose, _, subject)) = exchange else {
-                            bail!("guardrail projection has no request")
-                        };
-                        if purpose != "guardrail"
-                            || subject.as_ref().is_none_or(|subject| {
-                                subject.call_id != *call_id || subject.attempt != *attempt
-                            })
-                            || !calls.contains_key(call_id)
-                        {
+                    Projection::Guardrail { outcome, .. } => {
+                        if exchange.0.guardrail().is_none() {
                             bail!("guardrail projection does not match its Bash claim")
                         }
                         if !matches!(outcome.as_str(), "allow" | "deny") {
@@ -3761,21 +3345,26 @@ fn validate_events(events: &[EventLine]) -> Result<()> {
             }
             Event::ProviderFailed { exchange_id, .. }
             | Event::ProviderInterrupted { exchange_id } => {
-                if !exchanges.contains_key(exchange_id) {
+                let Some(exchange) = exchanges.get(exchange_id) else {
                     bail!("provider terminal event references unknown exchange: {exchange_id}")
-                }
+                };
                 if !terminal.insert(exchange_id) {
                     bail!("duplicate terminal provider event: {exchange_id}")
                 }
+                if exchange.0.is_agent()
+                    && let Some((turn_id, _, accepted)) = &mut pending_compaction
+                    && turn_id == &exchange.1
+                {
+                    *accepted = false;
+                }
             }
             Event::BashCompleted {
-                turn_id,
                 call_id,
                 outcome,
                 exit_code,
                 ..
             } => {
-                if calls.get(call_id) != Some(turn_id) {
+                if !calls.contains_key(call_id) {
                     bail!("Bash result references unknown call: {call_id}")
                 }
                 if !results.insert(call_id) {
@@ -3787,64 +3376,27 @@ fn validate_events(events: &[EventLine]) -> Result<()> {
                     bail!("Bash result outcome does not match its exit code")
                 }
             }
-            Event::CompactionApplied {
-                source_turn_id,
-                from_epoch,
-                to_epoch,
-                mode,
-                summary,
-                checkpoint,
-                continuation_turn_id,
-                ..
-            } => {
-                if !pending_compactions.remove(source_turn_id) {
+            Event::CompactionApplied { .. } => {
+                let Some((_, mode, accepted)) = pending_compaction.take() else {
                     bail!("compaction application references no pending compaction")
+                };
+                if !accepted {
+                    bail!("compaction application has no accepted summary")
                 }
-                if *from_epoch != epoch || *to_epoch != from_epoch.saturating_add(1) {
-                    bail!("compaction epoch transition is invalid")
-                }
-                let expected_checkpoint = format!(
-                    "<session_checkpoint mode=\"{}\" epoch=\"{to_epoch}\">\n{summary}\n</session_checkpoint>",
-                    mode.as_str()
-                );
-                if summary.trim().is_empty() || checkpoint != &expected_checkpoint {
-                    bail!("compaction application has an invalid checkpoint")
-                }
-                match (mode, continuation_turn_id) {
-                    (CompactionMode::AwaitUser, None) => {}
-                    (CompactionMode::ContinueTurn, Some(turn_id)) => {
-                        if turns.insert(turn_id.clone(), line.seq).is_some() {
-                            bail!("duplicate continuation turn id: {turn_id}")
-                        }
+                if mode == CompactionMode::ContinueTurn {
+                    let turn_id = format!("t{}", line.seq);
+                    if !turns.insert(turn_id.clone()) {
+                        bail!("duplicate continuation turn id: {turn_id}")
                     }
-                    _ => bail!("compaction continuation does not match its mode"),
+                    active_turn = Some(turn_id);
+                } else {
+                    active_turn = None;
                 }
-                epoch = *to_epoch;
             }
             _ => {}
         }
     }
     Ok(())
-}
-
-fn latest_compaction_before(journal: &Journal, max_seq: i64) -> Option<&EventLine> {
-    journal.events.iter().rev().find(|line| {
-        line.seq <= max_seq
-            && matches!(
-                line.event,
-                Event::ProviderCompleted {
-                    projection: Projection::Compaction { .. },
-                    ..
-                }
-            )
-    })
-}
-
-fn latest_turn_before(events: &[EventLine], seq: i64) -> Option<String> {
-    events.iter().rev().find_map(|line| match &line.event {
-        Event::TurnStarted { turn_id, .. } if line.seq < seq => Some(turn_id.clone()),
-        _ => None,
-    })
 }
 
 fn latest_active_turn_id(journal: &Journal) -> Option<String> {
@@ -3853,28 +3405,212 @@ fn latest_active_turn_id(journal: &Journal) -> Option<String> {
         .iter()
         .rev()
         .find_map(|line| match &line.event {
-            Event::TurnStarted { turn_id, .. } => Some(turn_id.clone()),
-            Event::CompactionApplied {
-                continuation_turn_id: Some(turn_id),
-                ..
-            } => Some(turn_id.clone()),
+            Event::PromptMaterialized { turn_id, .. }
+            | Event::CompactionStarted { turn_id, .. } => Some(turn_id.clone()),
+            Event::CompactionApplied { .. } => continuation_turn_id(journal, line.seq),
             _ => None,
         })
 }
 
 fn context_epoch(journal: &Journal, max_seq: i64) -> u64 {
-    let mut epoch = 0;
+    journal
+        .events
+        .iter()
+        .filter(|line| line.seq <= max_seq)
+        .filter(|line| matches!(line.event, Event::CompactionApplied { .. }))
+        .count() as u64
+}
+
+#[derive(Clone, Copy)]
+struct CompactionProjection {
+    trigger: CompactionTrigger,
+    mode: CompactionMode,
+    before_context_tokens: u64,
+    before_context_window: Option<u64>,
+}
+
+struct TurnProjection<'a> {
+    turn_id: &'a str,
+    cwd: &'a str,
+    git_worktree_root: Option<&'a str>,
+    prompt: &'a PersistedUserContent,
+    compaction: Option<CompactionProjection>,
+}
+
+fn queued_prompt_records(
+    journal: &Journal,
+) -> HashMap<&str, (&str, Option<&str>, &PersistedUserContent)> {
+    journal
+        .events
+        .iter()
+        .filter_map(|line| match &line.event {
+            Event::PromptQueued {
+                prompt_id,
+                cwd,
+                git_worktree_root,
+                prompt,
+            } => Some((
+                prompt_id.as_str(),
+                (cwd.as_str(), git_worktree_root.as_deref(), prompt),
+            )),
+            _ => None,
+        })
+        .collect()
+}
+
+fn project_turn<'a>(
+    event: &'a Event,
+    prompts: &HashMap<&str, (&'a str, Option<&'a str>, &'a PersistedUserContent)>,
+) -> Option<TurnProjection<'a>> {
+    match event {
+        Event::PromptMaterialized { prompt_id, turn_id } => {
+            let (cwd, git_worktree_root, prompt) = prompts.get(prompt_id.as_str())?;
+            Some(TurnProjection {
+                turn_id,
+                cwd,
+                git_worktree_root: *git_worktree_root,
+                prompt,
+                compaction: None,
+            })
+        }
+        Event::CompactionStarted {
+            turn_id,
+            cwd,
+            prompt,
+            trigger,
+            mode,
+            before_context_tokens,
+            before_context_window,
+        } => Some(TurnProjection {
+            turn_id,
+            cwd,
+            git_worktree_root: None,
+            prompt,
+            compaction: Some(CompactionProjection {
+                trigger: *trigger,
+                mode: *mode,
+                before_context_tokens: *before_context_tokens,
+                before_context_window: *before_context_window,
+            }),
+        }),
+        _ => None,
+    }
+}
+
+fn compaction_start_before(
+    journal: &Journal,
+    max_seq: i64,
+) -> Option<(&EventLine, &str, CompactionProjection)> {
+    let mut pending = None;
     for line in journal.events.iter().filter(|line| line.seq <= max_seq) {
         match &line.event {
-            Event::CompactionApplied { to_epoch, .. } => epoch = *to_epoch,
-            Event::ProviderCompleted {
-                projection: Projection::Compaction { .. },
+            Event::CompactionStarted {
+                turn_id,
+                trigger,
+                mode,
+                before_context_tokens,
+                before_context_window,
                 ..
-            } => epoch = epoch.saturating_add(1),
+            } => {
+                pending = Some((
+                    line,
+                    turn_id.as_str(),
+                    CompactionProjection {
+                        trigger: *trigger,
+                        mode: *mode,
+                        before_context_tokens: *before_context_tokens,
+                        before_context_window: *before_context_window,
+                    },
+                ));
+            }
+            Event::CompactionApplied { .. } => pending = None,
             _ => {}
         }
     }
-    epoch
+    pending
+}
+
+fn elapsed_ms_between(journal: &Journal, start_seq: i64, end_seq: i64) -> u64 {
+    let timestamp = |seq| {
+        journal
+            .events
+            .iter()
+            .find(|line| line.seq == seq)
+            .and_then(|line| chrono::DateTime::parse_from_rfc3339(&line.at).ok())
+    };
+    timestamp(start_seq)
+        .zip(timestamp(end_seq))
+        .and_then(|(start, end)| (end - start).to_std().ok())
+        .map_or(0, |elapsed| {
+            elapsed.as_millis().min(u128::from(u64::MAX)) as u64
+        })
+}
+
+fn compaction_summary_before(journal: &Journal, turn_id: &str, max_seq: i64) -> Option<String> {
+    let exchange_id = journal
+        .events
+        .iter()
+        .rev()
+        .filter(|line| line.seq <= max_seq)
+        .find_map(|line| match &line.event {
+            Event::ProviderRequested {
+                exchange_id,
+                turn_id: request_turn,
+                subject,
+                ..
+            } if request_turn == turn_id && subject.is_agent() => Some(exchange_id.as_str()),
+            _ => None,
+        })?;
+    journal
+        .events
+        .iter()
+        .rev()
+        .filter(|line| line.seq <= max_seq)
+        .find_map(|line| match &line.event {
+            Event::ProviderCompleted {
+                exchange_id: completed_exchange,
+                projection:
+                    Projection::Assistant {
+                        resumable,
+                        incomplete,
+                        items,
+                        ..
+                    },
+                ..
+            } if completed_exchange == exchange_id => {
+                assistant_summary(*resumable, *incomplete, items)
+            }
+            Event::ProviderCompleted {
+                exchange_id: completed_exchange,
+                ..
+            }
+            | Event::ProviderFailed {
+                exchange_id: completed_exchange,
+                ..
+            }
+            | Event::ProviderInterrupted {
+                exchange_id: completed_exchange,
+            } if completed_exchange == exchange_id => None,
+            _ => None,
+        })
+}
+
+fn compaction_checkpoint_for_application(journal: &Journal, seq: i64) -> Result<String> {
+    let (_, turn_id, compaction) = compaction_start_before(journal, seq.saturating_sub(1))
+        .context("compaction application has no pending compaction")?;
+    let summary = compaction_summary_before(journal, turn_id, seq.saturating_sub(1))
+        .context("compaction application has no accepted summary")?;
+    Ok(crate::compaction::checkpoint(
+        &summary,
+        compaction.mode,
+        context_epoch(journal, seq),
+    ))
+}
+
+fn continuation_turn_id(journal: &Journal, seq: i64) -> Option<String> {
+    compaction_start_before(journal, seq.saturating_sub(1))
+        .filter(|(_, _, compaction)| compaction.mode == CompactionMode::ContinueTurn)
+        .map(|_| format!("t{seq}"))
 }
 
 fn provider_exchange_turns(journal: &Journal) -> HashMap<&str, String> {
@@ -3895,12 +3631,12 @@ fn provider_exchange_turns(journal: &Journal) -> HashMap<&str, String> {
 fn resume_was_requested(journal: &Journal, turn_id: &str, after_seq: i64) -> bool {
     for line in journal.events.iter().filter(|line| line.seq > after_seq) {
         match &line.event {
-            Event::TurnStarted { .. } => return false,
+            Event::PromptMaterialized { .. } | Event::CompactionStarted { .. } => return false,
             Event::ProviderRequested {
                 turn_id: request_turn,
-                purpose,
+                subject,
                 ..
-            } if request_turn == turn_id && purpose == "agent" => return true,
+            } if request_turn == turn_id && subject.is_agent() => return true,
             _ => {}
         }
     }
@@ -3912,10 +3648,7 @@ fn append_queued_turn_projection(journal: &mut Journal) -> Result<()> {
         .events
         .iter()
         .filter_map(|line| match &line.event {
-            Event::TurnStarted {
-                queued_prompt_id: Some(id),
-                ..
-            } => Some(id.as_str()),
+            Event::PromptMaterialized { prompt_id, .. } => Some(prompt_id.as_str()),
             _ => None,
         })
         .collect::<HashSet<_>>();
@@ -3924,35 +3657,19 @@ fn append_queued_turn_projection(journal: &mut Journal) -> Result<()> {
         .iter()
         .rev()
         .find_map(|line| match &line.event {
-            Event::PromptQueued {
-                prompt_id,
-                cwd,
-                git_worktree_root,
-                prompt,
-                ..
-            } if !consumed.contains(prompt_id.as_str()) => Some((
-                prompt_id.clone(),
-                cwd.clone(),
-                git_worktree_root.clone(),
-                prompt.clone(),
-            )),
+            Event::PromptQueued { prompt_id, .. } if !consumed.contains(prompt_id.as_str()) => {
+                Some(prompt_id.clone())
+            }
             _ => None,
         })
         .context("session has no queued prompt")?;
     let seq = journal.next_seq();
-    let epoch = context_epoch(journal, i64::MAX);
     Arc::make_mut(&mut journal.events).push(EventLine {
         seq,
         at: now(),
-        event: Event::TurnStarted {
+        event: Event::PromptMaterialized {
+            prompt_id: queued,
             turn_id: format!("projected-t{seq}"),
-            cwd: queued.1,
-            git_worktree_root: queued.2,
-            prompt: queued.3,
-            epoch,
-            turn_kind: normal_turn_kind(),
-            compaction: None,
-            queued_prompt_id: Some(queued.0),
         },
     });
     Ok(())
@@ -3996,50 +3713,39 @@ fn find_call(journal: &Journal, call_id: i64) -> Option<(&str, &str)> {
 }
 
 fn call_turn_id(journal: &Journal, call_id: i64) -> Option<String> {
-    let (assistant_seq, exchange_id) =
-        journal.events.iter().find_map(|line| match &line.event {
-            Event::ProviderCompleted {
-                exchange_id,
-                projection: Projection::Assistant { items, .. },
-                ..
-            } if items
-                .iter()
-                .any(|item| item.bash_call().is_some_and(|call| call.0 == call_id)) =>
-            {
-                Some((line.seq, exchange_id.as_str()))
-            }
-            _ => None,
-        })?;
-    if let Some(turn_id) = journal.events.iter().find_map(|line| match &line.event {
+    let exchange_id = journal.events.iter().find_map(|line| match &line.event {
+        Event::ProviderCompleted {
+            exchange_id,
+            projection: Projection::Assistant { items, .. },
+            ..
+        } if items
+            .iter()
+            .any(|item| item.bash_call().is_some_and(|call| call.0 == call_id)) =>
+        {
+            Some(exchange_id.as_str())
+        }
+        _ => None,
+    })?;
+    journal.events.iter().find_map(|line| match &line.event {
         Event::ProviderRequested {
             exchange_id: candidate,
             turn_id,
             ..
         } if candidate == exchange_id => Some(turn_id.clone()),
         _ => None,
-    }) {
-        return Some(turn_id);
-    }
-    journal
-        .events
-        .iter()
-        .rev()
-        .find(|line| line.seq < assistant_seq && matches!(line.event, Event::TurnStarted { .. }))
-        .and_then(|line| match &line.event {
-            Event::TurnStarted { turn_id, .. } => Some(turn_id.clone()),
-            _ => None,
-        })
+    })
 }
 
 fn is_semantic(event: &Event) -> bool {
     matches!(
         event,
         Event::SystemPrompt { .. }
-            | Event::TurnStarted { .. }
+            | Event::PromptMaterialized { .. }
+            | Event::CompactionStarted { .. }
             | Event::CompactionApplied { .. }
             | Event::BashCompleted { .. }
             | Event::ProviderCompleted {
-                projection: Projection::Assistant { .. } | Projection::Compaction { .. },
+                projection: Projection::Assistant { .. },
                 ..
             }
     )
@@ -4053,11 +3759,11 @@ fn reported_context_tokens_before(journal: &Journal, max_seq: i64) -> Option<u64
         match &line.event {
             Event::ProviderRequested {
                 exchange_id,
-                purpose,
+                subject,
                 origin,
                 request_recipe,
                 ..
-            } if purpose == "agent" => {
+            } if subject.is_agent() => {
                 let current = request_format_is_current(&origin.api, &request_recipe.format);
                 request_formats.insert(exchange_id.as_str(), current);
             }
@@ -4093,19 +3799,32 @@ fn reported_context_tokens_before(journal: &Journal, max_seq: i64) -> Option<u64
                 projection: Projection::Assistant { .. },
                 ..
             } => semantic_after = true,
-            Event::TurnStarted { .. }
+            Event::PromptMaterialized { .. }
+            | Event::CompactionStarted { .. }
             | Event::CompactionApplied { .. }
-            | Event::BashCompleted { .. }
-            | Event::ProviderCompleted {
-                projection: Projection::Compaction { .. },
-                ..
-            } => semantic_after = true,
+            | Event::BashCompleted { .. } => semantic_after = true,
             _ => {}
         }
     }
     latest
         .filter(|(_, current)| !semantic_after && *current)
         .map(|(tokens, _)| tokens)
+}
+
+fn hydrate_native_replay(payload: &NativeReplayPayload, origin: &ProviderOrigin) -> NativeReplay {
+    NativeReplay {
+        provider_id: origin.provider_id.clone(),
+        endpoint: origin.endpoint.clone(),
+        model: origin.wire_model.clone(),
+        payload: payload.clone(),
+    }
+}
+
+#[derive(Clone, Copy)]
+struct ReplayTarget<'a> {
+    config: &'a Config,
+    model: &'a ResolvedModelRef,
+    api: ModelApi,
 }
 
 fn context_origin_compatible(
@@ -4189,7 +3908,9 @@ fn activity_at(journal: &Journal) -> &str {
     journal
         .events
         .last()
-        .map_or(&journal.meta.created_at, |line| &line.at)
+        .expect("validated journal has a system prompt")
+        .at
+        .as_str()
 }
 
 fn valid_session_id(id: &str) -> bool {
@@ -4431,6 +4152,16 @@ mod tests {
         assert!(projected.tokens > 102, "{projected:?}");
 
         store.materialize_queued_prompt(&session.id).unwrap();
+        let materialized = store
+            .audit_events(&session.id)
+            .unwrap()
+            .into_iter()
+            .find(|event| event["type"] == "prompt_materialized")
+            .unwrap();
+        assert!(materialized["prompt_id"].is_string());
+        for field in ["cwd", "git_worktree_root", "prompt"] {
+            assert!(materialized.get(field).is_none(), "unexpected {field}");
+        }
         assert_eq!(
             projected,
             store
@@ -4462,7 +4193,6 @@ mod tests {
             .start_provider_request(
                 &session.id,
                 &turn,
-                "agent",
                 ProviderOrigin {
                     canonical_model_ref: "source/model".into(),
                     provider_id: "source".into(),
@@ -4476,14 +4206,11 @@ mod tests {
                         "openai.chat_completions.v1",
                         &native,
                         serde_json::json!({
-                            "kind": "agent",
-                            "context_through_seq":
-                                store.current_context_seq(&session.id).unwrap(),
                             "native_replay_origins": [],
                         }),
                     )
                     .unwrap(),
-                None,
+                RequestSubject::Agent,
             )
             .unwrap();
         store
@@ -4500,6 +4227,7 @@ mod tests {
                         ..Usage::default()
                     }),
                     resumable: false,
+                    response_complete: true,
                     context_output_complete: false,
                 },
             )
@@ -4521,12 +4249,35 @@ mod tests {
     #[test]
     fn context_anchor_uses_recorded_replay_selection_after_config_drift() {
         let (store, session) = test_session();
-        store
+        let turn = store
             .start_turn(&session.id, "/tmp", None, &"test".into())
             .unwrap();
-        store
-            .append_message(
+        let replay_exchange = store
+            .start_provider_request(
                 &session.id,
+                &turn,
+                ProviderOrigin {
+                    canonical_model_ref: "legacy/model".into(),
+                    provider_id: "legacy".into(),
+                    api: ModelApi::Responses.name().into(),
+                    endpoint: "http://localhost/responses".into(),
+                    wire_model: "model".into(),
+                    effort: None,
+                },
+                store
+                    .request_recipe(
+                        "test.v1",
+                        &serde_json::json!({"model":"model"}),
+                        serde_json::json!({}),
+                    )
+                    .unwrap(),
+                RequestSubject::Agent,
+            )
+            .unwrap();
+        store
+            .complete_assistant_exchange(
+                &session.id,
+                &replay_exchange,
                 &Message::assistant(
                     Some("answer".into()),
                     None,
@@ -4547,6 +4298,8 @@ mod tests {
                         ]),
                     }),
                 ),
+                None,
+                None,
             )
             .unwrap();
         let mut config = context_test_config(Some("shared"), Some("shared"));
@@ -4601,7 +4354,6 @@ mod tests {
             .start_provider_request(
                 &session.id,
                 &store.current_turn_id(&session.id).unwrap(),
-                "agent",
                 ProviderOrigin {
                     canonical_model_ref: target.canonical.clone(),
                     provider_id: target.provider_id.clone(),
@@ -4615,14 +4367,11 @@ mod tests {
                         ModelApi::Responses.request_format(),
                         &native,
                         serde_json::json!({
-                            "kind": "agent",
-                            "context_through_seq":
-                                store.current_context_seq(&session.id).unwrap(),
                             "native_replay_origins": native_replay_origins(&messages),
                         }),
                     )
                     .unwrap(),
-                None,
+                RequestSubject::Agent,
             )
             .unwrap();
         store
@@ -4693,7 +4442,7 @@ mod tests {
             )
             .unwrap();
         let exchange = store
-            .start_test_provider_request(&session.id, &source_turn_id, "agent")
+            .start_test_provider_request(&session.id, &source_turn_id)
             .unwrap();
         store
             .complete_assistant_exchange(
@@ -4706,12 +4455,9 @@ mod tests {
             .unwrap();
         let config = context_test_config(None, None);
         let target = crate::models::resolve_model_ref(&config, "source/model").unwrap();
-        let checkpoint = crate::compaction::checkpoint("summary", CompactionMode::AwaitUser, 1);
         let projected = store
             .projected_compaction_context_tokens(
                 &session.id,
-                CompactionMode::AwaitUser,
-                &checkpoint,
                 &config,
                 &target,
                 ModelApi::ChatCompletions,
@@ -4722,17 +4468,8 @@ mod tests {
             .apply_compaction(
                 &session.id,
                 CompactionApplication {
-                    source_turn_id: &source_turn_id,
-                    trigger: CompactionTrigger::Manual,
-                    mode: CompactionMode::AwaitUser,
-                    summary: "summary",
-                    checkpoint: &checkpoint,
-                    before_context_tokens: 100,
-                    before_context_window: Some(200_000),
                     after_context_tokens_estimate: projected,
                     after_context_window: Some(200_000),
-                    elapsed_ms: 1,
-                    emergency_elided_call_ids: &[],
                 },
             )
             .unwrap();
@@ -4748,7 +4485,7 @@ mod tests {
     }
 
     #[test]
-    fn compaction_records_preserve_user_and_tool_attachments() {
+    fn context_preserves_user_and_tool_attachments() {
         let (store, session) = test_session();
         store
             .append_message(
@@ -4773,17 +4510,24 @@ mod tests {
             )
             .unwrap();
 
-        let records = store.message_records_from_seq(&session.id, 0).unwrap();
+        let context = store.load_context_messages(&session.id).unwrap();
         assert!(matches!(
-            records.last().unwrap().items.as_slice(),
-            [
-                MessageRecordItem::Text(before),
-                MessageRecordItem::Attachment(Attachment { filename, data, .. }),
-                MessageRecordItem::Text(after),
-            ] if before == "before"
-                && filename == "image.png"
-                && data == &[1, 2, 3]
-                && after == "after"
+            context.last(),
+            Some(Message::User {
+                content: UserContent::Parts(parts),
+            }) if matches!(
+                parts.as_slice(),
+                [
+                    ContentPart::Text { text: before },
+                    ContentPart::Attachment {
+                        attachment: Attachment { filename, data, .. },
+                    },
+                    ContentPart::Text { text: after },
+                ] if before == "before"
+                    && filename == "image.png"
+                    && data == &[1, 2, 3]
+                    && after == "after"
+            )
         ));
 
         let (_, call_ids) = store
@@ -4821,17 +4565,25 @@ mod tests {
                 }],
             )
             .unwrap();
-        let records = store.message_records_from_seq(&session.id, 0).unwrap();
-        let result = records
+        let context = store.load_context_messages(&session.id).unwrap();
+        let result = context
             .iter()
-            .find(|record| record.kind == "bash_result")
+            .find(|message| matches!(message, Message::Tool { .. }))
             .unwrap();
         assert!(matches!(
-            result.items.as_slice(),
-            [
-                MessageRecordItem::Text(text),
-                MessageRecordItem::Attachment(Attachment { filename, data, .. }),
-            ] if text == "result" && filename == "result.png" && data == &[4, 5, 6]
+            result,
+            Message::Tool {
+                content,
+                attachments,
+                ..
+            } if content == "result"
+                && matches!(
+                    attachments.as_slice(),
+                    [ToolAttachment {
+                        attachment: Attachment { filename, data, .. },
+                        ..
+                    }] if filename == "result.png" && data == &[4, 5, 6]
+                )
         ));
     }
 
@@ -4962,20 +4714,6 @@ mod tests {
                 },
             ]
         );
-        let records = store.message_records_from_seq(&session.id, 0).unwrap();
-        assert!(matches!(
-            records
-                .iter()
-                .find(|record| record.kind == "assistant")
-                .unwrap()
-                .items
-                .as_slice(),
-            [
-                MessageRecordItem::Text(before),
-                MessageRecordItem::BashCall(_),
-                MessageRecordItem::Text(after),
-            ] if before == "I will run it." && after == " Finished."
-        ));
     }
 
     #[test]
@@ -5163,10 +4901,17 @@ mod tests {
     }
 
     #[test]
-    fn object_file_is_verified() {
+    fn object_checksum_mismatch_is_rejected() {
         let store = Store::open_memory().unwrap();
         let object = store.write_object(b"content").unwrap();
-        assert_eq!(store.read_object(&object).unwrap(), b"content");
+        std::fs::write(store.objects_dir().join(&object.sha256), b"corrupt").unwrap();
+        assert!(
+            store
+                .read_object(&object)
+                .unwrap_err()
+                .to_string()
+                .contains("object checksum mismatch")
+        );
     }
 
     #[test]
@@ -5195,8 +4940,7 @@ mod tests {
                 "openai.chat_completions.v1",
                 &native,
                 serde_json::json!({
-                    "kind": "agent",
-                    "context_through_seq": store.current_context_seq(&session.id).unwrap()
+                    "native_replay_origins": [],
                 }),
             )
             .unwrap();
@@ -5208,7 +4952,6 @@ mod tests {
             .start_provider_request(
                 &session.id,
                 &turn,
-                "agent",
                 ProviderOrigin {
                     canonical_model_ref: request.model.canonical.clone(),
                     provider_id: request.model.provider_id.clone(),
@@ -5218,7 +4961,7 @@ mod tests {
                     effort: request.model.effort.clone(),
                 },
                 recipe,
-                None,
+                RequestSubject::Agent,
             )
             .unwrap();
 
@@ -5237,7 +4980,7 @@ mod tests {
             .start_turn(&session.id, "/tmp", None, &"work".into())
             .unwrap();
         let first = store
-            .start_test_provider_request(&session.id, &turn, "agent")
+            .start_test_provider_request(&session.id, &turn)
             .unwrap();
         let endpoint = "https://example.test/v1/messages";
         store
@@ -5288,8 +5031,6 @@ mod tests {
                 "anthropic.messages.v1",
                 &native,
                 serde_json::json!({
-                    "kind": "agent",
-                    "context_through_seq": store.current_context_seq(&session.id).unwrap(),
                     "native_replay_origins":
                         crate::provider::native_replay_origins(&messages),
                 }),
@@ -5299,7 +5040,6 @@ mod tests {
             .start_provider_request(
                 &session.id,
                 &turn,
-                "agent",
                 ProviderOrigin {
                     canonical_model_ref: request.model.canonical.clone(),
                     provider_id: request.model.provider_id.clone(),
@@ -5309,7 +5049,7 @@ mod tests {
                     effort: request.model.effort.clone(),
                 },
                 recipe,
-                None,
+                RequestSubject::Agent,
             )
             .unwrap();
 
@@ -5322,7 +5062,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_replay_origin_and_recorded_selection_reconstruct_exactly() {
+    fn recorded_replay_selection_reconstructs_exactly_after_model_change() {
         let (store, session) = test_session();
         store
             .start_turn(&session.id, "/tmp", None, &"run".into())
@@ -5338,7 +5078,7 @@ mod tests {
                         arguments: r#"{"risk":"readonly","command":"pwd"}"#.into(),
                     }]),
                     Some(NativeReplay {
-                        provider_id: String::new(),
+                        provider_id: "test".into(),
                         endpoint: String::new(),
                         model: "model".into(),
                         payload: crate::provider::NativeReplayPayload::ChatReasoning(
@@ -5397,8 +5137,6 @@ mod tests {
                 "openai.chat_completions.v1",
                 &native,
                 serde_json::json!({
-                    "kind": "agent",
-                    "context_through_seq": store.current_context_seq(&session.id).unwrap(),
                     "native_replay_origins": replay_origins,
                 }),
             )
@@ -5407,7 +5145,6 @@ mod tests {
             .start_provider_request(
                 &session.id,
                 &store.current_turn_id(&session.id).unwrap(),
-                "agent",
                 ProviderOrigin {
                     canonical_model_ref: request.model.canonical.clone(),
                     provider_id: request.model.provider_id.clone(),
@@ -5417,7 +5154,7 @@ mod tests {
                     effort: None,
                 },
                 recipe,
-                None,
+                RequestSubject::Agent,
             )
             .unwrap();
 
@@ -5440,7 +5177,6 @@ mod tests {
             .start_provider_request(
                 &session.id,
                 &turn,
-                "agent",
                 ProviderOrigin {
                     canonical_model_ref: "test/model".into(),
                     provider_id: "test".into(),
@@ -5450,9 +5186,9 @@ mod tests {
                     effort: None,
                 },
                 store
-                    .request_recipe("test.v0", &native, serde_json::json!({"kind":"agent"}))
+                    .request_recipe("test.v0", &native, serde_json::json!({}))
                     .unwrap(),
-                None,
+                RequestSubject::Agent,
             )
             .unwrap();
         store
@@ -5485,7 +5221,6 @@ mod tests {
             .start_provider_request(
                 &session.id,
                 &turn,
-                "agent",
                 ProviderOrigin {
                     canonical_model_ref: "test/model".into(),
                     provider_id: "test".into(),
@@ -5495,9 +5230,9 @@ mod tests {
                     effort: None,
                 },
                 store
-                    .request_recipe("test.v1", &native, serde_json::json!({"kind":"agent"}))
+                    .request_recipe("test.v1", &native, serde_json::json!({}))
                     .unwrap(),
-                None,
+                RequestSubject::Agent,
             )
             .unwrap();
         let call = ToolCall {
@@ -5656,13 +5391,12 @@ mod tests {
             .unwrap();
         let native = serde_json::json!({"model":"reviewer","messages":[]});
         let recipe = store
-            .request_recipe("test.v1", &native, serde_json::json!({"kind":"guardrail"}))
+            .request_recipe("test.v1", &native, serde_json::json!({}))
             .unwrap();
         let exchange = store
             .start_provider_request(
                 &session.id,
                 &turn,
-                "guardrail",
                 ProviderOrigin {
                     canonical_model_ref: "test/reviewer".into(),
                     provider_id: "test".into(),
@@ -5672,10 +5406,10 @@ mod tests {
                     effort: None,
                 },
                 recipe,
-                Some(RequestSubject {
+                RequestSubject::Guardrail {
                     call_id: calls[0],
                     attempt: 1,
-                }),
+                },
             )
             .unwrap();
         store
@@ -5683,8 +5417,6 @@ mod tests {
                 &session.id,
                 &exchange,
                 GuardrailCompletion {
-                    call_id: calls[0],
-                    attempt: 1,
                     outcome: "deny",
                     risk_level: Some("critical"),
                     auth_level: Some("none"),
@@ -5698,7 +5430,6 @@ mod tests {
             .start_provider_request(
                 &session.id,
                 &turn,
-                "agent",
                 ProviderOrigin {
                     canonical_model_ref: "test/model".into(),
                     provider_id: "test".into(),
@@ -5711,10 +5442,10 @@ mod tests {
                     .request_recipe(
                         "test.v1",
                         &serde_json::json!({"model":"model"}),
-                        serde_json::json!({"kind":"agent"}),
+                        serde_json::json!({}),
                     )
                     .unwrap(),
-                None,
+                RequestSubject::Agent,
             )
             .unwrap();
 
@@ -5743,7 +5474,7 @@ mod tests {
             .start_turn(&session.id, "/tmp", None, &"work".into())
             .unwrap();
         let exchange = store
-            .start_test_provider_request(&session.id, &turn, "agent")
+            .start_test_provider_request(&session.id, &turn)
             .unwrap();
         store
             .complete_resumable_assistant_exchange(
@@ -5762,7 +5493,7 @@ mod tests {
         ));
 
         let resumed = store
-            .start_test_provider_request(&session.id, &turn, "agent")
+            .start_test_provider_request(&session.id, &turn)
             .unwrap();
         store
             .interrupt_provider_exchange(&session.id, &resumed)
@@ -5775,13 +5506,128 @@ mod tests {
     }
 
     #[test]
+    fn compaction_requires_the_latest_response_to_be_final() {
+        let (store, session) = test_session();
+        store
+            .start_turn(&session.id, "/tmp", None, &"work".into())
+            .unwrap();
+        let compaction_turn = store
+            .start_compaction_turn(
+                &session.id,
+                CompactionStart {
+                    cwd: "/tmp",
+                    prompt: &"checkpoint".into(),
+                    trigger: CompactionTrigger::Manual,
+                    mode: CompactionMode::AwaitUser,
+                    before_context_tokens: 100,
+                    before_context_window: Some(1_000),
+                },
+            )
+            .unwrap();
+        let partial = store
+            .start_test_provider_request(&session.id, &compaction_turn)
+            .unwrap();
+        store
+            .complete_assistant_exchange_record(
+                &session.id,
+                &partial,
+                AssistantCompletion {
+                    message: &Message::assistant(Some("partial".into()), None, None, None),
+                    native_response: None,
+                    usage: None,
+                    resumable: false,
+                    response_complete: false,
+                    context_output_complete: true,
+                },
+            )
+            .unwrap();
+        assert!(
+            store
+                .pending_compaction_summary(&session.id, &compaction_turn)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .apply_compaction(
+                    &session.id,
+                    CompactionApplication {
+                        after_context_tokens_estimate: 10,
+                        after_context_window: Some(1_000),
+                    },
+                )
+                .is_err()
+        );
+
+        let final_exchange = store
+            .start_test_provider_request(&session.id, &compaction_turn)
+            .unwrap();
+        store
+            .complete_assistant_exchange(
+                &session.id,
+                &final_exchange,
+                &Message::assistant(Some("final".into()), None, None, None),
+                None,
+                None,
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .pending_compaction_summary(&session.id, &compaction_turn)
+                .unwrap()
+                .as_deref(),
+            Some("final")
+        );
+    }
+
+    #[test]
+    fn mismatched_native_replay_origin_is_audited_as_invalid() {
+        let (store, session) = test_session();
+        let turn = store
+            .start_turn(&session.id, "/tmp", None, &"work".into())
+            .unwrap();
+        let exchange = store
+            .start_test_provider_request(&session.id, &turn)
+            .unwrap();
+        let error = store
+            .complete_assistant_exchange(
+                &session.id,
+                &exchange,
+                &Message::assistant(
+                    Some("answer".into()),
+                    None,
+                    None,
+                    Some(NativeReplay {
+                        provider_id: "other".into(),
+                        endpoint: String::new(),
+                        model: "model".into(),
+                        payload: NativeReplayPayload::ChatReasoning("trace".into()),
+                    }),
+                ),
+                None,
+                None,
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("native replay origin"));
+        assert!(
+            store
+                .audit_events(&session.id)
+                .unwrap()
+                .iter()
+                .any(|event| {
+                    event["type"] == "provider_failed" && event["error_class"] == "invalid_response"
+                })
+        );
+    }
+
+    #[test]
     fn new_prompt_supersedes_unused_resume_without_synthetic_message() {
         let (store, session) = test_session();
         let turn = store
             .start_turn(&session.id, "/tmp", None, &"work".into())
             .unwrap();
         let exchange = store
-            .start_test_provider_request(&session.id, &turn, "agent")
+            .start_test_provider_request(&session.id, &turn)
             .unwrap();
         store
             .complete_resumable_assistant_exchange(
@@ -5814,7 +5660,7 @@ mod tests {
             .start_turn(&session.id, "/work", None, &"original task".into())
             .unwrap();
         let exchange = store
-            .start_test_provider_request(&session.id, &turn, "agent")
+            .start_test_provider_request(&session.id, &turn)
             .unwrap();
         store
             .complete_assistant_exchange(
@@ -5847,7 +5693,7 @@ mod tests {
                 .contains("compaction is incomplete")
         );
         let summary_exchange = store
-            .start_test_provider_request(&session.id, &compaction_turn, "agent")
+            .start_test_provider_request(&session.id, &compaction_turn)
             .unwrap();
         store
             .complete_assistant_exchange(
@@ -5872,17 +5718,8 @@ mod tests {
                 .apply_compaction(
                     &session.id,
                     CompactionApplication {
-                        source_turn_id: &compaction_turn,
-                        trigger: CompactionTrigger::Manual,
-                        mode: CompactionMode::AwaitUser,
-                        summary: "## Progress\nReady.",
-                        checkpoint,
-                        before_context_tokens: 1_700,
-                        before_context_window: Some(2_000),
                         after_context_tokens_estimate: 30,
                         after_context_window: Some(2_000),
-                        elapsed_ms: 250,
-                        emergency_elided_call_ids: &[],
                     },
                 )
                 .unwrap(),
@@ -5891,6 +5728,25 @@ mod tests {
         assert_eq!(store.context_epoch(&session.id).unwrap(), 1);
         assert!(store.pending_compaction(&session.id).unwrap().is_none());
         assert!(store.is_session_clean(&session.id).unwrap());
+        let audit = store.audit_events(&session.id).unwrap();
+        let applied = audit
+            .iter()
+            .find(|event| event["type"] == "compaction_applied")
+            .unwrap();
+        for field in [
+            "source_turn_id",
+            "trigger",
+            "mode",
+            "summary",
+            "checkpoint",
+            "continuation_turn_id",
+            "before_context_tokens",
+            "before_context_window",
+            "elapsed_ms",
+            "emergency_elided_call_ids",
+        ] {
+            assert!(applied.get(field).is_none(), "unexpected {field}");
+        }
         let context = store.load_context_messages(&session.id).unwrap();
         assert_eq!(context.len(), 2);
         assert!(matches!(
@@ -5918,81 +5774,6 @@ mod tests {
                 ..
             })
         ));
-    }
-
-    #[test]
-    fn validation_rejects_corrupted_epochs_on_queued_prompt_boundaries() {
-        let (store, session) = test_session();
-        store
-            .queue_prompt(&session.id, "/work", None, &"queued".into())
-            .unwrap();
-        let mut journal = store.load(&session.id).unwrap();
-        let events = Arc::make_mut(&mut journal.events);
-        let Event::PromptQueued { epoch, .. } = &mut events.last_mut().unwrap().event else {
-            panic!("expected queued prompt")
-        };
-        *epoch = 9;
-        assert!(
-            validate_events(events)
-                .unwrap_err()
-                .to_string()
-                .contains("queued prompt epoch")
-        );
-
-        let (store, session) = test_session();
-        store
-            .queue_prompt(&session.id, "/work", None, &"queued".into())
-            .unwrap();
-        store.materialize_queued_prompt(&session.id).unwrap();
-        let mut journal = store.load(&session.id).unwrap();
-        let events = Arc::make_mut(&mut journal.events);
-        let Event::TurnStarted {
-            epoch,
-            queued_prompt_id: Some(_),
-            ..
-        } = &mut events.last_mut().unwrap().event
-        else {
-            panic!("expected materialized queued turn")
-        };
-        *epoch = 9;
-        assert!(
-            validate_events(events)
-                .unwrap_err()
-                .to_string()
-                .contains("new-style turn epoch")
-        );
-
-        let (store, session) = test_session();
-        store
-            .start_compaction_turn(
-                &session.id,
-                CompactionStart {
-                    cwd: "/work",
-                    prompt: &"checkpoint".into(),
-                    trigger: CompactionTrigger::Manual,
-                    mode: CompactionMode::AwaitUser,
-                    before_context_tokens: 10,
-                    before_context_window: Some(100),
-                },
-            )
-            .unwrap();
-        let mut journal = store.load(&session.id).unwrap();
-        let events = Arc::make_mut(&mut journal.events);
-        let Event::TurnStarted {
-            epoch,
-            compaction: Some(_),
-            ..
-        } = &mut events.last_mut().unwrap().event
-        else {
-            panic!("expected compaction turn")
-        };
-        *epoch = 9;
-        assert!(
-            validate_events(events)
-                .unwrap_err()
-                .to_string()
-                .contains("new-style turn epoch")
-        );
     }
 
     #[test]
@@ -6049,6 +5830,24 @@ mod tests {
                 .unwrap(),
             durable_ids
         );
+        let context = store
+            .context_until_with_elisions(
+                &store.load(&session.id).unwrap(),
+                i64::MAX,
+                &HashSet::from([durable_ids[1]]),
+            )
+            .unwrap();
+        let outputs = context
+            .iter()
+            .filter_map(|message| match message {
+                Message::Tool { content, .. } => Some(content.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            outputs,
+            ["output", crate::compaction::EMERGENCY_OUTPUT_UNAVAILABLE]
+        );
     }
 
     #[test]
@@ -6058,7 +5857,7 @@ mod tests {
             .start_turn(&session.id, "/work", None, &"task".into())
             .unwrap();
         let exchange = store
-            .start_test_provider_request(&session.id, &turn, "agent")
+            .start_test_provider_request(&session.id, &turn)
             .unwrap();
         store
             .complete_assistant_exchange(
@@ -6083,7 +5882,7 @@ mod tests {
             )
             .unwrap();
         let summary_exchange = store
-            .start_test_provider_request(&session.id, &compaction_turn, "agent")
+            .start_test_provider_request(&session.id, &compaction_turn)
             .unwrap();
         store
             .complete_assistant_exchange(
@@ -6094,22 +5893,12 @@ mod tests {
                 None,
             )
             .unwrap();
-        let checkpoint = "<session_checkpoint mode=\"continue_turn\" epoch=\"1\">\nsummary\n</session_checkpoint>";
         store
             .apply_compaction(
                 &session.id,
                 CompactionApplication {
-                    source_turn_id: &compaction_turn,
-                    trigger: CompactionTrigger::Hard,
-                    mode: CompactionMode::ContinueTurn,
-                    summary: "summary",
-                    checkpoint,
-                    before_context_tokens: 1_700,
-                    before_context_window: Some(2_000),
                     after_context_tokens_estimate: 20,
                     after_context_window: Some(2_000),
-                    elapsed_ms: 20,
-                    emergency_elided_call_ids: &[],
                 },
             )
             .unwrap();
@@ -6149,10 +5938,14 @@ mod tests {
             .into_iter()
             .find(|event| event["type"] == "bash_completed" && event["call_id"] == call_ids[0])
             .unwrap();
-        assert_eq!(bash_turn["turn_id"], continuation_turn);
+        assert!(bash_turn.get("turn_id").is_none());
+        assert_eq!(
+            call_turn_id(&store.load(&session.id).unwrap(), call_ids[0]).as_deref(),
+            Some(continuation_turn.as_str())
+        );
 
         let resume_exchange = store
-            .start_test_provider_request(&session.id, &continuation_turn, "agent")
+            .start_test_provider_request(&session.id, &continuation_turn)
             .unwrap();
         store
             .complete_resumable_assistant_exchange(

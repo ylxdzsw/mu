@@ -776,20 +776,40 @@ journal.
 The durable event model is:
 
 - **`system_prompt`** — exact initial model-visible prompt.
-- **`turn_started`** — submitted prompt, working directory, Git worktree root,
+- **`prompt_queued`** — submitted prompt, working directory, Git worktree root,
   and attachment references.
-- **`provider_requested`** — request purpose, resolved provider/model origin,
-  and a checksummed recipe sufficient to reconstruct the native request.
+- **`prompt_materialized`** — binds one queued prompt to a user turn without
+  copying its content.
+- **`compaction_started`** — binds one synthetic compaction turn to its prompt,
+  trigger, mode, and before-context measurements.
+- **`provider_requested`** — typed agent or guardrail subject, resolved
+  provider/model origin, and a checksummed recipe sufficient to reconstruct the
+  native request. Its event sequence is the request's context boundary.
 - **`provider_completed`** — completed native response and accepted semantic
   projection.
 - **`provider_failed` / `provider_interrupted`** — terminal audit outcome with
   no semantic assistant message.
 - **`bash_completed`** — unique result and attachment references for one
   durable Bash claim.
+- **`compaction_applied`** — after-context telemetry for the committed epoch
+  transition.
 
-Assistant projections contain one ordered item array and a derived turn state:
-continue for tool use, resume for preserved incomplete work, or complete.
-Array position is authoritative.
+Assistant projections contain one ordered item array, optional resumable and
+non-final bits, and provider-native replay payload without copied provider
+origin. Turn state derives as continue for tool use, resume for preserved
+incomplete work, or complete. Array position is authoritative. Replay origin
+derives from the associated provider request after completion-time validation;
+the request recipe records the exact replay-origin selection so reconstruction
+remains stable across configuration changes.
+
+The journal format is version 3. It deliberately does not read version 2.
+Context epoch at event sequence `S` is the number of valid prior
+`compaction_applied` events: the application belongs to the old epoch, and
+events after it belong to the new epoch. User turns derive prompt content and
+location from their referenced queued prompt. Bash result ownership derives
+through Bash claim, assistant completion, and provider request. Guardrail call
+and attempt derive from the typed request subject. Session creation time and
+compaction elapsed time derive from event timestamps.
 
 There is no mutable session row, title, cached status flag, owner PID, or
 separate run entity. Session listings and status are projections of journal
@@ -894,9 +914,13 @@ Compaction is an ordinary synthetic turn in the current context. Its request
 uses the same model context, native replay, Bash tool, guardrail, streaming,
 fallback, persistence, and retry machinery as any other agent request. Mu asks
 for a plain Markdown checkpoint, accepts the final assistant text without
-parsing section syntax, and then appends a structured `compaction_applied`
-event containing the complete summary. The event advances the session context
-epoch and projects only the original system prompt plus:
+parsing section syntax, and then appends `compaction_applied`. Validation binds
+the application to exactly one pending `compaction_started` and a final,
+nonempty accepted assistant summary. The mode, summary, checkpoint, before-size
+measurements, source turn, optional continuation turn, elapsed time, and any
+emergency elisions therefore derive from that chain rather than being copied
+into the application event. The application advances the session context epoch
+and projects only the original system prompt plus:
 
 ```xml
 <session_checkpoint mode="await_user|continue_turn" epoch="N">
@@ -932,8 +956,10 @@ Emergency compaction makes a request-only projection that replaces oldest Bash
 results first with `[Bash output unavailable during emergency compaction.]`
 and removes their attachments until the estimated reduction reaches the
 configured hard headroom.
-Calls, arguments, stdin, and journal data are unchanged. The applied event
-records the elided durable call IDs. If pruning every Bash result is
+Calls, arguments, stdin, and journal data are unchanged. Each emergency request
+recipe records the elided occurrence-stable durable call IDs for exact
+reconstruction; a successful compaction application derives them from its
+accepted request rather than copying them. If pruning every Bash result is
 insufficient, Mu still makes one emergency request; a context-length error from
 that request is fatal.
 

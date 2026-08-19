@@ -22,7 +22,7 @@ use crate::renderer::{CompactionReport, Renderer};
 use crate::runtime::resume_session_fallback;
 use crate::store::{
     AssistantCompletion, BashResultRecord, CompactionApplication, CompactionMode, CompactionStart,
-    CompactionTrigger, PendingCompaction, ProviderOrigin, RESUME_PROMPT, Store,
+    CompactionTrigger, PendingCompaction, ProviderOrigin, RESUME_PROMPT, RequestSubject, Store,
 };
 use bash::RunningBash;
 
@@ -71,7 +71,7 @@ enum NextRequest {
 struct ActiveCompaction {
     pending: PendingCompaction,
     emergency: bool,
-    elided_provider_call_ids: Vec<String>,
+    elided_call_ids: Vec<i64>,
 }
 
 struct ConcurrentBashExecution<'a> {
@@ -178,9 +178,8 @@ impl<'a> AgentLoop<'a> {
                 .store
                 .pending_compaction_summary(self.session_id, &pending.turn_id)?
             {
-                let state = self.active_compaction(pending)?;
-                let mode = state.pending.mode;
-                self.finish_compaction(&state, &summary)?;
+                let mode = pending.mode;
+                self.finish_compaction(&pending)?;
                 let context = self.current_context_estimate()?;
                 TurnResult {
                     usage: Usage::default(),
@@ -247,7 +246,7 @@ impl<'a> AgentLoop<'a> {
                 .map(|pending| ActiveCompaction {
                     emergency: self.compaction_is_emergency(&pending),
                     pending,
-                    elided_provider_call_ids: Vec::new(),
+                    elided_call_ids: Vec::new(),
                 });
 
         let max_iter = self.config.limits.max_iterations;
@@ -280,7 +279,7 @@ impl<'a> AgentLoop<'a> {
                                 .map(|pending| ActiveCompaction {
                                     pending,
                                     emergency: false,
-                                    elided_provider_call_ids: Vec::new(),
+                                    elided_call_ids: Vec::new(),
                                 });
                         context = self.load_context()?;
                         next_request = NextRequest::User;
@@ -307,8 +306,12 @@ impl<'a> AgentLoop<'a> {
                     } else {
                         (request_context, Vec::new())
                     };
+                    let elided_call_ids = self.store.call_ids_for_provider_call_ids(
+                        self.session_id,
+                        &elided_provider_call_ids,
+                    )?;
                     if let Some(state) = active_compaction.as_mut() {
-                        state.elided_provider_call_ids = elided_provider_call_ids;
+                        state.elided_call_ids = elided_call_ids;
                     }
                     let epoch = self.store.context_epoch(self.session_id)?;
                     let request = Request {
@@ -321,32 +324,38 @@ impl<'a> AgentLoop<'a> {
                             .map(|_| self.config.compaction.hard_headroom_tokens),
                     };
                     let native_request = request.json(self.provider.api())?;
+                    let mut recipe_input = serde_json::json!({
+                        "native_replay_origins":
+                            crate::provider::native_replay_origins(&request.messages),
+                    });
+                    if let Some(state) = &active_compaction {
+                        let input = recipe_input
+                            .as_object_mut()
+                            .expect("request recipe input is an object");
+                        input.insert(
+                            "compaction_attempt".into(),
+                            (if state.emergency {
+                                "emergency"
+                            } else {
+                                state.pending.trigger.as_str()
+                            })
+                            .into(),
+                        );
+                        if !state.elided_call_ids.is_empty() {
+                            input.insert(
+                                "emergency_elided_call_ids".into(),
+                                serde_json::to_value(&state.elided_call_ids)?,
+                            );
+                        }
+                    }
                     let recipe = self.store.request_recipe(
                         self.provider.api().request_format(),
                         &native_request,
-                        serde_json::json!({
-                            "kind": "agent",
-                            "context_through_seq": self.store.current_context_seq(self.session_id)?,
-                            "native_replay_origins":
-                                crate::provider::native_replay_origins(&request.messages),
-                            "context_epoch": epoch,
-                            "compaction_attempt": active_compaction.as_ref().map(|state| {
-                                if state.emergency {
-                                    "emergency"
-                                } else {
-                                    state.pending.trigger.as_str()
-                                }
-                            }),
-                            "emergency_elided_provider_call_ids": active_compaction
-                                .as_ref()
-                                .map(|state| state.elided_provider_call_ids.as_slice())
-                                .unwrap_or_default(),
-                        }),
+                        recipe_input,
                     )?;
                     let exchange_id = self.store.start_provider_request(
                         self.session_id,
                         &self.store.current_turn_id(self.session_id)?,
-                        "agent",
                         ProviderOrigin {
                             canonical_model_ref: request.model.canonical.clone(),
                             provider_id: request.model.provider_id.clone(),
@@ -356,7 +365,7 @@ impl<'a> AgentLoop<'a> {
                             effort: request.model.effort.clone(),
                         },
                         recipe,
-                        None,
+                        RequestSubject::Agent,
                     )?;
                     let reviews_destructive = guardrail
                         .as_ref()
@@ -473,7 +482,7 @@ impl<'a> AgentLoop<'a> {
                                 .map(|pending| ActiveCompaction {
                                     pending,
                                     emergency: true,
-                                    elided_provider_call_ids: Vec::new(),
+                                    elided_call_ids: Vec::new(),
                                 });
                             context = self.load_context()?;
                             next_request = NextRequest::User;
@@ -593,6 +602,10 @@ impl<'a> AgentLoop<'a> {
                     native_response: stream_result.native_response.as_ref(),
                     usage: stream_result.usage.as_ref(),
                     resumable,
+                    response_complete: matches!(
+                        stream_result.finish_reason,
+                        FinishReason::Stop | FinishReason::ToolCalls
+                    ),
                     context_output_complete,
                 },
             )?;
@@ -602,16 +615,14 @@ impl<'a> AgentLoop<'a> {
             match stream_result.finish_reason {
                 FinishReason::Stop => {
                     if let Some(state) = active_compaction.take() {
-                        let summary = accepted_message
+                        if accepted_message
                             .assistant_text()
-                            .filter(|summary| !summary.trim().is_empty())
-                            .ok_or_else(|| {
-                                anyhow::anyhow!(
-                                    "compaction ended without a nonempty assistant summary"
-                                )
-                            })?;
+                            .is_none_or(|summary| summary.trim().is_empty())
+                        {
+                            bail!("compaction ended without a nonempty assistant summary")
+                        }
                         let mode = state.pending.mode;
-                        self.finish_compaction(&state, &summary)?;
+                        self.finish_compaction(&state.pending)?;
                         context = self.load_context()?;
                         live_provider_retries = 0;
                         iteration = 0;
@@ -947,65 +958,29 @@ impl<'a> AgentLoop<'a> {
                 .unwrap_or(false)
     }
 
-    fn active_compaction(&self, pending: PendingCompaction) -> Result<ActiveCompaction> {
-        let emergency = self.compaction_is_emergency(&pending);
-        let elided_provider_call_ids = if emergency {
-            let context = self.load_context()?;
-            compaction::emergency_projection(&context, self.config.compaction.hard_headroom_tokens)
-                .1
-        } else {
-            Vec::new()
-        };
-        Ok(ActiveCompaction {
-            pending,
-            emergency,
-            elided_provider_call_ids,
-        })
-    }
-
-    fn finish_compaction(&mut self, state: &ActiveCompaction, summary: &str) -> Result<()> {
-        let to_epoch = state.pending.from_epoch.saturating_add(1);
-        let checkpoint = compaction::checkpoint(summary, state.pending.mode, to_epoch);
+    fn finish_compaction(&mut self, pending: &PendingCompaction) -> Result<()> {
         let after_context_tokens_estimate = self.store.projected_compaction_context_tokens(
             self.session_id,
-            state.pending.mode,
-            &checkpoint,
             self.config,
             self.model.active_model(),
             self.provider.api(),
         )?;
-        let elapsed = DateTime::parse_from_rfc3339(&state.pending.started_at)
+        let elapsed = DateTime::parse_from_rfc3339(&pending.started_at)
             .ok()
             .and_then(|started| (Utc::now() - started.with_timezone(&Utc)).to_std().ok())
             .unwrap_or_default();
-        let elided_call_ids = self
-            .store
-            .call_ids_for_provider_call_ids(self.session_id, &state.elided_provider_call_ids)?;
         let new_epoch = self.store.apply_compaction(
             self.session_id,
             CompactionApplication {
-                source_turn_id: &state.pending.turn_id,
-                trigger: if state.emergency {
-                    CompactionTrigger::Emergency
-                } else {
-                    state.pending.trigger
-                },
-                mode: state.pending.mode,
-                summary,
-                checkpoint: &checkpoint,
-                before_context_tokens: state.pending.before_context_tokens,
-                before_context_window: state.pending.before_context_window,
                 after_context_tokens_estimate,
                 after_context_window: self.model_context_window,
-                elapsed_ms: elapsed.as_millis().min(u128::from(u64::MAX)) as u64,
-                emergency_elided_call_ids: &elided_call_ids,
             },
         )?;
         self.renderer.compaction_result(&CompactionReport {
-            from_epoch: state.pending.from_epoch,
+            from_epoch: pending.from_epoch,
             to_epoch: new_epoch,
-            before_context_tokens: state.pending.before_context_tokens,
-            before_context_window: state.pending.before_context_window,
+            before_context_tokens: pending.before_context_tokens,
+            before_context_window: pending.before_context_window,
             after_context_tokens_estimate,
             after_context_window: self.model_context_window,
             elapsed,
@@ -2271,7 +2246,7 @@ mod tests {
                 .audit_events(&session.id)
                 .unwrap()
                 .iter()
-                .filter(|event| event["type"] == "turn_started")
+                .filter(|event| event["type"] == "prompt_materialized")
                 .count(),
             1
         );
@@ -2352,13 +2327,13 @@ mod tests {
                 .count(),
             2
         );
-        assert_eq!(
-            audit
-                .iter()
-                .find(|event| event["type"] == "provider_completed")
-                .unwrap()["projection"]["turn_state"],
-            "resume"
-        );
+        let completed = audit
+            .iter()
+            .find(|event| event["type"] == "provider_completed")
+            .unwrap();
+        assert_eq!(completed["projection"]["resumable"], true);
+        assert_eq!(completed["projection"]["incomplete"], true);
+        assert!(completed["projection"].get("turn_state").is_none());
     }
 
     #[tokio::test]
@@ -2399,7 +2374,9 @@ mod tests {
             .into_iter()
             .find(|event| event["type"] == "provider_completed")
             .unwrap();
-        assert_eq!(completed["projection"]["turn_state"], "complete");
+        assert!(completed["projection"].get("resumable").is_none());
+        assert_eq!(completed["projection"]["incomplete"], true);
+        assert!(completed["projection"].get("turn_state").is_none());
     }
 
     #[tokio::test]

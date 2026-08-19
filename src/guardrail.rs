@@ -177,18 +177,12 @@ impl Guardrail {
                 provider.api().request_format(),
                 &native_request,
                 json!({
-                    "kind": "guardrail",
-                    "call_id": bash_call_id,
-                    "attempt": attempt,
-                    "context_through_seq": store.current_context_seq(session_id)?,
-                    "context_epoch": epoch,
                     "policy_version": 1,
                 }),
             )?;
             let exchange_id = store.start_provider_request(
                 session_id,
                 &store.current_turn_id(session_id)?,
-                "guardrail",
                 ProviderOrigin {
                     canonical_model_ref: request_model.canonical.clone(),
                     provider_id: request_model.provider_id.clone(),
@@ -198,10 +192,10 @@ impl Guardrail {
                     effort: request_model.effort.clone(),
                 },
                 recipe,
-                Some(RequestSubject {
+                RequestSubject::Guardrail {
                     call_id: bash_call_id,
                     attempt,
-                }),
+                },
             )?;
             let mut ignore_event = |_event: crate::provider::StreamEvent| Ok(());
             let result = tokio::time::timeout(timeout, async {
@@ -302,8 +296,6 @@ impl Guardrail {
                                 session_id,
                                 &exchange_id,
                                 GuardrailCompletion {
-                                    call_id: bash_call_id,
-                                    attempt,
                                     outcome: assessment.outcome(),
                                     risk_level: Some(&risk_level),
                                     auth_level: Some(&user_auth_level),
@@ -889,7 +881,9 @@ mod tests {
         let audit = store.audit_events(&session.id).unwrap();
         let request = audit
             .iter()
-            .find(|event| event["type"] == "provider_requested" && event["purpose"] == "guardrail")
+            .find(|event| {
+                event["type"] == "provider_requested" && event["subject"]["kind"] == "guardrail"
+            })
             .unwrap();
         assert_eq!(request["origin"]["provider_id"], "test");
         assert_eq!(request["subject"]["call_id"], bash_call_ids[0]);
