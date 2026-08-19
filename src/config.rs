@@ -207,7 +207,6 @@ pub struct CompactionConfig {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct LimitsConfig {
-    pub max_iterations: usize,
     pub max_lines: usize,
     pub max_bytes: usize,
     pub max_line_bytes: usize,
@@ -772,7 +771,6 @@ mod tests {
         merge_json(&mut user, project);
 
         let config = config_from_value(user).unwrap();
-        assert_eq!(config.limits.max_iterations, 50);
         assert_eq!(config.limits.max_lines, 123);
         assert_eq!(config.limits.max_bytes, 456);
         assert_eq!(config.limits.max_line_bytes, 10_240);

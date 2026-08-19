@@ -74,7 +74,6 @@ Complete shape, with default values where applicable:
     "hard_headroom_tokens": 48000
   },
   "limits": {
-    "max_iterations": 50,
     "max_lines": 2000,
     "max_bytes": 51200,
     "max_line_bytes": 10240
@@ -140,11 +139,10 @@ reported input and estimates retained output and later messages. With no
 compatible report, Mu estimates the full context. Estimated percentages have a
 `~` prefix.
 
-`limits.max_iterations` caps one agent turn; the other limits bound the
-model-visible preview of bash output by lines, total bytes, and bytes per line.
-The bell sounds only for turns lasting at least `min_duration_ms`. The guardrail
-reviews destructive bash calls; `timeout_seconds` and `max_denials_per_turn`
-must be positive.
+The limits bound the model-visible preview of bash output by lines, total bytes,
+and bytes per line. The bell sounds only for turns lasting at least
+`min_duration_ms`. The guardrail reviews destructive bash calls;
+`timeout_seconds` and `max_denials_per_turn` must be positive.
 
 Model references use `provider/model[:effort]` for a fixed provider or
 `model[:effort]` for ordered provider fallback. A bare model includes every

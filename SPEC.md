@@ -969,10 +969,7 @@ test. A failed compaction leaves its ordinary turn and provider records
 available for `/retry` and does not advance the epoch. Manual compaction of a
 session with no conversation history is inapplicable.
 
-### 11.6 Bounds and exit status
-
-`limits.max_iterations` bounds tool round-trips in one turn. Reaching it exits
-nonzero while retaining every completed message and Bash result.
+### 11.6 Exit status
 
 Exit status:
 

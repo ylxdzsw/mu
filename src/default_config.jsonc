@@ -58,10 +58,8 @@
     // Hard-threshold reserve, emergency reduction, and summary output cap.
     "hard_headroom_tokens": 48000
   },
-  // Agent-loop and Bash-output limits.
+  // Bash-output limits.
   "limits": {
-    // Maximum agent iterations per turn.
-    "max_iterations": 50,
     // Maximum retained Bash-output lines.
     "max_lines": 2000,
     // Maximum retained Bash-output bytes.

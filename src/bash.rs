@@ -1326,7 +1326,6 @@ mod tests {
 
     fn tight_limits() -> LimitsConfig {
         LimitsConfig {
-            max_iterations: 50,
             max_lines: 2,
             max_bytes: 10_000,
             max_line_bytes: 10_000,

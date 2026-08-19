@@ -249,15 +249,12 @@ impl<'a> AgentLoop<'a> {
                     elided_call_ids: Vec::new(),
                 });
 
-        let max_iter = self.config.limits.max_iterations;
-
         let mut total_usage = Usage::default();
         let mut final_assistant = None;
         let mut awaiting_user = false;
 
-        let mut iteration = 0;
         let mut live_provider_retries = 0;
-        while iteration < max_iter {
+        loop {
             let (exchange_id, stream_result, mut command_headers) = 'request_gate: loop {
                 if active_compaction.is_none() && next_request == NextRequest::ToolResults {
                     let before = self.current_context_tokens()?;
@@ -625,7 +622,6 @@ impl<'a> AgentLoop<'a> {
                         self.finish_compaction(&state.pending)?;
                         context = self.load_context()?;
                         live_provider_retries = 0;
-                        iteration = 0;
                         if mode == CompactionMode::AwaitUser {
                             awaiting_user = true;
                             break;
@@ -862,12 +858,6 @@ impl<'a> AgentLoop<'a> {
                 }
             }
 
-            if iteration + 1 >= max_iter {
-                self.renderer
-                    .notice("[mu] max iterations reached; stopping")?;
-                bail!("max iterations reached");
-            }
-            iteration += 1;
             live_provider_retries = 0;
         }
 
