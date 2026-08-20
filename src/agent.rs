@@ -3075,7 +3075,7 @@ mod tests {
                             arguments: serde_json::json!({
                                 "title": "grow context",
                                 "risk": "readonly",
-                                "command": "head -c 620000 /dev/zero | tr '\\0' x",
+                                "command": "head -c 690000 /dev/zero | tr '\\0' x",
                             })
                             .to_string(),
                         }]),
@@ -3112,8 +3112,8 @@ mod tests {
         let store = Store::open(&tmp.join("mu.db")).unwrap();
         let session = store.create_session("/tmp").unwrap();
         let mut config = test_config();
-        config.limits.max_bytes = 700_000;
-        config.limits.max_line_bytes = 700_000;
+        config.limits.max_bytes = 750_000;
+        config.limits.max_line_bytes = 750_000;
         config.compaction.soft_fraction = 0.80;
         config
             .providers
@@ -3182,9 +3182,9 @@ mod tests {
             provider,
             store: &store,
             session_id: &session.id,
-            // At 200K, the hard threshold is 152K tokens. The ~620KB tool result
-            // pushes the anchored estimate past it while the test's 80% soft
-            // target still accepts the retained current turn.
+            // At 200K, the hard threshold is 168K tokens. The ~690KB tool result
+            // pushes the anchored estimate past it while the 80% soft target
+            // still accepts the retained current turn.
             model_context_window: Some(200_000),
             renderer: &mut renderer,
         };

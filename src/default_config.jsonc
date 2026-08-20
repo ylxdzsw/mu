@@ -54,11 +54,11 @@
     // Enable automatic compaction.
     "enabled": true,
     // Compact before materializing a queued new prompt at this fraction.
-    "soft_fraction": 0.70,
+    "soft_fraction": 0.80,
     // Compact before returning completed Bash results at this fraction.
-    "hard_fraction": 0.85,
+    "hard_fraction": 0.90,
     // Hard-threshold reserve, emergency reduction, and summary output cap.
-    "hard_headroom_tokens": 48000
+    "hard_headroom_tokens": 32000
   },
   // Bash-output limits.
   "limits": {

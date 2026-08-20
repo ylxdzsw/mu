@@ -25,11 +25,10 @@ pub const BASH_CALL_ID_ENV: &str = "MU_BASH_CALL_ID";
 pub const ATTACHMENT_MANIFEST_ENV: &str = "MU_ATTACHMENT_MANIFEST";
 pub const OBJECTS_DIR_ENV: &str = "MU_OBJECTS_DIR";
 pub const INTERRUPTED_TOOL_RESULT: &str = "error: interrupted — this command may have started and not completed; its effects are unknown. Verify the resulting state before relying on it.";
-pub const RESUME_PROMPT: &str = "Continue the current task from where you stopped.";
+pub const RESUME_PROMPT: &str = "Continue";
 
-const FORMAT_VERSION: u32 = 3;
+const FORMAT_VERSION: u32 = 4;
 const SESSION_ID_RETRIES: usize = 16;
-const EXTERNAL_TEXT_BYTES: usize = 256 * 1024;
 const MAX_BASH_ATTACHMENTS: usize = 8;
 
 #[derive(Debug, Clone)]
@@ -341,7 +340,7 @@ enum Event {
     BashCompleted {
         call_id: i64,
         outcome: String,
-        output: PersistedText,
+        output: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         exit_code: Option<i32>,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -534,13 +533,6 @@ struct ManifestEntry {
     filename: String,
     media_type: String,
     detail: ImageDetail,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-enum PersistedText {
-    Inline { text: String },
-    Object { object: ObjectRef },
 }
 
 #[derive(Clone)]
@@ -1131,7 +1123,7 @@ impl Store {
                 Event::BashCompleted {
                     call_id,
                     outcome: outcome.into(),
-                    output: PersistedText::Inline { text: output },
+                    output,
                     exit_code: None,
                     duration_ms: None,
                     attachments: Vec::new(),
@@ -1201,7 +1193,7 @@ impl Store {
                         *call_id,
                         TranscriptBashResult {
                             outcome: outcome.clone(),
-                            output: self.hydrate_text(output)?,
+                            output: output.clone(),
                             exit_code: *exit_code,
                             duration_ms: *duration_ms,
                         },
@@ -1759,13 +1751,12 @@ impl Store {
             .iter()
             .map(|attachment| self.persist_tool_attachment(attachment))
             .collect::<Result<Vec<_>>>()?;
-        let output = self.persist_text(content)?;
         let seq = self.append(
             session_id,
             Event::BashCompleted {
                 call_id: record.bash_call_id,
                 outcome: record.outcome.to_string(),
-                output,
+                output: content.to_string(),
                 exit_code: record.exit_code,
                 duration_ms: record.duration_ms,
                 attachments: attachments.clone(),
@@ -2604,7 +2595,7 @@ impl Store {
                         continue;
                     }
                     messages.push(Message::Tool {
-                        content: self.hydrate_text(output)?,
+                        content: output.clone(),
                         attachments: attachments
                             .iter()
                             .map(|attachment| self.hydrate_tool_attachment(attachment))
@@ -2621,7 +2612,7 @@ impl Store {
         Ok(messages)
     }
 
-    // Object-backed content persistence.
+    // Content attachments and provider payload objects.
     fn persist_user_content(&self, content: &UserContent) -> Result<PersistedUserContent> {
         Ok(match content {
             UserContent::Text(text) => PersistedUserContent::Text { text: text.clone() },
@@ -2702,27 +2693,6 @@ impl Store {
             detail: attachment.detail,
             object_sha256: Some(attachment.object.sha256.clone()),
         })
-    }
-
-    fn persist_text(&self, text: &str) -> Result<PersistedText> {
-        if text.len() > EXTERNAL_TEXT_BYTES {
-            Ok(PersistedText::Object {
-                object: self.write_object(text.as_bytes())?,
-            })
-        } else {
-            Ok(PersistedText::Inline {
-                text: text.to_string(),
-            })
-        }
-    }
-
-    fn hydrate_text(&self, text: &PersistedText) -> Result<String> {
-        match text {
-            PersistedText::Inline { text } => Ok(text.clone()),
-            PersistedText::Object { object } => {
-                String::from_utf8(self.read_object(object)?).context("tool output is not UTF-8")
-            }
-        }
     }
 
     fn write_object(&self, bytes: &[u8]) -> Result<ObjectRef> {
@@ -4611,7 +4581,7 @@ mod tests {
         let supported = store.create_session_seeded("system").unwrap();
         let unsupported = store.create_session_seeded("system").unwrap();
         store.select_session(&unsupported.id).unwrap();
-        store.set_session_version_for_test(&unsupported.id, 1);
+        store.set_session_version_for_test(&unsupported.id, FORMAT_VERSION - 1);
         let path = store.session_path(&unsupported.id);
         let before = std::fs::read(&path).unwrap();
 
@@ -4620,7 +4590,7 @@ mod tests {
             error.downcast_ref::<UnsupportedSessionVersion>(),
             Some(&UnsupportedSessionVersion {
                 session_id: Some(unsupported.id.clone()),
-                found: 1,
+                found: FORMAT_VERSION - 1,
                 supported: FORMAT_VERSION,
             })
         );
@@ -4634,7 +4604,7 @@ mod tests {
             listing.skipped,
             vec![UnsupportedSessionVersion {
                 session_id: Some(unsupported.id),
-                found: 1,
+                found: FORMAT_VERSION - 1,
                 supported: FORMAT_VERSION,
             }]
         );
@@ -5461,7 +5431,7 @@ mod tests {
             .unwrap();
         assert_eq!(result["outcome"], "error");
         assert!(
-            result["output"]["text"]
+            result["output"]
                 .as_str()
                 .unwrap()
                 .contains("not authorized")

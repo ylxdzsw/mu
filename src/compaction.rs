@@ -146,10 +146,10 @@ mod tests {
 
     #[test]
     fn threshold_math_preserves_fixed_headroom() {
-        assert_eq!(soft_compaction_threshold(200_000, 0.70), 140_000);
-        assert_eq!(hard_compaction_threshold(200_000, 0.85, 48_000), 152_000);
-        assert_eq!(soft_compaction_threshold(353_000, 0.70), 247_100);
-        assert_eq!(hard_compaction_threshold(353_000, 0.85, 1), 300_050);
+        assert_eq!(soft_compaction_threshold(200_000, 0.80), 160_000);
+        assert_eq!(hard_compaction_threshold(200_000, 0.90, 32_000), 168_000);
+        assert_eq!(soft_compaction_threshold(353_000, 0.80), 282_400);
+        assert_eq!(hard_compaction_threshold(353_000, 0.90, 1), 317_700);
     }
 
     #[test]

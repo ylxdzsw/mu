@@ -12,8 +12,15 @@ use crate::paths;
 pub type EnvMap = HashMap<String, String>;
 
 pub fn load_effective_env(project_config_dir: Option<&Path>) -> Result<EnvMap> {
+    load_effective_env_from(&paths::global_dir(), project_config_dir)
+}
+
+fn load_effective_env_from(
+    global_config_dir: &Path,
+    project_config_dir: Option<&Path>,
+) -> Result<EnvMap> {
     let mut env: EnvMap = std::env::vars().collect();
-    load_dotenv_into(&paths::global_dir().join(".env"), &mut env)?;
+    load_dotenv_into(&global_config_dir.join(".env"), &mut env)?;
     if let Some(dir) = project_config_dir {
         load_dotenv_into(&dir.join(".env"), &mut env)?;
     }
@@ -232,6 +239,12 @@ pub struct RedactionConfig {
     pub env: Vec<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfigLoadMode {
+    Runtime,
+    Permissive,
+}
+
 #[derive(Debug, Clone)]
 pub struct OrderedMap<T> {
     entries: Vec<(String, T)>,
@@ -365,26 +378,8 @@ where
 }
 
 impl Config {
-    pub fn load_for_scope(project_config_dir: Option<&Path>) -> Result<Self> {
-        let global_path = paths::global_dir().join("config.jsonc");
-        ensure_starter_config(&global_path)?;
-        let (mut value, global_order) = read_config_file(&global_path)?;
-        let mut order = combined_config_order(&global_order, None);
-
-        if let Some(dir) = project_config_dir {
-            let project_path = dir.join("config.jsonc");
-            if project_path.exists() {
-                let (project, project_order) = read_config_file(&project_path)?;
-                merge_json(&mut value, project);
-                order = combined_config_order(&global_order, Some(&project_order));
-            }
-        }
-
-        let mut config = config_from_value(value)?;
-        apply_config_order(&mut config, &order);
-        config.env = load_effective_env(project_config_dir)?;
-        config.validate_runtime()?;
-        Ok(config)
+    pub fn load_for_scope(project_config_dir: Option<&Path>, mode: ConfigLoadMode) -> Result<Self> {
+        load_config(&paths::global_dir(), project_config_dir, mode)
     }
 
     pub fn provider(&self, provider_id: &str) -> Result<&ProviderConfig> {
@@ -483,6 +478,43 @@ impl Config {
     }
 }
 
+fn load_config(
+    global_config_dir: &Path,
+    project_config_dir: Option<&Path>,
+    mode: ConfigLoadMode,
+) -> Result<Config> {
+    let global_path = global_config_dir.join("config.jsonc");
+    if mode == ConfigLoadMode::Runtime {
+        ensure_starter_config(&global_path)?;
+    }
+    let (mut value, global_order) = if global_path.exists() {
+        read_config_file(&global_path, mode)?
+    } else {
+        (serde_json::json!({}), ConfigOrder::default())
+    };
+    let mut order = combined_config_order(&global_order, None);
+
+    if let Some(dir) = project_config_dir {
+        let project_path = dir.join("config.jsonc");
+        if project_path.exists() {
+            let (project, project_order) = read_config_file(&project_path, mode)?;
+            merge_json(&mut value, project);
+            order = combined_config_order(&global_order, Some(&project_order));
+        }
+    }
+
+    let mut config = match mode {
+        ConfigLoadMode::Runtime => deserialize_config(value, false)?,
+        ConfigLoadMode::Permissive => deserialize_config(value, true)?,
+    };
+    apply_config_order(&mut config, &order);
+    if mode == ConfigLoadMode::Runtime {
+        config.env = load_effective_env_from(global_config_dir, project_config_dir)?;
+        config.validate_runtime()?;
+    }
+    Ok(config)
+}
+
 pub(crate) fn redaction_suffix(selector: &str) -> Result<Option<&str>> {
     let Some(suffix) = selector.strip_prefix('*') else {
         if selector.contains('*') {
@@ -514,39 +546,66 @@ fn ensure_starter_config(path: &Path) -> Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
 fn config_from_value(value: serde_json::Value) -> Result<Config> {
-    let mut merged = bundled_defaults()?;
-    merge_json(&mut merged, value);
-    let config: Config =
-        serde_json::from_value(merged).context("invalid config.jsonc structure")?;
+    let config = deserialize_config(value, false)?;
     config.validate_structure()?;
     Ok(config)
 }
 
-fn read_config_file(path: &Path) -> Result<(serde_json::Value, ConfigOrder)> {
+fn deserialize_config(value: serde_json::Value, discard_invalid_providers: bool) -> Result<Config> {
+    let mut merged = bundled_defaults()?;
+    merge_json(&mut merged, value);
+    if !discard_invalid_providers {
+        return serde_json::from_value(merged).context("invalid config.jsonc structure");
+    }
+    match serde_json::from_value(merged.clone()) {
+        Ok(config) => Ok(config),
+        Err(_) => {
+            merged
+                .as_object_mut()
+                .context("config.jsonc must be an object")?
+                .insert("providers".into(), serde_json::json!({}));
+            serde_json::from_value(merged).context("invalid config.jsonc structure")
+        }
+    }
+}
+
+fn read_config_file(path: &Path, mode: ConfigLoadMode) -> Result<(serde_json::Value, ConfigOrder)> {
     if !path.exists() {
         bail!("config not found at {}", path.display());
     }
     let raw =
         std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
-    parse_config_source(&raw, &path.display().to_string())
+    parse_config_source(&raw, &path.display().to_string(), mode)
 }
 
-fn parse_config_source(raw: &str, source: &str) -> Result<(serde_json::Value, ConfigOrder)> {
+fn parse_config_source(
+    raw: &str,
+    source: &str,
+    mode: ConfigLoadMode,
+) -> Result<(serde_json::Value, ConfigOrder)> {
     let value =
         jsonc_parser::parse_to_serde_value::<Option<serde_json::Value>>(raw, &Default::default())
             .map_err(|e| anyhow::anyhow!("parsing {source}: {e}"))?
             .ok_or_else(|| anyhow::anyhow!("{source} is empty"))?;
-    let order =
-        jsonc_parser::parse_to_serde_value::<Option<ConfigOrderRaw>>(raw, &Default::default())
-            .map_err(|e| anyhow::anyhow!("parsing {source}: {e}"))?
-            .unwrap_or_default()
-            .into_order();
+    let order = match jsonc_parser::parse_to_serde_value::<Option<ConfigOrderRaw>>(
+        raw,
+        &Default::default(),
+    ) {
+        Ok(order) => order.unwrap_or_default().into_order(),
+        Err(_) if mode == ConfigLoadMode::Permissive => ConfigOrder::default(),
+        Err(error) => return Err(anyhow::anyhow!("parsing {source}: {error}")),
+    };
     Ok((value, order))
 }
 
 fn bundled_defaults() -> Result<serde_json::Value> {
-    let (mut value, _) = parse_config_source(DEFAULT_CONFIG, "bundled default config")?;
+    let (mut value, _) = parse_config_source(
+        DEFAULT_CONFIG,
+        "bundled default config",
+        ConfigLoadMode::Runtime,
+    )?;
     let object = value
         .as_object_mut()
         .ok_or_else(|| anyhow!("bundled default config must be a JSON object"))?;
@@ -651,8 +710,12 @@ pub(crate) fn bundled_test_default<T>(pointer: &str) -> T
 where
     T: serde::de::DeserializeOwned,
 {
-    let (value, _) =
-        parse_config_source(DEFAULT_CONFIG, "bundled default config").expect("valid defaults");
+    let (value, _) = parse_config_source(
+        DEFAULT_CONFIG,
+        "bundled default config",
+        ConfigLoadMode::Runtime,
+    )
+    .expect("valid defaults");
     serde_json::from_value(
         value
             .pointer(pointer)
@@ -1072,6 +1135,70 @@ mod tests {
 
         assert_eq!(std::fs::read_to_string(&config).unwrap(), DEFAULT_CONFIG);
         assert!(!root.join(".gitignore").exists());
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn permissive_load_does_not_create_a_missing_global_config() {
+        let root =
+            std::env::temp_dir().join(format!("mu-config-readonly-{}", uuid::Uuid::new_v4()));
+
+        let config = load_config(&root, None, ConfigLoadMode::Permissive).unwrap();
+
+        assert_eq!(config.output, OutputFormat::Concise);
+        assert!(config.providers.is_empty());
+        assert!(!root.exists());
+    }
+
+    #[test]
+    fn permissive_load_discards_malformed_providers_but_keeps_output() {
+        let root =
+            std::env::temp_dir().join(format!("mu-config-permissive-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            root.join("config.jsonc"),
+            r#"{"output":"full","providers":{"broken":{"models":[]}}}"#,
+        )
+        .unwrap();
+        std::fs::write(root.join(".env"), "INVALID=$(ignored)\n").unwrap();
+
+        let config = load_config(&root, None, ConfigLoadMode::Permissive).unwrap();
+
+        assert_eq!(config.output, OutputFormat::Full);
+        assert!(config.providers.is_empty());
+        assert!(config.env.is_empty());
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn permissive_load_keeps_model_metadata_without_provider_validation() {
+        let root =
+            std::env::temp_dir().join(format!("mu-config-metadata-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            root.join("config.jsonc"),
+            r#"{
+                "providers": {
+                    "broken": {
+                        "endpoint": "not a provider endpoint",
+                        "models": {"model": {"context_window": 123}}
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let config = load_config(&root, None, ConfigLoadMode::Permissive).unwrap();
+
+        assert_eq!(
+            config
+                .model_config("broken", "model")
+                .unwrap()
+                .context_window,
+            Some(123)
+        );
 
         let _ = std::fs::remove_dir_all(root);
     }

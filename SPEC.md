@@ -548,8 +548,7 @@ configured model.
 
 An adapter may classify a complete response as resumable. With
 `auto_resume:false`, that response is an ordinary clean ending. With
-`auto_resume:true`, Mu persists it, derives
-`Continue the current task from where you stopped.`, and continues the same
+`auto_resume:true`, Mu persists it, derives `Continue`, and continues the same
 turn using the current retry quota.
 
 Progress resets the quota. Exhaustion advances a floating candidate; a fixed or
@@ -762,7 +761,7 @@ Management commands:
 | `mu context` | Show the system prompt Mu would assemble; `--export` emits user instructions and non-built-in skill guidance for a foreign agent. |
 | `mu cat` | Resolve and preview exact prompt input without provider contact or session creation. |
 | `mu retry` | Normalize and continue an interrupted turn without a new prompt; a clean session reports a no-op. |
-| `mu compact` | Force compaction, optionally using non-terminal stdin as a focus instruction. |
+| `mu compact` | Force compaction with configured or explicit output density, optionally using non-terminal stdin as a focus instruction. |
 
 Provider-free management commands do not contact a provider.
 
@@ -799,8 +798,9 @@ The durable event model is:
   projection.
 - **`provider_failed` / `provider_interrupted`** — terminal audit outcome with
   no semantic assistant message.
-- **`bash_completed`** — unique result and attachment references for one
-  durable Bash claim.
+- **`bash_completed`** — unique inline result and attachment references for one
+  durable Bash claim. Text is always stored directly in the journal; binary
+  attachments remain content-addressed objects.
 - **`compaction_applied`** — after-context telemetry for the committed epoch
   transition.
 
@@ -812,7 +812,7 @@ derives from the associated provider request after completion-time validation;
 the request recipe records the exact replay-origin selection so reconstruction
 remains stable across configuration changes.
 
-The journal format is version 3. It deliberately does not read version 2.
+The journal format is version 4. It deliberately does not read version 3.
 Context epoch at event sequence `S` is the number of valid prior
 `compaction_applied` events: the application belongs to the old epoch, and
 events after it belong to the new epoch. User turns derive prompt content and
@@ -880,10 +880,16 @@ prompts, provider payloads, and journal metadata.
 Only open Chat reasoning is displayable, and only in `full`; opaque Responses
 and Anthropic reasoning remains omitted. Stored redaction is authoritative.
 
-Transcript output reuses the normal output densities. It reconstructs the
-historical prompt model, working directory, and prior context usage when the
-journal contains enough information. HTML output is a renderer replay, not a
-second transcript model. Its xterm viewport remains 100 columns wide, centers
+Transcript output reuses the normal output densities. It loads configuration
+permissively and read-only: replay does not create a missing global config,
+load environment files, or require providers to pass runtime validation.
+Malformed provider structure is discarded so the remaining settings can still
+be used. An explicit `--output` selects the density; otherwise both terminal
+and HTML replay use the configured output, falling back to the bundled
+`concise` default. It reconstructs the historical prompt model, working
+directory, and prior context usage from the journal and configured model
+metadata. HTML output is a renderer replay, not a second transcript model. Its
+xterm viewport remains 100 columns wide, centers
 when space permits, scrolls horizontally on narrower viewports, and debounces
 vertical fitting during resizing. Line breaks produced by the fixed-width
 renderer are not reflowed after export. Both scroll surfaces use a thin dark

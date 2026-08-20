@@ -277,14 +277,14 @@ function _mu_fish_append_history --argument-names entry
 end
 
 function _mu_fish_history_entry --argument-names input
-    set -g _MU_FISH_HISTORY_ENTRY (string join ' ' -- true mu-history-v1 (string escape -- "$input"))
+    set -g _MU_FISH_HISTORY_ENTRY (string join ' ' -- true mu-history (string escape -- "$input"))
 end
 
 function _mu_fish_decode_history --argument-names entry
     set -g _MU_FISH_DECODED_HISTORY
     printf '%s\n' "$entry" | read --tokenize -a words
     test (count $words) -ge 3; or return 1
-    test "$words[1]" = true; and test "$words[2]" = mu-history-v1; or return 1
+    test "$words[1]" = true; and test "$words[2]" = mu-history; or return 1
     set -g _MU_FISH_DECODED_HISTORY "$words[3]"
 end
 
@@ -298,7 +298,7 @@ end
 
 function _mu_fish_load_history
     set -g MU_FISH_HISTORY_ENTRIES
-    set -l entries (builtin history search --null --case-sensitive --prefix 'true mu-history-v1 ' | string split0)
+    set -l entries (builtin history search --null --case-sensitive --prefix 'true mu-history ' | string split0)
     for entry in $entries
         _mu_fish_decode_history "$entry"; or continue
         set -a MU_FISH_HISTORY_ENTRIES "$_MU_FISH_DECODED_HISTORY"
@@ -811,11 +811,13 @@ function _mu_fish_run_slash_command --argument-names line
         case /compact
             _mu_fish_activate_scope "$scope"
             _mu_fish_require_effective_session /compact; or return 1
+            set -l compact_command "$MU_FISH_BIN" compact --session "$MU_FISH_EFFECTIVE_SESSION_ID"
+            set -q MU_FISH_OUTPUT[1]; and test -n "$MU_FISH_OUTPUT"; and set -a compact_command --output "$MU_FISH_OUTPUT"
             if test -n "$instruction"
-                printf '%s' "$instruction" | "$MU_FISH_BIN" compact --session "$MU_FISH_EFFECTIVE_SESSION_ID"
+                printf '%s' "$instruction" | $compact_command
                 set exit_status $pipestatus[2]
             else
-                "$MU_FISH_BIN" compact --session "$MU_FISH_EFFECTIVE_SESSION_ID"
+                $compact_command
                 set exit_status $status
             end
             printf '\n'

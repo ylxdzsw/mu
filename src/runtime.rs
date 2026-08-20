@@ -709,7 +709,7 @@ mod tests {
             Some(UnsupportedSessionVersion {
                 session_id: Some(session.id.clone()),
                 found: 1,
-                supported: 3,
+                supported: 4,
             })
         );
 
@@ -1204,7 +1204,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(reported.context_tokens, Some(25));
-        assert_eq!(reported.compaction_soft_threshold_tokens, Some(70));
+        assert_eq!(reported.compaction_soft_threshold_tokens, Some(80));
         assert_eq!(
             reported.context_usage_source,
             Some(ContextUsageSource::Reported)

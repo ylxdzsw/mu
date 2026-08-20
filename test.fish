@@ -199,7 +199,7 @@ assert_equal (string join \x1e -- $submitted_args) (string join \x1e -- --output
 not set -q MU_FISH_PENDING_ATTACHMENTS[1]; or fail 'submission clears attachments'
 
 set replay (builtin history search --max 1 | string collect)
-assert_contains "$replay" 'true mu-history-v1 ' 'tags Fish Mu history'
+assert_contains "$replay" 'true mu-history ' 'tags Fish Mu history'
 assert_contains "$replay" "printf '%s\\n'" 'records replayable Fish history'
 assert_contains "$replay" 'inspect this' 'history preserves submitted prompt'
 _mu_fish_decode_history "$replay"; or fail 'decodes recorded Fish turn history'
@@ -218,6 +218,11 @@ not set -q MU_FISH_PENDING_ATTACHMENTS[1]; or fail '/attach --clear clears queue
 _mu_fish_run_slash_command '/model gpt'
 assert_equal "$MU_FISH_EFFECTIVE_MODEL" openai/gpt '/model stores canonical model'
 _mu_fish_run_slash_command '/model unknown'; and fail '/model should reject unknown model'
+
+rm -f "$capture_args" "$capture_stdin" "$capture_calls"
+_mu_fish_run_slash_command '/compact' >/dev/null
+set compact_args (cat "$capture_args")
+assert_equal (string join \x1e -- $compact_args) (string join \x1e -- compact --session ses_0000000a --output detail) '/compact forwards session and output'
 
 set models (_mu_fish_model_candidates gp)
 contains gpt $models; or fail 'model candidates include unique shorthand'

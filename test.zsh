@@ -144,7 +144,7 @@ MU_ZSH_BIN=$prompt_fake_bin/mu
 [[ "$MU_ZSH_MODE" == shell ]] || fail "starts in shell mode"
 
 history_input=$'first line\nsecond $HOME `tick` "quoted"'
-history_entry="true mu-history-v1 ${(qqq)history_input}; print replay"
+history_entry="true mu-history ${(qqq)history_input}; print replay"
 _mu_zsh_decode_history "$history_entry" || fail "decodes tagged zsh history"
 [[ "$REPLY" == "$history_input" ]] || fail "tagged zsh history preserves multiline shell-special input"
 _mu_zsh_decode_history "mu status" && fail "ordinary shell history must not decode as Mu input"
@@ -572,10 +572,10 @@ grep -q -- "retry -s tracked-session --model openai/gpt --output detail" "$MU_ZS
 _mu_zsh_clear_model_state
 rm -f "$MU_ZSH_FAKE_LOG"
 _mu_zsh_run_slash_command "/compact"
-grep -q -- "compact --session tracked-session" "$MU_ZSH_FAKE_LOG" || fail "compact slash command targets tracked session"
+grep -q -- "compact --session tracked-session --output detail" "$MU_ZSH_FAKE_LOG" || fail "compact slash command forwards session and output"
 rm -f "$MU_ZSH_FAKE_LOG"
 _mu_zsh_run_slash_command $'/compact Focus on authentication\nKeep concrete API shapes'
-grep -q -- "compact --session tracked-session" "$MU_ZSH_FAKE_LOG" || fail "focused compact targets tracked session"
+grep -q -- "compact --session tracked-session --output detail" "$MU_ZSH_FAKE_LOG" || fail "focused compact forwards session and output"
 compact_prompt=$(cat "$MU_ZSH_FAKE_LOG")
 [[ "$compact_prompt" == *$'prompt=Focus on authentication\nKeep concrete API shapes'* ]] || fail "focused compact pipes multiline instruction"
 rm -f "$MU_ZSH_FAKE_LOG"
@@ -1206,7 +1206,7 @@ history_replay=$tmpdir/history-replay
 history_file=$tmpdir/history
 history_recall_transcript=$tmpdir/history-recall-transcript
 history_recalled_prompt='recalled Mu prompt'
-history_tagged_entry="true mu-history-v1 ${(qqq)history_recalled_prompt}; print -rn -- recalled > ${(q)history_replay}"
+history_tagged_entry="true mu-history ${(qqq)history_recalled_prompt}; print -rn -- recalled > ${(q)history_replay}"
 print -r -- "$history_tagged_entry" > "$history_file"
 print -r -- "print -rn -- shell-history > ${(q)history_replay}" >> "$history_file"
 rm -f -- "$history_replay" "$interactive_capture_args" "$interactive_capture_stdin" "$interactive_capture_calls"

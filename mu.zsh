@@ -207,7 +207,7 @@ _mu_zsh_activate_scope() {
 _mu_zsh_append_history() {
   local input=$1
   local replay=${2:-}
-  local entry="true mu-history-v1 ${(qqq)input}"
+  local entry="true mu-history ${(qqq)input}"
   [[ -n "$replay" ]] && entry+="; $replay"
   print -sr -- "$entry"
 }
@@ -217,7 +217,7 @@ _mu_zsh_decode_history() {
   local -a words
   words=("${(z)entry}")
   (( ${#words[@]} >= 3 )) || return 1
-  [[ "${words[1]}" == true && "${words[2]}" == mu-history-v1 ]] || return 1
+  [[ "${words[1]}" == true && "${words[2]}" == mu-history ]] || return 1
   REPLY=${(Q)words[3]}
 }
 
@@ -1026,11 +1026,14 @@ _mu_zsh_run_slash_command() {
       _mu_zsh_activate_scope "$scope"
       _mu_zsh_require_effective_session "$command" || return 1
       session_id=$MU_ZSH_EFFECTIVE_SESSION_ID
+      local -a compact_command
+      compact_command=("$MU_ZSH_BIN" compact --session "$session_id")
+      [[ -n "$MU_ZSH_OUTPUT" ]] && compact_command+=(--output "$MU_ZSH_OUTPUT")
       if [[ -n "$instruction" ]]; then
-        print -rn -- "$instruction" | "$MU_ZSH_BIN" compact --session "$session_id"
+        print -rn -- "$instruction" | "${compact_command[@]}"
         exit_status=${pipestatus[2]}
       else
-        if "$MU_ZSH_BIN" compact --session "$session_id"; then
+        if "${compact_command[@]}"; then
           exit_status=0
         else
           exit_status=$?

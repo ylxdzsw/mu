@@ -120,7 +120,10 @@ written in an unsupported journal version are skipped with a warning.
 ### `mu transcript [-s <id>] [-o <format>] [--epoch <n>] [--html]`
 
 Replay a persisted session without contacting a provider, defaulting to the
-last selected session and `detail` output. `--html` emits a browser-viewable
+last selected session and configured output density. Configuration is loaded
+read-only and permissively: replay does not create a missing global config,
+load environment files, or require providers to pass runtime validation. With
+no config files, the bundled `concise` default applies. `--html` emits a browser-viewable
 xterm.js document whose pinned assets are loaded from jsDelivr when opened. The
 browser terminal keeps a centered 100-column width, scrolls horizontally on
 narrower viewports, and debounces vertical fitting while the page is resized.
@@ -157,9 +160,10 @@ Resume an interrupted turn, defaulting to `current-session`. It normalizes the
 interrupted tail, restores the submitted working directory, and continues
 without a new user prompt. A clean session is a no-op.
 
-### `mu compact [-s <id>]`
+### `mu compact [-s <id>] [-o <format>]`
 
-Force compaction for a session, defaulting to `current-session`. Non-terminal
+Force compaction for a session, defaulting to `current-session` and the
+configured output density. `--output` overrides configuration. Non-terminal
 stdin is an optional custom focus instruction.
 
 Compaction itself is a persisted synthetic agent turn. If it is interrupted,

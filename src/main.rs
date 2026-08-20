@@ -36,7 +36,7 @@ mod system_prompt;
 #[cfg(test)]
 use attachment::MAX_ATTACHMENT_BYTES;
 use attachment::load_attachments;
-use config::Config;
+use config::{Config, ConfigLoadMode};
 use models::ResolvedModelChoice;
 use provider::build_provider;
 use provider::{ContentPart, UserContent};
@@ -133,9 +133,9 @@ enum Command {
         #[arg(short = 's', long)]
         session: Option<String>,
 
-        /// Output density
-        #[arg(short = 'o', long, value_enum, default_value = "detail")]
-        output: OutputFormat,
+        /// Output density (overrides config)
+        #[arg(short = 'o', long, value_enum)]
+        output: Option<OutputFormat>,
 
         /// Emit a browser-viewable xterm.js document
         #[arg(long)]
@@ -166,6 +166,10 @@ enum Command {
     Compact {
         #[arg(short = 's', long)]
         session: Option<String>,
+
+        /// Output density (overrides config)
+        #[arg(short = 'o', long, value_enum)]
+        output: Option<OutputFormat>,
     },
 }
 
@@ -779,6 +783,9 @@ async fn run() -> Result<()> {
             html,
             epoch,
         }) => {
+            let config =
+                Config::load_for_scope(project_config_dir.as_deref(), ConfigLoadMode::Permissive)?;
+            let output = resolve_output(output, config.output);
             let store_path = scope.session_store_path();
             if !store_path.exists() {
                 return Err(session.as_deref().map_or_else(
@@ -789,15 +796,9 @@ async fn run() -> Result<()> {
             let store = store::Store::open(&store_path)?;
             let session = resolve_session_or_current(&store, session.as_deref())?;
             let events = store.transcript_events_for_epoch(&session.id, epoch)?;
-            let config = paths::global_dir()
-                .join("config.jsonc")
-                .exists()
-                .then(|| Config::load_for_scope(project_config_dir.as_deref()))
-                .and_then(Result::ok);
             let context_window = |model: &str| {
-                let config = config.as_ref()?;
-                let choice = models::resolve_model_choice(config, model).ok()?;
-                models::resolve_model_info(config, choice.active_model()).context_window
+                let choice = models::resolve_model_choice(&config, model).ok()?;
+                models::resolve_model_info(&config, choice.active_model()).context_window
             };
             if html {
                 let buffer = TranscriptBuffer::default();
@@ -822,7 +823,8 @@ async fn run() -> Result<()> {
             return Ok(());
         }
         Some(Command::Status(status_args)) => {
-            let config = Config::load_for_scope(project_config_dir.as_deref())?;
+            let config =
+                Config::load_for_scope(project_config_dir.as_deref(), ConfigLoadMode::Runtime)?;
             let store_path = scope.session_store_path();
             let store = if store_path.exists() {
                 store::Store::open(&store_path)?
@@ -901,7 +903,8 @@ async fn run() -> Result<()> {
         }
         Some(Command::Retry(retry_args)) => {
             ensure_subagent_turn_allowed(bash::subagent_depth_from_env())?;
-            let config = Config::load_for_scope(project_config_dir.as_deref())?;
+            let config =
+                Config::load_for_scope(project_config_dir.as_deref(), ConfigLoadMode::Runtime)?;
             let output = resolve_output(retry_args.output, config.output);
             set_resolved_output(output);
 
@@ -953,9 +956,12 @@ async fn run() -> Result<()> {
 
             return Ok(());
         }
-        Some(Command::Compact { session }) => {
+        Some(Command::Compact { session, output }) => {
             let custom_focus = load_optional_stdin_instruction()?;
-            let config = Config::load_for_scope(project_config_dir.as_deref())?;
+            let config =
+                Config::load_for_scope(project_config_dir.as_deref(), ConfigLoadMode::Runtime)?;
+            let output = resolve_output(output, config.output);
+            set_resolved_output(output);
             let store_path = scope.session_store_path();
             if !store_path.join("sessions").exists() {
                 return Err(session.as_deref().map_or_else(
@@ -967,13 +973,13 @@ async fn run() -> Result<()> {
             let session_state = resolve_session_or_current(&store, session.as_deref())?;
             let session = session_state.id.clone();
             let model = resolve_session_model(&store, &config, &session_state)?;
-            let _lock = acquire_session_lock_or_exit(&store, &session, OutputFormat::Detail)?;
+            let _lock = acquire_session_lock_or_exit(&store, &session, output)?;
             if store.pending_compaction(&session)?.is_some() {
                 bail!("session compaction is incomplete; run `mu retry -s {session}`")
             }
             store.normalize_interrupted_tail(&session)?;
             if !store.has_user_turn(&session)? {
-                Renderer::with_terminal_bell(OutputFormat::Detail, None)
+                Renderer::with_terminal_bell(output, None)
                     .notice("[mu] compaction inapplicable: session has no conversation history")?;
                 return Ok(());
             }
@@ -983,7 +989,7 @@ async fn run() -> Result<()> {
                 store: &store,
                 session_id: &session,
                 model,
-                output: OutputFormat::Detail,
+                output,
                 preamble_notice: None,
                 model_fallback: None,
                 mode: RunTurnMode::ManualCompaction(custom_focus.as_deref()),
@@ -995,7 +1001,7 @@ async fn run() -> Result<()> {
     }
 
     ensure_subagent_turn_allowed(bash::subagent_depth_from_env())?;
-    let config = Config::load_for_scope(project_config_dir.as_deref())?;
+    let config = Config::load_for_scope(project_config_dir.as_deref(), ConfigLoadMode::Runtime)?;
     let output = resolve_output(default_turn.output, config.output);
     set_resolved_output(output);
     let prompt_source = resolve_prompt_source(prompt_file, &scope)?;
@@ -1520,14 +1526,18 @@ mod tests {
         let compact = Args::try_parse_from(["mu", "compact"]).unwrap();
         assert!(matches!(
             compact.command,
-            Some(Command::Compact { session: None })
+            Some(Command::Compact {
+                session: None,
+                output: None,
+            })
         ));
         let selected_compact =
-            Args::try_parse_from(["mu", "compact", "-s", "ses_example"]).unwrap();
+            Args::try_parse_from(["mu", "compact", "-s", "ses_example", "-o", "full"]).unwrap();
         assert!(matches!(
             selected_compact.command,
             Some(Command::Compact {
                 session: Some(ref session),
+                output: Some(OutputFormat::Full),
             }) if session == "ses_example"
         ));
 
@@ -1537,10 +1547,15 @@ mod tests {
             transcript.command,
             Some(Command::Transcript {
                 session: Some(ref session),
-                output: OutputFormat::Full,
+                output: Some(OutputFormat::Full),
                 html: false,
                 epoch: None,
             }) if session == "ses_example"
+        ));
+        let transcript_default = Args::try_parse_from(["mu", "transcript"]).unwrap();
+        assert!(matches!(
+            transcript_default.command,
+            Some(Command::Transcript { output: None, .. })
         ));
 
         assert!(Args::try_parse_from(["mu", "session", "list"]).is_err());

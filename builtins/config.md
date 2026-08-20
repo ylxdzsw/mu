@@ -47,6 +47,10 @@ from bundled defaults; bundled providers are used only to create a missing
 global config. Objects merge recursively across scopes; scalars and arrays
 replace inherited values.
 
+`mu transcript` is a read-only exception: it does not create a missing global
+config or load `.env` files, and provider validation errors do not prevent it
+from using settings such as `output`.
+
 Complete shape, with default values where applicable:
 
 ```jsonc
@@ -70,9 +74,9 @@ Complete shape, with default values where applicable:
   "terminal_bell": { "enabled": true, "min_duration_ms": 10000 },
   "compaction": {
     "enabled": true,
-    "soft_fraction": 0.70,
-    "hard_fraction": 0.85,
-    "hard_headroom_tokens": 48000
+    "soft_fraction": 0.80,
+    "hard_fraction": 0.90,
+    "hard_headroom_tokens": 32000
   },
   "limits": {
     "max_lines": 2000,

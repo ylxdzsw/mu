@@ -197,16 +197,19 @@ mu transcript --session ses_... --epoch 2
 ```
 
 Terminal replay uses the same Markdown and Bash renderer as a live turn;
-redirected output is ANSI-free. Each user turn includes a synthesized shell
-status line with its requested model, recorded cwd, and historical context
-percentage when the model remains configured. HTML export is a single file
+redirected output is ANSI-free. Transcript replay reads configuration without
+creating a missing global config or validating providers for runtime use. It
+uses the configured output density, defaulting to bundled `concise`; pass `-o`
+to override it. Each user turn includes a synthesized shell status line with its
+requested model, recorded cwd, and historical context percentage when that
+model remains configured. HTML export is a single file
 containing the terminal transcript and loads pinned xterm.js assets from
 jsDelivr when opened. The browser terminal keeps a centered 100-column width,
 scrolls horizontally on narrower viewports, and debounces vertical fitting
 while the page is resized. Its scrollbars use a thin dark theme instead of
 the browser default.
-`mu compact` compacts the current session; pass `-s <id>` to select another
-session in the active scope.
+`mu compact` compacts the current session using the configured output density;
+pass `-s <id>` to select another session or `-o <format>` to override output.
 
 ## How it works
 
@@ -378,13 +381,14 @@ runtime state it needs. Use `mu init` when you explicitly want a local
 configuration scaffold, and keep project-specific guidance in `AGENTS.md` or
 `.mu` instruction files.
 
-Mu keeps one append-only version-3 JSONL journal per session under
+Mu keeps one append-only version-4 JSONL journal per session under
 `<scope>/.mu/sessions/`, with content-addressed attachment and provider objects
 under `<scope>/.mu/objects/`. `current-session` points to the last session
 selected in that scope, so `-c/--continue` and bare `mu retry` do not scan every
 session. Assistant reasoning, text blocks, and Bash calls retain their provider
-block order in new journals and transcript replay. Mu reads only journal version
-3 and never migrates session files; version-2 journals are unsupported.
+block order in new journals and transcript replay. Bash result text is stored
+inline while binary attachments remain content-addressed. Mu reads only journal
+version 4 and never migrates session files; version-3 journals are unsupported.
 Explicitly selected incompatible sessions fail; listings skip them with a warning, and an
 incompatible `current-session` is ignored with a warning when a new session can
 be created instead. Each active session journal is guarded by a nonblocking
