@@ -53,6 +53,7 @@ Complete shape, with default values where applicable:
 {
   "output": "concise",            // final | concise | detail | full
   "auto_resume": false,           // continue replayable incomplete responses
+  "soft_interrupt": true,         // Ctrl+\\ finishes active work, then stops
   "providers": {
     "openai": {
       "endpoint": "https://api.openai.com/v1/responses", // HTTP(S) URL or http+unix URI

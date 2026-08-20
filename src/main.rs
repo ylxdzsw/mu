@@ -1320,6 +1320,11 @@ async fn run_turn(args: RunTurnArgs<'_>) -> Result<()> {
 
     match &result {
         Ok(r) => {
+            if r.soft_interrupted {
+                renderer.finish_turn()?;
+                renderer.soft_interrupt_complete(r.skipped_bash_calls)?;
+                return Ok(());
+            }
             let ctx_pct = r.context_window.map(|cw| {
                 (
                     (r.context_tokens as f64 / cw as f64) * 100.0,

@@ -59,6 +59,8 @@ pub struct TurnResult {
     pub context_window: Option<u64>,
     pub final_assistant: Option<String>,
     pub awaiting_user: bool,
+    pub soft_interrupted: bool,
+    pub skipped_bash_calls: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -188,6 +190,8 @@ impl<'a> AgentLoop<'a> {
                     context_window: self.model_context_window,
                     final_assistant: Some(summary),
                     awaiting_user: mode == CompactionMode::AwaitUser,
+                    soft_interrupted: false,
+                    skipped_bash_calls: 0,
                 }
             } else {
                 self.run_turn_inner(&mut String::new(), NextRequest::Continue)
@@ -232,7 +236,7 @@ impl<'a> AgentLoop<'a> {
         mut next_request: NextRequest,
     ) -> Result<TurnResult> {
         bash::reset_cancellation_state();
-        bash::install_signal_forwarder();
+        bash::install_signal_forwarder(self.config.soft_interrupt);
         let mut guardrail = if self.config.guardrail.enabled {
             Some(Guardrail::new(self.config, self.model.active_model()))
         } else {
@@ -255,7 +259,13 @@ impl<'a> AgentLoop<'a> {
 
         let mut live_provider_retries = 0;
         loop {
+            if bash::soft_interrupt_requested() {
+                return self.soft_interrupt_result(total_usage);
+            }
             let (exchange_id, stream_result, mut command_headers) = 'request_gate: loop {
+                if bash::soft_interrupt_requested() {
+                    return self.soft_interrupt_result(total_usage);
+                }
                 if active_compaction.is_none() && next_request == NextRequest::ToolResults {
                     let before = self.current_context_tokens()?;
                     if compaction::should_compact(
@@ -364,6 +374,9 @@ impl<'a> AgentLoop<'a> {
                         recipe,
                         RequestSubject::Agent,
                     )?;
+                    if bash::soft_interrupt_requested() {
+                        return self.soft_interrupt_result(total_usage);
+                    }
                     let reviews_destructive = guardrail
                         .as_ref()
                         .is_some_and(|guardrail| guardrail.should_review(BashRisk::Destructive));
@@ -609,6 +622,18 @@ impl<'a> AgentLoop<'a> {
             current_partial_output.clear();
             context.push(accepted_message.clone());
 
+            if bash::soft_interrupt_requested()
+                && stream_result.finish_reason == FinishReason::ToolCalls
+            {
+                let calls = accepted_message
+                    .assistant_tool_calls()
+                    .into_iter()
+                    .cloned()
+                    .collect::<Vec<_>>();
+                let skipped = self.skip_bash_calls(&calls, &bash_call_ids, &mut context)?;
+                return self.soft_interrupt_result_with_skipped(total_usage, skipped);
+            }
+
             match stream_result.finish_reason {
                 FinishReason::Stop => {
                     if let Some(state) = active_compaction.take() {
@@ -626,6 +651,9 @@ impl<'a> AgentLoop<'a> {
                             awaiting_user = true;
                             break;
                         }
+                        if bash::soft_interrupt_requested() {
+                            return self.soft_interrupt_result(total_usage);
+                        }
                         next_request = NextRequest::Continue;
                         continue;
                     } else {
@@ -641,6 +669,9 @@ impl<'a> AgentLoop<'a> {
                     break;
                 }
                 FinishReason::Resume => {
+                    if bash::soft_interrupt_requested() {
+                        return self.soft_interrupt_result(total_usage);
+                    }
                     let retry_limit = provider_retry_limit(&self.model);
                     if live_provider_retries >= retry_limit {
                         let reason =
@@ -673,6 +704,14 @@ impl<'a> AgentLoop<'a> {
                     while cursor < tool_calls.len() {
                         if bash::cancellation_requested() {
                             bail!("turn interrupted");
+                        }
+                        if bash::soft_interrupt_requested() {
+                            let skipped = self.skip_bash_calls(
+                                &tool_calls[cursor..],
+                                &bash_call_ids[cursor..],
+                                &mut context,
+                            )?;
+                            return self.soft_interrupt_result_with_skipped(total_usage, skipped);
                         }
                         let args = parse_tool_args(&tool_calls[cursor])?;
                         let concurrent =
@@ -727,6 +766,17 @@ impl<'a> AgentLoop<'a> {
                                     let assessment = match assessment_result {
                                         Ok(assessment) => assessment,
                                         Err(error) => {
+                                            if bash::soft_interrupt_requested() {
+                                                let skipped = self.skip_bash_calls(
+                                                    &tool_calls[cursor..],
+                                                    &bash_call_ids[cursor..],
+                                                    &mut context,
+                                                )?;
+                                                return self.soft_interrupt_result_with_skipped(
+                                                    total_usage,
+                                                    skipped,
+                                                );
+                                            }
                                             let message =
                                                 format!("guardrail review failed: {error}");
                                             self.persist_bash_result(
@@ -786,6 +836,15 @@ impl<'a> AgentLoop<'a> {
                                 }
                             }
 
+                            if bash::soft_interrupt_requested() {
+                                let skipped = self.skip_bash_calls(
+                                    &tool_calls[cursor..],
+                                    &bash_call_ids[cursor..],
+                                    &mut context,
+                                )?;
+                                return self
+                                    .soft_interrupt_result_with_skipped(total_usage, skipped);
+                            }
                             self.renderer.tool_start(&args, header_already_rendered)?;
                             let started = Instant::now();
 
@@ -809,6 +868,15 @@ impl<'a> AgentLoop<'a> {
                                 true,
                             )?;
                             cursor += 1;
+                            if bash::soft_interrupt_requested() {
+                                let skipped = self.skip_bash_calls(
+                                    &tool_calls[cursor..],
+                                    &bash_call_ids[cursor..],
+                                    &mut context,
+                                )?;
+                                return self
+                                    .soft_interrupt_result_with_skipped(total_usage, skipped);
+                            }
                             continue;
                         }
 
@@ -842,6 +910,18 @@ impl<'a> AgentLoop<'a> {
                             if bash::cancellation_requested() {
                                 bail!("turn interrupted");
                             }
+                            if bash::soft_interrupt_requested() {
+                                let completed = cursor
+                                    + chunk_offset * bash::MAX_ACTIVE_PROCESS_GROUPS
+                                    + chunk.len();
+                                let skipped = self.skip_bash_calls(
+                                    &tool_calls[completed..],
+                                    &bash_call_ids[completed..],
+                                    &mut context,
+                                )?;
+                                return self
+                                    .soft_interrupt_result_with_skipped(total_usage, skipped);
+                            }
                         }
                         cursor = end;
                     }
@@ -869,7 +949,59 @@ impl<'a> AgentLoop<'a> {
             context_window: self.model_context_window,
             final_assistant,
             awaiting_user,
+            soft_interrupted: false,
+            skipped_bash_calls: 0,
         })
+    }
+
+    fn soft_interrupt_result(&mut self, usage: Usage) -> Result<TurnResult> {
+        self.soft_interrupt_result_with_skipped(usage, 0)
+    }
+
+    fn soft_interrupt_result_with_skipped(
+        &mut self,
+        usage: Usage,
+        skipped_bash_calls: usize,
+    ) -> Result<TurnResult> {
+        let context = self.current_context_estimate()?;
+        Ok(TurnResult {
+            usage,
+            context_tokens: context.tokens,
+            context_estimated: !context.reported,
+            context_window: self.model_context_window,
+            final_assistant: None,
+            awaiting_user: false,
+            soft_interrupted: true,
+            skipped_bash_calls,
+        })
+    }
+
+    fn skip_bash_calls(
+        &mut self,
+        calls: &[ToolCall],
+        bash_call_ids: &[i64],
+        context: &mut Vec<Message>,
+    ) -> Result<usize> {
+        for (call, bash_call_id) in calls.iter().zip(bash_call_ids) {
+            let output = bash::SOFT_INTERRUPT_SKIPPED_OUTPUT.to_string();
+            self.store.persist_bash_result(
+                self.session_id,
+                BashResultRecord {
+                    bash_call_id: *bash_call_id,
+                    outcome: "error",
+                    exit_code: None,
+                    duration_ms: Some(0),
+                },
+                &output,
+                &[],
+            )?;
+            context.push(Message::Tool {
+                content: output,
+                attachments: Vec::new(),
+                tool_call_id: call.id.clone(),
+            });
+        }
+        Ok(calls.len())
     }
 
     /// Load the full completed-message history, including the persisted leading
@@ -2177,6 +2309,7 @@ mod tests {
             )]),
             output: Default::default(),
             auto_resume: false,
+            soft_interrupt: crate::config::bundled_test_default("/soft_interrupt"),
             compaction: CompactionConfig::default(),
             limits: LimitsConfig::default(),
             guardrail: GuardrailConfig::default(),

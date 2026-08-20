@@ -169,6 +169,7 @@ pub struct Config {
     pub providers: OrderedMap<ProviderConfig>,
     pub output: OutputFormat,
     pub auto_resume: bool,
+    pub soft_interrupt: bool,
     pub compaction: CompactionConfig,
     pub limits: LimitsConfig,
     pub guardrail: GuardrailConfig,
@@ -646,7 +647,7 @@ fn merge_json(base: &mut serde_json::Value, overlay: serde_json::Value) {
 const DEFAULT_CONFIG: &str = include_str!("default_config.jsonc");
 
 #[cfg(test)]
-fn bundled_test_default<T>(pointer: &str) -> T
+pub(crate) fn bundled_test_default<T>(pointer: &str) -> T
 where
     T: serde::de::DeserializeOwned,
 {
@@ -715,6 +716,7 @@ mod tests {
             )]),
             output: OutputFormat::Detail,
             auto_resume: false,
+            soft_interrupt: bundled_test_default("/soft_interrupt"),
             compaction: CompactionConfig::default(),
             limits: LimitsConfig::default(),
             guardrail: GuardrailConfig::default(),

@@ -3,6 +3,8 @@
   "output": "concise",
   // Automatically continue replayable incomplete assistant responses.
   "auto_resume": false,
+  // Catch Ctrl+\\ as a soft interrupt instead of the terminal's default SIGQUIT.
+  "soft_interrupt": true,
   // Providers and models, in default and fallback order.
   "providers": {
     // Default provider: OpenCode Zen's free DeepSeek and Mimo models. They need

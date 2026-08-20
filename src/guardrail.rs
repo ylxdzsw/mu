@@ -143,7 +143,7 @@ impl Guardrail {
         session_id: &str,
         bash_call_id: i64,
     ) -> anyhow::Result<Assessment> {
-        bash::install_signal_forwarder();
+        bash::install_signal_forwarder(self.runtime.soft_interrupt);
         let mut model = match self.config.review_model.as_deref() {
             Some(model_ref) => resolve_model_choice(&self.runtime, model_ref)?,
             None => resolve_model_choice(&self.runtime, &self.active_model.canonical)?,
@@ -167,6 +167,9 @@ impl Guardrail {
         let mut provider_retries = 0;
 
         loop {
+            if bash::soft_interrupt_requested() {
+                anyhow::bail!("soft interrupt requested");
+            }
             attempt += 1;
             let request_model = model.active_model().clone();
             let epoch = store.context_epoch(session_id)?;
@@ -691,6 +694,7 @@ mod tests {
                 providers: Default::default(),
                 output: Default::default(),
                 auto_resume: false,
+                soft_interrupt: crate::config::bundled_test_default("/soft_interrupt"),
                 compaction: crate::config::CompactionConfig::default(),
                 limits: crate::config::LimitsConfig::default(),
                 guardrail: GuardrailConfig::default(),
@@ -725,6 +729,7 @@ mod tests {
                 providers: Default::default(),
                 output: Default::default(),
                 auto_resume: false,
+                soft_interrupt: crate::config::bundled_test_default("/soft_interrupt"),
                 compaction: crate::config::CompactionConfig::default(),
                 limits: crate::config::LimitsConfig::default(),
                 guardrail: GuardrailConfig::default(),
@@ -850,6 +855,7 @@ mod tests {
             )]),
             output: Default::default(),
             auto_resume: false,
+            soft_interrupt: crate::config::bundled_test_default("/soft_interrupt"),
             compaction: crate::config::CompactionConfig::default(),
             limits: crate::config::LimitsConfig::default(),
             guardrail: GuardrailConfig {

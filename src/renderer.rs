@@ -77,6 +77,7 @@ pub struct Renderer {
     reasoning_run_started: Option<Instant>,
     reasoning_run_title: Option<String>,
     bash_preview: Option<BashPreviewState>,
+    soft_interrupt_line_preserved: bool,
     concise_tool: Option<ConciseToolState>,
     last_committed_was_tool: bool,
     turn_done_bell_min_duration: Option<Duration>,
@@ -211,6 +212,7 @@ impl Renderer {
             reasoning_run_started: None,
             reasoning_run_title: None,
             bash_preview: None,
+            soft_interrupt_line_preserved: false,
             concise_tool: None,
             last_committed_was_tool: false,
             turn_done_bell_min_duration,
@@ -919,6 +921,15 @@ impl Renderer {
         Ok(())
     }
 
+    pub fn soft_interrupt_complete(&mut self, skipped: usize) -> io::Result<()> {
+        let suffix = match skipped {
+            0 => String::new(),
+            1 => " · 1 Bash command skipped".to_string(),
+            count => format!(" · {count} Bash commands skipped"),
+        };
+        self.notice(&format!("[mu] soft-interrupted{suffix}"))
+    }
+
     pub fn compaction_trigger(
         &mut self,
         trigger: CompactionTrigger,
@@ -1186,7 +1197,13 @@ impl Renderer {
             return Ok(());
         }
         if self.live_line_rendered {
-            self.stdout.write_all(b"\r\x1b[2K")?;
+            if self.preserve_soft_interrupt_line() {
+                self.stdout.write_all(b"\n")?;
+                self.stdout_at_line_start = true;
+                self.trailing_newlines = self.trailing_newlines.saturating_add(1);
+            } else {
+                self.stdout.write_all(b"\r\x1b[2K")?;
+            }
         } else if matches!(
             self.live_line,
             Some(
@@ -1212,12 +1229,30 @@ impl Renderer {
 
     fn clear_live_line(&mut self) -> io::Result<()> {
         if self.live_line_rendered {
-            self.stdout.write_all(b"\r\x1b[2K")?;
+            if self.preserve_soft_interrupt_line() {
+                self.stdout.write_all(b"\n")?;
+                self.stdout_at_line_start = true;
+                self.trailing_newlines = self.trailing_newlines.saturating_add(1);
+            } else {
+                self.stdout.write_all(b"\r\x1b[2K")?;
+            }
             self.stdout_at_line_start = true;
             self.stdout.flush()?;
             self.live_line_rendered = false;
         }
         Ok(())
+    }
+
+    fn preserve_soft_interrupt_line(&mut self) -> bool {
+        if self.soft_interrupt_line_preserved {
+            return false;
+        }
+        if crate::bash::soft_interrupt_requested() {
+            self.soft_interrupt_line_preserved = true;
+            true
+        } else {
+            false
+        }
     }
 
     fn format_live_line(&self) -> Option<String> {

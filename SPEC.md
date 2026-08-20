@@ -237,6 +237,13 @@ and terminates every active Bash process group. Mu drains available output and
 persists results for calls that began. Incomplete assistant streams do not enter
 semantic history.
 
+When `soft_interrupt` is enabled, `SIGQUIT` requests a soft interrupt instead:
+the active provider request and Bash calls are allowed to finish, Bash claims
+that have not started receive an explicit skipped error result, and Mu starts
+no further provider request or Bash call. The terminal's normal `^\\` echo is
+the receipt acknowledgement; Mu emits only the final soft-interrupt outcome.
+When disabled, Mu does not install a `SIGQUIT` handler.
+
 The next invocation normalizes unmatched requests and result-less Bash claims
 before continuing. A new prompt may redirect the work; `mu retry` continues the
 interrupted turn without adding a new prompt.
@@ -396,6 +403,9 @@ The plugins provide the same product contract:
   prompt without creating a turn.
 - Ctrl-C cancels an edited draft or interrupts the foreground Mu process using
   ordinary shell signal behavior.
+- Ctrl-\\ requests a soft interrupt when `soft_interrupt` is enabled: active
+  work finishes, pending Bash calls are skipped, and the turn stops before new
+  work. The terminal's `^\\` is the immediate acknowledgement.
 - Ctrl-D retains normal shell EOF behavior.
 - Up/Down navigate within multiline input and then browse Mu-tagged shell
   history without mixing ordinary commands. Recalled prompts run with the
@@ -669,7 +679,7 @@ silently merge into an existing one.
 [`src/default_config.jsonc`](src/default_config.jsonc) is the source of truth
 for field defaults. The durable field groups are:
 
-- `output` and `auto_resume`;
+- `output`, `auto_resume`, and `soft_interrupt`;
 - ordered `providers`, each with `endpoint`, optional `api_key_env`, and
   ordered `models`;
 - per-model `context_window`, optional `supported_efforts`, and optional

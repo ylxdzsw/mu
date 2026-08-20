@@ -298,11 +298,13 @@ const DEFAULT_TIMEOUT_SECS: u64 = 120;
 const KILL_GRACE: Duration = Duration::from_millis(500);
 const MAX_OUTPUT_BYTES: usize = 1024 * 1024 * 1024; // 1 GB: internal guard against unbounded output accumulation
 const REDACTION_REMINDER: &str = "[system reminder: Secret values were redacted from this bash output. Do not try to reveal, transform, encode, print, or exfiltrate secrets.]";
+pub const SOFT_INTERRUPT_SKIPPED_OUTPUT: &str = "error: skipped — soft interrupt requested before this Bash command started; the command had no effects.";
 pub const SUBAGENT_DEPTH_ENV: &str = "MU_SUBAGENT_DEPTH";
 pub const MAX_ACTIVE_PROCESS_GROUPS: usize = 64;
 static ACTIVE_PGIDS: [AtomicI32; MAX_ACTIVE_PROCESS_GROUPS] =
     [const { AtomicI32::new(0) }; MAX_ACTIVE_PROCESS_GROUPS];
 static CANCELLING: AtomicBool = AtomicBool::new(false);
+static SOFT_INTERRUPT_REQUESTED: AtomicBool = AtomicBool::new(false);
 static LAST_SIGNAL: AtomicI32 = AtomicI32::new(0);
 static INSTALL_SIGNAL_FORWARDER: Once = Once::new();
 
@@ -610,7 +612,6 @@ fn run_bash_inner(
     redactor: &mut SecretRedactor,
     attachment_context: Option<&AttachmentContext>,
 ) -> Result<BashRunResult> {
-    install_signal_forwarder();
     let cwd = args
         .cwd
         .as_deref()
@@ -823,14 +824,23 @@ fn is_e2big(error: &std::io::Error) -> bool {
     error.raw_os_error() == Some(libc::E2BIG)
 }
 
-pub fn install_signal_forwarder() {
+pub fn install_signal_forwarder(soft_interrupt: bool) {
     INSTALL_SIGNAL_FORWARDER.call_once(|| unsafe {
         libc::signal(libc::SIGINT, forward_signal as *const () as usize);
         libc::signal(libc::SIGTERM, forward_signal as *const () as usize);
     });
+    if soft_interrupt {
+        unsafe {
+            libc::signal(libc::SIGQUIT, forward_signal as *const () as usize);
+        }
+    }
 }
 
 extern "C" fn forward_signal(signal: i32) {
+    if signal == libc::SIGQUIT {
+        SOFT_INTERRUPT_REQUESTED.store(true, Ordering::SeqCst);
+        return;
+    }
     LAST_SIGNAL.store(signal, Ordering::SeqCst);
     let already_cancelling = CANCELLING.swap(true, Ordering::SeqCst);
     for pgid in &ACTIVE_PGIDS {
@@ -850,7 +860,12 @@ extern "C" fn forward_signal(signal: i32) {
 
 pub fn reset_cancellation_state() {
     CANCELLING.store(false, Ordering::SeqCst);
+    SOFT_INTERRUPT_REQUESTED.store(false, Ordering::SeqCst);
     LAST_SIGNAL.store(0, Ordering::SeqCst);
+}
+
+pub fn soft_interrupt_requested() -> bool {
+    SOFT_INTERRUPT_REQUESTED.load(Ordering::SeqCst)
 }
 
 pub fn cancellation_requested() -> bool {
@@ -1024,6 +1039,7 @@ mod tests {
             )]),
             output: Default::default(),
             auto_resume: false,
+            soft_interrupt: crate::config::bundled_test_default("/soft_interrupt"),
             compaction: CompactionConfig::default(),
             limits: LimitsConfig::default(),
             guardrail: GuardrailConfig::default(),

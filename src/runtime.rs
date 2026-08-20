@@ -602,6 +602,7 @@ mod tests {
             ]),
             output: Default::default(),
             auto_resume: false,
+            soft_interrupt: crate::config::bundled_test_default("/soft_interrupt"),
             compaction: CompactionConfig::default(),
             limits: LimitsConfig::default(),
             guardrail: GuardrailConfig::default(),
