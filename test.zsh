@@ -95,7 +95,7 @@ if [[ "$1" == "status" ]]; then
   [[ -n "$session" ]] && session_json="\"$session\""
   model_json="\"model\":{\"provider_id\":\"$provider\",\"model_id\":\"$model_id\",\"effort\":null,\"canonical\":\"$model\"},\"session_id\":$session_json"
   if (( include_models )); then
-    print -r -- "{$model_json,\"output\":\"concise\",\"context_tokens\":25,\"context_window\":100,\"project_root\":\"$MU_ZSH_TEST_PROJECT_ROOT\",\"available_models\":{\"providers\":[{\"id\":\"local\",\"models\":[{\"id\":\"local/solo\",\"model_id\":\"solo\",\"supported_efforts\":[\"max\"]},{\"id\":\"local/shared\",\"model_id\":\"shared\",\"supported_efforts\":[\"low\"]}]},{\"id\":\"openai\",\"models\":[{\"id\":\"openai/gpt\",\"model_id\":\"gpt\",\"supported_efforts\":[\"provider-custom\",\"high\",\"minimum\",\"low\",\"max\",\"medium\",\"xhigh\"]},{\"id\":\"openai/gpt-5.6-luna\",\"model_id\":\"gpt-5.6-luna\",\"supported_efforts\":[\"none\",\"max\"]},{\"id\":\"openai/shared\",\"model_id\":\"shared\",\"supported_efforts\":[\"medium\"]}]}]}}"
+    print -r -- "{$model_json,\"output\":\"concise\",\"context_tokens\":25,\"context_window\":100,\"project_root\":\"$MU_ZSH_TEST_PROJECT_ROOT\",\"available_models\":{\"providers\":[{\"id\":\"local\",\"models\":[{\"id\":\"local/solo\",\"model_id\":\"solo\",\"supported_efforts\":[\"max\"]},{\"id\":\"local/shared\",\"model_id\":\"shared\",\"supported_efforts\":[\"low\"]}]},{\"id\":\"openai\",\"models\":[{\"id\":\"openai/gpt\",\"model_id\":\"gpt\",\"supported_efforts\":[\"provider-custom\",\"high\",\"minimal\",\"low\",\"max\",\"medium\",\"xhigh\"]},{\"id\":\"openai/gpt-5.6-luna\",\"model_id\":\"gpt-5.6-luna\",\"supported_efforts\":[\"none\",\"max\"]},{\"id\":\"openai/shared\",\"model_id\":\"shared\",\"supported_efforts\":[\"medium\"]}]}]}}"
   elif (( include_commands )); then
     print -r -- "{$model_json,\"output\":\"concise\",\"context_tokens\":25,\"context_window\":100,\"project_root\":\"$MU_ZSH_TEST_PROJECT_ROOT\",\"commands\":[{\"name\":\"review.md\",\"path\":\"$MU_ZSH_TEST_PROJECT_ROOT/.mu/review.md\",\"scope\":\"project\"}]}"
   else
@@ -441,7 +441,7 @@ model_candidates=("${(@f)$(_mu_zsh_model_completion_candidates "gpt")}")
 [[ " ${(j: :)model_candidates} " == *" gpt "* ]] || fail "keeps all base models available for zsh matching"
 [[ " ${(j: :)model_candidates} " != *":high "* ]] || fail "does not show variants until colon"
 effort_suffixes=("${(@f)$(_mu_zsh_model_completion_candidates "gpt" 1)}")
-[[ "${(j:,:)effort_suffixes}" == ":minimum,:low,:medium,:high,:xhigh,:max,:provider-custom" ]] ||
+[[ "${(j:,:)effort_suffixes}" == ":minimal,:low,:medium,:high,:xhigh,:max,:provider-custom" ]] ||
   fail "sorts recognized exact-model efforts by strength and leaves custom efforts last: ${(j:,:)effort_suffixes}"
 qualified_effort_suffixes=("${(@f)$(_mu_zsh_model_completion_candidates "openai/gpt" 1)}")
 [[ "${(j:,:)qualified_effort_suffixes}" == "${(j:,:)effort_suffixes}" ]] ||
@@ -467,7 +467,7 @@ BUFFER="/model gpt:"
 CURSOR=${#BUFFER}
 _mu_zsh_fallback_completion
 unfunction compadd
-for effort in minimum low medium high xhigh max provider-custom; do
+for effort in minimal low medium high xhigh max provider-custom; do
   [[ ",$captured_compadd_calls[1]," == *",$effort,"* ]] ||
     fail "exact-model effort menu includes $effort"
 done

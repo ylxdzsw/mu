@@ -486,7 +486,9 @@ _mu_zsh_model_completion_candidates() {
       reduce .[] as $item ([]; if index($item) then . else . + [$item] end);
     def effort_rank:
       . as $effort
-      | (["minimum", "low", "medium", "high", "xhigh", "max"] | index($effort)) // 6;
+      | if $effort == "minimal" or $effort == "minimum" then 0
+        else ((["low", "medium", "high", "xhigh", "max"] | index($effort)) // 5) + 1
+        end;
     [.available_models.providers[]?.models[]? | {
       canonical: (.id // ""),
       short: (.model_id // ""),
@@ -538,7 +540,9 @@ _mu_zsh_model_completion_transition() {
         reduce .[] as $item ([]; if index($item) then . else . + [$item] end);
       def effort_rank:
         . as $effort
-        | (["minimum", "low", "medium", "high", "xhigh", "max"] | index($effort)) // 6;
+        | if $effort == "minimal" or $effort == "minimum" then 0
+          else ((["low", "medium", "high", "xhigh", "max"] | index($effort)) // 5) + 1
+          end;
       [.available_models.providers[]?.models[]? | {
         canonical: (.id // ""),
         short: (.model_id // ""),

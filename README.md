@@ -100,7 +100,7 @@ Type `/` to list prompt-mode commands. The common ones:
 - `/model` selects a configured model for later turns in this shell scope.
   Completing an unambiguous model appends a temporary `:` and lists its effort
   variants; type an effort prefix directly, or press Enter to select the model
-  without an effort. In zsh, recognized efforts are ordered from `minimum`
+  without an effort. In zsh, recognized efforts are ordered from `minimal`
   through `max`.
 - `/attach <file>` adds an image or audio file to the next turn.
 - `/retry` resumes a turn interrupted by Ctrl-C, a crash, a lost connection, or
