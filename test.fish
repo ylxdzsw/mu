@@ -42,12 +42,12 @@ set -g fish_history mu_fish_test_(random)
 
 source "$TEST_ROOT/mu.fish"
 
-assert_equal "$MU_FISH_MODE" shell 'starts in shell mode'
+assert_equal "$_MU_FISH_MODE" shell 'starts in shell mode'
 assert_equal (_mu_fish_current_scope) "project:$TEST_ROOT" 'discovers repository scope'
 set history_input (printf 'first line\nsecond $HOME `tick` "quoted"' | string collect)
-_mu_fish_history_entry "$history_input"
-_mu_fish_decode_history "$_MU_FISH_HISTORY_ENTRY; printf replay"; or fail 'decodes tagged Fish history'
-assert_equal "$_MU_FISH_DECODED_HISTORY" "$history_input" 'tagged Fish history preserves multiline shell-special input'
+set history_entry "$(_mu_fish_history_entry "$history_input")"
+set decoded_history "$(_mu_fish_decode_history "$history_entry; printf replay")"; or fail 'decodes tagged Fish history'
+assert_equal "$decoded_history" "$history_input" 'tagged Fish history preserves multiline shell-special input'
 _mu_fish_decode_history 'mu status'; and fail 'ordinary shell history must not decode as Mu input'
 
 set project_a "$TEST_TMPDIR/project-a"
@@ -130,8 +130,7 @@ set -gx TEST_CAPTURE_ARGS "$capture_args"
 set -gx TEST_CAPTURE_STDIN "$capture_stdin"
 set -gx TEST_CAPTURE_CALLS "$capture_calls"
 set -gx TEST_CAPTURE_SESSION_ARGS "$capture_session_args"
-set -g MU_FISH_BIN "$fake_bin/mu"
-set -g MU_FISH_OUTPUT detail
+set -gx PATH "$fake_bin" $PATH
 
 set prompt (_mu_fish_build_mode_prompt | string collect)
 assert_contains "$prompt" local/test 'prompt shows model'
@@ -141,41 +140,36 @@ string match -q '*75%*' -- "$prompt"; and fail 'fresh prompt should omit context
 string replace -q '[to compact]' '' -- "$prompt"; and fail 'fresh prompt should omit compaction marker'
 
 set -g MU_FISH_SESSION_ID ses_0000000a
-set -g MU_FISH_TRACKED_SCOPE (_mu_fish_current_scope)
-_mu_fish_sync_state
+set -g _MU_FISH_TRACKED_SCOPE (_mu_fish_current_scope)
 set prompt (_mu_fish_build_mode_prompt | string collect)
 assert_contains "$prompt" '~75%' 'session prompt marks estimated context'
 string replace -q '[to compact]' '' -- "$prompt"; or fail 'session prompt marks pending compaction'
 
 set command (_mu_fish_base_command)
-assert_equal (string join \x1e -- $command) (string join \x1e -- "$fake_bin/mu" --output detail -s ses_0000000a) 'builds active turn command'
+assert_equal (string join \x1e -- $command) (string join \x1e -- mu -s ses_0000000a) 'builds active turn command'
 
 set attachment "$TEST_TMPDIR/file with spaces.png"
 printf image >"$attachment"
-set -g MU_FISH_MODEL openai/gpt
-set -g MU_FISH_EFFECTIVE_MODEL openai/gpt
-set -g MU_FISH_PENDING_ATTACHMENTS "$attachment"
-set -g MU_FISH_EFFECTIVE_ATTACHMENT_COUNT 1
-set -g MU_FISH_OUTPUT
+set -g _MU_FISH_MODEL openai/gpt
+set -g _MU_FISH_PENDING_ATTACHMENTS "$attachment"
 rm -f "$capture_args" "$capture_calls"
 set load_output (_mu_fish_run_slash_command '/load ses_0000000b' | string collect)
 assert_equal "$MU_FISH_SESSION_ID" ses_0000000b '/load attaches the selected session'
-assert_equal "$MU_FISH_MODEL" openai/gpt '/load preserves the model override'
-set -q MU_FISH_PENDING_ATTACHMENTS[1]; or fail '/load preserves pending attachments'
+assert_equal "$_MU_FISH_MODEL" openai/gpt '/load preserves the model override'
+set -q _MU_FISH_PENDING_ATTACHMENTS[1]; or fail '/load preserves pending attachments'
 assert_contains "$load_output" 'Loaded transcript.' '/load renders the selected transcript'
 assert_contains "$load_output" '[mu] loaded session ses_0000000b' '/load confirms the selected session'
 set load_args (cat "$capture_args")
 assert_equal (string join \x1e -- $load_args) (string join \x1e -- transcript --session ses_0000000b --output concise) '/load uses the configured output density'
-set -g MU_FISH_OUTPUT full
 rm -f "$capture_args" "$capture_calls"
 _mu_fish_run_slash_command '/load ses_0000000c' >/dev/null
 set load_args (cat "$capture_args")
-assert_equal (string join \x1e -- $load_args) (string join \x1e -- transcript --session ses_0000000c --output full) '/load uses the shell output override'
+assert_equal (string join \x1e -- $load_args) (string join \x1e -- transcript --session ses_0000000c --output concise) '/load resolves each session output density'
 rm -f "$capture_args" "$capture_calls"
 set load_output (_mu_fish_run_slash_command '/load' | string collect)
 assert_equal "$MU_FISH_SESSION_ID" ses_0000000d 'argument-free /load attaches current-session'
 set load_args (cat "$capture_args")
-assert_equal (string join \x1e -- $load_args) (string join \x1e -- transcript --session ses_0000000d --output full) 'argument-free /load replays current-session explicitly'
+assert_equal (string join \x1e -- $load_args) (string join \x1e -- transcript --session ses_0000000d --output concise) 'argument-free /load replays current-session explicitly'
 assert_contains "$load_output" '[mu] loaded session ses_0000000d' 'argument-free /load confirms the resolved session'
 set -gx MU_FISH_TEST_NO_CURRENT 1
 _mu_fish_run_slash_command '/load' >/dev/null; and fail 'argument-free /load should reject a missing current-session'
@@ -185,44 +179,42 @@ _mu_fish_run_slash_command '/load ses_missing' >/dev/null 2>&1; and fail '/load 
 assert_equal "$MU_FISH_SESSION_ID" ses_0000000d 'failed load preserves the attached session'
 _mu_fish_run_slash_command '/load ses_0000000b extra' >/dev/null; and fail '/load should accept exactly one session id'
 set -g MU_FISH_SESSION_ID ses_0000000a
-set -g MU_FISH_EFFECTIVE_SESSION_ID ses_0000000a
-set -g MU_FISH_OUTPUT detail
 _mu_fish_clear_model_state
-set -g MU_FISH_PENDING_ATTACHMENTS
-set -g MU_FISH_PENDING_ATTACHMENTS "$attachment"
+set -g _MU_FISH_PENDING_ATTACHMENTS
+set -g _MU_FISH_PENDING_ATTACHMENTS "$attachment"
 rm -f "$capture_args" "$capture_stdin" "$capture_calls"
 _mu_fish_submit_prompt 'inspect this'
 assert_equal (cat "$capture_calls") x 'submits one turn'
 assert_equal (cat "$capture_stdin") 'inspect this' 'passes prompt on stdin'
 set submitted_args (cat "$capture_args")
-assert_equal (string join \x1e -- $submitted_args) (string join \x1e -- --output detail -s ses_0000000a -a "$attachment") 'forwards session and attachment'
-not set -q MU_FISH_PENDING_ATTACHMENTS[1]; or fail 'submission clears attachments'
+assert_equal (string join \x1e -- $submitted_args) (string join \x1e -- -s ses_0000000a -a "$attachment") 'forwards session and attachment'
+not set -q _MU_FISH_PENDING_ATTACHMENTS[1]; or fail 'submission clears attachments'
 
 set replay (builtin history search --max 1 | string collect)
 assert_contains "$replay" 'true mu-history ' 'tags Fish Mu history'
 assert_contains "$replay" "printf '%s\\n'" 'records replayable Fish history'
 assert_contains "$replay" 'inspect this' 'history preserves submitted prompt'
-_mu_fish_decode_history "$replay"; or fail 'decodes recorded Fish turn history'
-assert_equal "$_MU_FISH_DECODED_HISTORY" 'inspect this' 'recorded Fish turn decodes to its original prompt'
+set decoded_history "$(_mu_fish_decode_history "$replay")"; or fail 'decodes recorded Fish turn history'
+assert_equal "$decoded_history" 'inspect this' 'recorded Fish turn decodes to its original prompt'
 fish -n -c "$replay"; or fail 'recorded Fish history is not valid Fish syntax'
 builtin history save
 set expected_history_file "$XDG_DATA_HOME/fish/$fish_history"_history
 test -f "$expected_history_file"; or fail "test history escaped isolated data directory: $expected_history_file"
 
 _mu_fish_run_slash_command "/attach $attachment"
-assert_equal "$MU_FISH_PENDING_ATTACHMENTS[1]" "$attachment" '/attach stages resolved file'
+assert_equal "$_MU_FISH_PENDING_ATTACHMENTS[1]" "$attachment" '/attach stages resolved file'
 _mu_fish_run_slash_command /attach
 _mu_fish_run_slash_command '/attach --clear'
-not set -q MU_FISH_PENDING_ATTACHMENTS[1]; or fail '/attach --clear clears queue'
+not set -q _MU_FISH_PENDING_ATTACHMENTS[1]; or fail '/attach --clear clears queue'
 
 _mu_fish_run_slash_command '/model gpt'
-assert_equal "$MU_FISH_EFFECTIVE_MODEL" openai/gpt '/model stores canonical model'
+assert_equal "$_MU_FISH_MODEL" openai/gpt '/model stores canonical model'
 _mu_fish_run_slash_command '/model unknown'; and fail '/model should reject unknown model'
 
 rm -f "$capture_args" "$capture_stdin" "$capture_calls"
 _mu_fish_run_slash_command '/compact' >/dev/null
 set compact_args (cat "$capture_args")
-assert_equal (string join \x1e -- $compact_args) (string join \x1e -- compact --session ses_0000000a --output detail) '/compact forwards session and output'
+assert_equal (string join \x1e -- $compact_args) (string join \x1e -- compact --session ses_0000000a) '/compact forwards the session'
 
 set models (_mu_fish_model_candidates gp)
 contains gpt $models; or fail 'model candidates include unique shorthand'
@@ -235,31 +227,26 @@ set shared_efforts (_mu_fish_model_effort_suffixes shared)
 contains :medium $shared_efforts; or fail 'floating effort candidates merge provider suggestions'
 set model_records (_mu_fish_model_records)
 _mu_fish_model_completion_transition gpt $model_records; or fail 'unshadowed exact models transition to efforts'
-assert_equal (string join , -- $_MU_FISH_MODEL_COMPLETION_EFFORTS) :low,:high 'model transition exposes configured efforts'
 _mu_fish_model_completion_transition shared $model_records; or fail 'floating exact models transition to efforts'
-assert_equal (string join , -- $_MU_FISH_MODEL_COMPLETION_EFFORTS) :medium 'floating transition merges provider efforts'
 set shadow_records \
     (printf 'openai/gpt\tgpt\tlow\n') \
     (printf 'openai/gpt-plus\tgpt-plus\thigh\n')
 _mu_fish_model_completion_transition gpt $shadow_records; and fail 'prefix-shadowed exact models must not transition to efforts'
-set -g MU_FISH_MODEL unknown
-_mu_fish_sync_state
+set -g _MU_FISH_MODEL unknown
 set models (_mu_fish_model_candidates gp)
 contains openai/gpt $models; or fail 'stale model override does not block model discovery'
-set -g MU_FISH_MODEL openai/gpt
-_mu_fish_sync_state
+set -g _MU_FISH_MODEL openai/gpt
 assert_equal (_mu_fish_common_prefix 'file*one' 'file*two') 'file*' 'common prefix treats wildcard characters literally'
 set literal_matches (_mu_fish_matching_candidates 'file*' 'file*star' file-other)
 assert_equal (string join \x1e -- $literal_matches) 'file*star' 'candidate matching treats wildcard characters literally'
 
 set -g MU_FISH_SESSION_ID ses_0000000a
-set -g MU_FISH_TRACKED_SCOPE (_mu_fish_current_scope)
-_mu_fish_sync_state
+set -g _MU_FISH_TRACKED_SCOPE (_mu_fish_current_scope)
 _mu_fish_run_slash_command "/attach $attachment"
 _mu_fish_run_slash_command /new
 not set -q MU_FISH_SESSION_ID[1]; or fail '/new clears session'
-assert_equal "$MU_FISH_MODEL" openai/gpt '/new preserves model override'
-set -q MU_FISH_PENDING_ATTACHMENTS[1]; or fail '/new preserves pending attachments'
+assert_equal "$_MU_FISH_MODEL" openai/gpt '/new preserves model override'
+set -q _MU_FISH_PENDING_ATTACHMENTS[1]; or fail '/new preserves pending attachments'
 
 rm -f "$capture_args" "$capture_stdin" "$capture_calls"
 _mu_fish_run_slash_command '/review.md First line
@@ -275,68 +262,56 @@ assert_equal "$custom_args[-1]" review.md 'custom slash command selects prompt f
 set saved_pwd "$PWD"
 _mu_fish_clear_tracked_state
 cd "$project_a/subdir"
-set -g MU_FISH_TRACKED_SCOPE (_mu_fish_current_scope)
+set -g _MU_FISH_TRACKED_SCOPE (_mu_fish_current_scope)
 set -g MU_FISH_SESSION_ID ses_0000000a
-set -g MU_FISH_MODEL local/solo
-set -g MU_FISH_PENDING_ATTACHMENTS "$attachment"
-_mu_fish_sync_state
+set -g _MU_FISH_MODEL local/solo
+set -g _MU_FISH_PENDING_ATTACHMENTS "$attachment"
 
 cd "$project_b/subdir"
 set observed_command (_mu_fish_base_command)
-assert_equal (string join \x1e -- $observed_command) (string join \x1e -- "$fake_bin/mu" --output detail) 'passive observation hides another scope bundle'
+assert_equal (string join \x1e -- $observed_command) (string join \x1e -- mu) 'passive observation hides another scope bundle'
 set observed_prompt (_mu_fish_build_mode_prompt | string collect)
 not string match -q '*attachments*' -- "$observed_prompt"; or fail 'prompt hides another scope attachments'
 
 cd "$project_a/subdir"
-_mu_fish_sync_state
-assert_equal "$MU_FISH_EFFECTIVE_SESSION_ID" ses_0000000a 'returning without an action restores parked session'
-assert_equal "$MU_FISH_EFFECTIVE_MODEL" local/solo 'returning without an action restores parked model'
-assert_equal "$MU_FISH_EFFECTIVE_ATTACHMENT_COUNT" 1 'returning without an action restores parked attachments'
+_mu_fish_bundle_active; or fail 'returning without an action restores the parked bundle'
+assert_equal "$MU_FISH_SESSION_ID" ses_0000000a 'returning without an action restores parked session'
+assert_equal "$_MU_FISH_MODEL" local/solo 'returning without an action restores parked model'
+assert_equal (count $_MU_FISH_PENDING_ATTACHMENTS) 1 'returning without an action restores parked attachments'
 
 cd "$project_b/subdir"
 _mu_fish_run_slash_command '/model unknown'; and fail 'invalid model elsewhere should fail'
 _mu_fish_run_slash_command "/attach $TEST_TMPDIR/missing-scope-file"; and fail 'invalid attachment elsewhere should fail'
 _mu_fish_run_slash_command '/load ses_missing'; and fail 'invalid load elsewhere should fail'
 cd "$project_a/subdir"
-_mu_fish_sync_state
 assert_equal "$MU_FISH_SESSION_ID" ses_0000000a 'invalid actions elsewhere preserve parked session'
-assert_equal "$MU_FISH_MODEL" local/solo 'invalid actions elsewhere preserve parked model'
-set -q MU_FISH_PENDING_ATTACHMENTS[1]; or fail 'invalid actions elsewhere preserve parked attachments'
+assert_equal "$_MU_FISH_MODEL" local/solo 'invalid actions elsewhere preserve parked model'
+set -q _MU_FISH_PENDING_ATTACHMENTS[1]; or fail 'invalid actions elsewhere preserve parked attachments'
 
 cd "$project_b/subdir"
 _mu_fish_run_slash_command '/model gpt'
 not set -q MU_FISH_SESSION_ID[1]; or fail 'valid model action elsewhere invalidates parked session'
-assert_equal "$MU_FISH_MODEL" openai/gpt 'valid model action elsewhere replaces parked model'
-not set -q MU_FISH_PENDING_ATTACHMENTS[1]; or fail 'valid model action elsewhere invalidates parked attachments'
-assert_equal "$MU_FISH_TRACKED_SCOPE" "project:$project_b" 'valid model action moves tracked scope'
+assert_equal "$_MU_FISH_MODEL" openai/gpt 'valid model action elsewhere replaces parked model'
+not set -q _MU_FISH_PENDING_ATTACHMENTS[1]; or fail 'valid model action elsewhere invalidates parked attachments'
+assert_equal "$_MU_FISH_TRACKED_SCOPE" "project:$project_b" 'valid model action moves tracked scope'
 
 rm -f "$capture_args" "$capture_stdin" "$capture_calls" "$capture_session_args"
 _mu_fish_submit_prompt 'project b prompt'
 set session_args (cat "$capture_session_args")
 assert_equal (string join \x1e -- $session_args) new 'creates an empty session without forwarding model override'
 set submitted_args (cat "$capture_args")
-assert_equal (string join \x1e -- $submitted_args) (string join \x1e -- --output detail -s ses_01234567 --model openai/gpt) 'forwards model override on first real turn'
+assert_equal (string join \x1e -- $submitted_args) (string join \x1e -- -s ses_01234567 --model openai/gpt) 'forwards model override on first real turn'
 
 cd "$project_a/subdir"
 set observed_command (_mu_fish_base_command)
-assert_equal (string join \x1e -- $observed_command) (string join \x1e -- "$fake_bin/mu" --output detail) 'old scope bundle stays invalidated'
+assert_equal (string join \x1e -- $observed_command) (string join \x1e -- mu) 'old scope bundle stays invalidated'
 cd "$saved_pwd"
 _mu_fish_clear_tracked_state
 
-function _test_enter_hook
-    set -g TEST_ENTER_HOOK_RAN yes
-end
-function _test_exit_hook
-    set -g TEST_EXIT_HOOK_RAN yes
-end
-set -g MU_FISH_ENTER_HOOKS _test_enter_hook
-set -g MU_FISH_EXIT_HOOKS _test_exit_hook
 _mu_fish_enter_mode
-assert_equal "$MU_FISH_MODE" mu 'enters Mu mode'
-assert_equal "$TEST_ENTER_HOOK_RAN" yes 'runs enter hooks'
+assert_equal "$_MU_FISH_MODE" mu 'enters Mu mode'
 _mu_fish_exit_mode
-assert_equal "$MU_FISH_MODE" shell 'exits Mu mode'
-assert_equal "$TEST_EXIT_HOOK_RAN" yes 'runs exit hooks'
+assert_equal "$_MU_FISH_MODE" shell 'exits Mu mode'
 
 function fish_prompt
     printf 'custom:%s:%s> ' $status (string join , $pipestatus)
@@ -347,7 +322,16 @@ end
 function fish_mode_prompt
     printf 'mode:%s:%s> ' $status (string join , $pipestatus)
 end
+set -g MU_FISH_SESSION_ID ses_0000000e
+set -g _MU_FISH_TRACKED_SCOPE project:/stale
+set -g _MU_FISH_MODEL stale/model
+set -g _MU_FISH_PENDING_ATTACHMENTS stale.png
 source "$TEST_ROOT/mu.fish"
+_mu_fish_bundle_active; or fail 're-sourcing adopts the documented session seed in the current scope'
+assert_equal "$MU_FISH_SESSION_ID" ses_0000000e 're-sourcing preserves the documented session seed'
+not set -q _MU_FISH_MODEL[1]; or fail 're-sourcing resets the private model'
+not set -q _MU_FISH_PENDING_ATTACHMENTS[1]; or fail 're-sourcing resets private attachments'
+_mu_fish_clear_tracked_state
 set status_prompt "$TEST_TMPDIR/status-prompt"
 false | true
 fish_prompt >"$status_prompt"
@@ -396,9 +380,8 @@ set setup_parts \
     "set -gx TEST_CAPTURE_STDIN "(string escape "$capture_stdin") \
     "set -gx TEST_CAPTURE_CALLS "(string escape "$capture_calls") \
     "set -gx TEST_CAPTURE_SESSION_ARGS "(string escape "$capture_session_args") \
-    "set -g MU_FISH_BIN "(string escape "$fake_bin/mu") \
-    'set -g MU_FISH_OUTPUT detail' \
-    "source "(string escape "$TEST_ROOT/mu.fish")
+    "source "(string escape "$TEST_ROOT/mu.fish") \
+    "set -gx PATH "(string escape "$fake_bin")" \$PATH"
 set interactive_setup (string join '; ' $setup_parts)
 
 function send_interactive_setup --argument-names setup ready
@@ -445,7 +428,7 @@ test $interactive_status -eq 0; or fail "interactive transcript exited with stat
 test (cat "$capture_calls") = x; or fail 'interactive fake Mu should run exactly once'
 assert_equal (cat "$capture_stdin") hello 'interactive prompt reaches stdin'
 set interactive_args (cat "$capture_args")
-assert_equal (string join \x1e -- $interactive_args) (string join \x1e -- --output detail -s ses_01234567 --model openai/gpt) 'interactive turn uses created session and completed model'
+assert_equal (string join \x1e -- $interactive_args) (string join \x1e -- -s ses_01234567 --model openai/gpt) 'interactive turn uses created session and completed model'
 
 set normalized (perl -pe 's/\e\[[0-?]*[ -\/]*[@-~]//g' "$transcript" | col -b | string collect)
 set raw_transcript (string collect <"$transcript")
@@ -458,8 +441,7 @@ assert_contains "$normalized" 'Hello from Fish.' 'interactive output streams'
 assert_contains "$normalized" 'mu>' 'Mu prompt redraws after the turn'
 
 set history_recalled_prompt 'recalled Mu prompt'
-_mu_fish_history_entry "$history_recalled_prompt"
-set history_marker "$_MU_FISH_HISTORY_ENTRY"
+set history_marker "$(_mu_fish_history_entry "$history_recalled_prompt")"
 set history_setup (string join '; ' -- \
     "$interactive_setup" \
     "builtin history append "(string escape "$history_marker") \
@@ -545,7 +527,7 @@ not test -s "$capture_calls"; or fail 'model effort completion should not submit
 set speculative_colon_transcript "$TEST_TMPDIR/speculative-colon-transcript"
 set speculative_colon_setup (string join '; ' -- \
     "$interactive_setup" \
-    'function _mu_test_speculative_colon_state; commandline -r "/model gpt"; commandline -C 10; _mu_fish_append_speculative_model_colon; _mu_fish_model_colon; set explicit (string join , -- (commandline | string collect) (commandline -C) $MU_FISH_SPECULATIVE_MODEL_COLON); commandline -r "/model gpt"; commandline -C 10; _mu_fish_append_speculative_model_colon; _mu_fish_speculative_backspace; set back (string join , -- (commandline | string collect) (commandline -C) $MU_FISH_SPECULATIVE_MODEL_COLON); commandline -r "/model gpt"; commandline -C 10; _mu_fish_append_speculative_model_colon; _mu_fish_speculative_delete; set delete (string join , -- (commandline | string collect) (commandline -C) $MU_FISH_SPECULATIVE_MODEL_COLON); commandline -r "/model gpt"; commandline -C 10; _mu_fish_append_speculative_model_colon; commandline -C 10; _mu_fish_commit_speculative_model_colon_if_changed; set moved (string join , -- (commandline | string collect) (commandline -C) $MU_FISH_SPECULATIVE_MODEL_COLON); commandline -r "/model gpt"; commandline -C 10; _mu_fish_append_speculative_model_colon; _mu_fish_strip_speculative_model_colon; set entered (string join , -- (commandline | string collect) (commandline -C) $MU_FISH_SPECULATIVE_MODEL_COLON); printf "\n[explicit=%s back=%s delete=%s moved=%s entered=%s]\n" $explicit $back $delete $moved $entered; commandline -r ""; commandline -f repaint; end' \
+    'function _mu_test_speculative_colon_state; commandline -r "/model gpt"; commandline -C 10; _mu_fish_append_speculative_model_colon; _mu_fish_model_colon; set explicit (string join , -- (commandline | string collect) (commandline -C)); commandline -r "/model gpt"; commandline -C 10; _mu_fish_append_speculative_model_colon; _mu_fish_speculative_backspace; set back (string join , -- (commandline | string collect) (commandline -C)); commandline -r "/model gpt"; commandline -C 10; _mu_fish_append_speculative_model_colon; _mu_fish_speculative_delete; set delete (string join , -- (commandline | string collect) (commandline -C)); commandline -r "/model gpt"; commandline -C 10; _mu_fish_append_speculative_model_colon; commandline -C 10; _mu_fish_commit_speculative_model_colon_if_changed; set moved (string join , -- (commandline | string collect) (commandline -C)); commandline -r "/model gpt"; commandline -C 10; _mu_fish_append_speculative_model_colon; _mu_fish_strip_speculative_model_colon; set entered (string join , -- (commandline | string collect) (commandline -C)); printf "\n[explicit=%s back=%s delete=%s moved=%s entered=%s]\n" $explicit $back $delete $moved $entered; commandline -r ""; commandline -f repaint; end' \
     'bind -M mumode ctrl-y _mu_test_speculative_colon_state')
 rm -f "$interactive_ready"
 begin
@@ -560,7 +542,7 @@ end | timeout 10 script -qfec \
 set interactive_status $pipestatus[2]
 test $interactive_status -eq 0; or fail "speculative colon transcript exited with status $interactive_status"
 set raw_transcript (string collect <"$speculative_colon_transcript")
-assert_contains "$raw_transcript" '[explicit=/model gpt:,11,0 back=/model gpt,10,0 delete=/model gpt:,11,0 moved=/model gpt:,10,0 entered=/model gpt,10,0]' 'Fish speculative colon actions commit or remove the delimiter as specified'
+assert_contains "$raw_transcript" '[explicit=/model gpt:,11 back=/model gpt,10 delete=/model gpt:,11 moved=/model gpt:,10 entered=/model gpt,10]' 'Fish speculative colon actions commit or remove the delimiter as specified'
 
 set shift_transcript "$TEST_TMPDIR/shift-transcript"
 rm -f "$capture_args" "$capture_stdin" "$capture_calls" "$interactive_ready"

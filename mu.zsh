@@ -6,64 +6,43 @@
 # current mu prompt while leaving the typed line in scrollback, Ctrl+D to keep
 # normal shell EOF behavior even from "mu>" mode, and Up/Down to move through
 # multiline input before browsing earlier Mu submissions.
+# MU_ZSH_SESSION_ID is the only supported variable seed. Underscored variables
+# below are private implementation state, not configuration inputs.
 
-typeset -g MU_ZSH_MODE=${MU_ZSH_MODE:-shell}
-typeset -g MU_ZSH_TRACKED_SCOPE=${MU_ZSH_TRACKED_SCOPE:-}
+typeset -g _MU_ZSH_MODE=shell
+typeset -g _MU_ZSH_TRACKED_SCOPE=
 typeset -g MU_ZSH_SESSION_ID=${MU_ZSH_SESSION_ID:-}
-typeset -g MU_ZSH_EFFECTIVE_SESSION_ID=${MU_ZSH_EFFECTIVE_SESSION_ID:-}
-typeset -g MU_ZSH_MODEL=${MU_ZSH_MODEL:-}
-typeset -g MU_ZSH_EFFECTIVE_MODEL=${MU_ZSH_EFFECTIVE_MODEL:-}
-typeset -gi MU_ZSH_EFFECTIVE_ATTACHMENT_COUNT=0
-typeset -g MU_ZSH_BIN=${MU_ZSH_BIN:-mu}
-typeset -g MU_ZSH_OUTPUT=${MU_ZSH_OUTPUT:-}
-typeset -g MU_ZSH_PROMPT_INPUT=${MU_ZSH_PROMPT_INPUT:-${MU_ZSH_PROMPT:-'mu> '}}
-typeset -g MU_ZSH_PROMPT=${MU_ZSH_PROMPT:-$MU_ZSH_PROMPT_INPUT}
-typeset -g MU_ZSH_PENDING_INPUT=
-typeset -g MU_ZSH_PENDING_PROMPT=
-typeset -gi MU_ZSH_PENDING_SUBMIT=0
-typeset -gi MU_ZSH_SPECULATIVE_MODEL_COLON=0
-typeset -g MU_ZSH_SPECULATIVE_MODEL_BUFFER=
-typeset -gi MU_ZSH_SPECULATIVE_MODEL_CURSOR=0
-typeset -ga MU_ZSH_MODEL_COMPLETION_EFFORTS
-typeset -ga MU_ZSH_PENDING_ATTACHMENTS
-# 16-color theme slots (webterm/xterm Tango). model=bright-blue, ctx=magenta,
-# pwd=cyan, project=bright-black, unclean=bright-red.
-typeset -g MU_ZSH_PROMPT_MODEL_COLOR=${MU_ZSH_PROMPT_MODEL_COLOR:-12}
-typeset -g MU_ZSH_PROMPT_CONTEXT_COLOR=${MU_ZSH_PROMPT_CONTEXT_COLOR:-5}
-typeset -g MU_ZSH_PROMPT_PWD_COLOR=${MU_ZSH_PROMPT_PWD_COLOR:-6}
-typeset -g MU_ZSH_PROMPT_PROJECT_COLOR=${MU_ZSH_PROMPT_PROJECT_COLOR:-8}
-typeset -g MU_ZSH_PROMPT_UNCLEAN_COLOR=${MU_ZSH_PROMPT_UNCLEAN_COLOR:-9}
-typeset -g MU_ZSH_PROMPT_UNCLEAN_TEXT=${MU_ZSH_PROMPT_UNCLEAN_TEXT:-'interrupted · /retry'}
-typeset -g MU_ZSH_ORIGINAL_PROMPT=${MU_ZSH_ORIGINAL_PROMPT:-}
-typeset -g MU_ZSH_ORIGINAL_RPROMPT=${MU_ZSH_ORIGINAL_RPROMPT:-}
-typeset -g MU_ZSH_SAVED_KEYMAP=${MU_ZSH_SAVED_KEYMAP:-main}
-typeset -g MU_ZSH_ORIGINAL_TAB_WIDGET=${MU_ZSH_ORIGINAL_TAB_WIDGET:-}
-typeset -g MU_ZSH_ORIGINAL_SLASH_WIDGET=${MU_ZSH_ORIGINAL_SLASH_WIDGET:-}
-typeset -gi MU_ZSH_HISTORY_ACTIVE=0
-typeset -gi MU_ZSH_HISTORY_EVENT=0
-typeset -gi MU_ZSH_HISTORY_LATEST_EVENT=0
-typeset -g MU_ZSH_HISTORY_DRAFT=
-typeset -gi MU_ZSH_HISTORY_DRAFT_CURSOR=0
-typeset -gi MU_ZSH_HAD_HIGHLIGHTERS=${MU_ZSH_HAD_HIGHLIGHTERS:-0}
-typeset -gi MU_ZSH_DISABLED_AUTOSUGGESTIONS=${MU_ZSH_DISABLED_AUTOSUGGESTIONS:-0}
-typeset -ga MU_ZSH_COMMAND_REPLY
-typeset -ga MU_ZSH_SAVED_HIGHLIGHTERS
-typeset -ga MU_ZSH_ENTER_HOOKS
-typeset -ga MU_ZSH_EXIT_HOOKS
+typeset -g _MU_ZSH_MODEL=
+typeset -g _MU_ZSH_PENDING_INPUT=
+typeset -g _MU_ZSH_PENDING_PROMPT=
+typeset -g _MU_ZSH_SPECULATIVE_MODEL_BUFFER=
+typeset -ga _MU_ZSH_PENDING_ATTACHMENTS=()
+typeset -g _MU_ZSH_ORIGINAL_PROMPT=
+typeset -g _MU_ZSH_ORIGINAL_RPROMPT=
+typeset -g _MU_ZSH_SAVED_KEYMAP=main
+typeset -g _MU_ZSH_ORIGINAL_TAB_WIDGET
+typeset -g _MU_ZSH_ORIGINAL_SLASH_WIDGET
+typeset -gi _MU_ZSH_HISTORY_EVENT=0
+typeset -gi _MU_ZSH_HISTORY_LATEST_EVENT=0
+typeset -g _MU_ZSH_HISTORY_DRAFT=
+typeset -gi _MU_ZSH_HISTORY_DRAFT_CURSOR=0
+typeset -gi _MU_ZSH_HAD_HIGHLIGHTERS=0
+typeset -gi _MU_ZSH_DISABLED_AUTOSUGGESTIONS=0
+typeset -ga _MU_ZSH_SAVED_HIGHLIGHTERS=()
 
 _mu_zsh_save_widget_bindings() {
   local binding
-  if [[ -z "$MU_ZSH_ORIGINAL_TAB_WIDGET" ]]; then
+  if [[ -z "$_MU_ZSH_ORIGINAL_TAB_WIDGET" ]]; then
     binding=${${(z)$(bindkey '^I' 2>/dev/null)}[2]}
-    [[ "$binding" != _mu_zsh_tab ]] && MU_ZSH_ORIGINAL_TAB_WIDGET=$binding
+    [[ "$binding" != _mu_zsh_tab ]] && _MU_ZSH_ORIGINAL_TAB_WIDGET=$binding
   fi
-  [[ -z "$MU_ZSH_ORIGINAL_TAB_WIDGET" ]] && MU_ZSH_ORIGINAL_TAB_WIDGET=expand-or-complete
+  [[ -z "$_MU_ZSH_ORIGINAL_TAB_WIDGET" ]] && _MU_ZSH_ORIGINAL_TAB_WIDGET=expand-or-complete
 
-  if [[ -z "$MU_ZSH_ORIGINAL_SLASH_WIDGET" ]]; then
+  if [[ -z "$_MU_ZSH_ORIGINAL_SLASH_WIDGET" ]]; then
     binding=${${(z)$(bindkey '/' 2>/dev/null)}[2]}
-    [[ "$binding" != _mu_zsh_slash ]] && MU_ZSH_ORIGINAL_SLASH_WIDGET=$binding
+    [[ "$binding" != _mu_zsh_slash ]] && _MU_ZSH_ORIGINAL_SLASH_WIDGET=$binding
   fi
-  [[ -z "$MU_ZSH_ORIGINAL_SLASH_WIDGET" ]] && MU_ZSH_ORIGINAL_SLASH_WIDGET=.self-insert
+  [[ -z "$_MU_ZSH_ORIGINAL_SLASH_WIDGET" ]] && _MU_ZSH_ORIGINAL_SLASH_WIDGET=.self-insert
   return 0
 }
 
@@ -123,45 +102,35 @@ _mu_zsh_set_scope_key_for_dir() {
   REPLY=global
 }
 
-_mu_zsh_sync_state() {
+_mu_zsh_bundle_active() {
   local scope=${1:-}
   [[ -n "$scope" ]] || {
     _mu_zsh_set_scope_key_for_dir "$PWD"
     scope=$REPLY
   }
+  [[ -n "$_MU_ZSH_TRACKED_SCOPE" && "$_MU_ZSH_TRACKED_SCOPE" == "$scope" ]]
+}
 
-  if [[ -z "$MU_ZSH_TRACKED_SCOPE" ]] &&
-    [[ -n "$MU_ZSH_SESSION_ID" || -n "$MU_ZSH_MODEL" || ${#MU_ZSH_PENDING_ATTACHMENTS[@]} -gt 0 ]]; then
-    MU_ZSH_TRACKED_SCOPE=$scope
-  fi
-
-  if [[ -n "$MU_ZSH_TRACKED_SCOPE" && "$MU_ZSH_TRACKED_SCOPE" == "$scope" ]]; then
-    MU_ZSH_EFFECTIVE_SESSION_ID=$MU_ZSH_SESSION_ID
-    MU_ZSH_EFFECTIVE_MODEL=$MU_ZSH_MODEL
-    MU_ZSH_EFFECTIVE_ATTACHMENT_COUNT=${#MU_ZSH_PENDING_ATTACHMENTS[@]}
-  else
-    MU_ZSH_EFFECTIVE_SESSION_ID=
-    MU_ZSH_EFFECTIVE_MODEL=
-    MU_ZSH_EFFECTIVE_ATTACHMENT_COUNT=0
-  fi
+_mu_zsh_adopt_seeded_bundle() {
+  [[ -z "$_MU_ZSH_TRACKED_SCOPE" ]] || return 0
+  [[ -n "$MU_ZSH_SESSION_ID" ]] || return 0
+  _mu_zsh_set_scope_key_for_dir "$PWD"
+  _MU_ZSH_TRACKED_SCOPE=$REPLY
 }
 
 _mu_zsh_clear_session_state() {
   MU_ZSH_SESSION_ID=
-  MU_ZSH_EFFECTIVE_SESSION_ID=
 }
 
 _mu_zsh_clear_model_state() {
-  MU_ZSH_MODEL=
-  MU_ZSH_EFFECTIVE_MODEL=
+  _MU_ZSH_MODEL=
 }
 
 _mu_zsh_clear_tracked_state() {
   _mu_zsh_clear_session_state
   _mu_zsh_clear_model_state
-  MU_ZSH_PENDING_ATTACHMENTS=()
-  MU_ZSH_TRACKED_SCOPE=
-  MU_ZSH_EFFECTIVE_ATTACHMENT_COUNT=0
+  _MU_ZSH_PENDING_ATTACHMENTS=()
+  _MU_ZSH_TRACKED_SCOPE=
 }
 
 _mu_zsh_resolve_speculative_model_colon() {
@@ -169,9 +138,9 @@ _mu_zsh_resolve_speculative_model_colon() {
   local current=0
   local restored_cursor
 
-  if (( MU_ZSH_SPECULATIVE_MODEL_COLON )) &&
-    [[ "$BUFFER" == "$MU_ZSH_SPECULATIVE_MODEL_BUFFER" &&
-      $CURSOR -eq $MU_ZSH_SPECULATIVE_MODEL_CURSOR ]]; then
+  if [[ -n "$_MU_ZSH_SPECULATIVE_MODEL_BUFFER" &&
+    "$BUFFER" == "$_MU_ZSH_SPECULATIVE_MODEL_BUFFER" &&
+    $CURSOR -eq ${#_MU_ZSH_SPECULATIVE_MODEL_BUFFER} ]]; then
     current=1
     if [[ "$action" == discard ]]; then
       restored_cursor=$(( CURSOR - 1 ))
@@ -180,28 +149,23 @@ _mu_zsh_resolve_speculative_model_colon() {
     fi
   fi
 
-  MU_ZSH_SPECULATIVE_MODEL_COLON=0
-  MU_ZSH_SPECULATIVE_MODEL_BUFFER=
-  MU_ZSH_SPECULATIVE_MODEL_CURSOR=0
+  _MU_ZSH_SPECULATIVE_MODEL_BUFFER=
   REPLY=$current
 }
 
 _mu_zsh_append_speculative_model_colon() {
   BUFFER="${BUFFER[1,CURSOR]}:${BUFFER[CURSOR+1,-1]}"
   (( CURSOR += 1 ))
-  MU_ZSH_SPECULATIVE_MODEL_COLON=1
-  MU_ZSH_SPECULATIVE_MODEL_BUFFER=$BUFFER
-  MU_ZSH_SPECULATIVE_MODEL_CURSOR=$CURSOR
+  _MU_ZSH_SPECULATIVE_MODEL_BUFFER=$BUFFER
 }
 
 _mu_zsh_activate_scope() {
   local scope=$1
 
-  if [[ -n "$MU_ZSH_TRACKED_SCOPE" && "$MU_ZSH_TRACKED_SCOPE" != "$scope" ]]; then
+  if [[ -n "$_MU_ZSH_TRACKED_SCOPE" && "$_MU_ZSH_TRACKED_SCOPE" != "$scope" ]]; then
     _mu_zsh_clear_tracked_state
   fi
-  MU_ZSH_TRACKED_SCOPE=$scope
-  _mu_zsh_sync_state "$scope"
+  _MU_ZSH_TRACKED_SCOPE=$scope
 }
 
 _mu_zsh_append_history() {
@@ -222,11 +186,10 @@ _mu_zsh_decode_history() {
 }
 
 _mu_zsh_reset_history_navigation() {
-  MU_ZSH_HISTORY_ACTIVE=0
-  MU_ZSH_HISTORY_EVENT=0
-  MU_ZSH_HISTORY_LATEST_EVENT=0
-  MU_ZSH_HISTORY_DRAFT=
-  MU_ZSH_HISTORY_DRAFT_CURSOR=0
+  _MU_ZSH_HISTORY_EVENT=0
+  _MU_ZSH_HISTORY_LATEST_EVENT=0
+  _MU_ZSH_HISTORY_DRAFT=
+  _MU_ZSH_HISTORY_DRAFT_CURSOR=0
 }
 
 _mu_zsh_record_history() {
@@ -235,29 +198,27 @@ _mu_zsh_record_history() {
   local session_id
   local model
   local quoted=${(qqq)input}
-  _mu_zsh_sync_state "$scope"
-  session_id=$MU_ZSH_EFFECTIVE_SESSION_ID
-  model=$MU_ZSH_EFFECTIVE_MODEL
+  if _mu_zsh_bundle_active "$scope"; then
+    session_id=$MU_ZSH_SESSION_ID
+    model=$_MU_ZSH_MODEL
+  fi
 
   local attachments=
-  local output=
   local replay
   local attachment
-  for attachment in "${MU_ZSH_PENDING_ATTACHMENTS[@]}"; do
+  for attachment in "${_MU_ZSH_PENDING_ATTACHMENTS[@]}"; do
     attachments+=" -a ${(q)attachment}"
   done
-  [[ -n "$MU_ZSH_OUTPUT" ]] && output=" --output ${(q)MU_ZSH_OUTPUT}"
-
   if [[ -n "$session_id" ]]; then
     if [[ -n "$model" ]]; then
-      replay="$MU_ZSH_BIN -s ${(q)session_id} --model ${(q)model}${attachments}${output} <<< $quoted"
+      replay="mu -s ${(q)session_id} --model ${(q)model}${attachments} <<< $quoted"
     else
-      replay="$MU_ZSH_BIN -s ${(q)session_id}${attachments}${output} <<< $quoted"
+      replay="mu -s ${(q)session_id}${attachments} <<< $quoted"
     fi
   elif [[ -n "$model" ]]; then
-    replay="$MU_ZSH_BIN --model ${(q)model}${attachments}${output} <<< $quoted"
+    replay="mu --model ${(q)model}${attachments} <<< $quoted"
   else
-    replay="$MU_ZSH_BIN${attachments}${output} <<< $quoted"
+    replay="mu${attachments} <<< $quoted"
   fi
   _mu_zsh_append_history "$input" "$replay"
 }
@@ -271,7 +232,7 @@ _mu_zsh_create_session_for_scope() {
   local scope=$1
   local id
   local -a command
-  command=("$MU_ZSH_BIN")
+  command=(mu)
   id=$("${command[@]}" new) || return $?
   id=${id//$'\n'/}
   [[ "$id" =~ '^ses_[0-9a-hjkmnpqrstvwxyz]{8}$' ]] || {
@@ -280,43 +241,49 @@ _mu_zsh_create_session_for_scope() {
   }
   _mu_zsh_activate_scope "$scope"
   MU_ZSH_SESSION_ID=$id
-  MU_ZSH_EFFECTIVE_SESSION_ID=$id
 }
 
-_mu_zsh_base_command_reply() {
-  local scope=${1:-}
+_mu_zsh_base_command() {
+  local target=$1
+  local scope=${2:-}
+  local -a built
   [[ -n "$scope" ]] || {
     _mu_zsh_set_scope_key_for_dir "$PWD"
     scope=$REPLY
   }
 
-  _mu_zsh_sync_state "$scope"
-  MU_ZSH_COMMAND_REPLY=("$MU_ZSH_BIN")
-  [[ -n "$MU_ZSH_OUTPUT" ]] && MU_ZSH_COMMAND_REPLY+=(--output "$MU_ZSH_OUTPUT")
-  [[ -n "$MU_ZSH_EFFECTIVE_SESSION_ID" ]] && MU_ZSH_COMMAND_REPLY+=(-s "$MU_ZSH_EFFECTIVE_SESSION_ID")
-  [[ -n "$MU_ZSH_EFFECTIVE_MODEL" ]] && MU_ZSH_COMMAND_REPLY+=(--model "$MU_ZSH_EFFECTIVE_MODEL")
+  built=(mu)
+  if _mu_zsh_bundle_active "$scope"; then
+    [[ -n "$MU_ZSH_SESSION_ID" ]] && built+=(-s "$MU_ZSH_SESSION_ID")
+    [[ -n "$_MU_ZSH_MODEL" ]] && built+=(--model "$_MU_ZSH_MODEL")
+  fi
+  set -A "$target" "${built[@]}"
   return 0
 }
 
 _mu_zsh_status_json() {
   local -a command
-  _mu_zsh_sync_state
-  command=("$MU_ZSH_BIN" status --json "$@")
-  [[ -n "$MU_ZSH_EFFECTIVE_SESSION_ID" ]] && command+=(-s "$MU_ZSH_EFFECTIVE_SESSION_ID")
-  [[ -n "$MU_ZSH_EFFECTIVE_MODEL" ]] && command+=(--model "$MU_ZSH_EFFECTIVE_MODEL")
+  command=(mu status --json "$@")
+  if _mu_zsh_bundle_active; then
+    [[ -n "$MU_ZSH_SESSION_ID" ]] && command+=(-s "$MU_ZSH_SESSION_ID")
+    [[ -n "$_MU_ZSH_MODEL" ]] && command+=(--model "$_MU_ZSH_MODEL")
+  fi
   "${command[@]}" 2>/dev/null
 }
 
 _mu_zsh_build_mode_prompt() {
   local status_json model context_raw context context_source context_segment to_compact compaction_segment cwd project_root project_segment attachment_segment
-  local clean unclean_segment
+  local clean unclean_segment bundle_active=0 attachment_count=0
   local escaped_model escaped_context escaped_project_root escaped_unclean_text
 
   # One jq pass extracts every prompt field as TSV; forking jq per field
   # dominates prompt-draw latency, so keep this to a single invocation.
   local tsv
   local -a fields
-  _mu_zsh_sync_state
+  if _mu_zsh_bundle_active; then
+    bundle_active=1
+    attachment_count=${#_MU_ZSH_PENDING_ATTACHMENTS[@]}
+  fi
   status_json=$(_mu_zsh_status_json) || status_json=
   if [[ -n "$status_json" ]] && command -v jq >/dev/null 2>&1; then
     tsv=$(jq -r '[(.model.canonical // ""), (if ((.context_tokens | type) == "number" and (.context_window | type) == "number" and .context_window > 0) then (.context_tokens * 100 / .context_window) else "" end), (.project_root // ""), (if has("clean") then (.clean|tostring) else "" end), (.context_usage_source // ""), (if ((.context_tokens | type) == "number" and (.compaction_soft_threshold_tokens | type) == "number") then (.context_tokens > .compaction_soft_threshold_tokens) else false end)] | @tsv' <<< "$status_json" 2>/dev/null) || tsv=
@@ -329,7 +296,7 @@ _mu_zsh_build_mode_prompt() {
   clean=${fields[4]:-}
   context_source=${fields[5]:-}
   to_compact=${fields[6]:-false}
-  if [[ -n "$MU_ZSH_EFFECTIVE_SESSION_ID" ]]; then
+  if (( bundle_active )) && [[ -n "$MU_ZSH_SESSION_ID" ]]; then
     if [[ -z "$context_raw" || "$context_raw" == null ]]; then
       context=0%
     elif ! printf -v context '%.0f%%' "$context_raw" 2>/dev/null; then
@@ -338,12 +305,12 @@ _mu_zsh_build_mode_prompt() {
     [[ "$context_source" == estimated ]] && context="~$context"
     escaped_context=$context
     escaped_context=${escaped_context//\%/%%}
-    context_segment=" %F{$MU_ZSH_PROMPT_CONTEXT_COLOR}${escaped_context}%f"
+    context_segment=" %F{5}${escaped_context}%f"
   else
     context_segment=
   fi
-  if [[ -n "$MU_ZSH_EFFECTIVE_SESSION_ID" && "$to_compact" == true ]]; then
-    compaction_segment=" %F{$MU_ZSH_PROMPT_CONTEXT_COLOR}[to compact]%f"
+  if (( bundle_active )) && [[ -n "$MU_ZSH_SESSION_ID" && "$to_compact" == true ]]; then
+    compaction_segment=" %F{5}[to compact]%f"
   else
     compaction_segment=
   fi
@@ -352,17 +319,17 @@ _mu_zsh_build_mode_prompt() {
   escaped_model=$model
   escaped_model=${escaped_model//\%/%%}
   if [[ -z "$project_root" ]]; then
-    project_segment=" %F{$MU_ZSH_PROMPT_PROJECT_COLOR}(global)%f"
+    project_segment=" %F{8}(global)%f"
   elif [[ "$project_root" != "$PWD" ]]; then
     escaped_project_root=$project_root
     escaped_project_root=${escaped_project_root//\%/%%}
-    project_segment=" %F{$MU_ZSH_PROMPT_PROJECT_COLOR}(${escaped_project_root})%f"
+    project_segment=" %F{8}(${escaped_project_root})%f"
   else
     project_segment=
   fi
 
-  if (( MU_ZSH_EFFECTIVE_ATTACHMENT_COUNT )); then
-    attachment_segment=" %F{$MU_ZSH_PROMPT_CONTEXT_COLOR}[${MU_ZSH_EFFECTIVE_ATTACHMENT_COUNT} attachments]%f"
+  if (( attachment_count )); then
+    attachment_segment=" %F{5}[${attachment_count} attachments]%f"
   else
     attachment_segment=
   fi
@@ -370,71 +337,57 @@ _mu_zsh_build_mode_prompt() {
   # When the tracked session's last turn was interrupted (unclean), surface it
   # so the user knows they can /retry to resume or just type to redirect.
   if [[ "$clean" == false ]]; then
-    escaped_unclean_text=$MU_ZSH_PROMPT_UNCLEAN_TEXT
-    escaped_unclean_text=${escaped_unclean_text//\%/%%}
-    unclean_segment=" %F{$MU_ZSH_PROMPT_UNCLEAN_COLOR}[${escaped_unclean_text}]%f"
+    escaped_unclean_text='interrupted · /retry'
+    unclean_segment=" %F{9}[${escaped_unclean_text}]%f"
   else
     unclean_segment=
   fi
 
-  print -r -- "%F{$MU_ZSH_PROMPT_MODEL_COLOR}${escaped_model}%f${context_segment}${compaction_segment} %F{$MU_ZSH_PROMPT_PWD_COLOR}${cwd}%f${project_segment}${unclean_segment}${attachment_segment}
-${MU_ZSH_PROMPT_INPUT}"
+  print -r -- "%F{12}${escaped_model}%f${context_segment}${compaction_segment} %F{6}${cwd}%f${project_segment}${unclean_segment}${attachment_segment}
+mu> "
 }
 
 _mu_zsh_refresh_prompt() {
   local mode_prompt
 
-  mode_prompt=$(_mu_zsh_build_mode_prompt) || mode_prompt=$MU_ZSH_PROMPT_INPUT
-  MU_ZSH_PROMPT=$mode_prompt
-  [[ "$MU_ZSH_MODE" == mu ]] && PROMPT=$mode_prompt
+  mode_prompt=$(_mu_zsh_build_mode_prompt) || mode_prompt='mu> '
+  [[ "$_MU_ZSH_MODE" == mu ]] && PROMPT=$mode_prompt
 }
 
 _mu_zsh_disable_editor_plugins() {
   if (( $+ZSH_HIGHLIGHT_HIGHLIGHTERS )); then
-    MU_ZSH_HAD_HIGHLIGHTERS=1
-    MU_ZSH_SAVED_HIGHLIGHTERS=("${ZSH_HIGHLIGHT_HIGHLIGHTERS[@]}")
+    _MU_ZSH_HAD_HIGHLIGHTERS=1
+    _MU_ZSH_SAVED_HIGHLIGHTERS=("${ZSH_HIGHLIGHT_HIGHLIGHTERS[@]}")
     ZSH_HIGHLIGHT_HIGHLIGHTERS=()
   else
-    MU_ZSH_HAD_HIGHLIGHTERS=0
-    MU_ZSH_SAVED_HIGHLIGHTERS=()
+    _MU_ZSH_HAD_HIGHLIGHTERS=0
+    _MU_ZSH_SAVED_HIGHLIGHTERS=()
   fi
 
-  MU_ZSH_DISABLED_AUTOSUGGESTIONS=0
+  _MU_ZSH_DISABLED_AUTOSUGGESTIONS=0
   if (( ! ${+_ZSH_AUTOSUGGEST_DISABLED} )) && zle -l autosuggest-disable >/dev/null 2>&1; then
     if zle autosuggest-disable; then
-      MU_ZSH_DISABLED_AUTOSUGGESTIONS=1
+      _MU_ZSH_DISABLED_AUTOSUGGESTIONS=1
     fi
   fi
 }
 
 _mu_zsh_restore_editor_plugins() {
-  if (( MU_ZSH_HAD_HIGHLIGHTERS )); then
-    ZSH_HIGHLIGHT_HIGHLIGHTERS=("${MU_ZSH_SAVED_HIGHLIGHTERS[@]}")
+  if (( _MU_ZSH_HAD_HIGHLIGHTERS )); then
+    ZSH_HIGHLIGHT_HIGHLIGHTERS=("${_MU_ZSH_SAVED_HIGHLIGHTERS[@]}")
   else
     unset ZSH_HIGHLIGHT_HIGHLIGHTERS
   fi
 
-  if (( MU_ZSH_DISABLED_AUTOSUGGESTIONS )) && zle -l autosuggest-enable >/dev/null 2>&1; then
+  if (( _MU_ZSH_DISABLED_AUTOSUGGESTIONS )) && zle -l autosuggest-enable >/dev/null 2>&1; then
     zle autosuggest-enable
   fi
-  MU_ZSH_DISABLED_AUTOSUGGESTIONS=0
-}
-
-_mu_zsh_run_hooks() {
-  local hook
-  for hook in "$@"; do
-    [[ -z "$hook" ]] && continue
-    if (( $+functions[$hook] )); then
-      "$hook"
-    else
-      print -u2 -- "mu mu.zsh: hook function not found: $hook"
-    fi
-  done
+  _MU_ZSH_DISABLED_AUTOSUGGESTIONS=0
 }
 
 _mu_zsh_reset_mode_prompt() {
   local skip_refresh=${1:-0}
-  [[ "$MU_ZSH_MODE" == mu && "$skip_refresh" != 1 ]] && _mu_zsh_refresh_prompt
+  [[ "$_MU_ZSH_MODE" == mu && "$skip_refresh" != 1 ]] && _mu_zsh_refresh_prompt
   zle reset-prompt
   zle -R
   zle -K mumode 2>/dev/null || true
@@ -444,8 +397,7 @@ _mu_zsh_slash_command_candidates() {
   local -a commands
 
   commands=(/attach /load /model)
-  _mu_zsh_sync_state
-  [[ -n "$MU_ZSH_EFFECTIVE_SESSION_ID" ]] && commands+=(/new /retry /compact)
+  _mu_zsh_bundle_active && [[ -n "$MU_ZSH_SESSION_ID" ]] && commands+=(/new /retry /compact)
   commands+=("${(@f)$(_mu_zsh_custom_slash_commands 2>/dev/null || true)}")
 
   local command
@@ -476,9 +428,8 @@ _mu_zsh_model_completion_candidates() {
   local suffix_only=${2:-0}
   local -a command
   local json
-  _mu_zsh_sync_state
-  command=("$MU_ZSH_BIN" status --json --include-models)
-  [[ -n "$MU_ZSH_EFFECTIVE_SESSION_ID" ]] && command+=(-s "$MU_ZSH_EFFECTIVE_SESSION_ID")
+  command=(mu status --json --include-models)
+  _mu_zsh_bundle_active && [[ -n "$MU_ZSH_SESSION_ID" ]] && command+=(-s "$MU_ZSH_SESSION_ID")
   json=$("${command[@]}" 2>/dev/null) || return 1
   command -v jq >/dev/null 2>&1 || return 1
   jq -r --arg fragment "$fragment" --arg suffix_only "$suffix_only" '
@@ -525,13 +476,12 @@ _mu_zsh_model_completion_candidates() {
 
 _mu_zsh_model_completion_transition() {
   local fragment=$1
+  local target=$2
   local -a command result
   local json
 
-  MU_ZSH_MODEL_COMPLETION_EFFORTS=()
-  _mu_zsh_sync_state
-  command=("$MU_ZSH_BIN" status --json --include-models)
-  [[ -n "$MU_ZSH_EFFECTIVE_SESSION_ID" ]] && command+=(-s "$MU_ZSH_EFFECTIVE_SESSION_ID")
+  command=(mu status --json --include-models)
+  _mu_zsh_bundle_active && [[ -n "$MU_ZSH_SESSION_ID" ]] && command+=(-s "$MU_ZSH_SESSION_ID")
   json=$("${command[@]}" 2>/dev/null) || return 1
   command -v jq >/dev/null 2>&1 || return 1
   result=("${(@f)$(
@@ -582,8 +532,7 @@ _mu_zsh_model_completion_transition() {
     ' <<< "$json"
   )}")
   (( ${#result[@]} > 1 )) || return 1
-  REPLY=$result[1]
-  MU_ZSH_MODEL_COMPLETION_EFFORTS=("${result[@]:1}")
+  set -A "$target" "${result[@]:1}"
   return 0
 }
 
@@ -769,9 +718,9 @@ _mu_zsh_complete_slash() {
     [[ "${BUFFER[1,$CURSOR]}" == "/model "* &&
       $CURSOR -eq ${#BUFFER} ]]; then
     model_arg=${BUFFER#"/model "}
-    if _mu_zsh_model_completion_transition "$model_arg"; then
+    if _mu_zsh_model_completion_transition "$model_arg" effort_suffixes; then
       _mu_zsh_append_speculative_model_colon
-      for effort in "${MU_ZSH_MODEL_COMPLETION_EFFORTS[@]}"; do
+      for effort in "${effort_suffixes[@]}"; do
         display_efforts+=("${effort#:}")
       done
       zle -M "${(j:  :)display_efforts}"
@@ -789,10 +738,9 @@ _mu_zsh_list_slash_choices() {
   zle _mu_zsh_list_widget 2>/dev/null || true
 }
 
-_mu_zsh_require_effective_session() {
+_mu_zsh_require_active_session() {
   local command=$1
-  _mu_zsh_sync_state
-  if [[ -z "$MU_ZSH_EFFECTIVE_SESSION_ID" ]]; then
+  if ! _mu_zsh_bundle_active || [[ -z "$MU_ZSH_SESSION_ID" ]]; then
     _mu_zsh_print_block_message "[mu] $command requires an active session in this scope"
     return 1
   fi
@@ -813,9 +761,8 @@ _mu_zsh_validate_model_ref() {
   local model=$1
   local -a command
   local status_json resolved
-  _mu_zsh_sync_state
-  command=("$MU_ZSH_BIN" status --json --model "$model")
-  [[ -n "$MU_ZSH_EFFECTIVE_SESSION_ID" ]] && command+=(-s "$MU_ZSH_EFFECTIVE_SESSION_ID")
+  command=(mu status --json --model "$model")
+  _mu_zsh_bundle_active && [[ -n "$MU_ZSH_SESSION_ID" ]] && command+=(-s "$MU_ZSH_SESSION_ID")
   status_json=$("${command[@]}" 2>/dev/null) || return 1
   resolved=$(jq -r '.model.canonical // empty' <<< "$status_json" 2>/dev/null) || resolved=
   REPLY=${resolved:-$model}
@@ -826,12 +773,7 @@ _mu_zsh_resolve_load_output() {
   local session_id=$1
   local status_json output
 
-  if [[ -n "$MU_ZSH_OUTPUT" ]]; then
-    REPLY=$MU_ZSH_OUTPUT
-    return 0
-  fi
-
-  status_json=$("$MU_ZSH_BIN" status --json -s "$session_id") || return $?
+  status_json=$(mu status --json -s "$session_id") || return $?
   output=$(jq -r '.output // empty' <<< "$status_json" 2>/dev/null) || output=
   case "$output" in
     final|concise|detail|full)
@@ -853,7 +795,7 @@ _mu_zsh_resolve_load_session() {
     return 0
   fi
 
-  status_json=$("$MU_ZSH_BIN" status --json --continue) || return $?
+  status_json=$(mu status --json --continue) || return $?
   session_id=$(jq -r '.session_id // empty' <<< "$status_json" 2>/dev/null) || {
     print -u2 -- "mu mu.zsh: could not resolve current session from status"
     return 1
@@ -879,19 +821,17 @@ _mu_zsh_run_custom_slash_command() {
   _mu_zsh_set_scope_key_for_dir "$PWD"
   scope=$REPLY
   _mu_zsh_activate_scope "$scope"
-  [[ -n "$MU_ZSH_EFFECTIVE_SESSION_ID" ]] ||
+  [[ -n "$MU_ZSH_SESSION_ID" ]] ||
     _mu_zsh_create_session_for_scope "$scope" || return $?
-  _mu_zsh_base_command_reply "$scope"
-  session_id=$MU_ZSH_EFFECTIVE_SESSION_ID
+  _mu_zsh_base_command command "$scope"
+  session_id=$MU_ZSH_SESSION_ID
 
-  command=("${MU_ZSH_COMMAND_REPLY[@]}")
   local attachment
-  for attachment in "${MU_ZSH_PENDING_ATTACHMENTS[@]}"; do
+  for attachment in "${_MU_ZSH_PENDING_ATTACHMENTS[@]}"; do
     command+=(-a "$attachment")
   done
   command+=("$name")
-  MU_ZSH_PENDING_ATTACHMENTS=()
-  MU_ZSH_EFFECTIVE_ATTACHMENT_COUNT=0
+  _MU_ZSH_PENDING_ATTACHMENTS=()
 
   if [[ -n "$instruction" ]]; then
     print -rn -- "$instruction" | "${command[@]}"
@@ -933,8 +873,8 @@ _mu_zsh_run_slash_command() {
     /attach)
       if [[ -z "$rest" ]]; then
         _mu_zsh_activate_scope "$scope"
-        if (( ${#MU_ZSH_PENDING_ATTACHMENTS[@]} )); then
-          _mu_zsh_print_block_message "[mu] pending attachments: ${(j:, :)MU_ZSH_PENDING_ATTACHMENTS}"
+        if (( ${#_MU_ZSH_PENDING_ATTACHMENTS[@]} )); then
+          _mu_zsh_print_block_message "[mu] pending attachments: ${(j:, :)_MU_ZSH_PENDING_ATTACHMENTS}"
         else
           _mu_zsh_print_block_message "[mu] no pending attachments"
         fi
@@ -942,8 +882,7 @@ _mu_zsh_run_slash_command() {
       fi
       if [[ "$rest" == --clear ]]; then
         _mu_zsh_activate_scope "$scope"
-        MU_ZSH_PENDING_ATTACHMENTS=()
-        MU_ZSH_EFFECTIVE_ATTACHMENT_COUNT=0
+        _MU_ZSH_PENDING_ATTACHMENTS=()
         _mu_zsh_print_block_message "[mu] cleared pending attachments"
         return 0
       fi
@@ -959,9 +898,8 @@ _mu_zsh_run_slash_command() {
         return 1
       fi
       _mu_zsh_activate_scope "$scope"
-      MU_ZSH_PENDING_ATTACHMENTS+=("$attachment_path")
-      local attachment_count=${#MU_ZSH_PENDING_ATTACHMENTS[@]}
-      MU_ZSH_EFFECTIVE_ATTACHMENT_COUNT=$attachment_count
+      _MU_ZSH_PENDING_ATTACHMENTS+=("$attachment_path")
+      local attachment_count=${#_MU_ZSH_PENDING_ATTACHMENTS[@]}
       local attachment_label=files
       (( attachment_count == 1 )) && attachment_label=file
       _mu_zsh_print_block_message "[mu] attached ${attachment_path:t} for the next message ($attachment_count $attachment_label)"
@@ -981,8 +919,7 @@ _mu_zsh_run_slash_command() {
       fi
       resolved_model=$REPLY
       _mu_zsh_activate_scope "$scope"
-      MU_ZSH_MODEL=$resolved_model
-      MU_ZSH_EFFECTIVE_MODEL=$resolved_model
+      _MU_ZSH_MODEL=$resolved_model
       _mu_zsh_print_block_message "[mu] next turns in this scope will use $resolved_model"
       ;;
     /load)
@@ -994,28 +931,26 @@ _mu_zsh_run_slash_command() {
       session_id=$REPLY
       _mu_zsh_resolve_load_output "$session_id" || return $?
       load_output=$REPLY
-      "$MU_ZSH_BIN" transcript --session "$session_id" --output "$load_output" || return $?
+      mu transcript --session "$session_id" --output "$load_output" || return $?
       _mu_zsh_activate_scope "$scope"
       MU_ZSH_SESSION_ID=$session_id
-      MU_ZSH_EFFECTIVE_SESSION_ID=$session_id
       _mu_zsh_print_block_message "[mu] loaded session $session_id"
       ;;
     /new)
       _mu_zsh_validate_no_args "$command" "$rest" || return 1
       _mu_zsh_activate_scope "$scope"
-      _mu_zsh_require_effective_session "$command" || return 1
+      _mu_zsh_require_active_session "$command" || return 1
       _mu_zsh_clear_session_state
       _mu_zsh_print_block_message "[mu] next turn will start a new session"
       ;;
     /retry)
       _mu_zsh_validate_no_args "$command" "$rest" || return 1
       _mu_zsh_activate_scope "$scope"
-      _mu_zsh_require_effective_session "$command" || return 1
-      session_id=$MU_ZSH_EFFECTIVE_SESSION_ID
+      _mu_zsh_require_active_session "$command" || return 1
+      session_id=$MU_ZSH_SESSION_ID
       local -a retry_command
-      retry_command=("$MU_ZSH_BIN" retry -s "$session_id")
-      [[ -n "$MU_ZSH_EFFECTIVE_MODEL" ]] && retry_command+=(--model "$MU_ZSH_EFFECTIVE_MODEL")
-      [[ -n "$MU_ZSH_OUTPUT" ]] && retry_command+=(--output "$MU_ZSH_OUTPUT")
+      retry_command=(mu retry -s "$session_id")
+      [[ -n "$_MU_ZSH_MODEL" ]] && retry_command+=(--model "$_MU_ZSH_MODEL")
       if "${retry_command[@]}"; then
         exit_status=0
       else
@@ -1024,11 +959,10 @@ _mu_zsh_run_slash_command() {
       ;;
     /compact)
       _mu_zsh_activate_scope "$scope"
-      _mu_zsh_require_effective_session "$command" || return 1
-      session_id=$MU_ZSH_EFFECTIVE_SESSION_ID
+      _mu_zsh_require_active_session "$command" || return 1
+      session_id=$MU_ZSH_SESSION_ID
       local -a compact_command
-      compact_command=("$MU_ZSH_BIN" compact --session "$session_id")
-      [[ -n "$MU_ZSH_OUTPUT" ]] && compact_command+=(--output "$MU_ZSH_OUTPUT")
+      compact_command=(mu compact --session "$session_id")
       if [[ -n "$instruction" ]]; then
         print -rn -- "$instruction" | "${compact_command[@]}"
         exit_status=${pipestatus[2]}
@@ -1052,40 +986,37 @@ _mu_zsh_run_slash_command() {
       ;;
   esac
 
-  _mu_zsh_sync_state "$scope"
   return $exit_status
 }
 
 _mu_zsh_enter_mode() {
-  [[ "$MU_ZSH_MODE" == mu ]] && return 0
+  [[ "$_MU_ZSH_MODE" == mu ]] && return 0
 
-  MU_ZSH_MODE=mu
-  MU_ZSH_SAVED_KEYMAP=${KEYMAP:-main}
-  MU_ZSH_ORIGINAL_PROMPT=$PROMPT
-  MU_ZSH_ORIGINAL_RPROMPT=$RPROMPT
+  _MU_ZSH_MODE=mu
+  _MU_ZSH_SAVED_KEYMAP=${KEYMAP:-main}
+  _MU_ZSH_ORIGINAL_PROMPT=$PROMPT
+  _MU_ZSH_ORIGINAL_RPROMPT=$RPROMPT
   _mu_zsh_refresh_prompt
   RPROMPT=
   _mu_zsh_disable_editor_plugins
-  _mu_zsh_run_hooks "${MU_ZSH_ENTER_HOOKS[@]}"
   zle -K mumode 2>/dev/null || true
 }
 
 _mu_zsh_exit_mode() {
-  [[ "$MU_ZSH_MODE" == shell ]] && return 0
+  [[ "$_MU_ZSH_MODE" == shell ]] && return 0
 
   _mu_zsh_resolve_speculative_model_colon
   _mu_zsh_reset_history_navigation
-  MU_ZSH_MODE=shell
-  zle -K "${MU_ZSH_SAVED_KEYMAP:-main}" 2>/dev/null || zle -K main 2>/dev/null || true
-  PROMPT=$MU_ZSH_ORIGINAL_PROMPT
-  RPROMPT=$MU_ZSH_ORIGINAL_RPROMPT
+  _MU_ZSH_MODE=shell
+  zle -K "${_MU_ZSH_SAVED_KEYMAP:-main}" 2>/dev/null || zle -K main 2>/dev/null || true
+  PROMPT=$_MU_ZSH_ORIGINAL_PROMPT
+  RPROMPT=$_MU_ZSH_ORIGINAL_RPROMPT
   _mu_zsh_restore_editor_plugins
-  _mu_zsh_run_hooks "${MU_ZSH_EXIT_HOOKS[@]}"
 }
 
 _mu_zsh_insert_newline() {
   _mu_zsh_resolve_speculative_model_colon
-  [[ "$MU_ZSH_MODE" == mu ]] || {
+  [[ "$_MU_ZSH_MODE" == mu ]] || {
     zle self-insert
     return
   }
@@ -1101,29 +1032,28 @@ _mu_zsh_history_up() {
     return
   fi
 
-  local origin_event=$MU_ZSH_HISTORY_EVENT
+  local origin_event=$_MU_ZSH_HISTORY_EVENT
   local origin_histno=$HISTNO
   local origin_buffer=$BUFFER
   local origin_cursor=$CURSOR
   local candidate entry
 
-  if (( ! MU_ZSH_HISTORY_ACTIVE )); then
-    MU_ZSH_HISTORY_ACTIVE=1
-    MU_ZSH_HISTORY_LATEST_EVENT=$HISTNO
-    MU_ZSH_HISTORY_EVENT=$HISTNO
-    MU_ZSH_HISTORY_DRAFT=$BUFFER
-    MU_ZSH_HISTORY_DRAFT_CURSOR=$CURSOR
-  elif (( MU_ZSH_HISTORY_EVENT == MU_ZSH_HISTORY_LATEST_EVENT )); then
-    MU_ZSH_HISTORY_DRAFT=$BUFFER
-    MU_ZSH_HISTORY_DRAFT_CURSOR=$CURSOR
+  if (( ! _MU_ZSH_HISTORY_LATEST_EVENT )); then
+    _MU_ZSH_HISTORY_LATEST_EVENT=$HISTNO
+    _MU_ZSH_HISTORY_EVENT=$HISTNO
+    _MU_ZSH_HISTORY_DRAFT=$BUFFER
+    _MU_ZSH_HISTORY_DRAFT_CURSOR=$CURSOR
+  elif (( _MU_ZSH_HISTORY_EVENT == _MU_ZSH_HISTORY_LATEST_EVENT )); then
+    _MU_ZSH_HISTORY_DRAFT=$BUFFER
+    _MU_ZSH_HISTORY_DRAFT_CURSOR=$CURSOR
   fi
 
-  candidate=$(( MU_ZSH_HISTORY_EVENT - 1 ))
+  candidate=$(( _MU_ZSH_HISTORY_EVENT - 1 ))
   while (( candidate > 0 )); do
     HISTNO=$candidate
     entry=$BUFFER
     if _mu_zsh_decode_history "$entry"; then
-      MU_ZSH_HISTORY_EVENT=$candidate
+      _MU_ZSH_HISTORY_EVENT=$candidate
       BUFFER=$REPLY
       CURSOR=${#BUFFER}
       return
@@ -1145,16 +1075,16 @@ _mu_zsh_history_down() {
     zle down-line
     return
   fi
-  (( MU_ZSH_HISTORY_ACTIVE )) || return 0
-  (( MU_ZSH_HISTORY_EVENT < MU_ZSH_HISTORY_LATEST_EVENT )) || return 0
+  (( _MU_ZSH_HISTORY_LATEST_EVENT )) || return 0
+  (( _MU_ZSH_HISTORY_EVENT < _MU_ZSH_HISTORY_LATEST_EVENT )) || return 0
 
   local candidate entry
-  candidate=$(( MU_ZSH_HISTORY_EVENT + 1 ))
-  while (( candidate < MU_ZSH_HISTORY_LATEST_EVENT )); do
+  candidate=$(( _MU_ZSH_HISTORY_EVENT + 1 ))
+  while (( candidate < _MU_ZSH_HISTORY_LATEST_EVENT )); do
     HISTNO=$candidate
     entry=$BUFFER
     if _mu_zsh_decode_history "$entry"; then
-      MU_ZSH_HISTORY_EVENT=$candidate
+      _MU_ZSH_HISTORY_EVENT=$candidate
       BUFFER=$REPLY
       CURSOR=${#BUFFER}
       return
@@ -1162,9 +1092,9 @@ _mu_zsh_history_down() {
     (( candidate++ ))
   done
 
-  MU_ZSH_HISTORY_EVENT=$MU_ZSH_HISTORY_LATEST_EVENT
-  BUFFER=$MU_ZSH_HISTORY_DRAFT
-  CURSOR=$MU_ZSH_HISTORY_DRAFT_CURSOR
+  _MU_ZSH_HISTORY_EVENT=$_MU_ZSH_HISTORY_LATEST_EVENT
+  BUFFER=$_MU_ZSH_HISTORY_DRAFT
+  CURSOR=$_MU_ZSH_HISTORY_DRAFT_CURSOR
 }
 
 _mu_zsh_submit_prompt() {
@@ -1176,20 +1106,18 @@ _mu_zsh_submit_prompt() {
   _mu_zsh_set_scope_key_for_dir "$PWD"
   scope=$REPLY
   _mu_zsh_activate_scope "$scope"
-  [[ -n "$MU_ZSH_EFFECTIVE_SESSION_ID" ]] ||
+  [[ -n "$MU_ZSH_SESSION_ID" ]] ||
     _mu_zsh_create_session_for_scope "$scope" || return $?
   # Create the session before recording history so the replay command can
   # address the exact session even for the first turn in a scope.
   _mu_zsh_record_history "$input" "$scope"
-  _mu_zsh_base_command_reply "$scope"
-  session_id=$MU_ZSH_EFFECTIVE_SESSION_ID
-  command=("${MU_ZSH_COMMAND_REPLY[@]}")
+  _mu_zsh_base_command command "$scope"
+  session_id=$MU_ZSH_SESSION_ID
   local attachment
-  for attachment in "${MU_ZSH_PENDING_ATTACHMENTS[@]}"; do
+  for attachment in "${_MU_ZSH_PENDING_ATTACHMENTS[@]}"; do
     command+=(-a "$attachment")
   done
-  MU_ZSH_PENDING_ATTACHMENTS=()
-  MU_ZSH_EFFECTIVE_ATTACHMENT_COUNT=0
+  _MU_ZSH_PENDING_ATTACHMENTS=()
 
   "${command[@]}" <<< "$input"
   exit_status=$?
@@ -1198,7 +1126,7 @@ _mu_zsh_submit_prompt() {
 }
 
 _mu_zsh_tab() {
-  if [[ "$MU_ZSH_MODE" == mu ]]; then
+  if [[ "$_MU_ZSH_MODE" == mu ]]; then
     _mu_zsh_resolve_speculative_model_colon
     if _mu_zsh_slash_completion_context; then
       _mu_zsh_complete_slash
@@ -1208,7 +1136,7 @@ _mu_zsh_tab() {
     if (( CURSOR == 0 )); then
       _mu_zsh_exit_mode
       zle reset-prompt
-      zle -K "${MU_ZSH_SAVED_KEYMAP:-main}" 2>/dev/null || zle -K main 2>/dev/null || true
+      zle -K "${_MU_ZSH_SAVED_KEYMAP:-main}" 2>/dev/null || zle -K main 2>/dev/null || true
       return
     fi
 
@@ -1222,7 +1150,7 @@ _mu_zsh_tab() {
     return
   fi
 
-  [[ -n "$MU_ZSH_ORIGINAL_TAB_WIDGET" ]] && zle "$MU_ZSH_ORIGINAL_TAB_WIDGET"
+  [[ -n "$_MU_ZSH_ORIGINAL_TAB_WIDGET" ]] && zle "$_MU_ZSH_ORIGINAL_TAB_WIDGET"
 }
 
 _mu_zsh_slash() {
@@ -1230,12 +1158,12 @@ _mu_zsh_slash() {
 
   _mu_zsh_resolve_speculative_model_colon
 
-  if [[ "$MU_ZSH_MODE" == mu && "$BUFFER" != /* && "$CURSOR" -eq 0 ]]; then
+  if [[ "$_MU_ZSH_MODE" == mu && "$BUFFER" != /* && "$CURSOR" -eq 0 ]]; then
     should_complete=1
   fi
 
-  if [[ -n "$MU_ZSH_ORIGINAL_SLASH_WIDGET" && "$MU_ZSH_ORIGINAL_SLASH_WIDGET" != _mu_zsh_slash ]]; then
-    zle "$MU_ZSH_ORIGINAL_SLASH_WIDGET"
+  if [[ -n "$_MU_ZSH_ORIGINAL_SLASH_WIDGET" && "$_MU_ZSH_ORIGINAL_SLASH_WIDGET" != _mu_zsh_slash ]]; then
+    zle "$_MU_ZSH_ORIGINAL_SLASH_WIDGET"
   else
     zle .self-insert
   fi
@@ -1244,7 +1172,7 @@ _mu_zsh_slash() {
 }
 
 _mu_zsh_accept() {
-  if [[ "$MU_ZSH_MODE" != mu ]]; then
+  if [[ "$_MU_ZSH_MODE" != mu ]]; then
     zle .accept-line
     return
   fi
@@ -1257,16 +1185,15 @@ _mu_zsh_accept() {
     return
   fi
 
-  MU_ZSH_PENDING_INPUT=$input
-  MU_ZSH_PENDING_PROMPT=$PROMPT
-  MU_ZSH_PENDING_SUBMIT=1
+  _MU_ZSH_PENDING_INPUT=$input
+  _MU_ZSH_PENDING_PROMPT=$PROMPT
   # Accept the visible draft normally. The line-finish hook freezes that
   # display and clears the command before zsh can parse it.
   zle .accept-line
 }
 
 _mu_zsh_finish_pending() {
-  (( MU_ZSH_PENDING_SUBMIT )) || return 0
+  [[ -n "$_MU_ZSH_PENDING_INPUT" ]] || return 0
 
   _mu_zsh_resolve_speculative_model_colon
   zle -I
@@ -1275,27 +1202,26 @@ _mu_zsh_finish_pending() {
 }
 
 _mu_zsh_dispatch_pending() {
-  (( MU_ZSH_PENDING_SUBMIT )) || return 0
+  [[ -n "$_MU_ZSH_PENDING_INPUT" ]] || return 0
 
-  local input=$MU_ZSH_PENDING_INPUT
-  PROMPT=$MU_ZSH_PENDING_PROMPT
-  MU_ZSH_PENDING_INPUT=
-  MU_ZSH_PENDING_PROMPT=
-  MU_ZSH_PENDING_SUBMIT=0
+  local input=$_MU_ZSH_PENDING_INPUT
+  PROMPT=$_MU_ZSH_PENDING_PROMPT
+  _MU_ZSH_PENDING_INPUT=
+  _MU_ZSH_PENDING_PROMPT=
 
   if [[ "$input" == /* ]]; then
     _mu_zsh_run_slash_command "$input"
   else
     _mu_zsh_submit_prompt "$input"
   fi
-  [[ "$MU_ZSH_MODE" == mu ]] && _mu_zsh_refresh_prompt
+  [[ "$_MU_ZSH_MODE" == mu ]] && _mu_zsh_refresh_prompt
 }
 
 _mu_zsh_line_init() {
   _mu_zsh_resolve_speculative_model_colon
   _mu_zsh_reset_history_navigation
-  [[ "$MU_ZSH_MODE" == mu ]] && _mu_zsh_refresh_prompt
-  if [[ "$MU_ZSH_MODE" == mu ]]; then
+  [[ "$_MU_ZSH_MODE" == mu ]] && _mu_zsh_refresh_prompt
+  if [[ "$_MU_ZSH_MODE" == mu ]]; then
     zle -K mumode 2>/dev/null || true
   fi
 }
@@ -1351,7 +1277,7 @@ mu-zsh-mode() {
 mu-zsh-exit-mode() {
   _mu_zsh_exit_mode
   zle reset-prompt
-  zle -K "${MU_ZSH_SAVED_KEYMAP:-main}" 2>/dev/null || zle -K main 2>/dev/null || true
+  zle -K "${_MU_ZSH_SAVED_KEYMAP:-main}" 2>/dev/null || zle -K main 2>/dev/null || true
 }
 
 _mu_zsh_configure_keymap() {
@@ -1380,7 +1306,7 @@ _mu_zsh_configure_keymap() {
   # already handles by cancelling the draft and redrawing a fresh mu> prompt.
 }
 
-_mu_zsh_sync_state
+_mu_zsh_adopt_seeded_bundle
 
 if [[ -o zle ]]; then
   autoload -Uz add-zsh-hook 2>/dev/null || true

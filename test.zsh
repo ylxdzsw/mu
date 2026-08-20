@@ -35,8 +35,8 @@ assert_command_reply() {
   shift
   local -a expected
   expected=("$@")
-  if [[ "${(j:\0:)MU_ZSH_COMMAND_REPLY}" != "${(j:\0:)expected}" ]]; then
-    fail "$label: ${(q)MU_ZSH_COMMAND_REPLY[@]}"
+  if [[ "${(j:\0:)_MU_ZSH_TEST_COMMAND_REPLY}" != "${(j:\0:)expected}" ]]; then
+    fail "$label: ${(q)_MU_ZSH_TEST_COMMAND_REPLY[@]}"
   fi
 }
 
@@ -108,14 +108,6 @@ if [[ "$1" == "new" ]]; then
   print -r -- "ses_01234567"
   exit 0
 fi
-if [[ "$1" == "--output" && "$3" == "review.md" ]]; then
-  print -r -- "$*" >> "$MU_ZSH_FAKE_LOG"
-  if [[ ! -t 0 ]]; then
-    prompt=$(cat)
-    [[ -n "$prompt" ]] && print -r -- "prompt=$prompt" >> "$MU_ZSH_FAKE_LOG"
-  fi
-  exit 0
-fi
 if [[ "$1" == "compact" ]]; then
   print -r -- "$*" >> "$MU_ZSH_FAKE_LOG"
   if [[ -p /dev/stdin ]]; then
@@ -139,9 +131,9 @@ prompt=$(cat)
 print -r -- "prompt=$prompt" >> "$MU_ZSH_FAKE_LOG"
 EOF
 chmod +x "$prompt_fake_bin/mu"
-MU_ZSH_BIN=$prompt_fake_bin/mu
+path=("$prompt_fake_bin" $path)
 
-[[ "$MU_ZSH_MODE" == shell ]] || fail "starts in shell mode"
+[[ "$_MU_ZSH_MODE" == shell ]] || fail "starts in shell mode"
 
 history_input=$'first line\nsecond $HOME `tick` "quoted"'
 history_entry="true mu-history ${(qqq)history_input}; print replay"
@@ -154,13 +146,12 @@ CURSOR=0
 PROMPT="%# "
 RPROMPT="right"
 _mu_zsh_enter_mode
-[[ "$MU_ZSH_MODE" == mu ]] || fail "enters mu mode"
+[[ "$_MU_ZSH_MODE" == mu ]] || fail "enters mu mode"
 [[ "$BUFFER" == "echo hello" ]] || fail "preserves buffer in mu mode"
 [[ "$CURSOR" -eq 0 ]] || fail "preserves cursor in mu mode"
 escaped_pwd=${PWD//\%/%%}
 expected_prompt="%F{12}prompt-test-model%f %F{6}${escaped_pwd}%f
 mu> "
-[[ "$PROMPT" == "$MU_ZSH_PROMPT" ]] || fail "sets mu prompt"
 [[ "$PROMPT" == "$expected_prompt" ]] || fail "renders two-line mu prompt"
 
 short_fake_bin=$tmpdir/short-bin
@@ -175,12 +166,12 @@ exit 1
 EOF
 chmod +x "$short_fake_bin/mu"
 MU_ZSH_SESSION_ID=short-session
-MU_ZSH_TRACKED_SCOPE=$(current_scope_key)
-MU_ZSH_BIN=$short_fake_bin/mu
+_MU_ZSH_TRACKED_SCOPE=$(current_scope_key)
+path=("$short_fake_bin" $path)
 short_prompt=$(_mu_zsh_build_mode_prompt)
-MU_ZSH_BIN=$prompt_fake_bin/mu
+path=("$prompt_fake_bin" $path)
 _mu_zsh_clear_session_state
-[[ "$short_prompt" == *"%F{$MU_ZSH_PROMPT_CONTEXT_COLOR}~0%%%f"* ]] || fail "marks estimated context for an attached short session"
+[[ "$short_prompt" == *"%F{5}~0%%%f"* ]] || fail "marks estimated context for an attached short session"
 
 compact_fake_bin=$tmpdir/compact-bin
 mkdir -p -- "$compact_fake_bin"
@@ -194,32 +185,22 @@ exit 1
 EOF
 chmod +x "$compact_fake_bin/mu"
 MU_ZSH_SESSION_ID=compact-session
-MU_ZSH_TRACKED_SCOPE=$(current_scope_key)
-MU_ZSH_BIN=$compact_fake_bin/mu
+_MU_ZSH_TRACKED_SCOPE=$(current_scope_key)
+path=("$compact_fake_bin" $path)
 compact_prompt=$(_mu_zsh_build_mode_prompt)
-MU_ZSH_BIN=$prompt_fake_bin/mu
+path=("$prompt_fake_bin" $path)
 _mu_zsh_clear_session_state
-[[ "$compact_prompt" == *"%F{$MU_ZSH_PROMPT_CONTEXT_COLOR}[to compact]%f"* ]] || fail "marks sessions above the soft compaction threshold"
+[[ "$compact_prompt" == *"%F{5}[to compact]%f"* ]] || fail "marks sessions above the soft compaction threshold"
 
 BUFFER="edited in mu"
 CURSOR=3
 _mu_zsh_exit_mode
-[[ "$MU_ZSH_MODE" == shell ]] || fail "exits mu mode"
+[[ "$_MU_ZSH_MODE" == shell ]] || fail "exits mu mode"
 [[ "$BUFFER" == "edited in mu" ]] || fail "preserves current buffer when exiting mu mode"
 [[ "$CURSOR" -eq 3 ]] || fail "preserves current cursor when exiting mu mode"
 [[ "$PROMPT" == "%# " ]] || fail "restores prompt"
 [[ "$RPROMPT" == "right" ]] || fail "restores right prompt"
 
-typeset -ga mu_test_hooks=()
-_mu_zsh_test_enter_hook() {
-  mu_test_hooks+=("enter:$MU_ZSH_MODE")
-}
-_mu_zsh_test_exit_hook() {
-  mu_test_hooks+=("exit:$MU_ZSH_MODE")
-}
-
-MU_ZSH_ENTER_HOOKS=(_mu_zsh_test_enter_hook)
-MU_ZSH_EXIT_HOOKS=(_mu_zsh_test_exit_hook)
 ZSH_HIGHLIGHT_HIGHLIGHTERS=(main brackets)
 BUFFER="hook prompt"
 CURSOR=${#BUFFER}
@@ -227,14 +208,10 @@ PROMPT="%# "
 RPROMPT="right"
 _mu_zsh_enter_mode
 [[ "${#ZSH_HIGHLIGHT_HIGHLIGHTERS[@]}" -eq 0 ]] || fail "disables syntax highlighters in mu mode"
-[[ "${(j:,:)mu_test_hooks}" == "enter:mu" ]] || fail "runs enter hooks after switching modes"
 _mu_zsh_exit_mode
 [[ "${(j:,:)ZSH_HIGHLIGHT_HIGHLIGHTERS}" == "main,brackets" ]] || fail "restores syntax highlighters after exit"
-[[ "${(j:,:)mu_test_hooks}" == "enter:mu,exit:shell" ]] || fail "runs exit hooks after restoring shell mode"
-MU_ZSH_ENTER_HOOKS=()
-MU_ZSH_EXIT_HOOKS=()
 
-MU_ZSH_MODE=mu
+_MU_ZSH_MODE=mu
 BUFFER="first second"
 CURSOR=5
 _mu_zsh_insert_newline
@@ -247,9 +224,9 @@ PROMPT="%# "
 RPROMPT="right"
 KEYMAP=main
 _mu_zsh_enter_mode
-[[ "$MU_ZSH_SAVED_KEYMAP" == main ]] || fail "saves current keymap"
+[[ "$_MU_ZSH_SAVED_KEYMAP" == main ]] || fail "saves current keymap"
 _mu_zsh_exit_mode
-[[ "$MU_ZSH_MODE" == shell ]] || fail "mode exit path returns to shell"
+[[ "$_MU_ZSH_MODE" == shell ]] || fail "mode exit path returns to shell"
 [[ "$BUFFER" == "draft prompt" ]] || fail "mode exit path preserves shell buffer"
 
 primary_root=$tmpdir/primary-project
@@ -281,11 +258,11 @@ chmod +x "$global_fake_bin/mu"
 global_pwd=$tmpdir/global-scope
 mkdir -p -- "$global_pwd"
 saved_pwd=$PWD
-MU_ZSH_BIN=$global_fake_bin/mu
+path=("$global_fake_bin" $path)
 builtin cd "$global_pwd"
 global_prompt=$(_mu_zsh_build_mode_prompt)
 builtin cd "$saved_pwd"
-MU_ZSH_BIN=$prompt_fake_bin/mu
+path=("$prompt_fake_bin" $path)
 escaped_global_pwd=${global_pwd//\%/%%}
 [[ "$global_prompt" == *"%F{6}${escaped_global_pwd}%f %F{8}(global)%f"* ]] || fail "shows global marker outside project scope"
 
@@ -300,11 +277,10 @@ fi
 exit 1
 EOF
 chmod +x "$unclean_fake_bin/mu"
-MU_ZSH_BIN=$unclean_fake_bin/mu
+path=("$unclean_fake_bin" $path)
 unclean_prompt=$(_mu_zsh_build_mode_prompt)
-MU_ZSH_BIN=$prompt_fake_bin/mu
-escaped_unclean=${MU_ZSH_PROMPT_UNCLEAN_TEXT//\%/%%}
-[[ "$unclean_prompt" == *"%F{$MU_ZSH_PROMPT_UNCLEAN_COLOR}[${escaped_unclean}]%f"* ]] || fail "shows unclean marker when last turn was interrupted"
+path=("$prompt_fake_bin" $path)
+[[ "$unclean_prompt" == *"%F{9}[interrupted · /retry]%f"* ]] || fail "shows unclean marker when last turn was interrupted"
 
 clean_fake_bin=$tmpdir/clean-bin
 mkdir -p -- "$clean_fake_bin"
@@ -317,16 +293,16 @@ fi
 exit 1
 EOF
 chmod +x "$clean_fake_bin/mu"
-MU_ZSH_BIN=$clean_fake_bin/mu
+path=("$clean_fake_bin" $path)
 clean_prompt=$(_mu_zsh_build_mode_prompt)
-MU_ZSH_BIN=$prompt_fake_bin/mu
-[[ "$clean_prompt" != *"[${escaped_unclean}]"* ]] || fail "omits unclean marker when last turn was clean"
+path=("$prompt_fake_bin" $path)
+[[ "$clean_prompt" != *"[interrupted · /retry]"* ]] || fail "omits unclean marker when last turn was clean"
 
-MU_ZSH_ORIGINAL_TAB_WIDGET=
-MU_ZSH_ORIGINAL_SLASH_WIDGET=
+_MU_ZSH_ORIGINAL_TAB_WIDGET=
+_MU_ZSH_ORIGINAL_SLASH_WIDGET=
 _mu_zsh_save_widget_bindings
-[[ -n "$MU_ZSH_ORIGINAL_TAB_WIDGET" ]] || fail "saves tab widget fallback"
-[[ -n "$MU_ZSH_ORIGINAL_SLASH_WIDGET" ]] || fail "saves slash widget fallback"
+[[ -n "$_MU_ZSH_ORIGINAL_TAB_WIDGET" ]] || fail "saves tab widget fallback"
+[[ -n "$_MU_ZSH_ORIGINAL_SLASH_WIDGET" ]] || fail "saves slash widget fallback"
 scope_discovery_dir=$tmpdir/scope-discovery
 mkdir -p -- "$scope_discovery_dir"
 saved_pwd=$PWD
@@ -345,75 +321,69 @@ print -r -- '../..' > "$primary_scope_dir/.git/worktrees/feature/commondir"
 builtin cd "$primary_scope_dir"
 primary_scope_key=$(current_scope_key)
 MU_ZSH_SESSION_ID=session-primary
-MU_ZSH_MODEL=model-primary
-MU_ZSH_TRACKED_SCOPE=$primary_scope_key
+_MU_ZSH_MODEL=model-primary
+_MU_ZSH_TRACKED_SCOPE=$primary_scope_key
 builtin cd "$worktree_scope_dir/src"
 [[ "$(current_scope_key)" == "$primary_scope_key" ]] || fail "linked worktree shares the primary project scope"
-_mu_zsh_sync_state
-[[ "$MU_ZSH_EFFECTIVE_SESSION_ID" == session-primary ]] || fail "linked worktree reuses the primary project session"
-[[ "$MU_ZSH_EFFECTIVE_MODEL" == model-primary ]] || fail "linked worktree reuses the primary project model"
+_mu_zsh_bundle_active || fail "linked worktree activates the primary project bundle"
+[[ "$MU_ZSH_SESSION_ID" == session-primary ]] || fail "linked worktree reuses the primary project session"
+[[ "$_MU_ZSH_MODEL" == model-primary ]] || fail "linked worktree reuses the primary project model"
 _mu_zsh_clear_session_state
 _mu_zsh_clear_model_state
-MU_ZSH_TRACKED_SCOPE=
+_MU_ZSH_TRACKED_SCOPE=
 mkdir -p -- "$worktree_scope_dir/.mu"
 [[ "$(current_scope_key)" == "project:$worktree_scope_dir" ]] || fail "worktree-local .mu creates an independent scope"
 builtin cd "$saved_pwd"
 HOME=$saved_home
 
-MU_ZSH_BIN=mu
-MU_ZSH_OUTPUT=
 MU_ZSH_SESSION_ID=
-MU_ZSH_TRACKED_SCOPE=
-_mu_zsh_base_command_reply
-assert_command_reply "inherits configured output by default" mu
+_MU_ZSH_TRACKED_SCOPE=
+_mu_zsh_base_command _MU_ZSH_TEST_COMMAND_REPLY
+assert_command_reply "builds unattached command" mu
 
-MU_ZSH_OUTPUT=detail
 MU_ZSH_SESSION_ID=abc123
-MU_ZSH_TRACKED_SCOPE=$(current_scope_key)
-_mu_zsh_base_command_reply
-assert_command_reply "builds attached command" mu --output detail -s abc123
+_MU_ZSH_TRACKED_SCOPE=$(current_scope_key)
+_mu_zsh_base_command _MU_ZSH_TEST_COMMAND_REPLY
+assert_command_reply "builds attached command" mu -s abc123
 
 MU_ZSH_SESSION_ID=
-MU_ZSH_TRACKED_SCOPE=
-_mu_zsh_base_command_reply
-assert_command_reply "builds new-session command" mu --output detail
-MU_ZSH_BIN=$prompt_fake_bin/mu
+_MU_ZSH_TRACKED_SCOPE=
+_mu_zsh_base_command _MU_ZSH_TEST_COMMAND_REPLY
+assert_command_reply "builds new-session command" mu
+path=("$prompt_fake_bin" $path)
 
-MU_ZSH_MODEL=openai/gpt
-MU_ZSH_TRACKED_SCOPE=$(current_scope_key)
-_mu_zsh_base_command_reply
-assert_command_reply "builds pending-model command" "$prompt_fake_bin/mu" --output detail --model openai/gpt
+_MU_ZSH_MODEL=openai/gpt
+_MU_ZSH_TRACKED_SCOPE=$(current_scope_key)
+_mu_zsh_base_command _MU_ZSH_TEST_COMMAND_REPLY
+assert_command_reply "builds pending-model command" mu --model openai/gpt
 status_json=$(_mu_zsh_status_json)
 [[ "$status_json" == *"\"canonical\":\"openai/gpt\""* ]] || fail "status uses pending model"
 MU_ZSH_SESSION_ID=abc123
-_mu_zsh_base_command_reply
-assert_command_reply "builds attached pending-model command" "$prompt_fake_bin/mu" --output detail -s abc123 --model openai/gpt
+_mu_zsh_base_command _MU_ZSH_TEST_COMMAND_REPLY
+assert_command_reply "builds attached pending-model command" mu -s abc123 --model openai/gpt
 _mu_zsh_clear_model_state
 _mu_zsh_clear_session_state
 
 export MU_ZSH_FAKE_LOG=${TMPDIR:-/tmp}/mu-zsh-test-${$}.log
 rm -f "$MU_ZSH_FAKE_LOG"
-MU_ZSH_OUTPUT=detail
 MU_ZSH_SESSION_ID=
 _mu_zsh_submit_prompt "first prompt"
 [[ "$MU_ZSH_SESSION_ID" == "ses_01234567" ]] || fail "captures session id after explicit session creation"
 
 _mu_zsh_submit_prompt "second prompt"
-grep -q -- "--output detail" "$MU_ZSH_FAKE_LOG" || fail "passes output mode"
 grep -q -- "-s ses_01234567" "$MU_ZSH_FAKE_LOG" || fail "passes session id on later submit"
 grep -q -- "prompt=first prompt" "$MU_ZSH_FAKE_LOG" || fail "sends first prompt on stdin"
 grep -q -- "prompt=second prompt" "$MU_ZSH_FAKE_LOG" || fail "sends second prompt on stdin"
 
 rm -f "$MU_ZSH_FAKE_LOG"
 
-MU_ZSH_BIN=$prompt_fake_bin/mu
-MU_ZSH_OUTPUT=detail
+path=("$prompt_fake_bin" $path)
 MU_ZSH_SESSION_ID=
-MU_ZSH_TRACKED_SCOPE=
+_MU_ZSH_TRACKED_SCOPE=
 command_candidates=("${(@f)$(_mu_zsh_slash_command_candidates)}")
 [[ "${(j:,:)command_candidates}" == "/attach,/load,/model,/review.md" ]] || fail "hides session commands without a valid session"
 MU_ZSH_SESSION_ID=tracked-session
-MU_ZSH_TRACKED_SCOPE=$(current_scope_key)
+_MU_ZSH_TRACKED_SCOPE=$(current_scope_key)
 command_candidates=("${(@f)$(_mu_zsh_slash_command_candidates)}")
 [[ "${(j:,:)command_candidates}" == "/attach,/load,/model,/new,/retry,/compact,/review.md" ]] || fail "shows session commands with a valid session: ${(j:,:)command_candidates}"
 BUFFER="/ret"
@@ -450,16 +420,17 @@ prefix_effort_suffixes=("${(@f)$(_mu_zsh_model_completion_candidates "gp" 1)}")
 prefix_effort_suffixes=("${(@)prefix_effort_suffixes:#}")
 (( ${#prefix_effort_suffixes[@]} == 0 )) ||
   fail "model prefixes do not switch to the effort menu"
-if _mu_zsh_model_completion_transition "gpt"; then
+typeset -a transition_efforts
+if _mu_zsh_model_completion_transition "gpt" transition_efforts; then
   fail "exact models shadowed by longer model names do not transition to efforts"
 fi
-_mu_zsh_model_completion_transition "gpt-5.6-luna" ||
+_mu_zsh_model_completion_transition "gpt-5.6-luna" transition_efforts ||
   fail "unshadowed exact models transition to efforts"
-[[ "${(j:,:)MU_ZSH_MODEL_COMPLETION_EFFORTS}" == ":max,:none" ]] ||
+[[ "${(j:,:)transition_efforts}" == ":max,:none" ]] ||
   fail "transition exposes the completed model's efforts"
-_mu_zsh_model_completion_transition "shared" ||
+_mu_zsh_model_completion_transition "shared" transition_efforts ||
   fail "floating exact models transition to efforts"
-[[ "${(j:,:)MU_ZSH_MODEL_COMPLETION_EFFORTS}" == ":low,:medium" ]] ||
+[[ "${(j:,:)transition_efforts}" == ":low,:medium" ]] ||
   fail "floating transition merges provider efforts"
 captured_compadd_calls=()
 compadd() { captured_compadd_calls+=("${(j:,:)@}") }
@@ -477,8 +448,7 @@ model_candidates=("${(@f)$(_mu_zsh_model_completion_candidates "gpt:")}")
 [[ " ${(j: :)model_candidates} " == *" gpt:provider-custom "* ]] || fail "shows provider-defined effort strings"
 [[ " ${(j: :)model_candidates} " == *" shared:low "* ]] || fail "merges first floating-model provider efforts"
 [[ " ${(j: :)model_candidates} " == *" shared:medium "* ]] || fail "merges floating-model effort suggestions"
-MU_ZSH_MODEL=invalid/removed
-_mu_zsh_sync_state
+_MU_ZSH_MODEL=invalid/removed
 model_candidates=("${(@f)$(_mu_zsh_model_completion_candidates "")}")
 [[ " ${(j: :)model_candidates} " == *" openai/gpt "* ]] || fail "stale model override does not block model discovery"
 _mu_zsh_clear_model_state
@@ -491,31 +461,27 @@ completion_candidates=("${(@f)$(_mu_zsh_completion_candidates)}")
 attachment_one=$tmpdir/screenshot.png
 attachment_two=$tmpdir/recording.wav
 touch -- "$attachment_one" "$attachment_two"
-MU_ZSH_MODEL=openai/gpt
-MU_ZSH_EFFECTIVE_MODEL=openai/gpt
-MU_ZSH_PENDING_ATTACHMENTS=("$attachment_one")
-MU_ZSH_EFFECTIVE_ATTACHMENT_COUNT=1
-MU_ZSH_OUTPUT=
+_MU_ZSH_MODEL=openai/gpt
+_MU_ZSH_PENDING_ATTACHMENTS=("$attachment_one")
 rm -f "$MU_ZSH_FAKE_LOG"
 load_output=$tmpdir/load-output
 _mu_zsh_run_slash_command "/load ses_0000000b" > "$load_output"
 [[ "$MU_ZSH_SESSION_ID" == ses_0000000b ]] || fail "load attaches the selected session"
-[[ "$MU_ZSH_MODEL" == openai/gpt ]] || fail "load preserves the model override"
-(( ${#MU_ZSH_PENDING_ATTACHMENTS[@]} == 1 )) || fail "load preserves pending attachments"
+[[ "$_MU_ZSH_MODEL" == openai/gpt ]] || fail "load preserves the model override"
+(( ${#_MU_ZSH_PENDING_ATTACHMENTS[@]} == 1 )) || fail "load preserves pending attachments"
 grep -Fq -- "Loaded transcript." "$load_output" || fail "load renders the selected transcript"
 grep -Fq -- "[mu] loaded session ses_0000000b" "$load_output" || fail "load confirms the selected session"
 grep -Fq -- "transcript --session ses_0000000b --output concise" "$MU_ZSH_FAKE_LOG" ||
   fail "load uses the configured output density"
-MU_ZSH_OUTPUT=full
 rm -f "$MU_ZSH_FAKE_LOG"
 _mu_zsh_run_slash_command "/load ses_0000000c" >/dev/null
-grep -Fq -- "transcript --session ses_0000000c --output full" "$MU_ZSH_FAKE_LOG" ||
-  fail "load uses the shell output override"
+grep -Fq -- "transcript --session ses_0000000c --output concise" "$MU_ZSH_FAKE_LOG" ||
+  fail "load resolves each session output density"
 rm -f "$MU_ZSH_FAKE_LOG"
 load_output=$tmpdir/load-current-output
 _mu_zsh_run_slash_command "/load" > "$load_output"
 [[ "$MU_ZSH_SESSION_ID" == ses_0000000d ]] || fail "argument-free load attaches current-session"
-grep -Fq -- "transcript --session ses_0000000d --output full" "$MU_ZSH_FAKE_LOG" ||
+grep -Fq -- "transcript --session ses_0000000d --output concise" "$MU_ZSH_FAKE_LOG" ||
   fail "argument-free load replays current-session explicitly"
 grep -Fq -- "[mu] loaded session ses_0000000d" "$load_output" ||
   fail "argument-free load confirms the resolved session"
@@ -533,57 +499,55 @@ if _mu_zsh_run_slash_command "/load ses_0000000b extra" >/dev/null; then
   fail "load should accept exactly one session id"
 fi
 MU_ZSH_SESSION_ID=tracked-session
-MU_ZSH_EFFECTIVE_SESSION_ID=tracked-session
-MU_ZSH_OUTPUT=detail
-MU_ZSH_PENDING_ATTACHMENTS=()
+_MU_ZSH_PENDING_ATTACHMENTS=()
 _mu_zsh_run_slash_command "/attach $attachment_one"
 _mu_zsh_run_slash_command "/attach $attachment_two"
-(( ${#MU_ZSH_PENDING_ATTACHMENTS[@]} == 2 )) || fail "attach slash command queues repeated files"
+(( ${#_MU_ZSH_PENDING_ATTACHMENTS[@]} == 2 )) || fail "attach slash command queues repeated files"
 pending_prompt=$(_mu_zsh_build_mode_prompt)
 [[ "$pending_prompt" == *'[2 attachments]'* ]] || fail "prompt shows pending attachment count"
 _mu_zsh_run_slash_command "/model gpt"
-(( ${#MU_ZSH_PENDING_ATTACHMENTS[@]} == 2 )) || fail "model command preserves pending attachments"
+(( ${#_MU_ZSH_PENDING_ATTACHMENTS[@]} == 2 )) || fail "model command preserves pending attachments"
 _mu_zsh_clear_model_state
 rm -f "$MU_ZSH_FAKE_LOG"
 _mu_zsh_submit_prompt "inspect these"
 grep -Fq -- "-a $attachment_one -a $attachment_two" "$MU_ZSH_FAKE_LOG" || fail "prompt forwards every pending attachment"
-(( ${#MU_ZSH_PENDING_ATTACHMENTS[@]} == 0 )) || fail "prompt consumes pending attachments"
+(( ${#_MU_ZSH_PENDING_ATTACHMENTS[@]} == 0 )) || fail "prompt consumes pending attachments"
 
 _mu_zsh_run_slash_command "/attach $attachment_one"
 rm -f "$MU_ZSH_FAKE_LOG"
 _mu_zsh_run_slash_command "/review.md Inspect image"
 grep -Fq -- "-a $attachment_one review.md" "$MU_ZSH_FAKE_LOG" || fail "custom command forwards pending attachments"
-(( ${#MU_ZSH_PENDING_ATTACHMENTS[@]} == 0 )) || fail "custom command consumes pending attachments"
+(( ${#_MU_ZSH_PENDING_ATTACHMENTS[@]} == 0 )) || fail "custom command consumes pending attachments"
 
 _mu_zsh_run_slash_command "/attach $attachment_one"
 _mu_zsh_run_slash_command "/attach --clear"
-(( ${#MU_ZSH_PENDING_ATTACHMENTS[@]} == 0 )) || fail "attach clear discards pending attachments"
+(( ${#_MU_ZSH_PENDING_ATTACHMENTS[@]} == 0 )) || fail "attach clear discards pending attachments"
 if _mu_zsh_run_slash_command "/attach $tmpdir/missing.png"; then
   fail "attach should reject unreadable files"
 fi
 
 rm -f "$MU_ZSH_FAKE_LOG"
 _mu_zsh_run_slash_command "/retry"
-grep -q -- "retry -s tracked-session --output detail" "$MU_ZSH_FAKE_LOG" || fail "retry slash command targets tracked session"
+grep -q -- "retry -s tracked-session" "$MU_ZSH_FAKE_LOG" || fail "retry slash command targets tracked session"
 _mu_zsh_run_slash_command "/model gpt"
 rm -f "$MU_ZSH_FAKE_LOG"
 _mu_zsh_run_slash_command "/retry"
-grep -q -- "retry -s tracked-session --model openai/gpt --output detail" "$MU_ZSH_FAKE_LOG" || fail "retry slash command forwards pending model"
+grep -q -- "retry -s tracked-session --model openai/gpt" "$MU_ZSH_FAKE_LOG" || fail "retry slash command forwards pending model"
 _mu_zsh_clear_model_state
 rm -f "$MU_ZSH_FAKE_LOG"
 _mu_zsh_run_slash_command "/compact"
-grep -q -- "compact --session tracked-session --output detail" "$MU_ZSH_FAKE_LOG" || fail "compact slash command forwards session and output"
+grep -q -- "compact --session tracked-session" "$MU_ZSH_FAKE_LOG" || fail "compact slash command forwards the session"
 rm -f "$MU_ZSH_FAKE_LOG"
 _mu_zsh_run_slash_command $'/compact Focus on authentication\nKeep concrete API shapes'
-grep -q -- "compact --session tracked-session --output detail" "$MU_ZSH_FAKE_LOG" || fail "focused compact forwards session and output"
+grep -q -- "compact --session tracked-session" "$MU_ZSH_FAKE_LOG" || fail "focused compact forwards the session"
 compact_prompt=$(cat "$MU_ZSH_FAKE_LOG")
 [[ "$compact_prompt" == *$'prompt=Focus on authentication\nKeep concrete API shapes'* ]] || fail "focused compact pipes multiline instruction"
 rm -f "$MU_ZSH_FAKE_LOG"
 _mu_zsh_run_slash_command "/review.md"
-grep -q -- "--output detail -s tracked-session review.md" "$MU_ZSH_FAKE_LOG" || fail "custom slash command targets tracked session"
+grep -q -- "-s tracked-session review.md" "$MU_ZSH_FAKE_LOG" || fail "custom slash command targets tracked session"
 rm -f "$MU_ZSH_FAKE_LOG"
 _mu_zsh_run_slash_command "/review.md Focus on authentication"
-grep -q -- "--output detail -s tracked-session review.md" "$MU_ZSH_FAKE_LOG" || fail "custom slash command keeps tracked session with instruction"
+grep -q -- "-s tracked-session review.md" "$MU_ZSH_FAKE_LOG" || fail "custom slash command keeps tracked session with instruction"
 grep -Fxq -- "prompt=Focus on authentication" "$MU_ZSH_FAKE_LOG" || fail "custom slash command pipes instruction"
 rm -f "$MU_ZSH_FAKE_LOG"
 _mu_zsh_run_slash_command $'/review.md First line\nSecond line'
@@ -592,12 +556,11 @@ custom_prompt=$(cat "$MU_ZSH_FAKE_LOG")
 _mu_zsh_run_slash_command "/model gpt"
 _mu_zsh_run_slash_command "/attach $attachment_one"
 _mu_zsh_run_slash_command "/new"
-[[ -z "$MU_ZSH_SESSION_ID" && -n "$MU_ZSH_TRACKED_SCOPE" ]] || fail "new slash command lazily clears only the tracked session"
-[[ "$MU_ZSH_MODEL" == openai/gpt ]] || fail "new slash command preserves the model override"
-(( ${#MU_ZSH_PENDING_ATTACHMENTS[@]} == 1 )) || fail "new slash command preserves pending attachments"
+[[ -z "$MU_ZSH_SESSION_ID" && -n "$_MU_ZSH_TRACKED_SCOPE" ]] || fail "new slash command lazily clears only the tracked session"
+[[ "$_MU_ZSH_MODEL" == openai/gpt ]] || fail "new slash command preserves the model override"
+(( ${#_MU_ZSH_PENDING_ATTACHMENTS[@]} == 1 )) || fail "new slash command preserves pending attachments"
 _mu_zsh_clear_model_state
-MU_ZSH_PENDING_ATTACHMENTS=()
-MU_ZSH_EFFECTIVE_ATTACHMENT_COUNT=0
+_MU_ZSH_PENDING_ATTACHMENTS=()
 rm -f "$MU_ZSH_FAKE_LOG"
 _mu_zsh_run_slash_command "/review.md"
 [[ "$MU_ZSH_SESSION_ID" == "ses_01234567" ]] || fail "custom slash command captures new session id"
@@ -617,8 +580,8 @@ if _mu_zsh_run_slash_command "/unknown"; then
   fail "unknown slash command should fail"
 fi
 _mu_zsh_run_slash_command "/model gpt"
-[[ "$MU_ZSH_MODEL" == openai/gpt ]] || fail "model slash command records canonical model"
-[[ "$MU_ZSH_TRACKED_SCOPE" == "$(current_scope_key)" ]] || fail "model slash command records scope"
+[[ "$_MU_ZSH_MODEL" == openai/gpt ]] || fail "model slash command records canonical model"
+[[ "$_MU_ZSH_TRACKED_SCOPE" == "$(current_scope_key)" ]] || fail "model slash command records scope"
 if _mu_zsh_run_slash_command "/model invalid/model"; then
   fail "model slash command should validate model refs"
 fi
@@ -650,7 +613,7 @@ if [[ "$1" == "status" ]]; then
     shift
   done
   [[ "$model" == invalid/* ]] && exit 1
-  print -r -- "{\"model\":{\"provider_id\":\"test\",\"model_id\":\"$model\",\"effort\":null,\"canonical\":\"$model\"},\"context_tokens\":10,\"context_window\":100,\"project_root\":\"$scope_root\"}"
+  print -r -- "{\"model\":{\"provider_id\":\"test\",\"model_id\":\"$model\",\"effort\":null,\"canonical\":\"$model\"},\"output\":\"concise\",\"context_tokens\":10,\"context_window\":100,\"project_root\":\"$scope_root\"}"
   exit 0
 fi
 if [[ "$1" == "new" ]]; then
@@ -672,26 +635,23 @@ prompt=$(cat)
 print -r -- "prompt=$prompt" >> "$MU_ZSH_SCOPE_LOG"
 EOF
 chmod +x "$scope_fake_bin/mu"
-MU_ZSH_BIN=$scope_fake_bin/mu
-MU_ZSH_OUTPUT=detail
+path=("$scope_fake_bin" $path)
 export MU_ZSH_SCOPE_LOG=${TMPDIR:-/tmp}/mu-zsh-scope-${$}.log
 rm -f "$MU_ZSH_SCOPE_LOG"
 MU_ZSH_SESSION_ID=
-MU_ZSH_TRACKED_SCOPE=
-MU_ZSH_EFFECTIVE_SESSION_ID=
+_MU_ZSH_TRACKED_SCOPE=
 
 saved_pwd=$PWD
 builtin cd "$project_a/subdir"
 _mu_zsh_submit_prompt "project a prompt"
 [[ "$MU_ZSH_SESSION_ID" == "ses_0000000a" ]] || fail "creates a scoped session for the first project"
 
-MU_ZSH_MODEL=model-for-a
-MU_ZSH_PENDING_ATTACHMENTS=("$attachment_one")
-_mu_zsh_sync_state
+_MU_ZSH_MODEL=model-for-a
+_MU_ZSH_PENDING_ATTACHMENTS=("$attachment_one")
 
 builtin cd "$project_b/subdir"
-_mu_zsh_base_command_reply
-assert_command_reply "does not reuse another project's session before submitting there" "$scope_fake_bin/mu" --output detail
+_mu_zsh_base_command _MU_ZSH_TEST_COMMAND_REPLY
+assert_command_reply "does not reuse another project's session before submitting there" mu
 parked_prompt=$(_mu_zsh_build_mode_prompt)
 [[ "$parked_prompt" != *'[1 attachments]'* ]] || fail "prompt hides another scope's attachments"
 : > "$MU_ZSH_SCOPE_LOG"
@@ -700,9 +660,9 @@ status_json=$(_mu_zsh_status_json)
 ! grep -q -- "-s ses_0000000a" "$MU_ZSH_SCOPE_LOG" || fail "status should not attach the first project's session in a different project"
 
 builtin cd "$project_a/subdir"
-_mu_zsh_base_command_reply
-assert_command_reply "returns to the original scoped session and model after cd-ing back" "$scope_fake_bin/mu" --output detail -s ses_0000000a --model model-for-a
-(( ${#MU_ZSH_PENDING_ATTACHMENTS[@]} == 1 )) || fail "passive scope observation preserves parked attachments"
+_mu_zsh_base_command _MU_ZSH_TEST_COMMAND_REPLY
+assert_command_reply "returns to the original scoped session and model after cd-ing back" mu -s ses_0000000a --model model-for-a
+(( ${#_MU_ZSH_PENDING_ATTACHMENTS[@]} == 1 )) || fail "passive scope observation preserves parked attachments"
 restored_prompt=$(_mu_zsh_build_mode_prompt)
 [[ "$restored_prompt" == *'[1 attachments]'* ]] || fail "prompt restores parked attachments in their scope"
 
@@ -717,31 +677,40 @@ if _mu_zsh_run_slash_command "/load ses_missing"; then
   fail "invalid load in another scope should fail"
 fi
 builtin cd "$project_a/subdir"
-_mu_zsh_sync_state
-[[ "$MU_ZSH_SESSION_ID" == "ses_0000000a" && "$MU_ZSH_MODEL" == model-for-a ]] || fail "invalid actions elsewhere preserve parked session and model"
-(( ${#MU_ZSH_PENDING_ATTACHMENTS[@]} == 1 )) || fail "invalid actions elsewhere preserve parked attachments"
+[[ "$MU_ZSH_SESSION_ID" == "ses_0000000a" && "$_MU_ZSH_MODEL" == model-for-a ]] || fail "invalid actions elsewhere preserve parked session and model"
+(( ${#_MU_ZSH_PENDING_ATTACHMENTS[@]} == 1 )) || fail "invalid actions elsewhere preserve parked attachments"
 
 builtin cd "$project_b/subdir"
 _mu_zsh_run_slash_command "/model model-for-b"
 [[ -z "$MU_ZSH_SESSION_ID" ]] || fail "valid model action elsewhere invalidates the parked session"
-[[ "$MU_ZSH_MODEL" == model-for-b ]] || fail "valid model action elsewhere replaces the parked model"
-(( ${#MU_ZSH_PENDING_ATTACHMENTS[@]} == 0 )) || fail "valid model action elsewhere invalidates parked attachments"
-[[ "$MU_ZSH_TRACKED_SCOPE" == "project:$project_b" ]] || fail "valid model action moves the tracked scope"
+[[ "$_MU_ZSH_MODEL" == model-for-b ]] || fail "valid model action elsewhere replaces the parked model"
+(( ${#_MU_ZSH_PENDING_ATTACHMENTS[@]} == 0 )) || fail "valid model action elsewhere invalidates parked attachments"
+[[ "$_MU_ZSH_TRACKED_SCOPE" == "project:$project_b" ]] || fail "valid model action moves the tracked scope"
 
 : > "$MU_ZSH_SCOPE_LOG"
 _mu_zsh_submit_prompt "project b prompt"
 [[ "$MU_ZSH_SESSION_ID" == "ses_0000000b" ]] || fail "creates a new scoped session after submitting in the second project"
-[[ "$MU_ZSH_TRACKED_SCOPE" == "project:$project_b" ]] || fail "keeps the tracked scope after starting in the second project"
+[[ "$_MU_ZSH_TRACKED_SCOPE" == "project:$project_b" ]] || fail "keeps the tracked scope after starting in the second project"
 grep -Fxq -- "$project_b/subdir :: new" "$MU_ZSH_SCOPE_LOG" || fail "creates an empty session without forwarding the model override"
-grep -Fq -- "$project_b/subdir :: --output detail -s ses_0000000b --model model-for-b" "$MU_ZSH_SCOPE_LOG" || fail "forwards the model override on the first real turn"
+grep -Fq -- "$project_b/subdir :: -s ses_0000000b --model model-for-b" "$MU_ZSH_SCOPE_LOG" || fail "forwards the model override on the first real turn"
 
 builtin cd "$project_a/subdir"
-_mu_zsh_base_command_reply
-assert_command_reply "forgets the first project's session once a new one starts elsewhere" "$scope_fake_bin/mu" --output detail
+_mu_zsh_base_command _MU_ZSH_TEST_COMMAND_REPLY
+assert_command_reply "forgets the first project's session once a new one starts elsewhere" mu
 
 builtin cd "$saved_pwd"
-MU_ZSH_BIN=$prompt_fake_bin/mu
+path=("$prompt_fake_bin" $path)
 rm -f "$MU_ZSH_SCOPE_LOG"
+
+MU_ZSH_SESSION_ID=ses_0000000e
+_MU_ZSH_TRACKED_SCOPE=project:/stale
+_MU_ZSH_MODEL=stale/model
+_MU_ZSH_PENDING_ATTACHMENTS=(stale.png)
+source "$root/mu.zsh"
+_mu_zsh_bundle_active || fail "re-sourcing adopts the documented session seed in the current scope"
+[[ "$MU_ZSH_SESSION_ID" == ses_0000000e ]] || fail "re-sourcing preserves the documented session seed"
+[[ -z "$_MU_ZSH_MODEL" && ${#_MU_ZSH_PENDING_ATTACHMENTS[@]} -eq 0 ]] || fail "re-sourcing resets private bundle state"
+_mu_zsh_clear_tracked_state
 
 if [[ ${MU_ZSH_SKIP_PTY:-0} == 1 ]]; then
   print -- ok
@@ -803,17 +772,13 @@ fi
 printf x >> "$TEST_CAPTURE_CALLS"
 printf '%s\n' "$@" > "$TEST_CAPTURE_ARGS"
 cat > "$TEST_CAPTURE_STDIN"
-if [ "$2" = detail ]; then
-  printf '%s\n\n' "[thought 100ms, 2 tokens]"
-fi
+printf '%s\n\n' "[thought 100ms, 2 tokens]"
 printf '%s\n\n' "Hello! I'm your terminal agent."
-if [ "$2" = detail ] || [ "$2" = full ]; then
-  printf '%s\n\n' "[mu] tokens: 12 in / 5 out  context: 25%" >&2
-fi
+printf '%s\n\n' "[mu] tokens: 12 in / 5 out  context: 25%" >&2
 EOF
 chmod +x "$interactive_fake_bin/mu"
 
-interactive_setup="PS1='> '; PATH=${(q)interactive_fake_bin}:\$PATH; export TEST_CAPTURE_ARGS=${(q)interactive_capture_args} TEST_CAPTURE_STDIN=${(q)interactive_capture_stdin} TEST_CAPTURE_CALLS=${(q)interactive_capture_calls}; autoload -Uz compinit; compinit -D; source ${(q)root}/mu.zsh; MU_ZSH_OUTPUT=detail"
+interactive_setup="PS1='> '; PATH=${(q)interactive_fake_bin}:\$PATH; export TEST_CAPTURE_ARGS=${(q)interactive_capture_args} TEST_CAPTURE_STDIN=${(q)interactive_capture_stdin} TEST_CAPTURE_CALLS=${(q)interactive_capture_calls}; autoload -Uz compinit; compinit -D; source ${(q)root}/mu.zsh"
 interactive_ready=$tmpdir/interactive-ready
 
 send_interactive_setup() {
@@ -896,7 +861,7 @@ print -rn -- 'hello'$'\n' > "$interactive_expected_stdin"
 cmp -- "$interactive_expected_stdin" "$interactive_capture_stdin" || fail "interactive prompt should be passed on stdin"
 
 interactive_args=("${(@f)$(<"$interactive_capture_args")}")
-expected_interactive_args=(--output detail -s ses_01234567)
+expected_interactive_args=(-s ses_01234567)
 [[ "${(j:\0:)interactive_args}" == "${(j:\0:)expected_interactive_args}" ]] || fail "unexpected interactive args: ${interactive_args[*]}"
 
 no_prompt_sp_transcript=$tmpdir/no-prompt-sp-transcript
@@ -963,31 +928,8 @@ custom_slash_expected_stdin=$tmpdir/custom-slash-expected-stdin
 print -rn -- 'First line'$'\n''Second line' > "$custom_slash_expected_stdin"
 cmp -- "$custom_slash_expected_stdin" "$interactive_capture_stdin" || fail "custom slash instruction should preserve multiline text"
 interactive_args=("${(@f)$(<"$interactive_capture_args")}")
-expected_custom_slash_args=(--output detail -s ses_01234567 review.md)
+expected_custom_slash_args=(-s ses_01234567 review.md)
 [[ "${(j:\0:)interactive_args}" == "${(j:\0:)expected_custom_slash_args}" ]] || fail "custom slash command should use the command path"
-
-concise_transcript=$tmpdir/concise-transcript
-concise_setup="$interactive_setup; MU_ZSH_OUTPUT=concise"
-rm -f -- "$interactive_capture_args" "$interactive_capture_stdin" "$interactive_capture_calls"
-interactive_status=0
-{
-  send_interactive_setup "$concise_setup"
-  print -rn -- $'\t'"concise prompt"$'\r'
-  sleep 0.4
-  print -rn -- $'\x04'
-} | timeout 10 script -qfec 'TERM=xterm-256color zsh -df' "$concise_transcript" >/dev/null || interactive_status=$?
-(( interactive_status == 0 )) || fail "concise transcript exited with status $interactive_status"
-
-normalized=$(perl -pe 's/\e\[[0-?]*[ -\/]*[@-~]//g' "$concise_transcript" | col -b)
-after_submitted_prompt=${normalized##*$'mu> concise prompt\n'}
-[[ "$after_submitted_prompt" == *"Hello! I'm your terminal agent."* ]] || fail "concise output should follow the submitted prompt"
-raw_newline_count_between "$concise_transcript" 'concise prompt' "Hello! I'm your terminal agent."
-[[ "$REPLY" == 1 ]] || fail "concise prompt handoff should advance one raw line before output, saw $REPLY"
-after_response=${normalized#*"Hello! I'm your terminal agent."}
-[[ "$after_response" != *'[mu] tokens:'* ]] || fail "concise output should omit the token summary"
-interactive_args=("${(@f)$(<"$interactive_capture_args")}")
-expected_concise_args=(--output concise -s ses_01234567)
-[[ "${(j:\0:)interactive_args}" == "${(j:\0:)expected_concise_args}" ]] || fail "unexpected concise interactive args: ${interactive_args[*]}"
 
 model_switch_transcript=$tmpdir/model-switch-transcript
 rm -f -- "$interactive_capture_args" "$interactive_capture_stdin" "$interactive_capture_calls"
@@ -1011,7 +953,7 @@ after_model_switch=${normalized#*$'[mu] next turns in this scope will use openai
 new_session_transcript=$tmpdir/new-session-transcript
 rm -f -- "$interactive_capture_args" "$interactive_capture_stdin" "$interactive_capture_calls"
 interactive_status=0
-new_session_setup="$interactive_setup; MU_ZSH_SESSION_ID=tracked-session; _mu_zsh_set_scope_key_for_dir \"\$PWD\"; MU_ZSH_TRACKED_SCOPE=\$REPLY; _mu_zsh_sync_state"
+new_session_setup="$interactive_setup; MU_ZSH_SESSION_ID=tracked-session; _mu_zsh_set_scope_key_for_dir \"\$PWD\"; _MU_ZSH_TRACKED_SCOPE=\$REPLY"
 {
   send_interactive_setup "$new_session_setup"
   print -rn -- $'\t'"/new"$'\r'
@@ -1138,7 +1080,7 @@ raw_transcript=$(<"$floating_effort_transcript")
 [[ ! -e "$interactive_capture_calls" || ! -s "$interactive_capture_calls" ]] || fail "floating model effort completion should not submit a prompt"
 
 speculative_colon_transcript=$tmpdir/speculative-colon-transcript
-speculative_colon_setup="$interactive_setup; _mu_test_speculative_colon_state() { BUFFER='/model shared'; CURSOR=\${#BUFFER}; _mu_zsh_append_speculative_model_colon; _mu_zsh_model_colon; explicit=\"\$BUFFER,\$CURSOR,\$MU_ZSH_SPECULATIVE_MODEL_COLON\"; BUFFER='/model shared'; CURSOR=\${#BUFFER}; _mu_zsh_append_speculative_model_colon; _mu_zsh_speculative_backspace; back=\"\$BUFFER,\$CURSOR,\$MU_ZSH_SPECULATIVE_MODEL_COLON\"; BUFFER='/model shared'; CURSOR=\${#BUFFER}; _mu_zsh_append_speculative_model_colon; _mu_zsh_speculative_delete || true; delete=\"\$BUFFER,\$CURSOR,\$MU_ZSH_SPECULATIVE_MODEL_COLON\"; BUFFER='/model shared'; CURSOR=\${#BUFFER}; _mu_zsh_append_speculative_model_colon; (( CURSOR -= 1 )); _mu_zsh_resolve_speculative_model_colon; moved=\"\$BUFFER,\$CURSOR,\$MU_ZSH_SPECULATIVE_MODEL_COLON\"; BUFFER='/model shared'; CURSOR=\${#BUFFER}; _mu_zsh_append_speculative_model_colon; _mu_zsh_resolve_speculative_model_colon discard; entered=\"\$BUFFER,\$CURSOR,\$MU_ZSH_SPECULATIVE_MODEL_COLON\"; zle -I; print -r -- \"[explicit=\$explicit back=\$back delete=\$delete moved=\$moved entered=\$entered]\"; BUFFER=; CURSOR=0; _mu_zsh_reset_mode_prompt; }; zle -N _mu_test_speculative_colon_state; bindkey -M mumode '^Y' _mu_test_speculative_colon_state"
+speculative_colon_setup="$interactive_setup; _mu_test_speculative_colon_state() { BUFFER='/model shared'; CURSOR=\${#BUFFER}; _mu_zsh_append_speculative_model_colon; _mu_zsh_model_colon; explicit=\"\$BUFFER,\$CURSOR\"; BUFFER='/model shared'; CURSOR=\${#BUFFER}; _mu_zsh_append_speculative_model_colon; _mu_zsh_speculative_backspace; back=\"\$BUFFER,\$CURSOR\"; BUFFER='/model shared'; CURSOR=\${#BUFFER}; _mu_zsh_append_speculative_model_colon; _mu_zsh_speculative_delete || true; delete=\"\$BUFFER,\$CURSOR\"; BUFFER='/model shared'; CURSOR=\${#BUFFER}; _mu_zsh_append_speculative_model_colon; (( CURSOR -= 1 )); _mu_zsh_resolve_speculative_model_colon; moved=\"\$BUFFER,\$CURSOR\"; BUFFER='/model shared'; CURSOR=\${#BUFFER}; _mu_zsh_append_speculative_model_colon; _mu_zsh_resolve_speculative_model_colon discard; entered=\"\$BUFFER,\$CURSOR\"; zle -I; print -r -- \"[explicit=\$explicit back=\$back delete=\$delete moved=\$moved entered=\$entered]\"; BUFFER=; CURSOR=0; _mu_zsh_reset_mode_prompt; }; zle -N _mu_test_speculative_colon_state; bindkey -M mumode '^Y' _mu_test_speculative_colon_state"
 rm -f -- "$interactive_capture_args" "$interactive_capture_stdin" "$interactive_capture_calls"
 interactive_status=0
 {
@@ -1150,7 +1092,7 @@ interactive_status=0
 (( interactive_status == 0 )) || fail "speculative colon transcript exited with status $interactive_status"
 
 normalized=$(perl -pe 's/\e\[[0-?]*[ -\/]*[@-~]//g' "$speculative_colon_transcript" | col -b)
-[[ "$normalized" == *'[explicit=/model shared:,14,0 back=/model shared,13,0 delete=/model shared:,14,0 moved=/model shared:,13,0 entered=/model shared,13,0]'* ]] ||
+[[ "$normalized" == *'[explicit=/model shared:,14 back=/model shared,13 delete=/model shared:,14 moved=/model shared:,13 entered=/model shared,13]'* ]] ||
   fail "speculative colon editing actions should commit or remove the delimiter as specified"
 
 delete_slash_transcript=$tmpdir/delete-slash-transcript
