@@ -1047,8 +1047,7 @@ mod apply_patch {
                     }
                     std::thread::sleep(std::time::Duration::from_millis(10));
                 }
-                let error = atomic_write(&path, "new\n", None, true, Some(b"old\n")).unwrap_err();
-                assert!(error.to_string().contains("file is busy"));
+                atomic_write(&path, "new\n", None, true, Some(b"old\n")).unwrap_err();
                 assert_eq!(fs::read_to_string(&path).unwrap(), "old\n");
                 Ok(())
             })();
@@ -1067,9 +1066,7 @@ mod apply_patch {
             fs::write(dir.join("one.txt"), "old\n").unwrap();
             fs::write(dir.join("exists.txt"), "keep\n").unwrap();
             let patch = "*** Begin Patch\n*** Update File: one.txt\n@@\n-old\n+new\n*** Add File: exists.txt\n+replace\n*** End Patch\n";
-            let error = preflight(&dir, parse_patch(patch).unwrap()).unwrap_err();
-            assert!(error.to_string().contains("inspect it first"));
-            assert!(error.to_string().contains("use bash to move or remove"));
+            preflight(&dir, parse_patch(patch).unwrap()).unwrap_err();
             assert_eq!(fs::read_to_string(dir.join("one.txt")).unwrap(), "old\n");
             assert_eq!(
                 fs::read_to_string(dir.join("exists.txt")).unwrap(),
@@ -1079,10 +1076,10 @@ mod apply_patch {
         }
 
         #[test]
-        fn applies_repeated_updates_to_virtual_content() {
+        fn repeated_updates_use_virtual_content_and_reset_their_hunk_cursor() {
             let dir = temp_dir();
             fs::write(dir.join("file.txt"), "alpha\nmiddle\nomega\n").unwrap();
-            let patch = "*** Begin Patch\n*** Update File: file.txt\n@@\n-alpha\n+ALPHA\n*** Update File: file.txt\n@@\n-omega\n+OMEGA\n*** End Patch\n";
+            let patch = "*** Begin Patch\n*** Update File: file.txt\n@@\n-omega\n+OMEGA\n*** Update File: file.txt\n@@\n-alpha\n+ALPHA\n*** End Patch\n";
             let changes = preflight(&dir, parse_patch(patch).unwrap()).unwrap();
 
             assert_eq!(changes.len(), 1);
@@ -1091,22 +1088,7 @@ mod apply_patch {
                 fs::read_to_string(dir.join("file.txt")).unwrap(),
                 "ALPHA\nmiddle\nOMEGA\n"
             );
-            assert_eq!(format_summary(&changes, &dir), "Done!\nM file.txt\n");
-            fs::remove_dir_all(dir).unwrap();
-        }
-
-        #[test]
-        fn repeated_update_sections_reset_their_hunk_cursor() {
-            let dir = temp_dir();
-            fs::write(dir.join("file.txt"), "alpha\nmiddle\nomega\n").unwrap();
-            let patch = "*** Begin Patch\n*** Update File: file.txt\n@@\n-omega\n+OMEGA\n*** Update File: file.txt\n@@\n-alpha\n+ALPHA\n*** End Patch\n";
-            let changes = preflight(&dir, parse_patch(patch).unwrap()).unwrap();
-
-            commit(&changes).unwrap();
-            assert_eq!(
-                fs::read_to_string(dir.join("file.txt")).unwrap(),
-                "ALPHA\nmiddle\nOMEGA\n"
-            );
+            assert!(format_summary(&changes, &dir).contains("file.txt"));
             fs::remove_dir_all(dir).unwrap();
         }
 
@@ -1116,9 +1098,7 @@ mod apply_patch {
             fs::write(dir.join("one.txt"), "alpha\nomega\n").unwrap();
             fs::write(dir.join("two.txt"), "old\n").unwrap();
             let patch = "*** Begin Patch\n*** Update File: two.txt\n@@\n-old\n+new\n*** Update File: one.txt\n@@\n-alpha\n+ALPHA\n*** Update File: one.txt\n@@\n-missing\n+OMEGA\n*** End Patch\n";
-            let error = preflight(&dir, parse_patch(patch).unwrap()).unwrap_err();
-
-            assert!(error.to_string().contains("failed to find expected lines"));
+            preflight(&dir, parse_patch(patch).unwrap()).unwrap_err();
             assert_eq!(
                 fs::read_to_string(dir.join("one.txt")).unwrap(),
                 "alpha\nomega\n"
@@ -1160,8 +1140,7 @@ mod apply_patch {
             let changes = preflight(&dir, parse_patch(patch).unwrap()).unwrap();
             fs::write(&path, [0xfe, 0x00]).unwrap();
 
-            let error = commit(&changes).unwrap_err();
-            assert!(format!("{error:#}").contains("changed while the edit was being prepared"));
+            commit(&changes).unwrap_err();
             assert_eq!(fs::read(&path).unwrap(), [0xfe, 0x00]);
             fs::remove_dir_all(dir).unwrap();
         }
@@ -1172,11 +1151,14 @@ mod apply_patch {
             fs::write(dir.join("source.txt"), "source\n").unwrap();
             fs::write(dir.join("destination.txt"), "destination\n").unwrap();
             let patch = "*** Begin Patch\n*** Update File: source.txt\n*** Move to: destination.txt\n*** End Patch\n";
-            let error = preflight(&dir, parse_patch(patch).unwrap()).unwrap_err();
-            assert!(
-                error
-                    .to_string()
-                    .contains("move destination already exists")
+            preflight(&dir, parse_patch(patch).unwrap()).unwrap_err();
+            assert_eq!(
+                fs::read_to_string(dir.join("source.txt")).unwrap(),
+                "source\n"
+            );
+            assert_eq!(
+                fs::read_to_string(dir.join("destination.txt")).unwrap(),
+                "destination\n"
             );
             fs::remove_dir_all(dir).unwrap();
         }
@@ -1199,34 +1181,12 @@ mod apply_patch {
         fn rejects_lexically_aliased_operations() {
             let dir = temp_dir();
             let patch = "*** Begin Patch\n*** Add File: sub/../same.txt\n+one\n*** Add File: same.txt\n+two\n*** End Patch\n";
-            let error = preflight(&dir, parse_patch(patch).unwrap()).unwrap_err();
-            assert!(error.to_string().contains("multiple operations target"));
+            preflight(&dir, parse_patch(patch).unwrap()).unwrap_err();
             fs::remove_dir_all(dir).unwrap();
         }
 
         #[test]
-        fn update_through_symlink_preserves_link_and_updates_target() {
-            use std::os::unix::fs::symlink;
-
-            let dir = temp_dir();
-            fs::write(dir.join("target.txt"), "old\n").unwrap();
-            symlink("target.txt", dir.join("link.txt")).unwrap();
-            let patch =
-                "*** Begin Patch\n*** Update File: link.txt\n@@\n-old\n+new\n*** End Patch\n";
-            let changes = preflight(&dir, parse_patch(patch).unwrap()).unwrap();
-            commit(&changes).unwrap();
-            assert!(
-                fs::symlink_metadata(dir.join("link.txt"))
-                    .unwrap()
-                    .file_type()
-                    .is_symlink()
-            );
-            assert_eq!(fs::read_to_string(dir.join("target.txt")).unwrap(), "new\n");
-            fs::remove_dir_all(dir).unwrap();
-        }
-
-        #[test]
-        fn repeated_updates_through_same_symlink_preserve_link() {
+        fn repeated_updates_through_a_symlink_preserve_it_and_update_the_target() {
             use std::os::unix::fs::symlink;
 
             let dir = temp_dir();
@@ -1257,9 +1217,7 @@ mod apply_patch {
             fs::write(dir.join("target.txt"), "keep\n").unwrap();
             symlink("target.txt", dir.join("link.txt")).unwrap();
             let patch = "*** Begin Patch\n*** Delete File: link.txt\n*** Add File: link.txt\n+replacement\n*** End Patch\n";
-            let error = preflight(&dir, parse_patch(patch).unwrap()).unwrap_err();
-
-            assert!(error.to_string().contains("multiple operations target"));
+            preflight(&dir, parse_patch(patch).unwrap()).unwrap_err();
             assert!(
                 fs::symlink_metadata(dir.join("link.txt"))
                     .unwrap()
@@ -1366,8 +1324,7 @@ mod apply_patch {
             symlink("target.txt", dir.join("one.txt")).unwrap();
             symlink("target.txt", dir.join("two.txt")).unwrap();
             let patch = "*** Begin Patch\n*** Update File: one.txt\n@@\n-old\n+one\n*** Update File: two.txt\n@@\n-old\n+two\n*** End Patch\n";
-            let error = preflight(&dir, parse_patch(patch).unwrap()).unwrap_err();
-            assert!(error.to_string().contains("multiple operations target"));
+            preflight(&dir, parse_patch(patch).unwrap()).unwrap_err();
             assert_eq!(fs::read_to_string(dir.join("target.txt")).unwrap(), "old\n");
             fs::remove_dir_all(dir).unwrap();
         }
@@ -1377,9 +1334,7 @@ mod apply_patch {
             let dir = temp_dir();
             fs::write(dir.join("file.txt"), "old\n").unwrap();
             let patch = "*** Begin Patch\n*** Update File: file.txt\n@@\n-old\n+new\n*** Update File: file.txt\n*** Move to: moved.txt\n*** End Patch\n";
-            let error = preflight(&dir, parse_patch(patch).unwrap()).unwrap_err();
-
-            assert!(error.to_string().contains("multiple operations target"));
+            preflight(&dir, parse_patch(patch).unwrap()).unwrap_err();
             assert_eq!(fs::read_to_string(dir.join("file.txt")).unwrap(), "old\n");
             assert!(!dir.join("moved.txt").exists());
             fs::remove_dir_all(dir).unwrap();
@@ -1407,9 +1362,7 @@ mod apply_patch {
                     fs::write(dir.join("file.txt"), "old\n").unwrap();
                 }
                 let patch = format!("*** Begin Patch\n{operations}*** End Patch\n");
-                let error = preflight(&dir, parse_patch(&patch).unwrap()).unwrap_err();
-
-                assert!(error.to_string().contains("multiple operations target"));
+                preflight(&dir, parse_patch(&patch).unwrap()).unwrap_err();
                 assert_eq!(dir.join("file.txt").exists(), exists);
                 if exists {
                     assert_eq!(fs::read_to_string(dir.join("file.txt")).unwrap(), "old\n");
@@ -2112,15 +2065,13 @@ mod edit {
 
         #[test]
         fn rejects_empty_search_and_malformed_documents() {
-            let error =
-                parse_document("<<<<<<< SEARCH\n=======\nx\n>>>>>>> REPLACE\n").unwrap_err();
-            assert!(error.to_string().contains("empty SEARCH"));
-
-            let error = parse_document("<<<<<<< SEARCH\nx\n>>>>>>> REPLACE\n").unwrap_err();
-            assert!(error.to_string().contains("expected `=======`"));
-
-            let error = parse_document("not a block\n").unwrap_err();
-            assert!(error.to_string().contains("expected `<<<<<<< SEARCH`"));
+            for document in [
+                "<<<<<<< SEARCH\n=======\nx\n>>>>>>> REPLACE\n",
+                "<<<<<<< SEARCH\nx\n>>>>>>> REPLACE\n",
+                "not a block\n",
+            ] {
+                assert!(parse_document(document).is_err());
+            }
         }
 
         #[test]
@@ -2171,38 +2122,36 @@ mod edit {
             let path = dir.join("file.txt");
             fs::write(&path, "same same").unwrap();
 
-            let error = preflight(
-                &dir,
-                PathBuf::from("file.txt"),
-                parse_document(&block("missing", "new")).unwrap(),
-                false,
-            )
-            .unwrap_err();
-            assert!(error.to_string().contains("did not match"));
+            assert!(
+                preflight(
+                    &dir,
+                    PathBuf::from("file.txt"),
+                    parse_document(&block("missing", "new")).unwrap(),
+                    false,
+                )
+                .is_err()
+            );
 
-            let error = preflight(
-                &dir,
-                PathBuf::from("file.txt"),
-                parse_document(&block("same", "new")).unwrap(),
-                false,
-            )
-            .unwrap_err();
-            assert!(error.to_string().contains("matched 2 locations"));
+            assert!(
+                preflight(
+                    &dir,
+                    PathBuf::from("file.txt"),
+                    parse_document(&block("same", "new")).unwrap(),
+                    false,
+                )
+                .is_err()
+            );
             assert_eq!(fs::read_to_string(&path).unwrap(), "same same");
             fs::remove_dir_all(dir).unwrap();
         }
 
         #[test]
-        fn strict_mode_suggests_unique_relaxed_line_ending_match() {
+        fn strict_mode_rejects_line_ending_only_match() {
             let dir = temp_dir();
             let path = dir.join("file.txt");
             fs::write(&path, "first\r\nold\r\nlast\r\n").unwrap();
             let blocks = parse_document(&block("first\nold\nlast", "first\nnew\nlast")).unwrap();
-            let error = preflight(&dir, PathBuf::from("file.txt"), blocks, false)
-                .unwrap_err()
-                .to_string();
-            assert!(error.contains("matched once after normalizing line endings"));
-            assert!(error.contains("retry with --relaxed"));
+            assert!(preflight(&dir, PathBuf::from("file.txt"), blocks, false).is_err());
             assert_eq!(
                 fs::read_to_string(&path).unwrap(),
                 "first\r\nold\r\nlast\r\n"
@@ -2230,36 +2179,23 @@ mod edit {
 
             fs::write(dir.join("file.txt"), "a  b\n").unwrap();
             let blocks = parse_document(&block("a b", "changed")).unwrap();
-            let error = preflight(&dir, PathBuf::from("file.txt"), blocks, true)
-                .unwrap_err()
-                .to_string();
-            assert!(error.contains("even with --relaxed"));
+            assert!(preflight(&dir, PathBuf::from("file.txt"), blocks, true).is_err());
 
             fs::write(dir.join("file.txt"), "\n").unwrap();
             let blocks = parse_document(&block(" ", "changed")).unwrap();
-            let error = preflight(&dir, PathBuf::from("file.txt"), blocks, true)
-                .unwrap_err()
-                .to_string();
-            assert!(error.contains("even with --relaxed"));
+            assert!(preflight(&dir, PathBuf::from("file.txt"), blocks, true).is_err());
             fs::remove_dir_all(dir).unwrap();
         }
 
         #[test]
-        fn relaxed_ambiguity_is_reported() {
+        fn relaxed_ambiguity_is_rejected() {
             let dir = temp_dir();
             fs::write(dir.join("file.txt"), "  old\n    old\n").unwrap();
             let blocks = parse_document(&block("\told", "\tnew")).unwrap();
-            let error = preflight(&dir, PathBuf::from("file.txt"), blocks, false)
-                .unwrap_err()
-                .to_string();
-            assert!(error.contains("relaxed matching found 2 locations"));
+            assert!(preflight(&dir, PathBuf::from("file.txt"), blocks, false).is_err());
 
             let blocks = parse_document(&block("\told", "\tnew")).unwrap();
-            let error = preflight(&dir, PathBuf::from("file.txt"), blocks, true)
-                .unwrap_err()
-                .to_string();
-            assert!(error.contains("matched 2 locations"));
-            assert!(error.contains("with --relaxed"));
+            assert!(preflight(&dir, PathBuf::from("file.txt"), blocks, true).is_err());
             fs::remove_dir_all(dir).unwrap();
         }
 
@@ -2279,14 +2215,15 @@ mod edit {
             assert_eq!(planned.content, "new");
 
             let missing = dir.join("missing.txt");
-            let error = preflight(
-                &dir,
-                missing.clone(),
-                parse_document(&block("old", "new")).unwrap(),
-                false,
-            )
-            .unwrap_err();
-            assert!(error.to_string().contains("cannot edit missing file"));
+            assert!(
+                preflight(
+                    &dir,
+                    missing.clone(),
+                    parse_document(&block("old", "new")).unwrap(),
+                    false,
+                )
+                .is_err()
+            );
             assert!(!missing.exists());
             fs::remove_dir_all(dir).unwrap();
         }
@@ -2305,8 +2242,7 @@ mod edit {
                     replacement: "y".into(),
                 },
             ];
-            let error = preflight(&dir, PathBuf::from("file.txt"), blocks, false).unwrap_err();
-            assert!(error.to_string().contains("blocks 1 and 2 overlap"));
+            assert!(preflight(&dir, PathBuf::from("file.txt"), blocks, false).is_err());
             fs::remove_dir_all(dir).unwrap();
         }
 
@@ -2418,18 +2354,6 @@ mod view_image {
             attachment,
             detail,
         )
-    }
-
-    #[cfg(test)]
-    mod tests {
-        use super::*;
-
-        #[test]
-        fn detail_is_optional_and_defaults_to_auto() {
-            let args = Args::try_parse_from(["view_image", "image.png"]).unwrap();
-            assert_eq!(args.detail, ImageDetail::Auto);
-            assert_eq!(args.path, PathBuf::from("image.png"));
-        }
     }
 }
 

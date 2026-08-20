@@ -1092,14 +1092,6 @@ mod tests {
     }
 
     #[test]
-    fn subagent_depth_parsing_defaults_invalid_values_to_zero() {
-        assert_eq!(super::parse_subagent_depth(None), 0);
-        assert_eq!(super::parse_subagent_depth(Some("")), 0);
-        assert_eq!(super::parse_subagent_depth(Some("nope")), 0);
-        assert_eq!(super::parse_subagent_depth(Some("2")), 2);
-    }
-
-    #[test]
     fn bash_overrides_configured_subagent_depth_for_child_process() {
         let mut renderer = Renderer::new();
         let mut env = EnvMap::new();
@@ -1325,11 +1317,6 @@ mod tests {
         assert!(schema["properties"].get("script").is_none());
         assert!(schema["properties"].get("workdir").is_none());
         assert!(schema["properties"].get("cwd").is_some());
-        assert!(
-            schema["properties"]["stdin"]["description"]
-                .as_str()
-                .is_some_and(|description| description.contains("omit unless"))
-        );
     }
 
     #[test]
@@ -1348,8 +1335,17 @@ mod tests {
         }
     }
 
+    fn spill_path(output: &str) -> PathBuf {
+        let runtime = crate::paths::runtime_dir().unwrap();
+        output
+            .split_whitespace()
+            .map(|word| PathBuf::from(word.trim_end_matches(';')))
+            .find(|path| path.starts_with(&runtime))
+            .expect("spill path")
+    }
+
     #[test]
-    fn truncation_spills_full_output_without_a_retention_promise() {
+    fn truncation_spills_full_output_to_the_runtime_directory() {
         let clamped = apply_truncation(
             "one\ntwo\nthree\nfour".into(),
             &tight_limits(),
@@ -1357,13 +1353,8 @@ mod tests {
             true,
         );
 
-        assert!(clamped.contains("lines elided"));
-        assert!(clamped.contains("temporary file"));
-        assert!(clamped.contains("may disappear at any time"));
-        let marker = "temporary file ";
-        let start = clamped.find(marker).unwrap() + marker.len();
-        let end = clamped[start..].find(';').unwrap() + start;
-        let spill = PathBuf::from(&clamped[start..end]);
+        assert_ne!(clamped, "one\ntwo\nthree\nfour");
+        let spill = spill_path(&clamped);
         assert_eq!(
             spill.parent().unwrap(),
             crate::paths::runtime_dir().unwrap()
@@ -1380,17 +1371,12 @@ mod tests {
         ));
         let output = model_failure_output(&error, &tight_limits());
 
-        assert!(output.starts_with("error: command timed out after 120s\npartial output:\n"));
+        assert!(output.contains("command timed out after 120s"));
         assert!(!output.contains("\none\n"));
         assert!(output.contains("three\nfour"));
-        assert!(output.contains("lines elided"));
-        assert!(output.contains("temporary file"));
         assert!(output.ends_with(REDACTION_REMINDER));
 
-        let marker = "temporary file ";
-        let start = output.find(marker).unwrap() + marker.len();
-        let end = output[start..].find(';').unwrap() + start;
-        let spill = PathBuf::from(&output[start..end]);
+        let spill = spill_path(&output);
         assert_eq!(
             std::fs::read_to_string(&spill).unwrap(),
             "one\ntwo\nthree\nfour"

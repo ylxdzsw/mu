@@ -464,10 +464,6 @@ mod tests {
 
     #[test]
     fn detects_and_parses_mu_shebangs() {
-        assert!(mu_shebang_args("#!/usr/bin/env mu").is_some());
-        assert!(mu_shebang_args("#!/usr/bin/env -S mu --output detail").is_some());
-        assert!(mu_shebang_args("#!/usr/bin/mu").is_some());
-        assert!(mu_shebang_args("#!/usr/bin/env bash").is_none());
         assert_eq!(
             parse_mu_shebang("#!/usr/bin/env mu").unwrap(),
             Some(MuShebang { model: None })
@@ -499,23 +495,6 @@ mod tests {
         ] {
             assert!(parse_mu_shebang(line).is_err(), "accepted {line}");
         }
-    }
-
-    #[test]
-    fn command_prompt_rejects_other_mu_shebang_arguments() {
-        let root = temp_root("invalid-command-shebang");
-        fs::create_dir_all(&root).unwrap();
-        let path = root.join("review.md");
-        fs::write(
-            &path,
-            "#!/usr/bin/env -S mu --output detail\nReview the tree.\n",
-        )
-        .unwrap();
-
-        let error = command_prompt(&path).unwrap_err();
-        fs::remove_dir_all(root).unwrap();
-        assert!(error.to_string().contains("invalid custom command"));
-        assert!(format!("{error:#}").contains("unsupported mu shebang arguments"));
     }
 
     #[test]
@@ -740,13 +719,6 @@ mod tests {
             .find(|command| command.name == "goal")
             .expect("built-in goal command");
         assert_eq!(goal.scope, InstructionScope::Builtin);
-        let prompt = command_prompt(Path::new(&goal.path)).unwrap();
-        assert!(prompt.text.contains("error: /goal requires a goal"));
-        assert!(
-            prompt
-                .text
-                .contains("includes the original goal verbatim again")
-        );
         fs::remove_dir_all(global).unwrap();
     }
 

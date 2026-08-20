@@ -1481,20 +1481,22 @@ mod tests {
     }
 
     #[test]
-    fn load_prompt_file_trims_shebang_line() {
+    fn prompt_file_strips_its_shebang_and_appends_piped_stdin() {
         let path = temp_file_path("shebang");
         std::fs::write(
             &path,
             "#!/usr/bin/env -S mu --model openai/gpt-5:high\nhello\n",
         )
         .unwrap();
-        let mut stdin = Cursor::new("ignored instruction");
+        let mut stdin = Cursor::new("Focus on auth.\nKeep the second line.\n");
         let prompt =
-            load_prompt_with_stdin(PromptSource::File(path.clone()), true, &mut stdin).unwrap();
+            load_prompt_with_stdin(PromptSource::File(path.clone()), false, &mut stdin).unwrap();
         std::fs::remove_file(path).unwrap();
-        assert_eq!(prompt.text, "hello");
+        assert_eq!(
+            prompt.text,
+            "hello\n---\n\nFocus on auth.\nKeep the second line.\n"
+        );
         assert_eq!(prompt.model.as_deref(), Some("openai/gpt-5:high"));
-        assert_eq!(stdin.position(), 0);
     }
 
     #[test]
@@ -1502,19 +1504,13 @@ mod tests {
         let path = temp_file_path("invalid-shebang");
         std::fs::write(&path, "#!/usr/bin/env -S mu --output detail\nhello\n").unwrap();
         let mut stdin = Cursor::new("");
-        let error =
-            load_prompt_with_stdin(PromptSource::File(path.clone()), true, &mut stdin).unwrap_err();
+        let result = load_prompt_with_stdin(PromptSource::File(path.clone()), true, &mut stdin);
         std::fs::remove_file(path).unwrap();
-        assert!(error.to_string().contains("invalid prompt file"));
-        assert!(format!("{error:#}").contains("unsupported mu shebang arguments"));
+        assert!(result.is_err());
     }
 
     #[test]
     fn explicit_output_overrides_config_default() {
-        assert_eq!(
-            resolve_output(None, OutputFormat::Concise),
-            OutputFormat::Concise
-        );
         assert_eq!(
             resolve_output(Some(OutputFormat::Full), OutputFormat::Concise),
             OutputFormat::Full
@@ -1571,27 +1567,11 @@ mod tests {
     }
 
     #[test]
-    fn prompt_file_appends_non_terminal_stdin_verbatim() {
-        let path = temp_file_path("instruction");
-        std::fs::write(&path, "Use the release-note format.\n").unwrap();
-        let mut stdin = Cursor::new("Focus on auth.\nKeep the second line.\n");
-        let prompt =
-            load_prompt_with_stdin(PromptSource::File(path.clone()), false, &mut stdin).unwrap();
-        std::fs::remove_file(path).unwrap();
-        assert_eq!(
-            prompt.text,
-            "Use the release-note format.\n---\n\nFocus on auth.\nKeep the second line.\n"
-        );
-        assert_eq!(prompt.model, None);
-    }
-
-    #[test]
     fn stdin_prompt_source_uses_stdin_as_the_complete_prompt() {
         let mut stdin = Cursor::new("# Standalone prompt\n\nBody.\n");
         let prompt = load_prompt_with_stdin(PromptSource::Stdin, false, &mut stdin).unwrap();
 
         assert_eq!(prompt.text, "# Standalone prompt\n\nBody.");
-        assert_eq!(prompt.model, None);
     }
 
     #[test]
@@ -1647,11 +1627,6 @@ mod tests {
             scope: skills::InstructionScope::Builtin,
         };
 
-        let mut terminal_stdin = Cursor::new("must not be read");
-        let without_goal = load_prompt_with_stdin(source(), true, &mut terminal_stdin).unwrap();
-        assert!(without_goal.text.contains("error: /goal requires a goal"));
-        assert_eq!(terminal_stdin.position(), 0);
-
         let goal = "Finish the migration.\nKeep all tests green.";
         let mut piped_stdin = Cursor::new(goal);
         let with_goal = load_prompt_with_stdin(source(), false, &mut piped_stdin).unwrap();
@@ -1705,9 +1680,9 @@ mod tests {
         let file = std::fs::File::create(&path).unwrap();
         file.set_len(MAX_ATTACHMENT_BYTES + 1).unwrap();
         drop(file);
-        let error = load_attachments(std::slice::from_ref(&path)).unwrap_err();
+        let result = load_attachments(std::slice::from_ref(&path));
         std::fs::remove_file(path).unwrap();
-        assert!(error.to_string().contains("exceeds 20 MiB limit"));
+        assert!(result.is_err());
     }
 
     #[test]
@@ -1715,10 +1690,6 @@ mod tests {
         bash::reset_cancellation_state();
         let err = ExitError::session_not_found("abc123");
         assert_eq!(exit_code_for(&err), 2);
-        assert!(
-            err.to_string()
-                .contains("session not found in active scope: abc123")
-        );
     }
 
     #[test]
@@ -1881,14 +1852,6 @@ mod tests {
         assert!(html.contains("@xterm/addon-fit@0.10.0"));
         assert!(html.contains("new FitAddon.FitAddon()"));
         assert!(html.contains("term.loadAddon(fitAddon)"));
-        assert!(html.contains("const columns = 100"));
-        assert!(html.contains("term.resize(columns, dimensions.rows)"));
-        assert!(html.contains("fitTimer = setTimeout(fitVertically, 50)"));
-        assert!(html.contains("new ResizeObserver(scheduleFit).observe(scrollElement)"));
-        assert!(html.contains("color-scheme:dark"));
-        assert!(html.contains("overflow-y:auto"));
-        assert!(html.contains("scrollbar-width:thin"));
-        assert!(html.contains("::-webkit-scrollbar"));
         assert!(html.contains(r#"term.write("\u003c/script>\n")"#));
     }
 

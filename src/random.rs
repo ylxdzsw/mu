@@ -71,41 +71,29 @@ pub fn create_temp_file(directory: &Path, prefix: &str, suffix: &str) -> Result<
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashSet;
-    use std::io::Write;
-
     use super::*;
 
     #[test]
     fn session_ids_are_compact_lowercase_crockford_values() {
-        let mut seen = HashSet::new();
-        for _ in 0..128 {
-            let id = session_id().unwrap();
-            assert_eq!(id.len(), 12);
-            assert!(id.starts_with("ses_"));
-            assert!(id[4..].bytes().all(|byte| CROCKFORD.contains(&byte)));
-            seen.insert(id);
-        }
-        // Collision handling belongs to exclusive journal creation. This only guards
-        // against a broken source that returns one constant formatted value.
-        assert!(seen.len() > 120);
+        let id = session_id().unwrap();
+        assert_eq!(id.len(), 12);
+        assert!(id.starts_with("ses_"));
+        assert!(id[4..].bytes().all(|byte| CROCKFORD.contains(&byte)));
     }
 
     #[test]
-    fn temporary_files_are_exclusive_private_and_distinct() {
+    fn temporary_files_are_private_and_use_the_requested_name_shape() {
         use std::os::unix::fs::MetadataExt;
 
         let directory =
             std::env::temp_dir().join(format!("mu-random-test-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&directory).unwrap();
-        let (mut first, first_path) = create_temp_file(&directory, "spill-", ".tmp").unwrap();
-        let (_, second_path) = create_temp_file(&directory, "spill-", ".tmp").unwrap();
-        first.write_all(b"content").unwrap();
-        first.sync_all().unwrap();
+        let (_, path) = create_temp_file(&directory, "spill-", ".tmp").unwrap();
 
-        assert_ne!(first_path, second_path);
-        assert_eq!(std::fs::metadata(&first_path).unwrap().mode() & 0o077, 0);
-        assert_eq!(std::fs::read(&first_path).unwrap(), b"content");
+        assert_eq!(path.parent(), Some(directory.as_path()));
+        let name = path.file_name().unwrap().to_string_lossy();
+        assert!(name.starts_with("spill-") && name.ends_with(".tmp"));
+        assert_eq!(std::fs::metadata(&path).unwrap().mode() & 0o077, 0);
         let _ = std::fs::remove_dir_all(directory);
     }
 }

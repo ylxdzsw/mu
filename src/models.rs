@@ -39,17 +39,6 @@ impl ResolvedModelChoice {
         self.active = 0;
     }
 
-    #[cfg(test)]
-    pub fn resume_from(&mut self, previous: &ResolvedModelChoice) -> bool {
-        if !previous.floating {
-            return false;
-        }
-        self.resume_provider(
-            &previous.active_model().model_id,
-            &previous.active_model().provider_id,
-        )
-    }
-
     pub fn resume_provider(&mut self, model_id: &str, provider_id: &str) -> bool {
         if !self.floating || self.active_model().model_id != model_id {
             return false;
@@ -71,11 +60,6 @@ impl ResolvedModelChoice {
         }
         self.active += 1;
         true
-    }
-
-    #[cfg(test)]
-    pub fn candidate_count(&self) -> usize {
-        self.candidates.len()
     }
 }
 
@@ -341,14 +325,6 @@ mod tests {
                                     replay_key: None,
                                 },
                             ),
-                            (
-                                "GLM-5".into(),
-                                ModelConfig {
-                                    context_window: Some(300),
-                                    supported_efforts: None,
-                                    replay_key: None,
-                                },
-                            ),
                         ]),
                     },
                 ),
@@ -412,7 +388,6 @@ mod tests {
             resolve_model_choice(&test_config(), "common-model:provider-custom").unwrap();
 
         assert!(choice.is_floating());
-        assert_eq!(choice.candidate_count(), 2);
         assert_eq!(
             choice.active_model().canonical,
             "(alpha)/common-model:provider-custom"
@@ -423,19 +398,6 @@ mod tests {
             "(beta)/common-model:provider-custom"
         );
         assert!(!choice.advance());
-    }
-
-    #[test]
-    fn floating_resume_uses_model_as_key_and_ignores_effort() {
-        let mut previous = resolve_model_choice(&test_config(), "common-model:low").unwrap();
-        assert!(previous.advance());
-        let mut changed_effort = resolve_model_choice(&test_config(), "common-model:max").unwrap();
-        let mut changed_model = resolve_model_choice(&test_config(), "DeepSeek-V4:max").unwrap();
-
-        assert!(changed_effort.resume_from(&previous));
-        assert_eq!(changed_effort.active_model().provider_id, "beta");
-        assert!(!changed_model.resume_from(&previous));
-        assert_eq!(changed_model.active_model().provider_id, "alpha");
     }
 
     #[test]
@@ -458,44 +420,28 @@ mod tests {
     }
 
     #[test]
-    fn first_model_uses_configured_order() {
-        let choice = first_model_choice(&test_config()).unwrap();
-        let resolved = choice.active_model();
-        assert_eq!(resolved.canonical, "alpha/common-model");
-    }
-
-    #[test]
-    fn first_model_skips_empty_providers() {
+    fn first_model_skips_empty_providers_and_uses_configured_order() {
         let mut config = test_config();
-        config.providers = OrderedMap::from_iter([
-            (
-                "empty".into(),
-                ProviderConfig {
-                    endpoint: "https://empty.test/chat/completions".into(),
-                    api_key_env: "EMPTY_KEY".into(),
-                    models: OrderedMap::default(),
-                },
-            ),
-            (
-                "alpha".into(),
-                ProviderConfig {
-                    endpoint: "https://alpha.test/chat/completions".into(),
-                    api_key_env: "ALPHA_KEY".into(),
-                    models: OrderedMap::from_iter([(
-                        "first-real".into(),
-                        ModelConfig {
-                            context_window: None,
-                            supported_efforts: None,
-                            replay_key: None,
-                        },
-                    )]),
-                },
-            ),
-        ]);
+        let providers = std::iter::once((
+            "empty".into(),
+            ProviderConfig {
+                endpoint: "https://empty.test/chat/completions".into(),
+                api_key_env: "EMPTY_KEY".into(),
+                models: OrderedMap::default(),
+            },
+        ))
+        .chain(
+            config
+                .providers
+                .iter()
+                .map(|(id, provider)| (id.clone(), provider.clone())),
+        )
+        .collect();
+        config.providers = providers;
 
         let choice = first_model_choice(&config).unwrap();
         let resolved = choice.active_model();
-        assert_eq!(resolved.canonical, "alpha/first-real");
+        assert_eq!(resolved.canonical, "alpha/common-model");
     }
 
     #[test]

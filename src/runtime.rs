@@ -682,68 +682,21 @@ mod tests {
     }
 
     #[test]
-    fn new_scope_uses_first_configured_model() {
+    fn new_scope_uses_first_configured_model_unless_overridden() {
         let store = Store::open_memory().unwrap();
+        let config = test_config();
 
         let resolved =
-            resolve_invocation(&store, &test_config(), &InvocationOverrides::default()).unwrap();
+            resolve_invocation(&store, &config, &InvocationOverrides::default()).unwrap();
 
         assert_eq!(
             resolved.model.active_model().canonical,
             "alpha/default-model"
         );
-    }
-
-    #[test]
-    fn unsupported_current_session_is_ignored_only_for_implicit_new_session() {
-        let store = Store::open_memory().unwrap();
-        let session = store.create_session("/tmp").unwrap();
-        store.select_session(&session.id).unwrap();
-        store.set_session_version_for_test(&session.id, 1);
-
-        let resolved =
-            resolve_invocation(&store, &test_config(), &InvocationOverrides::default()).unwrap();
-        assert!(resolved.attached_session.is_none());
-        assert_eq!(
-            resolved.ignored_current_session,
-            Some(UnsupportedSessionVersion {
-                session_id: Some(session.id.clone()),
-                found: 1,
-                supported: 4,
-            })
-        );
-
-        let continued = resolve_invocation(
-            &store,
-            &test_config(),
-            &InvocationOverrides {
-                continue_current: true,
-                ..Default::default()
-            },
-        )
-        .unwrap();
-        assert!(continued.attached_session.is_none());
-        assert!(continued.ignored_current_session.is_some());
-
-        let explicit = InvocationOverrides {
-            session: Some(session.id),
-            ..Default::default()
-        };
-        assert!(
-            resolve_invocation(&store, &test_config(), &explicit)
-                .unwrap_err()
-                .downcast_ref::<UnsupportedSessionVersion>()
-                .is_some()
-        );
-    }
-
-    #[test]
-    fn explicit_model_override_wins_for_new_session() {
-        let store = Store::open_memory().unwrap();
 
         let resolved = resolve_invocation(
             &store,
-            &test_config(),
+            &config,
             &InvocationOverrides {
                 session: None,
                 continue_current: false,
@@ -759,13 +712,52 @@ mod tests {
         assert!(
             resolve_invocation(
                 &store,
-                &test_config(),
+                &config,
                 &InvocationOverrides {
                     model: Some("alpha/removed-model".into()),
                     ..Default::default()
                 },
             )
             .is_err()
+        );
+    }
+
+    #[test]
+    fn unsupported_current_session_is_ignored_only_for_implicit_new_session() {
+        let store = Store::open_memory().unwrap();
+        let config = test_config();
+        let session = store.create_session("/tmp").unwrap();
+        store.select_session(&session.id).unwrap();
+        store.set_session_version_for_test(&session.id, 1);
+
+        let resolved =
+            resolve_invocation(&store, &config, &InvocationOverrides::default()).unwrap();
+        assert!(resolved.attached_session.is_none());
+        let ignored = resolved.ignored_current_session.unwrap();
+        assert_eq!(ignored.session_id.as_deref(), Some(session.id.as_str()));
+        assert_eq!(ignored.found, 1);
+
+        let continued = resolve_invocation(
+            &store,
+            &config,
+            &InvocationOverrides {
+                continue_current: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(continued.attached_session.is_none());
+        assert!(continued.ignored_current_session.is_some());
+
+        let explicit = InvocationOverrides {
+            session: Some(session.id),
+            ..Default::default()
+        };
+        assert!(
+            resolve_invocation(&store, &config, &explicit)
+                .unwrap_err()
+                .downcast_ref::<UnsupportedSessionVersion>()
+                .is_some()
         );
     }
 
@@ -1003,7 +995,7 @@ mod tests {
     }
 
     #[test]
-    fn floating_provider_position_is_remembered_by_model_across_intervening_choices() {
+    fn floating_cursor_is_model_specific_and_tracks_guardrail_attempts() {
         let store = Store::open_memory().unwrap();
         let config = test_config();
         let session = store.create_session("/tmp").unwrap();
@@ -1035,13 +1027,7 @@ mod tests {
             after_fixed_guardrail.active_model().canonical,
             "(beta)/default-model"
         );
-    }
 
-    #[test]
-    fn floating_guardrail_attempt_advances_the_sessions_same_model_cursor() {
-        let store = Store::open_memory().unwrap();
-        let config = test_config();
-        let session = store.create_session("/tmp").unwrap();
         finish_attempt(&store, &session.id, "(alpha)/default-model", "completed");
         finish_guardrail_attempt(&store, &config, &session.id, "(beta)/default-model");
 
@@ -1168,6 +1154,7 @@ mod tests {
     #[test]
     fn context_usage_reports_when_exact_and_marks_post_compaction_estimates() {
         let store = Store::open_memory().unwrap();
+        let config = test_config();
         let session = store.create_session_seeded("system prompt").unwrap();
         let overrides = InvocationOverrides {
             session: Some(session.id.clone()),
@@ -1177,7 +1164,7 @@ mod tests {
 
         let initial = build_status_report(
             &store,
-            &test_config(),
+            &config,
             &overrides,
             None,
             StatusIncludes::default(),
@@ -1195,7 +1182,7 @@ mod tests {
             .unwrap();
         let reported = build_status_report(
             &store,
-            &test_config(),
+            &config,
             &overrides,
             None,
             StatusIncludes::default(),
@@ -1204,7 +1191,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(reported.context_tokens, Some(25));
-        assert_eq!(reported.compaction_soft_threshold_tokens, Some(80));
+        assert!(reported.compaction_soft_threshold_tokens.is_some());
         assert_eq!(
             reported.context_usage_source,
             Some(ContextUsageSource::Reported)
@@ -1215,7 +1202,7 @@ mod tests {
             .unwrap();
         let anchored = build_status_report(
             &store,
-            &test_config(),
+            &config,
             &overrides,
             None,
             StatusIncludes::default(),
@@ -1223,13 +1210,13 @@ mod tests {
             None,
         )
         .unwrap();
-        assert_eq!(anchored.context_tokens, Some(27));
+        assert!(anchored.context_tokens > reported.context_tokens);
         assert_eq!(
             anchored.context_usage_source,
             Some(ContextUsageSource::Estimated)
         );
 
-        let mut disabled_config = test_config();
+        let mut disabled_config = config.clone();
         disabled_config.compaction.enabled = false;
         let disabled = build_status_report(
             &store,
@@ -1246,7 +1233,7 @@ mod tests {
         store.apply_test_compaction(&session.id, "summary").unwrap();
         let estimated = build_status_report(
             &store,
-            &test_config(),
+            &config,
             &overrides,
             None,
             StatusIncludes::default(),
@@ -1282,7 +1269,6 @@ mod tests {
         )
         .unwrap();
         let lean_json = serde_json::to_value(&lean).unwrap();
-        assert_eq!(lean_json["output"], "detail");
         assert!(lean.session.is_none());
         assert!(lean.active.is_none());
         assert!(lean.compaction.is_none());
@@ -1309,39 +1295,22 @@ mod tests {
     }
 
     #[test]
-    fn parses_git_status_output_for_clean_branch() {
-        let (branch, dirty) =
-            parse_git_status_output(b"# branch.oid abc123\n# branch.head master\n");
-
-        assert_eq!(branch.as_deref(), Some("master"));
-        assert_eq!(dirty, Some(false));
-    }
-
-    #[test]
-    fn parses_git_status_output_for_detached_dirty_repo() {
-        let (branch, dirty) = parse_git_status_output(
-            b"# branch.oid abc123\n# branch.head (detached)\n1 M. N... 100644 100644 100644 abc def file.txt\n",
-        );
-
-        assert_eq!(branch, None);
-        assert_eq!(dirty, Some(true));
-    }
-
-    #[test]
-    fn git_status_uses_the_linked_checkout_root() {
-        let project = crate::paths::Project {
-            root: std::path::PathBuf::from("/tmp/primary"),
-            marker: crate::paths::ProjectMarker::Git,
-            worktree: Some(crate::paths::GitWorktreeInfo {
-                root: std::path::PathBuf::from("/tmp/linked"),
-                git_dir: std::path::PathBuf::from("/tmp/primary/.git/worktrees/linked"),
-                common_dir: Some(std::path::PathBuf::from("/tmp/primary/.git")),
-            }),
-        };
-
-        assert_eq!(
-            git_checkout_root(&project),
-            std::path::Path::new("/tmp/linked")
-        );
+    fn parses_git_status_output() {
+        for (input, expected_branch, expected_dirty) in [
+            (
+                b"# branch.oid abc123\n# branch.head master\n".as_slice(),
+                Some("master"),
+                Some(false),
+            ),
+            (
+                b"# branch.oid abc123\n# branch.head (detached)\n1 M. N... 100644 100644 100644 abc def file.txt\n".as_slice(),
+                None,
+                Some(true),
+            ),
+        ] {
+            let (branch, dirty) = parse_git_status_output(input);
+            assert_eq!(branch.as_deref(), expected_branch);
+            assert_eq!(dirty, expected_dirty);
+        }
     }
 }

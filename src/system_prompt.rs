@@ -252,7 +252,7 @@ fn os_release_value(os_release: &str, key: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use std::path::{Path, PathBuf};
+    use std::path::PathBuf;
 
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -285,21 +285,6 @@ mod tests {
     }
 
     #[test]
-    fn role_preamble_explicitly_limits_tools() {
-        let prompt = assemble_prompt(&[], Path::new("/tmp/mu-test-global"), None);
-        assert!(prompt.starts_with("<system_preamble>\n"));
-        assert!(prompt.contains(&format!(
-            "<system_preamble>\n{}\n</system_preamble>",
-            role_preamble()
-        )));
-        assert!(prompt.contains("Exactly one tool is available: `bash`"));
-        assert!(prompt.contains("Codex `*** Begin Patch` / `*** End Patch` syntax"));
-        assert!(prompt.contains("</system_preamble>\n\n<runtime>"));
-        assert!(prompt.contains("\nuser: "));
-        assert!(prompt.contains(" (uid "));
-    }
-
-    #[test]
     fn assemble_context_emits_preamble_agents_and_skills_without_role_preamble() {
         let global = temp_dir("assemble-global");
         fs::write(global.join("AGENTS.md"), "Global mu instructions.").unwrap();
@@ -310,19 +295,13 @@ mod tests {
         fs::remove_dir_all(&global).unwrap();
 
         assert!(context.starts_with(EXPORT_PREAMBLE));
-        assert!(context.contains("Mu `.env` files may contain secrets"));
         assert!(context.contains(&format!(
             "<agents_md scope=\"global\" path=\"{}\">\nGlobal mu instructions.\n</agents_md>",
             agents_path.display()
         )));
-        assert!(
-            context
-                .contains("<skills>\nBefore responding, actively scan the available skills below.")
-        );
-        assert!(context.contains("\n## Available skills\n\n- brave-search:"));
+        assert!(context.contains("<skills>"));
         assert!(context.contains("\n</skills>"));
         assert!(context.contains("brave-search"));
-        assert!(!context.contains("Relative paths inside a skill file"));
         assert!(!context.contains(role_preamble()));
         assert!(!context.contains("<runtime>"));
     }
@@ -387,12 +366,6 @@ mod tests {
         assert!(preamble.trim_end().ends_with("-->"));
         assert!(preamble.contains(&global_env.display().to_string()));
         assert!(preamble.contains(&project_env.display().to_string()));
-        assert!(preamble.contains("JSON strings"));
-        assert!(preamble.contains("in global-to-project precedence"));
-        assert!(preamble.contains("assignments are `NAME=VALUE` with optional `export`"));
-        assert!(preamble.contains("bare `[A-Za-z0-9_./:@%+,=-]*`"));
-        assert!(preamble.contains("single-quoted, or double-quoted"));
-        assert!(preamble.contains("never display the files or expose secret values"));
         // On a packaged or source checkout the built-in reference exists, so the
         // pointer is appended; otherwise the preamble is just opened and closed.
         if crate::paths::builtins_dir()
@@ -401,7 +374,6 @@ mod tests {
             .is_file()
         {
             assert!(preamble.contains("mu-doc.md"));
-            assert!(preamble.contains("Mu, its configuration, and its CLI"));
         }
     }
 

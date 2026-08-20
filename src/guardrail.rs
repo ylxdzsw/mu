@@ -715,40 +715,13 @@ mod tests {
     #[test]
     fn denial_limit_counts_all_denials_in_the_turn() {
         let mut g = test_guardrail(3);
+        assert!(g.should_review(BashRisk::Destructive));
+        assert!(!g.should_review(BashRisk::Reversible));
+        assert!(!g.should_review(BashRisk::Readonly));
         g.denials = 2;
         assert_eq!(g.denial_limit_reached(), None);
         g.denials += 1;
         assert_eq!(g.denial_limit_reached(), Some(3));
-    }
-
-    #[test]
-    fn should_review_only_destructive_by_default() {
-        let g = Guardrail {
-            config: GuardrailConfig::default(),
-            runtime: Config {
-                providers: Default::default(),
-                output: Default::default(),
-                auto_resume: false,
-                soft_interrupt: crate::config::bundled_test_default("/soft_interrupt"),
-                compaction: crate::config::CompactionConfig::default(),
-                limits: crate::config::LimitsConfig::default(),
-                guardrail: GuardrailConfig::default(),
-                terminal_bell: crate::config::TerminalBellConfig::default(),
-                redaction: crate::config::RedactionConfig::default(),
-                env: Default::default(),
-            },
-            active_model: crate::models::ResolvedModelRef {
-                canonical: "test/model".into(),
-                provider_id: "test".into(),
-                model_id: "model".into(),
-                effort: None,
-            },
-            denials: 0,
-        };
-
-        assert!(g.should_review(BashRisk::Destructive));
-        assert!(!g.should_review(BashRisk::Reversible));
-        assert!(!g.should_review(BashRisk::Readonly));
     }
 
     #[test]

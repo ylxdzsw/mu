@@ -250,30 +250,37 @@ mod tests {
     }
 
     #[test]
-    fn provider_key_is_implicitly_redacted_across_chunks() {
-        let cfg = config(&[("OPENAI_API_KEY", "secret-value")], &[]);
-        let (output, redacted) = redact_chunks(&cfg, &[b"before secret", b"-value after"]);
+    fn secrets_are_redacted_across_every_chunk_boundary() {
+        for (secret, input, expected) in [
+            (
+                "secret-value",
+                "before secret-value after",
+                "before [redacted:OPENAI_API_KEY] after",
+            ),
+            (
+                "abc",
+                "before-abc-after",
+                "before-[redacted:OPENAI_API_KEY]-after",
+            ),
+            ("秘密🔑", "前-秘密🔑-後", "前-[redacted:OPENAI_API_KEY]-後"),
+        ] {
+            let cfg = config(&[("OPENAI_API_KEY", secret)], &[]);
+            let bytes = input.as_bytes();
+            for split in 0..=bytes.len() {
+                let (output, redacted) = redact_chunks(&cfg, &[&bytes[..split], &bytes[split..]]);
+                assert_eq!(output, expected);
+                assert!(redacted);
+            }
 
-        assert_eq!(output, "before [redacted:OPENAI_API_KEY] after");
-        assert!(redacted);
-    }
-
-    #[test]
-    fn every_byte_split_redacts_without_cutting_inside_secret() {
-        let cfg = config(&[("OPENAI_API_KEY", "abc")], &[]);
-        let (output, _) = redact_chunks(&cfg, &[b"abcde"]);
-        assert_eq!(output, "[redacted:OPENAI_API_KEY]de");
-
-        let input = b"before-abc-after";
-        for split in 0..=input.len() {
-            let (output, redacted) = redact_chunks(&cfg, &[&input[..split], &input[split..]]);
-            assert_eq!(output, "before-[redacted:OPENAI_API_KEY]-after");
-            assert!(redacted);
+            let chunks = bytes.chunks(1).collect::<Vec<_>>();
+            assert_eq!(redact_chunks(&cfg, &chunks).0, expected);
         }
 
-        let chunks: Vec<_> = input.chunks(1).collect();
-        let (output, _) = redact_chunks(&cfg, &chunks);
-        assert_eq!(output, "before-[redacted:OPENAI_API_KEY]-after");
+        let cfg = config(&[("OPENAI_API_KEY", "abc")], &[]);
+        assert_eq!(
+            redact_chunks(&cfg, &[b"abcde"]).0,
+            "[redacted:OPENAI_API_KEY]de"
+        );
     }
 
     #[test]
@@ -303,16 +310,6 @@ mod tests {
         let (output, _) = redact_chunks(&cfg, &[b"abcd a"]);
 
         assert_eq!(output, "[redacted:LONG] [redacted:LETTER]");
-    }
-
-    #[test]
-    fn utf8_secret_and_output_survive_every_byte_split() {
-        let cfg = config(&[("OPENAI_API_KEY", "秘密🔑")], &[]);
-        let input = "前-秘密🔑-後".as_bytes();
-        for split in 0..=input.len() {
-            let (output, _) = redact_chunks(&cfg, &[&input[..split], &input[split..]]);
-            assert_eq!(output, "前-[redacted:OPENAI_API_KEY]-後");
-        }
     }
 
     #[test]

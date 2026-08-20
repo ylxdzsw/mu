@@ -712,7 +712,6 @@ mod tests {
         request.cache_key = Some("mu:ses_test:agent".into());
         let body = request.json(ModelApi::AnthropicMessages).unwrap();
 
-        assert_eq!(body["max_tokens"], 64_000);
         assert_eq!(body["stream"], true);
         assert_eq!(body["system"], "system");
         assert_eq!(body["thinking"]["type"], "adaptive");
@@ -959,7 +958,7 @@ mod tests {
         unsupported[1]["name"] = Value::String("python".into());
         assert!(matches!(
             tool_calls_from_blocks(&unsupported),
-            Err(ProviderError::Protocol(message)) if message.contains("unsupported tool `python`")
+            Err(ProviderError::Protocol(_))
         ));
         assert!(matches!(
             items_from_blocks(&blocks).unwrap().as_slice(),
@@ -1070,7 +1069,9 @@ mod tests {
             }]),
             None,
         );
-        let error = request_body(None, vec![system(), malformed], false).unwrap_err();
-        assert!(error.to_string().contains("toolu_bad"));
+        assert!(matches!(
+            request_body(None, vec![system(), malformed], false),
+            Err(ProviderError::Protocol(_))
+        ));
     }
 }

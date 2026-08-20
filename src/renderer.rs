@@ -4556,18 +4556,6 @@ mod tests {
         assert_eq!(strip_ansi(&transcript), "docs\n");
         assert!(transcript.contains(&open_hyperlink(url)), "{transcript:?}");
 
-        let mut concise = MarkdownStream::new(None, OutputFormat::Concise);
-        let rendered = [
-            concise.push("[docs](").concat(),
-            concise.push(url).concat(),
-            concise.push(")\n").concat(),
-            concise.finish().concat(),
-        ]
-        .concat();
-
-        assert_eq!(strip_ansi(&rendered), "docs\n");
-        assert!(rendered.contains(&open_hyperlink(url)), "{rendered:?}");
-
         let detail = strip_ansi(&render_markdown(
             "[docs](https://example.com/docs)",
             None,

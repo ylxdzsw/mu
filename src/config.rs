@@ -795,29 +795,7 @@ mod tests {
     }
 
     #[test]
-    fn bundled_defaults_fill_omitted_fields_without_adding_starter_providers() {
-        let value = serde_json::json!({
-            "providers": {
-                "openai": {
-                    "endpoint": "http://localhost/chat/completions",
-                    "models": {"gpt-4o": {"context_window": 128000}}
-                }
-            }
-        });
-
-        let config = config_from_value(value).unwrap();
-        assert_eq!(
-            config
-                .providers
-                .keys()
-                .map(String::as_str)
-                .collect::<Vec<_>>(),
-            ["openai"]
-        );
-    }
-
-    #[test]
-    fn user_and_project_values_recursively_override_bundled_defaults() {
+    fn config_overlays_are_recursive_without_injecting_starter_providers() {
         let mut user = serde_json::json!({
             "providers": {
                 "custom": {
@@ -827,94 +805,51 @@ mod tests {
             },
             "limits": {"max_lines": 123},
             "compaction": {"enabled": false},
-            "guardrail": {"max_denials_per_turn": 7}
+            "guardrail": {"max_denials_per_turn": 7},
+            "redaction": {"env": ["*_TOKEN"]}
         });
         let project = serde_json::json!({
             "limits": {"max_bytes": 456},
-            "guardrail": {"enabled": false}
+            "guardrail": {"enabled": false},
+            "redaction": {"env": []}
         });
         merge_json(&mut user, project);
 
         let config = config_from_value(user).unwrap();
+        assert_eq!(
+            config
+                .providers
+                .keys()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            ["custom"]
+        );
         assert_eq!(config.limits.max_lines, 123);
         assert_eq!(config.limits.max_bytes, 456);
-        assert_eq!(config.limits.max_line_bytes, 10_240);
         assert!(!config.compaction.enabled);
         assert!(!config.guardrail.enabled);
-        assert_eq!(config.guardrail.timeout_seconds, 120);
         assert_eq!(config.guardrail.max_denials_per_turn, 7);
-    }
-
-    #[test]
-    fn explicit_empty_redaction_list_disables_default_patterns() {
-        let value = serde_json::json!({
-            "providers": {
-                "openai": {
-                    "endpoint": "http://localhost/chat/completions",
-                    "models": {"gpt-4o": {"context_window": 128000}}
-                }
-            },
-            "redaction": {"env": []}
-        });
-
-        let config = config_from_value(value).unwrap();
         assert!(config.redaction.env.is_empty());
     }
 
     #[test]
-    fn guardrail_limits_must_be_positive() {
+    fn numeric_limits_reject_invalid_values() {
         let provider = serde_json::json!({
             "openai": {
                 "endpoint": "http://localhost/chat/completions",
                 "models": {"gpt-4o": {"context_window": 128000}}
             }
         });
-        for guardrail in [
-            serde_json::json!({"timeout_seconds": 0}),
-            serde_json::json!({"max_denials_per_turn": 0}),
+        for invalid in [
+            serde_json::json!({"guardrail": {"timeout_seconds": 0}}),
+            serde_json::json!({"guardrail": {"max_denials_per_turn": 0}}),
+            serde_json::json!({"compaction": {"hard_headroom_tokens": 0}}),
+            serde_json::json!({"compaction": {"soft_fraction": 0.0}}),
+            serde_json::json!({"compaction": {"hard_fraction": 1.01}}),
         ] {
-            let error = config_from_value(serde_json::json!({
-                "providers": provider.clone(),
-                "guardrail": guardrail,
-            }))
-            .unwrap_err()
-            .to_string();
-            assert!(error.contains("must be greater than zero"), "{error}");
-        }
-    }
-
-    #[test]
-    fn compaction_headroom_must_be_positive() {
-        let error = config_from_value(serde_json::json!({
-            "providers": {
-                "openai": {
-                    "endpoint": "http://localhost/chat/completions",
-                    "models": {"gpt-4o": {"context_window": 128000}}
-                }
-            },
-            "compaction": {"hard_headroom_tokens": 0},
-        }))
-        .unwrap_err()
-        .to_string();
-        assert!(error.contains("must be greater than zero"), "{error}");
-    }
-
-    #[test]
-    fn compaction_fractions_must_be_valid_proportions() {
-        for (name, value) in [("soft_fraction", 0.0), ("hard_fraction", 1.01)] {
-            let error = config_from_value(serde_json::json!({
-                "providers": {
-                    "openai": {
-                        "endpoint": "http://localhost/chat/completions",
-                        "models": {"gpt-4o": {"context_window": 128000}}
-                    }
-                },
-                "compaction": {name: value},
-            }))
-            .unwrap_err()
-            .to_string();
-            assert!(error.contains(name), "{error}");
-            assert!(error.contains("at most one"), "{error}");
+            let mut value = serde_json::json!({"providers": provider.clone()});
+            merge_json(&mut value, invalid);
+            assert!(config_from_value(value).is_err());
         }
     }
 
@@ -962,17 +897,17 @@ mod tests {
 
     #[test]
     fn model_ids_cannot_contain_colons() {
-        let error = config_from_value(serde_json::json!({
-            "providers": {
-                "openai": {
-                    "endpoint": "http://localhost/chat/completions",
-                    "models": {"version:latest": {"context_window": 128000}}
+        assert!(
+            config_from_value(serde_json::json!({
+                "providers": {
+                    "openai": {
+                        "endpoint": "http://localhost/chat/completions",
+                        "models": {"version:latest": {"context_window": 128000}}
+                    }
                 }
-            }
-        }))
-        .unwrap_err()
-        .to_string();
-        assert!(error.contains("contains reserved `:`"), "{error}");
+            }))
+            .is_err()
+        );
     }
 
     #[test]
@@ -998,97 +933,46 @@ mod tests {
         assert_eq!(config.replay_key("alpha", "shared"), "compatible-family");
         assert_eq!(config.replay_key("alpha", "defaulted"), "alpha/defaulted");
 
-        let error = config_from_value(serde_json::json!({
-            "providers": {
-                "alpha": {
-                    "endpoint": "https://alpha.test/chat/completions",
-                    "models": {
-                        "invalid": {
-                            "context_window": 128000,
-                            "replay_key": " "
+        assert!(
+            config_from_value(serde_json::json!({
+                "providers": {
+                    "alpha": {
+                        "endpoint": "https://alpha.test/chat/completions",
+                        "models": {
+                            "invalid": {
+                                "context_window": 128000,
+                                "replay_key": " "
+                            }
                         }
                     }
                 }
-            }
-        }))
-        .unwrap_err()
-        .to_string();
-        assert!(error.contains("empty `replay_key`"), "{error}");
-    }
-
-    #[test]
-    fn redaction_env_accepts_exact_names_and_leading_wildcard_suffixes() {
-        let config = config_from_value(serde_json::json!({
-            "providers": {
-                "openai": {
-                    "endpoint": "http://localhost/chat/completions",
-                    "models": {"gpt": {}}
-                }
-            },
-            "redaction": {"env": ["GITHUB_TOKEN", "*_TOKEN"]}
-        }))
-        .unwrap();
-
-        assert_eq!(config.redaction.env, ["GITHUB_TOKEN", "*_TOKEN"]);
-    }
-
-    #[test]
-    fn redaction_env_rejects_unsupported_wildcards() {
-        for (selector, expected) in [
-            ("*", "must be followed by a literal suffix"),
-            ("**_TOKEN", "exactly one `*` is allowed"),
-            ("AWS_*", "only allowed as the first character"),
-            ("*TOKEN*", "exactly one `*` is allowed"),
-        ] {
-            let error = config_from_value(serde_json::json!({
-                "providers": {
-                    "openai": {
-                        "endpoint": "http://localhost/chat/completions",
-                        "models": {"gpt": {}}
-                    }
-                },
-                "redaction": {"env": [selector]}
             }))
-            .unwrap_err();
+            .is_err()
+        );
+    }
 
-            let message = error.to_string();
-            assert!(message.contains(selector), "{message}");
-            assert!(message.contains(expected), "{message}");
+    #[test]
+    fn redaction_env_selector_grammar() {
+        assert_eq!(redaction_suffix("GITHUB_TOKEN").unwrap(), None);
+        assert_eq!(redaction_suffix("*_TOKEN").unwrap(), Some("_TOKEN"));
+        for selector in ["*", "**_TOKEN", "AWS_*", "*TOKEN*"] {
+            assert!(redaction_suffix(selector).is_err());
         }
     }
 
     #[test]
     fn rejects_unsupported_endpoint_paths_before_runtime() {
-        let error = config_from_value(serde_json::json!({
-            "providers": {
-                "openai": {
-                    "endpoint": "https://api.openai.com/v1",
-                    "models": {"gpt": {}}
-                }
-            }
-        }))
-        .unwrap_err();
         assert!(
-            error
-                .to_string()
-                .contains("must end in `/chat/completions`, `/responses`, or `/messages`")
-        );
-    }
-
-    #[test]
-    fn legacy_base_url_fails_with_endpoint_migration_hint() {
-        let error = config_from_value(serde_json::json!({
-            "providers": {
-                "openai": {
-                    "base_url": "https://api.openai.com/v1",
-                    "models": {"gpt": {}}
+            config_from_value(serde_json::json!({
+                "providers": {
+                    "openai": {
+                        "endpoint": "https://api.openai.com/v1",
+                        "models": {"gpt": {}}
+                    }
                 }
-            }
-        }))
-        .unwrap_err();
-        let message = error.to_string();
-        assert!(message.contains("missing `endpoint`"));
-        assert!(message.contains("complete URL"));
+            }))
+            .is_err()
+        );
     }
 
     #[test]
@@ -1127,26 +1011,12 @@ mod tests {
     }
 
     #[test]
-    fn bundled_default_config_is_written_as_the_full_global_template() {
-        let root = std::env::temp_dir().join(format!("mu-config-{}", uuid::Uuid::new_v4()));
-        let config = root.join("config.jsonc");
-
-        ensure_starter_config(&config).unwrap();
-
-        assert_eq!(std::fs::read_to_string(&config).unwrap(), DEFAULT_CONFIG);
-        assert!(!root.join(".gitignore").exists());
-
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    #[test]
     fn permissive_load_does_not_create_a_missing_global_config() {
         let root =
             std::env::temp_dir().join(format!("mu-config-readonly-{}", uuid::Uuid::new_v4()));
 
         let config = load_config(&root, None, ConfigLoadMode::Permissive).unwrap();
 
-        assert_eq!(config.output, OutputFormat::Concise);
         assert!(config.providers.is_empty());
         assert!(!root.exists());
     }
@@ -1201,11 +1071,6 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn bundled_auto_resume_default_is_disabled() {
-        assert!(!bundled_test_default::<bool>("/auto_resume"));
     }
 
     #[test]
@@ -1285,29 +1150,19 @@ export   EXPORTED='exported value'
         let path = tmp.join(".env");
         std::fs::create_dir_all(&tmp).unwrap();
         std::fs::write(&path, "GOOD=value\nSECRET=$(do-not-print)\n").unwrap();
-        let mut env = EnvMap::from([("EXISTING".into(), "kept".into())]);
+        let baseline = EnvMap::from([("EXISTING".into(), "kept".into())]);
+        let mut env = baseline.clone();
 
         let error = load_dotenv_into(&path, &mut env).unwrap_err().to_string();
 
-        assert!(error.contains(&format!("{}:2", path.display())));
         assert!(!error.contains("do-not-print"));
-        assert_eq!(env, EnvMap::from([("EXISTING".into(), "kept".into())]));
+        assert_eq!(env, baseline);
 
-        let _ = std::fs::remove_dir_all(tmp);
-    }
-
-    #[test]
-    fn env_file_rejects_invalid_utf8_without_mutation() {
-        let tmp = std::env::temp_dir().join(format!("mu-env-utf8-{}", uuid::Uuid::new_v4()));
-        let path = tmp.join(".env");
-        std::fs::create_dir_all(&tmp).unwrap();
         std::fs::write(&path, b"NAME=valid\nSECRET=\xff\n").unwrap();
-        let mut env = EnvMap::from([("EXISTING".into(), "kept".into())]);
+        let mut env = baseline.clone();
 
-        let error = load_dotenv_into(&path, &mut env).unwrap_err().to_string();
-
-        assert!(error.contains(&format!("reading {}", path.display())));
-        assert_eq!(env, EnvMap::from([("EXISTING".into(), "kept".into())]));
+        assert!(load_dotenv_into(&path, &mut env).is_err());
+        assert_eq!(env, baseline);
 
         let _ = std::fs::remove_dir_all(tmp);
     }

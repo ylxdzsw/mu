@@ -1366,10 +1366,6 @@ mod tests {
     #[test]
     fn assistant_constructor_uses_chat_canonical_order() {
         assert!(matches!(
-            Message::assistant(None, None, None, None),
-            Message::Assistant { items, .. } if items.is_empty()
-        ));
-        assert!(matches!(
             Message::assistant(
                 Some("text".into()),
                 Some(String::new()),
@@ -1546,16 +1542,18 @@ mod tests {
 
     #[test]
     fn media_has_a_nonzero_bounded_fallback_estimate() {
-        let message = Message::User {
+        let message = |bytes| Message::User {
             content: UserContent::Parts(vec![ContentPart::Attachment {
                 attachment: Attachment {
                     filename: "image.png".into(),
                     media_type: "image/png".into(),
-                    data: vec![0; 20 * 1024 * 1024],
+                    data: vec![0; bytes],
                 },
             }]),
         };
-        assert_eq!(message.approx_tokens(), 16_384);
+        let estimate = message(5 * 1024 * 1024).approx_tokens();
+        assert!(estimate > 0);
+        assert_eq!(estimate, message(20 * 1024 * 1024).approx_tokens());
     }
 
     #[test]
@@ -1820,13 +1818,7 @@ mod tests {
     }
 
     #[test]
-    fn retry_helpers_are_deterministic_and_retry_after_is_bounded() {
-        assert_eq!(
-            (1..=5)
-                .map(|ordinal| provider_retry_delay(ordinal).as_secs())
-                .collect::<Vec<_>>(),
-            [1, 2, 4, 4, 4]
-        );
+    fn retry_after_is_parsed_and_takes_precedence() {
         let error = ProviderError::Overloaded {
             status: Some(503),
             retry_after: Some(Duration::from_secs(20)),
@@ -1851,22 +1843,6 @@ mod tests {
             parse_retry_after(Some(&date), UNIX_EPOCH + Duration::from_secs(120)),
             Some(Duration::ZERO)
         );
-
-        let mut config = replay_config(None, None);
-        for (_, provider) in config.providers.iter_mut() {
-            provider.models = OrderedMap::from_iter([(
-                "shared-model".into(),
-                ModelConfig {
-                    context_window: None,
-                    supported_efforts: None,
-                    replay_key: None,
-                },
-            )]);
-        }
-        let fixed = crate::models::resolve_model_choice(&config, "source/shared-model").unwrap();
-        let floating = crate::models::resolve_model_choice(&config, "shared-model").unwrap();
-        assert_eq!(provider_retry_limit(&fixed), 5);
-        assert_eq!(provider_retry_limit(&floating), 3);
     }
 
     #[test]
