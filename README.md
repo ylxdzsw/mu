@@ -327,7 +327,7 @@ references.
 ## Using your own provider
 
 On first use, `mu` creates `~/.mu/config.jsonc`. It ships with the keyless
-OpenCode Zen free models and a commented OpenAI example. To use a keyed
+OpenCode Zen Big Pickle model and a commented OpenAI example. To use a keyed
 provider, add its API key to `~/.mu/.env` (create the file if needed):
 
 ```dotenv

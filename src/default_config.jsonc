@@ -7,8 +7,8 @@
   "soft_interrupt": true,
   // Providers and models, in default and fallback order.
   "providers": {
-    // Default provider: OpenCode Zen's free DeepSeek and Mimo models. They need
-    // no API key, so mu works out of the box.
+    // Default provider: OpenCode Zen's free Big Pickle model. It needs no API
+    // key, so mu works out of the box.
     "opencode": {
       // Complete HTTP(S) URL or http+unix API request endpoint.
       "endpoint": "https://opencode.ai/zen/v1/chat/completions",
@@ -16,15 +16,7 @@
       // "api_key_env": "OPENCODE_API_KEY",
       // Available models, in default order.
       "models": {
-        "deepseek-v4-flash-free": {
-          // Efforts shown by status and completion.
-          // "supported_efforts": ["low", "medium", "high"],
-          // Native replay compatibility group.
-          // "replay_key": "compatible-family",
-          // Token limit used for status and compaction.
-          "context_window": 200000
-        },
-        "mimo-v2.5-free": {
+        "big-pickle": {
           // Token limit used for status and compaction.
           "context_window": 200000
         }
