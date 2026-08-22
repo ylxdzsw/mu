@@ -3,9 +3,9 @@
   "output": "concise",
   // Automatically continue replayable incomplete assistant responses.
   "auto_resume": false,
-  // Catch Ctrl+\\ as a soft interrupt instead of the terminal's default SIGQUIT.
+  // Catch Ctrl+\ as a soft interrupt instead of the terminal's default SIGQUIT.
   "soft_interrupt": true,
-  // Providers and models, in default and fallback order.
+  // Providers and models. Relative order determines fallbacking order.
   "providers": {
     // Default provider: OpenCode Zen's free Big Pickle model. It needs no API
     // key, so mu works out of the box.
@@ -23,13 +23,14 @@
       }
     }
     // Example keyed provider. Add OPENAI_API_KEY to ~/.mu/.env, then select it
-    // with `mu --model openai/gpt-4o`.
+    // with `mu --model openai/gpt-5.6-luna`.
     // "openai": {
     //   "endpoint": "https://api.openai.com/v1/chat/completions",
     //   "api_key_env": "OPENAI_API_KEY",
     //   "models": {
-    //     "gpt-4o": {
-    //       "context_window": 128000
+    //     "gpt-5.6-luna": {
+    //       "context_window": 1050000,
+    //       "supported_efforts": [ "low", "medium", "high", "xhigh", "max" ]
     //     }
     //   }
     // }
@@ -64,7 +65,7 @@
   // Environment values redacted from Bash output.
   "redaction": {
     // Exact names or *suffix selectors to redact.
-    "env": ["*_API_KEY", "*_API_TOKEN", "*_AUTH_TOKEN"]
+    "env": ["*_API_KEY", "*_API_TOKEN", "*_AUTH_TOKEN", "*_ACCESS_TOKEN"]
   },
   // Review destructive Bash calls.
   "guardrail": {
