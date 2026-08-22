@@ -6,7 +6,7 @@ use crate::provider::{
     AssistantItem, Attachment, ContentPart, FinishReason, HttpProvider, Message, NativeReplay,
     NativeReplayPayload, ProviderError, ReasoningVisibility, Request, SseEvent, StreamEvent,
     StreamResult, ToolCall, ToolCallDelta, Usage, UserContent, base64_encode,
-    classify_stream_error,
+    classify_stream_error, parse_completed_tool_arguments,
 };
 
 const MAX_OUTPUT_TOKENS: u64 = 64_000;
@@ -511,16 +511,7 @@ fn consume_event(
             if let Some(arguments) = state.tool_arguments.remove(&index)
                 && !arguments.is_empty()
             {
-                let input: Value = serde_json::from_str(&arguments).map_err(|error| {
-                    ProviderError::Protocol(format!(
-                        "invalid Anthropic tool input for block {index}: {error}"
-                    ))
-                })?;
-                if !input.is_object() {
-                    return Err(ProviderError::Protocol(format!(
-                        "Anthropic tool input for block {index} is not an object"
-                    )));
-                }
+                let input = parse_completed_tool_arguments(&arguments)?;
                 state.block_mut(index)?["input"] = input;
             }
             if state.reasoning_index == Some(index) {

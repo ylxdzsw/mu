@@ -617,6 +617,16 @@ fn run_bash_inner(
         .as_deref()
         .map(resolve_path)
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+    let cwd_metadata = std::fs::metadata(&cwd).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            anyhow::anyhow!("working directory does not exist: {}", cwd.display())
+        } else {
+            anyhow::anyhow!(error).context(format!("accessing working directory {}", cwd.display()))
+        }
+    })?;
+    if !cwd_metadata.is_dir() {
+        bail!("working directory is not a directory: {}", cwd.display());
+    }
     let applets = crate::paths::applets_dir()?;
     let command_text = format!(
         "export PATH={}:$PATH\nexec 2>&1\n{}",
@@ -1089,6 +1099,28 @@ mod tests {
         assert_eq!(second_result.output, format!("{}|unset", tmp.display()));
 
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn missing_cwd_error_names_path() {
+        let cwd = std::env::temp_dir().join(format!("mu-missing-{}", uuid::Uuid::new_v4()));
+        let mut call = args("true");
+        call.cwd = Some(cwd.display().to_string());
+
+        let error = run_bash(
+            call,
+            5,
+            &mut Renderer::new(),
+            &empty_env(),
+            SecretRedactor::default(),
+            None,
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            format!("working directory does not exist: {}", cwd.display())
+        );
     }
 
     #[test]

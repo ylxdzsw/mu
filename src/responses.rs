@@ -6,7 +6,7 @@ use crate::provider::{
     AssistantItem, ContentPart, FinishReason, HttpProvider, Message, NativeReplay,
     NativeReplayPayload, ProviderError, ReasoningVisibility, Request, SseEvent, StreamEvent,
     StreamResult, ToolCall, ToolCallDelta as ProviderToolCallDelta, Usage, UserContent,
-    base64_encode, classify_stream_error, next_event_boundary,
+    base64_encode, classify_stream_error, next_event_boundary, validate_completed_tool_arguments,
 };
 
 pub(crate) async fn stream(
@@ -469,21 +469,7 @@ fn responses_items(output: &[Value]) -> Result<Vec<AssistantItem>, ProviderError
                     )));
                 }
                 let arguments = item["arguments"].as_str().unwrap_or("");
-                let arguments = if arguments.trim().is_empty() {
-                    "{}".into()
-                } else {
-                    let value: Value = serde_json::from_str(arguments).map_err(|error| {
-                        ProviderError::Protocol(format!(
-                            "invalid completed Responses tool arguments for `{id}`: {error}"
-                        ))
-                    })?;
-                    if !value.is_object() {
-                        return Err(ProviderError::Protocol(format!(
-                            "completed Responses tool arguments for `{id}` must be a JSON object"
-                        )));
-                    }
-                    arguments.to_string()
-                };
+                let arguments = validate_completed_tool_arguments(arguments)?;
                 items.push(AssistantItem::BashCall(ToolCall {
                     id: id.to_string(),
                     arguments,

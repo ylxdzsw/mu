@@ -7,7 +7,7 @@ use crate::provider::{
     AssistantItem, ContentPart, FinishReason, HttpProvider, Message, NativeReplay,
     NativeReplayPayload, ProviderError, ReasoningVisibility, Request, SseEvent, StreamEvent,
     StreamResult, ToolCall, ToolCallDelta as ProviderToolCallDelta, Usage, UserContent,
-    base64_encode, classify_stream_error,
+    base64_encode, classify_stream_error, validate_completed_tool_arguments,
 };
 
 #[derive(Debug, Deserialize)]
@@ -85,6 +85,7 @@ struct StreamParseState {
     reasoning_content_present: bool,
     tool_accum: ToolCallAccumulator,
     finish_reason: FinishReason,
+    terminal_finish_seen: bool,
     usage: Option<Usage>,
     reasoning_active: bool,
     tool_call_started: bool,
@@ -98,6 +99,7 @@ impl Default for StreamParseState {
             reasoning_content_present: false,
             tool_accum: BTreeMap::new(),
             finish_reason: FinishReason::Stop,
+            terminal_finish_seen: false,
             usage: None,
             reasoning_active: false,
             tool_call_started: false,
@@ -124,6 +126,7 @@ pub(crate) async fn stream(
     if state.reasoning_active {
         on_event(StreamEvent::ReasoningEnd)?;
     }
+    state.finish_reason = finalized_finish_reason(&state);
 
     let has_tool_calls = !state.tool_accum.is_empty();
     let validate_arguments = matches!(state.finish_reason, FinishReason::ToolCalls);
@@ -480,9 +483,16 @@ fn consume_sse_buffer(
                     }
                 }
                 if let Some(ref reason) = choice.finish_reason {
+                    state.terminal_finish_seen = true;
                     state.finish_reason = match reason.as_str() {
                         "stop" => FinishReason::Stop,
                         "tool_calls" => FinishReason::ToolCalls,
+                        // Some gateways encode transport failures as terminal finish reasons.
+                        "network_error" => {
+                            return Err(ProviderError::Transport(
+                                "provider ended response with finish_reason=network_error".into(),
+                            ));
+                        }
                         other => FinishReason::Other(other.to_string()),
                     };
                 }
@@ -491,6 +501,19 @@ fn consume_sse_buffer(
     }
 
     Ok(())
+}
+
+fn finalized_finish_reason(state: &StreamParseState) -> FinishReason {
+    if state.terminal_finish_seen
+        && state.finish_reason == FinishReason::Stop
+        && !state.reasoning_content.is_empty()
+        && state.content.is_empty()
+        && state.tool_accum.is_empty()
+    {
+        FinishReason::Resume
+    } else {
+        state.finish_reason.clone()
+    }
 }
 
 fn completed_tool_calls(
@@ -508,28 +531,13 @@ fn completed_tool_calls(
                 )));
             }
             let arguments = if validate_arguments {
-                validate_tool_arguments(&arguments)?
+                validate_completed_tool_arguments(&arguments)?
             } else {
                 arguments
             };
             Ok(ToolCall { id, arguments })
         })
         .collect()
-}
-
-fn validate_tool_arguments(arguments: &str) -> Result<String, ProviderError> {
-    if arguments.trim().is_empty() {
-        return Ok("{}".into());
-    }
-    let value: Value = serde_json::from_str(arguments).map_err(|error| {
-        ProviderError::Protocol(format!("invalid completed tool arguments: {error}"))
-    })?;
-    if !value.is_object() {
-        return Err(ProviderError::Protocol(
-            "completed tool arguments must be a JSON object".into(),
-        ));
-    }
-    Ok(arguments.to_string())
 }
 
 fn reasoning_text_from_value(value: &Value) -> Option<String> {
@@ -737,6 +745,13 @@ mod tests {
                 "accepted {invalid}"
             );
         }
+        assert!(matches!(
+            completed_tool_calls(
+                calls(r#"{"command":"pwd","command":"whoami"}"#),
+                true
+            ),
+            Err(ProviderError::Protocol(message)) if message.contains("duplicate key `command`")
+        ));
         assert_eq!(
             completed_tool_calls(calls("{"), false).unwrap()[0].arguments,
             "{"
@@ -784,6 +799,27 @@ mod tests {
             ),
             Err(ProviderError::Overloaded { detail, .. }) if detail == "upstream unavailable"
         ));
+
+        let mut frame =
+            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"network_error\"}]}\n\n"
+                .to_string();
+        assert!(matches!(
+            consume_sse_buffer(
+                &mut frame,
+                &mut StreamParseState::default(),
+                &mut on_event
+            ),
+            Err(ProviderError::Transport(message)) if message.contains("network_error")
+        ));
+    }
+
+    #[test]
+    fn reasoning_only_stop_is_resumable() {
+        let mut state = StreamParseState::default();
+        let mut frame = "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"still working\"},\"finish_reason\":\"stop\"}]}\n\n".to_string();
+        consume_sse_buffer(&mut frame, &mut state, &mut |_| Ok(())).unwrap();
+
+        assert_eq!(finalized_finish_reason(&state), FinishReason::Resume);
     }
 
     #[test]

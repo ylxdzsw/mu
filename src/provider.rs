@@ -9,7 +9,10 @@ use chrono::{DateTime, NaiveDateTime};
 use clap::ValueEnum;
 use percent_encoding::percent_decode_str;
 use reqwest::Client;
-use serde::{Deserialize, Serialize};
+use serde::{
+    Deserialize, Serialize,
+    de::{Error as _, MapAccess, Visitor},
+};
 use serde_json::Value;
 use tokio::time::{self, MissedTickBehavior};
 
@@ -727,6 +730,64 @@ pub struct ToolAttachment {
 pub struct ToolCall {
     pub id: String,
     pub arguments: String,
+}
+
+// MapAccess exposes duplicate keys before Value deserialization collapses them.
+struct UniqueToolArguments(Value);
+
+impl<'de> Deserialize<'de> for UniqueToolArguments {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct UniqueToolArgumentsVisitor;
+
+        impl<'de> Visitor<'de> for UniqueToolArgumentsVisitor {
+            type Value = UniqueToolArguments;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("a JSON object with unique keys")
+            }
+
+            fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+            where
+                A: MapAccess<'de>,
+            {
+                let mut object = serde_json::Map::new();
+                while let Some((key, value)) = map.next_entry::<String, Value>()? {
+                    if object.contains_key(&key) {
+                        return Err(A::Error::custom(format!("duplicate key `{key}`")));
+                    }
+                    object.insert(key, value);
+                }
+                Ok(UniqueToolArguments(Value::Object(object)))
+            }
+        }
+
+        deserializer.deserialize_map(UniqueToolArgumentsVisitor)
+    }
+}
+
+pub(crate) fn parse_completed_tool_arguments(arguments: &str) -> Result<Value, ProviderError> {
+    let arguments = if arguments.trim().is_empty() {
+        "{}"
+    } else {
+        arguments
+    };
+    serde_json::from_str::<UniqueToolArguments>(arguments)
+        .map(|arguments| arguments.0)
+        .map_err(|error| {
+            ProviderError::Protocol(format!("invalid completed tool arguments: {error}"))
+        })
+}
+
+pub(crate) fn validate_completed_tool_arguments(arguments: &str) -> Result<String, ProviderError> {
+    parse_completed_tool_arguments(arguments)?;
+    Ok(if arguments.trim().is_empty() {
+        "{}".into()
+    } else {
+        arguments.into()
+    })
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
