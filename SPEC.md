@@ -147,11 +147,10 @@ presentation.
 questions—how much information to show and whether the destination is a
 terminal. Removed names are rejected rather than kept as aliases.
 
-### 2.7 Unsandboxed execution with a narrow review gate
+### 2.7 Unsandboxed execution
 
-**Decision.** Bash runs with the invoking user's permissions. Declared
-destructive calls are reviewed by the optional guardrail before execution, but
-declared risk and model review are not security boundaries.
+**Decision.** Bash runs with the invoking user's permissions. Declared risk is
+advisory metadata and does not constrain execution.
 
 This matches Mu's role as a transparent terminal agent. A partial sandbox would
 create misleading assurance while breaking ordinary shell workflows.
@@ -202,7 +201,8 @@ One normal turn follows this sequence:
    the same session fails as `session busy`; different sessions remain
    independent.
 5. Reject the submission if that session has an unfinished compaction;
-   otherwise normalize any interrupted journal tail.
+   otherwise resolve the prior interrupted tail as superseded without
+   executing its pending calls.
 6. Durably queue the submitted prompt, working directory, Git worktree root,
    and attachment references. Only then select the session as
    `current-session`.
@@ -216,8 +216,10 @@ One normal turn follows this sequence:
      of semantic history;
    - on success, persist the completed native response and ordered semantic
      assistant projection before executing any Bash call;
-   - execute accepted Bash claims, persist one result for each started claim in
-     provider order, and request the provider again;
+   - before every Bash attempt, durably persist `bash_started`, then execute
+     accepted claims and persist results in provider order;
+   - after an interruption, resume never-started and readonly claims before
+     requesting the provider again;
    - stop on a completed assistant response.
 9. Emit the selected completion presentation, release the lock, and exit.
 
@@ -239,14 +241,17 @@ semantic history.
 
 When `soft_interrupt` is enabled, `SIGQUIT` requests a soft interrupt instead:
 the active provider request and Bash calls are allowed to finish, Bash claims
-that have not started receive an explicit skipped error result, and Mu starts
+that have not started remain pending without synthetic results, and Mu starts
 no further provider request or Bash call. The terminal's normal `^\\` echo is
-the receipt acknowledgement; Mu emits only the final soft-interrupt outcome.
-When disabled, Mu does not install a `SIGQUIT` handler.
+the receipt acknowledgement; Mu emits only the final soft-interrupt outcome
+and pending-call count. When disabled, Mu does not install a `SIGQUIT` handler.
 
-The next invocation normalizes unmatched requests and result-less Bash claims
-before continuing. A new prompt may redirect the work; `mu retry` continues the
-interrupted turn without adding a new prompt.
+`mu retry` continues the interrupted turn without adding a new prompt. It
+attempts never-started claims and may repeat a started but unresolved readonly
+claim. Started reversible or destructive claims receive a conservative
+interrupted result instead. A new prompt redirects the work: it never executes
+old pending claims, resolving started claims as interrupted and never-started
+claims as superseded before appending the new prompt.
 
 ---
 
@@ -266,8 +271,7 @@ bash({
 ```
 
 - `title` is concise human-facing action text.
-- `risk` is advisory audit/UI metadata. It selects guardrail review only for
-  `destructive`; it does not constrain the process.
+- `risk` is advisory audit/UI metadata. It does not constrain the process.
 - `command` runs as `bash -lc`.
 - `cwd` applies to this call only. Calls do not share `cd`, shell variables, or
   exported environment changes.
@@ -404,8 +408,9 @@ The plugins provide the same product contract:
 - Ctrl-C cancels an edited draft or interrupts the foreground Mu process using
   ordinary shell signal behavior.
 - Ctrl-\\ requests a soft interrupt when `soft_interrupt` is enabled: active
-  work finishes, pending Bash calls are skipped, and the turn stops before new
-  work. The terminal's `^\\` is the immediate acknowledgement.
+  work finishes, unstarted Bash calls remain pending for `/retry`, and the turn
+  stops before new work. The terminal's `^\\` is the immediate
+  acknowledgement.
 - Ctrl-D retains normal shell EOF behavior.
 - Up/Down navigate within multiline input and then browse Mu-tagged shell
   history without mixing ordinary commands. Recalled prompts run with the
@@ -414,8 +419,8 @@ The plugins provide the same product contract:
   key sequence.
 - Slash commands and model names use native shell completion.
 
-The plugins never implement provider, store, tool, guardrail, retry, or
-compaction semantics.
+The plugins never implement provider, store, tool, retry, or compaction
+semantics.
 
 ### 6.1 Shell-owned session bundle
 
@@ -476,8 +481,7 @@ depends on provider or model names.
 
 Every adapter consumes the same semantic message list and Bash schema and
 returns ordered assistant items: reasoning, text, and Bash calls. The renderer,
-agent loop, tool executor, guardrail, retries, and compaction remain
-protocol-neutral.
+agent loop, tool executor, retries, and compaction remain protocol-neutral.
 
 ### 7.1 Replay boundaries
 
@@ -535,7 +539,7 @@ Other invalid content-block sequencing remains a fatal protocol error.
 - `supported_efforts` is an ordered status/completion hint, not validation of
   manually entered effort strings.
 - A session remembers the forward-only provider position for each floating
-  model across agent, compaction, and guardrail requests.
+  model across agent and compaction requests.
 - Fixed choices do not mutate floating positions.
 - Missing historical candidates are skipped; Mu never adds compatibility
   aliases or rewrites the journal to recover them.
@@ -686,8 +690,7 @@ for field defaults. The durable field groups are:
 - `terminal_bell`;
 - `compaction`;
 - `limits`;
-- `redaction`;
-- `guardrail`.
+- `redaction`.
 
 Unknown output names and removed aliases are configuration errors.
 
@@ -760,7 +763,7 @@ Management commands:
 | `mu status` | Report resolved scope, selection, model, context, and optional expensive indexes. |
 | `mu context` | Show the system prompt Mu would assemble; `--export` emits user instructions and non-built-in skill guidance for a foreign agent. |
 | `mu cat` | Resolve and preview exact prompt input without provider contact or session creation. |
-| `mu retry` | Normalize and continue an interrupted turn without a new prompt; a clean session reports a no-op. |
+| `mu retry` | Recover and continue an interrupted turn without a new prompt, including pending Bash claims; a clean session reports a no-op. |
 | `mu compact` | Force compaction with configured or explicit output density, optionally using non-terminal stdin as a focus instruction. |
 
 Provider-free management commands do not contact a provider.
@@ -791,16 +794,21 @@ The durable event model is:
   copying its content.
 - **`compaction_started`** — binds one synthetic compaction turn to its prompt,
   trigger, mode, and before-context measurements.
-- **`provider_requested`** — typed agent or guardrail subject, resolved
-  provider/model origin, and a checksummed recipe sufficient to reconstruct the
-  native request. Its event sequence is the request's context boundary.
+- **`provider_requested`** — resolved provider/model origin and a checksummed
+  recipe sufficient to reconstruct the native request. Its event sequence is
+  the request's context boundary.
 - **`provider_completed`** — completed native response and accepted semantic
   projection.
 - **`provider_failed` / `provider_interrupted`** — terminal audit outcome with
   no semantic assistant message.
+- **`bash_started`** — write-ahead execution boundary for one Bash attempt.
+  More than one start is valid only when explicitly retrying an unresolved
+  readonly claim.
 - **`bash_completed`** — unique inline result and attachment references for one
-  durable Bash claim. Text is always stored directly in the journal; binary
+  started Bash claim. Text is always stored directly in the journal; binary
   attachments remain content-addressed objects.
+- **`bash_not_attempted`** — terminal model-visible result for a claim
+  deliberately abandoned before its first start.
 - **`compaction_applied`** — after-context telemetry for the committed epoch
   transition.
 
@@ -817,9 +825,8 @@ Context epoch at event sequence `S` is the number of valid prior
 `compaction_applied` events: the application belongs to the old epoch, and
 events after it belong to the new epoch. User turns derive prompt content and
 location from their referenced queued prompt. Bash result ownership derives
-through Bash claim, assistant completion, and provider request. Guardrail call
-and attempt derive from the typed request subject. Session creation time and
-compaction elapsed time derive from event timestamps.
+through Bash claim, assistant completion, and provider request. Session
+creation time and compaction elapsed time derive from event timestamps.
 
 There is no mutable session row, title, cached status flag, owner PID, or
 separate run entity. Session listings and status are projections of journal
@@ -838,25 +845,30 @@ An exclusive, nonblocking advisory lock on the journal owns a mutable
 operation. The descriptor remains open for the operation and the kernel
 releases it on exit. Mu does not use PID leases or stale-owner recovery.
 
-### 11.2 Cleanliness and interrupted-tail normalization
+### 11.2 Cleanliness and interrupted-tail recovery
 
 A latest turn is clean only when its latest accepted assistant state is
 complete and all Bash claims have results. Unmatched provider requests,
 resume states, and result-less claims make it dirty.
 
-Before a turn or retry, Mu:
+Every Bash process crosses a write-ahead boundary: Mu appends and syncs
+`bash_started` before spawning the process or opening its stdin. A claim with no
+start was therefore definitely not attempted. A start with no result means the
+claim may have executed; a crash can land between the durable start and the
+actual spawn, and recovery deliberately accepts that conservative false
+positive.
 
-- removes an incomplete final record;
-- appends interruption outcomes for unmatched provider requests;
-- gives each result-less Bash claim a deterministic denied result or a
-  conservative interrupted result.
+Before retry, Mu appends interruption outcomes for unmatched provider requests.
+Never-started claims remain pending. A started unresolved readonly claim also
+remains pending and may receive another start; higher-risk claims receive a
+conservative interrupted result and are never repeated automatically. Pending
+claims execute in their original provider order before another provider
+request.
 
-This normalization is idempotent.
-
-Mu deliberately does not guess whether a result-less claim began execution.
-Side effects may occur between durable claim publication and process tracking,
-so recovery says "possibly executed" and lets the agent verify rather than
-risk repeating work.
+Before a new user prompt, Mu instead closes every old pending claim. Started
+claims receive interrupted results, while never-started claims receive
+`bash_not_attempted` results with reason `superseded`. This recovery is
+idempotent.
 
 ### 11.3 Semantic context and transcripts
 
@@ -927,8 +939,8 @@ Automatic context management has three triggers:
    compaction is fatal.
 
 Compaction is an ordinary synthetic turn in the current context. Its request
-uses the same model context, native replay, Bash tool, guardrail, streaming,
-fallback, persistence, and retry machinery as any other agent request. Mu asks
+uses the same model context, native replay, Bash tool, streaming, fallback,
+persistence, and retry machinery as any other agent request. Mu asks
 for a plain Markdown checkpoint, accepts the final assistant text without
 parsing section syntax, and then appends `compaction_applied`. Validation binds
 the application to exactly one pending `compaction_started` and a final,
@@ -1011,52 +1023,17 @@ Durable safeguards are:
 - append-only visibility of accepted assistant actions and captured results;
 - foreground interruptibility and process-group termination;
 - output bounds and exact-value redaction for configured environment values;
-- a review gate for calls declared `destructive`;
 - treating external content as untrusted data in the agent prompt.
 
-The agent can misclassify risk, the reviewer can be wrong, commands can hide
-effects, and unselected secrets can enter output. Users must treat Mu as code
-execution with their own authority.
+The agent can misclassify risk, commands can hide effects, and unselected
+secrets can enter output. Users must treat Mu as code execution with their own
+authority.
 
-### 12.1 Guardrail
-
-When enabled, each Bash call declared `destructive` receives a separate
-provider request before execution. The reviewer has no tools and sees a
-budgeted semantic transcript plus bounded action JSON. It returns `risk_level`,
-`user_auth_level`, and a reason.
-
-Execution requires authorization rank at least risk rank:
-
-| Risk | Rank | Minimum authorization |
-|---|---:|---|
-| `low` | 0 | `unknown` |
-| `medium` | 1 | `low` |
-| `high` | 2 | `medium` |
-| `critical` | 4 | `explicit` |
-
-Authorization ranks are `unknown` 0, `low` 1, `medium` 2, `high` 3, and
-`explicit` 4. The gap before critical ensures only explicit authorization can
-approve it.
-
-An allowed call executes. A denial becomes a Bash error so the agent can choose
-a less destructive approach or request authorization. Reviewer failure records
-that execution did not begin and aborts the turn. Repeated denials are bounded
-by `guardrail.max_denials_per_turn`.
-
-Reviewer requests use the configured review model or the active turn model and
-follow the same provider protocol, audit, retry, and floating-fallback policy as
-other Mu requests. A user's later explicit approval is ordinary session history
-that the next review may consider; there is no hidden approval state.
-
-The guardrail reviews only calls declared destructive. It does not inspect or
-constrain calls declared readonly or reversible and is not a sandbox.
-
-### 12.2 Rejected and deferred safety designs
+### 12.1 Rejected and deferred safety designs
 
 **Interactive approval for every action — rejected.** It would turn Mu into an
 approval-driven UI, interrupt composition, and still rely on the model's action
-description. The current guardrail denies into the transcript and lets the
-agent ask for authorization when needed.
+description.
 
 **Static Bash parsing to discover privileged or destructive commands —
 rejected.** Bash permits variables, functions, aliases, sourced files, nested

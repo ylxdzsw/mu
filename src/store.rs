@@ -25,6 +25,10 @@ pub const BASH_CALL_ID_ENV: &str = "MU_BASH_CALL_ID";
 pub const ATTACHMENT_MANIFEST_ENV: &str = "MU_ATTACHMENT_MANIFEST";
 pub const OBJECTS_DIR_ENV: &str = "MU_OBJECTS_DIR";
 pub const INTERRUPTED_TOOL_RESULT: &str = "error: interrupted — this command may have started and not completed; its effects are unknown. Verify the resulting state before relying on it.";
+pub const SUPERSEDED_TOOL_RESULT: &str =
+    "error: not attempted — this Bash command was superseded by a new user prompt.";
+pub const ABANDONED_TOOL_RESULT: &str =
+    "error: not attempted — this Bash command was abandoned before it started.";
 pub const RESUME_PROMPT: &str = "Continue";
 
 const FORMAT_VERSION: u32 = 4;
@@ -123,6 +127,21 @@ pub struct BashResultRecord<'a> {
     pub duration_ms: Option<u64>,
 }
 
+#[derive(Debug, Clone)]
+pub struct PendingBashCall {
+    pub call_id: i64,
+    pub call: ToolCall,
+    pub attempts: usize,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum BashNotAttemptedReason {
+    InvalidArguments,
+    Superseded,
+    Abandoned,
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum CompactionTrigger {
@@ -204,15 +223,6 @@ pub struct CompactionStart<'a> {
     pub before_context_window: Option<u64>,
 }
 
-pub struct GuardrailCompletion<'a> {
-    pub outcome: &'a str,
-    pub risk_level: Option<&'a str>,
-    pub auth_level: Option<&'a str>,
-    pub reason: Option<&'a str>,
-    pub native_response: Option<&'a Value>,
-    pub usage: Option<&'a Usage>,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProviderOrigin {
     pub canonical_model_ref: String,
@@ -230,26 +240,6 @@ pub struct RequestRecipe {
     pub input: Value,
     pub envelope: Value,
     pub canonical_sha256: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum RequestSubject {
-    Agent,
-    Guardrail { call_id: i64, attempt: u32 },
-}
-
-impl RequestSubject {
-    fn is_agent(&self) -> bool {
-        matches!(self, Self::Agent)
-    }
-
-    fn guardrail(&self) -> Option<(i64, u32)> {
-        match self {
-            Self::Guardrail { call_id, attempt } => Some((*call_id, *attempt)),
-            Self::Agent => None,
-        }
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -313,7 +303,6 @@ enum Event {
     ProviderRequested {
         turn_id: String,
         exchange_id: String,
-        subject: RequestSubject,
         origin: ProviderOrigin,
         request_recipe: RequestRecipe,
     },
@@ -337,6 +326,9 @@ enum Event {
     ProviderInterrupted {
         exchange_id: String,
     },
+    BashStarted {
+        call_id: i64,
+    },
     BashCompleted {
         call_id: i64,
         outcome: String,
@@ -347,6 +339,11 @@ enum Event {
         duration_ms: Option<u64>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         attachments: Vec<PersistedToolAttachment>,
+    },
+    BashNotAttempted {
+        call_id: i64,
+        reason: BashNotAttemptedReason,
+        output: String,
     },
     CompactionApplied {
         after_context_tokens_estimate: u64,
@@ -361,9 +358,8 @@ fn agent_compaction_attempt(event: &Event) -> Option<(&str, &str, Option<&str>)>
             turn_id,
             exchange_id,
             request_recipe,
-            subject,
             ..
-        } if subject.is_agent() => Some((
+        } => Some((
             turn_id,
             exchange_id,
             request_recipe.input["compaction_attempt"].as_str(),
@@ -393,15 +389,6 @@ enum Projection {
         #[serde(skip_serializing_if = "Option::is_none")]
         native_replay: Option<NativeReplayPayload>,
         items: Vec<PersistedAssistantItem>,
-    },
-    Guardrail {
-        outcome: String,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        risk_level: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        auth_level: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        reason: Option<String>,
     },
 }
 
@@ -838,9 +825,9 @@ impl Store {
                 .iter()
                 .rev()
                 .find_map(|line| match &line.event {
-                    Event::ProviderRequested {
-                        subject, origin, ..
-                    } if subject.is_agent() => Some(origin.canonical_model_ref.clone()),
+                    Event::ProviderRequested { origin, .. } => {
+                        Some(origin.canonical_model_ref.clone())
+                    }
                     _ => None,
                 }))
         })
@@ -920,7 +907,6 @@ impl Store {
                     "native_replay_origins": native_replay_origins(&request.messages),
                 }),
             )?,
-            RequestSubject::Agent,
         )?;
         if outcome == "completed" {
             self.complete_assistant_exchange(
@@ -1001,11 +987,10 @@ impl Store {
                     );
                     complete = assistant_turn_state(*resumable, items) == "complete";
                 }
-                Event::BashCompleted { call_id, .. } => {
+                Event::BashCompleted { call_id, .. } | Event::BashNotAttempted { call_id, .. } => {
                     results.insert(*call_id);
                 }
-                Event::ProviderCompleted { exchange_id, .. }
-                | Event::ProviderFailed { exchange_id, .. }
+                Event::ProviderFailed { exchange_id, .. }
                 | Event::ProviderInterrupted { exchange_id } => {
                     terminal.insert(exchange_id.as_str());
                 }
@@ -1039,25 +1024,17 @@ impl Store {
             .is_some_and(|(seq, resume)| resume && !resume_was_requested(&journal, &turn_id, seq)))
     }
 
-    pub fn normalize_interrupted_tail(&self, session_id: &str) -> Result<usize> {
+    pub fn recover_interrupted_tail_for_retry(&self, session_id: &str) -> Result<usize> {
         let journal = self.load(session_id)?;
         let mut terminal = HashSet::new();
         let mut requested = Vec::new();
-        let mut guardrail_calls = HashMap::new();
         let mut calls = HashSet::new();
         let mut results = HashSet::new();
-        let mut denied = HashMap::new();
+        let mut starts = HashMap::<i64, usize>::new();
         for line in journal.events.iter() {
             match &line.event {
-                Event::ProviderRequested {
-                    exchange_id,
-                    subject,
-                    ..
-                } => {
+                Event::ProviderRequested { exchange_id, .. } => {
                     requested.push(exchange_id.clone());
-                    if let Some((call_id, _)) = subject.guardrail() {
-                        guardrail_calls.insert(exchange_id.clone(), call_id);
-                    }
                 }
                 Event::ProviderCompleted {
                     exchange_id,
@@ -1074,22 +1051,16 @@ impl Store {
                                 calls.insert(call_id);
                             }
                         }
-                        Projection::Guardrail {
-                            outcome, reason, ..
-                        } if outcome == "deny" => {
-                            let call_id = guardrail_calls
-                                .get(exchange_id)
-                                .context("guardrail completion has no request subject")?;
-                            denied.insert(*call_id, reason.clone().unwrap_or_default());
-                        }
-                        _ => {}
                     }
                 }
                 Event::ProviderFailed { exchange_id, .. }
                 | Event::ProviderInterrupted { exchange_id } => {
                     terminal.insert(exchange_id.clone());
                 }
-                Event::BashCompleted { call_id, .. } => {
+                Event::BashStarted { call_id } => {
+                    *starts.entry(*call_id).or_default() += 1;
+                }
+                Event::BashCompleted { call_id, .. } | Event::BashNotAttempted { call_id, .. } => {
                     results.insert(*call_id);
                 }
                 _ => {}
@@ -1101,36 +1072,94 @@ impl Store {
         {
             self.append(session_id, Event::ProviderInterrupted { exchange_id })?;
         }
-        let mut unresolved = calls
+        let mut uncertain = calls
             .iter()
-            .filter(|call_id| !results.contains(call_id))
+            .filter(|call_id| starts.contains_key(call_id) && !results.contains(call_id))
             .copied()
             .collect::<Vec<_>>();
-        unresolved.sort_unstable();
+        uncertain.sort_unstable();
         let mut normalized = 0;
-        for call_id in unresolved {
-            let (outcome, output) = if let Some(reason) = denied.get(&call_id) {
-                (
-                    "error",
-                    format!("error: guardrail denied this command: {reason}"),
-                )
+        for call_id in uncertain {
+            let (_, arguments) =
+                find_call(&journal, call_id).context("locating interrupted Bash claim")?;
+            if bash_risk(arguments)? != crate::bash::BashRisk::Readonly {
+                self.append_interrupted_bash_result(session_id, call_id)?;
+                normalized += 1;
+            }
+        }
+        Ok(normalized)
+    }
+
+    pub fn abandon_interrupted_tail(
+        &self,
+        session_id: &str,
+        reason: BashNotAttemptedReason,
+    ) -> Result<usize> {
+        self.recover_unmatched_provider_requests(session_id)?;
+        let pending = self.pending_bash_calls(session_id)?;
+        let mut resolved = 0;
+        for call in pending {
+            if call.attempts == 0 {
+                let output = match reason {
+                    BashNotAttemptedReason::Superseded => SUPERSEDED_TOOL_RESULT,
+                    BashNotAttemptedReason::Abandoned => ABANDONED_TOOL_RESULT,
+                    BashNotAttemptedReason::InvalidArguments => {
+                        bail!("invalid-arguments abandonment requires a specific error")
+                    }
+                };
+                self.persist_bash_not_attempted(session_id, call.call_id, reason, output)?;
             } else {
-                ("interrupted", INTERRUPTED_TOOL_RESULT.to_string())
-            };
-            self.append(
-                session_id,
-                Event::BashCompleted {
-                    call_id,
-                    outcome: outcome.into(),
-                    output,
-                    exit_code: None,
-                    duration_ms: None,
-                    attachments: Vec::new(),
-                },
-            )?;
+                self.append_interrupted_bash_result(session_id, call.call_id)?;
+            }
+            resolved += 1;
+        }
+        Ok(resolved)
+    }
+
+    fn recover_unmatched_provider_requests(&self, session_id: &str) -> Result<usize> {
+        let journal = self.load(session_id)?;
+        let mut terminal = HashSet::new();
+        let mut requested = Vec::new();
+        for line in journal.events.iter() {
+            match &line.event {
+                Event::ProviderRequested { exchange_id, .. } => {
+                    requested.push(exchange_id.clone());
+                }
+                Event::ProviderCompleted { exchange_id, .. }
+                | Event::ProviderFailed { exchange_id, .. }
+                | Event::ProviderInterrupted { exchange_id } => {
+                    terminal.insert(exchange_id.clone());
+                }
+                _ => {}
+            }
+        }
+        let mut normalized = 0;
+        for exchange_id in requested
+            .into_iter()
+            .filter(|exchange_id| !terminal.contains(exchange_id))
+        {
+            self.append(session_id, Event::ProviderInterrupted { exchange_id })?;
             normalized += 1;
         }
         Ok(normalized)
+    }
+
+    fn append_interrupted_bash_result(&self, session_id: &str, call_id: i64) -> Result<i64> {
+        let seq = self.append(
+            session_id,
+            Event::BashCompleted {
+                call_id,
+                outcome: "interrupted".into(),
+                output: INTERRUPTED_TOOL_RESULT.to_string(),
+                exit_code: None,
+                duration_ms: None,
+                attachments: Vec::new(),
+            },
+        )?;
+        if let Ok((manifest, _)) = self.attachment_paths(session_id) {
+            let _ = cleanup_bash_attachments(&manifest, call_id);
+        }
+        Ok(seq)
     }
 
     #[cfg(test)]
@@ -1198,12 +1227,22 @@ impl Store {
                         },
                     );
                 }
+                Event::BashNotAttempted {
+                    call_id, output, ..
+                } => {
+                    results.insert(
+                        *call_id,
+                        TranscriptBashResult {
+                            outcome: "not_attempted".into(),
+                            output: output.clone(),
+                            exit_code: None,
+                            duration_ms: None,
+                        },
+                    );
+                }
                 Event::ProviderRequested {
-                    turn_id,
-                    subject,
-                    origin,
-                    ..
-                } if subject.is_agent() => {
+                    turn_id, origin, ..
+                } => {
                     turn_models
                         .entry(turn_id.as_str())
                         .or_insert_with(|| origin.canonical_model_ref.clone());
@@ -1262,9 +1301,7 @@ impl Store {
                     });
                     seen_turn = true;
                 }
-                Event::ProviderRequested {
-                    subject, origin, ..
-                } if subject.is_agent() => {
+                Event::ProviderRequested { origin, .. } => {
                     remembered_model = Some(origin.canonical_model_ref.clone());
                 }
                 Event::ProviderCompleted {
@@ -1570,7 +1607,8 @@ impl Store {
                 .events
                 .iter()
                 .filter_map(|line| match &line.event {
-                    Event::BashCompleted { call_id, .. } => Some(*call_id),
+                    Event::BashCompleted { call_id, .. }
+                    | Event::BashNotAttempted { call_id, .. } => Some(*call_id),
                     _ => None,
                 })
                 .collect::<HashSet<_>>();
@@ -1722,7 +1760,126 @@ impl Store {
                 effort: None,
             },
             recipe,
-            RequestSubject::Agent,
+        )
+    }
+
+    pub fn pending_bash_calls(&self, session_id: &str) -> Result<Vec<PendingBashCall>> {
+        self.with_journal(session_id, |journal| {
+            let mut attempts = HashMap::<i64, usize>::new();
+            let mut resolved = HashSet::new();
+            for line in journal.events.iter() {
+                match &line.event {
+                    Event::BashStarted { call_id } => {
+                        *attempts.entry(*call_id).or_default() += 1;
+                    }
+                    Event::BashCompleted { call_id, .. }
+                    | Event::BashNotAttempted { call_id, .. } => {
+                        resolved.insert(*call_id);
+                    }
+                    _ => {}
+                }
+            }
+            Ok(journal
+                .events
+                .iter()
+                .flat_map(|line| match &line.event {
+                    Event::ProviderCompleted {
+                        projection: Projection::Assistant { items, .. },
+                        ..
+                    } => items.as_slice(),
+                    _ => &[],
+                })
+                .filter_map(PersistedAssistantItem::bash_call)
+                .filter(|(call_id, _, _)| !resolved.contains(call_id))
+                .map(|(call_id, provider_call_id, arguments)| PendingBashCall {
+                    call_id,
+                    call: ToolCall {
+                        id: provider_call_id.to_string(),
+                        arguments: arguments.to_string(),
+                    },
+                    attempts: attempts.get(&call_id).copied().unwrap_or_default(),
+                })
+                .collect())
+        })
+    }
+
+    pub fn start_bash_attempt(&self, session_id: &str, call_id: i64, retry: bool) -> Result<i64> {
+        self.with_journal(session_id, |journal| {
+            let (_, arguments) =
+                find_call(journal, call_id).context("locating Bash claim for start persistence")?;
+            if journal.events.iter().any(|line| {
+                matches!(
+                    line.event,
+                    Event::BashCompleted {
+                        call_id: completed,
+                        ..
+                    } | Event::BashNotAttempted {
+                        call_id: completed,
+                        ..
+                    } if completed == call_id
+                )
+            }) {
+                bail!("Bash claim is already resolved")
+            }
+            let attempts = journal
+                .events
+                .iter()
+                .filter(|line| {
+                    matches!(
+                        line.event,
+                        Event::BashStarted {
+                            call_id: started
+                        } if started == call_id
+                    )
+                })
+                .count();
+            if attempts > 0 && (!retry || bash_risk(arguments)? != crate::bash::BashRisk::Readonly)
+            {
+                bail!("Bash claim has already started")
+            }
+            Ok(())
+        })?;
+        if retry && let Ok((manifest, _)) = self.attachment_paths(session_id) {
+            let _ = cleanup_bash_attachments(&manifest, call_id);
+        }
+        self.append(session_id, Event::BashStarted { call_id })
+    }
+
+    pub fn persist_bash_not_attempted(
+        &self,
+        session_id: &str,
+        call_id: i64,
+        reason: BashNotAttemptedReason,
+        output: &str,
+    ) -> Result<i64> {
+        self.with_journal(session_id, |journal| {
+            find_call(journal, call_id)
+                .context("locating Bash claim for not-attempted persistence")?;
+            if journal.events.iter().any(|line| {
+                matches!(
+                    line.event,
+                    Event::BashStarted {
+                        call_id: started
+                    } | Event::BashCompleted {
+                        call_id: started,
+                        ..
+                    } | Event::BashNotAttempted {
+                        call_id: started,
+                        ..
+                    } if started == call_id
+                )
+            }) {
+                bail!("Bash claim was already started or resolved")
+            }
+            Ok(())
+        })?;
+        self.append(
+            session_id,
+            Event::BashNotAttempted {
+                call_id,
+                reason,
+                output: output.to_string(),
+            },
         )
     }
 
@@ -1736,10 +1893,20 @@ impl Store {
         let already_completed = self.with_journal(session_id, |journal| {
             find_call(journal, record.bash_call_id)
                 .context("locating Bash claim for result persistence")?;
+            if !journal.events.iter().any(|line| {
+                matches!(
+                    line.event,
+                    Event::BashStarted { call_id } if call_id == record.bash_call_id
+                )
+            }) {
+                bail!("Bash result has no start event")
+            }
             Ok(journal.events.iter().any(|line| {
                 matches!(
                     line.event,
-                    Event::BashCompleted { call_id, .. } if call_id == record.bash_call_id
+                    Event::BashCompleted { call_id, .. }
+                        | Event::BashNotAttempted { call_id, .. }
+                        if call_id == record.bash_call_id
                 )
             }))
         })?;
@@ -1876,11 +2043,10 @@ impl Store {
             match &line.event {
                 Event::ProviderRequested {
                     exchange_id,
-                    subject,
                     origin,
                     request_recipe,
                     ..
-                } if subject.is_agent() => {
+                } => {
                     requests.insert(exchange_id.as_str(), (line.seq, origin, request_recipe));
                 }
                 Event::ProviderCompleted {
@@ -2026,16 +2192,10 @@ impl Store {
         turn_id: &str,
         origin: ProviderOrigin,
         recipe: RequestRecipe,
-        subject: RequestSubject,
     ) -> Result<String> {
         self.with_journal(session_id, |journal| {
             if latest_active_turn_id(journal).as_deref() != Some(turn_id) {
                 bail!("provider request does not reference the active turn")
-            }
-            if let RequestSubject::Guardrail { call_id, .. } = &subject
-                && call_turn_id(journal, *call_id).as_deref() != Some(turn_id)
-            {
-                bail!("guardrail request does not match its Bash call turn")
             }
             Ok(())
         })?;
@@ -2045,7 +2205,6 @@ impl Store {
             Event::ProviderRequested {
                 turn_id: turn_id.to_string(),
                 exchange_id: exchange_id.clone(),
-                subject,
                 origin,
                 request_recipe: recipe,
             },
@@ -2176,12 +2335,9 @@ impl Store {
                 .find_map(|line| match &line.event {
                     Event::ProviderRequested {
                         exchange_id: requested_exchange,
-                        subject,
                         origin,
                         ..
-                    } if requested_exchange == exchange_id && subject.is_agent() => {
-                        Some(origin.clone())
-                    }
+                    } if requested_exchange == exchange_id => Some(origin.clone()),
                     _ => None,
                 })
                 .context("assistant completion has no agent request")
@@ -2247,27 +2403,6 @@ impl Store {
             },
         )?;
         Ok((seq, ids))
-    }
-
-    pub fn complete_guardrail_exchange(
-        &self,
-        session_id: &str,
-        exchange_id: &str,
-        completion: GuardrailCompletion<'_>,
-    ) -> Result<()> {
-        self.complete_provider_exchange(
-            session_id,
-            exchange_id,
-            completion.native_response,
-            completion.usage,
-            Projection::Guardrail {
-                outcome: completion.outcome.to_string(),
-                risk_level: completion.risk_level.map(str::to_string),
-                auth_level: completion.auth_level.map(str::to_string),
-                reason: completion.reason.map(str::to_string),
-            },
-        )
-        .map(|_| ())
     }
 
     pub fn fail_provider_exchange(
@@ -2446,9 +2581,7 @@ impl Store {
             .iter()
             .rev()
             .find_map(|line| match &line.event {
-                Event::ProviderRequested {
-                    subject, origin, ..
-                } if subject.is_agent() => Some(origin.canonical_model_ref.clone()),
+                Event::ProviderRequested { origin, .. } => Some(origin.canonical_model_ref.clone()),
                 _ => None,
             });
         Ok(Session {
@@ -2593,6 +2726,17 @@ impl Store {
                             .iter()
                             .map(|attachment| self.hydrate_tool_attachment(attachment))
                             .collect::<Result<_>>()?,
+                        tool_call_id: call.0.to_string(),
+                    });
+                }
+                Event::BashNotAttempted {
+                    call_id, output, ..
+                } => {
+                    let call = find_call(journal, *call_id)
+                        .context("not-attempted Bash result claim missing")?;
+                    messages.push(Message::Tool {
+                        content: output.clone(),
+                        attachments: Vec::new(),
                         tool_call_id: call.0.to_string(),
                     });
                 }
@@ -3129,8 +3273,8 @@ fn validate_events(events: &[EventLine]) -> Result<()> {
     let mut exchanges = HashMap::new();
     let mut terminal = HashSet::new();
     let mut calls = HashMap::new();
+    let mut starts = HashMap::<i64, usize>::new();
     let mut results = HashSet::new();
-    let mut guardrail_attempts = HashSet::new();
     let mut queued_prompts = HashSet::new();
     let mut unresolved_prompt = None;
     let mut pending_compaction: Option<(String, CompactionMode, bool)> = None;
@@ -3185,47 +3329,27 @@ fn validate_events(events: &[EventLine]) -> Result<()> {
                 turn_id,
                 exchange_id,
                 request_recipe,
-                subject,
                 origin,
             } => {
                 if active_turn.as_ref() != Some(turn_id) {
                     bail!("provider request does not reference the active turn")
                 }
-                if subject.is_agent() && request_recipe.input.get("native_fields").is_none() {
+                if calls.keys().any(|call_id| !results.contains(call_id)) {
+                    bail!("provider request starts before prior Bash claims are resolved")
+                }
+                if request_recipe.input.get("native_fields").is_none() {
                     serde_json::from_value::<Vec<ReplayOrigin>>(
                         request_recipe.input["native_replay_origins"].clone(),
                     )
                     .context("agent request recipe has no valid native replay origins")?;
                 }
-                if subject.is_agent()
-                    && let Some((pending_turn, _, accepted)) = &mut pending_compaction
+                if let Some((pending_turn, _, accepted)) = &mut pending_compaction
                     && pending_turn == turn_id
                 {
                     *accepted = false;
                 }
-                if let Some((call_id, attempt)) = subject.guardrail() {
-                    if !calls.contains_key(&call_id) {
-                        bail!(
-                            "guardrail request references unknown Bash call: {}",
-                            call_id
-                        )
-                    }
-                    if !guardrail_attempts.insert((call_id, attempt)) {
-                        bail!(
-                            "duplicate guardrail attempt {} for Bash call {}",
-                            attempt,
-                            call_id
-                        )
-                    }
-                    if calls.get(&call_id) != Some(turn_id) {
-                        bail!("guardrail request does not match its Bash call turn")
-                    }
-                }
                 if exchanges
-                    .insert(
-                        exchange_id.clone(),
-                        (subject.clone(), turn_id.clone(), origin.api.clone()),
-                    )
+                    .insert(exchange_id.clone(), (turn_id.clone(), origin.api.clone()))
                     .is_some()
                 {
                     bail!("duplicate exchange id: {exchange_id}")
@@ -3250,13 +3374,10 @@ fn validate_events(events: &[EventLine]) -> Result<()> {
                         items,
                         ..
                     } => {
-                        if !exchange.0.is_agent() {
-                            bail!("assistant projection does not complete an agent request")
-                        }
-                        if exchange.2 != "test"
+                        if exchange.1 != "test"
                             && native_replay
                                 .as_ref()
-                                .is_some_and(|native| native.api().name() != exchange.2)
+                                .is_some_and(|native| native.api().name() != exchange.1)
                         {
                             bail!("native replay protocol does not match provider request")
                         }
@@ -3284,24 +3405,16 @@ fn validate_events(events: &[EventLine]) -> Result<()> {
                             {
                                 bail!("Bash claim arguments are not a JSON object")
                             }
-                            let turn_id = exchange.1.clone();
+                            let turn_id = exchange.0.clone();
                             if calls.insert(*call_id, turn_id).is_some() {
                                 bail!("duplicate Bash call id: {call_id}")
                             }
                         }
                         if let Some((turn_id, _, accepted)) = &mut pending_compaction
-                            && turn_id == &exchange.1
+                            && turn_id == &exchange.0
                             && assistant_summary(*resumable, *incomplete, items).is_some()
                         {
                             *accepted = true;
-                        }
-                    }
-                    Projection::Guardrail { outcome, .. } => {
-                        if exchange.0.guardrail().is_none() {
-                            bail!("guardrail projection does not match its Bash claim")
-                        }
-                        if !matches!(outcome.as_str(), "allow" | "deny") {
-                            bail!("invalid guardrail outcome: {outcome}")
                         }
                     }
                 }
@@ -3314,12 +3427,27 @@ fn validate_events(events: &[EventLine]) -> Result<()> {
                 if !terminal.insert(exchange_id) {
                     bail!("duplicate terminal provider event: {exchange_id}")
                 }
-                if exchange.0.is_agent()
-                    && let Some((turn_id, _, accepted)) = &mut pending_compaction
-                    && turn_id == &exchange.1
+                if let Some((turn_id, _, accepted)) = &mut pending_compaction
+                    && turn_id == &exchange.0
                 {
                     *accepted = false;
                 }
+            }
+            Event::BashStarted { call_id } => {
+                let Some(_) = calls.get(call_id) else {
+                    bail!("Bash start references unknown call: {call_id}")
+                };
+                if results.contains(call_id) {
+                    bail!("Bash start follows its result: {call_id}")
+                }
+                let (_, arguments) =
+                    find_call_in_events(events, *call_id).context("Bash start claim missing")?;
+                let risk = bash_risk(arguments)?;
+                let attempts = starts.entry(*call_id).or_default();
+                if *attempts > 0 && risk != crate::bash::BashRisk::Readonly {
+                    bail!("non-readonly Bash claim has multiple starts: {call_id}")
+                }
+                *attempts += 1;
             }
             Event::BashCompleted {
                 call_id,
@@ -3330,6 +3458,9 @@ fn validate_events(events: &[EventLine]) -> Result<()> {
                 if !calls.contains_key(call_id) {
                     bail!("Bash result references unknown call: {call_id}")
                 }
+                if !starts.contains_key(call_id) {
+                    bail!("Bash result references an unstarted call: {call_id}")
+                }
                 if !results.insert(call_id) {
                     bail!("duplicate Bash result: {call_id}")
                 }
@@ -3337,6 +3468,17 @@ fn validate_events(events: &[EventLine]) -> Result<()> {
                     || (outcome == "completed") != exit_code.is_some()
                 {
                     bail!("Bash result outcome does not match its exit code")
+                }
+            }
+            Event::BashNotAttempted { call_id, .. } => {
+                if !calls.contains_key(call_id) {
+                    bail!("not-attempted Bash result references unknown call: {call_id}")
+                }
+                if starts.contains_key(call_id) {
+                    bail!("not-attempted Bash result references a started call: {call_id}")
+                }
+                if !results.insert(call_id) {
+                    bail!("duplicate Bash result: {call_id}")
                 }
             }
             Event::CompactionApplied { .. } => {
@@ -3519,9 +3661,8 @@ fn compaction_summary_before(journal: &Journal, turn_id: &str, max_seq: i64) -> 
             Event::ProviderRequested {
                 exchange_id,
                 turn_id: request_turn,
-                subject,
                 ..
-            } if request_turn == turn_id && subject.is_agent() => Some(exchange_id.as_str()),
+            } if request_turn == turn_id => Some(exchange_id.as_str()),
             _ => None,
         })?;
     journal
@@ -3597,9 +3738,8 @@ fn resume_was_requested(journal: &Journal, turn_id: &str, after_seq: i64) -> boo
             Event::PromptMaterialized { .. } | Event::CompactionStarted { .. } => return false,
             Event::ProviderRequested {
                 turn_id: request_turn,
-                subject,
                 ..
-            } if request_turn == turn_id && subject.is_agent() => return true,
+            } if request_turn == turn_id => return true,
             _ => {}
         }
     }
@@ -3658,7 +3798,11 @@ fn next_call_id(journal: &Journal) -> i64 {
 }
 
 fn find_call(journal: &Journal, call_id: i64) -> Option<(&str, &str)> {
-    journal.events.iter().find_map(|line| match &line.event {
+    find_call_in_events(&journal.events, call_id)
+}
+
+fn find_call_in_events(events: &[EventLine], call_id: i64) -> Option<(&str, &str)> {
+    events.iter().find_map(|line| match &line.event {
         Event::ProviderCompleted {
             projection: Projection::Assistant { items, .. },
             ..
@@ -3675,6 +3819,17 @@ fn find_call(journal: &Journal, call_id: i64) -> Option<(&str, &str)> {
     })
 }
 
+fn bash_risk(arguments: &str) -> Result<crate::bash::BashRisk> {
+    let arguments: Value =
+        serde_json::from_str(arguments).context("parsing persisted Bash arguments")?;
+    arguments
+        .get("risk")
+        .and_then(Value::as_str)
+        .and_then(|risk| risk.parse().ok())
+        .context("persisted Bash claim has no valid risk")
+}
+
+#[cfg(test)]
 fn call_turn_id(journal: &Journal, call_id: i64) -> Option<String> {
     let exchange_id = journal.events.iter().find_map(|line| match &line.event {
         Event::ProviderCompleted {
@@ -3707,6 +3862,7 @@ fn is_semantic(event: &Event) -> bool {
             | Event::CompactionStarted { .. }
             | Event::CompactionApplied { .. }
             | Event::BashCompleted { .. }
+            | Event::BashNotAttempted { .. }
             | Event::ProviderCompleted {
                 projection: Projection::Assistant { .. },
                 ..
@@ -3722,11 +3878,10 @@ fn reported_context_tokens_before(journal: &Journal, max_seq: i64) -> Option<u64
         match &line.event {
             Event::ProviderRequested {
                 exchange_id,
-                subject,
                 origin,
                 request_recipe,
                 ..
-            } if subject.is_agent() => {
+            } => {
                 let current = request_format_is_current(&origin.api, &request_recipe.format);
                 request_formats.insert(exchange_id.as_str(), current);
             }
@@ -3765,7 +3920,8 @@ fn reported_context_tokens_before(journal: &Journal, max_seq: i64) -> Option<u64
             Event::PromptMaterialized { .. }
             | Event::CompactionStarted { .. }
             | Event::CompactionApplied { .. }
-            | Event::BashCompleted { .. } => semantic_after = true,
+            | Event::BashCompleted { .. }
+            | Event::BashNotAttempted { .. } => semantic_after = true,
             _ => {}
         }
     }
@@ -3987,8 +4143,8 @@ fn canonical_json(value: &Value) -> Vec<u8> {
 mod tests {
     use super::*;
     use crate::config::{
-        CompactionConfig, GuardrailConfig, LimitsConfig, ModelConfig, OrderedMap, ProviderConfig,
-        RedactionConfig, TerminalBellConfig,
+        CompactionConfig, LimitsConfig, ModelConfig, OrderedMap, ProviderConfig, RedactionConfig,
+        TerminalBellConfig,
     };
     use crate::provider::{Message, NativeReplayPayload};
 
@@ -4021,7 +4177,6 @@ mod tests {
             soft_interrupt: crate::config::bundled_test_default("/soft_interrupt"),
             compaction: CompactionConfig::default(),
             limits: LimitsConfig::default(),
-            guardrail: GuardrailConfig::default(),
             terminal_bell: TerminalBellConfig::default(),
             redaction: RedactionConfig::default(),
             env: Default::default(),
@@ -4169,7 +4324,6 @@ mod tests {
                         }),
                     )
                     .unwrap(),
-                RequestSubject::Agent,
             )
             .unwrap();
         store
@@ -4226,7 +4380,6 @@ mod tests {
                         serde_json::json!({}),
                     )
                     .unwrap(),
-                RequestSubject::Agent,
             )
             .unwrap();
         store
@@ -4325,7 +4478,6 @@ mod tests {
                         }),
                     )
                     .unwrap(),
-                RequestSubject::Agent,
             )
             .unwrap();
         store
@@ -4499,6 +4651,9 @@ mod tests {
             )
             .unwrap();
         store
+            .start_bash_attempt(&session.id, call_ids[0], false)
+            .unwrap();
+        store
             .persist_bash_result(
                 &session.id,
                 BashResultRecord {
@@ -4624,6 +4779,9 @@ mod tests {
             )
             .unwrap();
         store
+            .start_bash_attempt(&session.id, call_ids[0], false)
+            .unwrap();
+        store
             .persist_bash_result(
                 &session.id,
                 BashResultRecord {
@@ -4732,7 +4890,7 @@ mod tests {
     }
 
     #[test]
-    fn interrupted_claim_gets_one_synthetic_result() {
+    fn retry_preserves_pending_calls_and_new_work_abandons_them() {
         let (store, session) = test_session();
         store
             .start_turn(&session.id, "/tmp", None, &"run".into())
@@ -4756,6 +4914,9 @@ mod tests {
                 ),
             )
             .unwrap();
+        store
+            .start_bash_attempt(&session.id, call_ids[0], false)
+            .unwrap();
         let (manifest, objects) = store.attachment_paths(&session.id).unwrap();
         stage_bash_attachment(
             &manifest,
@@ -4770,8 +4931,20 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(store.normalize_interrupted_tail(&session.id).unwrap(), 2);
-        assert_eq!(store.normalize_interrupted_tail(&session.id).unwrap(), 0);
+        assert_eq!(
+            store
+                .recover_interrupted_tail_for_retry(&session.id)
+                .unwrap(),
+            0
+        );
+        assert_eq!(store.pending_bash_calls(&session.id).unwrap().len(), 2);
+        assert_eq!(
+            store
+                .abandon_interrupted_tail(&session.id, BashNotAttemptedReason::Superseded)
+                .unwrap(),
+            2
+        );
+        assert!(store.pending_bash_calls(&session.id).unwrap().is_empty());
         let context = store.load_context_messages(&session.id).unwrap();
         let recovered = context
             .iter()
@@ -4795,6 +4968,59 @@ mod tests {
             recovered
                 .iter()
                 .all(|(_, attachments)| attachments.is_empty())
+        );
+    }
+
+    #[test]
+    fn retry_resolves_an_incomplete_destructive_attempt_without_restarting_it() {
+        let (store, session) = test_session();
+        store
+            .start_turn(&session.id, "/tmp", None, &"run".into())
+            .unwrap();
+        let (_, call_ids) = store
+            .append_message_with_bash_calls(
+                &session.id,
+                &Message::assistant(
+                    None,
+                    None,
+                    Some(vec![ToolCall {
+                        id: "destructive".into(),
+                        arguments: r#"{"title":"change","risk":"destructive","command":"true"}"#
+                            .into(),
+                    }]),
+                    None,
+                ),
+            )
+            .unwrap();
+        store
+            .start_bash_attempt(&session.id, call_ids[0], false)
+            .unwrap();
+
+        assert_eq!(
+            store
+                .recover_interrupted_tail_for_retry(&session.id)
+                .unwrap(),
+            1
+        );
+        assert!(store.pending_bash_calls(&session.id).unwrap().is_empty());
+        assert!(
+            store
+                .start_bash_attempt(&session.id, call_ids[0], true)
+                .is_err()
+        );
+        assert!(
+            store
+                .load_context_messages(&session.id)
+                .unwrap()
+                .iter()
+                .any(|message| matches!(
+                    message,
+                    Message::Tool {
+                        content,
+                        tool_call_id,
+                        ..
+                    } if tool_call_id == "destructive" && content == INTERRUPTED_TOOL_RESULT
+                ))
         );
     }
 
@@ -4832,6 +5058,9 @@ mod tests {
         )
         .unwrap();
         let attachments = read_bash_attachments(&manifest, &objects, call_ids[0]).unwrap();
+        store
+            .start_bash_attempt(&session.id, call_ids[0], false)
+            .unwrap();
         store
             .persist_bash_result(
                 &session.id,
@@ -4908,7 +5137,6 @@ mod tests {
                     effort: request.model.effort.clone(),
                 },
                 recipe,
-                RequestSubject::Agent,
             )
             .unwrap();
 
@@ -4995,7 +5223,6 @@ mod tests {
                     effort: request.model.effort.clone(),
                 },
                 recipe,
-                RequestSubject::Agent,
             )
             .unwrap();
 
@@ -5033,6 +5260,9 @@ mod tests {
                     }),
                 ),
             )
+            .unwrap();
+        store
+            .start_bash_attempt(&session.id, call_ids[0], false)
             .unwrap();
         store
             .persist_bash_result(
@@ -5099,7 +5329,6 @@ mod tests {
                     effort: None,
                 },
                 recipe,
-                RequestSubject::Agent,
             )
             .unwrap();
 
@@ -5133,7 +5362,6 @@ mod tests {
                 store
                     .request_recipe("test.v0", &native, serde_json::json!({}))
                     .unwrap(),
-                RequestSubject::Agent,
             )
             .unwrap();
         store
@@ -5177,7 +5405,6 @@ mod tests {
                 store
                     .request_recipe("test.v1", &native, serde_json::json!({}))
                     .unwrap(),
-                RequestSubject::Agent,
             )
             .unwrap();
         let call = ToolCall {
@@ -5301,104 +5528,6 @@ mod tests {
         assert_eq!(
             read_bash_attachments(&manifest, &objects, 7).unwrap().len(),
             MAX_BASH_ATTACHMENTS
-        );
-    }
-
-    #[test]
-    fn recovery_closes_unmatched_requests_and_durable_denials() {
-        let (store, session) = test_session();
-        let turn = store
-            .start_turn(&session.id, "/tmp", None, &"remove it".into())
-            .unwrap();
-        let (_, calls) = store
-            .append_message_with_bash_calls(
-                &session.id,
-                &Message::assistant(
-                    None,
-                    None,
-                    Some(vec![ToolCall {
-                        id: "provider-call".into(),
-                        arguments: r#"{"risk":"destructive","command":"rm x"}"#.into(),
-                    }]),
-                    None,
-                ),
-            )
-            .unwrap();
-        let native = serde_json::json!({"model":"reviewer","messages":[]});
-        let recipe = store
-            .request_recipe("test.v1", &native, serde_json::json!({}))
-            .unwrap();
-        let exchange = store
-            .start_provider_request(
-                &session.id,
-                &turn,
-                ProviderOrigin {
-                    canonical_model_ref: "test/reviewer".into(),
-                    provider_id: "test".into(),
-                    api: "test".into(),
-                    endpoint: String::new(),
-                    wire_model: "reviewer".into(),
-                    effort: None,
-                },
-                recipe,
-                RequestSubject::Guardrail {
-                    call_id: calls[0],
-                    attempt: 1,
-                },
-            )
-            .unwrap();
-        store
-            .complete_guardrail_exchange(
-                &session.id,
-                &exchange,
-                GuardrailCompletion {
-                    outcome: "deny",
-                    risk_level: Some("critical"),
-                    auth_level: Some("none"),
-                    reason: Some("not authorized"),
-                    native_response: None,
-                    usage: None,
-                },
-            )
-            .unwrap();
-        let unmatched = store
-            .start_provider_request(
-                &session.id,
-                &turn,
-                ProviderOrigin {
-                    canonical_model_ref: "test/model".into(),
-                    provider_id: "test".into(),
-                    api: "test".into(),
-                    endpoint: String::new(),
-                    wire_model: "model".into(),
-                    effort: None,
-                },
-                store
-                    .request_recipe(
-                        "test.v1",
-                        &serde_json::json!({"model":"model"}),
-                        serde_json::json!({}),
-                    )
-                    .unwrap(),
-                RequestSubject::Agent,
-            )
-            .unwrap();
-
-        assert_eq!(store.normalize_interrupted_tail(&session.id).unwrap(), 1);
-        let audit = store.audit_events(&session.id).unwrap();
-        assert!(audit.iter().any(|event| {
-            event["type"] == "provider_interrupted" && event["exchange_id"] == unmatched
-        }));
-        let result = audit
-            .iter()
-            .find(|event| event["type"] == "bash_completed")
-            .unwrap();
-        assert_eq!(result["outcome"], "error");
-        assert!(
-            result["output"]
-                .as_str()
-                .unwrap()
-                .contains("not authorized")
         );
     }
 
@@ -5732,6 +5861,9 @@ mod tests {
                 )
                 .unwrap();
             store
+                .start_bash_attempt(&session.id, call_ids[0], false)
+                .unwrap();
+            store
                 .persist_bash_result(
                     &session.id,
                     BashResultRecord {
@@ -5850,6 +5982,9 @@ mod tests {
                     None,
                 ),
             )
+            .unwrap();
+        store
+            .start_bash_attempt(&session.id, call_ids[0], false)
             .unwrap();
         store
             .persist_bash_result(

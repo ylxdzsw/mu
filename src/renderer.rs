@@ -33,7 +33,6 @@ const GRAY: &str = "\x1b[90m"; // meta / quote (bright-black)
 const CODE: &str = "\x1b[38;5;215m"; // peach exception
 pub(crate) const BASH_COMMAND_PREVIEW_BYTES: usize = 160;
 pub(crate) const BASH_TITLE_PREVIEW_BYTES: usize = 120;
-const GUARDRAIL_REASON_PREVIEW_BYTES: usize = 180;
 const REASONING_TITLE_MAX_WIDTH: usize = 80;
 const DEFAULT_TERMINAL_WIDTH: usize = 80;
 const TERMINAL_RIGHT_MARGIN: usize = 1;
@@ -633,7 +632,6 @@ impl Renderer {
         &mut self,
         title: Option<&str>,
         risk: Option<&str>,
-        guardrail_pending: bool,
     ) -> io::Result<()> {
         if self.format != OutputFormat::Concise {
             return Ok(());
@@ -645,7 +643,7 @@ impl Renderer {
                 .to_string(),
             risk: risk.map(str::to_string),
         });
-        if self.styled && !guardrail_pending {
+        if self.styled {
             self.live_line = Some(LiveLine::ConciseTool);
             self.render_live_line()?;
         }
@@ -685,7 +683,7 @@ impl Renderer {
         let risk = args.get("risk").and_then(|value| value.as_str());
         self.bash_header_start()?;
         if self.format == OutputFormat::Concise {
-            self.concise_tool_ready(Some(title), risk, false)?;
+            self.concise_tool_ready(Some(title), risk)?;
             return Ok(true);
         }
         self.bash_header_title_start()?;
@@ -840,71 +838,6 @@ impl Renderer {
         self.write_stdout_committed(&line)
     }
 
-    pub fn guardrail_start(&mut self) -> io::Result<()> {
-        if self.format != OutputFormat::Concise || !self.styled {
-            return Ok(());
-        }
-        self.live_line = Some(LiveLine::Guardrail);
-        self.render_live_line()
-    }
-
-    pub fn guardrail_rejected(&mut self) -> io::Result<()> {
-        if self.format == OutputFormat::Concise {
-            return self.commit_concise_tool(ConciseToolOutcome::GuardrailDenied);
-        }
-        Ok(())
-    }
-
-    pub fn guardrail_failed(&mut self) -> io::Result<()> {
-        if self.format == OutputFormat::Concise {
-            return self.commit_concise_tool(ConciseToolOutcome::GuardrailError);
-        }
-        Ok(())
-    }
-
-    pub fn guardrail_verdict(
-        &mut self,
-        allowed: bool,
-        risk_level: &str,
-        user_auth_level: &str,
-        reason: &str,
-    ) -> io::Result<()> {
-        if self.format == OutputFormat::Final {
-            return Ok(());
-        }
-        if self.format == OutputFormat::Concise {
-            if allowed && self.styled {
-                self.live_line = Some(LiveLine::ConciseTool);
-                self.render_live_line()?;
-            }
-            return Ok(());
-        }
-        self.assistant_block_open = false;
-        self.ensure_line_start()?;
-        let reason_preview = preview_first_line(reason, GUARDRAIL_REASON_PREVIEW_BYTES);
-        let line = if self.styled {
-            let (color, icon, verdict, relation) = if allowed {
-                (GREEN, "✓", "allowed", "≤")
-            } else {
-                (RED, "✗", "denied", ">")
-            };
-            format!(
-                "{color}{icon} guardrail {verdict}{RESET} {DIM}· {risk_level} {relation} {user_auth_level} — {reason_preview}{RESET}\n"
-            )
-        } else {
-            let (verdict, relation) = if allowed {
-                ("allow", "<=")
-            } else {
-                ("deny", ">")
-            };
-            format!(
-                "[guardrail: {verdict}] {risk_level} {relation} {user_auth_level} — {reason_preview}\n"
-            )
-        };
-        let line = self.fit_one_line(&terminal_trim_committed_text(&line));
-        self.write_stdout_committed(&line)
-    }
-
     pub fn error(&mut self, msg: &str) -> io::Result<()> {
         writeln!(self.stderr, "error: {msg}")?;
         self.stderr.flush()
@@ -921,11 +854,11 @@ impl Renderer {
         Ok(())
     }
 
-    pub fn soft_interrupt_complete(&mut self, skipped: usize) -> io::Result<()> {
-        let suffix = match skipped {
+    pub fn soft_interrupt_complete(&mut self, pending: usize) -> io::Result<()> {
+        let suffix = match pending {
             0 => String::new(),
-            1 => " · 1 Bash command skipped".to_string(),
-            count => format!(" · {count} Bash commands skipped"),
+            1 => " · 1 Bash command left pending for retry".to_string(),
+            count => format!(" · {count} Bash commands left pending for retry"),
         };
         self.notice(&format!("[mu] soft-interrupted{suffix}"))
     }
@@ -1006,7 +939,7 @@ impl Renderer {
             && (self.concise_tool.is_some()
                 || matches!(
                     self.live_line,
-                    Some(LiveLine::ToolComposition | LiveLine::ConciseTool | LiveLine::Guardrail)
+                    Some(LiveLine::ToolComposition | LiveLine::ConciseTool)
                 ))
         {
             self.commit_concise_tool(ConciseToolOutcome::ToolError)?;
@@ -1206,12 +1139,7 @@ impl Renderer {
             }
         } else if matches!(
             self.live_line,
-            Some(
-                LiveLine::Thinking
-                    | LiveLine::ToolComposition
-                    | LiveLine::ConciseTool
-                    | LiveLine::Guardrail
-            )
+            Some(LiveLine::Thinking | LiveLine::ToolComposition | LiveLine::ConciseTool)
         ) {
             let continues_concise_tools =
                 self.format == OutputFormat::Concise && self.last_committed_was_tool;
@@ -1277,14 +1205,6 @@ impl Renderer {
                 Some(format_concise_tool_live(
                     &tool.title,
                     tool.risk.as_deref(),
-                    self.styled,
-                    self.one_line_width(),
-                ))
-            }
-            Some(LiveLine::Guardrail) => {
-                let tool = self.concise_tool.as_ref()?;
-                Some(format_guardrail_live(
-                    &tool.title,
                     self.styled,
                     self.one_line_width(),
                 ))
@@ -1765,7 +1685,6 @@ enum LiveLine {
     Thinking,
     ToolComposition,
     ConciseTool,
-    Guardrail,
     TableBuffering {
         chars: usize,
     },
@@ -1798,8 +1717,6 @@ struct ConciseToolState {
 enum ConciseToolOutcome {
     Exit(i32),
     ToolError,
-    GuardrailDenied,
-    GuardrailError,
 }
 
 #[derive(Default)]
@@ -3652,8 +3569,6 @@ fn format_concise_tool(
     let outcome = match outcome {
         ConciseToolOutcome::Exit(code) => format!("exit {code}"),
         ConciseToolOutcome::ToolError => "error".to_string(),
-        ConciseToolOutcome::GuardrailDenied => "guardrail denied".to_string(),
-        ConciseToolOutcome::GuardrailError => "guardrail error".to_string(),
     };
     let suffix = format!(" · {outcome}");
     let title = fit_title(title, "=> ", &suffix, max_width);
@@ -3666,18 +3581,6 @@ fn format_concise_tool(
     max_width
         .map(|width| truncate_styled_line(&line, width))
         .unwrap_or(line)
-}
-
-fn format_guardrail_live(title: &str, styled: bool, max_width: Option<usize>) -> String {
-    let prefix = "[guardrail] ";
-    let suffix = "…";
-    let title = fit_title(title, prefix, suffix, max_width);
-    let body = format!("{prefix}{title}{suffix}");
-    if styled {
-        format!("{BRIGHT_YELLOW}{body}{RESET}")
-    } else {
-        body
-    }
 }
 
 fn fit_title(title: &str, prefix: &str, suffix: &str, max_width: Option<usize>) -> String {
@@ -5134,40 +5037,6 @@ mod tests {
             "[mu] auto-resuming [2/3] after incomplete response\n\
              \n\
              [mu] auto-resume exhausted [3/3]; use /retry to resume, or enter a new prompt to move on\n"
-        );
-    }
-
-    #[test]
-    fn concise_guardrail_status_replaces_preparation_without_tool_flash() {
-        let (mut renderer, output, _) =
-            Renderer::with_test_output(OutputFormat::Concise, true, true, None);
-
-        renderer.bash_header_start().unwrap();
-        renderer
-            .concise_tool_ready(Some("Review action"), Some("destructive"), true)
-            .unwrap();
-        assert_eq!(
-            strip_ansi(&output.transcript()),
-            "[preparing toolcall]",
-            "the destructive tool line must stay deferred while review is pending"
-        );
-
-        renderer.guardrail_start().unwrap();
-        assert_eq!(
-            strip_ansi(&renderer.format_live_line().unwrap()),
-            "[guardrail] Review action…"
-        );
-        assert!(
-            !strip_ansi(&output.transcript()).contains("=> Review action"),
-            "the guardrail transition must not flash the destructive tool line"
-        );
-        renderer
-            .guardrail_verdict(false, "high", "low", "not authorized")
-            .unwrap();
-        renderer.guardrail_rejected().unwrap();
-
-        assert!(
-            strip_ansi(&output.transcript()).ends_with("=> Review action · guardrail denied\n")
         );
     }
 

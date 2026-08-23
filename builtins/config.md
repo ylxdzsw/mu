@@ -57,7 +57,7 @@ Complete shape, with default values where applicable:
 {
   "output": "concise",            // final | concise | detail | full
   "auto_resume": false,           // continue replayable incomplete responses
-  "soft_interrupt": true,         // Ctrl+\\ finishes active work, then stops
+  "soft_interrupt": true,         // Ctrl+\\ finishes active work, leaves pending calls, then stops
   "providers": {
     "openai": {
       "endpoint": "https://api.openai.com/v1/responses", // HTTP(S) URL or http+unix URI
@@ -83,13 +83,7 @@ Complete shape, with default values where applicable:
     "max_bytes": 51200,
     "max_line_bytes": 10240
   },
-  "redaction": { "env": ["*_API_KEY", "*_API_TOKEN", "*_AUTH_TOKEN"] },
-  "guardrail": {
-    "enabled": true,
-    "review_model": "openai/gpt-5.6-terra:low", // optional; active model if omitted
-    "timeout_seconds": 120,
-    "max_denials_per_turn": 3
-  }
+  "redaction": { "env": ["*_API_KEY", "*_API_TOKEN", "*_AUTH_TOKEN"] }
 }
 ```
 
@@ -146,8 +140,7 @@ compatible report, Mu estimates the full context. Estimated percentages have a
 
 The limits bound the model-visible preview of bash output by lines, total bytes,
 and bytes per line. The bell sounds only for turns lasting at least
-`min_duration_ms`. The guardrail reviews destructive bash calls;
-`timeout_seconds` and `max_denials_per_turn` must be positive.
+`min_duration_ms`.
 
 Model references use `provider/model[:effort]` for a fixed provider or
 `model[:effort]` for ordered provider fallback. A bare model includes every

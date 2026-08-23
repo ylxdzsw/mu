@@ -19,7 +19,6 @@ mod bash;
 mod chat_completions;
 mod compaction;
 mod config;
-mod guardrail;
 mod install;
 mod models;
 mod paths;
@@ -917,7 +916,7 @@ async fn run() -> Result<()> {
             let session = resolve_retry_session(&store, &retry_args)?
                 .ok_or_else(|| anyhow::anyhow!("no sessions found in active scope"))?;
             let _lock = acquire_session_lock_or_exit(&store, &session.id, output)?;
-            store.normalize_interrupted_tail(&session.id)?;
+            store.recover_interrupted_tail_for_retry(&session.id)?;
 
             // Nothing to resume on a session whose last turn already finished.
             if store.is_session_clean(&session.id)? && store.queued_prompt(&session.id)?.is_none() {
@@ -977,7 +976,7 @@ async fn run() -> Result<()> {
             if store.pending_compaction(&session)?.is_some() {
                 bail!("session compaction is incomplete; run `mu retry -s {session}`")
             }
-            store.normalize_interrupted_tail(&session)?;
+            store.abandon_interrupted_tail(&session, store::BashNotAttemptedReason::Abandoned)?;
             if !store.has_user_turn(&session)? {
                 Renderer::with_terminal_bell(output, None)
                     .notice("[mu] compaction inapplicable: session has no conversation history")?;
@@ -1082,11 +1081,10 @@ async fn run_turn_from_source(
 
     let attachments = load_attachments(&turn.attachments)?;
 
-    // If the previous turn was interrupted, normalize its tail (synthesize
-    // interrupted results for any dangling tool calls) so history is valid.
-    // The new prompt then lands on top of that valid history — the user can
-    // redirect after a Ctrl-C without being forced to `mu retry` first.
-    store.normalize_interrupted_tail(&session_id)?;
+    // A new prompt redirects rather than resumes interrupted work. Started
+    // calls become conservative interrupted results; calls that never crossed
+    // the durable start boundary are explicitly superseded.
+    store.abandon_interrupted_tail(&session_id, store::BashNotAttemptedReason::Superseded)?;
 
     let prompt_content = build_prompt_content(&prompt, attachments);
     let git_worktree_root = scope
@@ -1328,7 +1326,7 @@ async fn run_turn(args: RunTurnArgs<'_>) -> Result<()> {
         Ok(r) => {
             if r.soft_interrupted {
                 renderer.finish_turn()?;
-                renderer.soft_interrupt_complete(r.skipped_bash_calls)?;
+                renderer.soft_interrupt_complete(r.pending_bash_calls)?;
                 return Ok(());
             }
             let ctx_pct = r.context_window.map(|cw| {

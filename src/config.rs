@@ -179,7 +179,6 @@ pub struct Config {
     pub soft_interrupt: bool,
     pub compaction: CompactionConfig,
     pub limits: LimitsConfig,
-    pub guardrail: GuardrailConfig,
     pub terminal_bell: TerminalBellConfig,
     pub redaction: RedactionConfig,
     #[serde(skip)]
@@ -218,14 +217,6 @@ pub struct LimitsConfig {
     pub max_lines: usize,
     pub max_bytes: usize,
     pub max_line_bytes: usize,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct GuardrailConfig {
-    pub enabled: bool,
-    pub review_model: Option<String>,
-    pub timeout_seconds: u64,
-    pub max_denials_per_turn: u32,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -422,12 +413,6 @@ impl Config {
         for selector in &self.redaction.env {
             redaction_suffix(selector)?;
         }
-        if self.guardrail.max_denials_per_turn == 0 {
-            bail!("`guardrail.max_denials_per_turn` must be greater than zero");
-        }
-        if self.guardrail.timeout_seconds == 0 {
-            bail!("`guardrail.timeout_seconds` must be greater than zero");
-        }
         if self.compaction.hard_headroom_tokens == 0 {
             bail!("`compaction.hard_headroom_tokens` must be greater than zero");
         }
@@ -554,6 +539,9 @@ fn config_from_value(value: serde_json::Value) -> Result<Config> {
 }
 
 fn deserialize_config(value: serde_json::Value, discard_invalid_providers: bool) -> Result<Config> {
+    if value.get("guardrail").is_some() {
+        bail!("`guardrail` was removed from config.jsonc")
+    }
     let mut merged = bundled_defaults()?;
     merge_json(&mut merged, value);
     if !discard_invalid_providers {
@@ -740,13 +728,6 @@ impl Default for LimitsConfig {
 }
 
 #[cfg(test)]
-impl Default for GuardrailConfig {
-    fn default() -> Self {
-        bundled_test_default("/guardrail")
-    }
-}
-
-#[cfg(test)]
 impl Default for TerminalBellConfig {
     fn default() -> Self {
         bundled_test_default("/terminal_bell")
@@ -782,7 +763,6 @@ mod tests {
             soft_interrupt: bundled_test_default("/soft_interrupt"),
             compaction: CompactionConfig::default(),
             limits: LimitsConfig::default(),
-            guardrail: GuardrailConfig::default(),
             terminal_bell: TerminalBellConfig::default(),
             redaction: RedactionConfig::default(),
             env: HashMap::from([("TEST_KEY".into(), "secret".into())]),
@@ -805,12 +785,10 @@ mod tests {
             },
             "limits": {"max_lines": 123},
             "compaction": {"enabled": false},
-            "guardrail": {"max_denials_per_turn": 7},
             "redaction": {"env": ["*_TOKEN"]}
         });
         let project = serde_json::json!({
             "limits": {"max_bytes": 456},
-            "guardrail": {"enabled": false},
             "redaction": {"env": []}
         });
         merge_json(&mut user, project);
@@ -827,8 +805,6 @@ mod tests {
         assert_eq!(config.limits.max_lines, 123);
         assert_eq!(config.limits.max_bytes, 456);
         assert!(!config.compaction.enabled);
-        assert!(!config.guardrail.enabled);
-        assert_eq!(config.guardrail.max_denials_per_turn, 7);
         assert!(config.redaction.env.is_empty());
     }
 
@@ -841,8 +817,6 @@ mod tests {
             }
         });
         for invalid in [
-            serde_json::json!({"guardrail": {"timeout_seconds": 0}}),
-            serde_json::json!({"guardrail": {"max_denials_per_turn": 0}}),
             serde_json::json!({"compaction": {"hard_headroom_tokens": 0}}),
             serde_json::json!({"compaction": {"soft_fraction": 0.0}}),
             serde_json::json!({"compaction": {"hard_fraction": 1.01}}),
@@ -851,6 +825,18 @@ mod tests {
             merge_json(&mut value, invalid);
             assert!(config_from_value(value).is_err());
         }
+    }
+
+    #[test]
+    fn removed_guardrail_config_is_rejected() {
+        assert!(
+            config_from_value(serde_json::json!({
+                "guardrail": {"enabled": true}
+            }))
+            .unwrap_err()
+            .to_string()
+            .contains("`guardrail` was removed")
+        );
     }
 
     #[test]

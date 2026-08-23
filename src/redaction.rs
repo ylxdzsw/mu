@@ -208,8 +208,7 @@ impl SecretRedactor {
 mod tests {
     use super::*;
     use crate::config::{
-        CompactionConfig, Config, GuardrailConfig, LimitsConfig, OrderedMap, ProviderConfig,
-        RedactionConfig,
+        CompactionConfig, Config, LimitsConfig, OrderedMap, ProviderConfig, RedactionConfig,
     };
 
     fn config(env: &[(&str, &str)], redaction_env: &[&str]) -> Config {
@@ -227,7 +226,6 @@ mod tests {
             soft_interrupt: crate::config::bundled_test_default("/soft_interrupt"),
             compaction: CompactionConfig::default(),
             limits: LimitsConfig::default(),
-            guardrail: GuardrailConfig::default(),
             terminal_bell: crate::config::TerminalBellConfig::default(),
             redaction: RedactionConfig {
                 env: redaction_env.iter().map(|name| name.to_string()).collect(),

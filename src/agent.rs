@@ -8,10 +8,9 @@ use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
 use crate::bash;
-use crate::bash::{BashRisk, ExecutionMode, ToolContext, ToolResult};
+use crate::bash::{ExecutionMode, ToolContext, ToolResult};
 use crate::compaction;
 use crate::config::Config;
-use crate::guardrail::Guardrail;
 use crate::models::{ResolvedModelChoice, resolve_model_info};
 use crate::provider::{
     AssistantItem, FinishReason, MAX_PROVIDER_RETRY_AFTER, Message, Provider, ProviderDisposition,
@@ -19,10 +18,10 @@ use crate::provider::{
     effective_retry_delay, provider_retry_limit,
 };
 use crate::renderer::{CompactionReport, Renderer};
-use crate::runtime::resume_session_fallback;
 use crate::store::{
-    AssistantCompletion, BashResultRecord, CompactionApplication, CompactionMode, CompactionStart,
-    CompactionTrigger, PendingCompaction, ProviderOrigin, RESUME_PROMPT, RequestSubject, Store,
+    AssistantCompletion, BashNotAttemptedReason, BashResultRecord, CompactionApplication,
+    CompactionMode, CompactionStart, CompactionTrigger, PendingBashCall, PendingCompaction,
+    ProviderOrigin, RESUME_PROMPT, Store,
 };
 use bash::RunningBash;
 
@@ -60,7 +59,7 @@ pub struct TurnResult {
     pub final_assistant: Option<String>,
     pub awaiting_user: bool,
     pub soft_interrupted: bool,
-    pub skipped_bash_calls: usize,
+    pub pending_bash_calls: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -191,7 +190,7 @@ impl<'a> AgentLoop<'a> {
                     final_assistant: Some(summary),
                     awaiting_user: mode == CompactionMode::AwaitUser,
                     soft_interrupted: false,
-                    skipped_bash_calls: 0,
+                    pending_bash_calls: 0,
                 }
             } else {
                 self.run_turn_inner(&mut String::new(), NextRequest::Continue)
@@ -237,12 +236,6 @@ impl<'a> AgentLoop<'a> {
     ) -> Result<TurnResult> {
         bash::reset_cancellation_state();
         bash::install_signal_forwarder(self.config.soft_interrupt);
-        let mut guardrail = if self.config.guardrail.enabled {
-            Some(Guardrail::new(self.config, self.model.active_model()))
-        } else {
-            None
-        };
-
         let mut context = self.load_context()?;
         let mut active_compaction =
             self.store
@@ -256,6 +249,20 @@ impl<'a> AgentLoop<'a> {
         let mut total_usage = Usage::default();
         let mut final_assistant = None;
         let mut awaiting_user = false;
+
+        if next_request == NextRequest::Continue {
+            let pending_calls = self.store.pending_bash_calls(self.session_id)?;
+            if !pending_calls.is_empty() {
+                let mut command_headers = StreamingCommandHeaders::default();
+                if let Some(pending) = self
+                    .execute_pending_bash_calls(&pending_calls, &mut context, &mut command_headers)
+                    .await?
+                {
+                    return self.soft_interrupt_result_with_pending(total_usage, pending);
+                }
+                next_request = NextRequest::ToolResults;
+            }
+        }
 
         let mut live_provider_retries = 0;
         loop {
@@ -369,14 +376,10 @@ impl<'a> AgentLoop<'a> {
                             effort: request.model.effort.clone(),
                         },
                         recipe,
-                        RequestSubject::Agent,
                     )?;
                     if bash::soft_interrupt_requested() {
                         return self.soft_interrupt_result(total_usage);
                     }
-                    let reviews_destructive = guardrail
-                        .as_ref()
-                        .is_some_and(|guardrail| guardrail.should_review(BashRisk::Destructive));
                     let mut renderer_error = None;
                     let result = {
                         let mut on_stream_event =
@@ -402,7 +405,6 @@ impl<'a> AgentLoop<'a> {
                                     StreamEvent::ToolCallDelta(delta) => handle_tool_call_delta(
                                         self.renderer,
                                         &mut command_headers,
-                                        reviews_destructive,
                                         delta,
                                     ),
                                     StreamEvent::Tick => self.renderer.thinking_tick(),
@@ -622,13 +624,7 @@ impl<'a> AgentLoop<'a> {
             if bash::soft_interrupt_requested()
                 && stream_result.finish_reason == FinishReason::ToolCalls
             {
-                let calls = accepted_message
-                    .assistant_tool_calls()
-                    .into_iter()
-                    .cloned()
-                    .collect::<Vec<_>>();
-                let skipped = self.skip_bash_calls(&calls, &bash_call_ids, &mut context)?;
-                return self.soft_interrupt_result_with_skipped(total_usage, skipped);
+                return self.soft_interrupt_result_with_pending(total_usage, bash_call_ids.len());
             }
 
             match stream_result.finish_reason {
@@ -688,239 +684,29 @@ impl<'a> AgentLoop<'a> {
                     continue;
                 }
                 FinishReason::ToolCalls => {
-                    let tool_calls = accepted_message
+                    let pending_calls = accepted_message
                         .assistant_tool_calls()
                         .into_iter()
                         .cloned()
+                        .zip(bash_call_ids.iter().copied())
+                        .map(|(call, call_id)| PendingBashCall {
+                            call_id,
+                            call,
+                            attempts: 0,
+                        })
                         .collect::<Vec<_>>();
-                    if tool_calls.is_empty() {
+                    if pending_calls.is_empty() {
                         bail!("missing tool calls");
                     }
-
-                    let mut cursor = 0;
-                    while cursor < tool_calls.len() {
-                        if bash::cancellation_requested() {
-                            bail!("turn interrupted");
-                        }
-                        if bash::soft_interrupt_requested() {
-                            let skipped = self.skip_bash_calls(
-                                &tool_calls[cursor..],
-                                &bash_call_ids[cursor..],
-                                &mut context,
-                            )?;
-                            return self.soft_interrupt_result_with_skipped(total_usage, skipped);
-                        }
-                        let args = parse_tool_args(&tool_calls[cursor])?;
-                        let concurrent =
-                            self.concurrent_tool_call_eligible(guardrail.as_ref(), &args);
-
-                        if !concurrent {
-                            let tc = &tool_calls[cursor];
-                            let guardrail_pending =
-                                guardrail_review_required(guardrail.as_ref(), &args);
-
-                            let header_already_rendered = finish_command_header(
-                                self.renderer,
-                                &mut command_headers,
-                                cursor,
-                                &args,
-                                guardrail_pending,
-                            )?;
-
-                            // Guardrail: review destructive bash calls before execution.
-                            // The streamed command header above is the proposed action;
-                            // denied commands still never stream execution output.
-                            if let Some(g) = guardrail.as_mut() {
-                                let risk = BashRisk::from_value(&args);
-                                if risk.is_none() {
-                                    let err = anyhow::anyhow!(
-                                        "bash tool call missing required `risk` field"
-                                    );
-                                    self.persist_bash_result(
-                                        bash_call_ids[cursor],
-                                        tc,
-                                        Err(err),
-                                        Duration::ZERO,
-                                        &mut context,
-                                        true,
-                                    )?;
-                                    cursor += 1;
-                                    continue;
-                                }
-                                if g.should_review(risk.expect("risk checked above")) {
-                                    let args_for_review = args.clone();
-                                    self.renderer.guardrail_start()?;
-                                    let assessment_result = g
-                                        .assess(
-                                            &args_for_review,
-                                            &context,
-                                            self.store,
-                                            self.session_id,
-                                            bash_call_ids[cursor],
-                                        )
-                                        .await;
-                                    self.sync_model_from_history()?;
-                                    let assessment = match assessment_result {
-                                        Ok(assessment) => assessment,
-                                        Err(error) => {
-                                            if bash::soft_interrupt_requested() {
-                                                let skipped = self.skip_bash_calls(
-                                                    &tool_calls[cursor..],
-                                                    &bash_call_ids[cursor..],
-                                                    &mut context,
-                                                )?;
-                                                return self.soft_interrupt_result_with_skipped(
-                                                    total_usage,
-                                                    skipped,
-                                                );
-                                            }
-                                            let message =
-                                                format!("guardrail review failed: {error}");
-                                            self.persist_bash_result(
-                                                bash_call_ids[cursor],
-                                                tc,
-                                                Err(anyhow::anyhow!(message.clone())),
-                                                Duration::ZERO,
-                                                &mut context,
-                                                false,
-                                            )?;
-                                            self.renderer.guardrail_failed()?;
-                                            bail!("{message}");
-                                        }
-                                    };
-                                    let risk_level = assessment.risk_level.to_string();
-                                    let user_auth_level = assessment.user_auth_level.to_string();
-                                    if assessment.is_allowed() {
-                                        self.renderer.guardrail_verdict(
-                                            true,
-                                            &risk_level,
-                                            &user_auth_level,
-                                            &assessment.reason,
-                                        )?;
-                                    } else {
-                                        let deny_err = anyhow::anyhow!(
-                                            "guardrail: action rejected — risk_level {} exceeds user_auth_level {} ({}). \
-                                             Do not work around this; stop and ask the user to authorize, \
-                                             or choose a less destructive approach.",
-                                            assessment.risk_level,
-                                            assessment.user_auth_level,
-                                            assessment.reason
-                                        );
-                                        self.persist_bash_result(
-                                            bash_call_ids[cursor],
-                                            tc,
-                                            Err(deny_err),
-                                            Duration::ZERO,
-                                            &mut context,
-                                            false,
-                                        )?;
-                                        self.renderer.guardrail_verdict(
-                                            false,
-                                            &risk_level,
-                                            &user_auth_level,
-                                            &assessment.reason,
-                                        )?;
-                                        self.renderer.guardrail_rejected()?;
-                                        if let Some(denials) = g.denial_limit_reached() {
-                                            self.renderer.notice(&format!(
-                                                "[mu] guardrail: aborting turn — {denials} denials in this turn"
-                                            ))?;
-                                            bail!("guardrail denial limit reached");
-                                        }
-                                        cursor += 1;
-                                        continue;
-                                    }
-                                }
-                            }
-
-                            if bash::soft_interrupt_requested() {
-                                let skipped = self.skip_bash_calls(
-                                    &tool_calls[cursor..],
-                                    &bash_call_ids[cursor..],
-                                    &mut context,
-                                )?;
-                                return self
-                                    .soft_interrupt_result_with_skipped(total_usage, skipped);
-                            }
-                            self.renderer.tool_start(&args, header_already_rendered)?;
-                            let started = Instant::now();
-
-                            let (manifest, objects_dir) =
-                                self.store.attachment_paths(self.session_id)?;
-                            let mut ctx = ToolContext {
-                                config: self.config,
-                                renderer: self.renderer,
-                                attachment_manifest: Some(&manifest),
-                                objects_dir: Some(&objects_dir),
-                                bash_call_id: bash_call_ids[cursor],
-                            };
-                            let tool_result = bash::execute(args, &mut ctx).await;
-
-                            self.persist_bash_result(
-                                bash_call_ids[cursor],
-                                tc,
-                                tool_result,
-                                started.elapsed(),
-                                &mut context,
-                                true,
-                            )?;
-                            cursor += 1;
-                            if bash::soft_interrupt_requested() {
-                                let skipped = self.skip_bash_calls(
-                                    &tool_calls[cursor..],
-                                    &bash_call_ids[cursor..],
-                                    &mut context,
-                                )?;
-                                return self
-                                    .soft_interrupt_result_with_skipped(total_usage, skipped);
-                            }
-                            continue;
-                        }
-
-                        let mut end = cursor + 1;
-                        while end < tool_calls.len() {
-                            let next_args = parse_tool_args(&tool_calls[end])?;
-                            let next_concurrent =
-                                self.concurrent_tool_call_eligible(guardrail.as_ref(), &next_args);
-                            if !next_concurrent {
-                                break;
-                            }
-                            end += 1;
-                        }
-
-                        let batch = &tool_calls[cursor..end];
-                        for (chunk_offset, chunk) in
-                            batch.chunks(bash::MAX_ACTIVE_PROCESS_GROUPS).enumerate()
-                        {
-                            self.execute_concurrent_bash_batch(
-                                chunk,
-                                &bash_call_ids[cursor
-                                    + chunk_offset * bash::MAX_ACTIVE_PROCESS_GROUPS
-                                    ..cursor
-                                        + chunk_offset * bash::MAX_ACTIVE_PROCESS_GROUPS
-                                        + chunk.len()],
-                                &mut context,
-                                &mut command_headers,
-                                cursor + chunk_offset * bash::MAX_ACTIVE_PROCESS_GROUPS,
-                            )
-                            .await?;
-                            if bash::cancellation_requested() {
-                                bail!("turn interrupted");
-                            }
-                            if bash::soft_interrupt_requested() {
-                                let completed = cursor
-                                    + chunk_offset * bash::MAX_ACTIVE_PROCESS_GROUPS
-                                    + chunk.len();
-                                let skipped = self.skip_bash_calls(
-                                    &tool_calls[completed..],
-                                    &bash_call_ids[completed..],
-                                    &mut context,
-                                )?;
-                                return self
-                                    .soft_interrupt_result_with_skipped(total_usage, skipped);
-                            }
-                        }
-                        cursor = end;
+                    if let Some(pending) = self
+                        .execute_pending_bash_calls(
+                            &pending_calls,
+                            &mut context,
+                            &mut command_headers,
+                        )
+                        .await?
+                    {
+                        return self.soft_interrupt_result_with_pending(total_usage, pending);
                     }
                     next_request = NextRequest::ToolResults;
                 }
@@ -947,18 +733,19 @@ impl<'a> AgentLoop<'a> {
             final_assistant,
             awaiting_user,
             soft_interrupted: false,
-            skipped_bash_calls: 0,
+            pending_bash_calls: 0,
         })
     }
 
     fn soft_interrupt_result(&mut self, usage: Usage) -> Result<TurnResult> {
-        self.soft_interrupt_result_with_skipped(usage, 0)
+        let pending = self.store.pending_bash_calls(self.session_id)?.len();
+        self.soft_interrupt_result_with_pending(usage, pending)
     }
 
-    fn soft_interrupt_result_with_skipped(
+    fn soft_interrupt_result_with_pending(
         &mut self,
         usage: Usage,
-        skipped_bash_calls: usize,
+        pending_bash_calls: usize,
     ) -> Result<TurnResult> {
         let context = self.current_context_estimate()?;
         Ok(TurnResult {
@@ -969,42 +756,130 @@ impl<'a> AgentLoop<'a> {
             final_assistant: None,
             awaiting_user: false,
             soft_interrupted: true,
-            skipped_bash_calls,
+            pending_bash_calls,
         })
     }
 
-    fn skip_bash_calls(
+    async fn execute_pending_bash_calls(
         &mut self,
-        calls: &[ToolCall],
-        bash_call_ids: &[i64],
+        calls: &[PendingBashCall],
         context: &mut Vec<Message>,
-    ) -> Result<usize> {
-        for (call, bash_call_id) in calls.iter().zip(bash_call_ids) {
-            let output = bash::SOFT_INTERRUPT_SKIPPED_OUTPUT.to_string();
-            self.store.persist_bash_result(
+        command_headers: &mut StreamingCommandHeaders,
+    ) -> Result<Option<usize>> {
+        let mut cursor = 0;
+        while cursor < calls.len() {
+            if bash::cancellation_requested() {
+                bail!("turn interrupted");
+            }
+            if bash::soft_interrupt_requested() {
+                return Ok(Some(calls.len() - cursor));
+            }
+
+            let pending = &calls[cursor];
+            let args = parse_tool_args(&pending.call)?;
+            let parsed = bash::parse_args::<bash::BashArgs>(&args);
+            if let Err(error) = parsed {
+                let header_already_rendered =
+                    finish_command_header(self.renderer, command_headers, cursor, &args)?;
+                if bash::soft_interrupt_requested() {
+                    return Ok(Some(calls.len() - cursor));
+                }
+                self.renderer.tool_start(&args, header_already_rendered)?;
+                self.renderer
+                    .tool_failed(&error.to_string(), Duration::ZERO)?;
+                let output = format!("error: {error}");
+                self.store.persist_bash_not_attempted(
+                    self.session_id,
+                    pending.call_id,
+                    BashNotAttemptedReason::InvalidArguments,
+                    &output,
+                )?;
+                context.push(Message::Tool {
+                    content: output,
+                    attachments: Vec::new(),
+                    tool_call_id: pending.call.id.clone(),
+                });
+                cursor += 1;
+                continue;
+            }
+
+            if self.concurrent_tool_call_eligible(&args) {
+                let mut end = cursor + 1;
+                while end < calls.len() {
+                    let next_args = parse_tool_args(&calls[end].call)?;
+                    if !self.concurrent_tool_call_eligible(&next_args) {
+                        break;
+                    }
+                    end += 1;
+                }
+
+                for (chunk_offset, chunk) in calls[cursor..end]
+                    .chunks(bash::MAX_ACTIVE_PROCESS_GROUPS)
+                    .enumerate()
+                {
+                    let header_start = cursor + chunk_offset * bash::MAX_ACTIVE_PROCESS_GROUPS;
+                    let started = self
+                        .execute_concurrent_bash_batch(
+                            chunk,
+                            context,
+                            command_headers,
+                            header_start,
+                        )
+                        .await?;
+                    let completed = header_start + started;
+                    if started < chunk.len() {
+                        return Ok(Some(calls.len() - completed));
+                    }
+                    if bash::cancellation_requested() {
+                        bail!("turn interrupted");
+                    }
+                    if bash::soft_interrupt_requested() {
+                        return Ok(Some(calls.len() - completed));
+                    }
+                }
+                cursor = end;
+                continue;
+            }
+
+            let header_already_rendered =
+                finish_command_header(self.renderer, command_headers, cursor, &args)?;
+            if bash::soft_interrupt_requested() {
+                return Ok(Some(calls.len() - cursor));
+            }
+            self.store.start_bash_attempt(
                 self.session_id,
-                BashResultRecord {
-                    bash_call_id: *bash_call_id,
-                    outcome: "error",
-                    exit_code: None,
-                    duration_ms: Some(0),
-                },
-                &output,
-                &[],
+                pending.call_id,
+                pending.attempts > 0,
             )?;
-            context.push(Message::Tool {
-                content: output,
-                attachments: Vec::new(),
-                tool_call_id: call.id.clone(),
-            });
+            self.renderer.tool_start(&args, header_already_rendered)?;
+            let started = Instant::now();
+
+            let (manifest, objects_dir) = self.store.attachment_paths(self.session_id)?;
+            let mut ctx = ToolContext {
+                config: self.config,
+                renderer: self.renderer,
+                attachment_manifest: Some(&manifest),
+                objects_dir: Some(&objects_dir),
+                bash_call_id: pending.call_id,
+            };
+            let tool_result = bash::execute(args, &mut ctx).await;
+            self.persist_bash_result(
+                pending.call_id,
+                &pending.call,
+                tool_result,
+                started.elapsed(),
+                context,
+                true,
+            )?;
+            cursor += 1;
         }
-        Ok(calls.len())
+        Ok(None)
     }
 
     /// Load the full completed-message history, including the persisted leading
     /// system prompt.
-    /// History is always valid here because the caller normalizes any
-    /// interrupted tail (synthesizing missing tool results) before the turn.
+    /// A resumed tool exchange may still have unresolved Bash claims; those
+    /// are executed before the next provider request.
     fn load_context(&self) -> Result<Vec<Message>> {
         let mut context = self.store.load_context_messages(self.session_id)?;
         if self.store.resume_reminder_needed(self.session_id)? {
@@ -1107,19 +982,6 @@ impl<'a> AgentLoop<'a> {
         Ok(())
     }
 
-    fn sync_model_from_history(&mut self) -> Result<()> {
-        let previous_provider = self.model.active_model().provider_id.clone();
-        resume_session_fallback(self.store, self.config, self.session_id, &mut self.model)?;
-        if self.model.active_model().provider_id != previous_provider {
-            self.provider = crate::provider::build_provider(
-                self.config,
-                &self.model.active_model().provider_id,
-            )?;
-            self.update_model_context_window();
-        }
-        Ok(())
-    }
-
     fn advance_provider(&mut self, reason: &str) -> Result<bool> {
         let Some((previous, next_provider)) =
             advance_provider(self.config, &mut self.model, &mut self.provider)?
@@ -1183,41 +1045,45 @@ impl<'a> AgentLoop<'a> {
         Ok(())
     }
 
-    fn concurrent_tool_call_eligible(&self, guardrail: Option<&Guardrail>, args: &Value) -> bool {
+    fn concurrent_tool_call_eligible(&self, args: &Value) -> bool {
         // Schema-invalid readonly calls must take the sequential path so the
         // normal tool-error persistence can return the validation failure to
         // the model instead of aborting while preparing a concurrent batch.
         if bash::parse_args::<bash::BashArgs>(args).is_err() {
             return false;
         }
-        if bash::execution_mode(args) != ExecutionMode::Concurrent {
-            return false;
-        }
-        !guardrail_review_required(guardrail, args)
+        bash::execution_mode(args) == ExecutionMode::Concurrent
     }
 
     async fn execute_concurrent_bash_batch(
         &mut self,
-        batch: &[ToolCall],
-        bash_call_ids: &[i64],
+        batch: &[PendingBashCall],
         context: &mut Vec<Message>,
         command_headers: &mut StreamingCommandHeaders,
         header_start_index: usize,
-    ) -> Result<()> {
+    ) -> Result<usize> {
         let mut executions = Vec::new();
         let (manifest, objects_dir) = self.store.attachment_paths(self.session_id)?;
-        for (call, bash_call_id) in batch.iter().zip(bash_call_ids) {
-            let args = parse_tool_args(call)?;
+        for pending in batch {
+            if bash::soft_interrupt_requested() {
+                break;
+            }
+            let args = parse_tool_args(&pending.call)?;
             let bash_args = bash::parse_args(&args)?;
+            self.store.start_bash_attempt(
+                self.session_id,
+                pending.call_id,
+                pending.attempts > 0,
+            )?;
             executions.push(ConcurrentBashExecution {
-                call,
+                call: &pending.call,
                 args,
                 running: Some(bash::start_bash_task(
                     bash_args,
                     self.config,
                     Some(&manifest),
                     Some(&objects_dir),
-                    *bash_call_id,
+                    pending.call_id,
                 )?),
                 streamed_len: 0,
             });
@@ -1229,7 +1095,6 @@ impl<'a> AgentLoop<'a> {
                 command_headers,
                 header_start_index + index,
                 &exec.args,
-                false,
             )?;
             if let Some(running) = exec.running.as_ref() {
                 for warning in running.warnings() {
@@ -1247,7 +1112,7 @@ impl<'a> AgentLoop<'a> {
                 .await;
             self.flush_buffered_bash_output(exec, &final_output)?;
             self.persist_bash_result(
-                bash_call_ids[index],
+                batch[index].call_id,
                 exec.call,
                 result,
                 elapsed,
@@ -1256,7 +1121,7 @@ impl<'a> AgentLoop<'a> {
             )?;
         }
 
-        Ok(())
+        Ok(executions.len())
     }
 
     async fn stream_running_bash(&mut self, exec: &mut ConcurrentBashExecution<'_>) -> Result<()> {
@@ -1328,7 +1193,6 @@ fn parse_tool_args(call: &ToolCall) -> Result<Value> {
 fn handle_tool_call_delta(
     renderer: &mut Renderer,
     headers: &mut StreamingCommandHeaders,
-    reviews_destructive: bool,
     delta: ToolCallDelta,
 ) -> std::io::Result<()> {
     if delta.index >= headers.entries.len() {
@@ -1350,11 +1214,6 @@ fn handle_tool_call_delta(
                 cwd: string_field_state(&header.arguments, "cwd"),
                 stdin: string_field_state(&header.arguments, "stdin"),
                 arguments_complete: arguments_json_complete(&header.arguments),
-                guardrail_pending: reviews_destructive
-                    && matches!(
-                        string_field_state(&header.arguments, "risk").complete_value(),
-                        Some("destructive")
-                    ),
             },
         )?;
         if header.display.is_done() {
@@ -1370,7 +1229,6 @@ fn finish_command_header(
     headers: &mut StreamingCommandHeaders,
     index: usize,
     args: &Value,
-    guardrail_pending: bool,
 ) -> std::io::Result<bool> {
     if index >= headers.entries.len() {
         headers
@@ -1378,16 +1236,11 @@ fn finish_command_header(
             .resize_with(index + 1, StreamingCommandHeader::default);
     }
     let header = &mut headers.entries[index];
-    header.finish(renderer, args, guardrail_pending)
+    header.finish(renderer, args)
 }
 
 impl StreamingCommandHeader {
-    fn finish(
-        &mut self,
-        renderer: &mut Renderer,
-        args: &Value,
-        guardrail_pending: bool,
-    ) -> std::io::Result<bool> {
+    fn finish(&mut self, renderer: &mut Renderer, args: &Value) -> std::io::Result<bool> {
         let title = args.get("title").and_then(|value| value.as_str());
         let risk = args.get("risk").and_then(|value| value.as_str());
         let command = args.get("command").and_then(|value| value.as_str());
@@ -1401,7 +1254,6 @@ impl StreamingCommandHeader {
                 cwd: StringFieldState::from_final(args.get("cwd").and_then(|value| value.as_str())),
                 stdin: StringFieldState::from_final(stdin),
                 arguments_complete: true,
-                guardrail_pending,
             },
         )?;
         Ok(self.display.started)
@@ -1428,7 +1280,6 @@ impl CommandHeaderDisplay {
             cwd,
             stdin,
             arguments_complete,
-            guardrail_pending,
         } = update;
         if !self.started {
             self.started = renderer.bash_header_start()?;
@@ -1437,11 +1288,7 @@ impl CommandHeaderDisplay {
         if renderer.output_format() == crate::OutputFormat::Concise {
             let ready = title.complete_value().is_some() && risk.complete_value().is_some();
             if ready || arguments_complete {
-                renderer.concise_tool_ready(
-                    title.complete_value(),
-                    risk.complete_value(),
-                    guardrail_pending,
-                )?;
+                renderer.concise_tool_ready(title.complete_value(), risk.complete_value())?;
                 self.title_line_done = true;
                 self.command_line_done = true;
                 self.cwd_line_done = true;
@@ -1647,7 +1494,6 @@ struct CommandHeaderUpdate {
     cwd: StringFieldState,
     stdin: StringFieldState,
     arguments_complete: bool,
-    guardrail_pending: bool,
 }
 
 struct FullCommandHeaderUpdate {
@@ -1963,16 +1809,6 @@ fn stream_all(
     Ok(complete)
 }
 
-fn guardrail_review_required(guardrail: Option<&Guardrail>, args: &Value) -> bool {
-    let Some(guardrail) = guardrail else {
-        return false;
-    };
-    let Some(risk) = BashRisk::from_value(args) else {
-        return false;
-    };
-    guardrail.should_review(risk)
-}
-
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
@@ -1981,8 +1817,7 @@ mod tests {
     use super::*;
     use crate::OutputFormat;
     use crate::config::{
-        CompactionConfig, GuardrailConfig, LimitsConfig, ProviderConfig, RedactionConfig,
-        TerminalBellConfig,
+        CompactionConfig, LimitsConfig, ProviderConfig, RedactionConfig, TerminalBellConfig,
     };
     use crate::provider::{FinishReason, ProviderError, StreamResult, Usage, UserContent};
     use async_trait::async_trait;
@@ -2164,6 +1999,27 @@ mod tests {
         step: Mutex<usize>,
     }
 
+    struct StopAfterPendingProvider {
+        seen: Arc<Mutex<Vec<Vec<Message>>>>,
+    }
+
+    #[async_trait(?Send)]
+    impl Provider for StopAfterPendingProvider {
+        async fn stream(
+            &self,
+            request: &Request,
+            _on_event: &mut dyn FnMut(crate::provider::StreamEvent) -> Result<(), ProviderError>,
+        ) -> Result<StreamResult, ProviderError> {
+            self.seen.lock().unwrap().push(request.messages.to_vec());
+            Ok(StreamResult {
+                message: Message::assistant(Some("done".into()), None, None, None),
+                finish_reason: FinishReason::Stop,
+                usage: None,
+                native_response: None,
+            })
+        }
+    }
+
     #[async_trait(?Send)]
     impl Provider for TwoReadonlyThenStopProvider {
         async fn stream(
@@ -2309,7 +2165,6 @@ mod tests {
             soft_interrupt: crate::config::bundled_test_default("/soft_interrupt"),
             compaction: CompactionConfig::default(),
             limits: LimitsConfig::default(),
-            guardrail: GuardrailConfig::default(),
             terminal_bell: TerminalBellConfig::default(),
             redaction: RedactionConfig::default(),
             env: HashMap::new(),
@@ -2925,6 +2780,96 @@ mod tests {
         assert_eq!(tool_messages[1].0, "call_invalid");
         assert!(!tool_messages[1].1.is_empty());
         assert!(!tool_messages[1].1.contains("must-not-run"));
+        let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    #[tokio::test]
+    async fn explicit_retry_reexecutes_an_incomplete_readonly_attempt_before_provider_contact() {
+        let tmp =
+            std::env::temp_dir().join(format!("mu-agent-readonly-retry-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let store = Store::open(&tmp.join("mu.db")).unwrap();
+        let session = store.create_session("system").unwrap();
+        store
+            .append_message(
+                &session.id,
+                &Message::User {
+                    content: UserContent::Text("inspect".into()),
+                },
+            )
+            .unwrap();
+        let (_, call_ids) = store
+            .append_message_with_bash_calls(
+                &session.id,
+                &Message::assistant(
+                    None,
+                    None,
+                    Some(vec![ToolCall {
+                        id: "call_retry".into(),
+                        arguments: serde_json::json!({
+                            "title": "retry read",
+                            "risk": "readonly",
+                            "command": "printf retried",
+                        })
+                        .to_string(),
+                    }]),
+                    None,
+                ),
+            )
+            .unwrap();
+        store
+            .start_bash_attempt(&session.id, call_ids[0], false)
+            .unwrap();
+        assert_eq!(
+            store
+                .recover_interrupted_tail_for_retry(&session.id)
+                .unwrap(),
+            0
+        );
+
+        let config = test_config();
+        let request_model = crate::models::resolve_model_ref(&config, "test/fake-model").unwrap();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let mut renderer = Renderer::with_format(OutputFormat::Detail);
+        let mut agent = AgentLoop {
+            config: &config,
+            model: ResolvedModelChoice::fixed(request_model),
+            provider: Box::new(StopAfterPendingProvider {
+                seen: Arc::clone(&seen),
+            }),
+            store: &store,
+            session_id: &session.id,
+            model_context_window: None,
+            renderer: &mut renderer,
+        };
+
+        let result = agent.resume_turn().await.unwrap();
+        assert_eq!(result.final_assistant.as_deref(), Some("done"));
+        assert!(seen.lock().unwrap()[0].iter().any(|message| {
+            matches!(
+                message,
+                Message::Tool {
+                    content,
+                    tool_call_id,
+                    ..
+                } if tool_call_id == "call_retry" && content.contains("retried")
+            )
+        }));
+        let audit = store.audit_events(&session.id).unwrap();
+        assert_eq!(
+            audit
+                .iter()
+                .filter(|event| event["type"] == "bash_started")
+                .count(),
+            2
+        );
+        assert_eq!(
+            audit
+                .iter()
+                .filter(|event| event["type"] == "bash_completed")
+                .count(),
+            1
+        );
         let _ = std::fs::remove_dir_all(tmp);
     }
 

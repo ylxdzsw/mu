@@ -517,8 +517,8 @@ mod tests {
 
     use super::*;
     use crate::config::{
-        CompactionConfig, Config, GuardrailConfig, LimitsConfig, ModelConfig, OrderedMap,
-        ProviderConfig, RedactionConfig, TerminalBellConfig,
+        CompactionConfig, Config, LimitsConfig, ModelConfig, OrderedMap, ProviderConfig,
+        RedactionConfig, TerminalBellConfig,
     };
 
     fn test_config() -> Config {
@@ -605,7 +605,6 @@ mod tests {
             soft_interrupt: crate::config::bundled_test_default("/soft_interrupt"),
             compaction: CompactionConfig::default(),
             limits: LimitsConfig::default(),
-            guardrail: GuardrailConfig::default(),
             terminal_bell: TerminalBellConfig::default(),
             redaction: RedactionConfig::default(),
             env: HashMap::new(),
@@ -615,69 +614,6 @@ mod tests {
     fn finish_attempt(store: &Store, session_id: &str, model: &str, outcome: &str) {
         store
             .append_test_agent_exchange(session_id, model, outcome, 1)
-            .unwrap();
-    }
-
-    fn finish_guardrail_attempt(store: &Store, config: &Config, session_id: &str, model: &str) {
-        let turn_id = store
-            .start_turn(session_id, "/tmp", None, &"test guardrail".into())
-            .unwrap();
-        let call = crate::provider::ToolCall {
-            id: uuid::Uuid::new_v4().to_string(),
-            arguments: r#"{"title":"Test","risk":"destructive","command":"true"}"#.into(),
-        };
-        let (_, call_ids) = store
-            .append_message_with_bash_calls(
-                session_id,
-                &crate::provider::Message::assistant(None, None, Some(vec![call]), None),
-            )
-            .unwrap();
-        let resolved = resolve_model_choice(config, model).unwrap();
-        let request_model = resolved.active_model();
-        let native = serde_json::json!({"model":request_model.model_id});
-        let exchange_id = store
-            .start_provider_request(
-                session_id,
-                &turn_id,
-                crate::store::ProviderOrigin {
-                    canonical_model_ref: model.into(),
-                    provider_id: request_model.provider_id.clone(),
-                    api: "test".into(),
-                    endpoint: String::new(),
-                    wire_model: request_model.model_id.clone(),
-                    effort: request_model.effort.clone(),
-                },
-                store
-                    .request_recipe("test.v1", &native, serde_json::json!({}))
-                    .unwrap(),
-                crate::store::RequestSubject::Guardrail {
-                    call_id: call_ids[0],
-                    attempt: 1,
-                },
-            )
-            .unwrap();
-        store
-            .fail_provider_exchange(
-                session_id,
-                &exchange_id,
-                "test",
-                serde_json::json!({"message":"test failure"}),
-                None,
-                None,
-            )
-            .unwrap();
-        store
-            .persist_bash_result(
-                session_id,
-                crate::store::BashResultRecord {
-                    bash_call_id: call_ids[0],
-                    outcome: "error",
-                    exit_code: None,
-                    duration_ms: None,
-                },
-                "test",
-                &[],
-            )
             .unwrap();
     }
 
@@ -995,7 +931,7 @@ mod tests {
     }
 
     #[test]
-    fn floating_cursor_is_model_specific_and_tracks_guardrail_attempts() {
+    fn floating_cursor_is_model_specific() {
         let store = Store::open_memory().unwrap();
         let config = test_config();
         let session = store.create_session("/tmp").unwrap();
@@ -1015,21 +951,8 @@ mod tests {
             "(beta)/default-model:high"
         );
 
-        finish_guardrail_attempt(&store, &config, &session.id, "alpha/default-model");
-        let after_fixed_guardrail = resolve_retry_model(
-            &store,
-            &config,
-            &store.get_session(&session.id).unwrap().unwrap(),
-            Some("default-model"),
-        )
-        .unwrap();
-        assert_eq!(
-            after_fixed_guardrail.active_model().canonical,
-            "(beta)/default-model"
-        );
-
         finish_attempt(&store, &session.id, "(alpha)/default-model", "completed");
-        finish_guardrail_attempt(&store, &config, &session.id, "(beta)/default-model");
+        finish_attempt(&store, &session.id, "(beta)/default-model", "completed");
 
         let resumed = resolve_retry_model(
             &store,

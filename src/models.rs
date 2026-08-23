@@ -93,10 +93,6 @@ pub struct AvailableModel {
 
 pub fn validate_config(config: &Config) -> Result<()> {
     first_model_choice(config)?;
-    if let Some(review_model) = config.guardrail.review_model.as_deref() {
-        resolve_model_choice(config, review_model)
-            .with_context(|| "invalid `guardrail.review_model` in config.jsonc")?;
-    }
     Ok(())
 }
 
@@ -284,8 +280,8 @@ mod tests {
 
     use super::*;
     use crate::config::{
-        CompactionConfig, GuardrailConfig, LimitsConfig, ModelConfig, OrderedMap, ProviderConfig,
-        RedactionConfig, TerminalBellConfig,
+        CompactionConfig, LimitsConfig, ModelConfig, OrderedMap, ProviderConfig, RedactionConfig,
+        TerminalBellConfig,
     };
 
     fn test_config() -> Config {
@@ -349,12 +345,6 @@ mod tests {
             soft_interrupt: crate::config::bundled_test_default("/soft_interrupt"),
             compaction: CompactionConfig::default(),
             limits: LimitsConfig::default(),
-            guardrail: GuardrailConfig {
-                enabled: false,
-                review_model: Some("alpha/common-model".into()),
-                timeout_seconds: 120,
-                max_denials_per_turn: 3,
-            },
             terminal_bell: TerminalBellConfig::default(),
             redaction: RedactionConfig::default(),
             env: HashMap::new(),
@@ -411,12 +401,8 @@ mod tests {
     }
 
     #[test]
-    fn validate_config_checks_first_and_review_models() {
+    fn validate_config_checks_first_model() {
         validate_config(&test_config()).unwrap();
-
-        let mut invalid = test_config();
-        invalid.guardrail.review_model = Some("alpha/missing".into());
-        assert!(validate_config(&invalid).is_err());
     }
 
     #[test]

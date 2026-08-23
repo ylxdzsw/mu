@@ -3,7 +3,7 @@
   "output": "concise",
   // Automatically continue replayable incomplete assistant responses.
   "auto_resume": false,
-  // Catch Ctrl+\ as a soft interrupt instead of the terminal's default SIGQUIT.
+  // Catch Ctrl+\ to finish active work and leave unstarted Bash calls pending.
   "soft_interrupt": true,
   // Providers and models. Relative order determines fallbacking order.
   "providers": {
@@ -66,16 +66,5 @@
   "redaction": {
     // Exact names or *suffix selectors to redact.
     "env": ["*_API_KEY", "*_API_TOKEN", "*_AUTH_TOKEN", "*_ACCESS_TOKEN"]
-  },
-  // Review destructive Bash calls.
-  "guardrail": {
-    // Enable destructive-call review.
-    "enabled": true,
-    // Fixed reviewer; omit to use the active model.
-    // "review_model": "opencode/deepseek-v4-flash-free",
-    // Reviewer timeout in seconds.
-    "timeout_seconds": 120,
-    // Maximum denied attempts in one turn.
-    "max_denials_per_turn": 3
   }
 }

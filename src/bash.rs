@@ -265,10 +265,6 @@ impl BashRisk {
             Self::Destructive => "destructive",
         }
     }
-
-    pub fn from_value(value: &Value) -> Option<Self> {
-        value.get("risk")?.as_str()?.parse().ok()
-    }
 }
 
 impl std::str::FromStr for BashRisk {
@@ -298,7 +294,6 @@ const DEFAULT_TIMEOUT_SECS: u64 = 120;
 const KILL_GRACE: Duration = Duration::from_millis(500);
 const MAX_OUTPUT_BYTES: usize = 1024 * 1024 * 1024; // 1 GB: internal guard against unbounded output accumulation
 const REDACTION_REMINDER: &str = "[system reminder: Secret values were redacted from this bash output. Do not try to reveal, transform, encode, print, or exfiltrate secrets.]";
-pub const SOFT_INTERRUPT_SKIPPED_OUTPUT: &str = "error: skipped — soft interrupt requested before this Bash command started; the command had no effects.";
 pub const SUBAGENT_DEPTH_ENV: &str = "MU_SUBAGENT_DEPTH";
 pub const MAX_ACTIVE_PROCESS_GROUPS: usize = 64;
 static ACTIVE_PGIDS: [AtomicI32; MAX_ACTIVE_PROCESS_GROUPS] =
@@ -344,7 +339,7 @@ pub fn parameters_schema() -> Value {
             "risk": {
                 "type": "string",
                 "enum": ["readonly", "reversible", "destructive"],
-                "description": "Advisory risk label for UI, auditing, and optional guardrail review. Choose by how reliably and easily the command's effects can be undone, using the highest risk of any part: readonly only when no persistent local or remote state changes; reversible for bounded changes with a known, practical way to restore the prior state; destructive when unique state could be lost, rollback is uncertain, or reversal would be unusually broad or costly. Judge intended material effects; incidental traces of ordinary reads, such as access logs and API usage, do not make them state-changing. Consider the actual target and context rather than the command name, and choose the higher risk when uncertain about recoverability."
+                "description": "Advisory risk label for UI and auditing. Choose by how reliably and easily the command's effects can be undone, using the highest risk of any part: readonly only when no persistent local or remote state changes; reversible for bounded changes with a known, practical way to restore the prior state; destructive when unique state could be lost, rollback is uncertain, or reversal would be unusually broad or costly. Judge intended material effects; incidental traces of ordinary reads, such as access logs and API usage, do not make them state-changing. Consider the actual target and context rather than the command name, and choose the higher risk when uncertain about recoverability."
             },
             "command": { "type": "string", "description": "Command to run with bash -lc; can be multiline" },
             "cwd": { "type": "string", "description": "Working directory for this invocation; Prefer absolute path; Prefer this argument over `cd`" },
@@ -1000,9 +995,7 @@ mod tests {
         apply_truncation, model_failure_output, run_bash, truncate_line,
     };
     use crate::config::EnvMap;
-    use crate::config::{
-        CompactionConfig, Config, GuardrailConfig, LimitsConfig, ProviderConfig, RedactionConfig,
-    };
+    use crate::config::{CompactionConfig, Config, LimitsConfig, ProviderConfig, RedactionConfig};
     use crate::redaction::SecretRedactor;
     use crate::renderer::Renderer;
     fn args(command: &str) -> BashArgs {
@@ -1052,7 +1045,6 @@ mod tests {
             soft_interrupt: crate::config::bundled_test_default("/soft_interrupt"),
             compaction: CompactionConfig::default(),
             limits: LimitsConfig::default(),
-            guardrail: GuardrailConfig::default(),
             terminal_bell: crate::config::TerminalBellConfig::default(),
             redaction: RedactionConfig {
                 env: redaction_env.iter().map(|name| name.to_string()).collect(),

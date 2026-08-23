@@ -354,20 +354,6 @@ pub struct Request {
 }
 
 impl Request {
-    pub fn for_guardrail(
-        model: ResolvedModelRef,
-        session_id: &str,
-        epoch: u64,
-        messages: Vec<Message>,
-    ) -> Self {
-        Self {
-            model,
-            cache_key: Some(format!("mu:{session_id}:epoch:{epoch}")),
-            messages,
-            bash: false,
-        }
-    }
-
     pub fn json(&self, api: ModelApi) -> Result<Value, ProviderError> {
         let tools = self.tools();
         match api {
@@ -655,6 +641,7 @@ pub enum UserContent {
 }
 
 impl UserContent {
+    #[cfg(test)]
     pub fn text(&self) -> String {
         match self {
             UserContent::Text(text) => text.clone(),
@@ -1395,8 +1382,8 @@ mod tests {
 
     use super::*;
     use crate::config::{
-        CompactionConfig, GuardrailConfig, LimitsConfig, ModelConfig, OrderedMap, ProviderConfig,
-        RedactionConfig, TerminalBellConfig,
+        CompactionConfig, LimitsConfig, ModelConfig, OrderedMap, ProviderConfig, RedactionConfig,
+        TerminalBellConfig,
     };
     use crate::models::ResolvedModelRef;
 
@@ -1516,7 +1503,6 @@ mod tests {
             soft_interrupt: crate::config::bundled_test_default("/soft_interrupt"),
             compaction: CompactionConfig::default(),
             limits: LimitsConfig::default(),
-            guardrail: GuardrailConfig::default(),
             terminal_bell: TerminalBellConfig::default(),
             redaction: RedactionConfig::default(),
             env: HashMap::new(),

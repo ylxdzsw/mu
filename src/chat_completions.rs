@@ -869,7 +869,12 @@ mod tests {
 
     #[test]
     fn chat_and_responses_requests_include_context_epoch_cache_key() {
-        let request = Request::for_guardrail(test_model(None), "ses_test", 3, vec![]);
+        let request = Request {
+            model: test_model(None),
+            cache_key: Some("mu:ses_test:epoch:3".into()),
+            messages: vec![],
+            bash: false,
+        };
 
         assert_eq!(request.cache_key.as_deref(), Some("mu:ses_test:epoch:3"));
         let chat = request.json(ModelApi::ChatCompletions).unwrap();

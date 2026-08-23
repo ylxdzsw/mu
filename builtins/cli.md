@@ -157,8 +157,10 @@ composed prompt.
 ### `mu retry [selection options] [-o <format>]`
 
 Resume an interrupted turn, defaulting to `current-session`. It normalizes the
-interrupted tail, restores the submitted working directory, and continues
-without a new user prompt. A clean session is a no-op.
+interrupted provider tail, restores the submitted working directory, resumes
+never-started Bash calls, and may retry unresolved readonly attempts before
+continuing without a new user prompt. Started higher-risk calls are not
+repeated. A clean session is a no-op.
 
 ### `mu compact [-s <id>] [-o <format>]`
 
