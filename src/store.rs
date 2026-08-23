@@ -196,6 +196,7 @@ pub struct PendingCompaction {
 pub struct QueuedPrompt {
     pub prompt_id: String,
     pub epoch: u64,
+    pub trap: crate::bash::TrapLevel,
 }
 
 pub(crate) struct AssistantCompletion<'a> {
@@ -217,6 +218,7 @@ pub struct CompactionApplication {
 pub struct CompactionStart<'a> {
     pub cwd: &'a str,
     pub prompt: &'a UserContent,
+    pub trap: crate::bash::TrapLevel,
     pub trigger: CompactionTrigger,
     pub mode: CompactionMode,
     pub before_context_tokens: u64,
@@ -287,6 +289,7 @@ enum Event {
         turn_id: String,
         cwd: String,
         prompt: PersistedUserContent,
+        trap: crate::bash::TrapLevel,
         trigger: CompactionTrigger,
         mode: CompactionMode,
         before_context_tokens: u64,
@@ -296,6 +299,7 @@ enum Event {
     PromptQueued {
         prompt_id: String,
         cwd: String,
+        trap: crate::bash::TrapLevel,
         #[serde(skip_serializing_if = "Option::is_none")]
         git_worktree_root: Option<String>,
         prompt: PersistedUserContent,
@@ -1415,7 +1419,13 @@ impl Store {
         git_worktree_root: Option<&str>,
         prompt: &UserContent,
     ) -> Result<String> {
-        self.queue_prompt(session_id, cwd, git_worktree_root, prompt)?;
+        self.queue_prompt(
+            session_id,
+            cwd,
+            git_worktree_root,
+            prompt,
+            crate::bash::TrapLevel::Destructive,
+        )?;
         self.materialize_queued_prompt(session_id)?
             .context("queued prompt was not materialized")
     }
@@ -1433,6 +1443,7 @@ impl Store {
                 turn_id: turn_id.clone(),
                 cwd: start.cwd.to_string(),
                 prompt,
+                trap: start.trap,
                 trigger: start.trigger,
                 mode: start.mode,
                 before_context_tokens: start.before_context_tokens,
@@ -1448,6 +1459,7 @@ impl Store {
         cwd: &str,
         git_worktree_root: Option<&str>,
         prompt: &UserContent,
+        trap: crate::bash::TrapLevel,
     ) -> Result<String> {
         if self.pending_compaction(session_id)?.is_some() {
             bail!("session compaction is incomplete; run `mu retry -s {session_id}`")
@@ -1461,6 +1473,7 @@ impl Store {
             Event::PromptQueued {
                 prompt_id: prompt_id.clone(),
                 cwd: cwd.to_string(),
+                trap,
                 git_worktree_root: git_worktree_root.map(str::to_string),
                 prompt: self.persist_user_content(prompt)?,
             },
@@ -1483,16 +1496,50 @@ impl Store {
             .iter()
             .rev()
             .find_map(|line| match &line.event {
-                Event::PromptQueued { prompt_id, .. } if !consumed.contains(prompt_id.as_str()) => {
-                    Some(QueuedPrompt {
-                        prompt_id: prompt_id.clone(),
-                        epoch: context_epoch(&journal, line.seq.saturating_sub(1)),
-                    })
-                }
+                Event::PromptQueued {
+                    prompt_id, trap, ..
+                } if !consumed.contains(prompt_id.as_str()) => Some(QueuedPrompt {
+                    prompt_id: prompt_id.clone(),
+                    epoch: context_epoch(&journal, line.seq.saturating_sub(1)),
+                    trap: *trap,
+                }),
                 _ => None,
             })
             .map(Ok)
             .transpose()
+    }
+
+    pub fn pending_trap_level(&self, session_id: &str) -> Result<crate::bash::TrapLevel> {
+        let journal = self.load(session_id)?;
+        let prompts = queued_prompt_records(&journal);
+        let mut active = None;
+        let mut compaction_mode = None;
+        for line in journal.events.iter() {
+            match &line.event {
+                Event::PromptMaterialized { .. } => {
+                    active = project_turn(&line.event, &prompts).map(|turn| turn.trap);
+                    compaction_mode = None;
+                }
+                Event::CompactionStarted { mode, .. } => {
+                    active = project_turn(&line.event, &prompts).map(|turn| turn.trap);
+                    compaction_mode = Some(mode.to_owned());
+                }
+                Event::CompactionApplied { .. } => {
+                    if compaction_mode == Some(CompactionMode::AwaitUser) {
+                        active = None;
+                    }
+                    compaction_mode = None;
+                }
+                _ => {}
+            }
+        }
+        if compaction_mode.is_some() {
+            return active.context("pending compaction has no turn policy");
+        }
+        if let Some(queued) = self.queued_prompt(session_id)? {
+            return Ok(queued.trap);
+        }
+        active.context("session has no pending turn policy")
     }
 
     pub fn materialize_queued_prompt(&self, session_id: &str) -> Result<Option<String>> {
@@ -1720,6 +1767,7 @@ impl Store {
             CompactionStart {
                 cwd: "/tmp",
                 prompt: &"compact".into(),
+                trap: crate::bash::TrapLevel::Destructive,
                 trigger: CompactionTrigger::Manual,
                 mode: CompactionMode::AwaitUser,
                 before_context_tokens: 0,
@@ -3536,6 +3584,7 @@ struct CompactionProjection {
 
 struct TurnProjection<'a> {
     turn_id: &'a str,
+    trap: crate::bash::TrapLevel,
     cwd: &'a str,
     git_worktree_root: Option<&'a str>,
     prompt: &'a PersistedUserContent,
@@ -3544,7 +3593,15 @@ struct TurnProjection<'a> {
 
 fn queued_prompt_records(
     journal: &Journal,
-) -> HashMap<&str, (&str, Option<&str>, &PersistedUserContent)> {
+) -> HashMap<
+    &str,
+    (
+        &str,
+        Option<&str>,
+        &PersistedUserContent,
+        crate::bash::TrapLevel,
+    ),
+> {
     journal
         .events
         .iter()
@@ -3552,11 +3609,12 @@ fn queued_prompt_records(
             Event::PromptQueued {
                 prompt_id,
                 cwd,
+                trap,
                 git_worktree_root,
                 prompt,
             } => Some((
                 prompt_id.as_str(),
-                (cwd.as_str(), git_worktree_root.as_deref(), prompt),
+                (cwd.as_str(), git_worktree_root.as_deref(), prompt, *trap),
             )),
             _ => None,
         })
@@ -3565,13 +3623,22 @@ fn queued_prompt_records(
 
 fn project_turn<'a>(
     event: &'a Event,
-    prompts: &HashMap<&str, (&'a str, Option<&'a str>, &'a PersistedUserContent)>,
+    prompts: &HashMap<
+        &str,
+        (
+            &'a str,
+            Option<&'a str>,
+            &'a PersistedUserContent,
+            crate::bash::TrapLevel,
+        ),
+    >,
 ) -> Option<TurnProjection<'a>> {
     match event {
         Event::PromptMaterialized { prompt_id, turn_id } => {
-            let (cwd, git_worktree_root, prompt) = prompts.get(prompt_id.as_str())?;
+            let (cwd, git_worktree_root, prompt, trap) = prompts.get(prompt_id.as_str())?;
             Some(TurnProjection {
                 turn_id,
+                trap: *trap,
                 cwd,
                 git_worktree_root: *git_worktree_root,
                 prompt,
@@ -3582,12 +3649,14 @@ fn project_turn<'a>(
             turn_id,
             cwd,
             prompt,
+            trap,
             trigger,
             mode,
             before_context_tokens,
             before_context_window,
         } => Some(TurnProjection {
             turn_id,
+            trap: *trap,
             cwd,
             git_worktree_root: None,
             prompt,
@@ -4173,6 +4242,7 @@ mod tests {
                 ("target".into(), provider(target_key)),
             ]),
             output: Default::default(),
+            trap: crate::bash::TrapLevel::Off,
             auto_resume: false,
             soft_interrupt: crate::config::bundled_test_default("/soft_interrupt"),
             compaction: CompactionConfig::default(),
@@ -4255,8 +4325,18 @@ mod tests {
             .append_test_agent_exchange(&session.id, "source/model", "completed", 100)
             .unwrap();
         store
-            .queue_prompt(&session.id, "/other", Some("/repo"), &"12345678".into())
+            .queue_prompt(
+                &session.id,
+                "/other",
+                Some("/repo"),
+                &"12345678".into(),
+                crate::bash::TrapLevel::All,
+            )
             .unwrap();
+        assert_eq!(
+            store.pending_trap_level(&session.id).unwrap(),
+            crate::bash::TrapLevel::All
+        );
         let config = context_test_config(Some("shared"), Some("shared"));
         let target = crate::models::resolve_model_ref(&config, "target/model").unwrap();
 
@@ -4532,7 +4612,13 @@ mod tests {
             .start_turn(&session.id, "/tmp", None, &"test".into())
             .unwrap();
         store
-            .queue_prompt(&session.id, "/other", Some("/repo"), &"queued".into())
+            .queue_prompt(
+                &session.id,
+                "/other",
+                Some("/repo"),
+                &"queued".into(),
+                crate::bash::TrapLevel::Destructive,
+            )
             .unwrap();
         let source_turn_id = store
             .start_compaction_turn(
@@ -4540,6 +4626,7 @@ mod tests {
                 CompactionStart {
                     cwd: "/tmp",
                     prompt: &"compact".into(),
+                    trap: crate::bash::TrapLevel::Reversible,
                     trigger: CompactionTrigger::Manual,
                     mode: CompactionMode::AwaitUser,
                     before_context_tokens: 100,
@@ -4547,6 +4634,10 @@ mod tests {
                 },
             )
             .unwrap();
+        assert_eq!(
+            store.pending_trap_level(&session.id).unwrap(),
+            crate::bash::TrapLevel::Reversible
+        );
         let exchange = store
             .start_test_provider_request(&session.id, &source_turn_id)
             .unwrap();
@@ -5581,6 +5672,7 @@ mod tests {
                 CompactionStart {
                     cwd: "/tmp",
                     prompt: &"checkpoint".into(),
+                    trap: crate::bash::TrapLevel::Destructive,
                     trigger: CompactionTrigger::Manual,
                     mode: CompactionMode::AwaitUser,
                     before_context_tokens: 100,
@@ -5741,6 +5833,7 @@ mod tests {
                 CompactionStart {
                     cwd: "/work",
                     prompt: &"checkpoint prompt".into(),
+                    trap: crate::bash::TrapLevel::Destructive,
                     trigger: CompactionTrigger::Manual,
                     mode: CompactionMode::AwaitUser,
                     before_context_tokens: 1_700,
@@ -5750,7 +5843,13 @@ mod tests {
             .unwrap();
         assert!(
             store
-                .queue_prompt(&session.id, "/work", None, &"too early".into())
+                .queue_prompt(
+                    &session.id,
+                    "/work",
+                    None,
+                    &"too early".into(),
+                    crate::bash::TrapLevel::Destructive,
+                )
                 .is_err()
         );
         let summary_exchange = store
@@ -5938,6 +6037,7 @@ mod tests {
                 CompactionStart {
                     cwd: "/work",
                     prompt: &"checkpoint prompt".into(),
+                    trap: crate::bash::TrapLevel::Destructive,
                     trigger: CompactionTrigger::Hard,
                     mode: CompactionMode::ContinueTurn,
                     before_context_tokens: 1_700,

@@ -93,7 +93,8 @@ runs against the current Mu session and shell state.
 
 Type `/` to list prompt-mode commands. The common ones:
 
-- `/new` starts a new session while keeping the current model and attachments.
+- `/new` starts a new session while keeping the current model, trap level, and
+  attachments.
 - `/load [<session-id>]` renders an existing session's transcript and attaches
   the shell to it for later turns. Without an id, it loads the active scope's
   last selected session. It uses the current output density.
@@ -102,6 +103,8 @@ Type `/` to list prompt-mode commands. The common ones:
   variants; type an effort prefix directly, or press Enter to select the model
   without an effort. In zsh, recognized efforts are ordered from `minimal`
   through `max`.
+- `/trap <off|destructive|reversible|all>` persistently selects the Bash trap
+  level for this shell scope. `/trap default` returns to configuration.
 - `/attach <file>` adds an image or audio file to the next turn.
 - `/retry` resumes a turn interrupted by Ctrl-C, a crash, a lost connection, or
   exhausted automatic resume attempts.
@@ -246,6 +249,8 @@ messages, and exits. A few ideas follow from that:
   automatic context compaction, optional automatic response resumption, and
   interrupted-turn recovery.
 - Four output densities with automatic interactive-terminal rendering.
+- Deterministic Bash trapping, defaulting to commands declared destructive,
+  with durable retry before execution.
 - Image and audio attachments from the CLI and both shell prompt modes.
 - Reusable prompt files, executable prompts, slash commands, project/user
   instructions, and conditionally available skills.
@@ -404,6 +409,14 @@ width, while compact tool and status rows are ellipsized to it. This never
 changes redirected, final, persisted, or model-visible text. In interactive
 concise output, Markdown links show only their labels while remaining clickable;
 detail and full output also show the full destination URL.
+
+Setting `"trap": "destructive"` controls which declared Bash risks stop before
+execution. `reversible` also traps reversible calls, `all` traps every call,
+and `off` disables trapping. The selected policy is persisted with the turn;
+`mu retry --trap off` can run the exact pending claim without rewriting that
+policy. A trap always prints the complete command and stdin, even under
+`--output final`, and exits with status 3. Risk labels are supplied by the
+model, so trapping is not a sandbox or security boundary.
 
 Setting `"auto_resume": true` automatically continues provider responses that
 Mu classifies as resumable while preserving the problematic assistant message.

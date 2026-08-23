@@ -18,6 +18,7 @@ set -g _MU_FISH_MODE shell
 set -g _MU_FISH_TRACKED_SCOPE
 set -q MU_FISH_SESSION_ID; or set -g MU_FISH_SESSION_ID
 set -g _MU_FISH_MODEL
+set -g _MU_FISH_TRAP
 set -g _MU_FISH_PENDING_ATTACHMENTS
 set -g _MU_FISH_SAVED_BIND_MODE default
 set -q _MU_FISH_DEFAULT_TAB_BINDING; or set -g _MU_FISH_DEFAULT_TAB_BINDING
@@ -112,9 +113,14 @@ function _mu_fish_clear_model_state
     set -g _MU_FISH_MODEL
 end
 
+function _mu_fish_clear_trap_state
+    set -g _MU_FISH_TRAP
+end
+
 function _mu_fish_clear_tracked_state
     _mu_fish_clear_session_state
     _mu_fish_clear_model_state
+    _mu_fish_clear_trap_state
     set -g _MU_FISH_PENDING_ATTACHMENTS
     set -g _MU_FISH_TRACKED_SCOPE
 end
@@ -193,6 +199,7 @@ function _mu_fish_base_command --argument-names requested_scope
     if _mu_fish_bundle_active "$scope"
         set -q MU_FISH_SESSION_ID[1]; and test -n "$MU_FISH_SESSION_ID"; and printf '%s\n' -s "$MU_FISH_SESSION_ID"
         set -q _MU_FISH_MODEL[1]; and test -n "$_MU_FISH_MODEL"; and printf '%s\n' --model "$_MU_FISH_MODEL"
+        set -q _MU_FISH_TRAP[1]; and test -n "$_MU_FISH_TRAP"; and printf '%s\n' --trap "$_MU_FISH_TRAP"
     end
     return 0
 end
@@ -357,6 +364,13 @@ function _mu_fish_build_mode_prompt
         set_color normal
     end
 
+    if test $bundle_active -eq 1; and set -q _MU_FISH_TRAP[1]; and test -n "$_MU_FISH_TRAP"
+        printf ' '
+        set_color yellow
+        printf '[trap:%s]' "$_MU_FISH_TRAP"
+        set_color normal
+    end
+
     printf '\nmu> '
 end
 
@@ -418,7 +432,7 @@ function _mu_fish_has_custom_slash_command --argument-names requested_command
 end
 
 function _mu_fish_slash_command_candidates
-    printf '%s\n' /attach /load /model
+    printf '%s\n' /attach /load /model /trap
     _mu_fish_has_active_session; and printf '%s\n' /new /retry /compact
     _mu_fish_custom_slash_commands 2>/dev/null
 end
@@ -709,6 +723,24 @@ function _mu_fish_run_slash_command --argument-names line
             set -g _MU_FISH_MODEL "$resolved_model"
             _mu_fish_print_block_message "[mu] next turns in this scope will use $resolved_model"
 
+        case /trap
+            if test -z "$rest"
+                _mu_fish_print_block_message '[mu] usage: /trap <off|destructive|reversible|all|default>'
+                return 1
+            end
+            if string match -qr '[[:space:]]' -- "$rest"; or not contains -- "$rest" off destructive reversible all default
+                _mu_fish_print_block_message "[mu] invalid trap level: $rest"
+                return 1
+            end
+            _mu_fish_activate_scope "$scope"
+            if test "$rest" = default
+                set -g _MU_FISH_TRAP
+                _mu_fish_print_block_message '[mu] next turns in this scope will use the configured trap level'
+            else
+                set -g _MU_FISH_TRAP "$rest"
+                _mu_fish_print_block_message "[mu] next turns in this scope will use trap $rest"
+            end
+
         case /load
             if string match -qr '[[:space:]]' -- "$rest"
                 _mu_fish_print_block_message '[mu] /load accepts exactly one session id'
@@ -742,6 +774,7 @@ function _mu_fish_run_slash_command --argument-names line
             _mu_fish_require_active_session /retry; or return 1
             set -l retry_command mu retry -s "$MU_FISH_SESSION_ID"
             set -q _MU_FISH_MODEL[1]; and test -n "$_MU_FISH_MODEL"; and set -a retry_command --model "$_MU_FISH_MODEL"
+            set -q _MU_FISH_TRAP[1]; and test -n "$_MU_FISH_TRAP"; and set -a retry_command --trap "$_MU_FISH_TRAP"
             $retry_command
             set exit_status $status
 
@@ -749,6 +782,7 @@ function _mu_fish_run_slash_command --argument-names line
             _mu_fish_activate_scope "$scope"
             _mu_fish_require_active_session /compact; or return 1
             set -l compact_command mu compact --session "$MU_FISH_SESSION_ID"
+            set -q _MU_FISH_TRAP[1]; and test -n "$_MU_FISH_TRAP"; and set -a compact_command --trap "$_MU_FISH_TRAP"
             if test -n "$instruction"
                 printf '%s' "$instruction" | $compact_command
                 set exit_status $pipestatus[2]
@@ -883,6 +917,12 @@ function _mu_fish_complete_slash
                 commandline -f complete
             end
         end
+        return
+    end
+
+    if string match -q '/trap *' -- "$left"
+        set -l fragment (string replace -r '^/trap ' '' -- "$left")
+        _mu_fish_complete_values '/trap ' "$fragment" '' off destructive reversible all default
         return
     end
 

@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::task::JoinHandle;
 
@@ -264,6 +264,41 @@ impl BashRisk {
             Self::Reversible => "reversible",
             Self::Destructive => "destructive",
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, clap::ValueEnum)]
+#[serde(rename_all = "lowercase")]
+pub enum TrapLevel {
+    Off,
+    Destructive,
+    Reversible,
+    All,
+}
+
+impl TrapLevel {
+    pub fn traps(self, risk: BashRisk) -> bool {
+        match self {
+            Self::Off => false,
+            Self::Destructive => risk == BashRisk::Destructive,
+            Self::Reversible => risk != BashRisk::Readonly,
+            Self::All => true,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Destructive => "destructive",
+            Self::Reversible => "reversible",
+            Self::All => "all",
+        }
+    }
+}
+
+impl fmt::Display for TrapLevel {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
     }
 }
 
@@ -998,6 +1033,18 @@ mod tests {
     use crate::config::{CompactionConfig, Config, LimitsConfig, ProviderConfig, RedactionConfig};
     use crate::redaction::SecretRedactor;
     use crate::renderer::Renderer;
+
+    #[test]
+    fn trap_levels_match_declared_risk_thresholds() {
+        assert!(!crate::bash::TrapLevel::Off.traps(BashRisk::Destructive));
+        assert!(crate::bash::TrapLevel::Destructive.traps(BashRisk::Destructive));
+        assert!(!crate::bash::TrapLevel::Destructive.traps(BashRisk::Reversible));
+        assert!(crate::bash::TrapLevel::Reversible.traps(BashRisk::Reversible));
+        assert!(crate::bash::TrapLevel::Reversible.traps(BashRisk::Destructive));
+        assert!(!crate::bash::TrapLevel::Reversible.traps(BashRisk::Readonly));
+        assert!(crate::bash::TrapLevel::All.traps(BashRisk::Readonly));
+    }
+
     fn args(command: &str) -> BashArgs {
         BashArgs {
             title: "test".into(),
@@ -1041,6 +1088,7 @@ mod tests {
                 },
             )]),
             output: Default::default(),
+            trap: crate::bash::TrapLevel::Off,
             auto_resume: false,
             soft_interrupt: crate::config::bundled_test_default("/soft_interrupt"),
             compaction: CompactionConfig::default(),

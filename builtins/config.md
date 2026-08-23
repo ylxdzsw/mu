@@ -56,6 +56,7 @@ Complete shape, with default values where applicable:
 ```jsonc
 {
   "output": "concise",            // final | concise | detail | full
+  "trap": "destructive",          // off | destructive | reversible | all
   "auto_resume": false,           // continue replayable incomplete responses
   "soft_interrupt": true,         // Ctrl+\\ finishes active work, leaves pending calls, then stops
   "providers": {
@@ -97,6 +98,10 @@ percent-encoded as the authority:
 ignores DNS and proxy configuration. Without `context_window`, percentage
 reporting and proactive compaction are unavailable. `output` is overridden by
 CLI `--output`.
+`trap` is the default Bash trapping level for new user and compaction turns.
+`destructive` traps only claims declared destructive, `reversible` also traps
+reversible claims, `all` traps every Bash claim, and `off` traps none. Declared
+risk is model-supplied advisory metadata, not a security boundary.
 `auto_resume` preserves provider responses classified as resumable and
 continues the same turn with a derived user `Continue` message. Attempts share
 the provider retry quota. Exhaustion advances a floating provider candidate;

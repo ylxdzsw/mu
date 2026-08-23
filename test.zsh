@@ -361,6 +361,10 @@ status_json=$(_mu_zsh_status_json)
 MU_ZSH_SESSION_ID=abc123
 _mu_zsh_base_command _MU_ZSH_TEST_COMMAND_REPLY
 assert_command_reply "builds attached pending-model command" mu -s abc123 --model openai/gpt
+_MU_ZSH_TRAP=all
+_mu_zsh_base_command _MU_ZSH_TEST_COMMAND_REPLY
+assert_command_reply "builds attached trap command" mu -s abc123 --model openai/gpt --trap all
+_MU_ZSH_TRAP=
 _mu_zsh_clear_model_state
 _mu_zsh_clear_session_state
 
@@ -381,23 +385,23 @@ path=("$prompt_fake_bin" $path)
 MU_ZSH_SESSION_ID=
 _MU_ZSH_TRACKED_SCOPE=
 command_candidates=("${(@f)$(_mu_zsh_slash_command_candidates)}")
-[[ "${(j:,:)command_candidates}" == "/attach,/load,/model,/review.md" ]] || fail "hides session commands without a valid session"
+[[ "${(j:,:)command_candidates}" == "/attach,/load,/model,/trap,/review.md" ]] || fail "hides session commands without a valid session"
 MU_ZSH_SESSION_ID=tracked-session
 _MU_ZSH_TRACKED_SCOPE=$(current_scope_key)
 command_candidates=("${(@f)$(_mu_zsh_slash_command_candidates)}")
-[[ "${(j:,:)command_candidates}" == "/attach,/load,/model,/new,/retry,/compact,/review.md" ]] || fail "shows session commands with a valid session: ${(j:,:)command_candidates}"
+[[ "${(j:,:)command_candidates}" == "/attach,/load,/model,/trap,/new,/retry,/compact,/review.md" ]] || fail "shows session commands with a valid session: ${(j:,:)command_candidates}"
 BUFFER="/ret"
 CURSOR=${#BUFFER}
 completion_candidates=("${(@f)$(_mu_zsh_completion_candidates)}")
-[[ "${(j:,:)completion_candidates}" == "/attach,/load,/model,/new,/retry,/compact,/review.md" ]] || fail "offers zsh the complete slash-command set: ${(j:,:)completion_candidates}"
+[[ "${(j:,:)completion_candidates}" == "/attach,/load,/model,/trap,/new,/retry,/compact,/review.md" ]] || fail "offers zsh the complete slash-command set: ${(j:,:)completion_candidates}"
 BUFFER="/M"
 CURSOR=${#BUFFER}
 completion_candidates=("${(@f)$(_mu_zsh_completion_candidates)}")
-[[ "${(j:,:)completion_candidates}" == "/attach,/load,/model,/new,/retry,/compact,/review.md" ]] || fail "leaves case matching to zsh: ${(j:,:)completion_candidates}"
+[[ "${(j:,:)completion_candidates}" == "/attach,/load,/model,/trap,/new,/retry,/compact,/review.md" ]] || fail "leaves case matching to zsh: ${(j:,:)completion_candidates}"
 BUFFER="/unknown"
 CURSOR=${#BUFFER}
 completion_candidates=("${(@f)$(_mu_zsh_completion_candidates)}")
-[[ "${(j:,:)completion_candidates}" == "/attach,/load,/model,/new,/retry,/compact,/review.md" ]] || fail "keeps freeform slash input advisory: ${(j:,:)completion_candidates}"
+[[ "${(j:,:)completion_candidates}" == "/attach,/load,/model,/trap,/new,/retry,/compact,/review.md" ]] || fail "keeps freeform slash input advisory: ${(j:,:)completion_candidates}"
 model_candidates=("${(@f)$(_mu_zsh_model_completion_candidates "")}")
 [[ " ${(j: :)model_candidates} " == *" openai/gpt "* ]] || fail "offers provider-qualified model"
 [[ " ${(j: :)model_candidates} " == *" gpt "* ]] || fail "offers unique unqualified model"
@@ -584,6 +588,13 @@ _mu_zsh_run_slash_command "/model gpt"
 [[ "$_MU_ZSH_TRACKED_SCOPE" == "$(current_scope_key)" ]] || fail "model slash command records scope"
 if _mu_zsh_run_slash_command "/model invalid/model"; then
   fail "model slash command should validate model refs"
+fi
+_mu_zsh_run_slash_command "/trap reversible"
+[[ "$_MU_ZSH_TRAP" == reversible ]] || fail "trap slash command records persistent level"
+_mu_zsh_run_slash_command "/trap default"
+[[ -z "$_MU_ZSH_TRAP" ]] || fail "trap default clears the shell override"
+if _mu_zsh_run_slash_command "/trap readonly"; then
+  fail "trap slash command should reject the removed readonly spelling"
 fi
 _mu_zsh_clear_model_state
 _mu_zsh_clear_session_state

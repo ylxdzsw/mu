@@ -150,10 +150,40 @@ terminal. Removed names are rejected rather than kept as aliases.
 ### 2.7 Unsandboxed execution
 
 **Decision.** Bash runs with the invoking user's permissions. Declared risk is
-advisory metadata and does not constrain execution.
+advisory metadata used by trapping, not a sandbox or security boundary.
 
 This matches Mu's role as a transparent terminal agent. A partial sandbox would
 create misleading assurance while breaking ordinary shell workflows.
+
+### 2.8 Deterministic trapping
+
+**Decision.** Every turn persists a Bash trap level: `off`, `destructive`,
+`reversible`, or `all`. The bundled default is `destructive`. A matching claim
+ends the invocation before `bash_started`; it creates no tool result or trap
+event and remains pending for retry.
+
+The levels mean:
+
+- `off` traps no valid claim;
+- `destructive` traps only claims declared destructive;
+- `reversible` traps claims declared reversible or destructive;
+- `all` traps every valid Bash claim.
+
+For a new user or manual-compaction turn, explicit `--trap` wins over merged
+project/global configuration, which in turn wins over the bundled default. The
+selected base level is stored with the turn. Automatic compaction inherits its
+parent turn's stored base level.
+
+The model supplies `risk`, so a mislabeled command can bypass trapping.
+`mu retry --trap <level>` overrides the stored level for that invocation
+without rewriting it. The override also governs compaction and continuation
+within that invocation, while any automatically created compaction still
+persists the inherited base level.
+
+Mu evaluates valid claims in provider order. Allowed predecessors may finish;
+the first matching claim and every later sibling remain unstarted and pending.
+A trapped compaction remains an ordinary incomplete compaction recoverable
+through `mu retry`.
 
 Rejected and deferred safety alternatives are recorded in §12.
 
@@ -204,7 +234,7 @@ One normal turn follows this sequence:
    otherwise resolve the prior interrupted tail as superseded without
    executing its pending calls.
 6. Durably queue the submitted prompt, working directory, Git worktree root,
-   and attachment references. Only then select the session as
+   trap level, and attachment references. Only then select the session as
    `current-session`.
 7. Build the candidate semantic provider context. If it exceeds the soft
    threshold, complete an out-of-turn compaction before materializing the
@@ -216,8 +246,9 @@ One normal turn follows this sequence:
      of semantic history;
    - on success, persist the completed native response and ordered semantic
      assistant projection before executing any Bash call;
-   - before every Bash attempt, durably persist `bash_started`, then execute
-     accepted claims and persist results in provider order;
+   - before every Bash attempt, apply the effective trap level; a match ends
+     the invocation without a start, otherwise durably persist `bash_started`,
+     execute the claim, and persist its result in provider order;
    - after an interruption, resume never-started and readonly claims before
      requesting the provider again;
    - stop on a completed assistant response.
@@ -231,6 +262,7 @@ content, never speculative execution.
 Contiguous `risk:"readonly"` calls may execute concurrently. Their display,
 journal records, tool-result messages, and next provider request retain the
 provider's original call order. Any other call is an ordering barrier.
+Trapping is checked before forming or starting an eligible concurrent batch.
 
 ### 3.2 Interruption
 
@@ -253,6 +285,13 @@ interrupted result instead. A new prompt redirects the work: it never executes
 old pending claims, resolving started claims as interrupted and never-started
 claims as superseded before appending the new prompt.
 
+A trapped claim follows the same incomplete-turn path. Retry reapplies the
+stored trap level before provider contact; an explicit `--trap` may loosen it.
+Retry under the same level immediately stops on and redisplays the same claim.
+After a looser retry succeeds, semantic history contains the original claim
+and its eventual result as though no trap occurred. A new prompt supersedes
+the unstarted claim rather than approving or executing it.
+
 ---
 
 ## 4. Tools
@@ -271,7 +310,8 @@ bash({
 ```
 
 - `title` is concise human-facing action text.
-- `risk` is advisory audit/UI metadata. It does not constrain the process.
+- `risk` is advisory audit/UI metadata used by trapping. It does not change
+  process permissions or provide confinement.
 - `command` runs as `bash -lc`.
 - `cwd` applies to this call only. Calls do not share `cd`, shell variables, or
   exported environment changes.
@@ -343,7 +383,7 @@ Output density changes presentation, not agent behavior:
 
 | Mode | Contract |
 |---|---|
-| `final` | Buffer the turn and write only the final assistant text on success, without an added newline. On unrecovered failure, write `error: ...\n` and exit nonzero. |
+| `final` | Buffer the turn and write only the final assistant text on success, without an added newline. On unrecovered failure, write `error: ...\n` and exit nonzero. A trapped call is the sole tool-presentation exception. |
 | `concise` | Stream assistant text and notices; reduce each Bash call to one committed outcome line. Reasoning progress is ephemeral. |
 | `detail` | Normal human transcript: thought status, tool headers, bounded output previews, exits, and turn summary. |
 | `full` | Expose available reasoning/summary text and complete redacted tool presentation. Model-context truncation still applies. |
@@ -368,6 +408,19 @@ no configuration supplied a value.
 Assistant text, tool presentation, tool failures, and Bash output go to stdout.
 Fatal process diagnostics and the normal `detail`/`full` summary go to stderr.
 The summary is shown only for a successful turn when stderr is a terminal.
+
+A trapped call always exposes its complete title, declared risk, command,
+effective cwd, and stdin on stdout in every output mode. It bypasses width,
+preview, stdin-summary, and Bash-output limits, then reports that execution did
+not start. It emits no final assistant answer or duplicate generic error.
+Complete commands and stdin can therefore enter redirected logs even under
+`--output final`.
+
+When trapping is enabled, the streaming renderer withholds a Bash header until
+the complete risk field is known. An allowed call then resumes ordinary
+streaming. A matching call stays buffered until its complete accepted
+arguments are durable, so no partial or compact header precedes the forced
+full block.
 
 Top-level interactive transcript blocks have exactly one empty line between
 them. The shell integration owns spacing between the submitted `mu>` prompt and
@@ -418,6 +471,7 @@ The plugins provide the same product contract:
 - Shift+Enter inserts a newline when the terminal provides a distinguishable
   key sequence.
 - Slash commands and model names use native shell completion.
+- Trap completion offers the four levels and the shell-only `default` action.
 
 The plugins never implement provider, store, tool, retry, or compaction
 semantics.
@@ -429,6 +483,7 @@ Each shell integration tracks one in-memory bundle:
 - active scope;
 - optional session id;
 - optional sticky model override;
+- optional sticky trap override;
 - staged attachments.
 
 Changing directory temporarily masks a bundle from another scope. A submitted
@@ -442,11 +497,13 @@ turn, then passes that id explicitly. `MU_ZSH_SESSION_ID` or
 
 ### 6.2 Slash behavior
 
-- `/new` clears the session id but preserves the shell model override and
+- `/new` clears the session id but preserves shell model/trap overrides and
   staged attachments.
 - `/load [<id>]` replays a session and attaches only after successful replay.
   Without an id, it selects the active scope's persisted `current-session`.
 - `/model <ref>` stores a shell-only override for later turns and retries.
+- `/trap <off|destructive|reversible|all>` stores a shell-only override for
+  later turns, retries, and compaction. `/trap default` clears it.
 - `/attach <file>` stages a readable attachment; `/attach` lists and
   `/attach --clear` discards the queue. The next ordinary prompt or custom
   command consumes the queue.
@@ -458,6 +515,10 @@ turn, then passes that id explicitly. `MU_ZSH_SESSION_ID` or
 
 Unknown or malformed slash input does not activate a new scope or mutate the
 bundle.
+
+An active trap override is shown in the Mu prompt and included in replayable
+shell history. It becomes the persisted base level for a new prompt or manual
+compaction, but remains an invocation-only override when passed to `/retry`.
 
 zsh requires `jq` and supports native ZLE completion/hooks. Fish integration
 requires Fish 4 and wraps the user's prompt and editing bindings without
@@ -682,7 +743,7 @@ silently merge into an existing one.
 [`src/default_config.jsonc`](src/default_config.jsonc) is the source of truth
 for field defaults. The durable field groups are:
 
-- `output`, `auto_resume`, and `soft_interrupt`;
+- `output`, `trap`, `auto_resume`, and `soft_interrupt`;
 - ordered `providers`, each with `endpoint`, optional `api_key_env`, and
   ordered `models`;
 - per-model `context_window`, optional `supported_efforts`, and optional
@@ -693,6 +754,8 @@ for field defaults. The durable field groups are:
 - `redaction`.
 
 Unknown output names and removed aliases are configuration errors.
+The removed `guardrail` object is rejected with a focused diagnostic; it is not
+a trapping alias.
 
 ### 10.1 Environment overlay and redaction
 
@@ -763,8 +826,8 @@ Management commands:
 | `mu status` | Report resolved scope, selection, model, context, and optional expensive indexes. |
 | `mu context` | Show the system prompt Mu would assemble; `--export` emits user instructions and non-built-in skill guidance for a foreign agent. |
 | `mu cat` | Resolve and preview exact prompt input without provider contact or session creation. |
-| `mu retry` | Recover and continue an interrupted turn without a new prompt, including pending Bash claims; a clean session reports a no-op. |
-| `mu compact` | Force compaction with configured or explicit output density, optionally using non-terminal stdin as a focus instruction. |
+| `mu retry` | Recover and continue an interrupted turn without a new prompt, including pending Bash claims; `--trap` overrides its stored policy for this invocation; a clean session reports a no-op. |
+| `mu compact` | Force compaction with configured or explicit output density and trap level, optionally using non-terminal stdin as a focus instruction. |
 
 Provider-free management commands do not contact a provider.
 
@@ -789,11 +852,11 @@ The durable event model is:
 
 - **`system_prompt`** — exact initial model-visible prompt.
 - **`prompt_queued`** — submitted prompt, working directory, Git worktree root,
-  and attachment references.
+  trap level, and attachment references.
 - **`prompt_materialized`** — binds one queued prompt to a user turn without
   copying its content.
 - **`compaction_started`** — binds one synthetic compaction turn to its prompt,
-  trigger, mode, and before-context measurements.
+  trap level, trigger, mode, and before-context measurements.
 - **`provider_requested`** — resolved provider/model origin and a checksummed
   recipe sufficient to reconstruct the native request. Its event sequence is
   the request's context boundary.
@@ -857,6 +920,13 @@ start was therefore definitely not attempted. A start with no result means the
 claim may have executed; a crash can land between the durable start and the
 actual spawn, and recovery deliberately accepts that conservative false
 positive.
+
+Trapping is invocation control, not a journal event or semantic Bash result.
+While a claim is pending, transcript replay shows the ordinary unresolved
+claim. If it is later started, the journal retains no historical indication
+that an earlier invocation trapped it. A crash before an otherwise ordinary
+start is likewise indistinguishable from a trap, but in both cases the claim
+was not attempted.
 
 Before retry, Mu appends interruption outcomes for unmatched provider requests.
 Never-started claims remain pending. A started unresolved readonly claim also
@@ -1004,6 +1074,7 @@ Exit status:
 - `0`: success, including a clean `mu retry` no-op;
 - `1`: general, configuration, or unrecovered provider error;
 - `2`: session busy or explicit session not found;
+- `3`: Bash command trapped before execution;
 - `128 + signal`: forwarded terminating signal, commonly 130 for SIGINT and
   143 for SIGTERM.
 
@@ -1020,6 +1091,7 @@ improve visibility and recovery; they do not make execution safe.
 
 Durable safeguards are:
 
+- deterministic pre-start trapping based on the model-declared risk;
 - append-only visibility of accepted assistant actions and captured results;
 - foreground interruptibility and process-group termination;
 - output bounds and exact-value redaction for configured environment values;

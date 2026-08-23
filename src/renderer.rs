@@ -721,6 +721,62 @@ impl Renderer {
         Ok(true)
     }
 
+    pub fn trapped_bash(
+        &mut self,
+        args: &serde_json::Value,
+        trap: crate::bash::TrapLevel,
+    ) -> io::Result<()> {
+        self.assistant_end()?;
+        self.end_reasoning_run()?;
+        self.clear_live_line()?;
+        self.live_line = None;
+        self.concise_tool = None;
+        self.bash_preview = None;
+        self.ensure_block_separator_if_needed()?;
+
+        let title = args
+            .get("title")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default();
+        let risk = args
+            .get("risk")
+            .and_then(|value| value.as_str())
+            .unwrap_or("unknown");
+        let command = args
+            .get("command")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default();
+        let base = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let cwd = args
+            .get("cwd")
+            .and_then(|value| value.as_str())
+            .map(PathBuf::from)
+            .map(|cwd| {
+                if cwd.is_absolute() {
+                    cwd
+                } else {
+                    base.join(cwd)
+                }
+            })
+            .unwrap_or(base);
+        let cwd = std::fs::canonicalize(&cwd).unwrap_or(cwd);
+
+        self.write_stdout_committed(&format!("# {title}\n$ [{risk}] {command}"))?;
+        if !command.ends_with('\n') {
+            self.write_stdout_committed("\n")?;
+        }
+        self.write_stdout_committed(&format!("@ {}\n", cwd.display()))?;
+        if let Some(stdin) = args.get("stdin").and_then(|value| value.as_str()) {
+            self.write_stdout_committed(&format!("< {stdin}"))?;
+            if !stdin.ends_with('\n') {
+                self.write_stdout_committed("\n")?;
+            }
+        }
+        self.write_stdout_committed(&format!(
+            "⊘ trapped before execution · declared {risk}, trap {trap}\n"
+        ))
+    }
+
     pub fn bash_header_cwd_line(&mut self, raw_cwd: &str) -> io::Result<()> {
         if self.format == OutputFormat::Final || !should_render_bash_cwd(raw_cwd) {
             return Ok(());
@@ -4281,6 +4337,36 @@ mod tests {
     use super::*;
     use serde_json::json;
     use unicode_width::UnicodeWidthChar;
+
+    #[test]
+    fn trapped_bash_is_complete_in_every_output_format() {
+        let command = format!("printf first\nprintf '{}'", "x".repeat(200));
+        let stdin = format!("line one\n{}", "y".repeat(200));
+        let args = json!({
+            "title": "Dangerous operation",
+            "risk": "destructive",
+            "command": command,
+            "cwd": "relative/path",
+            "stdin": stdin,
+        });
+        for format in [
+            OutputFormat::Final,
+            OutputFormat::Concise,
+            OutputFormat::Detail,
+            OutputFormat::Full,
+        ] {
+            let (mut renderer, stdout, stderr) =
+                Renderer::with_test_output(format, false, false, None);
+            renderer
+                .trapped_bash(&args, crate::bash::TrapLevel::Destructive)
+                .unwrap();
+            let output = stdout.transcript();
+            assert!(output.contains(&command), "{format:?}: {output:?}");
+            assert!(output.contains(&stdin), "{format:?}: {output:?}");
+            assert!(output.contains("⊘ trapped before execution"));
+            assert_eq!(stderr.transcript(), "");
+        }
+    }
 
     #[test]
     fn markdown_renderer_bounds_complete_grid_to_terminal_width() {

@@ -175,6 +175,7 @@ fn parse_double_quoted_env_value(source: &str) -> std::result::Result<String, &'
 pub struct Config {
     pub providers: OrderedMap<ProviderConfig>,
     pub output: OutputFormat,
+    pub trap: crate::bash::TrapLevel,
     pub auto_resume: bool,
     pub soft_interrupt: bool,
     pub compaction: CompactionConfig,
@@ -759,6 +760,7 @@ mod tests {
                 },
             )]),
             output: OutputFormat::Detail,
+            trap: bundled_test_default("/trap"),
             auto_resume: false,
             soft_interrupt: bundled_test_default("/soft_interrupt"),
             compaction: CompactionConfig::default(),
@@ -853,6 +855,25 @@ mod tests {
 
         let config = config_from_value(value).unwrap();
         assert_eq!(config.output, OutputFormat::Concise);
+    }
+
+    #[test]
+    fn bundled_and_configured_trap_levels_are_valid() {
+        assert_eq!(
+            bundled_test_default::<crate::bash::TrapLevel>("/trap"),
+            crate::bash::TrapLevel::Destructive
+        );
+        let config = config_from_value(serde_json::json!({
+            "trap": "all",
+            "providers": {
+                "openai": {
+                    "endpoint": "http://localhost/chat/completions",
+                    "models": {"gpt-4o": {"context_window": 128000}}
+                }
+            }
+        }))
+        .unwrap();
+        assert_eq!(config.trap, crate::bash::TrapLevel::All);
     }
 
     #[test]

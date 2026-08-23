@@ -13,6 +13,7 @@ typeset -g _MU_ZSH_MODE=shell
 typeset -g _MU_ZSH_TRACKED_SCOPE=
 typeset -g MU_ZSH_SESSION_ID=${MU_ZSH_SESSION_ID:-}
 typeset -g _MU_ZSH_MODEL=
+typeset -g _MU_ZSH_TRAP=
 typeset -g _MU_ZSH_PENDING_INPUT=
 typeset -g _MU_ZSH_PENDING_PROMPT=
 typeset -g _MU_ZSH_SPECULATIVE_MODEL_BUFFER=
@@ -126,9 +127,14 @@ _mu_zsh_clear_model_state() {
   _MU_ZSH_MODEL=
 }
 
+_mu_zsh_clear_trap_state() {
+  _MU_ZSH_TRAP=
+}
+
 _mu_zsh_clear_tracked_state() {
   _mu_zsh_clear_session_state
   _mu_zsh_clear_model_state
+  _mu_zsh_clear_trap_state
   _MU_ZSH_PENDING_ATTACHMENTS=()
   _MU_ZSH_TRACKED_SCOPE=
 }
@@ -197,28 +203,32 @@ _mu_zsh_record_history() {
   local scope=${2:-}
   local session_id
   local model
+  local trap
   local quoted=${(qqq)input}
   if _mu_zsh_bundle_active "$scope"; then
     session_id=$MU_ZSH_SESSION_ID
     model=$_MU_ZSH_MODEL
+    trap=$_MU_ZSH_TRAP
   fi
 
   local attachments=
+  local trap_arg=
   local replay
   local attachment
   for attachment in "${_MU_ZSH_PENDING_ATTACHMENTS[@]}"; do
     attachments+=" -a ${(q)attachment}"
   done
+  [[ -n "$trap" ]] && trap_arg=" --trap ${(q)trap}"
   if [[ -n "$session_id" ]]; then
     if [[ -n "$model" ]]; then
-      replay="mu -s ${(q)session_id} --model ${(q)model}${attachments} <<< $quoted"
+      replay="mu -s ${(q)session_id} --model ${(q)model}${trap_arg}${attachments} <<< $quoted"
     else
-      replay="mu -s ${(q)session_id}${attachments} <<< $quoted"
+      replay="mu -s ${(q)session_id}${trap_arg}${attachments} <<< $quoted"
     fi
   elif [[ -n "$model" ]]; then
-    replay="mu --model ${(q)model}${attachments} <<< $quoted"
+    replay="mu --model ${(q)model}${trap_arg}${attachments} <<< $quoted"
   else
-    replay="mu${attachments} <<< $quoted"
+    replay="mu${trap_arg}${attachments} <<< $quoted"
   fi
   _mu_zsh_append_history "$input" "$replay"
 }
@@ -256,6 +266,7 @@ _mu_zsh_base_command() {
   if _mu_zsh_bundle_active "$scope"; then
     [[ -n "$MU_ZSH_SESSION_ID" ]] && built+=(-s "$MU_ZSH_SESSION_ID")
     [[ -n "$_MU_ZSH_MODEL" ]] && built+=(--model "$_MU_ZSH_MODEL")
+    [[ -n "$_MU_ZSH_TRAP" ]] && built+=(--trap "$_MU_ZSH_TRAP")
   fi
   set -A "$target" "${built[@]}"
   return 0
@@ -272,7 +283,7 @@ _mu_zsh_status_json() {
 }
 
 _mu_zsh_build_mode_prompt() {
-  local status_json model context_raw context context_source context_segment to_compact compaction_segment cwd project_root project_segment attachment_segment
+  local status_json model context_raw context context_source context_segment to_compact compaction_segment cwd project_root project_segment attachment_segment trap_segment
   local clean unclean_segment bundle_active=0 attachment_count=0
   local escaped_model escaped_context escaped_project_root escaped_unclean_text
 
@@ -333,6 +344,11 @@ _mu_zsh_build_mode_prompt() {
   else
     attachment_segment=
   fi
+  if (( bundle_active )) && [[ -n "$_MU_ZSH_TRAP" ]]; then
+    trap_segment=" %F{3}[trap:${_MU_ZSH_TRAP}]%f"
+  else
+    trap_segment=
+  fi
 
   # When the tracked session's last turn was interrupted (unclean), surface it
   # so the user knows they can /retry to resume or just type to redirect.
@@ -343,7 +359,7 @@ _mu_zsh_build_mode_prompt() {
     unclean_segment=
   fi
 
-  print -r -- "%F{12}${escaped_model}%f${context_segment}${compaction_segment} %F{6}${cwd}%f${project_segment}${unclean_segment}${attachment_segment}
+  print -r -- "%F{12}${escaped_model}%f${context_segment}${compaction_segment} %F{6}${cwd}%f${project_segment}${unclean_segment}${attachment_segment}${trap_segment}
 mu> "
 }
 
@@ -396,7 +412,7 @@ _mu_zsh_reset_mode_prompt() {
 _mu_zsh_slash_command_candidates() {
   local -a commands
 
-  commands=(/attach /load /model)
+  commands=(/attach /load /model /trap)
   _mu_zsh_bundle_active && [[ -n "$MU_ZSH_SESSION_ID" ]] && commands+=(/new /retry /compact)
   commands+=("${(@f)$(_mu_zsh_custom_slash_commands 2>/dev/null || true)}")
 
@@ -561,6 +577,12 @@ _mu_zsh_slash_completion_context() {
     return
   fi
 
+  if [[ "$left" == "/trap "* ]]; then
+    left=${left#"/trap "}
+    [[ "$left" != *[[:space:]]* ]]
+    return
+  fi
+
   [[ "$left" == "/attach "* ]] && return 0
 
   [[ "$left" != *[[:space:]]* ]]
@@ -575,6 +597,13 @@ _mu_zsh_completion_candidates() {
     arg=${left#"/model "}
     [[ "$arg" != *[[:space:]]* ]] || return 1
     _mu_zsh_model_completion_candidates "$arg"
+    return
+  fi
+
+  if [[ "$left" == "/trap "* ]]; then
+    arg=${left#"/trap "}
+    [[ "$arg" != *[[:space:]]* ]] || return 1
+    print -l -- off destructive reversible all default
     return
   fi
 
@@ -614,6 +643,7 @@ _mu_zsh_fallback_completion() {
 
   suffix=' '
   [[ "$left" == "/model "* ]] && suffix=''
+  [[ "$left" == "/trap "* ]] && suffix=''
   compadd -Q -S "$suffix" -- "${candidates[@]}"
 }
 
@@ -653,6 +683,7 @@ _mu_zsh_completion_system() {
 
   suffix=' '
   [[ "$left" == "/model "* ]] && suffix=''
+  [[ "$left" == "/trap "* ]] && suffix=''
   _wanted mu-slash-command expl 'mu slash command' \
     compadd -Q -S "$suffix" -- "${candidates[@]}"
 }
@@ -922,6 +953,26 @@ _mu_zsh_run_slash_command() {
       _MU_ZSH_MODEL=$resolved_model
       _mu_zsh_print_block_message "[mu] next turns in this scope will use $resolved_model"
       ;;
+    /trap)
+      if [[ -z "$rest" ]]; then
+        _mu_zsh_print_block_message "[mu] usage: /trap <off|destructive|reversible|all|default>"
+        return 1
+      fi
+      if [[ "$rest" == *[[:space:]]* ||
+        "$rest" != off && "$rest" != destructive && "$rest" != reversible &&
+        "$rest" != all && "$rest" != default ]]; then
+        _mu_zsh_print_block_message "[mu] invalid trap level: $rest"
+        return 1
+      fi
+      _mu_zsh_activate_scope "$scope"
+      if [[ "$rest" == default ]]; then
+        _MU_ZSH_TRAP=
+        _mu_zsh_print_block_message "[mu] next turns in this scope will use the configured trap level"
+      else
+        _MU_ZSH_TRAP=$rest
+        _mu_zsh_print_block_message "[mu] next turns in this scope will use trap $rest"
+      fi
+      ;;
     /load)
       if [[ "$rest" == *[[:space:]]* ]]; then
         _mu_zsh_print_block_message "[mu] /load accepts exactly one session id"
@@ -951,6 +1002,7 @@ _mu_zsh_run_slash_command() {
       local -a retry_command
       retry_command=(mu retry -s "$session_id")
       [[ -n "$_MU_ZSH_MODEL" ]] && retry_command+=(--model "$_MU_ZSH_MODEL")
+      [[ -n "$_MU_ZSH_TRAP" ]] && retry_command+=(--trap "$_MU_ZSH_TRAP")
       if "${retry_command[@]}"; then
         exit_status=0
       else
@@ -963,6 +1015,7 @@ _mu_zsh_run_slash_command() {
       session_id=$MU_ZSH_SESSION_ID
       local -a compact_command
       compact_command=(mu compact --session "$session_id")
+      [[ -n "$_MU_ZSH_TRAP" ]] && compact_command+=(--trap "$_MU_ZSH_TRAP")
       if [[ -n "$instruction" ]]; then
         print -rn -- "$instruction" | "${compact_command[@]}"
         exit_status=${pipestatus[2]}

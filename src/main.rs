@@ -88,6 +88,10 @@ struct TurnArgs {
     /// Output density (overrides config)
     #[arg(short = 'o', long, value_enum)]
     output: Option<OutputFormat>,
+
+    /// Trap Bash calls at this declared risk level
+    #[arg(long, value_enum)]
+    trap: Option<bash::TrapLevel>,
 }
 
 #[derive(ClapArgs, Debug, Clone)]
@@ -98,6 +102,10 @@ struct RetryArgs {
     /// Output density (overrides config)
     #[arg(short = 'o', long, value_enum)]
     output: Option<OutputFormat>,
+
+    /// Override the persisted trap level for this retry
+    #[arg(long, value_enum)]
+    trap: Option<bash::TrapLevel>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, ValueEnum, Deserialize, Serialize)]
@@ -169,6 +177,10 @@ enum Command {
         /// Output density (overrides config)
         #[arg(short = 'o', long, value_enum)]
         output: Option<OutputFormat>,
+
+        /// Trap Bash calls at this declared risk level
+        #[arg(long, value_enum)]
+        trap: Option<bash::TrapLevel>,
     },
 }
 
@@ -234,6 +246,17 @@ impl fmt::Display for ExitError {
 
 impl std::error::Error for ExitError {}
 
+#[derive(Debug)]
+struct TrappedExit;
+
+impl fmt::Display for TrappedExit {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("Bash command trapped before execution")
+    }
+}
+
+impl std::error::Error for TrappedExit {}
+
 #[derive(Clone)]
 enum PromptSource {
     Stdin,
@@ -256,6 +279,7 @@ struct RunTurnArgs<'a> {
     session_id: &'a str,
     model: ResolvedModelChoice,
     output: OutputFormat,
+    trap: bash::TrapLevel,
     /// A short notice rendered before the turn (e.g. "resuming interrupted turn").
     preamble_notice: Option<&'a str>,
     model_fallback: Option<runtime::ModelFallback>,
@@ -282,11 +306,13 @@ fn main() {
             .and_then(|runtime| runtime.block_on(run()))
     });
     if let Err(e) = result {
-        if error_output_format() == OutputFormat::Final {
-            let _ = write_final_error(&e.to_string());
-        } else {
-            let mut r = Renderer::with_format(error_output_format());
-            let _ = r.error(&e.to_string());
+        if e.downcast_ref::<TrappedExit>().is_none() {
+            if error_output_format() == OutputFormat::Final {
+                let _ = write_final_error(&e.to_string());
+            } else {
+                let mut r = Renderer::with_format(error_output_format());
+                let _ = r.error(&e.to_string());
+            }
         }
         process::exit(exit_code_for(&e));
     }
@@ -303,6 +329,9 @@ fn exit_code_for(error: &anyhow::Error) -> i32 {
     }
     if let Some(exit) = error.downcast_ref::<ExitError>() {
         return exit.code;
+    }
+    if error.downcast_ref::<TrappedExit>().is_some() {
+        return 3;
     }
     1
 }
@@ -925,6 +954,7 @@ async fn run() -> Result<()> {
                 }
                 return Ok(());
             }
+            let stored_trap = store.pending_trap_level(&session.id)?;
 
             store.select_session(&session.id)?;
             std::env::set_current_dir(&session.cwd).with_context(|| {
@@ -947,6 +977,7 @@ async fn run() -> Result<()> {
                 session_id: &session.id,
                 model: selection.model,
                 output,
+                trap: retry_args.trap.unwrap_or(stored_trap),
                 preamble_notice: Some("[mu] resuming incomplete turn"),
                 model_fallback: selection.fallback,
                 mode: RunTurnMode::Resume,
@@ -955,11 +986,16 @@ async fn run() -> Result<()> {
 
             return Ok(());
         }
-        Some(Command::Compact { session, output }) => {
+        Some(Command::Compact {
+            session,
+            output,
+            trap,
+        }) => {
             let custom_focus = load_optional_stdin_instruction()?;
             let config =
                 Config::load_for_scope(project_config_dir.as_deref(), ConfigLoadMode::Runtime)?;
             let output = resolve_output(output, config.output);
+            let trap = trap.unwrap_or(config.trap);
             set_resolved_output(output);
             let store_path = scope.session_store_path();
             if !store_path.join("sessions").exists() {
@@ -989,6 +1025,7 @@ async fn run() -> Result<()> {
                 session_id: &session,
                 model,
                 output,
+                trap,
                 preamble_notice: None,
                 model_fallback: None,
                 mode: RunTurnMode::ManualCompaction(custom_focus.as_deref()),
@@ -1021,7 +1058,8 @@ fn validate_cli_args(args: &Args) -> Result<()> {
         || args.turn.selection.continue_current
         || args.turn.selection.model.is_some()
         || !args.turn.attachments.is_empty()
-        || args.turn.output.is_some();
+        || args.turn.output.is_some()
+        || args.turn.trap.is_some();
     let reserved_prompt = args
         .prompt_file
         .as_ref()
@@ -1087,6 +1125,7 @@ async fn run_turn_from_source(
     store.abandon_interrupted_tail(&session_id, store::BashNotAttemptedReason::Superseded)?;
 
     let prompt_content = build_prompt_content(&prompt, attachments);
+    let trap = turn.trap.unwrap_or(config.trap);
     let git_worktree_root = scope
         .project()
         .and_then(|project| project.worktree.as_ref())
@@ -1096,6 +1135,7 @@ async fn run_turn_from_source(
         &cwd.display().to_string(),
         git_worktree_root.as_deref(),
         &prompt_content,
+        trap,
     )?;
     // Publish the session only after its journal lock is held and its first
     // turn is durable. Standalone `new` deliberately does not select.
@@ -1107,6 +1147,7 @@ async fn run_turn_from_source(
         session_id: &session_id,
         model: resolved.model,
         output,
+        trap,
         preamble_notice: None,
         model_fallback: resolved.model_fallback,
         mode: RunTurnMode::QueuedPrompt,
@@ -1283,10 +1324,14 @@ async fn run_turn(args: RunTurnArgs<'_>) -> Result<()> {
         session_id,
         model,
         output,
+        trap,
         preamble_notice,
         model_fallback,
         mode,
     } = args;
+    let mut invocation_config = config.clone();
+    invocation_config.trap = trap;
+    let config = &invocation_config;
     let active_model = model.active_model();
     let model_context_window = models::resolve_model_info(config, active_model).context_window;
     let provider = build_provider(config, &active_model.provider_id)?;
@@ -1328,6 +1373,10 @@ async fn run_turn(args: RunTurnArgs<'_>) -> Result<()> {
                 renderer.finish_turn()?;
                 renderer.soft_interrupt_complete(r.pending_bash_calls)?;
                 return Ok(());
+            }
+            if r.trapped {
+                renderer.finish_turn()?;
+                return Err(TrappedExit.into());
             }
             let ctx_pct = r.context_window.map(|cw| {
                 (
@@ -1523,6 +1572,7 @@ mod tests {
             Some(Command::Compact {
                 session: None,
                 output: None,
+                trap: None,
             })
         ));
         let selected_compact =
@@ -1532,6 +1582,7 @@ mod tests {
             Some(Command::Compact {
                 session: Some(ref session),
                 output: Some(OutputFormat::Full),
+                trap: None,
             }) if session == "ses_example"
         ));
 
@@ -1555,6 +1606,24 @@ mod tests {
         assert!(Args::try_parse_from(["mu", "session", "list"]).is_err());
         assert!(Args::try_parse_from(["mu", "new", "--model", "gpt-5"]).is_err());
         assert!(Args::try_parse_from(["mu", "-s", "ses_example", "-c"]).is_err());
+        assert_eq!(
+            Args::try_parse_from(["mu", "--trap", "all"])
+                .unwrap()
+                .turn
+                .trap,
+            Some(bash::TrapLevel::All)
+        );
+        assert!(Args::try_parse_from(["mu", "--trap", "readonly"]).is_err());
+        assert_eq!(
+            match Args::try_parse_from(["mu", "retry", "--trap", "off"])
+                .unwrap()
+                .command
+            {
+                Some(Command::Retry(args)) => args.trap,
+                other => panic!("unexpected command: {other:?}"),
+            },
+            Some(bash::TrapLevel::Off)
+        );
         assert!(
             Args::try_parse_from(["mu", "status", "--session", "ses_example", "--continue"])
                 .is_err()
@@ -1688,6 +1757,12 @@ mod tests {
         bash::reset_cancellation_state();
         let err = ExitError::session_not_found("abc123");
         assert_eq!(exit_code_for(&err), 2);
+    }
+
+    #[test]
+    fn exit_code_maps_trapping_to_three() {
+        bash::reset_cancellation_state();
+        assert_eq!(exit_code_for(&TrappedExit.into()), 3);
     }
 
     #[test]

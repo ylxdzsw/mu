@@ -59,6 +59,7 @@ pub struct TurnResult {
     pub final_assistant: Option<String>,
     pub awaiting_user: bool,
     pub soft_interrupted: bool,
+    pub trapped: bool,
     pub pending_bash_calls: usize,
 }
 
@@ -67,6 +68,12 @@ enum NextRequest {
     User,
     ToolResults,
     Continue,
+}
+
+enum BashCallStop {
+    Complete,
+    SoftInterrupted(usize),
+    Trapped(usize),
 }
 
 struct ActiveCompaction {
@@ -190,6 +197,7 @@ impl<'a> AgentLoop<'a> {
                     final_assistant: Some(summary),
                     awaiting_user: mode == CompactionMode::AwaitUser,
                     soft_interrupted: false,
+                    trapped: false,
                     pending_bash_calls: 0,
                 }
             } else {
@@ -254,11 +262,17 @@ impl<'a> AgentLoop<'a> {
             let pending_calls = self.store.pending_bash_calls(self.session_id)?;
             if !pending_calls.is_empty() {
                 let mut command_headers = StreamingCommandHeaders::default();
-                if let Some(pending) = self
+                match self
                     .execute_pending_bash_calls(&pending_calls, &mut context, &mut command_headers)
                     .await?
                 {
-                    return self.soft_interrupt_result_with_pending(total_usage, pending);
+                    BashCallStop::Complete => {}
+                    BashCallStop::SoftInterrupted(pending) => {
+                        return self.soft_interrupt_result_with_pending(total_usage, pending);
+                    }
+                    BashCallStop::Trapped(pending) => {
+                        return self.trapped_result(total_usage, pending);
+                    }
                 }
                 next_request = NextRequest::ToolResults;
             }
@@ -406,6 +420,7 @@ impl<'a> AgentLoop<'a> {
                                         self.renderer,
                                         &mut command_headers,
                                         delta,
+                                        self.config.trap,
                                     ),
                                     StreamEvent::Tick => self.renderer.thinking_tick(),
                                 };
@@ -698,7 +713,7 @@ impl<'a> AgentLoop<'a> {
                     if pending_calls.is_empty() {
                         bail!("missing tool calls");
                     }
-                    if let Some(pending) = self
+                    match self
                         .execute_pending_bash_calls(
                             &pending_calls,
                             &mut context,
@@ -706,7 +721,13 @@ impl<'a> AgentLoop<'a> {
                         )
                         .await?
                     {
-                        return self.soft_interrupt_result_with_pending(total_usage, pending);
+                        BashCallStop::Complete => {}
+                        BashCallStop::SoftInterrupted(pending) => {
+                            return self.soft_interrupt_result_with_pending(total_usage, pending);
+                        }
+                        BashCallStop::Trapped(pending) => {
+                            return self.trapped_result(total_usage, pending);
+                        }
                     }
                     next_request = NextRequest::ToolResults;
                 }
@@ -733,6 +754,7 @@ impl<'a> AgentLoop<'a> {
             final_assistant,
             awaiting_user,
             soft_interrupted: false,
+            trapped: false,
             pending_bash_calls: 0,
         })
     }
@@ -756,6 +778,22 @@ impl<'a> AgentLoop<'a> {
             final_assistant: None,
             awaiting_user: false,
             soft_interrupted: true,
+            trapped: false,
+            pending_bash_calls,
+        })
+    }
+
+    fn trapped_result(&mut self, usage: Usage, pending_bash_calls: usize) -> Result<TurnResult> {
+        let context = self.current_context_estimate()?;
+        Ok(TurnResult {
+            usage,
+            context_tokens: context.tokens,
+            context_estimated: !context.reported,
+            context_window: self.model_context_window,
+            final_assistant: None,
+            awaiting_user: false,
+            soft_interrupted: false,
+            trapped: true,
             pending_bash_calls,
         })
     }
@@ -765,42 +803,50 @@ impl<'a> AgentLoop<'a> {
         calls: &[PendingBashCall],
         context: &mut Vec<Message>,
         command_headers: &mut StreamingCommandHeaders,
-    ) -> Result<Option<usize>> {
+    ) -> Result<BashCallStop> {
         let mut cursor = 0;
         while cursor < calls.len() {
             if bash::cancellation_requested() {
                 bail!("turn interrupted");
             }
             if bash::soft_interrupt_requested() {
-                return Ok(Some(calls.len() - cursor));
+                return Ok(BashCallStop::SoftInterrupted(calls.len() - cursor));
             }
 
             let pending = &calls[cursor];
             let args = parse_tool_args(&pending.call)?;
             let parsed = bash::parse_args::<bash::BashArgs>(&args);
-            if let Err(error) = parsed {
-                let header_already_rendered =
-                    finish_command_header(self.renderer, command_headers, cursor, &args)?;
-                if bash::soft_interrupt_requested() {
-                    return Ok(Some(calls.len() - cursor));
+            let bash_args = match parsed {
+                Ok(args) => args,
+                Err(error) => {
+                    let header_already_rendered =
+                        finish_command_header(self.renderer, command_headers, cursor, &args)?;
+                    if bash::soft_interrupt_requested() {
+                        return Ok(BashCallStop::SoftInterrupted(calls.len() - cursor));
+                    }
+                    self.renderer.tool_start(&args, header_already_rendered)?;
+                    self.renderer
+                        .tool_failed(&error.to_string(), Duration::ZERO)?;
+                    let output = format!("error: {error}");
+                    self.store.persist_bash_not_attempted(
+                        self.session_id,
+                        pending.call_id,
+                        BashNotAttemptedReason::InvalidArguments,
+                        &output,
+                    )?;
+                    context.push(Message::Tool {
+                        content: output,
+                        attachments: Vec::new(),
+                        tool_call_id: pending.call.id.clone(),
+                    });
+                    cursor += 1;
+                    continue;
                 }
-                self.renderer.tool_start(&args, header_already_rendered)?;
-                self.renderer
-                    .tool_failed(&error.to_string(), Duration::ZERO)?;
-                let output = format!("error: {error}");
-                self.store.persist_bash_not_attempted(
-                    self.session_id,
-                    pending.call_id,
-                    BashNotAttemptedReason::InvalidArguments,
-                    &output,
-                )?;
-                context.push(Message::Tool {
-                    content: output,
-                    attachments: Vec::new(),
-                    tool_call_id: pending.call.id.clone(),
-                });
-                cursor += 1;
-                continue;
+            };
+
+            if self.config.trap.traps(bash_args.risk) {
+                self.renderer.trapped_bash(&args, self.config.trap)?;
+                return Ok(BashCallStop::Trapped(calls.len() - cursor));
             }
 
             if self.concurrent_tool_call_eligible(&args) {
@@ -828,13 +874,13 @@ impl<'a> AgentLoop<'a> {
                         .await?;
                     let completed = header_start + started;
                     if started < chunk.len() {
-                        return Ok(Some(calls.len() - completed));
+                        return Ok(BashCallStop::SoftInterrupted(calls.len() - completed));
                     }
                     if bash::cancellation_requested() {
                         bail!("turn interrupted");
                     }
                     if bash::soft_interrupt_requested() {
-                        return Ok(Some(calls.len() - completed));
+                        return Ok(BashCallStop::SoftInterrupted(calls.len() - completed));
                     }
                 }
                 cursor = end;
@@ -844,7 +890,7 @@ impl<'a> AgentLoop<'a> {
             let header_already_rendered =
                 finish_command_header(self.renderer, command_headers, cursor, &args)?;
             if bash::soft_interrupt_requested() {
-                return Ok(Some(calls.len() - cursor));
+                return Ok(BashCallStop::SoftInterrupted(calls.len() - cursor));
             }
             self.store.start_bash_attempt(
                 self.session_id,
@@ -873,7 +919,7 @@ impl<'a> AgentLoop<'a> {
             )?;
             cursor += 1;
         }
-        Ok(None)
+        Ok(BashCallStop::Complete)
     }
 
     /// Load the full completed-message history, including the persisted leading
@@ -929,6 +975,11 @@ impl<'a> AgentLoop<'a> {
             CompactionStart {
                 cwd: &cwd,
                 prompt: &compaction::compaction_prompt(mode, focus),
+                trap: if trigger == CompactionTrigger::Manual {
+                    self.config.trap
+                } else {
+                    self.store.pending_trap_level(self.session_id)?
+                },
                 trigger,
                 mode,
                 before_context_tokens,
@@ -1194,6 +1245,7 @@ fn handle_tool_call_delta(
     renderer: &mut Renderer,
     headers: &mut StreamingCommandHeaders,
     delta: ToolCallDelta,
+    trap: bash::TrapLevel,
 ) -> std::io::Result<()> {
     if delta.index >= headers.entries.len() {
         headers
@@ -1205,17 +1257,29 @@ fn handle_tool_call_delta(
 
     if delta.index == 0 {
         let header = &mut headers.entries[0];
-        header.display.update(
-            renderer,
-            CommandHeaderUpdate {
-                title: string_field_state(&header.arguments, "title"),
-                risk: string_field_state(&header.arguments, "risk"),
-                command: string_field_state(&header.arguments, "command"),
-                cwd: string_field_state(&header.arguments, "cwd"),
-                stdin: string_field_state(&header.arguments, "stdin"),
-                arguments_complete: arguments_json_complete(&header.arguments),
-            },
-        )?;
+        let arguments_complete = arguments_json_complete(&header.arguments);
+        let risk = string_field_state(&header.arguments, "risk");
+        let defer = trap != bash::TrapLevel::Off
+            && !header.display.started
+            && match risk.complete_value() {
+                Some(risk) => risk
+                    .parse::<bash::BashRisk>()
+                    .is_ok_and(|risk| trap.traps(risk)),
+                None => !arguments_complete,
+            };
+        if !defer {
+            header.display.update(
+                renderer,
+                CommandHeaderUpdate {
+                    title: string_field_state(&header.arguments, "title"),
+                    risk,
+                    command: string_field_state(&header.arguments, "command"),
+                    cwd: string_field_state(&header.arguments, "cwd"),
+                    stdin: string_field_state(&header.arguments, "stdin"),
+                    arguments_complete,
+                },
+            )?;
+        }
         if header.display.is_done() {
             headers.next_to_render = headers.next_to_render.max(1);
         }
@@ -2003,6 +2067,53 @@ mod tests {
         seen: Arc<Mutex<Vec<Vec<Message>>>>,
     }
 
+    struct DestructiveThenStopProvider {
+        step: Arc<Mutex<usize>>,
+        path: String,
+    }
+
+    #[async_trait(?Send)]
+    impl Provider for DestructiveThenStopProvider {
+        async fn stream(
+            &self,
+            _request: &Request,
+            _on_event: &mut dyn FnMut(crate::provider::StreamEvent) -> Result<(), ProviderError>,
+        ) -> Result<StreamResult, ProviderError> {
+            let mut step = self.step.lock().unwrap();
+            let current = *step;
+            *step += 1;
+            match current {
+                0 => Ok(StreamResult {
+                    message: Message::assistant(
+                        None,
+                        None,
+                        Some(vec![ToolCall {
+                            id: "call_destructive".into(),
+                            arguments: serde_json::json!({
+                                "title": "write marker",
+                                "risk": "destructive",
+                                "command": format!("touch '{}'", self.path),
+                                "stdin": "complete\nstdin",
+                            })
+                            .to_string(),
+                        }]),
+                        None,
+                    ),
+                    finish_reason: FinishReason::ToolCalls,
+                    usage: None,
+                    native_response: None,
+                }),
+                1 => Ok(StreamResult {
+                    message: Message::assistant(Some("done".into()), None, None, None),
+                    finish_reason: FinishReason::Stop,
+                    usage: None,
+                    native_response: None,
+                }),
+                other => panic!("unexpected destructive provider step {other}"),
+            }
+        }
+    }
+
     #[async_trait(?Send)]
     impl Provider for StopAfterPendingProvider {
         async fn stream(
@@ -2161,6 +2272,7 @@ mod tests {
                 },
             )]),
             output: Default::default(),
+            trap: bash::TrapLevel::Off,
             auto_resume: false,
             soft_interrupt: crate::config::bundled_test_default("/soft_interrupt"),
             compaction: CompactionConfig::default(),
@@ -2873,6 +2985,109 @@ mod tests {
         let _ = std::fs::remove_dir_all(tmp);
     }
 
+    #[tokio::test]
+    async fn destructive_trap_stops_before_start_and_lifted_retry_executes_pending_claim() {
+        let tmp = std::env::temp_dir().join(format!("mu-agent-trap-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let marker = tmp.join("marker");
+        let store = Store::open(&tmp.join("mu.db")).unwrap();
+        let session = store.create_session("system").unwrap();
+        store
+            .append_message(
+                &session.id,
+                &Message::User {
+                    content: UserContent::Text("write it".into()),
+                },
+            )
+            .unwrap();
+
+        let mut config = test_config();
+        config.trap = bash::TrapLevel::Destructive;
+        let model = crate::models::resolve_model_ref(&config, "test/fake-model").unwrap();
+        let step = Arc::new(Mutex::new(0));
+        let mut renderer = Renderer::with_format(OutputFormat::Final);
+        let mut agent = AgentLoop {
+            config: &config,
+            model: ResolvedModelChoice::fixed(model.clone()),
+            provider: Box::new(DestructiveThenStopProvider {
+                step: Arc::clone(&step),
+                path: marker.display().to_string(),
+            }),
+            store: &store,
+            session_id: &session.id,
+            model_context_window: None,
+            renderer: &mut renderer,
+        };
+
+        let trapped = agent.run_turn().await.unwrap();
+        assert!(trapped.trapped);
+        assert_eq!(trapped.pending_bash_calls, 1);
+        assert!(!marker.exists());
+        assert_eq!(
+            store.pending_trap_level(&session.id).unwrap(),
+            bash::TrapLevel::Destructive
+        );
+        assert!(
+            !store
+                .audit_events(&session.id)
+                .unwrap()
+                .iter()
+                .any(|event| event["type"] == "bash_started")
+        );
+
+        let mut renderer = Renderer::with_format(OutputFormat::Final);
+        let mut same_policy_retry = AgentLoop {
+            config: &config,
+            model: ResolvedModelChoice::fixed(model.clone()),
+            provider: Box::new(DestructiveThenStopProvider {
+                step: Arc::clone(&step),
+                path: marker.display().to_string(),
+            }),
+            store: &store,
+            session_id: &session.id,
+            model_context_window: None,
+            renderer: &mut renderer,
+        };
+        let trapped_again = same_policy_retry.resume_turn().await.unwrap();
+        assert!(trapped_again.trapped);
+        assert_eq!(*step.lock().unwrap(), 1);
+        assert!(!marker.exists());
+
+        config.trap = bash::TrapLevel::Off;
+        let mut renderer = Renderer::with_format(OutputFormat::Final);
+        let mut retry = AgentLoop {
+            config: &config,
+            model: ResolvedModelChoice::fixed(model),
+            provider: Box::new(DestructiveThenStopProvider {
+                step,
+                path: marker.display().to_string(),
+            }),
+            store: &store,
+            session_id: &session.id,
+            model_context_window: None,
+            renderer: &mut renderer,
+        };
+        let completed = retry.resume_turn().await.unwrap();
+        assert_eq!(completed.final_assistant.as_deref(), Some("done"));
+        assert!(marker.exists());
+        let audit = store.audit_events(&session.id).unwrap();
+        assert_eq!(
+            audit
+                .iter()
+                .filter(|event| event["type"] == "bash_started")
+                .count(),
+            1
+        );
+        assert_eq!(
+            audit
+                .iter()
+                .filter(|event| event["type"] == "bash_completed")
+                .count(),
+            1
+        );
+        let _ = std::fs::remove_dir_all(tmp);
+    }
+
     /// A provider that grows the context with one large tool result, then
     /// stops. Any summarization request (the compaction call) is answered with
     /// a short summary so the hard request-level compaction path can complete.
@@ -2927,6 +3142,7 @@ mod tests {
                 CompactionStart {
                     cwd: "/tmp",
                     prompt: &"checkpoint".into(),
+                    trap: bash::TrapLevel::Destructive,
                     trigger: CompactionTrigger::Manual,
                     mode: CompactionMode::AwaitUser,
                     before_context_tokens: 10,
@@ -3183,6 +3399,7 @@ mod tests {
                 "/tmp",
                 None,
                 &UserContent::Text("new request".into()),
+                bash::TrapLevel::Destructive,
             )
             .unwrap();
         new_turn_agent.run_queued_turn().await.unwrap();

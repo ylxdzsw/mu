@@ -222,6 +222,7 @@ mod tests {
                 },
             )]),
             output: Default::default(),
+            trap: crate::bash::TrapLevel::Off,
             auto_resume: false,
             soft_interrupt: crate::config::bundled_test_default("/soft_interrupt"),
             compaction: CompactionConfig::default(),

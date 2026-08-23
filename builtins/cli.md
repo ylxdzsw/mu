@@ -22,6 +22,7 @@ Session and model selection:
 - `-c|--continue`: continue the active scope's last selected session.
 - `-m|--model provider/model[:effort]`: use a fixed provider.
 - `-m|--model model[:effort]`: use ordered provider fallback.
+- `--trap off|destructive|reversible|all`: set the turn's Bash trap level.
 
 An explicit `-o|--output` overrides `config.jsonc`:
 
@@ -32,7 +33,8 @@ An explicit `-o|--output` overrides `config.jsonc`:
 
 `final` is intended for supervisors and scripts. On success, stdout contains
 only the final assistant message. An unrecovered fatal error writes
-`error: ...` to stdout and exits nonzero.
+`error: ...` to stdout and exits nonzero. A trapped Bash call is the exception:
+Mu prints its complete command and stdin to stdout and exits with status 3.
 
 When invoking Mu through an agent's Bash tool, pass multiline or
 escaping-sensitive prompt text through the tool's `stdin` field:
@@ -154,15 +156,17 @@ creating session state. With no target, stdin is the prompt. Interactive output
 includes provenance and rendered Markdown; redirected output is the exact
 composed prompt.
 
-### `mu retry [selection options] [-o <format>]`
+### `mu retry [selection options] [-o <format>] [--trap <level>]`
 
 Resume an interrupted turn, defaulting to `current-session`. It normalizes the
 interrupted provider tail, restores the submitted working directory, resumes
 never-started Bash calls, and may retry unresolved readonly attempts before
 continuing without a new user prompt. Started higher-risk calls are not
 repeated. A clean session is a no-op.
+Without `--trap`, retry reuses the persisted turn policy. An explicit value
+overrides it only for this invocation.
 
-### `mu compact [-s <id>] [-o <format>]`
+### `mu compact [-s <id>] [-o <format>] [--trap <level>]`
 
 Force compaction for a session, defaulting to `current-session` and the
 configured output density. `--output` overrides configuration. Non-terminal
