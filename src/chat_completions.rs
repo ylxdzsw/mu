@@ -207,9 +207,6 @@ pub(crate) fn build_request_body(request: &Request, tools: &[Value]) -> Value {
         // is rejected by real OpenAI `/chat/completions`.)
         body["reasoning_effort"] = Value::String(effort.to_string());
     }
-    if let Some(max_output_tokens) = request.max_output_tokens {
-        body["max_completion_tokens"] = Value::from(max_output_tokens);
-    }
     body
 }
 
@@ -627,7 +624,6 @@ mod tests {
         Request {
             model: test_model(effort),
             cache_key: None,
-            max_output_tokens: None,
             messages,
             bash,
         }
@@ -880,6 +876,8 @@ mod tests {
         let responses = request.json(ModelApi::Responses).unwrap();
         assert_eq!(chat["prompt_cache_key"], "mu:ses_test:epoch:3");
         assert_eq!(responses["prompt_cache_key"], "mu:ses_test:epoch:3");
+        assert!(chat.get("max_completion_tokens").is_none());
+        assert!(responses.get("max_output_tokens").is_none());
     }
 
     #[test]
@@ -952,6 +950,7 @@ mod tests {
         assert_eq!(body["include"][0], "reasoning.encrypted_content");
         assert_eq!(body["reasoning"]["effort"], "max");
         assert_eq!(body["reasoning"]["summary"], "auto");
+        assert!(body.get("max_output_tokens").is_none());
         assert!(body.get("previous_response_id").is_none());
         assert!(body.get("conversation").is_none());
         assert_eq!(body["tools"][0]["name"], "bash");

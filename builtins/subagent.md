@@ -17,7 +17,8 @@ delegation-specific conventions.
 Use `--output final` for normal subagent calls. It prints only the final
 assistant message on success, which keeps the parent context small.
 
-Increase the outer bash timeout; subagent calls usually need longer than normal shell probes.
+Increase the outer bash timeout to at least 30 minutes; subagent calls usually need
+longer than normal shell probes.
 
 ```ts
 bash({

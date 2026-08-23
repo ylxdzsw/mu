@@ -351,7 +351,6 @@ pub struct Request {
     pub cache_key: Option<String>,
     pub messages: Vec<Message>,
     pub bash: bool,
-    pub max_output_tokens: Option<u64>,
 }
 
 impl Request {
@@ -366,7 +365,6 @@ impl Request {
             cache_key: Some(format!("mu:{session_id}:epoch:{epoch}")),
             messages,
             bash: false,
-            max_output_tokens: None,
         }
     }
 
@@ -1411,7 +1409,6 @@ mod tests {
                 effort: None,
             },
             cache_key: None,
-            max_output_tokens: None,
             messages: vec![
                 Message::System {
                     content: "system".into(),

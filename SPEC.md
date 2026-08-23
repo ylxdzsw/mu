@@ -979,11 +979,11 @@ accepted request rather than copying them. If pruning every Bash result is
 insufficient, Mu still makes one emergency request; a context-length error from
 that request is fatal.
 
-The summary request output limit is capped by the configured hard headroom.
-Mu rejects an empty summary, but it does not apply a post-compaction soft-limit
-test. A failed compaction leaves its ordinary turn and provider records
-available for `/retry` and does not advance the epoch. Manual compaction of a
-session with no conversation history is inapplicable.
+Compaction requests do not add a provider output-token cap. Mu rejects an empty
+summary, but it does not apply a post-compaction soft-limit test. A failed
+compaction leaves its ordinary turn and provider records available for
+`/retry` and does not advance the epoch. Manual compaction of a session with no
+conversation history is inapplicable.
 
 ### 11.6 Exit status
 

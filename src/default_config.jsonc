@@ -50,7 +50,7 @@
     "soft_fraction": 0.80,
     // Compact before returning completed Bash results at this fraction.
     "hard_fraction": 0.90,
-    // Hard-threshold reserve, emergency reduction, and summary output cap.
+    // Hard-threshold reserve and emergency reduction.
     "hard_headroom_tokens": 32000
   },
   // Bash-output limits.

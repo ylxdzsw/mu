@@ -132,8 +132,8 @@ the session context epoch; provider cache keys have the form
 which temporarily replaces oldest Bash outputs and removes their attachments
 until their estimated reduction reaches the configured headroom. The journal,
 Bash requests, commands, and stdin remain intact. The same error during an
-emergency attempt is fatal. Compaction output is capped at
-`hard_headroom_tokens`, which must be greater than zero.
+emergency attempt is fatal. Compaction requests do not add a provider
+output-token cap; `hard_headroom_tokens` must still be greater than zero.
 
 Context accounting uses the latest compatible provider-reported usage and
 estimates only later messages. Compatibility requires the same API and model

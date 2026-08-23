@@ -900,7 +900,6 @@ impl Store {
             cache_key: None,
             messages: self.load_context_messages(session_id)?,
             bash: true,
-            max_output_tokens: None,
         };
         let native = request.json(ModelApi::ChatCompletions)?;
         let exchange_id = self.start_provider_request(
@@ -2415,12 +2414,6 @@ impl Store {
                 cache_key,
                 messages,
                 bash: true,
-                max_output_tokens: recipe
-                    .envelope
-                    .get("max_output_tokens")
-                    .or_else(|| recipe.envelope.get("max_completion_tokens"))
-                    .or_else(|| recipe.envelope.get("max_tokens"))
-                    .and_then(Value::as_u64),
             };
             request.json(api)?
         };
@@ -4153,7 +4146,6 @@ mod tests {
             cache_key: None,
             messages: store.load_context_messages(&session.id).unwrap(),
             bash: true,
-            max_output_tokens: None,
         };
         let native = request.json(ModelApi::ChatCompletions).unwrap();
         let exchange = store
@@ -4310,7 +4302,6 @@ mod tests {
             cache_key: None,
             messages: messages.clone(),
             bash: true,
-            max_output_tokens: None,
         };
         let native = request.json(ModelApi::Responses).unwrap();
         let exchange = store
@@ -4887,7 +4878,6 @@ mod tests {
                 effort: Some("high".into()),
             },
             cache_key: Some(format!("mu:{}:agent", session.id)),
-            max_output_tokens: None,
             messages,
             bash: true,
         };
@@ -4978,7 +4968,6 @@ mod tests {
                 effort: Some("high".into()),
             },
             cache_key: None,
-            max_output_tokens: None,
             messages: messages.clone(),
             bash: true,
         };
@@ -5083,7 +5072,6 @@ mod tests {
                 effort: None,
             },
             cache_key: None,
-            max_output_tokens: None,
             messages: request_messages,
             bash: true,
         };

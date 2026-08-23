@@ -154,7 +154,7 @@ pub(crate) fn build_request_body(
         "messages": wire_messages,
         "tools": anthropic_tools,
         "stream": true,
-        "max_tokens": request.max_output_tokens.unwrap_or(MAX_OUTPUT_TOKENS),
+        "max_tokens": MAX_OUTPUT_TOKENS,
         "thinking": {
             "type": "adaptive",
             "display": "summarized",
@@ -657,7 +657,6 @@ mod tests {
                 effort: effort.map(str::to_owned),
             },
             cache_key: None,
-            max_output_tokens: None,
             messages,
             bash,
         }
@@ -708,6 +707,7 @@ mod tests {
         assert_eq!(body["thinking"]["type"], "adaptive");
         assert_eq!(body["thinking"]["display"], "summarized");
         assert_eq!(body["output_config"]["effort"], "max");
+        assert_eq!(body["max_tokens"], MAX_OUTPUT_TOKENS);
         assert_eq!(body["cache_control"]["type"], "ephemeral");
         assert!(body.get("prompt_cache_key").is_none());
         assert_eq!(body["tools"][0]["name"], "bash");
