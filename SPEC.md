@@ -275,8 +275,10 @@ When `soft_interrupt` is enabled, `SIGQUIT` requests a soft interrupt instead:
 the active provider request and Bash calls are allowed to finish, Bash claims
 that have not started remain pending without synthetic results, and Mu starts
 no further provider request or Bash call. The terminal's normal `^\\` echo is
-the receipt acknowledgement; Mu emits only the final soft-interrupt outcome
-and pending-call count. When disabled, Mu does not install a `SIGQUIT` handler.
+the receipt acknowledgement. If the active provider request normally completes
+the turn at that boundary, Mu consumes the interrupt and reports normal
+completion. Otherwise, Mu emits only the final soft-interrupt outcome and
+pending-call count. When disabled, Mu does not install a `SIGQUIT` handler.
 
 `mu retry` continues the interrupted turn without adding a new prompt. It
 attempts never-started claims and may repeat a started but unresolved readonly

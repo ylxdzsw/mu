@@ -114,9 +114,11 @@ Type `/` to list prompt-mode commands. The common ones:
 - When `soft_interrupt` is enabled (the default), press **Ctrl+\\** while Mu is
   working to let active provider or Bash work finish, leave Bash calls that
   have not started pending for `/retry`, and stop before the next operation.
-  The terminal's `^\\` acknowledges the request; final output reports the
-  completed soft interrupt and pending-call count. Set `soft_interrupt` to
-  `false` to retain normal `SIGQUIT` behavior.
+  The terminal's `^\\` acknowledges the request. If the active provider request
+  normally completes the turn at that boundary, Mu consumes the interrupt and
+  reports normal completion. Otherwise, final output reports the completed soft
+  interrupt and pending-call count. Set `soft_interrupt` to `false` to retain
+  normal `SIGQUIT` behavior.
 - `/goal <goal>` starts a supervisor that drives one persistent worker session
   until the supplied goal is verified as achieved or genuinely blocked. The
   goal argument is required.

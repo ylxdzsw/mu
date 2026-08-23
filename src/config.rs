@@ -540,9 +540,6 @@ fn config_from_value(value: serde_json::Value) -> Result<Config> {
 }
 
 fn deserialize_config(value: serde_json::Value, discard_invalid_providers: bool) -> Result<Config> {
-    if value.get("guardrail").is_some() {
-        bail!("`guardrail` was removed from config.jsonc")
-    }
     let mut merged = bundled_defaults()?;
     merge_json(&mut merged, value);
     if !discard_invalid_providers {
@@ -827,18 +824,6 @@ mod tests {
             merge_json(&mut value, invalid);
             assert!(config_from_value(value).is_err());
         }
-    }
-
-    #[test]
-    fn removed_guardrail_config_is_rejected() {
-        assert!(
-            config_from_value(serde_json::json!({
-                "guardrail": {"enabled": true}
-            }))
-            .unwrap_err()
-            .to_string()
-            .contains("`guardrail` was removed")
-        );
     }
 
     #[test]

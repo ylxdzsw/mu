@@ -84,7 +84,9 @@ Complete shape, with default values where applicable:
     "max_bytes": 51200,
     "max_line_bytes": 10240
   },
-  "redaction": { "env": ["*_API_KEY", "*_API_TOKEN", "*_AUTH_TOKEN"] }
+  "redaction": {
+    "env": ["*_API_KEY", "*_API_TOKEN", "*_AUTH_TOKEN", "*_ACCESS_TOKEN"]
+  }
 }
 ```
 
