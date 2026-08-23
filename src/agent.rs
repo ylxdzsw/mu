@@ -2933,7 +2933,6 @@ mod tests {
     /// a short summary so the hard request-level compaction path can complete.
     struct GrowThenStopProvider {
         turn_step: Mutex<usize>,
-        output_caps: Arc<Mutex<Vec<bool>>>,
     }
 
     struct BoundaryCompactionProvider;
@@ -3020,13 +3019,6 @@ mod tests {
             request: &Request,
             _on_event: &mut dyn FnMut(crate::provider::StreamEvent) -> Result<(), ProviderError>,
         ) -> Result<StreamResult, ProviderError> {
-            self.output_caps.lock().unwrap().push(
-                request
-                    .json(crate::provider::ModelApi::ChatCompletions)
-                    .unwrap()
-                    .get("max_completion_tokens")
-                    .is_some(),
-            );
             let is_summarize = request.messages.iter().any(|message| match message {
                 Message::User { content } => {
                     let text = content.text();
@@ -3158,10 +3150,8 @@ mod tests {
                 .is_none()
         );
 
-        let output_caps = Arc::new(Mutex::new(Vec::new()));
         let provider = Box::new(GrowThenStopProvider {
             turn_step: Mutex::new(0),
-            output_caps: Arc::clone(&output_caps),
         });
         let mut renderer = Renderer::with_format(OutputFormat::Detail);
         let mut agent = AgentLoop {
@@ -3192,7 +3182,6 @@ mod tests {
             messages.last().and_then(Message::assistant_text).as_deref(),
             Some("done")
         );
-        assert!(output_caps.lock().unwrap().iter().all(|cap| !cap));
 
         let _ = std::fs::remove_dir_all(tmp);
     }

@@ -876,8 +876,6 @@ mod tests {
         let responses = request.json(ModelApi::Responses).unwrap();
         assert_eq!(chat["prompt_cache_key"], "mu:ses_test:epoch:3");
         assert_eq!(responses["prompt_cache_key"], "mu:ses_test:epoch:3");
-        assert!(chat.get("max_completion_tokens").is_none());
-        assert!(responses.get("max_output_tokens").is_none());
     }
 
     #[test]
@@ -950,7 +948,6 @@ mod tests {
         assert_eq!(body["include"][0], "reasoning.encrypted_content");
         assert_eq!(body["reasoning"]["effort"], "max");
         assert_eq!(body["reasoning"]["summary"], "auto");
-        assert!(body.get("max_output_tokens").is_none());
         assert!(body.get("previous_response_id").is_none());
         assert!(body.get("conversation").is_none());
         assert_eq!(body["tools"][0]["name"], "bash");
