@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use chrono::Local;
 
@@ -17,6 +17,42 @@ for `mu`, a terminal agent whose only tool is `bash`. Adapt their intent to your
 tools. Mu `.env` files may contain secrets needed for some skills.";
 
 const EXPORT_PREAMBLE_CLOSE: &str = " -->";
+
+#[derive(Debug, Clone)]
+pub struct SystemPromptSource {
+    global_config_dir: PathBuf,
+    project_config_dir: Option<PathBuf>,
+    #[cfg(test)]
+    fixed: Option<String>,
+}
+
+impl SystemPromptSource {
+    pub fn new(global_config_dir: &Path, project_config_dir: Option<&Path>) -> Self {
+        Self {
+            global_config_dir: global_config_dir.to_path_buf(),
+            project_config_dir: project_config_dir.map(Path::to_path_buf),
+            #[cfg(test)]
+            fixed: None,
+        }
+    }
+
+    pub fn build(&self) -> anyhow::Result<String> {
+        #[cfg(test)]
+        if let Some(prompt) = &self.fixed {
+            return Ok(prompt.clone());
+        }
+        build_system_prompt(&self.global_config_dir, self.project_config_dir.as_deref())
+    }
+
+    #[cfg(test)]
+    pub fn fixed(prompt: impl Into<String>) -> Self {
+        Self {
+            global_config_dir: PathBuf::new(),
+            project_config_dir: None,
+            fixed: Some(prompt.into()),
+        }
+    }
+}
 
 pub fn role_preamble() -> &'static str {
     ROLE_PREAMBLE.trim_end_matches(['\r', '\n'])
@@ -258,8 +294,8 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::{
-        EXPORT_PREAMBLE, assemble_context, assemble_prompt, build_context, export_preamble,
-        json_string_for_html_comment, role_preamble,
+        EXPORT_PREAMBLE, SystemPromptSource, assemble_context, assemble_prompt, build_context,
+        export_preamble, json_string_for_html_comment, role_preamble,
     };
     use crate::skills::{InstructionScope, SkillMeta, SkillRequirements};
 
@@ -337,6 +373,19 @@ mod tests {
         assert!(prompt.contains(&global_block));
         assert!(prompt.contains(&project_block));
         assert!(prompt.find(&global_block) < prompt.find(&project_block));
+    }
+
+    #[test]
+    fn system_prompt_source_reads_latest_instructions_on_each_build() {
+        let global = temp_dir("prompt-source-global");
+        fs::write(global.join("AGENTS.md"), "First instructions.").unwrap();
+        let source = SystemPromptSource::new(&global, None);
+
+        assert!(source.build().unwrap().contains("First instructions."));
+        fs::write(global.join("AGENTS.md"), "Second instructions.").unwrap();
+        assert!(source.build().unwrap().contains("Second instructions."));
+
+        fs::remove_dir_all(global).unwrap();
     }
 
     #[test]

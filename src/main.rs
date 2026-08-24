@@ -275,6 +275,7 @@ struct LoadedPrompt {
 
 struct RunTurnArgs<'a> {
     config: &'a Config,
+    project_config_dir: Option<&'a Path>,
     store: &'a store::Store,
     session_id: &'a str,
     model: ResolvedModelChoice,
@@ -973,6 +974,7 @@ async fn run() -> Result<()> {
 
             run_turn(RunTurnArgs {
                 config: &config,
+                project_config_dir: project_config_dir.as_deref(),
                 store: &store,
                 session_id: &session.id,
                 model: selection.model,
@@ -1021,6 +1023,7 @@ async fn run() -> Result<()> {
             store.select_session(&session)?;
             run_turn(RunTurnArgs {
                 config: &config,
+                project_config_dir: project_config_dir.as_deref(),
                 store: &store,
                 session_id: &session,
                 model,
@@ -1143,6 +1146,7 @@ async fn run_turn_from_source(
 
     run_turn(RunTurnArgs {
         config,
+        project_config_dir,
         store: &store,
         session_id: &session_id,
         model: resolved.model,
@@ -1320,6 +1324,7 @@ fn trim_trailing_newlines(text: &str) -> &str {
 async fn run_turn(args: RunTurnArgs<'_>) -> Result<()> {
     let RunTurnArgs {
         config,
+        project_config_dir,
         store,
         session_id,
         model,
@@ -1353,6 +1358,10 @@ async fn run_turn(args: RunTurnArgs<'_>) -> Result<()> {
     }
     let mut agent = agent::AgentLoop {
         config,
+        system_prompt_source: system_prompt::SystemPromptSource::new(
+            &paths::global_dir(),
+            project_config_dir,
+        ),
         model,
         provider,
         store,

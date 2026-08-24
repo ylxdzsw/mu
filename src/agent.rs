@@ -23,6 +23,7 @@ use crate::store::{
     CompactionMode, CompactionStart, CompactionTrigger, PendingBashCall, PendingCompaction,
     ProviderOrigin, RESUME_PROMPT, Store,
 };
+use crate::system_prompt::SystemPromptSource;
 use bash::RunningBash;
 
 #[derive(Debug)]
@@ -118,6 +119,7 @@ struct CommandHeaderDisplay {
 
 pub struct AgentLoop<'a> {
     pub config: &'a Config,
+    pub system_prompt_source: SystemPromptSource,
     pub model: ResolvedModelChoice,
     pub provider: Box<dyn Provider>,
     pub store: &'a Store,
@@ -1004,8 +1006,10 @@ impl<'a> AgentLoop<'a> {
     }
 
     fn finish_compaction(&mut self, pending: &PendingCompaction) -> Result<()> {
+        let system_prompt = self.system_prompt_source.build()?;
         let after_context_tokens_estimate = self.store.projected_compaction_context_tokens(
             self.session_id,
+            &system_prompt,
             self.config,
             self.model.active_model(),
             self.provider.api(),
@@ -1017,6 +1021,7 @@ impl<'a> AgentLoop<'a> {
         let new_epoch = self.store.apply_compaction(
             self.session_id,
             CompactionApplication {
+                system_prompt,
                 after_context_tokens_estimate,
                 after_context_window: self.model_context_window,
             },
@@ -2313,6 +2318,7 @@ mod tests {
         let mut renderer = Renderer::with_format(OutputFormat::Detail);
         let mut agent = AgentLoop {
             config: &config,
+            system_prompt_source: SystemPromptSource::fixed("refreshed system prompt"),
             model: ResolvedModelChoice::fixed(request_model.clone()),
             provider,
             store: &store,
@@ -2383,6 +2389,7 @@ mod tests {
         let mut renderer = Renderer::with_format(OutputFormat::Detail);
         let mut agent = AgentLoop {
             config: &config,
+            system_prompt_source: SystemPromptSource::fixed("refreshed system prompt"),
             model: ResolvedModelChoice::fixed(request_model.clone()),
             provider,
             store: &store,
@@ -2441,6 +2448,7 @@ mod tests {
         let mut renderer = Renderer::with_format(OutputFormat::Detail);
         let mut agent = AgentLoop {
             config: &config,
+            system_prompt_source: SystemPromptSource::fixed("refreshed system prompt"),
             model: ResolvedModelChoice::fixed(request_model.clone()),
             provider,
             store: &store,
@@ -2485,6 +2493,7 @@ mod tests {
         let mut renderer = Renderer::with_format(OutputFormat::Detail);
         let mut agent = AgentLoop {
             config: &config,
+            system_prompt_source: SystemPromptSource::fixed("refreshed system prompt"),
             model: ResolvedModelChoice::fixed(request_model.clone()),
             provider,
             store: &store,
@@ -2519,6 +2528,7 @@ mod tests {
         let mut renderer = Renderer::with_format(OutputFormat::Detail);
         let mut retry = AgentLoop {
             config: &config,
+            system_prompt_source: SystemPromptSource::fixed("refreshed system prompt"),
             model: ResolvedModelChoice::fixed(request_model.clone()),
             provider,
             store: &store,
@@ -2585,6 +2595,7 @@ mod tests {
         let mut renderer = Renderer::with_format(OutputFormat::Detail);
         let mut agent = AgentLoop {
             config: &config,
+            system_prompt_source: SystemPromptSource::fixed("refreshed system prompt"),
             model,
             provider,
             store: &store,
@@ -2637,6 +2648,7 @@ mod tests {
         let mut renderer = Renderer::with_format(OutputFormat::Detail);
         let mut agent = AgentLoop {
             config: &config,
+            system_prompt_source: SystemPromptSource::fixed("refreshed system prompt"),
             model: ResolvedModelChoice::fixed(request_model.clone()),
             provider: Box::new(ContextAfterCompactionProvider {
                 counts: counts.clone(),
@@ -2686,6 +2698,7 @@ mod tests {
         let mut renderer = Renderer::with_format(OutputFormat::Detail);
         let mut agent = AgentLoop {
             config: &config,
+            system_prompt_source: SystemPromptSource::fixed("refreshed system prompt"),
             model: ResolvedModelChoice::fixed(request_model.clone()),
             provider: Box::new(ContextAfterCompactionProvider {
                 counts: counts.clone(),
@@ -2736,6 +2749,7 @@ mod tests {
         let mut renderer = Renderer::with_format(OutputFormat::Detail);
         let mut agent = AgentLoop {
             config: &config,
+            system_prompt_source: SystemPromptSource::fixed("refreshed system prompt"),
             model: ResolvedModelChoice::fixed(request_model.clone()),
             provider: Box::new(PartialFailureProvider),
             store: &store,
@@ -2797,6 +2811,7 @@ mod tests {
         let mut renderer = Renderer::with_format(OutputFormat::Detail);
         let mut agent = AgentLoop {
             config: &config,
+            system_prompt_source: SystemPromptSource::fixed("refreshed system prompt"),
             model: ResolvedModelChoice::fixed(request_model.clone()),
             provider,
             store: &store,
@@ -2862,6 +2877,7 @@ mod tests {
         let mut renderer = Renderer::with_format(OutputFormat::Detail);
         let mut agent = AgentLoop {
             config: &config,
+            system_prompt_source: SystemPromptSource::fixed("refreshed system prompt"),
             model: ResolvedModelChoice::fixed(request_model.clone()),
             provider,
             store: &store,
@@ -2945,6 +2961,7 @@ mod tests {
         let mut renderer = Renderer::with_format(OutputFormat::Detail);
         let mut agent = AgentLoop {
             config: &config,
+            system_prompt_source: SystemPromptSource::fixed("refreshed system prompt"),
             model: ResolvedModelChoice::fixed(request_model),
             provider: Box::new(StopAfterPendingProvider {
                 seen: Arc::clone(&seen),
@@ -3008,6 +3025,7 @@ mod tests {
         let mut renderer = Renderer::with_format(OutputFormat::Final);
         let mut agent = AgentLoop {
             config: &config,
+            system_prompt_source: SystemPromptSource::fixed("refreshed system prompt"),
             model: ResolvedModelChoice::fixed(model.clone()),
             provider: Box::new(DestructiveThenStopProvider {
                 step: Arc::clone(&step),
@@ -3038,6 +3056,7 @@ mod tests {
         let mut renderer = Renderer::with_format(OutputFormat::Final);
         let mut same_policy_retry = AgentLoop {
             config: &config,
+            system_prompt_source: SystemPromptSource::fixed("refreshed system prompt"),
             model: ResolvedModelChoice::fixed(model.clone()),
             provider: Box::new(DestructiveThenStopProvider {
                 step: Arc::clone(&step),
@@ -3057,6 +3076,7 @@ mod tests {
         let mut renderer = Renderer::with_format(OutputFormat::Final);
         let mut retry = AgentLoop {
             config: &config,
+            system_prompt_source: SystemPromptSource::fixed("refreshed system prompt"),
             model: ResolvedModelChoice::fixed(model),
             provider: Box::new(DestructiveThenStopProvider {
                 step,
@@ -3153,6 +3173,7 @@ mod tests {
         let mut renderer = Renderer::with_format(OutputFormat::Final);
         let mut agent = AgentLoop {
             config: &config,
+            system_prompt_source: SystemPromptSource::fixed("refreshed system prompt"),
             model: ResolvedModelChoice::fixed(request_model),
             provider: Box::new(BoundaryCompactionProvider),
             store: &store,
@@ -3317,6 +3338,7 @@ mod tests {
         let mut renderer = Renderer::with_format(OutputFormat::Detail);
         let mut agent = AgentLoop {
             config: &config,
+            system_prompt_source: SystemPromptSource::fixed("refreshed system prompt"),
             model: ResolvedModelChoice::fixed(request_model.clone()),
             provider,
             store: &store,
@@ -3339,6 +3361,10 @@ mod tests {
         );
         // The turn still completed cleanly after compaction.
         let messages = store.load_context_messages(&session.id).unwrap();
+        assert!(matches!(
+            &messages[0],
+            Message::System { content } if content == "refreshed system prompt"
+        ));
         assert_eq!(
             messages.last().and_then(Message::assistant_text).as_deref(),
             Some("done")
@@ -3385,6 +3411,7 @@ mod tests {
         let mut renderer = Renderer::with_format(OutputFormat::Final);
         let mut new_turn_agent = AgentLoop {
             config: &config,
+            system_prompt_source: SystemPromptSource::fixed("refreshed system prompt"),
             model: ResolvedModelChoice::fixed(request_model.clone()),
             provider: Box::new(BoundaryCompactionProvider),
             store: &store,
@@ -3415,6 +3442,7 @@ mod tests {
         let mut renderer = Renderer::with_format(OutputFormat::Final);
         let mut retry_agent = AgentLoop {
             config: &config,
+            system_prompt_source: SystemPromptSource::fixed("refreshed system prompt"),
             model: ResolvedModelChoice::fixed(request_model.clone()),
             provider: Box::new(BoundaryCompactionProvider),
             store: &store,
@@ -3516,6 +3544,7 @@ mod tests {
         let mut renderer = Renderer::with_format(OutputFormat::Detail);
         let mut agent = AgentLoop {
             config: &config,
+            system_prompt_source: SystemPromptSource::fixed("refreshed system prompt"),
             model: ResolvedModelChoice::fixed(request_model.clone()),
             provider,
             store: &store,
@@ -3606,6 +3635,7 @@ mod tests {
         let mut renderer = Renderer::with_format(OutputFormat::Detail);
         let mut agent = AgentLoop {
             config: &config,
+            system_prompt_source: SystemPromptSource::fixed("refreshed system prompt"),
             model: ResolvedModelChoice::fixed(request_model.clone()),
             provider,
             store: &store,

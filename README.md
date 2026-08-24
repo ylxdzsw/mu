@@ -264,7 +264,7 @@ messages, and exits. A few ideas follow from that:
 `mu context` introspects the agent context and has two modes. On its own it
 prints the assembled system prompt mu itself would use — `<system_preamble>`,
 `<runtime>`, `<skills>`, and your merged `<agents_md>` blocks — so you can see
-exactly what a new session receives:
+exactly what a new session or successfully compacted context epoch receives:
 
 ```sh
 mu context             # the system prompt mu itself would use (inspection)
@@ -443,9 +443,11 @@ Soft compaction runs before a queued new prompt is materialized. Hard
 compaction runs between completed Bash results and their model continuation.
 Provider context-length errors use an emergency attempt that may omit oldest
 Bash outputs and attachments from that one summary request while preserving
-the journal. A successful summary starts the next context epoch and therefore
-the next provider cache key. If compaction is interrupted, that session accepts
-only `mu retry` until the epoch transition completes.
+the journal. A successful summary regenerates and persists the latest system
+prompt, including the current date, instructions, and skill metadata, then
+starts the next context epoch and therefore the next provider cache key. If
+compaction is interrupted, that session accepts only `mu retry` until the epoch
+transition completes.
 
 ## Native installation and portable builds
 

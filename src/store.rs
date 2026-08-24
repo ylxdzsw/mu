@@ -209,6 +209,8 @@ pub(crate) struct AssistantCompletion<'a> {
 }
 
 pub struct CompactionApplication {
+    /// Exact leading system prompt for the new context epoch.
+    pub system_prompt: String,
     /// Estimated immediate next provider input after applying the checkpoint.
     /// Automatic await-user compaction includes its queued prompt here.
     pub after_context_tokens_estimate: u64,
@@ -350,6 +352,7 @@ enum Event {
         output: String,
     },
     CompactionApplied {
+        system_prompt: String,
         after_context_tokens_estimate: u64,
         #[serde(skip_serializing_if = "Option::is_none")]
         after_context_window: Option<u64>,
@@ -1698,6 +1701,9 @@ impl Store {
         session_id: &str,
         application: CompactionApplication,
     ) -> Result<u64> {
+        if application.system_prompt.trim().is_empty() {
+            bail!("compaction application has an empty system prompt")
+        }
         let to_epoch = self.with_journal(session_id, |journal| {
             let (_, turn_id, _) = compaction_start_before(journal, i64::MAX)
                 .context("session has no pending compaction")?;
@@ -1708,6 +1714,7 @@ impl Store {
         self.append(
             session_id,
             Event::CompactionApplied {
+                system_prompt: application.system_prompt,
                 after_context_tokens_estimate: application.after_context_tokens_estimate,
                 after_context_window: application.after_context_window,
             },
@@ -1785,6 +1792,7 @@ impl Store {
         self.apply_compaction(
             session_id,
             CompactionApplication {
+                system_prompt: "test compacted system prompt".into(),
                 after_context_tokens_estimate: 0,
                 after_context_window: None,
             },
@@ -2019,6 +2027,7 @@ impl Store {
     pub fn projected_compaction_context_tokens(
         &self,
         session_id: &str,
+        system_prompt: &str,
         config: &Config,
         target: &ResolvedModelRef,
         api: ModelApi,
@@ -2033,6 +2042,7 @@ impl Store {
             seq,
             at: now(),
             event: Event::CompactionApplied {
+                system_prompt: system_prompt.to_string(),
                 after_context_tokens_estimate: 0,
                 after_context_window: None,
             },
@@ -2657,8 +2667,11 @@ impl Store {
         let system = journal
             .events
             .iter()
+            .rev()
+            .filter(|line| line.seq <= max_seq)
             .find_map(|line| match &line.event {
                 Event::SystemPrompt { content } => Some(content.clone()),
+                Event::CompactionApplied { system_prompt, .. } => Some(system_prompt.clone()),
                 _ => None,
             })
             .context("missing persisted system prompt")?;
@@ -3529,12 +3542,15 @@ fn validate_events(events: &[EventLine]) -> Result<()> {
                     bail!("duplicate Bash result: {call_id}")
                 }
             }
-            Event::CompactionApplied { .. } => {
+            Event::CompactionApplied { system_prompt, .. } => {
                 let Some((_, mode, accepted)) = pending_compaction.take() else {
                     bail!("compaction application references no pending compaction")
                 };
                 if !accepted {
                     bail!("compaction application has no accepted summary")
+                }
+                if system_prompt.trim().is_empty() {
+                    bail!("compaction application has an empty system prompt")
                 }
                 if mode == CompactionMode::ContinueTurn {
                     let turn_id = format!("t{}", line.seq);
@@ -4655,6 +4671,7 @@ mod tests {
         let projected = store
             .projected_compaction_context_tokens(
                 &session.id,
+                "refreshed system prompt",
                 &config,
                 &target,
                 ModelApi::ChatCompletions,
@@ -4665,6 +4682,7 @@ mod tests {
             .apply_compaction(
                 &session.id,
                 CompactionApplication {
+                    system_prompt: "refreshed system prompt".into(),
                     after_context_tokens_estimate: projected,
                     after_context_window: Some(200_000),
                 },
@@ -5708,6 +5726,7 @@ mod tests {
                 .apply_compaction(
                     &session.id,
                     CompactionApplication {
+                        system_prompt: "refreshed system prompt".into(),
                         after_context_tokens_estimate: 10,
                         after_context_window: Some(1_000),
                     },
@@ -5809,7 +5828,7 @@ mod tests {
     }
 
     #[test]
-    fn applied_compaction_advances_epoch_and_projects_only_the_checkpoint() {
+    fn applied_compaction_projects_refreshed_system_prompt_and_checkpoint() {
         let (store, session) = test_session();
         let turn = store
             .start_turn(&session.id, "/work", None, &"original task".into())
@@ -5873,11 +5892,24 @@ mod tests {
         );
 
         let checkpoint = "<session_checkpoint mode=\"await_user\" epoch=\"1\">\n## Progress\nReady.\n</session_checkpoint>";
+        assert!(
+            store
+                .apply_compaction(
+                    &session.id,
+                    CompactionApplication {
+                        system_prompt: String::new(),
+                        after_context_tokens_estimate: 30,
+                        after_context_window: Some(2_000),
+                    },
+                )
+                .is_err()
+        );
         assert_eq!(
             store
                 .apply_compaction(
                     &session.id,
                     CompactionApplication {
+                        system_prompt: "refreshed system prompt".into(),
                         after_context_tokens_estimate: 30,
                         after_context_window: Some(2_000),
                     },
@@ -5893,6 +5925,7 @@ mod tests {
             .iter()
             .find(|event| event["type"] == "compaction_applied")
             .unwrap();
+        assert_eq!(applied["system_prompt"], "refreshed system prompt");
         for field in [
             "source_turn_id",
             "trigger",
@@ -5911,7 +5944,7 @@ mod tests {
         assert_eq!(context.len(), 2);
         assert!(matches!(
             &context[0],
-            Message::System { content } if content == "system"
+            Message::System { content } if content == "refreshed system prompt"
         ));
         assert!(matches!(
             &context[1],
@@ -6061,6 +6094,7 @@ mod tests {
             .apply_compaction(
                 &session.id,
                 CompactionApplication {
+                    system_prompt: "refreshed system prompt".into(),
                     after_context_tokens_estimate: 20,
                     after_context_window: Some(2_000),
                 },

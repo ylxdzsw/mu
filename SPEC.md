@@ -783,12 +783,14 @@ never enter a journal.
 
 ### 10.2 System prompt
 
-The system prompt is assembled when a session is created and then persisted.
-Existing sessions do not silently rebuild it after instruction/config changes.
-Its fixed order is:
+The system prompt is assembled when a session is created and again when a
+compaction is successfully applied. Its exact bytes are persisted for that
+context epoch; loading, replaying, and retrying an existing epoch never rebuild
+it. Instruction and configuration changes therefore take effect in an existing
+session only at a successful compaction boundary. Its fixed order is:
 
 1. `<system_preamble>` from `src/system_preamble.md`;
-2. `<runtime>` with stable host and project facts;
+2. `<runtime>` with current runtime, host, and project facts;
 3. one complete Markdown `<skills>` document when active skills exist;
 4. global `<agents_md>`;
 5. project `<agents_md>`.
@@ -874,8 +876,8 @@ The durable event model is:
   attachments remain content-addressed objects.
 - **`bash_not_attempted`** — terminal model-visible result for a claim
   deliberately abandoned before its first start.
-- **`compaction_applied`** — after-context telemetry for the committed epoch
-  transition.
+- **`compaction_applied`** — exact new-epoch system prompt and after-context
+  telemetry for the committed epoch transition.
 
 Assistant projections contain one ordered item array, optional resumable and
 non-final bits, and provider-native replay payload without copied provider
@@ -1016,11 +1018,12 @@ persistence, and retry machinery as any other agent request. Mu asks
 for a plain Markdown checkpoint, accepts the final assistant text without
 parsing section syntax, and then appends `compaction_applied`. Validation binds
 the application to exactly one pending `compaction_started` and a final,
-nonempty accepted assistant summary. The mode, summary, checkpoint, before-size
-measurements, source turn, optional continuation turn, elapsed time, and any
-emergency elisions therefore derive from that chain rather than being copied
-into the application event. The application advances the session context epoch
-and projects only the original system prompt plus:
+nonempty accepted assistant summary. Mu then assembles and persists the latest
+system prompt in `compaction_applied`. The mode, summary, checkpoint,
+before-size measurements, source turn, optional continuation turn, elapsed
+time, and any emergency elisions therefore derive from that chain rather than
+being copied into the application event. The application advances the session
+context epoch and projects only that new epoch's system prompt plus:
 
 ```xml
 <session_checkpoint mode="await_user|continue_turn" epoch="N">
@@ -1046,7 +1049,8 @@ request remains in the old epoch; only a successfully applied checkpoint
 advances the epoch. Once a compaction turn is durable, new prompts and another
 manual compaction for that session are rejected until `/retry` completes it.
 If the final summary was durable but the applied event was not, `/retry`
-commits that existing summary without contacting the provider again.
+assembles the then-current system prompt and commits that existing summary
+without contacting the provider again.
 
 Epoch-filtered transcripts place a compaction request, its streamed activity,
 and its result in `from_epoch`, matching the cache key used for that request.
