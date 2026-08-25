@@ -800,7 +800,7 @@ async fn run() -> Result<()> {
                 warn_unsupported_session(error, "skipping it");
             }
             for (s, updated) in listing.sessions {
-                let title = s.title.unwrap_or_else(|| "(untitled)".into());
+                let title = session_listing_title(s.title.as_deref());
                 let model = s.last_model.unwrap_or_else(|| "-".into());
                 println!("{}  {}  {}  {}", s.id, title, model, updated);
             }
@@ -1521,6 +1521,10 @@ fn print_status_report(report: &StatusReport) {
     println!("supported effort levels: {effort_levels}");
 }
 
+fn session_listing_title(title: Option<&str>) -> String {
+    title.unwrap_or("(untitled)").replace('\n', "  ")
+}
+
 #[cfg(test)]
 mod tests {
     use std::io::Cursor;
@@ -1622,6 +1626,15 @@ mod tests {
 
         let misplaced = Args::try_parse_from(["mu", "-m", "gpt-5", "new"]).unwrap();
         assert!(validate_cli_args(&misplaced).is_err());
+    }
+
+    #[test]
+    fn session_listing_replaces_title_newlines_with_double_spaces() {
+        assert_eq!(
+            session_listing_title(Some("first line\nsecond line\nthird line")),
+            "first line  second line  third line"
+        );
+        assert_eq!(session_listing_title(None), "(untitled)");
     }
 
     #[test]
