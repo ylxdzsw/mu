@@ -2047,7 +2047,7 @@ impl Store {
                 after_context_window: None,
             },
         });
-        if mode == CompactionMode::AwaitUser {
+        if mode == CompactionMode::AwaitUser && self.queued_prompt(session_id)?.is_some() {
             append_queued_turn_projection(&mut journal)?;
         }
         Ok(estimate_messages_tokens(
