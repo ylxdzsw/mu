@@ -1119,8 +1119,13 @@ impl<'a> AgentLoop<'a> {
         header_start_index: usize,
     ) -> Result<usize> {
         let mut executions = Vec::new();
+        let mut hard_interrupted = false;
         let (manifest, objects_dir) = self.store.attachment_paths(self.session_id)?;
         for pending in batch {
+            if bash::cancellation_requested() {
+                hard_interrupted = true;
+                break;
+            }
             if bash::soft_interrupt_requested() {
                 break;
             }
@@ -1177,6 +1182,9 @@ impl<'a> AgentLoop<'a> {
             )?;
         }
 
+        if hard_interrupted {
+            bail!("turn interrupted");
+        }
         Ok(executions.len())
     }
 

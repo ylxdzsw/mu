@@ -695,6 +695,15 @@ fn run_bash_inner(
     }
     configure_process_group(&mut command);
 
+    if cancellation_requested() {
+        return Err(BashExecutionError::new(
+            format!("command interrupted by {}", signal_name(last_signal())),
+            String::new(),
+            redactor.did_redact(),
+        )
+        .into());
+    }
+
     let mut child = command.spawn().map_err(|error| {
         if is_e2big(&error) {
             anyhow::anyhow!("command is too large to execute: OS reported argument list too long")
