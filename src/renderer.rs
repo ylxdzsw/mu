@@ -277,7 +277,7 @@ impl Renderer {
                 ))?;
             }
             self.write_stdout_committed(&format!(" {CYAN}{cwd}{RESET}\n"))?;
-            self.write_stdout_committed(&format!("{CYAN}{BOLD}mu>{RESET} "))?;
+            self.write_stdout_committed("mu> ")?;
         } else {
             self.write_stdout_committed(model)?;
             if let Some((percent, estimated)) = context_percent {
