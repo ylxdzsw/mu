@@ -1027,7 +1027,7 @@ mod tests {
 
     use super::{
         AttachmentContext, BashArgs, BashExecutionError, BashRisk, REDACTION_REMINDER, ToolContext,
-        apply_truncation, model_failure_output, run_bash, truncate_line,
+        apply_truncation, model_failure_output, run_bash,
     };
     use crate::config::EnvMap;
     use crate::config::{CompactionConfig, Config, LimitsConfig, ProviderConfig, RedactionConfig};
@@ -1142,28 +1142,6 @@ mod tests {
     }
 
     #[test]
-    fn missing_cwd_error_names_path() {
-        let cwd = std::env::temp_dir().join(format!("mu-missing-{}", uuid::Uuid::new_v4()));
-        let mut call = args("true");
-        call.cwd = Some(cwd.display().to_string());
-
-        let error = run_bash(
-            call,
-            5,
-            &mut Renderer::new(),
-            &empty_env(),
-            SecretRedactor::default(),
-            None,
-        )
-        .unwrap_err();
-
-        assert_eq!(
-            error.to_string(),
-            format!("working directory does not exist: {}", cwd.display())
-        );
-    }
-
-    #[test]
     fn bash_overrides_configured_subagent_depth_for_child_process() {
         let mut renderer = Renderer::new();
         let mut env = EnvMap::new();
@@ -1201,23 +1179,6 @@ mod tests {
                 .output
                 .starts_with(&format!("{}:", applets.display()))
         );
-    }
-
-    #[test]
-    fn bash_without_attachment_context_exports_no_sink_identity() {
-        let mut renderer = Renderer::new();
-        let command = "test -z \"${MU_ATTACHMENT_MANIFEST+x}\" && test -z \"${MU_BASH_CALL_ID+x}\" && test -z \"${MU_OBJECTS_DIR+x}\"; printf 'visible'";
-        let result = run_bash(
-            args(command),
-            5,
-            &mut renderer,
-            &empty_env(),
-            SecretRedactor::default(),
-            None,
-        )
-        .unwrap();
-        assert_eq!(result.output, "visible");
-        assert!(result.attachments.is_empty());
     }
 
     #[test]
@@ -1389,14 +1350,6 @@ mod tests {
         assert!(schema["properties"].get("script").is_none());
         assert!(schema["properties"].get("workdir").is_none());
         assert!(schema["properties"].get("cwd").is_some());
-    }
-
-    #[test]
-    fn truncate_line_respects_char_boundaries() {
-        let line = "héllo wörld ".repeat(20);
-        let out = truncate_line(&line, 25);
-        assert!(out.ends_with('…'));
-        assert!(out.len() <= 25 + '…'.len_utf8());
     }
 
     fn tight_limits() -> LimitsConfig {

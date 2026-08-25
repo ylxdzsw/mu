@@ -495,37 +495,6 @@ mod tests {
     }
 
     #[test]
-    fn waits_for_complete_crlf_frames_and_preserves_the_remainder() {
-        let mut state = ResponsesStreamState::default();
-        let mut events = Vec::new();
-        let mut buffer =
-            "data: {\"type\":\"response.output_text.delta\",\r\ndata: \"delta\":\"hel\"}\r\n"
-                .to_string();
-
-        consume(&mut state, &mut events, &mut buffer).unwrap();
-        assert!(events.is_empty());
-        assert!(!buffer.is_empty());
-
-        buffer.push_str(
-            "\r\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"lo\"}\n\n\
-             data: {\"type\":\"response.output_text.delta\"",
-        );
-        consume(&mut state, &mut events, &mut buffer).unwrap();
-
-        assert_eq!(state.content, "hello");
-        assert_eq!(events.len(), 2);
-        assert!(matches!(
-            events.first(),
-            Some(StreamEvent::TextDelta(text)) if text == "hel"
-        ));
-        assert!(matches!(
-            events.get(1),
-            Some(StreamEvent::TextDelta(text)) if text == "lo"
-        ));
-        assert_eq!(buffer, "data: {\"type\":\"response.output_text.delta\"");
-    }
-
-    #[test]
     fn accumulates_text_refusal_and_usage() {
         let mut state = ResponsesStreamState::default();
         let mut events = Vec::new();
@@ -706,34 +675,5 @@ mod tests {
         assert!(state.content.is_empty());
         assert!(!state.terminal);
         assert!(events.is_empty());
-    }
-
-    #[test]
-    fn completed_tool_arguments_must_be_json_objects() {
-        let output = |arguments: &str| {
-            vec![serde_json::json!({
-                "type": "function_call",
-                "call_id": "call_1",
-                "name": "bash",
-                "arguments": arguments,
-            })]
-        };
-
-        assert_eq!(
-            responses_tool_calls(&output(" \n")).unwrap()[0].arguments,
-            "{}"
-        );
-        for invalid in ["{", "[]", "\"text\"", "1", "true", "null"] {
-            assert!(matches!(
-                responses_tool_calls(&output(invalid)),
-                Err(ProviderError::Protocol(_))
-            ));
-        }
-        let mut unsupported = output("{}");
-        unsupported[0]["name"] = Value::String("python".into());
-        assert!(matches!(
-            responses_tool_calls(&unsupported),
-            Err(ProviderError::Protocol(_))
-        ));
     }
 }

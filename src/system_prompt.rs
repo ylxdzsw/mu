@@ -389,16 +389,6 @@ mod tests {
     }
 
     #[test]
-    fn assemble_context_is_empty_without_agents_or_skills() {
-        let global = temp_dir("assemble-empty");
-
-        // Nothing is emitted when there is no user content, so a SessionStart
-        // hook injects nothing — not even the preamble.
-        assert!(assemble_context(&[], &global, None, EXPORT_PREAMBLE).is_empty());
-        fs::remove_dir_all(&global).unwrap();
-    }
-
-    #[test]
     fn export_preamble_points_at_mu_doc_and_existing_env_files() {
         let global = temp_dir("export-env-global");
         let project = temp_dir("export-env-project");

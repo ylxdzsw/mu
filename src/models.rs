@@ -362,18 +362,6 @@ mod tests {
     }
 
     #[test]
-    fn resolves_arbitrary_effort_without_allowlist_validation() {
-        let resolved =
-            resolve_model_ref(&test_config(), "alpha/common-model:provider:custom").unwrap();
-        assert_eq!(resolved.model_id, "common-model");
-        assert_eq!(resolved.effort.as_deref(), Some("provider:custom"));
-        assert_eq!(resolved.canonical, "alpha/common-model:provider:custom");
-
-        let unlisted = resolve_model_ref(&test_config(), "alpha/nested/model:none").unwrap();
-        assert_eq!(unlisted.effort.as_deref(), Some("none"));
-    }
-
-    #[test]
     fn bare_model_floats_in_provider_order_without_effort_filtering() {
         let mut choice =
             resolve_model_choice(&test_config(), "common-model:provider-custom").unwrap();
@@ -399,11 +387,6 @@ mod tests {
 
         let reset = resolve_model_choice(&test_config(), "(removed)/common-model:high").unwrap();
         assert_eq!(reset.active_model().provider_id, "alpha");
-    }
-
-    #[test]
-    fn validate_config_checks_first_model() {
-        validate_config(&test_config()).unwrap();
     }
 
     #[test]

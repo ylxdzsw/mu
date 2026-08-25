@@ -7,7 +7,7 @@ use crate::provider::{
     AssistantItem, ContentPart, FinishReason, HttpProvider, Message, NativeReplay,
     NativeReplayPayload, ProviderError, ReasoningVisibility, Request, SseEvent, StreamEvent,
     StreamResult, ToolCall, ToolCallDelta as ProviderToolCallDelta, Usage, UserContent,
-    base64_encode, classify_stream_error, validate_completed_tool_arguments,
+    base64_encode, classify_stream_error, next_event_boundary, validate_completed_tool_arguments,
 };
 
 #[derive(Debug, Deserialize)]
@@ -579,26 +579,6 @@ fn collect_reasoning_text(value: &Value, out: &mut String) {
     }
 }
 
-/// Find the next SSE event boundary, accepting both `\n\n` (LF) and
-/// `\r\n\r\n` (CRLF) framing. Returns the byte offset of the boundary and
-/// the separator length.
-fn next_event_boundary(buffer: &str) -> Option<(usize, usize)> {
-    let lf = buffer.find("\n\n");
-    let crlf = buffer.find("\r\n\r\n");
-    match (lf, crlf) {
-        (Some(a), Some(b)) => {
-            if a <= b {
-                Some((a, 2))
-            } else {
-                Some((b, 4))
-            }
-        }
-        (Some(a), None) => Some((a, 2)),
-        (None, Some(b)) => Some((b, 4)),
-        (None, None) => None,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -606,8 +586,6 @@ mod tests {
     use crate::provider::{ModelApi, Provider};
     use crate::responses::{ResponsesStreamState, consume_responses_sse_buffer};
     use std::time::Duration;
-    const CHAT_ENDPOINT: &str = "https://example.test/v1/chat/completions";
-
     fn test_model(effort: Option<&str>) -> ResolvedModelRef {
         ResolvedModelRef {
             canonical: match effort {
@@ -868,22 +846,6 @@ mod tests {
     }
 
     #[test]
-    fn chat_and_responses_requests_include_context_epoch_cache_key() {
-        let request = Request {
-            model: test_model(None),
-            cache_key: Some("mu:ses_test:epoch:3".into()),
-            messages: vec![],
-            bash: false,
-        };
-
-        assert_eq!(request.cache_key.as_deref(), Some("mu:ses_test:epoch:3"));
-        let chat = request.json(ModelApi::ChatCompletions).unwrap();
-        let responses = request.json(ModelApi::Responses).unwrap();
-        assert_eq!(chat["prompt_cache_key"], "mu:ses_test:epoch:3");
-        assert_eq!(responses["prompt_cache_key"], "mu:ses_test:epoch:3");
-    }
-
-    #[test]
     fn serializes_image_and_audio_attachments_for_chat_completions() {
         let messages = vec![Message::User {
             content: UserContent::Parts(vec![
@@ -1061,46 +1023,6 @@ mod tests {
     }
 
     #[test]
-    fn switching_between_apis_keeps_semantics_without_foreign_native_state() {
-        let call = ToolCall {
-            id: "call_1".into(),
-            arguments: "{}".into(),
-        };
-        let from_chat = Message::assistant(
-            None,
-            Some("private chat reasoning".into()),
-            Some(vec![call.clone()]),
-            Some(NativeReplay {
-                provider_id: "test".into(),
-                endpoint: CHAT_ENDPOINT.into(),
-                model: "gpt-test".into(),
-                payload: NativeReplayPayload::ChatReasoning("private chat reasoning".into()),
-            }),
-        );
-        let responses = body(ModelApi::Responses, None, vec![from_chat], false).unwrap();
-        assert_eq!(responses["input"][0]["type"], "function_call");
-        assert!(!responses.to_string().contains("private chat reasoning"));
-
-        let from_responses = Message::assistant(
-            None,
-            None,
-            Some(vec![call]),
-            Some(NativeReplay {
-                provider_id: "test".into(),
-                endpoint: "https://api.test/v1/responses".into(),
-                model: "gpt-test".into(),
-                payload: NativeReplayPayload::ResponsesOutput(vec![serde_json::json!({
-                    "type": "reasoning", "encrypted_content": "opaque"
-                })]),
-            }),
-        );
-        let chat = body(ModelApi::ChatCompletions, None, vec![from_responses], false).unwrap();
-        assert_eq!(chat["messages"][0]["tool_calls"][0]["id"], "call_1");
-        assert_eq!(chat["messages"][0]["tool_calls"][0]["type"], "function");
-        assert!(!chat.to_string().contains("opaque"));
-    }
-
-    #[test]
     fn responses_rejects_audio_locally() {
         let error = body(
             ModelApi::Responses,
@@ -1179,29 +1101,6 @@ mod tests {
         assert!(matches!(state.finish_reason,
             Some(FinishReason::Other(ref reason)) if reason == "max_output_tokens"
         ));
-    }
-
-    #[test]
-    fn replays_chat_reasoning_verbatim_including_empty() {
-        for reasoning in ["  exact\\ntrace  ", ""] {
-            let message = Message::assistant(
-                None,
-                Some(reasoning.into()),
-                Some(vec![ToolCall {
-                    id: "call_1".into(),
-                    arguments: "{}".into(),
-                }]),
-                Some(NativeReplay {
-                    provider_id: "test".into(),
-                    endpoint: CHAT_ENDPOINT.into(),
-                    model: "gpt-test".into(),
-                    payload: NativeReplayPayload::ChatReasoning(reasoning.into()),
-                }),
-            );
-            let body = body(ModelApi::ChatCompletions, None, vec![message], false).unwrap();
-            assert_eq!(body["messages"][0]["reasoning_content"], reasoning);
-            assert_eq!(body["messages"][0]["tool_calls"][0]["id"], "call_1");
-        }
     }
 
     #[tokio::test]

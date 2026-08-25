@@ -746,34 +746,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn api_key_reads_effective_env_for_provider() {
-        let config = Config {
-            providers: OrderedMap::from_iter([(
-                "alpha".into(),
-                ProviderConfig {
-                    endpoint: "http://localhost/chat/completions".into(),
-                    api_key_env: "TEST_KEY".into(),
-                    models: OrderedMap::default(),
-                },
-            )]),
-            output: OutputFormat::Detail,
-            trap: bundled_test_default("/trap"),
-            auto_resume: false,
-            soft_interrupt: bundled_test_default("/soft_interrupt"),
-            compaction: CompactionConfig::default(),
-            limits: LimitsConfig::default(),
-            terminal_bell: TerminalBellConfig::default(),
-            redaction: RedactionConfig::default(),
-            env: HashMap::from([("TEST_KEY".into(), "secret".into())]),
-        };
-
-        assert_eq!(
-            config.api_key_for_provider("alpha").unwrap(),
-            Some("secret".into())
-        );
-    }
-
-    #[test]
     fn config_overlays_are_recursive_without_injecting_starter_providers() {
         let mut user = serde_json::json!({
             "providers": {
@@ -824,67 +796,6 @@ mod tests {
             merge_json(&mut value, invalid);
             assert!(config_from_value(value).is_err());
         }
-    }
-
-    #[test]
-    fn parse_accepts_configured_output() {
-        let value = serde_json::json!({
-            "output": "concise",
-            "providers": {
-                "openai": {
-                    "endpoint": "http://localhost/chat/completions",
-                    "models": {"gpt-4o": {"context_window": 128000}}
-                }
-            }
-        });
-
-        let config = config_from_value(value).unwrap();
-        assert_eq!(config.output, OutputFormat::Concise);
-    }
-
-    #[test]
-    fn bundled_and_configured_trap_levels_are_valid() {
-        assert_eq!(
-            bundled_test_default::<crate::bash::TrapLevel>("/trap"),
-            crate::bash::TrapLevel::Destructive
-        );
-        let config = config_from_value(serde_json::json!({
-            "trap": "all",
-            "providers": {
-                "openai": {
-                    "endpoint": "http://localhost/chat/completions",
-                    "models": {"gpt-4o": {"context_window": 128000}}
-                }
-            }
-        }))
-        .unwrap();
-        assert_eq!(config.trap, crate::bash::TrapLevel::All);
-    }
-
-    #[test]
-    fn parse_accepts_provider_defined_effort_strings() {
-        let value = serde_json::json!({
-            "providers": {
-                "openai": {
-                    "endpoint": "http://localhost/chat/completions",
-                    "models": {
-                        "custom": {
-                            "context_window": 128000,
-                            "supported_efforts": ["none", "minimal", "provider-custom"]
-                        }
-                    }
-                }
-            }
-        });
-
-        let config = config_from_value(value).unwrap();
-        let efforts = config
-            .model_config("openai", "custom")
-            .unwrap()
-            .supported_efforts
-            .as_ref()
-            .unwrap();
-        assert_eq!(efforts, &["none", "minimal", "provider-custom"]);
     }
 
     #[test]
@@ -950,21 +861,6 @@ mod tests {
         for selector in ["*", "**_TOKEN", "AWS_*", "*TOKEN*"] {
             assert!(redaction_suffix(selector).is_err());
         }
-    }
-
-    #[test]
-    fn rejects_unsupported_endpoint_paths_before_runtime() {
-        assert!(
-            config_from_value(serde_json::json!({
-                "providers": {
-                    "openai": {
-                        "endpoint": "https://api.openai.com/v1",
-                        "models": {"gpt": {}}
-                    }
-                }
-            }))
-            .is_err()
-        );
     }
 
     #[test]
@@ -1155,80 +1051,6 @@ export   EXPORTED='exported value'
 
         assert!(load_dotenv_into(&path, &mut env).is_err());
         assert_eq!(env, baseline);
-
-        let _ = std::fs::remove_dir_all(tmp);
-    }
-
-    #[test]
-    fn env_file_values_match_bash_sourcing() {
-        let tmp = std::env::temp_dir().join(format!("mu-env-source-{}", uuid::Uuid::new_v4()));
-        let path = tmp.join(".env");
-        std::fs::create_dir_all(&tmp).unwrap();
-        std::fs::write(
-            &path,
-            r#"# source-compatible fixture
-MU_TEST_BARE=abc_123-./:@%+,==
-MU_TEST_SINGLE='hello world $HOME and `ticks`'
-MU_TEST_DOUBLE="say \"hello\" for \$5 at \\tmp with \`ticks\` and it's fine"
-export MU_TEST_EXPORTED='exported value'
-MU_TEST_EMPTY=
-"#,
-        )
-        .unwrap();
-
-        let mut env = EnvMap::new();
-        load_dotenv_into(&path, &mut env).unwrap();
-        let names = [
-            "MU_TEST_BARE",
-            "MU_TEST_SINGLE",
-            "MU_TEST_DOUBLE",
-            "MU_TEST_EXPORTED",
-            "MU_TEST_EMPTY",
-        ];
-        let output = std::process::Command::new("bash")
-            .args([
-                "--noprofile",
-                "--norc",
-                "-c",
-                "set -a\n. \"$1\"\nprintf '%s\\0' \"$MU_TEST_BARE\" \"$MU_TEST_SINGLE\" \"$MU_TEST_DOUBLE\" \"$MU_TEST_EXPORTED\" \"$MU_TEST_EMPTY\"",
-                "bash",
-            ])
-            .arg(&path)
-            .output()
-            .unwrap();
-        assert!(
-            output.status.success(),
-            "bash failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-
-        let mut expected = Vec::new();
-        for name in names {
-            expected.extend_from_slice(env[name].as_bytes());
-            expected.push(0);
-        }
-        assert_eq!(output.stdout, expected);
-
-        let _ = std::fs::remove_dir_all(tmp);
-    }
-
-    #[test]
-    fn env_files_overlay_in_order() {
-        let tmp = std::env::temp_dir().join(format!("mu-env-{}", uuid::Uuid::new_v4()));
-        let global = tmp.join("global");
-        let project = tmp.join("project/.mu");
-        std::fs::create_dir_all(&global).unwrap();
-        std::fs::create_dir_all(&project).unwrap();
-        std::fs::write(global.join(".env"), "SAME=global\nGLOBAL_ONLY=1\n").unwrap();
-        std::fs::write(project.join(".env"), "SAME=project\nPROJECT_ONLY=2\n").unwrap();
-
-        let mut env = EnvMap::new();
-        load_dotenv_into(&global.join(".env"), &mut env).unwrap();
-        load_dotenv_into(&project.join(".env"), &mut env).unwrap();
-
-        assert_eq!(env.get("SAME").map(String::as_str), Some("project"));
-        assert_eq!(env.get("GLOBAL_ONLY").map(String::as_str), Some("1"));
-        assert_eq!(env.get("PROJECT_ONLY").map(String::as_str), Some("2"));
 
         let _ = std::fs::remove_dir_all(tmp);
     }

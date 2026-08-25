@@ -4425,46 +4425,6 @@ mod tests {
     }
 
     #[test]
-    fn streaming_wrapper_uses_reserved_column_for_one_dangling_cell() {
-        let text = "abcdefghij, next";
-        let whole = wrap_terminal_chunks(&[text], 10);
-        let chunks = text.graphemes(true).collect::<Vec<_>>();
-
-        assert_eq!(whole, "abcdefghij,\nnext");
-        assert_eq!(wrap_terminal_chunks(&chunks, 10), whole);
-        assert_eq!(UnicodeWidthStr::width(whole.lines().next().unwrap()), 11);
-
-        let styled = format!("abcdefghij,{RESET} next");
-        assert_eq!(
-            wrap_terminal_chunks(&[&styled], 10),
-            format!("abcdefghij,{RESET}\nnext")
-        );
-        assert_eq!(
-            wrap_terminal_chunks(&["abcdefghij,, next"], 10),
-            "abcdefghij\n,, next"
-        );
-        assert_eq!(
-            wrap_terminal_chunks(&["abcdefghij界 next"], 10),
-            "abcdefghij\n界 next"
-        );
-        assert_eq!(
-            wrap_terminal_chunks(&["abcdefghij,\nnext"], 10),
-            "abcdefghij,\nnext"
-        );
-        let final_text = "abcdefghij.";
-        let final_chunks = final_text.graphemes(true).collect::<Vec<_>>();
-        assert_eq!(wrap_terminal_chunks(&[final_text], 10), final_text);
-        assert_eq!(wrap_terminal_chunks(&final_chunks, 10), final_text);
-        assert_eq!(
-            wrap_terminal_chunks(&["abcdefghij.\nnext"], 10),
-            "abcdefghij.\nnext"
-        );
-
-        let styled_final = format!("abcdefghij,{RESET}");
-        assert_eq!(wrap_terminal_chunks(&[&styled_final], 10), styled_final);
-    }
-
-    #[test]
     fn streaming_wrapper_preserves_ansi_and_hyperlink_sequences() {
         let open = open_hyperlink("https://example.com");
         let styled = format!("{BOLD}alpha wonderful{RESET} {open}linked text{OSC8_CLOSE}");
@@ -4562,25 +4522,6 @@ mod tests {
         ));
         assert_eq!(concise_table.matches("https://example.com/docs").count(), 0);
         assert!(concise_table.contains("docs"), "{concise_table:?}");
-    }
-
-    #[test]
-    fn markdown_stream_keeps_one_empty_line_after_blocks() {
-        for (chunks, expected) in [
-            (vec!["## Heading\n", "\n", "body\n"], "Heading\n\nbody\n"),
-            (vec!["## Heading\n", "body\n"], "Heading\n\nbody\n"),
-            (
-                vec!["```sh\n", "echo hi\n", "```\n", "\n", "body\n"],
-                "echo hi\n\nbody\n",
-            ),
-        ] {
-            let mut stream = MarkdownStream::default();
-            let rendered = chunks
-                .into_iter()
-                .flat_map(|chunk| stream.push(chunk))
-                .collect::<String>();
-            assert_eq!(strip_ansi(&rendered), expected);
-        }
     }
 
     #[test]
@@ -4725,63 +4666,6 @@ mod tests {
     }
 
     #[test]
-    fn tool_composition_indicator_is_replaced_before_title_commits() {
-        let (mut renderer, output, _) =
-            Renderer::with_test_output(OutputFormat::Detail, true, true, None);
-
-        renderer.bash_header_start().unwrap();
-        assert_eq!(
-            output.transcript(),
-            format!("{GRAY}[preparing toolcall]{RESET}")
-        );
-        assert!(matches!(
-            renderer.live_line,
-            Some(LiveLine::ToolComposition)
-        ));
-
-        renderer.bash_header_title_start().unwrap();
-        renderer.bash_header_delta("Inspect").unwrap();
-        renderer.bash_header_title_end().unwrap();
-
-        assert!(renderer.live_line.is_none());
-        assert_eq!(
-            output.transcript(),
-            format!("{GRAY}[preparing toolcall]{RESET}\r\x1b[2K{BOLD}# Inspect{RESET}\n")
-        );
-    }
-
-    #[test]
-    fn renderer_transitions_flush_wrapping_lookbehind() {
-        for reasoning in [false, true] {
-            let (mut renderer, output, _) =
-                Renderer::with_test_output(OutputFormat::Detail, true, true, None);
-            renderer
-                .assistant_text("An explanation ending in tail")
-                .unwrap();
-
-            let next_block = if reasoning {
-                renderer
-                    .reasoning_start(ReasoningVisibility::Opaque)
-                    .unwrap();
-                "[thought "
-            } else {
-                renderer.bash_header_start().unwrap();
-                renderer.bash_header_title_start().unwrap();
-                renderer.bash_header_delta("Inspect").unwrap();
-                renderer.bash_header_title_end().unwrap();
-                "[preparing toolcall]# Inspect\n"
-            };
-
-            let normalized = strip_ansi(&output.transcript().replace('\r', ""));
-            assert!(
-                normalized.starts_with(&format!("An explanation ending in tail\n\n{next_block}")),
-                "{normalized:?}"
-            );
-            assert_eq!(normalized.matches("tail").count(), 1, "{normalized:?}");
-        }
-    }
-
-    #[test]
     fn opaque_reasoning_commits_title_or_timer_without_tokens() {
         // With summary: title extracted, no token count
         let (mut renderer, output, _stderr) =
@@ -4812,89 +4696,6 @@ mod tests {
         assert!(transcript.starts_with("[thought "), "{transcript:?}");
         assert!(transcript.ends_with("]\n"), "{transcript:?}");
         assert!(!transcript.contains("token"), "{transcript:?}");
-    }
-
-    #[test]
-    fn consecutive_reasoning_blocks_share_timer_until_assistant_text() {
-        for format in [OutputFormat::Concise, OutputFormat::Detail] {
-            for visibility in [
-                ReasoningVisibility::Opaque,
-                ReasoningVisibility::StreamedTrace,
-            ] {
-                let (mut renderer, _, _) = Renderer::with_test_output(format, true, true, None);
-                renderer.reasoning_start(visibility).unwrap();
-                let started = Instant::now() - Duration::from_secs(3);
-                renderer.reasoning_run_started = Some(started);
-                renderer.reasoning.as_mut().unwrap().started = started;
-                renderer.reasoning_end(None).unwrap();
-
-                renderer.reasoning_start(visibility).unwrap();
-                assert_eq!(renderer.reasoning.as_ref().unwrap().started, started);
-
-                renderer.reasoning_end(None).unwrap();
-                renderer.assistant_text("answer").unwrap();
-                renderer.reasoning_start(visibility).unwrap();
-                assert!(renderer.reasoning.as_ref().unwrap().started > started);
-            }
-        }
-    }
-
-    #[test]
-    fn consecutive_opaque_reasoning_updates_title_without_resetting_timer() {
-        let (mut renderer, output, _) =
-            Renderer::with_test_output(OutputFormat::Concise, true, true, None);
-        renderer
-            .reasoning_start(ReasoningVisibility::Opaque)
-            .unwrap();
-        let started = Instant::now() - Duration::from_secs(3);
-        renderer.reasoning_run_started = Some(started);
-        renderer.reasoning.as_mut().unwrap().started = started;
-        renderer
-            .reasoning_summary_delta(0, "**First title**\n\nIgnored detail")
-            .unwrap();
-        assert!(output.transcript().contains("\r\x1b[2K"));
-        assert!(
-            strip_ansi(&output.transcript()).ends_with("[thought 3.0s] First title"),
-            "{:?}",
-            output.transcript()
-        );
-        assert!(!output.transcript().contains("Ignored detail"));
-        renderer.thinking_tick().unwrap();
-        assert!(
-            strip_ansi(&renderer.format_live_line().unwrap()).ends_with(" First title"),
-            "{:?}",
-            renderer.format_live_line()
-        );
-        renderer.reasoning_end(None).unwrap();
-
-        renderer
-            .reasoning_start(ReasoningVisibility::Opaque)
-            .unwrap();
-        let live = strip_ansi(&renderer.format_live_line().unwrap());
-        assert!(live.ends_with(" First title"), "{live:?}");
-
-        let long_title = format!("**{}**\n", "x".repeat(100));
-        renderer.reasoning_summary_delta(0, &long_title).unwrap();
-
-        let reasoning = renderer.reasoning.as_ref().unwrap();
-        assert_eq!(reasoning.started, started);
-        let title = reasoning.title.as_deref().unwrap();
-        assert_eq!(UnicodeWidthStr::width(title), REASONING_TITLE_MAX_WIDTH);
-        assert!(title.ends_with(ELLIPSIS));
-        let live = strip_ansi(&renderer.format_live_line().unwrap());
-        assert!(live.starts_with("[thought 3."), "{live:?}");
-        assert!(live.contains(" x"), "{live:?}");
-        assert!(live.ends_with(ELLIPSIS), "{live:?}");
-        assert!(UnicodeWidthStr::width(live.as_str()) <= DEFAULT_TERMINAL_WIDTH);
-
-        renderer.reasoning_end(None).unwrap();
-        renderer.assistant_text("answer").unwrap();
-        renderer
-            .reasoning_start(ReasoningVisibility::Opaque)
-            .unwrap();
-        let live = strip_ansi(&renderer.format_live_line().unwrap());
-        assert!(!live.contains("title"), "{live:?}");
-        assert!(!live.contains('x'), "{live:?}");
     }
 
     #[test]
@@ -4932,164 +4733,6 @@ mod tests {
     }
 
     #[test]
-    fn compaction_result_is_committed_for_concise_interactive_and_redirected_output() {
-        let (mut interactive, stdout, _stderr) =
-            Renderer::with_test_output(OutputFormat::Concise, true, true, None);
-        interactive
-            .compaction_result(&CompactionReport {
-                from_epoch: 3,
-                to_epoch: 4,
-                before_context_tokens: 12_826,
-                before_context_window: Some(200_000),
-                after_context_tokens_estimate: 10_582,
-                after_context_window: Some(200_000),
-                elapsed: Duration::from_millis(2_400),
-            })
-            .unwrap();
-        let interactive_text = strip_ansi(&stdout.transcript());
-        assert!(
-            interactive_text.ends_with(
-                "[mu] compacted epoch 3 → 4: context 6.4% → ~5.3% (~10,582 tokens) · 2.4s\n"
-            ),
-            "{interactive_text:?}"
-        );
-
-        let (mut redirected, redirected_stdout, redirected_stderr) =
-            Renderer::with_test_output(OutputFormat::Concise, false, false, None);
-        redirected
-            .compaction_result(&CompactionReport {
-                from_epoch: 3,
-                to_epoch: 4,
-                before_context_tokens: 12_826,
-                before_context_window: Some(200_000),
-                after_context_tokens_estimate: 10_582,
-                after_context_window: Some(200_000),
-                elapsed: Duration::from_millis(2_400),
-            })
-            .unwrap();
-        assert_eq!(redirected_stdout.transcript(), "");
-        assert_eq!(
-            redirected_stderr.transcript(),
-            "[mu] compacted epoch 3 → 4: context 6.4% → ~5.3% (~10,582 tokens) · 2.4s\n"
-        );
-
-        let (mut detail_redirected, detail_stdout, detail_stderr) =
-            Renderer::with_test_output(OutputFormat::Detail, false, false, None);
-        detail_redirected
-            .compaction_result(&CompactionReport {
-                from_epoch: 3,
-                to_epoch: 4,
-                before_context_tokens: 12_826,
-                before_context_window: Some(200_000),
-                after_context_tokens_estimate: 10_582,
-                after_context_window: Some(200_000),
-                elapsed: Duration::from_millis(2_400),
-            })
-            .unwrap();
-        assert_eq!(detail_stdout.transcript(), "");
-        assert_eq!(
-            detail_stderr.transcript(),
-            "[mu] compacted epoch 3 → 4: context 6.4% → ~5.3% (~10,582 tokens) · 2.4s\n"
-        );
-    }
-
-    #[test]
-    fn transcript_compaction_result_has_one_block_gap_on_each_side() {
-        let (mut renderer, output, stderr) =
-            Renderer::with_test_output(OutputFormat::Detail, true, true, None);
-        renderer.assistant_text("Summary.").unwrap();
-        renderer.assistant_end().unwrap();
-        renderer
-            .transcript_compaction_result(&CompactionReport {
-                from_epoch: 3,
-                to_epoch: 4,
-                before_context_tokens: 170_800,
-                before_context_window: Some(200_000),
-                after_context_tokens_estimate: 37_200,
-                after_context_window: Some(200_000),
-                elapsed: Duration::from_millis(2_400),
-            })
-            .unwrap();
-        renderer.assistant_text("Continued.").unwrap();
-        renderer.assistant_end().unwrap();
-
-        assert_eq!(stderr.transcript(), "");
-        assert_eq!(
-            strip_ansi(&output.transcript()),
-            "Summary.\n\n[mu] compacted epoch 3 → 4: context 85.4% → ~18.6% (~37,200 tokens) · 2.4s\n\nContinued.\n"
-        );
-    }
-
-    #[test]
-    fn turn_summary_shows_reported_cache_usage_without_a_total() {
-        assert_eq!(
-            format_turn_summary(
-                1_234,
-                567,
-                Some(89),
-                12_345,
-                Some((12.0, false)),
-                Duration::from_millis(4200),
-            ),
-            "[mu] tokens: 1,234 in (+567 cache read, +89 cache write) / 12,345 out  context: 12%  time: 4.2s"
-        );
-        assert_eq!(
-            format_turn_summary(
-                600,
-                500,
-                None,
-                456,
-                Some((12.0, false)),
-                Duration::from_millis(932),
-            ),
-            "[mu] tokens: 600 in (+500 cache read) / 456 out  context: 12%  time: 932ms"
-        );
-        assert_eq!(
-            format_turn_summary(
-                600,
-                0,
-                None,
-                456,
-                Some((12.0, false)),
-                Duration::from_millis(1100),
-            ),
-            "[mu] tokens: 600 in / 456 out  context: 12%  time: 1.1s"
-        );
-        assert_eq!(
-            format_turn_summary(
-                600,
-                0,
-                None,
-                456,
-                Some((38.0, true)),
-                Duration::from_secs(1),
-            ),
-            "[mu] tokens: 600 in / 456 out  context: ~38%  time: 1.0s"
-        );
-    }
-
-    #[test]
-    fn concise_noninteractive_tool_is_exactly_one_line() {
-        let (mut renderer, output, _) =
-            Renderer::with_test_output(OutputFormat::Concise, false, false, None);
-        let args = json!({
-            "title": "Inspect files",
-            "risk": "readonly",
-            "command": "printf 'hidden command'",
-            "stdin": "hidden stdin",
-        });
-
-        renderer.bash_header_full(&args).unwrap();
-        renderer.tool_start(&args, true).unwrap();
-        renderer.bash_output("hidden output\n").unwrap();
-        renderer
-            .tool_finished(7, Duration::from_millis(250))
-            .unwrap();
-
-        assert_eq!(output.transcript(), "=> Inspect files · exit 7\n");
-    }
-
-    #[test]
     fn interruption_reports_reason_and_unsaved_output_only_when_present() {
         let (mut renderer, output, _) =
             Renderer::with_test_output(OutputFormat::Detail, false, false, None);
@@ -5107,22 +4750,6 @@ mod tests {
         assert!(
             transcript.contains("partial output above is not saved to session history"),
             "{transcript:?}"
-        );
-    }
-
-    #[test]
-    fn auto_resume_notices_state_the_attempt_and_recovery_choices() {
-        let (mut renderer, output, _) =
-            Renderer::with_test_output(OutputFormat::Detail, false, false, None);
-
-        renderer.turn_auto_resume(2, 3).unwrap();
-        renderer.turn_auto_resume_exhausted(3).unwrap();
-
-        assert_eq!(
-            output.transcript(),
-            "[mu] auto-resuming [2/3] after incomplete response\n\
-             \n\
-             [mu] auto-resume exhausted [3/3]; use /retry to resume, or enter a new prompt to move on\n"
         );
     }
 

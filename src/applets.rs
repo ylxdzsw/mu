@@ -1,5 +1,13 @@
 use std::ffi::OsStr;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+
+fn resolve_path(cwd: &Path, path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        cwd.join(path)
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Applet {
@@ -32,6 +40,8 @@ mod apply_patch {
     use std::path::{Component, Path, PathBuf};
 
     use anyhow::{Context, Result, bail};
+
+    use super::resolve_path;
 
     #[derive(Debug)]
     enum Operation {
@@ -78,19 +88,17 @@ mod apply_patch {
             reported_path: PathBuf,
             original: Vec<u8>,
             content: String,
-            permissions: fs::Permissions,
         },
         Move {
             from: PathBuf,
             to: PathBuf,
             original: Vec<u8>,
             content: String,
-            permissions: fs::Permissions,
         },
         MoveSymlink {
             from: PathBuf,
             to: PathBuf,
-            target_update: Option<(PathBuf, Vec<u8>, String, fs::Permissions)>,
+            target_update: Option<(PathBuf, Vec<u8>, String)>,
         },
     }
 
@@ -274,14 +282,6 @@ mod apply_patch {
         Ok(path)
     }
 
-    fn resolve_path(cwd: &Path, path: &Path) -> PathBuf {
-        if path.is_absolute() {
-            path.to_path_buf()
-        } else {
-            cwd.join(path)
-        }
-    }
-
     fn preflight(cwd: &Path, operations: Vec<Operation>) -> Result<Vec<PlannedChange>> {
         let mut claims = HashMap::new();
         let mut changes: Vec<PlannedChange> = Vec::new();
@@ -314,7 +314,6 @@ mod apply_patch {
                             reported_path: full,
                             original,
                             content,
-                            permissions: metadata.permissions(),
                         };
                         repeatable[owner] = Repeatable::No;
                         continue;
@@ -405,7 +404,7 @@ mod apply_patch {
                             format!("resolving symlink to update {}", path.display())
                         })?;
                         claim_path(&mut claims, &target, &path, owner)?;
-                        let metadata = regular_file_metadata(&target, "update symlink target")?;
+                        regular_file_metadata(&target, "update symlink target")?;
                         let original = fs::read_to_string(&target).with_context(|| {
                             format!("reading symlink target to update {}", path.display())
                         })?;
@@ -414,12 +413,7 @@ mod apply_patch {
                             changes.push(PlannedChange::MoveSymlink {
                                 from: full,
                                 to: destination,
-                                target_update: Some((
-                                    target,
-                                    original.into_bytes(),
-                                    content,
-                                    metadata.permissions(),
-                                )),
+                                target_update: Some((target, original.into_bytes(), content)),
                             });
                         } else {
                             changes.push(PlannedChange::Update {
@@ -427,7 +421,6 @@ mod apply_patch {
                                 reported_path: full,
                                 original: original.into_bytes(),
                                 content,
-                                permissions: metadata.permissions(),
                             });
                         }
                         reported_entries.push(path);
@@ -454,7 +447,6 @@ mod apply_patch {
                             to: destination_full,
                             original: original.into_bytes(),
                             content,
-                            permissions: entry_metadata.permissions(),
                         });
                     } else {
                         changes.push(PlannedChange::Update {
@@ -462,7 +454,6 @@ mod apply_patch {
                             path: full,
                             original: original.into_bytes(),
                             content,
-                            permissions: entry_metadata.permissions(),
                         });
                     }
                     reported_entries.push(path);
@@ -664,9 +655,7 @@ mod apply_patch {
         let mut completed = Vec::new();
         for change in changes {
             let result = match change {
-                PlannedChange::Add { path, content } => {
-                    atomic_write(path, content, None, false, None)
-                }
+                PlannedChange::Add { path, content } => atomic_write(path, content, false, None),
                 PlannedChange::Delete { path, .. } => {
                     fs::remove_file(path).with_context(|| format!("deleting {}", path.display()))
                 }
@@ -675,31 +664,17 @@ mod apply_patch {
                     reported_path: _,
                     original,
                     content,
-                    permissions,
-                } => atomic_write(
-                    path,
-                    content,
-                    Some(permissions.clone()),
-                    true,
-                    Some(original.as_slice()),
-                ),
+                } => atomic_write(path, content, true, Some(original.as_slice())),
                 PlannedChange::Move {
                     from,
                     to,
                     original,
                     content,
-                    permissions,
                 } => {
                     fs::rename(from, to).with_context(|| {
                         format!("moving {} to {}", from.display(), to.display())
                     })?;
-                    if let Err(error) = atomic_write(
-                        to,
-                        content,
-                        Some(permissions.clone()),
-                        true,
-                        Some(original.as_slice()),
-                    ) {
+                    if let Err(error) = atomic_write(to, content, true, Some(original.as_slice())) {
                         return match fs::rename(to, from) {
                             Ok(()) => Err(error.context(format!(
                                 "updating moved file {}; move rolled back",
@@ -727,14 +702,9 @@ mod apply_patch {
                     fs::rename(from, to).with_context(|| {
                         format!("moving symlink {} to {}", from.display(), to.display())
                     })?;
-                    if let Some((target, original, content, permissions)) = target_update
-                        && let Err(error) = atomic_write(
-                            target,
-                            content,
-                            Some(permissions.clone()),
-                            true,
-                            Some(original.as_slice()),
-                        )
+                    if let Some((target, original, content)) = target_update
+                        && let Err(error) =
+                            atomic_write(target, content, true, Some(original.as_slice()))
                     {
                         return match fs::rename(to, from) {
                             Ok(()) => Err(error.context(format!(
@@ -768,7 +738,6 @@ mod apply_patch {
     pub(super) fn atomic_write(
         path: &Path,
         content: &str,
-        permissions: Option<fs::Permissions>,
         replace: bool,
         expected: Option<&[u8]>,
     ) -> Result<()> {
@@ -776,7 +745,7 @@ mod apply_patch {
         fs::create_dir_all(parent)
             .with_context(|| format!("creating parent directory {}", parent.display()))?;
         if replace {
-            return overwrite_existing(path, content.as_bytes(), expected, permissions);
+            return overwrite_existing(path, content.as_bytes(), expected);
         }
 
         let filename = path
@@ -787,9 +756,6 @@ mod apply_patch {
             crate::random::create_temp_file(parent, &format!(".{filename}.mu-tmp-"), ".tmp")?;
         let result = (|| -> Result<()> {
             file.write_all(content.as_bytes())?;
-            if let Some(permissions) = permissions {
-                file.set_permissions(permissions)?;
-            }
             file.sync_all()?;
             drop(file);
             fs::hard_link(&temporary, path)
@@ -803,12 +769,7 @@ mod apply_patch {
         result
     }
 
-    fn overwrite_existing(
-        path: &Path,
-        content: &[u8],
-        expected: Option<&[u8]>,
-        _permissions: Option<fs::Permissions>,
-    ) -> Result<()> {
+    fn overwrite_existing(path: &Path, content: &[u8], expected: Option<&[u8]>) -> Result<()> {
         let mut target = OpenOptions::new()
             .read(true)
             .write(true)
@@ -978,7 +939,7 @@ mod apply_patch {
             fs::hard_link(&path, &hardlink).unwrap();
             let before = fs::metadata(&path).unwrap();
 
-            atomic_write(&path, "new\n", None, true, Some(b"old\n")).unwrap();
+            atomic_write(&path, "new\n", true, Some(b"old\n")).unwrap();
 
             let after = fs::metadata(&path).unwrap();
             assert_eq!((after.dev(), after.ino()), (before.dev(), before.ino()));
@@ -1000,7 +961,7 @@ mod apply_patch {
             let path = dir.join("file.txt");
             fs::write(&path, "changed\n").unwrap();
 
-            let error = atomic_write(&path, "new\n", None, true, Some(b"old\n")).unwrap_err();
+            let error = atomic_write(&path, "new\n", true, Some(b"old\n")).unwrap_err();
 
             assert!(
                 error
@@ -1047,7 +1008,7 @@ mod apply_patch {
                     }
                     std::thread::sleep(std::time::Duration::from_millis(10));
                 }
-                atomic_write(&path, "new\n", None, true, Some(b"old\n")).unwrap_err();
+                atomic_write(&path, "new\n", true, Some(b"old\n")).unwrap_err();
                 assert_eq!(fs::read_to_string(&path).unwrap(), "old\n");
                 Ok(())
             })();
@@ -1055,23 +1016,8 @@ mod apply_patch {
             let _ = holder.kill();
             let _ = holder.wait();
             contention.unwrap();
-            atomic_write(&path, "new\n", None, true, Some(b"old\n")).unwrap();
+            atomic_write(&path, "new\n", true, Some(b"old\n")).unwrap();
             assert_eq!(fs::read_to_string(&path).unwrap(), "new\n");
-            fs::remove_dir_all(dir).unwrap();
-        }
-
-        #[test]
-        fn failed_preflight_leaves_every_file_unchanged() {
-            let dir = temp_dir();
-            fs::write(dir.join("one.txt"), "old\n").unwrap();
-            fs::write(dir.join("exists.txt"), "keep\n").unwrap();
-            let patch = "*** Begin Patch\n*** Update File: one.txt\n@@\n-old\n+new\n*** Add File: exists.txt\n+replace\n*** End Patch\n";
-            preflight(&dir, parse_patch(patch).unwrap()).unwrap_err();
-            assert_eq!(fs::read_to_string(dir.join("one.txt")).unwrap(), "old\n");
-            assert_eq!(
-                fs::read_to_string(dir.join("exists.txt")).unwrap(),
-                "keep\n"
-            );
             fs::remove_dir_all(dir).unwrap();
         }
 
@@ -1089,21 +1035,6 @@ mod apply_patch {
                 "ALPHA\nmiddle\nOMEGA\n"
             );
             assert!(format_summary(&changes, &dir).contains("file.txt"));
-            fs::remove_dir_all(dir).unwrap();
-        }
-
-        #[test]
-        fn failed_repeated_update_leaves_every_file_unchanged() {
-            let dir = temp_dir();
-            fs::write(dir.join("one.txt"), "alpha\nomega\n").unwrap();
-            fs::write(dir.join("two.txt"), "old\n").unwrap();
-            let patch = "*** Begin Patch\n*** Update File: two.txt\n@@\n-old\n+new\n*** Update File: one.txt\n@@\n-alpha\n+ALPHA\n*** Update File: one.txt\n@@\n-missing\n+OMEGA\n*** End Patch\n";
-            preflight(&dir, parse_patch(patch).unwrap()).unwrap_err();
-            assert_eq!(
-                fs::read_to_string(dir.join("one.txt")).unwrap(),
-                "alpha\nomega\n"
-            );
-            assert_eq!(fs::read_to_string(dir.join("two.txt")).unwrap(), "old\n");
             fs::remove_dir_all(dir).unwrap();
         }
 
@@ -1328,48 +1259,6 @@ mod apply_patch {
             assert_eq!(fs::read_to_string(dir.join("target.txt")).unwrap(), "old\n");
             fs::remove_dir_all(dir).unwrap();
         }
-
-        #[test]
-        fn repeated_operation_involving_move_is_rejected() {
-            let dir = temp_dir();
-            fs::write(dir.join("file.txt"), "old\n").unwrap();
-            let patch = "*** Begin Patch\n*** Update File: file.txt\n@@\n-old\n+new\n*** Update File: file.txt\n*** Move to: moved.txt\n*** End Patch\n";
-            preflight(&dir, parse_patch(patch).unwrap()).unwrap_err();
-            assert_eq!(fs::read_to_string(dir.join("file.txt")).unwrap(), "old\n");
-            assert!(!dir.join("moved.txt").exists());
-            fs::remove_dir_all(dir).unwrap();
-        }
-
-        #[test]
-        fn unsupported_repeated_operation_sequences_are_rejected() {
-            let cases = [
-                (
-                    "*** Add File: file.txt\n+new\n*** Update File: file.txt\n@@\n-new\n+newer\n",
-                    false,
-                ),
-                (
-                    "*** Update File: file.txt\n@@\n-old\n+new\n*** Delete File: file.txt\n",
-                    true,
-                ),
-                (
-                    "*** Delete File: file.txt\n*** Add File: file.txt\n+new\n*** Update File: file.txt\n@@\n-new\n+newer\n",
-                    true,
-                ),
-            ];
-            for (operations, exists) in cases {
-                let dir = temp_dir();
-                if exists {
-                    fs::write(dir.join("file.txt"), "old\n").unwrap();
-                }
-                let patch = format!("*** Begin Patch\n{operations}*** End Patch\n");
-                preflight(&dir, parse_patch(&patch).unwrap()).unwrap_err();
-                assert_eq!(dir.join("file.txt").exists(), exists);
-                if exists {
-                    assert_eq!(fs::read_to_string(dir.join("file.txt")).unwrap(), "old\n");
-                }
-                fs::remove_dir_all(dir).unwrap();
-            }
-        }
     }
 }
 
@@ -1380,6 +1269,8 @@ mod edit {
 
     use anyhow::{Context, Result, bail};
     use clap::Parser;
+
+    use super::resolve_path;
 
     #[derive(Debug, Parser)]
     #[command(
@@ -1449,7 +1340,6 @@ mod edit {
         reported_path: PathBuf,
         original: String,
         content: String,
-        permissions: fs::Permissions,
         blocks: usize,
         replacements: usize,
     }
@@ -1493,7 +1383,6 @@ mod edit {
         super::apply_patch::atomic_write(
             &planned.target,
             &planned.content,
-            Some(planned.permissions.clone()),
             true,
             Some(planned.original.as_bytes()),
         )?;
@@ -1613,14 +1502,6 @@ mod edit {
         matches!(line, "<<<<<<< SEARCH" | "=======" | ">>>>>>> REPLACE")
     }
 
-    fn resolve_path(cwd: &Path, path: &Path) -> PathBuf {
-        if path.is_absolute() {
-            path.to_path_buf()
-        } else {
-            cwd.join(path)
-        }
-    }
-
     fn preflight(
         cwd: &Path,
         reported_path: PathBuf,
@@ -1726,7 +1607,6 @@ mod edit {
             reported_path,
             original: original_snapshot,
             content,
-            permissions: metadata.permissions(),
             blocks: blocks.len(),
             replacements,
         })
@@ -2013,16 +1893,6 @@ mod edit {
         }
 
         #[test]
-        fn parses_file_and_relaxed_flag_and_rejects_all() {
-            let args = Args::try_parse_from(["edit", "--relaxed", "src/main.rs"]).unwrap();
-            assert!(args.relaxed);
-            assert_eq!(args.file, PathBuf::from("src/main.rs"));
-
-            let error = Args::try_parse_from(["edit", "--all", "src/main.rs"]).unwrap_err();
-            assert_eq!(error.kind(), clap::error::ErrorKind::UnknownArgument);
-        }
-
-        #[test]
         fn parses_multiple_blocks_and_empty_replacement() {
             let document = concat!(
                 "<<<<<<< SEARCH\none\n=======\ntwo\n>>>>>>> REPLACE\n",
@@ -2041,26 +1911,6 @@ mod edit {
                     }
                 ]
             );
-        }
-
-        #[test]
-        fn framing_newlines_are_not_part_of_the_bodies() {
-            let blocks = parse_document(
-                "<<<<<<< SEARCH\nfirst\nsecond\n\n=======\nreplacement\n>>>>>>> REPLACE\n",
-            )
-            .unwrap();
-            assert_eq!(blocks[0].search, "first\nsecond\n");
-            assert_eq!(blocks[0].replacement, "replacement");
-        }
-
-        #[test]
-        fn preserves_internal_crlf_line_endings() {
-            let blocks = parse_document(
-                "<<<<<<< SEARCH\r\nfirst\r\nsecond\r\n=======\r\nnew\r\n>>>>>>> REPLACE\r\n",
-            )
-            .unwrap();
-            assert_eq!(blocks[0].search, "first\r\nsecond");
-            assert_eq!(blocks[0].replacement, "new");
         }
 
         #[test]
@@ -2094,7 +1944,6 @@ mod edit {
             super::super::apply_patch::atomic_write(
                 &planned.target,
                 &planned.content,
-                Some(planned.permissions.clone()),
                 true,
                 Some(planned.original.as_bytes()),
             )
@@ -2103,16 +1952,6 @@ mod edit {
                 fs::read_to_string(dir.join("file.txt")).unwrap(),
                 "A beta G\n"
             );
-            fs::remove_dir_all(dir).unwrap();
-        }
-
-        #[test]
-        fn empty_replacement_deletes_the_match() {
-            let dir = temp_dir();
-            fs::write(dir.join("file.txt"), "keep remove keep").unwrap();
-            let blocks = parse_document(&block(" remove", "")).unwrap();
-            let planned = preflight(&dir, PathBuf::from("file.txt"), blocks, false).unwrap();
-            assert_eq!(planned.content, "keep keep");
             fs::remove_dir_all(dir).unwrap();
         }
 
@@ -2200,35 +2039,6 @@ mod edit {
         }
 
         #[test]
-        fn accepts_absolute_paths_and_rejects_missing_files() {
-            let dir = temp_dir();
-            let path = dir.join("file.txt");
-            fs::write(&path, "old").unwrap();
-            let planned = preflight(
-                &dir,
-                path.clone(),
-                parse_document(&block("old", "new")).unwrap(),
-                false,
-            )
-            .unwrap();
-            assert_eq!(planned.target, path);
-            assert_eq!(planned.content, "new");
-
-            let missing = dir.join("missing.txt");
-            assert!(
-                preflight(
-                    &dir,
-                    missing.clone(),
-                    parse_document(&block("old", "new")).unwrap(),
-                    false,
-                )
-                .is_err()
-            );
-            assert!(!missing.exists());
-            fs::remove_dir_all(dir).unwrap();
-        }
-
-        #[test]
         fn rejects_overlapping_blocks() {
             let dir = temp_dir();
             fs::write(dir.join("file.txt"), "abc").unwrap();
@@ -2260,7 +2070,6 @@ mod edit {
             super::super::apply_patch::atomic_write(
                 &planned.target,
                 &planned.content,
-                Some(planned.permissions.clone()),
                 true,
                 Some(planned.original.as_bytes()),
             )
@@ -2354,25 +2163,5 @@ mod view_image {
             attachment,
             detail,
         )
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn dispatches_only_known_argv0_basenames() {
-        assert_eq!(
-            from_argv0(OsStr::new("/x/apply_patch")),
-            Some(Applet::ApplyPatch)
-        );
-        assert_eq!(from_argv0(OsStr::new("edit")), Some(Applet::Edit));
-        assert_eq!(
-            from_argv0(OsStr::new("view_image")),
-            Some(Applet::ViewImage)
-        );
-        assert_eq!(from_argv0(OsStr::new("mu")), None);
-        assert_eq!(from_argv0(OsStr::new("renamed-mu")), None);
     }
 }

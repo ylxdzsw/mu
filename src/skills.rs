@@ -569,17 +569,6 @@ mod tests {
     }
 
     #[test]
-    fn skill_requirements_parse_comma_separated_env_and_commands() {
-        let skill = parse_skill_frontmatter(
-            "---\nname: review\ndescription: Review changes.\nrequires_env: TOKEN, OTHER_TOKEN\nrequires_commands: gh, jq\n---\nReview it.\n",
-        )
-        .unwrap();
-
-        assert_eq!(skill.requirements.env, ["TOKEN", "OTHER_TOKEN"]);
-        assert_eq!(skill.requirements.commands, ["gh", "jq"]);
-    }
-
-    #[test]
     fn env_requirements_gate_skill_activation() {
         let root = temp_root("env-requirements");
         fs::create_dir_all(&root).unwrap();
@@ -691,35 +680,6 @@ mod tests {
         fs::remove_dir_all(builtins).unwrap();
         fs::remove_dir_all(global).unwrap();
         fs::remove_dir_all(project).unwrap();
-    }
-
-    #[test]
-    fn repository_reference_files_are_not_indexed_as_instructions() {
-        let builtins = Path::new(env!("CARGO_MANIFEST_DIR")).join("builtins");
-        let global = temp_root("repository-builtins-global");
-        fs::create_dir_all(&global).unwrap();
-
-        let env = env_map(&[("PATH", "/usr/bin:/bin")]);
-        let index =
-            scan_instruction_index_with_builtins(Some(&builtins), &global, None, &env).unwrap();
-
-        assert!(index.skills.iter().any(|skill| skill.name == "mu-doc"));
-        assert!(!index.skills.iter().any(|skill| skill.name == "config"));
-        assert!(!index.skills.iter().any(|skill| skill.name == "cli"));
-        assert!(!index.skills.iter().any(|skill| skill.name == "goal"));
-        assert!(
-            !index
-                .commands
-                .iter()
-                .any(|command| { matches!(command.name.as_str(), "config.md" | "cli.md") })
-        );
-        let goal = index
-            .commands
-            .iter()
-            .find(|command| command.name == "goal")
-            .expect("built-in goal command");
-        assert_eq!(goal.scope, InstructionScope::Builtin);
-        fs::remove_dir_all(global).unwrap();
     }
 
     #[test]

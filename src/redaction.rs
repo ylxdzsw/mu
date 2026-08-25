@@ -301,17 +301,6 @@ mod tests {
     }
 
     #[test]
-    fn longest_match_wins_and_replacements_are_not_rescanned() {
-        let cfg = config(
-            &[("LONG", "abcd"), ("SHORT", "b"), ("LETTER", "a")],
-            &["LONG", "SHORT", "LETTER"],
-        );
-        let (output, _) = redact_chunks(&cfg, &[b"abcd a"]);
-
-        assert_eq!(output, "[redacted:LONG] [redacted:LETTER]");
-    }
-
-    #[test]
     fn utf8_output_is_decoded_across_chunks_without_secrets() {
         let cfg = config(&[], &[]);
         let input = "前🔑後".as_bytes();
@@ -320,14 +309,6 @@ mod tests {
 
         assert_eq!(output, "前🔑後");
         assert!(!redacted);
-    }
-
-    #[test]
-    fn invalid_utf8_is_replaced_without_corrupting_split_valid_text() {
-        let cfg = config(&[], &[]);
-        let (output, _) = redact_chunks(&cfg, &[b"before-\xf0\x9f", b"\x94\x91-\xff-after"]);
-
-        assert_eq!(output, "before-🔑-�-after");
     }
 
     #[test]

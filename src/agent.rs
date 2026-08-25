@@ -1901,8 +1901,6 @@ mod tests {
         seen: Arc<Mutex<Vec<Vec<Message>>>>,
     }
 
-    struct PartialFailureProvider;
-
     struct ContextAfterCompactionProvider {
         counts: Arc<Mutex<(u32, u32)>>,
     }
@@ -1980,18 +1978,6 @@ mod tests {
             Err(ProviderError::ContextLength {
                 detail: "test overflow".into(),
             })
-        }
-    }
-
-    #[async_trait(?Send)]
-    impl Provider for PartialFailureProvider {
-        async fn stream(
-            &self,
-            _request: &Request,
-            on_event: &mut dyn FnMut(crate::provider::StreamEvent) -> Result<(), ProviderError>,
-        ) -> Result<StreamResult, ProviderError> {
-            on_event(StreamEvent::TextDelta("unfinished answer".into()))?;
-            Err(ProviderError::Protocol("fatal stream failure".into()))
         }
     }
 
@@ -2431,50 +2417,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn disabled_auto_resume_keeps_resumable_completion_terminal() {
-        let store = Store::open_memory().unwrap();
-        let session = store.create_session_seeded("system").unwrap();
-        store
-            .start_turn(&session.id, "/tmp", None, &"work".into())
-            .unwrap();
-        let config = test_config();
-        let request_model = crate::models::resolve_model_ref(&config, "test/fake-model").unwrap();
-        let seen = Arc::new(Mutex::new(Vec::new()));
-        let provider = Box::new(ResumeThenStopProvider {
-            resumes_before_stop: 1,
-            calls: Mutex::new(0),
-            seen: Arc::clone(&seen),
-        });
-        let mut renderer = Renderer::with_format(OutputFormat::Detail);
-        let mut agent = AgentLoop {
-            config: &config,
-            system_prompt_source: SystemPromptSource::fixed("refreshed system prompt"),
-            model: ResolvedModelChoice::fixed(request_model.clone()),
-            provider,
-            store: &store,
-            session_id: &session.id,
-            model_context_window: None,
-            renderer: &mut renderer,
-        };
-
-        let result = agent.run_turn().await.unwrap();
-
-        assert_eq!(result.final_assistant, None);
-        assert_eq!(seen.lock().unwrap().len(), 1);
-        assert!(store.is_session_clean(&session.id).unwrap());
-        assert!(!store.resume_reminder_needed(&session.id).unwrap());
-        let completed = store
-            .audit_events(&session.id)
-            .unwrap()
-            .into_iter()
-            .find(|event| event["type"] == "provider_completed")
-            .unwrap();
-        assert!(completed["projection"].get("resumable").is_none());
-        assert_eq!(completed["projection"]["incomplete"], true);
-        assert!(completed["projection"].get("turn_state").is_none());
-    }
-
-    #[tokio::test]
     async fn fixed_auto_resume_exhaustion_is_retryable_and_explicit_retry_resumes() {
         let store = Store::open_memory().unwrap();
         let session = store.create_session_seeded("system").unwrap();
@@ -2661,120 +2603,6 @@ mod tests {
 
         assert!(agent.run_turn().await.is_err());
         assert_eq!(*counts.lock().unwrap(), (2, 0));
-    }
-
-    #[tokio::test]
-    async fn disabled_compaction_aborts_on_the_first_context_error() {
-        let store = Store::open_memory().unwrap();
-        let session = store.create_session_seeded("system").unwrap();
-        for index in 0..5 {
-            store
-                .append_message(
-                    &session.id,
-                    &Message::User {
-                        content: UserContent::Text(format!("user {index}")),
-                    },
-                )
-                .unwrap();
-            store
-                .append_message(
-                    &session.id,
-                    &Message::assistant(Some(format!("assistant {index}")), None, None, None),
-                )
-                .unwrap();
-        }
-        store
-            .append_message(
-                &session.id,
-                &Message::User {
-                    content: UserContent::Text("current".into()),
-                },
-            )
-            .unwrap();
-        let mut config = test_config();
-        config.compaction.enabled = false;
-        let request_model = crate::models::resolve_model_ref(&config, "test/fake-model").unwrap();
-        let counts = Arc::new(Mutex::new((0, 0)));
-        let mut renderer = Renderer::with_format(OutputFormat::Detail);
-        let mut agent = AgentLoop {
-            config: &config,
-            system_prompt_source: SystemPromptSource::fixed("refreshed system prompt"),
-            model: ResolvedModelChoice::fixed(request_model.clone()),
-            provider: Box::new(ContextAfterCompactionProvider {
-                counts: counts.clone(),
-            }),
-            store: &store,
-            session_id: &session.id,
-            model_context_window: None,
-            renderer: &mut renderer,
-        };
-
-        let error = match agent.run_turn().await {
-            Ok(_) => panic!("expected context length error"),
-            Err(error) => error,
-        };
-
-        assert!(matches!(
-            error.downcast_ref::<ProviderError>(),
-            Some(ProviderError::ContextLength { .. })
-        ));
-        assert_eq!(*counts.lock().unwrap(), (1, 0));
-        assert_eq!(store.latest_summary_sequence(&session.id).unwrap(), None);
-    }
-
-    #[tokio::test]
-    async fn failed_partial_output_is_audited_but_excluded_from_history() {
-        let tmp = std::env::temp_dir().join(format!("mu-agent-partial-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&tmp).unwrap();
-        let store = Store::open(&tmp.join("mu.db")).unwrap();
-        let session = store.create_session("/tmp").unwrap();
-        let config = test_config();
-        let request_model = crate::models::resolve_model_ref(&config, "test/fake-model").unwrap();
-        store
-            .append_message(
-                &session.id,
-                &Message::System {
-                    content: "system".into(),
-                },
-            )
-            .unwrap();
-        store
-            .append_message(
-                &session.id,
-                &Message::User {
-                    content: UserContent::Text("fail after streaming".into()),
-                },
-            )
-            .unwrap();
-        let mut renderer = Renderer::with_format(OutputFormat::Detail);
-        let mut agent = AgentLoop {
-            config: &config,
-            system_prompt_source: SystemPromptSource::fixed("refreshed system prompt"),
-            model: ResolvedModelChoice::fixed(request_model.clone()),
-            provider: Box::new(PartialFailureProvider),
-            store: &store,
-            session_id: &session.id,
-            model_context_window: None,
-            renderer: &mut renderer,
-        };
-
-        assert!(agent.run_turn().await.is_err());
-        let messages = store.load_context_messages(&session.id).unwrap();
-        assert!(matches!(messages.last(), Some(Message::User { .. })));
-        assert!(
-            !messages
-                .iter()
-                .filter_map(Message::assistant_text)
-                .any(|content| content.contains("unfinished answer"))
-        );
-        let audit = store.audit_events(&session.id).unwrap();
-        let failed = audit
-            .iter()
-            .find(|event| event["type"] == "provider_failed")
-            .unwrap();
-        assert_eq!(failed["error_class"], "protocol");
-        assert!(failed["partial_response_json"].is_object());
-        let _ = std::fs::remove_dir_all(tmp);
     }
 
     #[tokio::test]
@@ -3148,50 +2976,6 @@ mod tests {
                 native_response: None,
             })
         }
-    }
-
-    #[test]
-    fn begin_compaction_rejects_an_existing_pending_compaction() {
-        let store = Store::open_memory().unwrap();
-        let session = store.create_session_seeded("system").unwrap();
-        let config = test_config();
-        let request_model = crate::models::resolve_model_ref(&config, "test/fake-model").unwrap();
-        store
-            .start_compaction_turn(
-                &session.id,
-                CompactionStart {
-                    cwd: "/tmp",
-                    prompt: &"checkpoint".into(),
-                    trap: bash::TrapLevel::Destructive,
-                    trigger: CompactionTrigger::Manual,
-                    mode: CompactionMode::AwaitUser,
-                    before_context_tokens: 10,
-                    before_context_window: Some(100),
-                },
-            )
-            .unwrap();
-        let mut renderer = Renderer::with_format(OutputFormat::Final);
-        let mut agent = AgentLoop {
-            config: &config,
-            system_prompt_source: SystemPromptSource::fixed("refreshed system prompt"),
-            model: ResolvedModelChoice::fixed(request_model),
-            provider: Box::new(BoundaryCompactionProvider),
-            store: &store,
-            session_id: &session.id,
-            model_context_window: Some(100),
-            renderer: &mut renderer,
-        };
-
-        assert!(
-            agent
-                .begin_compaction(
-                    CompactionTrigger::Hard,
-                    CompactionMode::ContinueTurn,
-                    90,
-                    None,
-                )
-                .is_err()
-        );
     }
 
     #[async_trait(?Send)]

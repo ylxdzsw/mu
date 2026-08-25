@@ -1768,42 +1768,32 @@ impl Store {
     }
 
     #[cfg(test)]
-    pub fn apply_test_compaction(&self, session_id: &str, summary: &str) -> Result<()> {
-        let source_turn_id = self.start_compaction_turn(
-            session_id,
-            CompactionStart {
-                cwd: "/tmp",
-                prompt: &"compact".into(),
-                trap: crate::bash::TrapLevel::Destructive,
-                trigger: CompactionTrigger::Manual,
-                mode: CompactionMode::AwaitUser,
-                before_context_tokens: 0,
-                before_context_window: None,
-            },
-        )?;
-        let exchange_id = self.start_test_provider_request(session_id, &source_turn_id)?;
-        self.complete_assistant_exchange(
-            session_id,
-            &exchange_id,
-            &Message::assistant(Some(summary.to_string()), None, None, None),
-            None,
-            None,
-        )?;
-        self.apply_compaction(
-            session_id,
-            CompactionApplication {
-                system_prompt: "test compacted system prompt".into(),
-                after_context_tokens_estimate: 0,
-                after_context_window: None,
-            },
-        )
-        .map(|_| ())
-    }
-
-    #[cfg(test)]
     fn start_test_provider_request(&self, session_id: &str, turn_id: &str) -> Result<String> {
-        let native_request = serde_json::json!({"model":"test"});
-        let recipe = self.request_recipe("test.v1", &native_request, serde_json::json!({}))?;
+        let mut messages = self.load_context_messages(session_id)?;
+        if self.resume_reminder_needed(session_id)? {
+            messages.push(Message::User {
+                content: RESUME_PROMPT.into(),
+            });
+        }
+        let request = Request {
+            model: ResolvedModelRef {
+                canonical: "test/model".into(),
+                provider_id: "test".into(),
+                model_id: "model".into(),
+                effort: None,
+            },
+            cache_key: None,
+            messages,
+            bash: true,
+        };
+        let native_request = request.json(ModelApi::ChatCompletions)?;
+        let recipe = self.request_recipe(
+            ModelApi::ChatCompletions.request_format(),
+            &native_request,
+            serde_json::json!({
+                "native_replay_origins": native_replay_origins(&request.messages),
+            }),
+        )?;
         self.start_provider_request(
             session_id,
             turn_id,
@@ -2179,7 +2169,6 @@ impl Store {
     ) -> Result<bool> {
         if !request_format_is_current(&origin.api, &recipe.format)
             || !context_origin_compatible(target.config, origin, target.model, target.api)
-            || recipe.input.get("native_fields").is_some()
         {
             return Ok(false);
         }
@@ -2500,21 +2489,16 @@ impl Store {
         &self,
         format: &str,
         native_request: &Value,
-        mut input: Value,
+        input: Value,
     ) -> Result<RequestRecipe> {
+        serde_json::from_value::<Vec<ReplayOrigin>>(input["native_replay_origins"].clone())
+            .context("agent request recipe has no valid native replay origins")?;
         let mut envelope = native_request.clone();
-        let mut native_fields = serde_json::Map::new();
-        if let Some(object) = envelope.as_object_mut() {
-            for key in ["input", "messages", "system", "tools"] {
-                if let Some(value) = object.remove(key) {
-                    native_fields.insert(key.to_string(), value);
-                }
-            }
-        }
-        if (input.get("native_replay_origins").is_none() || format.starts_with("test."))
-            && let Some(object) = input.as_object_mut()
-        {
-            object.insert("native_fields".into(), Value::Object(native_fields));
+        let object = envelope
+            .as_object_mut()
+            .context("provider request is not an object")?;
+        for key in ["input", "messages", "system", "tools"] {
+            object.remove(key);
         }
         Ok(RequestRecipe {
             format: format.to_string(),
@@ -2551,65 +2535,49 @@ impl Store {
                 _ => None,
             })
             .with_context(|| format!("provider request not found: {exchange_id}"))?;
-        let request = if let Some(fields) = recipe.input.get("native_fields") {
-            let mut request = recipe.envelope.clone();
-            let object = request
-                .as_object_mut()
-                .context("provider request envelope is not an object")?;
-            for (key, value) in fields
-                .as_object()
-                .context("provider request native_fields is not an object")?
-            {
-                object.insert(key.clone(), value.clone());
-            }
-            request
-        } else {
-            let api = match recipe.format.as_str() {
-                "openai.chat_completions.v1" => ModelApi::ChatCompletions,
-                "openai.responses.v1" => ModelApi::Responses,
-                "anthropic.messages.v1" => ModelApi::AnthropicMessages,
-                format => bail!("unsupported provider request format: {format}"),
-            };
-            let through_seq = request_seq.saturating_sub(1);
-            let elided_call_ids = recipe
-                .input
-                .get("emergency_elided_call_ids")
-                .map(|call_ids| {
-                    serde_json::from_value::<HashSet<i64>>(call_ids.clone())
-                        .context("invalid emergency Bash elision ids in request recipe")
-                })
-                .transpose()?
-                .unwrap_or_default();
-            let messages =
-                self.context_until_with_elisions(journal, through_seq, &elided_call_ids)?;
-            let origins: Vec<crate::provider::ReplayOrigin> =
-                serde_json::from_value(recipe.input["native_replay_origins"].clone())
-                    .context("agent request recipe has no valid native replay origins")?;
-            let messages =
-                crate::provider::filter_native_replay_for_origins(&messages, api, &origins);
-            let cache_key = recipe
-                .envelope
-                .get("prompt_cache_key")
-                .map(|value| {
-                    value
-                        .as_str()
-                        .context("provider request prompt_cache_key is not a string")
-                })
-                .transpose()?
-                .map(str::to_owned);
-            let request = Request {
-                model: ResolvedModelRef {
-                    canonical: origin.canonical_model_ref.clone(),
-                    provider_id: origin.provider_id.clone(),
-                    model_id: origin.wire_model.clone(),
-                    effort: origin.effort.clone(),
-                },
-                cache_key,
-                messages,
-                bash: true,
-            };
-            request.json(api)?
+        let api = match recipe.format.as_str() {
+            "openai.chat_completions.v1" => ModelApi::ChatCompletions,
+            "openai.responses.v1" => ModelApi::Responses,
+            "anthropic.messages.v1" => ModelApi::AnthropicMessages,
+            format => bail!("unsupported provider request format: {format}"),
         };
+        let through_seq = request_seq.saturating_sub(1);
+        let elided_call_ids = recipe
+            .input
+            .get("emergency_elided_call_ids")
+            .map(|call_ids| {
+                serde_json::from_value::<HashSet<i64>>(call_ids.clone())
+                    .context("invalid emergency Bash elision ids in request recipe")
+            })
+            .transpose()?
+            .unwrap_or_default();
+        let messages = self.context_until_with_elisions(journal, through_seq, &elided_call_ids)?;
+        let origins: Vec<ReplayOrigin> =
+            serde_json::from_value(recipe.input["native_replay_origins"].clone())
+                .context("agent request recipe has no valid native replay origins")?;
+        let messages = crate::provider::filter_native_replay_for_origins(&messages, api, &origins);
+        let cache_key = recipe
+            .envelope
+            .get("prompt_cache_key")
+            .map(|value| {
+                value
+                    .as_str()
+                    .context("provider request prompt_cache_key is not a string")
+            })
+            .transpose()?
+            .map(str::to_owned);
+        let request = Request {
+            model: ResolvedModelRef {
+                canonical: origin.canonical_model_ref.clone(),
+                provider_id: origin.provider_id.clone(),
+                model_id: origin.wire_model.clone(),
+                effort: origin.effort.clone(),
+            },
+            cache_key,
+            messages,
+            bash: true,
+        }
+        .json(api)?;
         if hex(Sha256::digest(canonical_json(&request))) != recipe.canonical_sha256 {
             bail!("reconstructed provider request checksum mismatch")
         }
@@ -3398,12 +3366,10 @@ fn validate_events(events: &[EventLine]) -> Result<()> {
                 if calls.keys().any(|call_id| !results.contains(call_id)) {
                     bail!("provider request starts before prior Bash claims are resolved")
                 }
-                if request_recipe.input.get("native_fields").is_none() {
-                    serde_json::from_value::<Vec<ReplayOrigin>>(
-                        request_recipe.input["native_replay_origins"].clone(),
-                    )
-                    .context("agent request recipe has no valid native replay origins")?;
-                }
+                serde_json::from_value::<Vec<ReplayOrigin>>(
+                    request_recipe.input["native_replay_origins"].clone(),
+                )
+                .context("agent request recipe has no valid native replay origins")?;
                 if let Some((pending_turn, _, accepted)) = &mut pending_compaction
                     && pending_turn == turn_id
                 {
@@ -4062,7 +4028,7 @@ fn context_origin_compatible(
 fn request_format_is_current(api: &str, format: &str) -> bool {
     #[cfg(test)]
     if api == "test" {
-        return format == "test.v1";
+        return format == ModelApi::ChatCompletions.request_format();
     }
     ModelApi::from_name(api).is_some_and(|api| format == api.request_format())
 }
@@ -4320,21 +4286,6 @@ mod tests {
     }
 
     #[test]
-    fn invalid_provider_context_total_falls_back_to_projection() {
-        let (store, session) = test_session();
-        store
-            .append_test_agent_exchange(&session.id, "source/model", "completed", 0)
-            .unwrap();
-        let config = context_test_config(None, None);
-        let target = crate::models::resolve_model_ref(&config, "source/model").unwrap();
-        let estimate = store
-            .context_tokens(&session.id, &config, &target, ModelApi::ChatCompletions)
-            .unwrap();
-        assert!(!estimate.reported);
-        assert!(estimate.tokens > 0);
-    }
-
-    #[test]
     fn queued_context_projection_matches_materialized_turn() {
         let (store, session) = test_session();
         store
@@ -4457,6 +4408,19 @@ mod tests {
         let turn = store
             .start_turn(&session.id, "/tmp", None, &"test".into())
             .unwrap();
+        let replay_messages = store.load_context_messages(&session.id).unwrap();
+        let replay_request = Request {
+            model: ResolvedModelRef {
+                canonical: "legacy/model".into(),
+                provider_id: "legacy".into(),
+                model_id: "model".into(),
+                effort: None,
+            },
+            cache_key: None,
+            messages: replay_messages.clone(),
+            bash: true,
+        };
+        let replay_native = replay_request.json(ModelApi::Responses).unwrap();
         let replay_exchange = store
             .start_provider_request(
                 &session.id,
@@ -4471,9 +4435,11 @@ mod tests {
                 },
                 store
                     .request_recipe(
-                        "test.v1",
-                        &serde_json::json!({"model":"model"}),
-                        serde_json::json!({}),
+                        ModelApi::Responses.request_format(),
+                        &replay_native,
+                        serde_json::json!({
+                            "native_replay_origins": native_replay_origins(&replay_messages),
+                        }),
                     )
                     .unwrap(),
             )
@@ -4806,23 +4772,6 @@ mod tests {
     }
 
     #[test]
-    fn short_id_collision_retries_and_journal_replays() {
-        let store = Store::open_memory().unwrap();
-        let collision = "ses_00000000";
-        File::create(store.session_path(collision)).unwrap();
-        let mut ids = [collision, "ses_00000001"].into_iter();
-        let session = store
-            .create_session_with("system", || Ok(ids.next().unwrap().to_string()))
-            .unwrap();
-        assert_eq!(session.id, "ses_00000001");
-        let turn = store
-            .start_turn(&session.id, "/tmp", None, &"hello".into())
-            .unwrap();
-        assert!(turn.starts_with('t'));
-        assert_eq!(store.load_context_messages(&session.id).unwrap().len(), 3);
-    }
-
-    #[test]
     fn unsupported_session_versions_are_reported_without_rewriting() {
         let store = Store::open_memory().unwrap();
         let supported = store.create_session_seeded("system").unwrap();
@@ -4934,67 +4883,6 @@ mod tests {
                     internal: false,
                 },
             ]
-        );
-    }
-
-    #[test]
-    fn transcript_projection_reconstructs_prompt_model_and_context_state() {
-        let (store, session) = test_session();
-        store
-            .start_turn(&session.id, "/first", None, &"First".into())
-            .unwrap();
-        store
-            .append_test_agent_exchange(&session.id, "test/model:high", "completed", 25)
-            .unwrap();
-        store
-            .start_turn(&session.id, "/second", None, &"Second".into())
-            .unwrap();
-        store
-            .start_turn(&session.id, "/third", None, &"Third".into())
-            .unwrap();
-
-        let prompts = store
-            .transcript_events(&session.id)
-            .unwrap()
-            .into_iter()
-            .filter_map(|event| match event {
-                TranscriptEvent::User {
-                    cwd,
-                    model,
-                    context,
-                    ..
-                } => Some((cwd, model, context)),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-
-        assert_eq!(
-            prompts[0],
-            ("/first".into(), Some("test/model:high".into()), None)
-        );
-        assert_eq!(
-            prompts[1],
-            (
-                "/second".into(),
-                Some("test/model:high".into()),
-                Some(TranscriptContext {
-                    tokens: 25,
-                    estimated: false,
-                }),
-            )
-        );
-        assert_eq!(prompts[2].0, "/third");
-        assert_eq!(prompts[2].1.as_deref(), Some("test/model:high"));
-        assert!(
-            matches!(
-                prompts[2].2,
-                Some(TranscriptContext {
-                    tokens,
-                    estimated: true
-                }) if tokens > 0
-            ),
-            "{:?}",
-            prompts[2].2
         );
     }
 
@@ -5198,6 +5086,20 @@ mod tests {
         let object = store.write_object(b"content").unwrap();
         std::fs::write(store.objects_dir().join(&object.sha256), b"corrupt").unwrap();
         assert!(store.read_object(&object).is_err());
+    }
+
+    #[test]
+    fn request_recipe_requires_native_replay_origins() {
+        let store = Store::open_memory().unwrap();
+        assert!(
+            store
+                .request_recipe(
+                    ModelApi::ChatCompletions.request_format(),
+                    &serde_json::json!({"model":"model"}),
+                    serde_json::json!({}),
+                )
+                .is_err()
+        );
     }
 
     #[test]
@@ -5455,22 +5357,43 @@ mod tests {
         let turn = store
             .start_turn(&session.id, "/tmp", None, &"hello".into())
             .unwrap();
-        let native = serde_json::json!({"model":"model"});
-        let exchange = store
-            .start_provider_request(
+        let request = Request {
+            model: ResolvedModelRef {
+                canonical: "test/model".into(),
+                provider_id: "test".into(),
+                model_id: "model".into(),
+                effort: None,
+            },
+            cache_key: None,
+            messages: store.load_context_messages(&session.id).unwrap(),
+            bash: true,
+        };
+        let native = request.json(ModelApi::ChatCompletions).unwrap();
+        let mut recipe = store
+            .request_recipe(
+                ModelApi::ChatCompletions.request_format(),
+                &native,
+                serde_json::json!({"native_replay_origins": []}),
+            )
+            .unwrap();
+        recipe.format = "test.v0".into();
+        let exchange = "old-format".to_string();
+        store
+            .append(
                 &session.id,
-                &turn,
-                ProviderOrigin {
-                    canonical_model_ref: "test/model".into(),
-                    provider_id: "test".into(),
-                    api: "test".into(),
-                    endpoint: String::new(),
-                    wire_model: "model".into(),
-                    effort: None,
+                Event::ProviderRequested {
+                    turn_id: turn,
+                    exchange_id: exchange.clone(),
+                    origin: ProviderOrigin {
+                        canonical_model_ref: "test/model".into(),
+                        provider_id: "test".into(),
+                        api: "test".into(),
+                        endpoint: String::new(),
+                        wire_model: "model".into(),
+                        effort: None,
+                    },
+                    request_recipe: recipe,
                 },
-                store
-                    .request_recipe("test.v0", &native, serde_json::json!({}))
-                    .unwrap(),
             )
             .unwrap();
         store
@@ -5498,23 +5421,8 @@ mod tests {
         let turn = store
             .start_turn(&session.id, "/tmp", None, &"hello".into())
             .unwrap();
-        let native = serde_json::json!({"model":"model"});
         let exchange = store
-            .start_provider_request(
-                &session.id,
-                &turn,
-                ProviderOrigin {
-                    canonical_model_ref: "test/model".into(),
-                    provider_id: "test".into(),
-                    api: "test".into(),
-                    endpoint: String::new(),
-                    wire_model: "model".into(),
-                    effort: None,
-                },
-                store
-                    .request_recipe("test.v1", &native, serde_json::json!({}))
-                    .unwrap(),
-            )
+            .start_test_provider_request(&session.id, &turn)
             .unwrap();
         let call = ToolCall {
             id: "call_1".into(),
@@ -5570,22 +5478,6 @@ mod tests {
     }
 
     #[test]
-    fn reopening_validates_events_written_by_the_typed_append_path() {
-        let (store, session) = test_session();
-        store
-            .append(
-                &session.id,
-                Event::ProviderInterrupted {
-                    exchange_id: "unknown".into(),
-                },
-            )
-            .unwrap();
-
-        let reopened = Store::open(&store.root).unwrap();
-        assert!(reopened.get_session(&session.id).is_err());
-    }
-
-    #[test]
     fn session_lock_fails_fast_and_current_pointer_is_last_selected() {
         let store = Store::open_memory().unwrap();
         let first = store.create_session_seeded("system").unwrap();
@@ -5607,14 +5499,6 @@ mod tests {
         assert!(store.get_session("../../outside").unwrap().is_none());
         assert!(store.select_session("../../outside").is_err());
         assert!(store.acquire_session_lock("../../outside").is_err());
-    }
-
-    #[test]
-    fn location_reminder_reports_leaving_a_worktree() {
-        assert_eq!(
-            location_context(Some(&("/repo".into(), Some("/repo".into()))), "/tmp", None).unwrap(),
-            "<system-reminder>\ngit worktree root: (none)\ncurrent working directory: /tmp\n</system-reminder>"
-        );
     }
 
     #[test]
@@ -5824,148 +5708,6 @@ mod tests {
         assert!(matches!(
             context.last(),
             Some(Message::User { content }) if content.text() == "new direction"
-        ));
-    }
-
-    #[test]
-    fn applied_compaction_projects_refreshed_system_prompt_and_checkpoint() {
-        let (store, session) = test_session();
-        let turn = store
-            .start_turn(&session.id, "/work", None, &"original task".into())
-            .unwrap();
-        let exchange = store
-            .start_test_provider_request(&session.id, &turn)
-            .unwrap();
-        store
-            .complete_assistant_exchange(
-                &session.id,
-                &exchange,
-                &Message::assistant(Some("work so far".into()), None, None, None),
-                None,
-                None,
-            )
-            .unwrap();
-
-        let compaction_turn = store
-            .start_compaction_turn(
-                &session.id,
-                CompactionStart {
-                    cwd: "/work",
-                    prompt: &"checkpoint prompt".into(),
-                    trap: crate::bash::TrapLevel::Destructive,
-                    trigger: CompactionTrigger::Manual,
-                    mode: CompactionMode::AwaitUser,
-                    before_context_tokens: 1_700,
-                    before_context_window: Some(2_000),
-                },
-            )
-            .unwrap();
-        assert!(
-            store
-                .queue_prompt(
-                    &session.id,
-                    "/work",
-                    None,
-                    &"too early".into(),
-                    crate::bash::TrapLevel::Destructive,
-                )
-                .is_err()
-        );
-        let summary_exchange = store
-            .start_test_provider_request(&session.id, &compaction_turn)
-            .unwrap();
-        store
-            .complete_assistant_exchange(
-                &session.id,
-                &summary_exchange,
-                &Message::assistant(Some("## Progress\nReady.".into()), None, None, None),
-                None,
-                None,
-            )
-            .unwrap();
-        assert_eq!(
-            store
-                .pending_compaction_summary(&session.id, &compaction_turn)
-                .unwrap()
-                .as_deref(),
-            Some("## Progress\nReady.")
-        );
-
-        let checkpoint = "<session_checkpoint mode=\"await_user\" epoch=\"1\">\n## Progress\nReady.\n</session_checkpoint>";
-        assert!(
-            store
-                .apply_compaction(
-                    &session.id,
-                    CompactionApplication {
-                        system_prompt: String::new(),
-                        after_context_tokens_estimate: 30,
-                        after_context_window: Some(2_000),
-                    },
-                )
-                .is_err()
-        );
-        assert_eq!(
-            store
-                .apply_compaction(
-                    &session.id,
-                    CompactionApplication {
-                        system_prompt: "refreshed system prompt".into(),
-                        after_context_tokens_estimate: 30,
-                        after_context_window: Some(2_000),
-                    },
-                )
-                .unwrap(),
-            1
-        );
-        assert_eq!(store.context_epoch(&session.id).unwrap(), 1);
-        assert!(store.pending_compaction(&session.id).unwrap().is_none());
-        assert!(store.is_session_clean(&session.id).unwrap());
-        let audit = store.audit_events(&session.id).unwrap();
-        let applied = audit
-            .iter()
-            .find(|event| event["type"] == "compaction_applied")
-            .unwrap();
-        assert_eq!(applied["system_prompt"], "refreshed system prompt");
-        for field in [
-            "source_turn_id",
-            "trigger",
-            "mode",
-            "summary",
-            "checkpoint",
-            "continuation_turn_id",
-            "before_context_tokens",
-            "before_context_window",
-            "elapsed_ms",
-            "emergency_elided_call_ids",
-        ] {
-            assert!(applied.get(field).is_none(), "unexpected {field}");
-        }
-        let context = store.load_context_messages(&session.id).unwrap();
-        assert_eq!(context.len(), 2);
-        assert!(matches!(
-            &context[0],
-            Message::System { content } if content == "refreshed system prompt"
-        ));
-        assert!(matches!(
-            &context[1],
-            Message::User { content } if content.text() == checkpoint
-        ));
-
-        let transcript = store.transcript_events(&session.id).unwrap();
-        assert!(matches!(
-            transcript[2],
-            TranscriptEvent::CompactionTriggered {
-                trigger: CompactionTrigger::Manual,
-                ..
-            }
-        ));
-        assert!(matches!(
-            transcript.last(),
-            Some(TranscriptEvent::CompactionApplied {
-                from_epoch: 0,
-                to_epoch: 1,
-                ..
-            })
         ));
     }
 

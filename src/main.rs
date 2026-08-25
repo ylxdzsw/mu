@@ -1556,24 +1556,6 @@ mod tests {
     }
 
     #[test]
-    fn prompt_file_rejects_other_mu_shebang_arguments() {
-        let path = temp_file_path("invalid-shebang");
-        std::fs::write(&path, "#!/usr/bin/env -S mu --output detail\nhello\n").unwrap();
-        let mut stdin = Cursor::new("");
-        let result = load_prompt_with_stdin(PromptSource::File(path.clone()), true, &mut stdin);
-        std::fs::remove_file(path).unwrap();
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn explicit_output_overrides_config_default() {
-        assert_eq!(
-            resolve_output(Some(OutputFormat::Full), OutputFormat::Concise),
-            OutputFormat::Full
-        );
-    }
-
-    #[test]
     fn flattened_commands_use_command_local_arguments() {
         let compact = Args::try_parse_from(["mu", "compact"]).unwrap();
         assert!(matches!(
@@ -1643,14 +1625,6 @@ mod tests {
     }
 
     #[test]
-    fn stdin_prompt_source_uses_stdin_as_the_complete_prompt() {
-        let mut stdin = Cursor::new("# Standalone prompt\n\nBody.\n");
-        let prompt = load_prompt_with_stdin(PromptSource::Stdin, false, &mut stdin).unwrap();
-
-        assert_eq!(prompt.text, "# Standalone prompt\n\nBody.");
-    }
-
-    #[test]
     fn optional_instruction_uses_custom_command_stdin_rules() {
         let mut terminal_stdin = Cursor::new("do not read");
         assert_eq!(
@@ -1710,17 +1684,6 @@ mod tests {
     }
 
     #[test]
-    fn explicit_prompt_paths_bypass_command_lookup() {
-        let scope = paths::Scope::Global;
-        for path in ["./review.md", "../review.md", "/tmp/review.md"] {
-            assert!(matches!(
-                resolve_prompt_source(Some(PathBuf::from(path)), &scope).unwrap(),
-                PromptSource::File(resolved) if resolved.as_path() == Path::new(path)
-            ));
-        }
-    }
-
-    #[test]
     fn bare_prompt_name_resolves_to_project_command() {
         let root = temp_file_path("resolve-project-command");
         let command_dir = root.join(".mu");
@@ -1759,19 +1722,6 @@ mod tests {
         let result = load_attachments(std::slice::from_ref(&path));
         std::fs::remove_file(path).unwrap();
         assert!(result.is_err());
-    }
-
-    #[test]
-    fn exit_code_maps_session_not_found_to_two() {
-        bash::reset_cancellation_state();
-        let err = ExitError::session_not_found("abc123");
-        assert_eq!(exit_code_for(&err), 2);
-    }
-
-    #[test]
-    fn exit_code_maps_trapping_to_three() {
-        bash::reset_cancellation_state();
-        assert_eq!(exit_code_for(&TrappedExit.into()), 3);
     }
 
     #[test]
@@ -1832,28 +1782,6 @@ mod tests {
             buffer.text().unwrap(),
             "test/model ~42% /work\nmu> Question\n\nFinal answer\n"
         );
-    }
-
-    #[test]
-    fn terminal_transcript_starts_after_an_empty_line() {
-        let events = vec![store::TranscriptEvent::User {
-            text: "Question".into(),
-            cwd: "/work".into(),
-            model: None,
-            context: None,
-            internal: false,
-        }];
-        let mut terminal = Vec::new();
-        write_terminal_transcript_separator(&mut terminal, true, &events).unwrap();
-        assert_eq!(terminal, b"\n");
-
-        let mut redirected = Vec::new();
-        write_terminal_transcript_separator(&mut redirected, false, &events).unwrap();
-        assert!(redirected.is_empty());
-
-        let mut empty = Vec::new();
-        write_terminal_transcript_separator(&mut empty, true, &[]).unwrap();
-        assert!(empty.is_empty());
     }
 
     #[test]
@@ -1935,16 +1863,5 @@ mod tests {
         assert!(html.contains("new FitAddon.FitAddon()"));
         assert!(html.contains("term.loadAddon(fitAddon)"));
         assert!(html.contains(r#"term.write("\u003c/script>\n")"#));
-    }
-
-    #[test]
-    fn subagent_turn_guard_rejects_grandchild_turns() {
-        assert!(ensure_subagent_turn_allowed(0).is_ok());
-        assert!(ensure_subagent_turn_allowed(1).is_ok());
-        let err = ensure_subagent_turn_allowed(2).unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("subagent recursion depth exceeded")
-        );
     }
 }

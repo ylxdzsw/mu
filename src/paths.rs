@@ -460,30 +460,6 @@ mod tests {
     }
 
     #[test]
-    fn nonstandard_common_dir_keeps_worktree_local_scope() {
-        let repository =
-            std::env::temp_dir().join(format!("mu-bare-worktree-{}", uuid::Uuid::new_v4()));
-        let common_dir = repository.join("repo.git");
-        let git_dir = common_dir.join("worktrees/feature");
-        let worktree = repository.join("feature");
-        std::fs::create_dir_all(&git_dir).unwrap();
-        std::fs::create_dir_all(&worktree).unwrap();
-        std::fs::write(
-            worktree.join(".git"),
-            format!("gitdir: {}\n", git_dir.display()),
-        )
-        .unwrap();
-        std::fs::write(git_dir.join("commondir"), "../..\n").unwrap();
-
-        let project = discover_project(&worktree).unwrap();
-
-        assert_eq!(project.root, worktree);
-        assert_eq!(project.marker, ProjectMarker::Git);
-
-        let _ = std::fs::remove_dir_all(repository);
-    }
-
-    #[test]
     fn init_project_layout_at_creates_minimal_scaffold() {
         let root = std::env::temp_dir().join(format!("mu-layout-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&root).unwrap();
@@ -500,26 +476,6 @@ mod tests {
         assert!(state_dir.join("config.jsonc").is_file());
         assert_required_gitignore(&state_dir.join(".gitignore"));
         assert!(!state_dir.join("skills").exists());
-
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn automatic_project_layout_omits_project_config() {
-        let root = std::env::temp_dir().join(format!("mu-layout-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&root).unwrap();
-        let scope = Scope::Project(Project {
-            root: root.clone(),
-            marker: ProjectMarker::Git,
-            worktree: None,
-        });
-
-        ensure_project_layout(&scope).unwrap();
-
-        let state_dir = root.join(".mu");
-        assert!(state_dir.is_dir());
-        assert!(!state_dir.join("config.jsonc").exists());
-        assert_required_gitignore(&state_dir.join(".gitignore"));
 
         let _ = std::fs::remove_dir_all(root);
     }

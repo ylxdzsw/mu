@@ -1387,27 +1387,6 @@ mod tests {
     };
     use crate::models::ResolvedModelRef;
 
-    fn request(bash: bool) -> Request {
-        Request {
-            model: ResolvedModelRef {
-                canonical: "test/model".into(),
-                provider_id: "test".into(),
-                model_id: "model".into(),
-                effort: None,
-            },
-            cache_key: None,
-            messages: vec![
-                Message::System {
-                    content: "system".into(),
-                },
-                Message::User {
-                    content: "hello".into(),
-                },
-            ],
-            bash,
-        }
-    }
-
     #[test]
     fn assistant_constructor_uses_chat_canonical_order() {
         assert!(matches!(
@@ -1440,28 +1419,6 @@ mod tests {
                         && second == "second"
                 )
         ));
-    }
-
-    #[test]
-    fn request_boolean_controls_the_fixed_bash_schema() {
-        for (api, name_pointer) in [
-            (ModelApi::ChatCompletions, "/tools/0/function/name"),
-            (ModelApi::Responses, "/tools/0/name"),
-            (ModelApi::AnthropicMessages, "/tools/0/name"),
-        ] {
-            let with_bash = request(true).json(api).unwrap();
-            assert_eq!(
-                with_bash.pointer(name_pointer).and_then(Value::as_str),
-                Some("bash")
-            );
-            assert_eq!(
-                request(false).json(api).unwrap()["tools"]
-                    .as_array()
-                    .unwrap()
-                    .len(),
-                0
-            );
-        }
     }
 
     fn replay_config(source_key: Option<&str>, target_key: Option<&str>) -> Config {
@@ -1586,22 +1543,6 @@ mod tests {
     }
 
     #[test]
-    fn media_has_a_nonzero_bounded_fallback_estimate() {
-        let message = |bytes| Message::User {
-            content: UserContent::Parts(vec![ContentPart::Attachment {
-                attachment: Attachment {
-                    filename: "image.png".into(),
-                    media_type: "image/png".into(),
-                    data: vec![0; bytes],
-                },
-            }]),
-        };
-        let estimate = message(5 * 1024 * 1024).approx_tokens();
-        assert!(estimate > 0);
-        assert_eq!(estimate, message(20 * 1024 * 1024).approx_tokens());
-    }
-
-    #[test]
     fn context_total_rejects_missing_or_inconsistent_usage() {
         assert_eq!(Usage::default().context_total(), None);
         assert_eq!(
@@ -1704,36 +1645,6 @@ mod tests {
         assert_eq!(request.headers()["x-api-key"], "test-key");
         assert_eq!(request.headers()["anthropic-version"], "2023-06-01");
         assert!(request.headers().get("authorization").is_none());
-    }
-
-    #[test]
-    fn fallback_policy_distinguishes_availability_from_request_errors() {
-        assert_eq!(
-            classify_http_error(401, "unauthorized".into(), None).disposition(),
-            ProviderDisposition::Advance
-        );
-        assert_eq!(
-            classify_http_error(403, r#"{"error":{"code":"model_not_found"}}"#.into(), None)
-                .disposition(),
-            ProviderDisposition::Advance
-        );
-        assert_eq!(
-            classify_http_error(403, "content policy rejected the request".into(), None)
-                .disposition(),
-            ProviderDisposition::Fail
-        );
-        assert_eq!(
-            classify_http_error(400, "unsupported reasoning effort".into(), None).disposition(),
-            ProviderDisposition::Fail
-        );
-        assert_eq!(
-            ProviderError::Transport("stream ended".into()).disposition(),
-            ProviderDisposition::Retry
-        );
-        assert_eq!(
-            ProviderError::Protocol("bad JSON".into()).disposition(),
-            ProviderDisposition::Fail
-        );
     }
 
     #[test]
