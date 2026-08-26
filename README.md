@@ -495,13 +495,19 @@ the cache:
 
 Mu aborts rather than using `/tmp` if no cache root can be determined or if a
 cache path cannot be created. Cached resources live in fixed `builtins/` and
-`applets/` subdirectories. A missing subdirectory is created and populated in
-place; cached applets are absolute symlinks to the current executable. An
-existing directory is authoritative and is never inspected, refreshed, or
-repaired. A conflicting non-directory is an error, and a failed first
-population may leave a partial directory that later runs deliberately trust.
-Moving or upgrading the binary does not update either cache: remove the
-applicable cache subdirectory manually to regenerate it.
+`applets/` subdirectories. A missing subdirectory is created and populated;
+cached applets are absolute symlinks to the current executable. An existing
+directory whose modification time is older than the portable executable is
+removed and repopulated. A directory with an equal or newer modification time
+is authoritative and is not inspected or repaired. A conflicting
+non-directory is an error, and a failed population is removed so a later run
+can retry.
+
+This comparison deliberately uses only modification times. Preserving an old
+timestamp while replacing or moving the binary may therefore leave the cache
+unchanged, including absolute applet links to the old location. Conversely, a
+future-dated binary may refresh the cache repeatedly. Touch the executable or
+remove the applicable cache subdirectory to force regeneration.
 
 Version tags publish the three standalone portable binaries, the zsh and Fish
 integrations, and the native Arch package.

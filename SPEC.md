@@ -723,9 +723,10 @@ For an executable under `<prefix>/bin`, native resources live under
 
 The optional `portable` build embeds built-ins. Each resource independently
 uses a valid installed directory when present; otherwise Mu materializes it
-under the platform user cache. Existing cache directories are authoritative
-and are not refreshed or repaired automatically. Mu never falls back to `/tmp`
-for package resources.
+under the platform user cache. An existing cache directory is authoritative
+when its modification time is not older than the portable executable. An older
+directory is removed and repopulated; cache contents are not otherwise
+inspected or repaired. Mu never falls back to `/tmp` for package resources.
 
 ---
 

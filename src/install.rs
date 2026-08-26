@@ -49,14 +49,35 @@ pub fn prepare() -> Result<()> {
             std::env::var_os("HOME").as_deref(),
             cfg!(target_os = "macos"),
         )?;
+        let executable_mtime = if paths.builtins.cached || paths.applets.cached {
+            Some(
+                std::fs::metadata(&executable)
+                    .with_context(|| format!("reading Mu executable {}", executable.display()))?
+                    .modified()
+                    .with_context(|| {
+                        format!("reading Mu executable mtime {}", executable.display())
+                    })?,
+            )
+        } else {
+            None
+        };
 
         if paths.builtins.cached {
             initialize_cache_root(&paths.cache_root)?;
-            initialize_builtins(&paths.builtins.path, BUILTINS)?;
+            initialize_builtins(
+                &paths.builtins.path,
+                BUILTINS,
+                executable_mtime.expect("cached resources have an executable mtime"),
+            )?;
         }
         if paths.applets.cached {
             initialize_cache_root(&paths.cache_root)?;
-            initialize_applets(&executable, &paths.applets.path, APPLET_NAMES)?;
+            initialize_applets(
+                &executable,
+                &paths.applets.path,
+                APPLET_NAMES,
+                executable_mtime.expect("cached resources have an executable mtime"),
+            )?;
         }
     }
     Ok(())
@@ -228,51 +249,87 @@ fn initialize_cache_root(cache_root: &Path) -> Result<()> {
 }
 
 #[cfg(feature = "portable")]
-fn initialize_builtins(directory: &Path, builtins: &[(&str, &str, bool)]) -> Result<()> {
-    if trust_existing_directory(directory, "built-in")? {
+fn initialize_builtins(
+    directory: &Path,
+    builtins: &[(&str, &str, bool)],
+    executable_mtime: std::time::SystemTime,
+) -> Result<()> {
+    if !prepare_cache_directory(directory, "built-in", executable_mtime)? {
         return Ok(());
     }
 
     std::fs::create_dir(directory)
         .with_context(|| format!("creating portable built-ins {}", directory.display()))?;
-    for (name, contents, executable) in builtins {
-        let path = directory.join(name);
-        std::fs::write(&path, contents)
-            .with_context(|| format!("writing portable built-in {}", path.display()))?;
-        std::fs::set_permissions(
-            &path,
-            std::fs::Permissions::from_mode(if *executable { 0o755 } else { 0o644 }),
-        )
-        .with_context(|| format!("setting portable built-in mode {}", path.display()))?;
+    let result = (|| {
+        for (name, contents, executable) in builtins {
+            let path = directory.join(name);
+            std::fs::write(&path, contents)
+                .with_context(|| format!("writing portable built-in {}", path.display()))?;
+            std::fs::set_permissions(
+                &path,
+                std::fs::Permissions::from_mode(if *executable { 0o755 } else { 0o644 }),
+            )
+            .with_context(|| format!("setting portable built-in mode {}", path.display()))?;
+        }
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_dir_all(directory);
     }
-    Ok(())
+    result
 }
 
 #[cfg(feature = "portable")]
-fn initialize_applets(executable: &Path, directory: &Path, names: &[&str]) -> Result<()> {
-    if trust_existing_directory(directory, "applet")? {
+fn initialize_applets(
+    executable: &Path,
+    directory: &Path,
+    names: &[&str],
+    executable_mtime: std::time::SystemTime,
+) -> Result<()> {
+    if !prepare_cache_directory(directory, "applet", executable_mtime)? {
         return Ok(());
     }
 
     std::fs::create_dir(directory)
         .with_context(|| format!("creating portable applets {}", directory.display()))?;
-    for name in names {
-        let path = directory.join(name);
-        std::os::unix::fs::symlink(executable, &path)
-            .with_context(|| format!("creating portable applet {}", path.display()))?;
+    let result = (|| {
+        for name in names {
+            let path = directory.join(name);
+            std::os::unix::fs::symlink(executable, &path)
+                .with_context(|| format!("creating portable applet {}", path.display()))?;
+        }
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_dir_all(directory);
     }
-    Ok(())
+    result
 }
 
 #[cfg(feature = "portable")]
-fn trust_existing_directory(directory: &Path, kind: &str) -> Result<bool> {
+fn prepare_cache_directory(
+    directory: &Path,
+    kind: &str,
+    executable_mtime: std::time::SystemTime,
+) -> Result<bool> {
     match std::fs::symlink_metadata(directory) {
-        Ok(metadata) if metadata.is_dir() => Ok(true),
+        Ok(metadata) if metadata.is_dir() => {
+            let directory_mtime = metadata.modified().with_context(|| {
+                format!("reading portable {kind} mtime {}", directory.display())
+            })?;
+            if directory_mtime >= executable_mtime {
+                return Ok(false);
+            }
+            std::fs::remove_dir_all(directory).with_context(|| {
+                format!("removing stale portable {kind}s {}", directory.display())
+            })?;
+            Ok(true)
+        }
         Ok(_) => bail!(
             "portable {kind} path is not a directory: {}",
             directory.display()
         ),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(true),
         Err(error) => {
             Err(error).with_context(|| format!("checking portable {kind}s {}", directory.display()))
         }
@@ -412,8 +469,8 @@ mod tests {
         std::fs::create_dir_all(root.join("cache")).unwrap();
         std::fs::write(&executable, "binary").unwrap();
 
-        initialize_builtins(&builtins, BUILTINS).unwrap();
-        initialize_applets(&executable, &applets, APPLET_NAMES).unwrap();
+        initialize_builtins(&builtins, BUILTINS, std::time::UNIX_EPOCH).unwrap();
+        initialize_applets(&executable, &applets, APPLET_NAMES, std::time::UNIX_EPOCH).unwrap();
 
         for (name, _, executable) in BUILTINS {
             let path = builtins.join(name);
@@ -431,7 +488,7 @@ mod tests {
 
     #[cfg(feature = "portable")]
     #[test]
-    fn existing_empty_and_partial_directories_are_trusted() {
+    fn fresh_existing_empty_and_partial_directories_are_trusted() {
         let root = temp_root("trust");
         let builtins = root.join("builtins");
         let applets = root.join("applets");
@@ -439,8 +496,14 @@ mod tests {
         std::fs::create_dir_all(&applets).unwrap();
         std::fs::write(applets.join("partial"), "keep").unwrap();
 
-        initialize_builtins(&builtins, BUILTINS).unwrap();
-        initialize_applets(&root.join("mu"), &applets, APPLET_NAMES).unwrap();
+        initialize_builtins(&builtins, BUILTINS, std::time::UNIX_EPOCH).unwrap();
+        initialize_applets(
+            &root.join("mu"),
+            &applets,
+            APPLET_NAMES,
+            std::time::UNIX_EPOCH,
+        )
+        .unwrap();
 
         assert!(std::fs::read_dir(&builtins).unwrap().next().is_none());
         assert_eq!(
@@ -452,14 +515,105 @@ mod tests {
 
     #[cfg(feature = "portable")]
     #[test]
+    fn stale_directories_are_replaced() {
+        use std::fs::FileTimes;
+        use std::time::{Duration, UNIX_EPOCH};
+
+        let root = temp_root("stale");
+        let executable = root.join("mu");
+        let builtins = root.join("builtins");
+        let applets = root.join("applets");
+        std::fs::create_dir_all(&builtins).unwrap();
+        std::fs::create_dir_all(&applets).unwrap();
+        std::fs::write(&executable, "binary").unwrap();
+        std::fs::write(builtins.join("obsolete"), "remove").unwrap();
+        std::os::unix::fs::symlink(root.join("old-mu"), applets.join("apply_patch")).unwrap();
+
+        let old = UNIX_EPOCH + Duration::from_secs(1_000_000_000);
+        let executable_mtime = old + Duration::from_secs(1);
+        for directory in [&builtins, &applets] {
+            std::fs::File::open(directory)
+                .unwrap()
+                .set_times(FileTimes::new().set_modified(old))
+                .unwrap();
+        }
+
+        initialize_builtins(&builtins, BUILTINS, executable_mtime).unwrap();
+        initialize_applets(&executable, &applets, APPLET_NAMES, executable_mtime).unwrap();
+
+        assert!(!builtins.join("obsolete").exists());
+        for (name, contents, _) in BUILTINS {
+            assert_eq!(
+                std::fs::read_to_string(builtins.join(name)).unwrap(),
+                *contents
+            );
+        }
+        for name in APPLET_NAMES {
+            assert_eq!(std::fs::read_link(applets.join(name)).unwrap(), executable);
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(feature = "portable")]
+    #[test]
+    fn equal_directory_mtime_is_fresh() {
+        use std::fs::FileTimes;
+        use std::time::{Duration, UNIX_EPOCH};
+
+        let root = temp_root("equal-mtime");
+        let builtins = root.join("builtins");
+        std::fs::create_dir_all(&builtins).unwrap();
+        let mtime = UNIX_EPOCH + Duration::from_secs(1_000_000_000);
+        std::fs::File::open(&builtins)
+            .unwrap()
+            .set_times(FileTimes::new().set_modified(mtime))
+            .unwrap();
+
+        initialize_builtins(&builtins, BUILTINS, mtime).unwrap();
+
+        assert!(std::fs::read_dir(&builtins).unwrap().next().is_none());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(feature = "portable")]
+    #[test]
+    fn failed_population_removes_partial_directory() {
+        let root = temp_root("failed-population");
+        let builtins = root.join("builtins");
+        std::fs::create_dir(&root).unwrap();
+
+        assert!(
+            initialize_builtins(
+                &builtins,
+                &[("missing/child", "contents", false)],
+                std::time::UNIX_EPOCH,
+            )
+            .is_err()
+        );
+        assert!(!builtins.exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(feature = "portable")]
+    #[test]
     fn conflicting_files_are_rejected() {
         let root = temp_root("conflict");
         std::fs::create_dir(&root).unwrap();
         std::fs::write(root.join("builtins"), "occupied").unwrap();
         std::fs::write(root.join("applets"), "occupied").unwrap();
 
-        assert!(initialize_builtins(&root.join("builtins"), BUILTINS).is_err());
-        assert!(initialize_applets(&root.join("mu"), &root.join("applets"), APPLET_NAMES).is_err());
+        assert!(
+            initialize_builtins(&root.join("builtins"), BUILTINS, std::time::UNIX_EPOCH,).is_err()
+        );
+        assert!(
+            initialize_applets(
+                &root.join("mu"),
+                &root.join("applets"),
+                APPLET_NAMES,
+                std::time::UNIX_EPOCH,
+            )
+            .is_err()
+        );
         std::fs::remove_dir_all(root).unwrap();
     }
 }
