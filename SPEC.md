@@ -11,8 +11,8 @@ the rationale for consequential design choices. It is not a changelog,
 implementation diary, release manifest, or migration record. Exact
 configuration defaults live in [`src/default_config.jsonc`](src/default_config.jsonc);
 user-facing command and configuration references live in
-[`builtins/cli.md`](builtins/cli.md) and
-[`builtins/config.md`](builtins/config.md).
+[`builtins/cli`](builtins/cli) and
+[`builtins/config`](builtins/config).
 
 ---
 
@@ -665,16 +665,19 @@ or system prompt.
 
 A regular instruction file becomes a custom command when its first line is a
 supported Mu shebang. The shebang accepts no arguments or exactly
-`-m|--model <model-ref>`. Command names are relative instruction-root paths,
-including extensions.
+`-m|--model <model-ref>`. Command names are exact relative instruction-root
+paths, including an extension when the file has one. Executable permission does
+not affect discovery, but suffixless executable command files are recommended
+so they can also be invoked directly through their shebang. Shipped flat
+built-in resources are suffixless, and shipped custom commands are executable.
 
 A file may be both a command and a skill. Command invocation strips the shebang
 and supported frontmatter before submitting the prompt. An explicit invocation
 model overrides the shebang model; otherwise the shebang is turn-local and does
 not rewrite session model state.
 
-The extensionless built-in `goal` is a custom command, not a skill. It requires
-a goal as its custom instruction. The command agent acts only as supervisor: it
+The built-in `goal` is a custom command, not a skill. It requires a goal as its
+custom instruction. The command agent acts only as supervisor: it
 creates one fresh worker session, repeatedly continues that same session, and
 judges completion without planning, diagnosing, or performing the work. The
 worker owns current-state inspection, planning, execution, and verification.

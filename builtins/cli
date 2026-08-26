@@ -75,16 +75,19 @@ prompt. File-backed turns do not read terminal stdin. Non-terminal stdin, when
 non-empty, is appended verbatim after `\n---\n\n` as a custom instruction.
 
 ```sh
-mu review.md
-printf 'Focus on authentication.' | mu review.md
+mu review
+printf 'Focus on authentication.' | mu review
 ```
 
-In zsh and Fish prompt mode, a discovered command is invoked by its relative
-path, including extension, such as `/review.md`.
+Executable permission does not affect discovery. Suffixless executable command
+files are recommended so they can also be invoked directly through their
+shebang, such as `./.mu/review`. In zsh and Fish prompt mode, a discovered
+command is invoked by its exact relative path, such as `/review` (or
+`/review.md` when that is the filename).
 
 ### Built-in `/grill`
 
-`/grill <topic>` invokes the extensionless built-in `grill` custom command. The
+`/grill <topic>` invokes the built-in `grill` custom command. The
 topic argument is required. Its agent conducts a structured design interview:
 it maps the topic's decisions as a tree, works the tree in frontier rounds
 (asking every unblocked question at once with a recommended answer), looks up
@@ -95,7 +98,7 @@ current directory.
 
 ### Built-in `/goal`
 
-`/goal <goal>` invokes the extensionless built-in `goal` custom command. The
+`/goal <goal>` invokes the built-in `goal` custom command. The
 goal argument is required. Its agent acts only as a supervisor: it creates one
 fresh worker session, continues that same session until completion, and judges
 the result without planning or performing the work. The worker owns state
@@ -146,7 +149,7 @@ Inspect resolved session, model, context, scope, and output state.
 
 Without `--export`, print the assembled system prompt Mu would use.
 `--export` emits user `AGENTS.md`, non-built-in skills, environment-file
-guidance, and a pointer to `mu-doc.md` for a foreign agent. It never contacts a
+guidance, and a pointer to `mu-doc` for a foreign agent. It never contacts a
 provider.
 
 ### `mu cat [<prompt-file-or-command>]`

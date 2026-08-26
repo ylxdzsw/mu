@@ -506,14 +506,16 @@ mod tests {
     }
 
     #[test]
-    fn scans_flat_command_skill_files() {
+    fn scans_non_executable_flat_command_skill_files() {
         let root = temp_root("flat-command-skill");
         fs::create_dir_all(&root).unwrap();
+        let path = root.join("review.md");
         fs::write(
-            root.join("review.md"),
+            &path,
             "#!/usr/bin/env mu\n---\nname: review\ndescription: Review changes.\n---\nReview it.\n",
         )
         .unwrap();
+        assert_eq!(fs::metadata(path).unwrap().permissions().mode() & 0o111, 0);
 
         let env = env_map(&[]);
         let index = scan_instruction_index_with_builtins(None, &root, None, &env).unwrap();

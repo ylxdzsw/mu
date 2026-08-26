@@ -2,33 +2,38 @@ use std::path::{Path, PathBuf};
 
 #[cfg(feature = "portable")]
 use std::ffi::OsStr;
+#[cfg(feature = "portable")]
+use std::os::unix::fs::PermissionsExt;
 
 #[cfg(feature = "portable")]
 use anyhow::bail;
 use anyhow::{Context, Result};
 
 #[cfg(feature = "portable")]
-const BUILTINS: &[(&str, &str)] = &[
+const BUILTINS: &[(&str, &str, bool)] = &[
     (
-        "agent-browser.md",
-        include_str!("../builtins/agent-browser.md"),
+        "agent-browser",
+        include_str!("../builtins/agent-browser"),
+        false,
     ),
     (
-        "background-task.md",
-        include_str!("../builtins/background-task.md"),
+        "background-task",
+        include_str!("../builtins/background-task"),
+        false,
     ),
     (
-        "brave-search.md",
-        include_str!("../builtins/brave-search.md"),
+        "brave-search",
+        include_str!("../builtins/brave-search"),
+        false,
     ),
-    ("cli.md", include_str!("../builtins/cli.md")),
-    ("config.md", include_str!("../builtins/config.md")),
-    ("exa-search.md", include_str!("../builtins/exa-search.md")),
-    ("goal", include_str!("../builtins/goal")),
-    ("grill", include_str!("../builtins/grill")),
-    ("markitdown.md", include_str!("../builtins/markitdown.md")),
-    ("mu-doc.md", include_str!("../builtins/mu-doc.md")),
-    ("subagent.md", include_str!("../builtins/subagent.md")),
+    ("cli", include_str!("../builtins/cli"), false),
+    ("config", include_str!("../builtins/config"), false),
+    ("exa-search", include_str!("../builtins/exa-search"), false),
+    ("goal", include_str!("../builtins/goal"), true),
+    ("grill", include_str!("../builtins/grill"), true),
+    ("markitdown", include_str!("../builtins/markitdown"), false),
+    ("mu-doc", include_str!("../builtins/mu-doc"), false),
+    ("subagent", include_str!("../builtins/subagent"), false),
 ];
 
 #[cfg(feature = "portable")]
@@ -223,17 +228,22 @@ fn initialize_cache_root(cache_root: &Path) -> Result<()> {
 }
 
 #[cfg(feature = "portable")]
-fn initialize_builtins(directory: &Path, builtins: &[(&str, &str)]) -> Result<()> {
+fn initialize_builtins(directory: &Path, builtins: &[(&str, &str, bool)]) -> Result<()> {
     if trust_existing_directory(directory, "built-in")? {
         return Ok(());
     }
 
     std::fs::create_dir(directory)
         .with_context(|| format!("creating portable built-ins {}", directory.display()))?;
-    for (name, contents) in builtins {
+    for (name, contents, executable) in builtins {
         let path = directory.join(name);
         std::fs::write(&path, contents)
             .with_context(|| format!("writing portable built-in {}", path.display()))?;
+        std::fs::set_permissions(
+            &path,
+            std::fs::Permissions::from_mode(if *executable { 0o755 } else { 0o644 }),
+        )
+        .with_context(|| format!("setting portable built-in mode {}", path.display()))?;
     }
     Ok(())
 }
@@ -294,17 +304,22 @@ mod tests {
 
     #[cfg(feature = "portable")]
     #[test]
-    fn embedded_builtins_exactly_cover_the_shipped_files() {
-        let mut embedded = BUILTINS.iter().map(|(name, _)| *name).collect::<Vec<_>>();
+    fn embedded_builtins_exactly_cover_the_shipped_files_and_modes() {
+        let mut embedded = BUILTINS
+            .iter()
+            .map(|(name, _, executable)| ((*name).to_string(), *executable))
+            .collect::<Vec<_>>();
         embedded.sort_unstable();
         let mut shipped = std::fs::read_dir(Path::new(env!("CARGO_MANIFEST_DIR")).join("builtins"))
             .unwrap()
             .map(|entry| {
-                entry
-                    .unwrap()
+                let entry = entry.unwrap();
+                let executable = entry.metadata().unwrap().permissions().mode() & 0o111 != 0;
+                let name = entry
                     .file_name()
                     .into_string()
-                    .expect("built-in names are UTF-8")
+                    .expect("built-in names are UTF-8");
+                (name, executable)
             })
             .collect::<Vec<_>>();
         shipped.sort_unstable();
@@ -400,8 +415,13 @@ mod tests {
         initialize_builtins(&builtins, BUILTINS).unwrap();
         initialize_applets(&executable, &applets, APPLET_NAMES).unwrap();
 
-        for (name, _) in BUILTINS {
-            assert!(builtins.join(name).is_file());
+        for (name, _, executable) in BUILTINS {
+            let path = builtins.join(name);
+            assert!(path.is_file());
+            assert_eq!(
+                path.metadata().unwrap().permissions().mode() & 0o111 != 0,
+                *executable
+            );
         }
         for name in APPLET_NAMES {
             assert_eq!(std::fs::read_link(applets.join(name)).unwrap(), executable);

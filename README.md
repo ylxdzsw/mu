@@ -153,11 +153,21 @@ Emphasize compatibility and migration risks.
 EOF
 ```
 
-`mu` is compatible with shebang lines, so an executable prompt can select its own
-model:
+Files directly under `.mu` become custom commands when they start with a Mu
+shebang. Executable permission is not required for discovery, but suffixless
+executable commands are recommended so they also work as ordinary scripts:
+
+`.mu/review`:
+
+```markdown
+#!/usr/bin/env -S mu --model openai/gpt-5:high
+Review the current checkout.
+```
 
 ```sh
-#!/usr/bin/env -S mu --model openai/gpt-5:high
+chmod +x .mu/review
+mu review
+./.mu/review
 ```
 
 Instruction discovery reads direct `.mu` files and direct
@@ -167,8 +177,8 @@ indexed.
 Preview the exact user-prompt text without starting a turn:
 
 ```sh
-mu cat review.md
-printf 'Focus on authentication.' | mu cat review.md
+mu cat review
+printf 'Focus on authentication.' | mu cat review
 printf '# Standalone prompt\n' | mu cat
 ```
 

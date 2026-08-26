@@ -18,8 +18,8 @@ commands in shell prompt mode.
 
 For full details, read:
 
-- [Configuration, instructions, skills, and commands](config.md)
-- [CLI reference](cli.md)
+- [Configuration, instructions, skills, and commands](config)
+- [CLI reference](cli)
 
 ## Important paths
 

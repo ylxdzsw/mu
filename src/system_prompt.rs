@@ -157,8 +157,12 @@ fn existing_env_paths(
 
 fn export_preamble(env_paths: &[std::path::PathBuf]) -> anyhow::Result<String> {
     let mut preamble = EXPORT_PREAMBLE.to_string();
-    let mu_doc = crate::paths::builtins_dir()?.join("mu-doc.md");
-    if mu_doc.is_file() {
+    let builtins = crate::paths::builtins_dir()?;
+    let mu_doc = ["mu-doc", "mu-doc.md"]
+        .into_iter()
+        .map(|name| builtins.join(name))
+        .find(|path| path.is_file());
+    if let Some(mu_doc) = mu_doc {
         preamble.push_str(&format!(
             "\nTo understand Mu, its configuration, and its CLI, read {}.",
             mu_doc.display()
@@ -407,12 +411,12 @@ mod tests {
         assert!(preamble.contains(&project_env.display().to_string()));
         // On a packaged or source checkout the built-in reference exists, so the
         // pointer is appended; otherwise the preamble is just opened and closed.
-        if crate::paths::builtins_dir()
-            .unwrap()
-            .join("mu-doc.md")
-            .is_file()
+        if ["mu-doc", "mu-doc.md"]
+            .into_iter()
+            .map(|name| crate::paths::builtins_dir().unwrap().join(name))
+            .any(|path| path.is_file())
         {
-            assert!(preamble.contains("mu-doc.md"));
+            assert!(preamble.contains("mu-doc"));
         }
     }
 

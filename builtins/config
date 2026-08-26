@@ -2,7 +2,7 @@
 
 This is the reference for Mu configuration, environment overlays, durable
 instructions, custom commands, skills, scope, and precedence. For turn and
-management-command invocation, read [the CLI reference](cli.md).
+management-command invocation, read [the Mu CLI reference](cli).
 
 ## First steps
 
@@ -17,7 +17,7 @@ Then read the relevant files from the active scopes:
 - Global config directory: `~/.mu`, or `$MU_CONFIG_DIR` when set.
 - Project config directory: `<project>/.mu` when the current directory resolves
   to a project.
-- Built-ins: the directory containing `mu-doc.md`, normally `/usr/share/mu`;
+- Built-ins: the directory containing `mu-doc`, normally `/usr/share/mu`;
   portable builds may materialize it in the user cache.
 
 `mu` discovers a project by walking upward from the invoking `pwd` until it
@@ -208,12 +208,19 @@ Summarize the current checkout and suggest the next release note.
 
 The shebang accepts no arguments or exactly `-m|--model <model-ref>` as separate
 tokens; other arguments and `--model=value` are rejected on invocation. Use
-`env -S` with a model. Commands are discovered by their relative `.mu` path,
-including the extension. A file may be both a command and a skill; command
-execution strips the shebang and skill frontmatter. Command files need not have
-executable permission.
+`env -S` with a model. Commands are discovered by their exact relative `.mu`
+path, including an extension when present. A file may be both a command and a
+skill; command execution strips the shebang and skill frontmatter. Executable
+permission does not affect discovery, but a suffixless executable file is the
+recommended convention because it can also be run directly:
 
-See [the CLI reference](cli.md) for invocation, argument precedence, prompt
+```sh
+chmod +x .mu/review
+mu review
+./.mu/review
+```
+
+See [the Mu CLI reference](cli) for invocation, argument precedence, prompt
 input, and `mu cat`.
 
 ## Skills
