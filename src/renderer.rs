@@ -169,7 +169,8 @@ impl Renderer {
         )
     }
 
-    pub fn with_transcript_output(
+    #[cfg(test)]
+    pub(crate) fn with_transcript_output(
         format: OutputFormat,
         stdout: Box<dyn Write + Send>,
         line_width: usize,

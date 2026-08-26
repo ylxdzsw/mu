@@ -122,17 +122,13 @@ as `current-session`.
 List recent sessions in the active scope. The default limit is 20. Sessions
 written in an unsupported journal version are skipped with a warning.
 
-### `mu transcript [-s <id>] [-o <format>] [--epoch <n>] [--html]`
+### `mu transcript [-s <id>] [-o <format>] [--epoch <n>]`
 
 Replay a persisted session without contacting a provider, defaulting to the
 last selected session and configured output density. Configuration is loaded
 read-only and permissively: replay does not create a missing global config,
 load environment files, or require providers to pass runtime validation. With
-no config files, the bundled `concise` default applies. `--html` emits a browser-viewable
-xterm.js document whose pinned assets are loaded from jsDelivr when opened. The
-browser terminal keeps a centered 100-column width, scrolls horizontally on
-narrower viewports, and debounces vertical fitting while the page is resized.
-Its scrollbars use a thin dark theme instead of the browser default.
+no config files, the bundled `concise` default applies.
 The default replay includes synthetic compaction turns and their derived
 trigger/result lines; `final` omits those internals. `--epoch` limits replay to
 activity sent under one context-epoch cache key. A compaction request and its

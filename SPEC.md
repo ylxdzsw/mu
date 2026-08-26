@@ -830,7 +830,7 @@ Management commands:
 | `mu init` | Create minimal project metadata. |
 | `mu new` | Create a model-free session without selecting it. |
 | `mu sessions` | List recent active-scope sessions. |
-| `mu transcript` | Replay the persisted semantic transcript without contacting a provider; `--html` emits an xterm.js document that loads pinned assets when opened. |
+| `mu transcript` | Replay the persisted semantic transcript without contacting a provider. |
 | `mu status` | Report resolved scope, selection, model, context, and optional expensive indexes. |
 | `mu context` | Show the system prompt Mu would assemble; `--export` emits user instructions and non-built-in skill guidance for a foreign agent. |
 | `mu cat` | Resolve and preview exact prompt input without provider contact or session creation. |
@@ -974,16 +974,10 @@ Transcript output reuses the normal output densities. It loads configuration
 permissively and read-only: replay does not create a missing global config,
 load environment files, or require providers to pass runtime validation.
 Malformed provider structure is discarded so the remaining settings can still
-be used. An explicit `--output` selects the density; otherwise both terminal
-and HTML replay use the configured output, falling back to the bundled
-`concise` default. It reconstructs the historical prompt model, working
-directory, and prior context usage from the journal and configured model
-metadata. HTML output is a renderer replay, not a second transcript model. Its
-xterm viewport remains 100 columns wide, centers
-when space permits, scrolls horizontally on narrower viewports, and debounces
-vertical fitting during resizing. Line breaks produced by the fixed-width
-renderer are not reflowed after export. Both scroll surfaces use a thin dark
-theme rather than the browser default.
+be used. An explicit `--output` selects the density; otherwise replay uses the
+configured output, falling back to the bundled `concise` default. It
+reconstructs the historical prompt model, working directory, and prior context
+usage from the journal and configured model metadata.
 
 ### 11.4 Usage accounting
 

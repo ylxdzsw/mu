@@ -4,7 +4,6 @@ use std::io::{self, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process;
 use std::sync::atomic::{AtomicU8, Ordering};
-use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
@@ -143,10 +142,6 @@ enum Command {
         /// Output density (overrides config)
         #[arg(short = 'o', long, value_enum)]
         output: Option<OutputFormat>,
-
-        /// Emit a browser-viewable xterm.js document
-        #[arg(long)]
-        html: bool,
 
         /// Show only activity sent under one context epoch
         #[arg(long)]
@@ -464,31 +459,6 @@ fn warn_unsupported_session(error: &store::UnsupportedSessionVersion, action: &s
     eprintln!("[mu] warning: {error}; {action}");
 }
 
-#[derive(Clone, Default)]
-struct TranscriptBuffer(Arc<Mutex<Vec<u8>>>);
-
-impl TranscriptBuffer {
-    fn text(&self) -> Result<String> {
-        Ok(String::from_utf8(
-            self.0.lock().expect("transcript buffer poisoned").clone(),
-        )?)
-    }
-}
-
-impl Write for TranscriptBuffer {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.0
-            .lock()
-            .expect("transcript buffer poisoned")
-            .extend_from_slice(buf);
-        Ok(buf.len())
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
-    }
-}
-
 fn bash_output_for_transcript(output: &str, exit_code: i32) -> Cow<'_, str> {
     let marker = format!("\n[exit code: {exit_code}]");
     if let Some(output) = output.strip_suffix(&marker) {
@@ -650,108 +620,6 @@ fn replay_transcript(
     Ok(())
 }
 
-fn write_terminal_transcript_separator(
-    stdout: &mut impl Write,
-    stdout_is_terminal: bool,
-    events: &[store::TranscriptEvent],
-) -> io::Result<()> {
-    if stdout_is_terminal
-        && events
-            .iter()
-            .any(|event| matches!(event, store::TranscriptEvent::User { .. }))
-    {
-        stdout.write_all(b"\n")?;
-    }
-    Ok(())
-}
-
-const TRANSCRIPT_HTML_COLUMNS: usize = 100;
-
-fn transcript_html(ansi: &str) -> Result<String> {
-    let transcript = serde_json::to_string(ansi)?.replace('<', "\\u003c");
-    Ok(format!(
-        r##"<!doctype html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Mu transcript</title>
-<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/css/xterm.css">
-<style>
-:root {{
-  color-scheme:dark;
-  --scroll-thumb:rgba(255,255,255,.2);
-  --scroll-thumb-hover:rgba(255,255,255,.4);
-}}
-html,body,#terminal-scroll,#terminal {{ height:100%; margin:0 }}
-body {{ box-sizing:border-box; padding:16px; background:#000 }}
-#terminal-scroll {{
-  overflow-x:auto; overflow-y:hidden;
-  scrollbar-width:thin; scrollbar-color:var(--scroll-thumb) transparent;
-}}
-#terminal {{ margin:0 auto; overflow:hidden }}
-.xterm .xterm-viewport {{
-  overflow-y:auto;
-  scrollbar-width:thin; scrollbar-color:var(--scroll-thumb) transparent;
-}}
-.xterm .xterm-viewport::-webkit-scrollbar {{ width:7px }}
-#terminal-scroll::-webkit-scrollbar {{ height:7px }}
-.xterm .xterm-viewport::-webkit-scrollbar-track,
-#terminal-scroll::-webkit-scrollbar-track {{ background:transparent }}
-.xterm .xterm-viewport::-webkit-scrollbar-thumb,
-#terminal-scroll::-webkit-scrollbar-thumb {{
-  background:var(--scroll-thumb);
-  border:2px solid transparent; border-radius:999px;
-  background-clip:padding-box;
-}}
-.xterm .xterm-viewport:hover {{
-  scrollbar-color:var(--scroll-thumb-hover) transparent;
-}}
-#terminal-scroll:hover {{ scrollbar-color:var(--scroll-thumb-hover) transparent }}
-.xterm .xterm-viewport::-webkit-scrollbar-thumb:hover,
-#terminal-scroll::-webkit-scrollbar-thumb:hover {{ background:var(--scroll-thumb-hover) }}
-</style>
-</head>
-<body>
-<div id="terminal-scroll"><div id="terminal"></div></div>
-<script src="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/lib/xterm.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/@xterm/addon-fit@0.10.0/lib/addon-fit.js"></script>
-<script>
-const columns = {TRANSCRIPT_HTML_COLUMNS};
-const scrollElement = document.getElementById("terminal-scroll");
-const terminalElement = document.getElementById("terminal");
-const term = new Terminal({{
-  cols:columns, rows:30, convertEol:true, disableStdin:true, scrollback:100000,
-  fontFamily:"ui-monospace,SFMono-Regular,Menlo,Consolas,monospace",
-  theme:{{background:"#000000"}}
-}});
-const fitAddon = new FitAddon.FitAddon();
-term.loadAddon(fitAddon);
-term.open(terminalElement);
-fitAddon.fit();
-const screenElement = terminalElement.querySelector(".xterm-screen");
-const horizontalGutter = Math.max(0, terminalElement.clientWidth - screenElement.clientWidth);
-term.resize(columns, term.rows);
-terminalElement.style.width = Math.ceil(screenElement.getBoundingClientRect().width + horizontalGutter) + "px";
-const fitVertically = () => {{
-  const dimensions = fitAddon.proposeDimensions();
-  if (dimensions) term.resize(columns, dimensions.rows);
-}};
-fitVertically();
-let fitTimer;
-const scheduleFit = () => {{
-  clearTimeout(fitTimer);
-  fitTimer = setTimeout(fitVertically, 50);
-}};
-new ResizeObserver(scheduleFit).observe(scrollElement);
-term.write({transcript});
-</script>
-</body>
-</html>
-"##
-    ))
-}
-
 async fn run() -> Result<()> {
     let args = Args::parse();
     validate_cli_args(&args)?;
@@ -809,7 +677,6 @@ async fn run() -> Result<()> {
         Some(Command::Transcript {
             session,
             output,
-            html,
             epoch,
         }) => {
             let config =
@@ -829,26 +696,16 @@ async fn run() -> Result<()> {
                 let choice = models::resolve_model_choice(&config, model).ok()?;
                 models::resolve_model_info(&config, choice.active_model()).context_window
             };
-            if html {
-                let buffer = TranscriptBuffer::default();
-                let mut renderer = Renderer::with_transcript_output(
-                    output,
-                    Box::new(buffer.clone()),
-                    TRANSCRIPT_HTML_COLUMNS - 1,
-                );
-                replay_transcript(&mut renderer, &events, output, context_window)?;
-                let html = transcript_html(&buffer.text()?)?;
-                io::stdout().write_all(html.as_bytes())?;
-            } else {
-                let stdout = io::stdout();
-                write_terminal_transcript_separator(
-                    &mut stdout.lock(),
-                    stdout.is_terminal(),
-                    &events,
-                )?;
-                let mut renderer = Renderer::with_format(output);
-                replay_transcript(&mut renderer, &events, output, context_window)?;
+            let stdout = io::stdout();
+            if stdout.is_terminal()
+                && events
+                    .iter()
+                    .any(|event| matches!(event, store::TranscriptEvent::User { .. }))
+            {
+                stdout.lock().write_all(b"\n")?;
             }
+            let mut renderer = Renderer::with_format(output);
+            replay_transcript(&mut renderer, &events, output, context_window)?;
             return Ok(());
         }
         Some(Command::Status(status_args)) => {
@@ -1528,9 +1385,35 @@ fn session_listing_title(title: Option<&str>) -> String {
 #[cfg(test)]
 mod tests {
     use std::io::Cursor;
+    use std::sync::{Arc, Mutex};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::*;
+
+    #[derive(Clone, Default)]
+    struct TranscriptBuffer(Arc<Mutex<Vec<u8>>>);
+
+    impl TranscriptBuffer {
+        fn text(&self) -> Result<String> {
+            Ok(String::from_utf8(
+                self.0.lock().expect("transcript buffer poisoned").clone(),
+            )?)
+        }
+    }
+
+    impl Write for TranscriptBuffer {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0
+                .lock()
+                .expect("transcript buffer poisoned")
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
 
     fn temp_file_path(name: &str) -> PathBuf {
         let nanos = SystemTime::now()
@@ -1588,7 +1471,6 @@ mod tests {
             Some(Command::Transcript {
                 session: Some(ref session),
                 output: Some(OutputFormat::Full),
-                html: false,
                 epoch: None,
             }) if session == "ses_example"
         ));
@@ -1865,16 +1747,5 @@ mod tests {
 
         let mismatched = "tail\n[exit code: 9]";
         assert_eq!(bash_output_for_transcript(mismatched, 7), mismatched);
-    }
-
-    #[test]
-    fn transcript_html_uses_pinned_xterm_and_escapes_embedded_script_end() {
-        let html = transcript_html("</script>\n").unwrap();
-
-        assert!(html.contains("@xterm/xterm@5.5.0"));
-        assert!(html.contains("@xterm/addon-fit@0.10.0"));
-        assert!(html.contains("new FitAddon.FitAddon()"));
-        assert!(html.contains("term.loadAddon(fitAddon)"));
-        assert!(html.contains(r#"term.write("\u003c/script>\n")"#));
     }
 }

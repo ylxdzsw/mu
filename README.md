@@ -204,11 +204,10 @@ state with `mu sessions`, `mu transcript --session <id>`, and `mu status
 --json`. Add `--include-git` or `--include-session-details` when those heavier
 status sections are needed. Run `mu --help` for the full CLI surface.
 
-Replay or share a session without contacting a provider:
+Replay a session without contacting a provider:
 
 ```sh
 mu transcript -o full
-mu transcript --session ses_... --html > session.html
 mu transcript --session ses_... --epoch 2
 ```
 
@@ -218,12 +217,7 @@ creating a missing global config or validating providers for runtime use. It
 uses the configured output density, defaulting to bundled `concise`; pass `-o`
 to override it. Each user turn includes a synthesized shell status line with its
 requested model, recorded cwd, and historical context percentage when that
-model remains configured. HTML export is a single file
-containing the terminal transcript and loads pinned xterm.js assets from
-jsDelivr when opened. The browser terminal keeps a centered 100-column width,
-scrolls horizontally on narrower viewports, and debounces vertical fitting
-while the page is resized. Its scrollbars use a thin dark theme instead of
-the browser default.
+model remains configured.
 `mu compact` compacts the current session using the configured output density;
 pass `-s <id>` to select another session or `-o <format>` to override output.
 
