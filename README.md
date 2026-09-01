@@ -15,7 +15,7 @@ whatever cursor movement keybindings you configured for your shell. `mu` is in y
 [pi](https://github.com/earendil-works/pi/tree/main/packages/coding-agent).
 
 **"Coding Mode"**&emsp; If you doubt how a single `bash` suffice: this idea is closely related to [code mode](https://blog.cloudflare.com/code-mode/).
-The difference is that we choose `bash`, a language that has stood 50 years test of composibility, over `javascript`, and we use
+The difference is that we choose `bash`, a language that has stood the test of decades, over `javascript`, and we use
 POSIX tools, the maximum common divisor across agents that all models born to master, instead of a custom tool set. Since POSIX
 commands need no teaching, the total system prompt of `mu` is < 1k tokens.
 
