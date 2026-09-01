@@ -1155,8 +1155,7 @@ mod tests {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         use tokio::net::UnixListener;
 
-        let tmp = std::env::temp_dir().join(format!("mu-http-unix-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&tmp).unwrap();
+        let tmp = crate::random::create_temp_dir(&std::env::temp_dir(), "mu-http-unix-").unwrap();
         let socket_path = tmp.join("provider.sock");
         let listener = UnixListener::bind(&socket_path).unwrap();
 

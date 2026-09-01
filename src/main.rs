@@ -1610,8 +1610,9 @@ mod tests {
 
     #[test]
     fn rejects_oversized_attachment_before_reading_it() {
-        let path = std::env::temp_dir().join(format!("mu-oversized-{}.wav", uuid::Uuid::new_v4()));
-        let file = std::fs::File::create(&path).unwrap();
+        let (file, path) =
+            crate::random::create_temp_file(&std::env::temp_dir(), "mu-oversized-", ".wav")
+                .unwrap();
         file.set_len(MAX_ATTACHMENT_BYTES + 1).unwrap();
         drop(file);
         let result = load_attachments(std::slice::from_ref(&path));

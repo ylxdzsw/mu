@@ -1,5 +1,7 @@
 use std::fs::{File, OpenOptions};
 use std::io::Read;
+#[cfg(test)]
+use std::os::unix::fs::DirBuilderExt;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
@@ -37,6 +39,13 @@ pub fn session_id() -> Result<String> {
     Ok(format!("ses_{}", String::from_utf8_lossy(&suffix)))
 }
 
+fn random_hex<const N: usize>() -> Result<String> {
+    Ok(random_bytes::<N>()?
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect())
+}
+
 /// Create a private, unpredictably named file in `directory`.
 ///
 /// `create_new` is the important part: a random name is only a hint until the
@@ -45,11 +54,7 @@ pub fn create_temp_file(directory: &Path, prefix: &str, suffix: &str) -> Result<
     std::fs::create_dir_all(directory)
         .with_context(|| format!("creating temporary directory {}", directory.display()))?;
     for _ in 0..32 {
-        let bytes = random_bytes::<12>()?;
-        let token = bytes
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect::<String>();
+        let token = random_hex::<12>()?;
         let path = directory.join(format!("{prefix}{token}{suffix}"));
         let mut options = OpenOptions::new();
         options.write(true).read(true).create_new(true);
@@ -69,6 +74,30 @@ pub fn create_temp_file(directory: &Path, prefix: &str, suffix: &str) -> Result<
     )
 }
 
+/// Create a private, unpredictably named directory in `directory`.
+#[cfg(test)]
+pub fn create_temp_dir(directory: &Path, prefix: &str) -> Result<PathBuf> {
+    std::fs::create_dir_all(directory)
+        .with_context(|| format!("creating temporary directory {}", directory.display()))?;
+    let mut builder = std::fs::DirBuilder::new();
+    builder.mode(0o700);
+    for _ in 0..32 {
+        let path = directory.join(format!("{prefix}{}", random_hex::<12>()?));
+        match builder.create(&path) {
+            Ok(()) => return Ok(path),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("creating temporary directory {}", path.display()));
+            }
+        }
+    }
+    bail!(
+        "could not choose a unique temporary directory in {}",
+        directory.display()
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -82,18 +111,27 @@ mod tests {
     }
 
     #[test]
-    fn temporary_files_are_private_and_use_the_requested_name_shape() {
+    fn temporary_paths_are_private_unique_and_use_the_requested_name_shape() {
         use std::os::unix::fs::MetadataExt;
 
-        let directory =
-            std::env::temp_dir().join(format!("mu-random-test-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&directory).unwrap();
+        let directory = create_temp_dir(&std::env::temp_dir(), "mu-random-test-").unwrap();
+        let other = create_temp_dir(&std::env::temp_dir(), "mu-random-test-").unwrap();
         let (_, path) = create_temp_file(&directory, "spill-", ".tmp").unwrap();
 
+        assert_ne!(directory, other);
+        assert!(
+            directory
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("mu-random-test-")
+        );
+        assert_eq!(std::fs::metadata(&directory).unwrap().mode() & 0o077, 0);
         assert_eq!(path.parent(), Some(directory.as_path()));
         let name = path.file_name().unwrap().to_string_lossy();
         assert!(name.starts_with("spill-") && name.ends_with(".tmp"));
         assert_eq!(std::fs::metadata(&path).unwrap().mode() & 0o077, 0);
         let _ = std::fs::remove_dir_all(directory);
+        let _ = std::fs::remove_dir_all(other);
     }
 }

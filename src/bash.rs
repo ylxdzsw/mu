@@ -1115,8 +1115,7 @@ mod tests {
 
     #[test]
     fn cwd_and_environment_do_not_persist_between_calls() {
-        let tmp = std::env::temp_dir().join(format!("mu-bash-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&tmp).unwrap();
+        let tmp = crate::random::create_temp_dir(&std::env::temp_dir(), "mu-bash-").unwrap();
         let mut renderer = Renderer::new();
 
         let mut first = args("cd / && export MU_TEST=works && pwd");
@@ -1244,7 +1243,8 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn redirected_setsid_command_detaches_with_pid_as_sid() {
-        let log = std::env::temp_dir().join(format!("mu-bg-test-{}", uuid::Uuid::new_v4()));
+        let tmp = crate::random::create_temp_dir(&std::env::temp_dir(), "mu-bg-test-").unwrap();
+        let log = tmp.join("output");
         let command = format!(
             "setsid sleep 10 </dev/null >{} 2>&1 & pid=$!; sleep 0.05; sid=$(ps -o sid= -p \"$pid\"); printf '%s %s' \"$pid\" \"$sid\"",
             log.display()
@@ -1270,7 +1270,7 @@ mod tests {
                 libc::kill(-pid, libc::SIGKILL);
             }
         }
-        let _ = std::fs::remove_file(log);
+        let _ = std::fs::remove_dir_all(tmp);
 
         assert!(started.elapsed() < std::time::Duration::from_secs(2));
         assert_eq!(ids.len(), 2);
@@ -1280,7 +1280,8 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn redirected_setsid_command_can_read_tool_stdin() {
-        let output = std::env::temp_dir().join(format!("mu-bg-stdin-{}", uuid::Uuid::new_v4()));
+        let tmp = crate::random::create_temp_dir(&std::env::temp_dir(), "mu-bg-stdin-").unwrap();
+        let output = tmp.join("output");
         let command = format!(
             "setsid sh -c 'cat >\"$1\"' sh {} <&0 >/dev/null 2>&1 &",
             output.display()
@@ -1307,14 +1308,16 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(25));
             None
         });
-        let _ = std::fs::remove_file(output);
+        let _ = std::fs::remove_dir_all(tmp);
         assert_eq!(contents.as_deref(), Some(expected));
     }
 
     #[test]
     fn timeout_kills_background_descendants() {
-        let marker = format!("/tmp/mu-bash-descendant-{}", uuid::Uuid::new_v4());
-        let script = format!("sleep 20 & echo $! > {marker}; sleep 20");
+        let tmp =
+            crate::random::create_temp_dir(&std::env::temp_dir(), "mu-bash-descendant-").unwrap();
+        let marker = tmp.join("marker");
+        let script = format!("sleep 20 & echo $! > {}; sleep 20", marker.display());
         let mut renderer = Renderer::new();
         let result = run_bash(
             args(&script),
@@ -1343,7 +1346,7 @@ mod tests {
             false
         });
         assert!(stopped, "background sleep {pid} survived timeout");
-        let _ = std::fs::remove_file(marker);
+        let _ = std::fs::remove_dir_all(tmp);
     }
 
     #[test]

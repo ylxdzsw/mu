@@ -884,10 +884,7 @@ mod apply_patch {
         use super::*;
 
         fn temp_dir() -> PathBuf {
-            let path =
-                std::env::temp_dir().join(format!("mu-apply-patch-{}", uuid::Uuid::new_v4()));
-            fs::create_dir_all(&path).unwrap();
-            path
+            crate::random::create_temp_dir(&std::env::temp_dir(), "mu-apply-patch-").unwrap()
         }
 
         #[test]
@@ -1883,9 +1880,7 @@ mod edit {
         use super::*;
 
         fn temp_dir() -> PathBuf {
-            let path = std::env::temp_dir().join(format!("mu-edit-{}", uuid::Uuid::new_v4()));
-            fs::create_dir_all(&path).unwrap();
-            path
+            crate::random::create_temp_dir(&std::env::temp_dir(), "mu-edit-").unwrap()
         }
 
         fn block(search: &str, replacement: &str) -> String {

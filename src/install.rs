@@ -341,12 +341,14 @@ mod tests {
     use super::*;
 
     fn temp_root(name: &str) -> PathBuf {
-        std::env::temp_dir().join(format!("mu-install-{name}-{}", uuid::Uuid::new_v4()))
+        crate::random::create_temp_dir(&std::env::temp_dir(), &format!("mu-install-{name}-"))
+            .unwrap()
     }
 
     #[test]
     fn native_paths_are_derived_without_checking_installation_resources() {
-        let root = temp_root("native-paths");
+        let tmp = temp_root("native-paths");
+        let root = tmp.join("missing");
         let executable = root.join("bin/mu");
         assert_eq!(
             native_builtins_dir(&executable).unwrap(),
@@ -357,6 +359,7 @@ mod tests {
             root.join("libexec/mu")
         );
         assert!(!root.exists());
+        std::fs::remove_dir_all(tmp).unwrap();
     }
 
     #[cfg(feature = "portable")]
@@ -580,7 +583,6 @@ mod tests {
     fn failed_population_removes_partial_directory() {
         let root = temp_root("failed-population");
         let builtins = root.join("builtins");
-        std::fs::create_dir(&root).unwrap();
 
         assert!(
             initialize_builtins(
@@ -598,7 +600,6 @@ mod tests {
     #[test]
     fn conflicting_files_are_rejected() {
         let root = temp_root("conflict");
-        std::fs::create_dir(&root).unwrap();
         std::fs::write(root.join("builtins"), "occupied").unwrap();
         std::fs::write(root.join("applets"), "occupied").unwrap();
 

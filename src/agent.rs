@@ -2284,8 +2284,7 @@ mod tests {
 
     #[tokio::test]
     async fn live_provider_retry_completes_turn() {
-        let tmp = std::env::temp_dir().join(format!("mu-agent-retry-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&tmp).unwrap();
+        let tmp = crate::random::create_temp_dir(&std::env::temp_dir(), "mu-agent-retry-").unwrap();
         let store = Store::open(&tmp.join("mu.db")).unwrap();
         let session = store.create_session("/tmp").unwrap();
         let config = test_config();
@@ -2615,11 +2614,9 @@ mod tests {
 
     #[tokio::test]
     async fn plain_readonly_bash_batch_executes_concurrently_but_persists_in_order() {
-        let tmp = std::env::temp_dir().join(format!(
-            "mu-agent-plain-concurrent-{}",
-            uuid::Uuid::new_v4()
-        ));
-        std::fs::create_dir_all(&tmp).unwrap();
+        let tmp =
+            crate::random::create_temp_dir(&std::env::temp_dir(), "mu-agent-plain-concurrent-")
+                .unwrap();
         let store = Store::open(&tmp.join("mu.db")).unwrap();
         let session = store.create_session("/tmp").unwrap();
         let config = test_config();
@@ -2682,11 +2679,9 @@ mod tests {
 
     #[tokio::test]
     async fn invalid_readonly_bash_in_batch_persists_error_and_turn_continues() {
-        let tmp = std::env::temp_dir().join(format!(
-            "mu-agent-invalid-concurrent-{}",
-            uuid::Uuid::new_v4()
-        ));
-        std::fs::create_dir_all(&tmp).unwrap();
+        let tmp =
+            crate::random::create_temp_dir(&std::env::temp_dir(), "mu-agent-invalid-concurrent-")
+                .unwrap();
         let store = Store::open(&tmp.join("mu.db")).unwrap();
         let session = store.create_session("/tmp").unwrap();
         let config = test_config();
@@ -2749,9 +2744,8 @@ mod tests {
 
     #[tokio::test]
     async fn explicit_retry_reexecutes_an_incomplete_readonly_attempt_before_provider_contact() {
-        let tmp =
-            std::env::temp_dir().join(format!("mu-agent-readonly-retry-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&tmp).unwrap();
+        let tmp = crate::random::create_temp_dir(&std::env::temp_dir(), "mu-agent-readonly-retry-")
+            .unwrap();
         let store = Store::open(&tmp.join("mu.db")).unwrap();
         let session = store.create_session("system").unwrap();
         store
@@ -2840,8 +2834,7 @@ mod tests {
 
     #[tokio::test]
     async fn destructive_trap_stops_before_start_and_lifted_retry_executes_pending_claim() {
-        let tmp = std::env::temp_dir().join(format!("mu-agent-trap-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&tmp).unwrap();
+        let tmp = crate::random::create_temp_dir(&std::env::temp_dir(), "mu-agent-trap-").unwrap();
         let marker = tmp.join("marker");
         let store = Store::open(&tmp.join("mu.db")).unwrap();
         let session = store.create_session("system").unwrap();
@@ -3059,8 +3052,8 @@ mod tests {
 
     #[tokio::test]
     async fn large_tool_result_triggers_in_loop_compaction() {
-        let tmp = std::env::temp_dir().join(format!("mu-agent-proactive-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&tmp).unwrap();
+        let tmp =
+            crate::random::create_temp_dir(&std::env::temp_dir(), "mu-agent-proactive-").unwrap();
         let store = Store::open(&tmp.join("mu.db")).unwrap();
         let session = store.create_session("/tmp").unwrap();
         let mut config = test_config();
@@ -3308,8 +3301,7 @@ mod tests {
 
     #[tokio::test]
     async fn turn_usage_is_cumulative_but_context_tokens_is_last_call() {
-        let tmp = std::env::temp_dir().join(format!("mu-agent-usage-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&tmp).unwrap();
+        let tmp = crate::random::create_temp_dir(&std::env::temp_dir(), "mu-agent-usage-").unwrap();
         let store = Store::open(&tmp.join("mu.db")).unwrap();
         let session = store.create_session("/tmp").unwrap();
         let config = test_config();
@@ -3401,8 +3393,8 @@ mod tests {
 
     #[tokio::test]
     async fn captures_final_assistant_on_non_stop_finish() {
-        let tmp = std::env::temp_dir().join(format!("mu-agent-length-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&tmp).unwrap();
+        let tmp =
+            crate::random::create_temp_dir(&std::env::temp_dir(), "mu-agent-length-").unwrap();
         let store = Store::open(&tmp.join("mu.db")).unwrap();
         let session = store.create_session("/tmp").unwrap();
         let config = test_config();

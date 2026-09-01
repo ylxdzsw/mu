@@ -900,20 +900,21 @@ mod tests {
 
     #[test]
     fn permissive_load_does_not_create_a_missing_global_config() {
-        let root =
-            std::env::temp_dir().join(format!("mu-config-readonly-{}", uuid::Uuid::new_v4()));
+        let tmp =
+            crate::random::create_temp_dir(&std::env::temp_dir(), "mu-config-readonly-").unwrap();
+        let root = tmp.join("missing");
 
         let config = load_config(&root, None, ConfigLoadMode::Permissive).unwrap();
 
         assert!(config.providers.is_empty());
         assert!(!root.exists());
+        let _ = std::fs::remove_dir_all(tmp);
     }
 
     #[test]
     fn permissive_load_discards_malformed_providers_but_keeps_output() {
         let root =
-            std::env::temp_dir().join(format!("mu-config-permissive-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&root).unwrap();
+            crate::random::create_temp_dir(&std::env::temp_dir(), "mu-config-permissive-").unwrap();
         std::fs::write(
             root.join("config.jsonc"),
             r#"{"output":"full","providers":{"broken":{"models":[]}}}"#,
@@ -933,8 +934,7 @@ mod tests {
     #[test]
     fn permissive_load_keeps_model_metadata_without_provider_validation() {
         let root =
-            std::env::temp_dir().join(format!("mu-config-metadata-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&root).unwrap();
+            crate::random::create_temp_dir(&std::env::temp_dir(), "mu-config-metadata-").unwrap();
         std::fs::write(
             root.join("config.jsonc"),
             r#"{
@@ -1034,9 +1034,8 @@ export   EXPORTED='exported value'
 
     #[test]
     fn env_file_errors_are_atomic_and_do_not_echo_values() {
-        let tmp = std::env::temp_dir().join(format!("mu-env-error-{}", uuid::Uuid::new_v4()));
+        let tmp = crate::random::create_temp_dir(&std::env::temp_dir(), "mu-env-error-").unwrap();
         let path = tmp.join(".env");
-        std::fs::create_dir_all(&tmp).unwrap();
         std::fs::write(&path, "GOOD=value\nSECRET=$(do-not-print)\n").unwrap();
         let baseline = EnvMap::from([("EXISTING".into(), "kept".into())]);
         let mut env = baseline.clone();

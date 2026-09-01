@@ -407,7 +407,7 @@ mod tests {
 
     #[test]
     fn discovers_nearest_mu_project_without_creating_files() {
-        let root = std::env::temp_dir().join(format!("mu-paths-{}", uuid::Uuid::new_v4()));
+        let root = crate::random::create_temp_dir(&std::env::temp_dir(), "mu-paths-").unwrap();
         let nested = root.join("a/b");
         std::fs::create_dir_all(root.join(".mu")).unwrap();
         std::fs::create_dir_all(&nested).unwrap();
@@ -415,11 +415,13 @@ mod tests {
         let project = discover_project(&nested).unwrap();
         assert_eq!(project.root, root);
         assert_eq!(project.marker, ProjectMarker::Mu);
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
     fn linked_worktree_uses_primary_project_unless_it_has_local_mu_state() {
-        let repository = std::env::temp_dir().join(format!("mu-worktree-{}", uuid::Uuid::new_v4()));
+        let repository =
+            crate::random::create_temp_dir(&std::env::temp_dir(), "mu-worktree-").unwrap();
         let worktree = repository.join("worktrees/feature");
         let nested = worktree.join("src/nested");
         let git_dir = repository.join(".git/worktrees/feature");
@@ -461,8 +463,7 @@ mod tests {
 
     #[test]
     fn init_project_layout_at_creates_minimal_scaffold() {
-        let root = std::env::temp_dir().join(format!("mu-layout-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&root).unwrap();
+        let root = crate::random::create_temp_dir(&std::env::temp_dir(), "mu-layout-").unwrap();
 
         let result = init_project_layout_at(&root, true).unwrap();
 
@@ -482,7 +483,7 @@ mod tests {
 
     #[test]
     fn existing_state_gitignore_keeps_old_entries_and_adds_current_paths() {
-        let root = std::env::temp_dir().join(format!("mu-layout-{}", uuid::Uuid::new_v4()));
+        let root = crate::random::create_temp_dir(&std::env::temp_dir(), "mu-layout-").unwrap();
         let state = root.join(".mu");
         std::fs::create_dir_all(&state).unwrap();
         std::fs::write(
