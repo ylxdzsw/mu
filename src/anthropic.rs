@@ -521,6 +521,18 @@ fn consume_event(
         }
         "message_delta" => {
             if let Some(reason) = value["delta"]["stop_reason"].as_str() {
+                if reason == "refusal" {
+                    let details = &value["delta"]["stop_details"];
+                    let details = (!details.is_null())
+                        .then(|| format!(": {details}"))
+                        .unwrap_or_default();
+                    return Err(ProviderError::BadRequestPermanent {
+                        status: None,
+                        detail: format!(
+                            "Anthropic refused the request{details}; retry with a fallback model using `mu retry -m provider/model`"
+                        ),
+                    });
+                }
                 state.stop_reason = Some(reason.to_string());
             }
             state.usage.update(&value["usage"]);
@@ -963,10 +975,6 @@ mod tests {
             finish_reason(state.stop_reason.as_deref(), &blocks, &calls),
             FinishReason::ToolCalls
         ));
-        assert!(matches!(
-            finish_reason(Some("refusal"), &[], &[]),
-            FinishReason::Other(reason) if reason == "refusal"
-        ));
 
         let usage = state.usage.finish().unwrap();
         assert_eq!(usage.input_tokens, 15);
@@ -995,6 +1003,34 @@ mod tests {
                 .iter()
                 .any(|event| matches!(event, StreamEvent::TextDelta(text) if text == "done"))
         );
+    }
+
+    #[test]
+    fn surfaces_refusal_details_and_fallback_hint() {
+        let mut state = AnthropicStreamState::default();
+        let mut events = Vec::new();
+        let error = consume(
+            &mut state,
+            &mut events,
+            serde_json::json!({
+                "type": "message_delta",
+                "delta": {
+                    "stop_reason": "refusal",
+                    "stop_details": {
+                        "type": "refusal",
+                        "category": "cyber",
+                        "explanation": "declined",
+                    },
+                },
+                "usage": { "output_tokens": 0 },
+            }),
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, ProviderError::BadRequestPermanent { .. }));
+        let message = error.to_string();
+        assert!(message.contains(r#""category":"cyber""#));
+        assert!(message.contains("mu retry -m provider/model"));
     }
 
     #[test]
