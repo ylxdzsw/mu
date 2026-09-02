@@ -1213,9 +1213,17 @@ fn classify_provider_error(
     if lower.contains("upstream authentication failed") || has_explicit_auth_marker(&lower) {
         return ProviderError::AuthFailed { detail };
     }
+    let retry_later = lower.contains("try again later") || lower.contains("retry later");
+    let transient_evidence = lower.contains("server")
+        || lower.contains("service")
+        || lower.contains("upstream")
+        || lower.contains("temporar")
+        || lower.contains("overload")
+        || lower.contains("capacity");
     if lower.contains("queue is full")
         || lower.contains("cpu overloaded")
         || lower.contains("bad gateway")
+        || (retry_later && transient_evidence)
     {
         return ProviderError::Overloaded {
             status,
@@ -1719,6 +1727,24 @@ mod tests {
             assert_eq!(http.disposition(), disposition);
             assert_eq!(stream.disposition(), disposition);
         }
+    }
+
+    #[test]
+    fn classifies_transient_retry_advice_without_status() {
+        for message in [
+            "Our servers are currently overloaded. Please try again later.",
+            "Temporary upstream failure; please retry later.",
+        ] {
+            let error = classify_stream_error(&serde_json::json!({"message": message}));
+            assert_eq!(error.class(), "overloaded");
+            assert_eq!(error.disposition(), ProviderDisposition::Retry);
+        }
+
+        let permanent = classify_stream_error(&serde_json::json!({
+            "message": "Invalid request; please retry with corrected parameters."
+        }));
+        assert_eq!(permanent.class(), "bad_request");
+        assert_eq!(permanent.disposition(), ProviderDisposition::Fail);
     }
 
     #[test]
