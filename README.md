@@ -57,7 +57,7 @@ chmod +x "$HOME/.local/bin/mu"
 export PATH="$HOME/.local/bin:$PATH"
 ```
 
-MacOS binaries are available at [releases](https://github.com/ylxdzsw/mu/releases).
+MacOS binaries and ArchLinux package are available at [releases](https://github.com/ylxdzsw/mu/releases).
 
 Now ask it something:
 
