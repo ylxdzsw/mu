@@ -15,7 +15,7 @@ use crate::models::{ResolvedModelChoice, resolve_model_info};
 use crate::provider::{
     AssistantItem, FinishReason, MAX_PROVIDER_RETRY_AFTER, Message, Provider, ProviderDisposition,
     ProviderError, Request, StreamEvent, ToolCall, ToolCallDelta, Usage, advance_provider,
-    effective_retry_delay, provider_retry_limit,
+    effective_retry_delay, estimate_messages_tokens, provider_retry_limit,
 };
 use crate::renderer::{CompactionReport, Renderer};
 use crate::store::{
@@ -336,6 +336,12 @@ impl<'a> AgentLoop<'a> {
                     } else {
                         (request_context, Vec::new())
                     };
+                    let request_context_tokens = estimate_messages_tokens(
+                        &request_context,
+                        self.config,
+                        self.model.active_model(),
+                        self.provider.api(),
+                    );
                     let elided_call_ids = self.store.call_ids_for_provider_call_ids(
                         self.session_id,
                         &elided_provider_call_ids,
@@ -489,17 +495,16 @@ impl<'a> AgentLoop<'a> {
                                 state.emergency = true;
                                 self.renderer.compaction_trigger(
                                     CompactionTrigger::Emergency,
-                                    state.pending.before_context_tokens,
+                                    request_context_tokens,
                                     state.pending.before_context_window,
                                     Some("compaction request exceeded provider context"),
                                 )?;
                                 continue 'request_gate;
                             }
-                            let before = self.current_context_tokens()?;
                             self.begin_compaction(
                                 CompactionTrigger::Emergency,
                                 CompactionMode::ContinueTurn,
-                                before,
+                                request_context_tokens,
                                 None,
                             )?;
                             active_compaction = self
@@ -1909,6 +1914,11 @@ mod tests {
         seen: Arc<Mutex<Vec<Vec<Message>>>>,
     }
 
+    struct ResumeThenContextErrorProvider {
+        calls: Mutex<usize>,
+        seen: Arc<Mutex<Vec<Vec<Message>>>>,
+    }
+
     struct ContextAfterCompactionProvider {
         counts: Arc<Mutex<(u32, u32)>>,
     }
@@ -2050,6 +2060,43 @@ mod tests {
                 }),
                 native_response: None,
             })
+        }
+    }
+
+    #[async_trait(?Send)]
+    impl Provider for ResumeThenContextErrorProvider {
+        async fn stream(
+            &self,
+            request: &Request,
+            _on_event: &mut dyn FnMut(crate::provider::StreamEvent) -> Result<(), ProviderError>,
+        ) -> Result<StreamResult, ProviderError> {
+            self.seen.lock().unwrap().push(request.messages.clone());
+            let mut calls = self.calls.lock().unwrap();
+            let call = *calls;
+            *calls += 1;
+            match call {
+                0 => Ok(StreamResult {
+                    message: Message::assistant(Some("partial".into()), None, None, None),
+                    finish_reason: FinishReason::Resume,
+                    usage: None,
+                    native_response: None,
+                }),
+                1 => Err(ProviderError::ContextLength {
+                    detail: "test overflow".into(),
+                }),
+                2 => Ok(StreamResult {
+                    message: Message::assistant(Some("summary".into()), None, None, None),
+                    finish_reason: FinishReason::Stop,
+                    usage: None,
+                    native_response: None,
+                }),
+                _ => Ok(StreamResult {
+                    message: Message::assistant(Some("done".into()), None, None, None),
+                    finish_reason: FinishReason::Stop,
+                    usage: None,
+                    native_response: None,
+                }),
+            }
         }
     }
 
@@ -2421,6 +2468,57 @@ mod tests {
         assert_eq!(completed["projection"]["resumable"], true);
         assert_eq!(completed["projection"]["incomplete"], true);
         assert!(completed["projection"].get("turn_state").is_none());
+    }
+
+    #[tokio::test]
+    async fn emergency_compaction_records_the_failed_request_context_size() {
+        let store = Store::open_memory().unwrap();
+        let session = store.create_session_seeded("system").unwrap();
+        store
+            .start_turn(&session.id, "/tmp", None, &"work".into())
+            .unwrap();
+        let mut config = test_config();
+        config.auto_resume = true;
+        let request_model = crate::models::resolve_model_ref(&config, "test/fake-model").unwrap();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let mut renderer = Renderer::with_format(OutputFormat::Detail);
+        let mut agent = AgentLoop {
+            config: &config,
+            system_prompt_source: SystemPromptSource::fixed("refreshed system prompt"),
+            model: ResolvedModelChoice::fixed(request_model.clone()),
+            provider: Box::new(ResumeThenContextErrorProvider {
+                calls: Mutex::new(0),
+                seen: Arc::clone(&seen),
+            }),
+            store: &store,
+            session_id: &session.id,
+            model_context_window: None,
+            renderer: &mut renderer,
+        };
+
+        let result = agent.run_turn().await.unwrap();
+
+        assert_eq!(result.final_assistant.as_deref(), Some("done"));
+        let seen = seen.lock().unwrap();
+        assert!(matches!(
+            seen[1].last(),
+            Some(Message::User { content }) if content.text() == RESUME_PROMPT
+        ));
+        let expected = estimate_messages_tokens(
+            &seen[1],
+            &config,
+            &request_model,
+            crate::provider::ModelApi::ChatCompletions,
+        );
+        drop(seen);
+
+        let compaction = store
+            .audit_events(&session.id)
+            .unwrap()
+            .into_iter()
+            .find(|event| event["type"] == "compaction_started")
+            .unwrap();
+        assert_eq!(compaction["before_context_tokens"], expected);
     }
 
     #[tokio::test]

@@ -512,6 +512,12 @@ fn parse_endpoint(endpoint: &str) -> anyhow::Result<ParsedEndpoint> {
     }
 
     let url = normalized_url(endpoint, endpoint)?;
+    if !matches!(url.scheme(), "http" | "https") {
+        anyhow::bail!(
+            "unsupported provider endpoint protocol `{}`; only HTTP(S) endpoints are supported",
+            url.scheme()
+        );
+    }
     let api = classify_endpoint_path(endpoint, url.path())?;
     let endpoint = url.to_string();
     Ok(ParsedEndpoint {
@@ -1607,6 +1613,8 @@ mod tests {
             "https://gateway.test/v1/Responses",
             "https://gateway.test/v1/message",
             "https://gateway.test/v1/chat/completions/extra",
+            "ftp://gateway.test/v1/chat/completions",
+            "file:///tmp/chat/completions",
         ] {
             assert!(classify_endpoint(endpoint).is_err(), "accepted {endpoint}");
         }
