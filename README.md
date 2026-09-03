@@ -14,7 +14,7 @@ whatever cursor movement keybindings you configured for your shell. `mu` is in y
 **Absolute Minimum Toolset**&emsp; `mu` comes with only one tool: `bash`. That's 75% fewer than
 [pi](https://github.com/earendil-works/pi/tree/main/packages/coding-agent).
 
-**"Coding Mode"**&emsp; If you doubt how a single `bash` suffices: this idea is closely related to [code mode](https://blog.cloudflare.com/code-mode/).
+**"Code Mode"**&emsp; If you doubt how a single `bash` suffices: this idea is closely related to [code mode](https://blog.cloudflare.com/code-mode/).
 The difference is that we choose `bash`, a language that has stood the test of decades, over `javascript`, and we use
 POSIX tools, the common denominator across agents that all models are born to master, instead of a custom tool set. Since POSIX
 commands need no teaching, the total system prompt of `mu` is < 1k tokens.
