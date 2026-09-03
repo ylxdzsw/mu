@@ -52,14 +52,14 @@ On Linux x86-64, download the latest portable binary and put it on `PATH`:
 
 ```sh
 mkdir -p "$HOME/.local/bin"
-curl https://github.com/ylxdzsw/mu/releases/latest/download/mu-linux-x86_64-musl -o "$HOME/.local/bin/mu"
+curl -fsSL https://github.com/ylxdzsw/mu/releases/latest/download/mu-linux-x86_64-musl -o "$HOME/.local/bin/mu"
 chmod +x "$HOME/.local/bin/mu"
 export PATH="$HOME/.local/bin:$PATH"
 ```
 
 Now ask it something:
 
-```sh
+```zsh
 mu <<< 'Introduce yourself. Including CLI usage and configuration guide.'
 ```
 
@@ -75,7 +75,7 @@ source <(curl -fsSL https://github.com/ylxdzsw/mu/releases/latest/download/mu.zs
 For Fish 4 or newer:
 
 ```fish
-source <(curl -fsSL https://github.com/ylxdzsw/mu/releases/latest/download/mu.fish)
+curl -fsSL https://github.com/ylxdzsw/mu/releases/latest/download/mu.fish | source
 ```
 
 At an empty shell prompt, press **Tab** to enter `mu>` mode, type a request, and press **Enter**:
