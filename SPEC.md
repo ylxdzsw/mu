@@ -522,9 +522,9 @@ An active trap override is shown in the Mu prompt and included in replayable
 shell history. It becomes the persisted base level for a new prompt or manual
 compaction, but remains an invocation-only override when passed to `/retry`.
 
-zsh requires `jq` and supports native ZLE completion/hooks. Fish integration
-requires Fish 4 and wraps the user's prompt and editing bindings without
-replacing normal shell mode.
+The zsh and Fish integrations require `jq`. zsh supports native ZLE
+completion/hooks. Fish integration requires Fish 4 and wraps the user's prompt
+and editing bindings without replacing normal shell mode.
 
 ---
 

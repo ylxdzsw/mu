@@ -42,6 +42,16 @@ set -g fish_history mu_fish_test_(random)
 
 source "$TEST_ROOT/mu.fish"
 
+mkdir -p "$TEST_TMPDIR/no-jq"
+set saved_path $PATH
+set -gx PATH "$TEST_TMPDIR/no-jq"
+if _mu_fish_enter_mode 2>"$TEST_TMPDIR/no-jq-fish.err"
+    fail 'enters Mu mode without jq'
+end
+set -gx PATH $saved_path
+assert_equal "$_MU_FISH_MODE" shell 'missing jq leaves Fish in shell mode'
+assert_equal (cat "$TEST_TMPDIR/no-jq-fish.err") 'mu: mu.fish requires jq; install it with your package manager (apt, brew, dnf, etc.)' 'missing jq prints Fish installation guidance'
+
 assert_equal "$_MU_FISH_MODE" shell 'starts in shell mode'
 assert_equal (_mu_fish_current_scope) "project:$TEST_ROOT" 'discovers repository scope'
 set history_input (printf 'first line\nsecond $HOME `tick` "quoted"' | string collect)

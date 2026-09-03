@@ -53,6 +53,17 @@ TRAPEXIT() {
   return $exit_code
 }
 
+mkdir -p -- "$tmpdir/no-jq"
+saved_path=("${path[@]}")
+path=("$tmpdir/no-jq")
+if _mu_zsh_enter_mode 2> "$tmpdir/no-jq-zsh.err"; then
+  fail "enters Mu mode without jq"
+fi
+path=("${saved_path[@]}")
+[[ "$_MU_ZSH_MODE" == shell ]] || fail "missing jq leaves zsh in shell mode"
+grep -Fqx -- 'mu: mu.zsh requires jq; install it with your package manager (apt, brew, dnf, etc.)' "$tmpdir/no-jq-zsh.err" ||
+  fail "missing jq prints zsh installation guidance"
+
 prompt_fake_bin=$tmpdir/prompt-bin
 mkdir -p -- "$prompt_fake_bin"
 export MU_ZSH_TEST_PROJECT_ROOT=$root

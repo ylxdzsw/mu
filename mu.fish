@@ -943,6 +943,10 @@ end
 
 function _mu_fish_enter_mode
     test "$_MU_FISH_MODE" = mu; and return 0
+    if not command -q jq
+        printf '%s\n' 'mu: mu.fish requires jq; install it with your package manager (apt, brew, dnf, etc.)' >&2
+        return 1
+    end
     _mu_fish_clear_speculative_model_colon
     _mu_fish_reset_history_navigation
     set -g _MU_FISH_MODE mu

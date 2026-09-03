@@ -1044,6 +1044,10 @@ _mu_zsh_run_slash_command() {
 
 _mu_zsh_enter_mode() {
   [[ "$_MU_ZSH_MODE" == mu ]] && return 0
+  command -v jq >/dev/null 2>&1 || {
+    print -u2 -- "mu: mu.zsh requires jq; install it with your package manager (apt, brew, dnf, etc.)"
+    return 1
+  }
 
   _MU_ZSH_MODE=mu
   _MU_ZSH_SAVED_KEYMAP=${KEYMAP:-main}
@@ -1198,8 +1202,12 @@ _mu_zsh_tab() {
   fi
 
   if (( CURSOR == 0 )); then
-    _mu_zsh_enter_mode
-    _mu_zsh_reset_mode_prompt 1
+    if _mu_zsh_enter_mode; then
+      _mu_zsh_reset_mode_prompt 1
+    else
+      zle reset-prompt
+      zle -R
+    fi
     return
   fi
 
@@ -1323,8 +1331,12 @@ _mu_zsh_speculative_right() {
 }
 
 mu-zsh-mode() {
-  _mu_zsh_enter_mode
-  _mu_zsh_reset_mode_prompt 1
+  if _mu_zsh_enter_mode; then
+    _mu_zsh_reset_mode_prompt 1
+  else
+    zle reset-prompt
+    zle -R
+  fi
 }
 
 mu-zsh-exit-mode() {
