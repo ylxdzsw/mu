@@ -74,6 +74,8 @@ The intended way to use `mu` is through the shell plugins. For zsh:
 source <(curl -fsSL https://github.com/ylxdzsw/mu/releases/latest/download/mu.zsh)
 ```
 
+(This loads the plugin in your current session and modifies nothing on the machine.)
+
 For Fish 4 or newer:
 
 ```fish
