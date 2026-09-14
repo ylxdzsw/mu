@@ -70,11 +70,13 @@ jobs:
           cargo test --features portable -- --test-threads=1
 
       - name: Test zsh integration
+        if: ${{ !cancelled() }}
         run: |
           zsh -n mu.zsh test.zsh
           MU_ZSH_SKIP_PTY=1 zsh test.zsh
 
       - name: Build and test portable distribution
+        if: ${{ !cancelled() }}
         run: |
           cargo build --release --features portable
           python test.windows.py target/release/mu.exe
@@ -85,7 +87,9 @@ jobs:
           sha256sum dist/*.exe > dist/SHA256SUMS
 
       - name: Build and install UCRT64 package
+        if: ${{ !cancelled() }}
         run: |
+          mkdir -p dist
           export MU_SOURCE_URL="file://$(cygpath -m "$GITHUB_WORKSPACE")"
           export MU_SOURCE_COMMIT="$(git rev-parse HEAD)"
           cd packaging/msys2
