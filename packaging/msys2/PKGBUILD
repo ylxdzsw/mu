@@ -1,0 +1,55 @@
+_realname=mu
+pkgbase=mingw-w64-${_realname}
+pkgname="${MINGW_PACKAGE_PREFIX}-${_realname}"
+pkgver=0.3.0
+pkgrel=1
+pkgdesc='Terminal agent runtime for MSYS2 UCRT64'
+arch=('any')
+mingw_arch=('ucrt64')
+url='https://github.com/ylxdzsw/mu'
+license=('MIT')
+depends=(
+  'bash' 'zsh'
+  "${MINGW_PACKAGE_PREFIX}-jq"
+  "${MINGW_PACKAGE_PREFIX}-python"
+  "${MINGW_PACKAGE_PREFIX}-ripgrep"
+  "${MINGW_PACKAGE_PREFIX}-curl"
+)
+makedepends=('git' "${MINGW_PACKAGE_PREFIX}-rust")
+options=('!strip' '!lto')
+_source_url="${MU_SOURCE_URL:-${url}.git}"
+_source_ref="${MU_SOURCE_COMMIT:+commit=${MU_SOURCE_COMMIT}}"
+source=("${_realname}::git+${_source_url}#${_source_ref:-branch=msys2-v0.3}")
+sha256sums=('SKIP')
+
+pkgver() {
+  cd "${_realname}"
+  printf '0.3.0.r%s.g%s' "$(git rev-list --count HEAD)" "$(git rev-parse --short HEAD)"
+}
+
+build() {
+  cd "${_realname}"
+  export CARGO_TARGET_DIR="${srcdir}/target"
+  cargo build --release
+}
+
+check() {
+  cd "${_realname}"
+  export CARGO_TARGET_DIR="${srcdir}/target"
+  cargo test -- --test-threads=1
+}
+
+package() {
+  cd "${_realname}"
+  install -Dm755 "${srcdir}/target/release/mu.exe" "${pkgdir}${MINGW_PREFIX}/bin/mu.exe"
+  for applet in apply_patch edit view_image; do
+    install -Dm755 "${srcdir}/target/release/mu.exe" "${pkgdir}${MINGW_PREFIX}/libexec/mu/${applet}.exe"
+  done
+  install -Dm644 mu.zsh "${pkgdir}${MINGW_PREFIX}/share/zsh/plugins/mu/mu.zsh"
+  install -dm755 "${pkgdir}${MINGW_PREFIX}/share/mu"
+  cp -a builtins/. "${pkgdir}${MINGW_PREFIX}/share/mu/"
+  for document in SPEC.md WINDOWS.md; do
+    install -Dm644 "$document" "${pkgdir}${MINGW_PREFIX}/share/doc/mu/$document"
+  done
+  install -Dm644 LICENSE "${pkgdir}${MINGW_PREFIX}/share/licenses/mu/LICENSE"
+}

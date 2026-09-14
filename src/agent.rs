@@ -245,7 +245,7 @@ impl<'a> AgentLoop<'a> {
         mut next_request: NextRequest,
     ) -> Result<TurnResult> {
         bash::reset_cancellation_state();
-        bash::install_signal_forwarder(self.config.soft_interrupt);
+        bash::install_console_handler(self.config.soft_interrupt);
         let mut context = self.load_context()?;
         let mut active_compaction =
             self.store
@@ -866,11 +866,10 @@ impl<'a> AgentLoop<'a> {
                     end += 1;
                 }
 
-                for (chunk_offset, chunk) in calls[cursor..end]
-                    .chunks(bash::MAX_ACTIVE_PROCESS_GROUPS)
-                    .enumerate()
+                for (chunk_offset, chunk) in
+                    calls[cursor..end].chunks(bash::MAX_ACTIVE_JOBS).enumerate()
                 {
-                    let header_start = cursor + chunk_offset * bash::MAX_ACTIVE_PROCESS_GROUPS;
+                    let header_start = cursor + chunk_offset * bash::MAX_ACTIVE_JOBS;
                     let started = self
                         .execute_concurrent_bash_batch(
                             chunk,
@@ -2737,7 +2736,7 @@ mod tests {
             .unwrap();
         let provider = Box::new(TwoReadonlyThenStopProvider {
             step: Mutex::new(0),
-            barrier_path: tmp.join("second-started").display().to_string(),
+            barrier_path: crate::windows_msys2::shell_path(&tmp.join("second-started")).unwrap(),
         });
         let mut renderer = Renderer::with_format(OutputFormat::Detail);
         let mut agent = AgentLoop {
@@ -2956,7 +2955,7 @@ mod tests {
             model: ResolvedModelChoice::fixed(model.clone()),
             provider: Box::new(DestructiveThenStopProvider {
                 step: Arc::clone(&step),
-                path: marker.display().to_string(),
+                path: crate::windows_msys2::shell_path(&marker).unwrap(),
             }),
             store: &store,
             session_id: &session.id,
@@ -2987,7 +2986,7 @@ mod tests {
             model: ResolvedModelChoice::fixed(model.clone()),
             provider: Box::new(DestructiveThenStopProvider {
                 step: Arc::clone(&step),
-                path: marker.display().to_string(),
+                path: crate::windows_msys2::shell_path(&marker).unwrap(),
             }),
             store: &store,
             session_id: &session.id,
@@ -3007,7 +3006,7 @@ mod tests {
             model: ResolvedModelChoice::fixed(model),
             provider: Box::new(DestructiveThenStopProvider {
                 step,
-                path: marker.display().to_string(),
+                path: crate::windows_msys2::shell_path(&marker).unwrap(),
             }),
             store: &store,
             session_id: &session.id,

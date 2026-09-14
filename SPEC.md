@@ -3,7 +3,7 @@
 `mu` is a small, composable terminal agent runtime: one prompt in, one completed
 turn out. The core binary reads a prompt, runs an agent loop with one
 model-visible `bash` tool, streams the selected presentation, persists durable
-session events, and exits. The zsh and Fish integrations build an interactive
+session events, and exits. The MSYS2 zsh integration builds an interactive
 experience from that turn primitive without replacing the user's shell.
 
 This document defines durable product behavior, architectural boundaries, and
@@ -24,7 +24,7 @@ user-facing command and configuration references live in
   negligible next to provider latency.
 - **Responsive output.** Human-facing modes stream stable output as it arrives
   and return control as soon as the turn completes.
-- **Composable turns.** `mu` behaves as a Unix command. Shell scripts,
+- **Composable turns.** `mu` composes through MSYS2 shells. Shell scripts,
   supervisors, and shell integrations compose turns rather than embedding a
   separate agent runtime.
 - **Shell-native interaction.** The user's shell retains line editing,
@@ -45,7 +45,8 @@ user-facing command and configuration references live in
 - No in-process plugin SDK, MCP client, or subagent orchestrator.
 - No dynamic model-visible tool registration.
 - No sandbox guarantee or per-command interactive approval prompt.
-- No support in this codebase for non-Unix process semantics.
+- No Unix build compatibility, non-UCRT64 MSYS2 environments, or native PowerShell/cmd integration.
+- No automatic rebasing or synchronization with master; this is a release-specific Windows port.
 
 ---
 
@@ -70,7 +71,7 @@ possible as ordinary external tools, but they are not part of Mu's turn path.
 
 ### 2.2 Interaction belongs to the shell
 
-**Decision.** The zsh and Fish integrations own prompt mode, line editing,
+**Decision.** The zsh integration owns prompt mode, line editing,
 completion, and shell history. Each submitted prompt starts the same foreground
 turn runner used by scripts.
 
@@ -88,7 +89,7 @@ and `view_image` applets are commands available inside Bash. Skills are
 Markdown files loaded through Bash.
 
 One stable schema is easier for models to learn, works across providers, and
-retains the full Unix tool ecosystem without an adapter per command.
+retains the MSYS2 command ecosystem without an adapter per command.
 
 **Rejected: a broad built-in tool catalog.** Separate read, write, search,
 process, web, and skill tools would duplicate shell capabilities and enlarge
@@ -192,7 +193,7 @@ Rejected and deferred safety alternatives are recorded in §12.
 ## 3. Architecture overview
 
 ```text
-shell script or zsh/Fish prompt mode
+MSYS2 shell script or zsh prompt mode
                  │
                  ▼
           mu turn runner
@@ -267,18 +268,17 @@ Trapping is checked before forming or starting an eligible concurrent batch.
 ### 3.2 Interruption
 
 An interrupt stops new work, cancels the active provider request when possible,
-and terminates every active Bash process group. Mu drains available output and
+and terminates every active Bash Job Object. Mu drains available output and
 persists results for calls that began. Incomplete assistant streams do not enter
 semantic history.
 
-When `soft_interrupt` is enabled, `SIGQUIT` requests a soft interrupt instead:
+When `soft_interrupt` is enabled, a Windows Ctrl-Break console event requests a soft interrupt instead:
 the active provider request and Bash calls are allowed to finish, Bash claims
 that have not started remain pending without synthetic results, and Mu starts
-no further provider request or Bash call. The terminal's normal `^\\` echo is
-the receipt acknowledgement. If the active provider request normally completes
+no further provider request or Bash call. If the active provider request normally completes
 the turn at that boundary, Mu consumes the interrupt and reports normal
 completion. Otherwise, Mu emits only the final soft-interrupt outcome and
-pending-call count. When disabled, Mu does not install a `SIGQUIT` handler.
+pending-call count. When disabled, Ctrl-Break is a hard interrupt. Ctrl-\ is not a Windows soft-interrupt binding.
 
 `mu retry` continues the interrupted turn without adding a new prompt. It
 attempts never-started claims and may repeat a started but unresolved readonly
@@ -322,10 +322,11 @@ bash({
 - `timeout` is a positive number of seconds and defaults to 120.
 
 The resolved Mu applet directory is prepended to the post-login `PATH`. Calls
-run in separate process groups. Timeout or interruption sends TERM, waits a
-short grace period, then sends KILL; Linux also requests a parent-death signal
-for the direct child. Ordinary calls are expected not to outlive their tool
-result.
+run in separate Windows Job Objects. Bash is assigned before it starts.
+Timeout or hard interruption terminates the job immediately; closing the last
+job handle also terminates remaining descendants, including on Mu process exit.
+There is no TERM grace period or in-tool background escape. A private command
+script avoids the Windows command-line length limit while stdin stays literal.
 
 Recursive Mu delegation is bounded by `MU_SUBAGENT_DEPTH`: management commands
 remain available, but recursive agent turns beyond one nested level are
@@ -366,7 +367,7 @@ These are shell commands, not function tools:
   progressively tolerates line-ending and line-edge whitespace differences,
   never arbitrary internal whitespace. All matches are computed against one
   snapshot and overlapping matches are rejected. The write preserves the
-  existing inode, permissions, hard links, and symlink target relationship,
+  existing file identity, attributes, hard links, and native symlink target relationship,
   using an advisory lock and a recoverable sibling backup.
 - **`view_image [--detail auto|low|high|original] PATH`** validates and attaches
   a PNG, JPEG, WebP, or GIF to the current Bash result. It works only inside a
@@ -453,19 +454,19 @@ Opaque reasoning is never invented for display.
 
 ---
 
-## 6. zsh and Fish shell surfaces
+## 6. MSYS2 zsh shell surface
 
-The plugins provide the same product contract:
+The zsh plugin provides this product contract:
 
 - Tab at cursor zero toggles `mu>` mode while preserving the edit buffer.
 - Non-empty Enter submits one foreground Mu turn; empty Enter redraws the
   prompt without creating a turn.
 - Ctrl-C cancels an edited draft or interrupts the foreground Mu process using
-  ordinary shell signal behavior.
-- Ctrl-\\ requests a soft interrupt when `soft_interrupt` is enabled: active
+  Windows console cancellation.
+- Ctrl-Break requests a soft interrupt when `soft_interrupt` is enabled: active
   work finishes, unstarted Bash calls remain pending for `/retry`, and the turn
-  stops before new work. The terminal's `^\\` is the immediate
-  acknowledgement.
+  stops before new work. This requires a terminal that delivers Ctrl-Break;
+  Ctrl-\ is not an equivalent Windows event.
 - Ctrl-D retains normal shell EOF behavior.
 - Up/Down navigate within multiline input and then browse Mu-tagged shell
   history without mixing ordinary commands. Recalled prompts run with the
@@ -522,9 +523,10 @@ An active trap override is shown in the Mu prompt and included in replayable
 shell history. It becomes the persisted base level for a new prompt or manual
 compaction, but remains an invocation-only override when passed to `/retry`.
 
-The zsh and Fish integrations require `jq`. zsh supports native ZLE
-completion/hooks. Fish integration requires Fish 4 and wraps the user's prompt
-and editing bindings without replacing normal shell mode.
+The MSYS2 zsh integration requires `jq` and uses native ZLE completion/hooks.
+Windows Terminal with a UCRT64 shell is the supported console surface. Native
+Mu does not treat arbitrary mintty pipes as interactive terminals. Fish is not
+part of the Windows distribution.
 
 ---
 
@@ -538,9 +540,9 @@ Mu has three hand-written streaming adapters:
 
 Each provider has one complete endpoint. A request path ending in
 `/chat/completions`, `/responses`, or `/messages` selects the adapter. Any other
-path is invalid. HTTP(S) and `http+unix` endpoints are supported; Unix-socket
-paths are percent-encoded in the URI authority. Protocol selection never
-depends on provider or model names.
+path is invalid. HTTP(S) endpoints use native Windows TLS. `http+unix` is
+rejected locally on Windows. Protocol selection never depends on provider or
+model names.
 
 Every adapter consumes the same semantic message list and Bash schema and
 returns ordered assistant items: reasoning, text, and Bash calls. The renderer,
@@ -719,7 +721,9 @@ and refuses an already nested Mu project unless `--force` is supplied.
 ### 9.1 Installed and portable resources
 
 For an executable under `<prefix>/bin`, native resources live under
-`<prefix>/share/mu` and applet links under `<prefix>/libexec/mu`.
+`<prefix>/share/mu` and executable applet copies under `<prefix>/libexec/mu`. The package prefix
+is `/ucrt64`; applets have `.exe` suffixes. Native symlink privileges are not
+required for installation.
 
 The optional `portable` build embeds built-ins. Each resource independently
 uses a valid installed directory when present; otherwise Mu materializes it
@@ -912,9 +916,10 @@ events.
 - `mu new` creates but does not select a session.
 - `current-session` changes only after a submitted turn is durable.
 
-An exclusive, nonblocking advisory lock on the journal owns a mutable
-operation. The descriptor remains open for the operation and the kernel
-releases it on exit. Mu does not use PID leases or stale-owner recovery.
+An exclusive, nonblocking Windows byte-range lock outside the journal data
+owns a mutable operation without blocking transcript readers. The handle stays
+open for the operation and the kernel releases the lock on exit. The Windows
+`current-session` pointer is an atomically replaced regular file. Mu does not use PID leases or stale-owner recovery.
 
 ### 11.2 Cleanliness and interrupted-tail recovery
 
@@ -1079,8 +1084,7 @@ Exit status:
 - `1`: general, configuration, or unrecovered provider error;
 - `2`: session busy or explicit session not found;
 - `3`: Bash command trapped before execution;
-- `128 + signal`: forwarded terminating signal, commonly 130 for SIGINT and
-  143 for SIGTERM.
+- `130`: hard console interruption; other console termination uses `143`.
 
 Mu cannot pause and resume a partial provider stream. Resume always restarts
 from the last completed semantic boundary.
@@ -1097,7 +1101,7 @@ Durable safeguards are:
 
 - deterministic pre-start trapping based on the model-declared risk;
 - append-only visibility of accepted assistant actions and captured results;
-- foreground interruptibility and process-group termination;
+- foreground interruptibility and Job Object termination;
 - output bounds and exact-value redaction for configured environment values;
 - treating external content as untrusted data in the agent prompt.
 

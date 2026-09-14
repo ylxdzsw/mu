@@ -47,6 +47,15 @@ _mu_zsh_save_widget_bindings() {
   return 0
 }
 
+_mu_zsh_normalize_git_path() {
+  local path=$1
+  if [[ "$path" == [A-Za-z]:* || "$path" == //* ]]; then
+    command -v cygpath >/dev/null 2>&1 || return 1
+    path=$(cygpath -au -- "$path") || return 1
+  fi
+  REPLY=${path:A}
+}
+
 _mu_zsh_linked_project_root() {
   local checkout_root=$1
   local pointer git_dir common_dir
@@ -57,14 +66,24 @@ _mu_zsh_linked_project_root() {
   git_dir=${pointer#gitdir:}
   git_dir=${git_dir# }
   [[ -n "$git_dir" ]] || return 1
-  [[ "$git_dir" == /* ]] || git_dir="$checkout_root/$git_dir"
-  git_dir=${git_dir:A}
+  if [[ "$git_dir" == [A-Za-z]:* || "$git_dir" == //* ]]; then
+    _mu_zsh_normalize_git_path "$git_dir" || return 1
+    git_dir=$REPLY
+  else
+    [[ "$git_dir" == /* ]] || git_dir="$checkout_root/$git_dir"
+    git_dir=${git_dir:A}
+  fi
 
   [[ -r "$git_dir/commondir" ]] || return 1
   IFS= read -r common_dir < "$git_dir/commondir" || return 1
   [[ -n "$common_dir" ]] || return 1
-  [[ "$common_dir" == /* ]] || common_dir="$git_dir/$common_dir"
-  common_dir=${common_dir:A}
+  if [[ "$common_dir" == [A-Za-z]:* || "$common_dir" == //* ]]; then
+    _mu_zsh_normalize_git_path "$common_dir" || return 1
+    common_dir=$REPLY
+  else
+    [[ "$common_dir" == /* ]] || common_dir="$git_dir/$common_dir"
+    common_dir=${common_dir:A}
+  fi
 
   [[ "${common_dir:t}" == .git ]] || return 1
   [[ "${git_dir:h:h}" == "$common_dir" ]] || return 1

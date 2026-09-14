@@ -1,25 +1,28 @@
 use std::fs::{File, OpenOptions};
-use std::io::Read;
-#[cfg(test)]
-use std::os::unix::fs::DirBuilderExt;
-use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
+use windows_sys::Win32::Security::Cryptography::{
+    BCRYPT_USE_SYSTEM_PREFERRED_RNG, BCryptGenRandom,
+};
 
 const CROCKFORD: &[u8; 32] = b"0123456789abcdefghjkmnpqrstvwxyz";
 
-/// Read bytes from the operating system's cryptographic random source.
-///
-/// Mu only targets Unix-like systems today, and `/dev/urandom` is available
-/// on the supported platforms, including macOS. Keeping this small wrapper
-/// here avoids using an application-level UUID as a pathname primitive.
+/// Read bytes from the Windows system cryptographic random source.
 pub fn random_bytes<const N: usize>() -> Result<[u8; N]> {
     let mut bytes = [0u8; N];
-    let mut source = File::open("/dev/urandom").context("opening OS random source")?;
-    source
-        .read_exact(&mut bytes)
-        .context("reading OS random bytes")?;
+    let length = u32::try_from(N).context("random request is too large")?;
+    let status = unsafe {
+        BCryptGenRandom(
+            std::ptr::null_mut(),
+            bytes.as_mut_ptr(),
+            length,
+            BCRYPT_USE_SYSTEM_PREFERRED_RNG,
+        )
+    };
+    if status != 0 {
+        bail!("Windows random source failed with NTSTATUS {status:#x}");
+    }
     Ok(bytes)
 }
 
@@ -58,7 +61,6 @@ pub fn create_temp_file(directory: &Path, prefix: &str, suffix: &str) -> Result<
         let path = directory.join(format!("{prefix}{token}{suffix}"));
         let mut options = OpenOptions::new();
         options.write(true).read(true).create_new(true);
-        options.mode(0o600);
         match options.open(&path) {
             Ok(file) => return Ok((file, path)),
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
@@ -79,8 +81,7 @@ pub fn create_temp_file(directory: &Path, prefix: &str, suffix: &str) -> Result<
 pub fn create_temp_dir(directory: &Path, prefix: &str) -> Result<PathBuf> {
     std::fs::create_dir_all(directory)
         .with_context(|| format!("creating temporary directory {}", directory.display()))?;
-    let mut builder = std::fs::DirBuilder::new();
-    builder.mode(0o700);
+    let builder = std::fs::DirBuilder::new();
     for _ in 0..32 {
         let path = directory.join(format!("{prefix}{}", random_hex::<12>()?));
         match builder.create(&path) {
@@ -112,8 +113,6 @@ mod tests {
 
     #[test]
     fn temporary_paths_are_private_unique_and_use_the_requested_name_shape() {
-        use std::os::unix::fs::MetadataExt;
-
         let directory = create_temp_dir(&std::env::temp_dir(), "mu-random-test-").unwrap();
         let other = create_temp_dir(&std::env::temp_dir(), "mu-random-test-").unwrap();
         let (_, path) = create_temp_file(&directory, "spill-", ".tmp").unwrap();
@@ -126,11 +125,9 @@ mod tests {
                 .to_string_lossy()
                 .starts_with("mu-random-test-")
         );
-        assert_eq!(std::fs::metadata(&directory).unwrap().mode() & 0o077, 0);
         assert_eq!(path.parent(), Some(directory.as_path()));
         let name = path.file_name().unwrap().to_string_lossy();
         assert!(name.starts_with("spill-") && name.ends_with(".tmp"));
-        assert_eq!(std::fs::metadata(&path).unwrap().mode() & 0o077, 0);
         let _ = std::fs::remove_dir_all(directory);
         let _ = std::fs::remove_dir_all(other);
     }

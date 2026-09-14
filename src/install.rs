@@ -2,8 +2,6 @@ use std::path::{Path, PathBuf};
 
 #[cfg(feature = "portable")]
 use std::ffi::OsStr;
-#[cfg(feature = "portable")]
-use std::os::unix::fs::PermissionsExt;
 
 #[cfg(feature = "portable")]
 use anyhow::bail;
@@ -37,7 +35,7 @@ const BUILTINS: &[(&str, &str, bool)] = &[
 ];
 
 #[cfg(feature = "portable")]
-const APPLET_NAMES: &[&str] = &["apply_patch", "edit", "view_image"];
+const APPLET_NAMES: &[&str] = &["apply_patch.exe", "edit.exe", "view_image.exe"];
 
 pub fn prepare() -> Result<()> {
     #[cfg(feature = "portable")]
@@ -46,8 +44,7 @@ pub fn prepare() -> Result<()> {
         let paths = portable_paths(
             &executable,
             std::env::var_os("XDG_CACHE_HOME").as_deref(),
-            std::env::var_os("HOME").as_deref(),
-            cfg!(target_os = "macos"),
+            std::env::var_os("LOCALAPPDATA").as_deref(),
         )?;
         let executable_mtime = if paths.builtins.cached || paths.applets.cached {
             Some(
@@ -140,8 +137,7 @@ fn builtins_dir_from_executable(executable: &Path) -> Result<PathBuf> {
     Ok(portable_paths(
         executable,
         std::env::var_os("XDG_CACHE_HOME").as_deref(),
-        std::env::var_os("HOME").as_deref(),
-        cfg!(target_os = "macos"),
+        std::env::var_os("LOCALAPPDATA").as_deref(),
     )?
     .builtins
     .path)
@@ -152,8 +148,7 @@ fn applets_dir_from_executable(executable: &Path) -> Result<PathBuf> {
     Ok(portable_paths(
         executable,
         std::env::var_os("XDG_CACHE_HOME").as_deref(),
-        std::env::var_os("HOME").as_deref(),
-        cfg!(target_os = "macos"),
+        std::env::var_os("LOCALAPPDATA").as_deref(),
     )?
     .applets
     .path)
@@ -178,8 +173,7 @@ struct PortablePaths {
 fn portable_paths(
     executable: &Path,
     xdg_cache_home: Option<&OsStr>,
-    home: Option<&OsStr>,
-    macos: bool,
+    local_app_data: Option<&OsStr>,
 ) -> Result<PortablePaths> {
     let installed = executable_dir(executable)?
         .file_name()
@@ -189,7 +183,7 @@ fn portable_paths(
     let use_native_builtins = installed && native_builtins.is_dir();
     let use_native_applets = installed && native_applets.is_dir();
 
-    let cache_root = cache_root(xdg_cache_home, home, macos)?;
+    let cache_root = cache_root(xdg_cache_home, local_app_data)?;
     Ok(PortablePaths {
         builtins: ResourcePath {
             path: if use_native_builtins {
@@ -212,34 +206,27 @@ fn portable_paths(
 }
 
 #[cfg(feature = "portable")]
-fn cache_root(
-    xdg_cache_home: Option<&OsStr>,
-    home: Option<&OsStr>,
-    macos: bool,
-) -> Result<PathBuf> {
+fn cache_root(xdg_cache_home: Option<&OsStr>, local_app_data: Option<&OsStr>) -> Result<PathBuf> {
     if let Some(xdg) = xdg_cache_home {
-        let xdg = PathBuf::from(xdg);
+        let xdg = crate::windows_msys2::native_env_path_result(xdg)?;
         if !xdg.is_absolute() {
             bail!("XDG_CACHE_HOME must be an absolute path: {}", xdg.display());
         }
         return Ok(xdg.join("mu"));
     }
 
-    let home = home
-        .filter(|home| !home.is_empty())
-        .map(PathBuf::from)
-        .context("cannot determine Mu cache directory: HOME is not set")?;
-    if !home.is_absolute() {
+    let local_app_data = local_app_data
+        .filter(|path| !path.is_empty())
+        .map(crate::windows_msys2::native_env_path_result)
+        .transpose()?
+        .context("cannot determine Mu cache directory: LOCALAPPDATA is not set")?;
+    if !local_app_data.is_absolute() {
         bail!(
-            "cannot determine Mu cache directory: HOME must be an absolute path: {}",
-            home.display()
+            "cannot determine Mu cache directory: LOCALAPPDATA must be an absolute path: {}",
+            local_app_data.display()
         );
     }
-    if macos {
-        Ok(home.join("Library/Caches/mu"))
-    } else {
-        Ok(home.join(".cache/mu"))
-    }
+    Ok(local_app_data.join("mu"))
 }
 
 #[cfg(feature = "portable")]
@@ -265,11 +252,7 @@ fn initialize_builtins(
             let path = directory.join(name);
             std::fs::write(&path, contents)
                 .with_context(|| format!("writing portable built-in {}", path.display()))?;
-            std::fs::set_permissions(
-                &path,
-                std::fs::Permissions::from_mode(if *executable { 0o755 } else { 0o644 }),
-            )
-            .with_context(|| format!("setting portable built-in mode {}", path.display()))?;
+            let _ = executable;
         }
         Ok(())
     })();
@@ -295,8 +278,10 @@ fn initialize_applets(
     let result = (|| {
         for name in names {
             let path = directory.join(name);
-            std::os::unix::fs::symlink(executable, &path)
-                .with_context(|| format!("creating portable applet {}", path.display()))?;
+            if std::fs::hard_link(executable, &path).is_err() {
+                std::fs::copy(executable, &path)
+                    .with_context(|| format!("creating portable applet {}", path.display()))?;
+            }
         }
         Ok(())
     })();
@@ -364,22 +349,20 @@ mod tests {
 
     #[cfg(feature = "portable")]
     #[test]
-    fn embedded_builtins_exactly_cover_the_shipped_files_and_modes() {
+    fn embedded_builtins_exactly_cover_the_shipped_files() {
         let mut embedded = BUILTINS
             .iter()
-            .map(|(name, _, executable)| ((*name).to_string(), *executable))
+            .map(|(name, _, _)| *name)
             .collect::<Vec<_>>();
         embedded.sort_unstable();
         let mut shipped = std::fs::read_dir(Path::new(env!("CARGO_MANIFEST_DIR")).join("builtins"))
             .unwrap()
             .map(|entry| {
-                let entry = entry.unwrap();
-                let executable = entry.metadata().unwrap().permissions().mode() & 0o111 != 0;
-                let name = entry
+                entry
+                    .unwrap()
                     .file_name()
                     .into_string()
-                    .expect("built-in names are UTF-8");
-                (name, executable)
+                    .expect("built-in names are UTF-8")
             })
             .collect::<Vec<_>>();
         shipped.sort_unstable();
@@ -388,39 +371,23 @@ mod tests {
 
     #[cfg(feature = "portable")]
     #[test]
-    fn cache_root_uses_xdg_then_platform_home_conventions() {
+    fn cache_root_uses_xdg_then_local_app_data() {
         assert_eq!(
-            cache_root(
-                Some(OsStr::new("/cache")),
-                Some(OsStr::new("/home/me")),
-                false
-            )
-            .unwrap(),
-            Path::new("/cache/mu")
+            cache_root(Some(OsStr::new(r"C:\cache")), None).unwrap(),
+            PathBuf::from(r"C:\cache\mu")
         );
         assert_eq!(
-            cache_root(None, Some(OsStr::new("/home/me")), true).unwrap(),
-            Path::new("/home/me/Library/Caches/mu")
-        );
-        assert_eq!(
-            cache_root(None, Some(OsStr::new("/home/me")), false).unwrap(),
-            Path::new("/home/me/.cache/mu")
+            cache_root(None, Some(OsStr::new(r"C:\Users\me\AppData\Local"))).unwrap(),
+            PathBuf::from(r"C:\Users\me\AppData\Local\mu")
         );
     }
 
     #[cfg(feature = "portable")]
     #[test]
     fn cache_root_rejects_missing_or_relative_home_and_relative_xdg() {
-        assert!(cache_root(None, None, false).is_err());
-        assert!(cache_root(None, Some(OsStr::new("home")), false).is_err());
-        assert!(
-            cache_root(
-                Some(OsStr::new("cache")),
-                Some(OsStr::new("/home/me")),
-                false
-            )
-            .is_err()
-        );
+        assert!(cache_root(None, None).is_err());
+        assert!(cache_root(None, Some(OsStr::new("home"))).is_err());
+        assert!(cache_root(Some(OsStr::new("cache")), Some(OsStr::new("/home/me")),).is_err());
     }
 
     #[cfg(feature = "portable")]
@@ -431,7 +398,7 @@ mod tests {
         let cache = root.join("cache");
         std::fs::create_dir_all(root.join("share/mu")).unwrap();
 
-        let paths = portable_paths(&executable, Some(cache.as_os_str()), None, false).unwrap();
+        let paths = portable_paths(&executable, Some(cache.as_os_str()), None).unwrap();
         assert_eq!(paths.builtins.path, root.join("share/mu"));
         assert!(!paths.builtins.cached);
         assert_eq!(paths.applets.path, cache.join("mu/applets"));
@@ -439,7 +406,7 @@ mod tests {
 
         std::fs::remove_dir_all(root.join("share")).unwrap();
         std::fs::create_dir_all(root.join("libexec/mu")).unwrap();
-        let paths = portable_paths(&executable, Some(cache.as_os_str()), None, false).unwrap();
+        let paths = portable_paths(&executable, Some(cache.as_os_str()), None).unwrap();
         assert_eq!(paths.builtins.path, cache.join("mu/builtins"));
         assert!(paths.builtins.cached);
         assert_eq!(paths.applets.path, root.join("libexec/mu"));
@@ -456,7 +423,7 @@ mod tests {
         std::fs::create_dir_all(root.join("share/mu")).unwrap();
         std::fs::create_dir_all(root.join("libexec/mu")).unwrap();
 
-        let paths = portable_paths(&executable, Some(cache.as_os_str()), None, false).unwrap();
+        let paths = portable_paths(&executable, Some(cache.as_os_str()), None).unwrap();
         assert_eq!(paths.builtins.path, cache.join("mu/builtins"));
         assert_eq!(paths.applets.path, cache.join("mu/applets"));
         std::fs::remove_dir_all(root).unwrap();
@@ -464,7 +431,7 @@ mod tests {
 
     #[cfg(feature = "portable")]
     #[test]
-    fn first_creation_populates_builtins_and_absolute_applet_symlinks() {
+    fn first_creation_populates_builtins_and_exe_applets() {
         let root = temp_root("create");
         let executable = root.join("mu");
         let builtins = root.join("cache/builtins");
@@ -475,16 +442,12 @@ mod tests {
         initialize_builtins(&builtins, BUILTINS, std::time::UNIX_EPOCH).unwrap();
         initialize_applets(&executable, &applets, APPLET_NAMES, std::time::UNIX_EPOCH).unwrap();
 
-        for (name, _, executable) in BUILTINS {
+        for (name, contents, _) in BUILTINS {
             let path = builtins.join(name);
-            assert!(path.is_file());
-            assert_eq!(
-                path.metadata().unwrap().permissions().mode() & 0o111 != 0,
-                *executable
-            );
+            assert_eq!(std::fs::read_to_string(path).unwrap(), *contents);
         }
         for name in APPLET_NAMES {
-            assert_eq!(std::fs::read_link(applets.join(name)).unwrap(), executable);
+            assert_eq!(std::fs::read(applets.join(name)).unwrap(), b"binary");
         }
         std::fs::remove_dir_all(root).unwrap();
     }
@@ -530,7 +493,7 @@ mod tests {
         std::fs::create_dir_all(&applets).unwrap();
         std::fs::write(&executable, "binary").unwrap();
         std::fs::write(builtins.join("obsolete"), "remove").unwrap();
-        std::os::unix::fs::symlink(root.join("old-mu"), applets.join("apply_patch")).unwrap();
+        std::fs::write(applets.join("apply_patch.exe"), "old-mu").unwrap();
 
         let old = UNIX_EPOCH + Duration::from_secs(1_000_000_000);
         let executable_mtime = old + Duration::from_secs(1);
@@ -552,7 +515,7 @@ mod tests {
             );
         }
         for name in APPLET_NAMES {
-            assert_eq!(std::fs::read_link(applets.join(name)).unwrap(), executable);
+            assert_eq!(std::fs::read(applets.join(name)).unwrap(), b"binary");
         }
         std::fs::remove_dir_all(root).unwrap();
     }

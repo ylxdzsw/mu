@@ -1,7 +1,6 @@
 use std::fmt;
 use std::io::Write;
-use std::os::unix::process::CommandExt;
-use std::os::unix::process::ExitStatusExt;
+use std::os::windows::process::CommandExt;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::{Command, ExitStatus, Stdio};
@@ -20,6 +19,15 @@ use crate::config::{Config, EnvMap, LimitsConfig};
 use crate::provider::ToolAttachment;
 use crate::redaction::SecretRedactor;
 use crate::renderer::Renderer;
+
+#[path = "windows_process.rs"]
+mod windows_process;
+
+use windows_sys::Win32::System::Console::{
+    CTRL_BREAK_EVENT, CTRL_C_EVENT, CTRL_CLOSE_EVENT, CTRL_LOGOFF_EVENT, CTRL_SHUTDOWN_EVENT,
+    SetConsoleCtrlHandler,
+};
+use windows_sys::Win32::System::Threading::ExitProcess;
 
 #[derive(Debug, Clone)]
 pub struct ToolResult {
@@ -78,15 +86,6 @@ pub fn tool_definitions() -> Vec<Value> {
             "strict": false
         }
     })]
-}
-
-pub fn resolve_path(path: &str) -> PathBuf {
-    let p = PathBuf::from(path);
-    if p.is_absolute() {
-        p
-    } else {
-        std::env::current_dir().unwrap_or_default().join(p)
-    }
 }
 
 pub fn apply_truncation(
@@ -159,7 +158,7 @@ fn truncate_output(
     let spill_note = match write_spill(output, spill_prefix) {
         Ok(spill_path) => format!(
             "full output was written to temporary file {}; it may disappear at any time",
-            spill_path.display()
+            crate::windows_msys2::display_path(&spill_path)
         ),
         Err(error) => {
             format!("full output could not be saved ({error}); only this preview is available")
@@ -330,13 +329,12 @@ const KILL_GRACE: Duration = Duration::from_millis(500);
 const MAX_OUTPUT_BYTES: usize = 1024 * 1024 * 1024; // 1 GB: internal guard against unbounded output accumulation
 const REDACTION_REMINDER: &str = "[system reminder: Secret values were redacted from this bash output. Do not try to reveal, transform, encode, print, or exfiltrate secrets.]";
 pub const SUBAGENT_DEPTH_ENV: &str = "MU_SUBAGENT_DEPTH";
-pub const MAX_ACTIVE_PROCESS_GROUPS: usize = 64;
-static ACTIVE_PGIDS: [AtomicI32; MAX_ACTIVE_PROCESS_GROUPS] =
-    [const { AtomicI32::new(0) }; MAX_ACTIVE_PROCESS_GROUPS];
+pub const MAX_ACTIVE_JOBS: usize = windows_process::MAX_ACTIVE_JOBS;
 static CANCELLING: AtomicBool = AtomicBool::new(false);
 static SOFT_INTERRUPT_REQUESTED: AtomicBool = AtomicBool::new(false);
 static LAST_SIGNAL: AtomicI32 = AtomicI32::new(0);
 static INSTALL_SIGNAL_FORWARDER: Once = Once::new();
+static SOFT_INTERRUPT_ENABLED: AtomicBool = AtomicBool::new(false);
 
 pub fn description() -> &'static str {
     "Run bash command."
@@ -634,6 +632,22 @@ fn execute_bash_task(
     })
 }
 
+const MAX_INLINE_COMMAND_UTF16: usize = 12_000;
+
+struct CommandScript(PathBuf);
+
+impl CommandScript {
+    fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for CommandScript {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
 fn run_bash_inner(
     args: BashArgs,
     timeout_secs: u64,
@@ -642,11 +656,11 @@ fn run_bash_inner(
     redactor: &mut SecretRedactor,
     attachment_context: Option<&AttachmentContext>,
 ) -> Result<BashRunResult> {
-    let cwd = args
-        .cwd
-        .as_deref()
-        .map(resolve_path)
-        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+    let cwd = match args.cwd.as_deref() {
+        Some(path) => crate::windows_msys2::native_path(path)
+            .with_context(|| format!("resolving MSYS2 working directory {path}"))?,
+        None => std::env::current_dir().context("determining current working directory")?,
+    };
     let cwd_metadata = std::fs::metadata(&cwd).map_err(|error| {
         if error.kind() == std::io::ErrorKind::NotFound {
             anyhow::anyhow!("working directory does not exist: {}", cwd.display())
@@ -657,19 +671,53 @@ fn run_bash_inner(
     if !cwd_metadata.is_dir() {
         bail!("working directory is not a directory: {}", cwd.display());
     }
-    let applets = crate::paths::applets_dir()?;
-    let command_text = format!(
-        "export PATH={}:$PATH\nexec 2>&1\n{}",
-        shell_quote(&applets.to_string_lossy()),
-        args.command
-    );
 
-    let mut command = Command::new("bash");
+    let applets = crate::paths::applets_dir()?;
+    let applets = crate::windows_msys2::shell_path(&applets)?;
+    let bootstrap = format!("export PATH={}:$PATH\nexec 2>&1\n", shell_quote(&applets));
+    let mut _command_script = None;
+    let command_text = if bootstrap.encode_utf16().count() + args.command.encode_utf16().count()
+        > MAX_INLINE_COMMAND_UTF16
+    {
+        let directory = crate::paths::runtime_dir()?;
+        let (mut file, path) = crate::random::create_temp_file(&directory, "bash-", ".sh")?;
+        let script = CommandScript(path);
+        file.write_all(format!("{bootstrap}{}", args.command).as_bytes())?;
+        drop(file);
+        let shell_script = crate::windows_msys2::shell_path(script.path())
+            .context("converting temporary Bash script path")?;
+        _command_script = Some(script);
+        format!(". {}", shell_quote(&shell_script))
+    } else {
+        format!("{bootstrap}{}", args.command)
+    };
+
+    if cancellation_requested() {
+        return Err(BashExecutionError::new(
+            format!("command interrupted by {}", signal_name(last_signal())),
+            String::new(),
+            redactor.did_redact(),
+        )
+        .into());
+    }
+
+    let job = windows_process::Job::new()?;
+    if cancellation_requested() {
+        return Err(BashExecutionError::new(
+            format!("command interrupted by {}", signal_name(last_signal())),
+            String::new(),
+            redactor.did_redact(),
+        )
+        .into());
+    }
+
+    let mut command = Command::new(crate::windows_msys2::bash_program()?);
     command
         .arg("-lc")
         .arg(command_text)
         .current_dir(&cwd)
         .envs(env)
+        .env("CHERE_INVOKING", "1")
         .env(SUBAGENT_DEPTH_ENV, next_subagent_depth_env())
         .stdin(if args.stdin.is_some() {
             Stdio::piped()
@@ -677,7 +725,8 @@ fn run_bash_inner(
             Stdio::null()
         })
         .stdout(Stdio::piped())
-        .stderr(Stdio::null());
+        .stderr(Stdio::null())
+        .creation_flags(windows_process::CREATION_FLAGS);
     if let Some(attachment_context) = attachment_context {
         command
             .env(
@@ -693,16 +742,6 @@ fn run_bash_inner(
                 &attachment_context.objects_dir,
             );
     }
-    configure_process_group(&mut command);
-
-    if cancellation_requested() {
-        return Err(BashExecutionError::new(
-            format!("command interrupted by {}", signal_name(last_signal())),
-            String::new(),
-            redactor.did_redact(),
-        )
-        .into());
-    }
 
     let mut child = command.spawn().map_err(|error| {
         if is_e2big(&error) {
@@ -711,19 +750,35 @@ fn run_bash_inner(
             anyhow::anyhow!(error).context("spawning bash")
         }
     })?;
-    let child_id = child.id();
-    let _active = ActiveProcessGroup::new(child_id);
-
-    if let Some(stdin) = args.stdin {
-        let mut child_stdin = child.stdin.take().context("taking bash stdin")?;
-        std::thread::spawn(move || {
-            let _ = child_stdin.write_all(stdin.as_bytes());
-        });
+    if let Err(error) = job.assign_and_resume(&child) {
+        job.terminate(&mut child);
+        return Err(error.context("starting bash inside a Windows Job Object"));
     }
 
-    let stdout = child.stdout.take().context("taking bash stdout")?;
+    let mut stdin_writer = None;
+    if let Some(stdin) = args.stdin {
+        let mut child_stdin = match child.stdin.take() {
+            Some(stdin) => stdin,
+            None => {
+                job.terminate(&mut child);
+                bail!("taking bash stdin");
+            }
+        };
+        stdin_writer = Some(std::thread::spawn(move || {
+            let _ = child_stdin.write_all(stdin.as_bytes());
+        }));
+    }
+
+    let stdout = match child.stdout.take() {
+        Some(stdout) => stdout,
+        None => {
+            job.terminate(&mut child);
+            join_stdin_writer(&mut stdin_writer);
+            bail!("taking bash stdout");
+        }
+    };
     let (tx, rx) = mpsc::channel();
-    std::thread::spawn(move || {
+    let reader = std::thread::spawn(move || {
         let mut stdout = stdout;
         loop {
             let mut buf = [0u8; 4096];
@@ -743,16 +798,13 @@ fn run_bash_inner(
     let mut output = String::new();
     let mut status: Option<ExitStatus> = None;
     let mut stdout_closed = false;
-    let mut interrupted = false;
     let mut terminal_error: Option<BashExecutionError> = None;
 
     loop {
         if cancellation_requested() {
-            interrupted = true;
-            terminate_child_group(child_id, &mut child);
-            drain_available(&rx, target, &mut output, redactor)?;
+            job.terminate(&mut child);
+            stdout_closed = drain_after_termination(&rx, target, &mut output, redactor)?;
             flush_redactor(target, &mut output, redactor)?;
-            let _ = child.wait();
             terminal_error = Some(BashExecutionError::new(
                 format!("command interrupted by {}", signal_name(last_signal())),
                 std::mem::take(&mut output),
@@ -762,10 +814,9 @@ fn run_bash_inner(
         }
 
         if Instant::now() >= deadline {
-            terminate_child_group(child_id, &mut child);
-            drain_available(&rx, target, &mut output, redactor)?;
+            job.terminate(&mut child);
+            stdout_closed = drain_after_termination(&rx, target, &mut output, redactor)?;
             flush_redactor(target, &mut output, redactor)?;
-            let _ = child.wait();
             terminal_error = Some(BashExecutionError::new(
                 format!("command timed out after {timeout_secs}s"),
                 std::mem::take(&mut output),
@@ -775,19 +826,36 @@ fn run_bash_inner(
         }
 
         if status.is_none() {
-            status = child.try_wait().context("waiting for bash")?;
+            match child.try_wait() {
+                Ok(next_status) => {
+                    status = next_status;
+                    if status.is_some() {
+                        job.terminate(&mut child);
+                    }
+                }
+                Err(error) => {
+                    job.terminate(&mut child);
+                    let _ = drain_after_termination(&rx, target, &mut output, redactor);
+                    join_stdin_writer(&mut stdin_writer);
+                    return Err(error).context("waiting for bash");
+                }
+            }
         }
 
         match rx.recv_timeout(Duration::from_millis(25)) {
             Ok(bytes) => {
                 let redacted = redactor.redact_chunk(&bytes);
                 output.push_str(&redacted);
-                target.push_output(&redacted)?;
+                if let Err(error) = target.push_output(&redacted) {
+                    job.terminate(&mut child);
+                    let _ = drain_after_termination(&rx, target, &mut output, redactor);
+                    join_stdin_writer(&mut stdin_writer);
+                    return Err(error);
+                }
                 if output.len() > MAX_OUTPUT_BYTES {
-                    terminate_child_group(child_id, &mut child);
-                    drain_available(&rx, target, &mut output, redactor)?;
+                    job.terminate(&mut child);
+                    stdout_closed = drain_after_termination(&rx, target, &mut output, redactor)?;
                     flush_redactor(target, &mut output, redactor)?;
-                    let _ = child.wait();
                     terminal_error = Some(BashExecutionError::new(
                         format!(
                             "command killed: output exceeded {} MB limit",
@@ -810,12 +878,19 @@ fn run_bash_inner(
         }
     }
 
-    let status = status.unwrap_or_else(|| child.wait().expect("bash status"));
+    let status = match status {
+        Some(status) => status,
+        None => child.wait().context("waiting for bash")?,
+    };
+    if stdout_closed {
+        let _ = reader.join();
+    }
+    join_stdin_writer(&mut stdin_writer);
     flush_redactor(target, &mut output, redactor)?;
     if let Some(error) = terminal_error {
         return Err(error.into());
     }
-    if interrupted || (cancellation_requested() && status.signal().is_some()) {
+    if cancellation_requested() {
         return Err(BashExecutionError::new(
             format!("command interrupted by {}", signal_name(last_signal())),
             output,
@@ -824,7 +899,7 @@ fn run_bash_inner(
         .into());
     }
     Ok(BashRunResult {
-        output: output.trim_end_matches('\n').to_string(),
+        output: output.trim_end_matches(['\r', '\n']).to_string(),
         exit_code: status.code().unwrap_or(1),
         redacted: redactor.did_redact(),
         attachments: attachment_context.map_or_else(
@@ -838,6 +913,35 @@ fn run_bash_inner(
             },
         )?,
     })
+}
+
+fn join_stdin_writer(writer: &mut Option<std::thread::JoinHandle<()>>) {
+    if let Some(writer) = writer.take() {
+        let _ = writer.join();
+    }
+}
+
+fn drain_after_termination(
+    rx: &mpsc::Receiver<Vec<u8>>,
+    target: &mut impl BashOutputTarget,
+    output: &mut String,
+    redactor: &mut SecretRedactor,
+) -> Result<bool> {
+    let deadline = Instant::now() + KILL_GRACE;
+    loop {
+        match rx.recv_timeout(Duration::from_millis(25)) {
+            Ok(bytes) => {
+                let redacted = redactor.redact_chunk(&bytes);
+                output.push_str(&redacted);
+                target.push_output(&redacted)?;
+            }
+            Err(RecvTimeoutError::Disconnected) => return Ok(true),
+            Err(RecvTimeoutError::Timeout) if Instant::now() >= deadline => break,
+            Err(RecvTimeoutError::Timeout) => {}
+        }
+    }
+    drain_available(rx, target, output, redactor)?;
+    Ok(false)
 }
 
 fn shell_quote(value: &str) -> String {
@@ -870,41 +974,41 @@ fn flush_redactor(
 }
 
 fn is_e2big(error: &std::io::Error) -> bool {
-    error.raw_os_error() == Some(libc::E2BIG)
+    error.raw_os_error() == Some(206)
 }
 
-pub fn install_signal_forwarder(soft_interrupt: bool) {
+pub fn install_console_handler(soft_interrupt: bool) {
+    SOFT_INTERRUPT_ENABLED.store(soft_interrupt, Ordering::SeqCst);
     INSTALL_SIGNAL_FORWARDER.call_once(|| unsafe {
-        libc::signal(libc::SIGINT, forward_signal as *const () as usize);
-        libc::signal(libc::SIGTERM, forward_signal as *const () as usize);
-    });
-    if soft_interrupt {
-        unsafe {
-            libc::signal(libc::SIGQUIT, forward_signal as *const () as usize);
+        if SetConsoleCtrlHandler(Some(console_control_handler), 1) == 0 {
+            eprintln!(
+                "warning: unable to install Windows console control handler: {}",
+                std::io::Error::last_os_error()
+            );
         }
-    }
+    });
 }
 
-extern "C" fn forward_signal(signal: i32) {
-    if signal == libc::SIGQUIT {
-        SOFT_INTERRUPT_REQUESTED.store(true, Ordering::SeqCst);
-        return;
-    }
+unsafe extern "system" fn console_control_handler(control: u32) -> i32 {
+    let signal = match control {
+        CTRL_C_EVENT => 2,
+        CTRL_BREAK_EVENT if SOFT_INTERRUPT_ENABLED.load(Ordering::SeqCst) => {
+            SOFT_INTERRUPT_REQUESTED.store(true, Ordering::SeqCst);
+            return 1;
+        }
+        CTRL_BREAK_EVENT => 2,
+        CTRL_CLOSE_EVENT | CTRL_LOGOFF_EVENT | CTRL_SHUTDOWN_EVENT => 15,
+        _ => return 0,
+    };
+
     LAST_SIGNAL.store(signal, Ordering::SeqCst);
     let already_cancelling = CANCELLING.swap(true, Ordering::SeqCst);
-    for pgid in &ACTIVE_PGIDS {
-        let pgid = pgid.load(Ordering::SeqCst);
-        if pgid > 0 {
-            unsafe {
-                libc::kill(-pgid, signal);
-            }
-        }
-    }
-    if already_cancelling || !has_active_process_groups() {
+    if already_cancelling || windows_process::active_job_count() == 0 {
         unsafe {
-            libc::_exit(128 + signal);
+            ExitProcess((128 + signal) as u32);
         }
     }
+    1
 }
 
 pub fn reset_cancellation_state() {
@@ -921,111 +1025,26 @@ pub fn cancellation_requested() -> bool {
     CANCELLING.load(Ordering::SeqCst)
 }
 
-/// If a terminating signal was forwarded during this turn, return its number so
+/// If a terminating console event occurred during this turn, return its number so
 /// the process can exit with the shell-conventional `128 + signal` status
-/// (e.g. `130` for SIGINT). Returns `None` when no cancellation occurred.
+/// (e.g. `130` for Ctrl-C). Returns `None` when no cancellation occurred.
 pub fn cancellation_signal() -> Option<i32> {
-    if !cancellation_requested() {
-        return None;
-    }
-    let signal = LAST_SIGNAL.load(Ordering::SeqCst);
-    Some(if signal > 0 { signal } else { libc::SIGINT })
+    cancellation_requested().then(|| {
+        let signal = LAST_SIGNAL.load(Ordering::SeqCst);
+        if signal > 0 { signal } else { 2 }
+    })
 }
 
 fn last_signal() -> i32 {
     LAST_SIGNAL.load(Ordering::SeqCst)
 }
 
-fn has_active_process_groups() -> bool {
-    ACTIVE_PGIDS
-        .iter()
-        .any(|pgid| pgid.load(Ordering::SeqCst) > 0)
-}
-
 fn signal_name(signal: i32) -> &'static str {
     match signal {
-        libc::SIGINT => "SIGINT",
-        libc::SIGTERM => "SIGTERM",
-        _ => "signal",
+        2 => "Ctrl-C",
+        15 => "console termination",
+        _ => "console control event",
     }
-}
-
-struct ActiveProcessGroup {
-    slot: Option<usize>,
-}
-
-impl ActiveProcessGroup {
-    fn new(child_id: u32) -> Self {
-        Self {
-            slot: set_active_process_group(child_id),
-        }
-    }
-}
-
-impl Drop for ActiveProcessGroup {
-    fn drop(&mut self) {
-        clear_active_process_group(self.slot);
-    }
-}
-
-fn set_active_process_group(child_id: u32) -> Option<usize> {
-    let pgid = child_id.cast_signed();
-    for (idx, slot) in ACTIVE_PGIDS.iter().enumerate() {
-        if slot
-            .compare_exchange(0, pgid, Ordering::SeqCst, Ordering::SeqCst)
-            .is_ok()
-        {
-            return Some(idx);
-        }
-    }
-    None
-}
-
-fn clear_active_process_group(slot: Option<usize>) {
-    if let Some(slot) = slot {
-        ACTIVE_PGIDS[slot].store(0, Ordering::SeqCst);
-    }
-}
-
-fn configure_process_group(command: &mut Command) {
-    unsafe {
-        command.pre_exec(|| {
-            if libc::setpgid(0, 0) != 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            #[cfg(target_os = "linux")]
-            {
-                libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM);
-            }
-            Ok(())
-        });
-    }
-}
-
-fn terminate_child_group(child_id: u32, child: &mut std::process::Child) {
-    let pgid = -child_id.cast_signed();
-    unsafe {
-        if libc::kill(pgid, libc::SIGTERM) != 0 {
-            let _ = child.kill();
-        }
-    }
-    let _ = wait_for_exit(child, KILL_GRACE);
-    unsafe {
-        if libc::kill(pgid, libc::SIGKILL) != 0 {
-            let _ = child.kill();
-        }
-    }
-}
-
-fn wait_for_exit(child: &mut std::process::Child, grace: Duration) -> bool {
-    let deadline = Instant::now() + grace;
-    while Instant::now() < deadline {
-        if matches!(child.try_wait(), Ok(Some(_))) {
-            return true;
-        }
-        std::thread::sleep(Duration::from_millis(25));
-    }
-    false
 }
 
 #[cfg(test)]
@@ -1033,6 +1052,10 @@ mod tests {
     use std::path::PathBuf;
 
     use serde_json::json;
+    use windows_sys::Win32::Foundation::{CloseHandle, STILL_ACTIVE};
+    use windows_sys::Win32::System::Threading::{
+        GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
 
     use super::{
         AttachmentContext, BashArgs, BashExecutionError, BashRisk, REDACTION_REMINDER, ToolContext,
@@ -1070,20 +1093,21 @@ mod tests {
     }
 
     fn process_is_running(pid: i32) -> bool {
-        if unsafe { libc::kill(pid, 0) } != 0 {
+        let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid as u32) };
+        if handle.is_null() {
             return false;
         }
-
-        #[cfg(target_os = "linux")]
-        if let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat"))
-            && stat
-                .rsplit_once(") ")
-                .is_some_and(|(_, status)| status.starts_with('Z'))
-        {
-            return false;
+        let mut exit_code = 0;
+        let running = unsafe { GetExitCodeProcess(handle, &mut exit_code) != 0 }
+            && exit_code == STILL_ACTIVE as u32;
+        unsafe {
+            CloseHandle(handle);
         }
+        running
+    }
 
-        true
+    fn shell_path(path: &std::path::Path) -> String {
+        crate::windows_msys2::shell_path(path).unwrap()
     }
 
     fn test_config(env: &[(&str, &str)], redaction_env: &[&str]) -> Config {
@@ -1144,7 +1168,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(second_result.exit_code, 0);
-        assert_eq!(second_result.output, format!("{}|unset", tmp.display()));
+        assert_eq!(second_result.output, format!("{}|unset", shell_path(&tmp)));
 
         let _ = std::fs::remove_dir_all(&tmp);
     }
@@ -1181,20 +1205,33 @@ mod tests {
             None,
         )
         .unwrap();
-        let applets = crate::paths::applets_dir().unwrap();
-        assert!(
-            result
-                .output
-                .starts_with(&format!("{}:", applets.display()))
-        );
+        let applets = shell_path(&crate::paths::applets_dir().unwrap());
+        assert!(result.output.starts_with(&format!("{applets}:")));
+    }
+
+    #[test]
+    fn bash_executes_long_commands_from_a_private_script() {
+        let value = "x".repeat(25_000);
+        let command = format!("printf '%s' '{value}'");
+        let mut renderer = Renderer::new();
+        let result = run_bash(
+            args(&command),
+            5,
+            &mut renderer,
+            &empty_env(),
+            SecretRedactor::default(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(result.output, value);
     }
 
     #[test]
     fn bash_attachment_context_exports_manifest_call_and_object_paths() {
         let mut renderer = Renderer::new();
         let context = AttachmentContext {
-            manifest: PathBuf::from("/tmp/attachments.jsonl"),
-            objects_dir: PathBuf::from("/tmp/objects"),
+            manifest: PathBuf::from(r"C:\mu-test\attachments.jsonl"),
+            objects_dir: PathBuf::from(r"C:\mu-test\objects"),
             bash_call_id: 42,
         };
         let result = run_bash(
@@ -1206,7 +1243,14 @@ mod tests {
             Some(&context),
         )
         .unwrap();
-        assert_eq!(result.output, "/tmp/attachments.jsonl|42|/tmp/objects");
+        assert_eq!(
+            result.output,
+            format!(
+                "{}|42|{}",
+                context.manifest.display(),
+                context.objects_dir.display()
+            )
+        );
     }
 
     #[tokio::test]
@@ -1240,56 +1284,12 @@ mod tests {
         assert!(!result.output.contains("tiny"));
     }
 
-    #[cfg(target_os = "linux")]
     #[test]
-    fn redirected_setsid_command_detaches_with_pid_as_sid() {
-        let tmp = crate::random::create_temp_dir(&std::env::temp_dir(), "mu-bg-test-").unwrap();
-        let log = tmp.join("output");
-        let command = format!(
-            "setsid sleep 10 </dev/null >{} 2>&1 & pid=$!; sleep 0.05; sid=$(ps -o sid= -p \"$pid\"); printf '%s %s' \"$pid\" \"$sid\"",
-            log.display()
-        );
-        let mut renderer = Renderer::new();
-        let started = std::time::Instant::now();
-        let result = run_bash(
-            args(&command),
-            5,
-            &mut renderer,
-            &empty_env(),
-            SecretRedactor::default(),
-            None,
-        )
-        .unwrap();
-        let ids = result
-            .output
-            .split_whitespace()
-            .map(|value| value.parse::<i32>().unwrap())
-            .collect::<Vec<_>>();
-        if let Some(pid) = ids.first() {
-            unsafe {
-                libc::kill(-pid, libc::SIGKILL);
-            }
-        }
-        let _ = std::fs::remove_dir_all(tmp);
-
-        assert!(started.elapsed() < std::time::Duration::from_secs(2));
-        assert_eq!(ids.len(), 2);
-        assert_eq!(ids[0], ids[1]);
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn redirected_setsid_command_can_read_tool_stdin() {
-        let tmp = crate::random::create_temp_dir(&std::env::temp_dir(), "mu-bg-stdin-").unwrap();
-        let output = tmp.join("output");
-        let command = format!(
-            "setsid sh -c 'cat >\"$1\"' sh {} <&0 >/dev/null 2>&1 &",
-            output.display()
-        );
-        let mut input = args(&command);
+    fn bash_reads_literal_tool_stdin() {
+        let mut input = args("cat");
         input.stdin = Some("delegated prompt\n".into());
         let mut renderer = Renderer::new();
-        run_bash(
+        let result = run_bash(
             input,
             5,
             &mut renderer,
@@ -1298,18 +1298,7 @@ mod tests {
             None,
         )
         .unwrap();
-
-        let expected = "delegated prompt\n";
-        let contents = (0..40).find_map(|_| {
-            let contents = std::fs::read_to_string(&output).ok();
-            if contents.as_deref() == Some(expected) {
-                return contents;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(25));
-            None
-        });
-        let _ = std::fs::remove_dir_all(tmp);
-        assert_eq!(contents.as_deref(), Some(expected));
+        assert_eq!(result.output, "delegated prompt");
     }
 
     #[test]
@@ -1317,7 +1306,10 @@ mod tests {
         let tmp =
             crate::random::create_temp_dir(&std::env::temp_dir(), "mu-bash-descendant-").unwrap();
         let marker = tmp.join("marker");
-        let script = format!("sleep 20 & echo $! > {}; sleep 20", marker.display());
+        let script = format!(
+            "python -c 'import os,time; print(os.getpid(), flush=True); time.sleep(20)' > {} & wait",
+            super::shell_quote(&shell_path(&marker))
+        );
         let mut renderer = Renderer::new();
         let result = run_bash(
             args(&script),
@@ -1374,10 +1366,14 @@ mod tests {
 
     fn spill_path(output: &str) -> PathBuf {
         let runtime = crate::paths::runtime_dir().unwrap();
-        output
-            .split_whitespace()
-            .map(|word| PathBuf::from(word.trim_end_matches(';')))
-            .find(|path| path.starts_with(&runtime))
+        let prefix = "full output was written to temporary file ";
+        let raw = output
+            .split_once(prefix)
+            .and_then(|(_, rest)| rest.split_once("; it may").map(|(path, _)| path))
+            .expect("spill path note");
+        crate::windows_msys2::native_path(raw)
+            .ok()
+            .filter(|path| path.starts_with(&runtime))
             .expect("spill path")
     }
 

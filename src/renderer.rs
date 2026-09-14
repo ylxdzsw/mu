@@ -1,11 +1,16 @@
-use std::io::{self, IsTerminal, Write};
-use std::os::fd::AsRawFd;
+use std::io::{self, Write};
+use std::os::windows::io::AsRawHandle;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use pulldown_cmark::{Alignment, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
+use windows_sys::Win32::Foundation::HANDLE;
+use windows_sys::Win32::System::Console::{
+    CONSOLE_MODE, CONSOLE_SCREEN_BUFFER_INFO, ENABLE_PROCESSED_OUTPUT,
+    ENABLE_VIRTUAL_TERMINAL_PROCESSING, GetConsoleMode, GetConsoleScreenBufferInfo, SetConsoleMode,
+};
 
 use crate::OutputFormat;
 use crate::provider::ReasoningVisibility;
@@ -97,16 +102,32 @@ impl TerminalLayout {
 }
 
 fn stdout_terminal_width(stdout: &io::Stdout) -> Option<usize> {
-    let mut size = std::mem::MaybeUninit::<libc::winsize>::zeroed();
-    // SAFETY: TIOCGWINSZ initializes the winsize pointed to by the third
-    // argument and does not retain that pointer.
-    let result = unsafe { libc::ioctl(stdout.as_raw_fd(), libc::TIOCGWINSZ, size.as_mut_ptr()) };
-    if result != 0 {
+    console_width(stdout).map(|columns| columns.saturating_sub(TERMINAL_RIGHT_MARGIN).max(1))
+}
+
+fn console_width<T: AsRawHandle>(stream: &T) -> Option<usize> {
+    let handle = stream.as_raw_handle() as HANDLE;
+    if handle.is_null() {
         return None;
     }
-    // SAFETY: A successful TIOCGWINSZ call initialized the structure.
-    let columns = unsafe { size.assume_init() }.ws_col as usize;
-    (columns > 0).then_some(columns.saturating_sub(TERMINAL_RIGHT_MARGIN).max(1))
+
+    let mut info = std::mem::MaybeUninit::<CONSOLE_SCREEN_BUFFER_INFO>::zeroed();
+    let result = unsafe { GetConsoleScreenBufferInfo(handle, info.as_mut_ptr()) };
+    if result == 0 {
+        return None;
+    }
+
+    let mut mode: CONSOLE_MODE = 0;
+    if unsafe { GetConsoleMode(handle, &mut mode) } != 0 {
+        let ansi_mode = mode | ENABLE_PROCESSED_OUTPUT | ENABLE_VIRTUAL_TERMINAL_PROCESSING;
+        if ansi_mode != mode {
+            let _ = unsafe { SetConsoleMode(handle, ansi_mode) };
+        }
+    }
+
+    let info = unsafe { info.assume_init() };
+    let columns = i32::from(info.srWindow.Right) - i32::from(info.srWindow.Left) + 1;
+    (columns > 0).then_some(columns as usize)
 }
 
 #[cfg(test)]
@@ -150,15 +171,11 @@ impl Renderer {
         turn_done_bell_min_duration: Option<Duration>,
     ) -> Self {
         let stdout = io::stdout();
-        let styled = format != OutputFormat::Final && stdout.is_terminal();
-        let detected_width = if styled {
-            stdout_terminal_width(&stdout)
-        } else {
-            None
-        };
+        let detected_width = stdout_terminal_width(&stdout);
+        let styled = format != OutputFormat::Final && detected_width.is_some();
         let terminal_layout = styled.then(|| TerminalLayout::new(detected_width));
         let stderr = io::stderr();
-        let stderr_is_terminal = stderr.is_terminal();
+        let stderr_is_terminal = console_width(&stderr).is_some();
         Self::with_outputs(
             format,
             Box::new(stdout),
@@ -751,22 +768,24 @@ impl Renderer {
         let cwd = args
             .get("cwd")
             .and_then(|value| value.as_str())
-            .map(PathBuf::from)
             .map(|cwd| {
-                if cwd.is_absolute() {
-                    cwd
-                } else {
-                    base.join(cwd)
-                }
+                crate::windows_msys2::native_path(cwd).unwrap_or_else(|_| {
+                    let path = PathBuf::from(cwd);
+                    if path.is_absolute() {
+                        path
+                    } else {
+                        base.join(path)
+                    }
+                })
             })
             .unwrap_or(base);
-        let cwd = std::fs::canonicalize(&cwd).unwrap_or(cwd);
+        let cwd = crate::windows_msys2::canonical_path(&cwd).unwrap_or(cwd);
 
         self.write_stdout_committed(&format!("# {title}\n$ [{risk}] {command}"))?;
         if !command.ends_with('\n') {
             self.write_stdout_committed("\n")?;
         }
-        self.write_stdout_committed(&format!("@ {}\n", cwd.display()))?;
+        self.write_stdout_committed(&format!("@ {}\n", crate::windows_msys2::display_path(&cwd)))?;
         if let Some(stdin) = args.get("stdin").and_then(|value| value.as_str()) {
             self.write_stdout_committed(&format!("< {stdin}"))?;
             if !stdin.ends_with('\n') {
@@ -3695,21 +3714,30 @@ fn format_stdin_summary(bytes: usize, styled: bool) -> String {
 }
 
 fn format_cwd_line(raw_cwd: &str, styled: bool) -> String {
+    let display_cwd = match crate::windows_msys2::native_path(raw_cwd) {
+        Ok(path) => crate::windows_msys2::display_path(&path),
+        Err(error) => {
+            eprintln!("mu: could not resolve Bash cwd {raw_cwd}: {error:#}");
+            raw_cwd.to_string()
+        }
+    };
     if styled {
-        format!("{DIM}@{RESET} {GRAY}{raw_cwd}{RESET}\n")
+        format!("{DIM}@{RESET} {GRAY}{display_cwd}{RESET}\n")
     } else {
-        format!("@ {raw_cwd}\n")
+        format!("@ {display_cwd}\n")
     }
 }
 
 fn should_render_bash_cwd(raw_cwd: &str) -> bool {
     let pwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    let raw_path = PathBuf::from(raw_cwd);
-    let resolved = if raw_path.is_absolute() {
-        raw_path
-    } else {
-        pwd.join(raw_path)
-    };
+    let resolved = crate::windows_msys2::native_path(raw_cwd).unwrap_or_else(|_| {
+        let raw_path = PathBuf::from(raw_cwd);
+        if raw_path.is_absolute() {
+            raw_path
+        } else {
+            pwd.join(raw_path)
+        }
+    });
     crate::paths::lexical_normalize(&resolved) != crate::paths::lexical_normalize(&pwd)
 }
 

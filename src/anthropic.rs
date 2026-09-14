@@ -523,9 +523,11 @@ fn consume_event(
             if let Some(reason) = value["delta"]["stop_reason"].as_str() {
                 if reason == "refusal" {
                     let details = &value["delta"]["stop_details"];
-                    let details = (!details.is_null())
-                        .then(|| format!(": {details}"))
-                        .unwrap_or_default();
+                    let details = if details.is_null() {
+                        String::new()
+                    } else {
+                        format!(": {details}")
+                    };
                     return Err(ProviderError::BadRequestPermanent {
                         status: None,
                         detail: format!(

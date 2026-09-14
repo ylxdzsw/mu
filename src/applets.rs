@@ -1,11 +1,13 @@
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
-fn resolve_path(cwd: &Path, path: &Path) -> PathBuf {
+fn resolve_path(cwd: &Path, path: &Path) -> anyhow::Result<PathBuf> {
     if path.is_absolute() {
-        path.to_path_buf()
+        Ok(path.to_path_buf())
+    } else if path.as_os_str().to_string_lossy().starts_with('/') {
+        crate::windows_msys2::native_path(&path.as_os_str().to_string_lossy())
     } else {
-        cwd.join(path)
+        Ok(cwd.join(path))
     }
 }
 
@@ -17,7 +19,7 @@ pub enum Applet {
 }
 
 pub fn from_argv0(argv0: &OsStr) -> Option<Applet> {
-    match Path::new(argv0).file_name().and_then(OsStr::to_str) {
+    match Path::new(argv0).file_stem().and_then(OsStr::to_str) {
         Some("apply_patch") => Some(Applet::ApplyPatch),
         Some("edit") => Some(Applet::Edit),
         Some("view_image") => Some(Applet::ViewImage),
@@ -34,6 +36,8 @@ pub fn dispatch(applet: Applet) -> i32 {
 }
 
 mod apply_patch {
+    #![allow(clippy::permissions_set_readonly_false)]
+
     use std::collections::HashMap;
     use std::fs::{self, OpenOptions};
     use std::io::{Read, Seek, SeekFrom, Write};
@@ -88,17 +92,19 @@ mod apply_patch {
             reported_path: PathBuf,
             original: Vec<u8>,
             content: String,
+            permissions: fs::Permissions,
         },
         Move {
             from: PathBuf,
             to: PathBuf,
             original: Vec<u8>,
             content: String,
+            permissions: fs::Permissions,
         },
         MoveSymlink {
             from: PathBuf,
             to: PathBuf,
-            target_update: Option<(PathBuf, Vec<u8>, String)>,
+            target_update: Option<(PathBuf, Vec<u8>, String, fs::Permissions)>,
         },
     }
 
@@ -290,7 +296,7 @@ mod apply_patch {
         for operation in operations {
             match operation {
                 Operation::Add { path, content } => {
-                    let full = resolve_path(cwd, &path);
+                    let full = resolve_path(cwd, &path)?;
                     if let Some(&owner) = claims.get(&normalize_path(&full)) {
                         if reported_entries[owner] != path {
                             conflicting_operation(&path)?;
@@ -309,11 +315,13 @@ mod apply_patch {
                         let original = fs::read(&full).with_context(|| {
                             format!("reading file to replace {}", path.display())
                         })?;
+                        reject_msys_emulated_symlink(&full, &metadata)?;
                         changes[owner] = PlannedChange::Update {
                             path: full.clone(),
                             reported_path: full,
                             original,
                             content,
+                            permissions: metadata.permissions(),
                         };
                         repeatable[owner] = Repeatable::No;
                         continue;
@@ -334,7 +342,7 @@ mod apply_patch {
                     repeatable.push(Repeatable::No);
                 }
                 Operation::Delete { path } => {
-                    let full = resolve_path(cwd, &path);
+                    let full = resolve_path(cwd, &path)?;
                     if claims.contains_key(&normalize_path(&full)) {
                         conflicting_operation(&path)?;
                     }
@@ -353,7 +361,7 @@ mod apply_patch {
                     move_to,
                     chunks,
                 } => {
-                    let full = resolve_path(cwd, &path);
+                    let full = resolve_path(cwd, &path)?;
                     if let Some(&owner) = claims.get(&normalize_path(&full)) {
                         if reported_entries[owner] != path
                             || move_to.is_some()
@@ -371,7 +379,8 @@ mod apply_patch {
                     claim_path(&mut claims, &full, &path, owner)?;
                     let destination_full = move_to
                         .as_ref()
-                        .map(|destination| resolve_path(cwd, destination));
+                        .map(|destination| resolve_path(cwd, destination))
+                        .transpose()?;
                     if let (Some(destination), Some(destination_full)) =
                         (&move_to, &destination_full)
                     {
@@ -387,6 +396,7 @@ mod apply_patch {
                     let entry_metadata = fs::symlink_metadata(&full).with_context(|| {
                         format!("cannot update missing file {}", path.display())
                     })?;
+                    reject_msys_emulated_symlink(&full, &entry_metadata)?;
                     if entry_metadata.file_type().is_symlink() {
                         if chunks.is_empty() {
                             let destination = destination_full
@@ -400,11 +410,12 @@ mod apply_patch {
                             repeatable.push(Repeatable::No);
                             continue;
                         }
-                        let target = fs::canonicalize(&full).with_context(|| {
-                            format!("resolving symlink to update {}", path.display())
-                        })?;
+                        let target =
+                            crate::windows_msys2::canonical_path(&full).with_context(|| {
+                                format!("resolving symlink to update {}", path.display())
+                            })?;
                         claim_path(&mut claims, &target, &path, owner)?;
-                        regular_file_metadata(&target, "update symlink target")?;
+                        let metadata = regular_file_metadata(&target, "update symlink target")?;
                         let original = fs::read_to_string(&target).with_context(|| {
                             format!("reading symlink target to update {}", path.display())
                         })?;
@@ -413,7 +424,12 @@ mod apply_patch {
                             changes.push(PlannedChange::MoveSymlink {
                                 from: full,
                                 to: destination,
-                                target_update: Some((target, original.into_bytes(), content)),
+                                target_update: Some((
+                                    target,
+                                    original.into_bytes(),
+                                    content,
+                                    metadata.permissions(),
+                                )),
                             });
                         } else {
                             changes.push(PlannedChange::Update {
@@ -421,6 +437,7 @@ mod apply_patch {
                                 reported_path: full,
                                 original: original.into_bytes(),
                                 content,
+                                permissions: metadata.permissions(),
                             });
                         }
                         reported_entries.push(path);
@@ -447,6 +464,7 @@ mod apply_patch {
                             to: destination_full,
                             original: original.into_bytes(),
                             content,
+                            permissions: entry_metadata.permissions(),
                         });
                     } else {
                         changes.push(PlannedChange::Update {
@@ -454,6 +472,7 @@ mod apply_patch {
                             path: full,
                             original: original.into_bytes(),
                             content,
+                            permissions: entry_metadata.permissions(),
                         });
                     }
                     reported_entries.push(path);
@@ -507,6 +526,9 @@ mod apply_patch {
     }
 
     fn regular_file_metadata(path: &Path, action: &str) -> Result<fs::Metadata> {
+        let entry_metadata = fs::symlink_metadata(path)
+            .with_context(|| format!("cannot {action} missing file {}", path.display()))?;
+        reject_msys_emulated_symlink(path, &entry_metadata)?;
         let metadata = fs::metadata(path)
             .with_context(|| format!("cannot {action} missing file {}", path.display()))?;
         if !metadata.is_file() {
@@ -521,6 +543,7 @@ mod apply_patch {
         if !metadata.is_file() && !metadata.file_type().is_symlink() {
             bail!("cannot {action} non-file {}", path.display());
         }
+        reject_msys_emulated_symlink(path, &metadata)?;
         Ok(metadata)
     }
 
@@ -655,26 +678,40 @@ mod apply_patch {
         let mut completed = Vec::new();
         for change in changes {
             let result = match change {
-                PlannedChange::Add { path, content } => atomic_write(path, content, false, None),
-                PlannedChange::Delete { path, .. } => {
-                    fs::remove_file(path).with_context(|| format!("deleting {}", path.display()))
+                PlannedChange::Add { path, content } => {
+                    atomic_write(path, content, false, None, None)
                 }
+                PlannedChange::Delete { path, regular } => delete_file(path, *regular),
                 PlannedChange::Update {
                     path,
                     reported_path: _,
                     original,
                     content,
-                } => atomic_write(path, content, true, Some(original.as_slice())),
+                    permissions,
+                } => atomic_write(
+                    path,
+                    content,
+                    true,
+                    Some(original.as_slice()),
+                    Some(permissions.clone()),
+                ),
                 PlannedChange::Move {
                     from,
                     to,
                     original,
                     content,
+                    permissions,
                 } => {
                     fs::rename(from, to).with_context(|| {
                         format!("moving {} to {}", from.display(), to.display())
                     })?;
-                    if let Err(error) = atomic_write(to, content, true, Some(original.as_slice())) {
+                    if let Err(error) = atomic_write(
+                        to,
+                        content,
+                        true,
+                        Some(original.as_slice()),
+                        Some(permissions.clone()),
+                    ) {
                         return match fs::rename(to, from) {
                             Ok(()) => Err(error.context(format!(
                                 "updating moved file {}; move rolled back",
@@ -702,9 +739,14 @@ mod apply_patch {
                     fs::rename(from, to).with_context(|| {
                         format!("moving symlink {} to {}", from.display(), to.display())
                     })?;
-                    if let Some((target, original, content)) = target_update
-                        && let Err(error) =
-                            atomic_write(target, content, true, Some(original.as_slice()))
+                    if let Some((target, original, content, permissions)) = target_update
+                        && let Err(error) = atomic_write(
+                            target,
+                            content,
+                            true,
+                            Some(original.as_slice()),
+                            Some(permissions.clone()),
+                        )
                     {
                         return match fs::rename(to, from) {
                             Ok(()) => Err(error.context(format!(
@@ -735,17 +777,47 @@ mod apply_patch {
         Ok(())
     }
 
+    fn delete_file(path: &Path, regular: bool) -> Result<()> {
+        if !regular {
+            return fs::remove_file(path).with_context(|| format!("deleting {}", path.display()));
+        }
+        let metadata = fs::symlink_metadata(path)
+            .with_context(|| format!("checking {} before deletion", path.display()))?;
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            return fs::remove_file(path).with_context(|| format!("deleting {}", path.display()));
+        }
+        let permissions = metadata.permissions();
+        if !permissions.readonly() {
+            return fs::remove_file(path).with_context(|| format!("deleting {}", path.display()));
+        }
+        let mut writable = permissions.clone();
+        writable.set_readonly(false);
+        fs::set_permissions(path, writable)
+            .with_context(|| format!("making {} writable for deletion", path.display()))?;
+        match fs::remove_file(path) {
+            Ok(()) => Ok(()),
+            Err(error) => match fs::set_permissions(path, permissions) {
+                Ok(()) => Err(error).with_context(|| format!("deleting {}", path.display())),
+                Err(restore_error) => Err(error).context(format!(
+                    "deleting {}; also failed to restore read-only attribute: {restore_error}",
+                    path.display()
+                )),
+            },
+        }
+    }
+
     pub(super) fn atomic_write(
         path: &Path,
         content: &str,
         replace: bool,
         expected: Option<&[u8]>,
+        permissions: Option<fs::Permissions>,
     ) -> Result<()> {
         let parent = path.parent().unwrap_or_else(|| Path::new("."));
         fs::create_dir_all(parent)
             .with_context(|| format!("creating parent directory {}", parent.display()))?;
         if replace {
-            return overwrite_existing(path, content.as_bytes(), expected);
+            return overwrite_existing(path, content.as_bytes(), expected, permissions);
         }
 
         let filename = path
@@ -756,11 +828,15 @@ mod apply_patch {
             crate::random::create_temp_file(parent, &format!(".{filename}.mu-tmp-"), ".tmp")?;
         let result = (|| -> Result<()> {
             file.write_all(content.as_bytes())?;
+            if let Some(permissions) = permissions {
+                file.set_permissions(permissions)?;
+            }
             file.sync_all()?;
             drop(file);
             fs::hard_link(&temporary, path)
                 .with_context(|| format!("creating {} without overwriting", path.display()))?;
             fs::remove_file(&temporary)?;
+            crate::windows_fs::flush_directory(parent)?;
             Ok(())
         })();
         if result.is_err() {
@@ -769,14 +845,58 @@ mod apply_patch {
         result
     }
 
-    fn overwrite_existing(path: &Path, content: &[u8], expected: Option<&[u8]>) -> Result<()> {
+    fn overwrite_existing(
+        path: &Path,
+        content: &[u8],
+        expected: Option<&[u8]>,
+        permissions: Option<fs::Permissions>,
+    ) -> Result<()> {
+        let original_permissions = permissions.or_else(|| {
+            fs::metadata(path)
+                .ok()
+                .map(|metadata| metadata.permissions())
+        });
+        let was_readonly = original_permissions
+            .as_ref()
+            .is_some_and(fs::Permissions::readonly);
+        if was_readonly {
+            let mut writable = original_permissions
+                .as_ref()
+                .expect("read-only permissions")
+                .clone();
+            writable.set_readonly(false);
+            fs::set_permissions(path, writable)
+                .with_context(|| format!("making {} writable for update", path.display()))?;
+        }
+        let result = overwrite_existing_writable(path, content, expected);
+        if was_readonly
+            && let Some(permissions) = original_permissions
+            && let Err(error) = fs::set_permissions(path, permissions)
+        {
+            return match result {
+                Ok(()) => Err(error).with_context(|| {
+                    format!("restoring read-only attribute on {}", path.display())
+                }),
+                Err(update_error) => Err(update_error.context(format!(
+                    "also failed to restore read-only attribute on {}: {error}",
+                    path.display()
+                ))),
+            };
+        }
+        result
+    }
+
+    fn overwrite_existing_writable(
+        path: &Path,
+        content: &[u8],
+        expected: Option<&[u8]>,
+    ) -> Result<()> {
         let mut target = OpenOptions::new()
             .read(true)
             .write(true)
             .open(path)
             .with_context(|| format!("opening {} for locked update", path.display()))?;
-        target
-            .try_lock()
+        crate::windows_fs::try_lock_exclusive(&target)
             .map_err(|error| anyhow::anyhow!("file is busy or cannot be locked: {error}"))?;
         target.seek(SeekFrom::Start(0))?;
         let mut old = Vec::new();
@@ -835,6 +955,23 @@ mod apply_patch {
                 backup_path.display()
             )
         })
+    }
+
+    pub(super) fn reject_msys_emulated_symlink(path: &Path, metadata: &fs::Metadata) -> Result<()> {
+        if !metadata.is_file() || metadata.len() < 10 {
+            return Ok(());
+        }
+        let mut prefix = [0u8; 10];
+        let read = fs::File::open(path)
+            .and_then(|mut file| file.read(&mut prefix))
+            .unwrap_or(0);
+        if read >= 10 && &prefix == b"!<symlink>" {
+            bail!(
+                "MSYS2 emulated symlink is unsupported: {}; enable native symlinks and check out the repository again",
+                crate::windows_msys2::display_path(path)
+            );
+        }
+        Ok(())
     }
 
     fn format_summary(changes: &[PlannedChange], cwd: &Path) -> String {
@@ -897,7 +1034,7 @@ mod apply_patch {
                 .write(true)
                 .open(path)
                 .unwrap();
-            file.lock().unwrap();
+            crate::windows_fs::lock_exclusive(&file).unwrap();
             fs::write(ready, "locked").unwrap();
             loop {
                 std::thread::sleep(std::time::Duration::from_secs(1));
@@ -927,19 +1064,17 @@ mod apply_patch {
 
         #[test]
         fn existing_file_update_preserves_inode_and_hardlinks_and_removes_backup() {
-            use std::os::unix::fs::MetadataExt;
-
             let dir = temp_dir();
             let path = dir.join("file.txt");
             let hardlink = dir.join("hardlink.txt");
             fs::write(&path, "old\n").unwrap();
             fs::hard_link(&path, &hardlink).unwrap();
-            let before = fs::metadata(&path).unwrap();
+            let before = crate::windows_fs::file_identity(&fs::File::open(&path).unwrap()).unwrap();
 
-            atomic_write(&path, "new\n", true, Some(b"old\n")).unwrap();
+            atomic_write(&path, "new\n", true, Some(b"old\n"), None).unwrap();
 
-            let after = fs::metadata(&path).unwrap();
-            assert_eq!((after.dev(), after.ino()), (before.dev(), before.ino()));
+            let after = crate::windows_fs::file_identity(&fs::File::open(&path).unwrap()).unwrap();
+            assert_eq!(after, before);
             assert_eq!(fs::read_to_string(&hardlink).unwrap(), "new\n");
             let backup_prefix = ".file.txt.mu-backup-";
             assert!(fs::read_dir(&dir).unwrap().all(|entry| {
@@ -958,7 +1093,7 @@ mod apply_patch {
             let path = dir.join("file.txt");
             fs::write(&path, "changed\n").unwrap();
 
-            let error = atomic_write(&path, "new\n", true, Some(b"old\n")).unwrap_err();
+            let error = atomic_write(&path, "new\n", true, Some(b"old\n"), None).unwrap_err();
 
             assert!(
                 error
@@ -1005,7 +1140,7 @@ mod apply_patch {
                     }
                     std::thread::sleep(std::time::Duration::from_millis(10));
                 }
-                atomic_write(&path, "new\n", true, Some(b"old\n")).unwrap_err();
+                atomic_write(&path, "new\n", true, Some(b"old\n"), None).unwrap_err();
                 assert_eq!(fs::read_to_string(&path).unwrap(), "old\n");
                 Ok(())
             })();
@@ -1013,7 +1148,7 @@ mod apply_patch {
             let _ = holder.kill();
             let _ = holder.wait();
             contention.unwrap();
-            atomic_write(&path, "new\n", true, Some(b"old\n")).unwrap();
+            atomic_write(&path, "new\n", true, Some(b"old\n"), None).unwrap();
             assert_eq!(fs::read_to_string(&path).unwrap(), "new\n");
             fs::remove_dir_all(dir).unwrap();
         }
@@ -1037,23 +1172,26 @@ mod apply_patch {
 
         #[test]
         fn delete_then_add_rewrites_regular_file_in_place() {
-            use std::os::unix::fs::{MetadataExt, PermissionsExt};
-
             let dir = temp_dir();
             let path = dir.join("file.txt");
             let hardlink = dir.join("hardlink.txt");
             fs::write(&path, "old\n").unwrap();
-            fs::set_permissions(&path, fs::Permissions::from_mode(0o640)).unwrap();
+            let mut readonly = fs::metadata(&path).unwrap().permissions();
+            readonly.set_readonly(true);
+            fs::set_permissions(&path, readonly).unwrap();
             fs::hard_link(&path, &hardlink).unwrap();
-            let before = fs::metadata(&path).unwrap();
+            let before = crate::windows_fs::file_identity(&fs::File::open(&path).unwrap()).unwrap();
             let patch = "*** Begin Patch\n*** Delete File: file.txt\n*** Add File: file.txt\n+new\n*** End Patch\n";
             let changes = preflight(&dir, parse_patch(patch).unwrap()).unwrap();
 
             assert_eq!(changes.len(), 1);
             commit(&changes).unwrap();
             let after = fs::metadata(&path).unwrap();
-            assert_eq!((after.dev(), after.ino()), (before.dev(), before.ino()));
-            assert_eq!(after.permissions().mode() & 0o777, 0o640);
+            assert_eq!(
+                crate::windows_fs::file_identity(&fs::File::open(&path).unwrap()).unwrap(),
+                before
+            );
+            assert!(after.permissions().readonly());
             assert_eq!(fs::read_to_string(&hardlink).unwrap(), "new\n");
             assert_eq!(format_summary(&changes, &dir), "Done!\nM file.txt\n");
             fs::remove_dir_all(dir).unwrap();
@@ -1115,7 +1253,7 @@ mod apply_patch {
 
         #[test]
         fn repeated_updates_through_a_symlink_preserve_it_and_update_the_target() {
-            use std::os::unix::fs::symlink;
+            use std::os::windows::fs::symlink_file as symlink;
 
             let dir = temp_dir();
             fs::write(dir.join("target.txt"), "alpha\nomega\n").unwrap();
@@ -1139,7 +1277,7 @@ mod apply_patch {
 
         #[test]
         fn delete_then_add_symlink_is_rejected() {
-            use std::os::unix::fs::symlink;
+            use std::os::windows::fs::symlink_file as symlink;
 
             let dir = temp_dir();
             fs::write(dir.join("target.txt"), "keep\n").unwrap();
@@ -1161,7 +1299,7 @@ mod apply_patch {
 
         #[test]
         fn delete_symlink_removes_only_the_link() {
-            use std::os::unix::fs::symlink;
+            use std::os::windows::fs::symlink_file as symlink;
 
             let dir = temp_dir();
             fs::write(dir.join("target.txt"), "keep\n").unwrap();
@@ -1179,7 +1317,7 @@ mod apply_patch {
 
         #[test]
         fn pure_move_renames_symlink_without_touching_target() {
-            use std::os::unix::fs::symlink;
+            use std::os::windows::fs::symlink_file as symlink;
 
             let dir = temp_dir();
             fs::write(dir.join("target.txt"), "keep\n").unwrap();
@@ -1203,7 +1341,7 @@ mod apply_patch {
 
         #[test]
         fn move_with_update_edits_target_and_renames_symlink() {
-            use std::os::unix::fs::symlink;
+            use std::os::windows::fs::symlink_file as symlink;
 
             let dir = temp_dir();
             fs::write(dir.join("target.txt"), "old\n").unwrap();
@@ -1224,7 +1362,7 @@ mod apply_patch {
 
         #[test]
         fn failed_symlink_move_does_not_update_target() {
-            use std::os::unix::fs::symlink;
+            use std::os::windows::fs::symlink_file as symlink;
 
             let dir = temp_dir();
             fs::write(dir.join("target.txt"), "old\n").unwrap();
@@ -1245,7 +1383,7 @@ mod apply_patch {
 
         #[test]
         fn rejects_updates_through_two_symlinks_to_the_same_target() {
-            use std::os::unix::fs::symlink;
+            use std::os::windows::fs::symlink_file as symlink;
 
             let dir = temp_dir();
             fs::write(dir.join("target.txt"), "old\n").unwrap();
@@ -1337,6 +1475,7 @@ mod edit {
         reported_path: PathBuf,
         original: String,
         content: String,
+        permissions: fs::Permissions,
         blocks: usize,
         replacements: usize,
     }
@@ -1382,6 +1521,7 @@ mod edit {
             &planned.content,
             true,
             Some(planned.original.as_bytes()),
+            Some(planned.permissions.clone()),
         )?;
         Ok(format_summary(&planned, &cwd))
     }
@@ -1505,11 +1645,12 @@ mod edit {
         blocks: Vec<Block>,
         relaxed: bool,
     ) -> Result<PlannedEdit> {
-        let path = resolve_path(cwd, &reported_path);
+        let path = resolve_path(cwd, &reported_path)?;
         let entry_metadata = fs::symlink_metadata(&path)
             .with_context(|| format!("cannot edit missing file {}", reported_path.display()))?;
+        super::apply_patch::reject_msys_emulated_symlink(&path, &entry_metadata)?;
         let target = if entry_metadata.file_type().is_symlink() {
-            fs::canonicalize(&path)
+            crate::windows_msys2::canonical_path(&path)
                 .with_context(|| format!("resolving symlink to edit {}", reported_path.display()))?
         } else {
             path
@@ -1604,6 +1745,7 @@ mod edit {
             reported_path,
             original: original_snapshot,
             content,
+            permissions: metadata.permissions(),
             blocks: blocks.len(),
             replacements,
         })
@@ -1941,6 +2083,7 @@ mod edit {
                 &planned.content,
                 true,
                 Some(planned.original.as_bytes()),
+                None,
             )
             .unwrap();
             assert_eq!(
@@ -2053,12 +2196,14 @@ mod edit {
 
         #[test]
         fn preserves_permissions_and_updates_through_symlink() {
-            use std::os::unix::fs::{PermissionsExt, symlink};
+            use std::os::windows::fs::symlink_file as symlink;
 
             let dir = temp_dir();
             let target = dir.join("target.txt");
             fs::write(&target, "old").unwrap();
-            fs::set_permissions(&target, fs::Permissions::from_mode(0o640)).unwrap();
+            let mut readonly = fs::metadata(&target).unwrap().permissions();
+            readonly.set_readonly(true);
+            fs::set_permissions(&target, readonly).unwrap();
             symlink("target.txt", dir.join("link.txt")).unwrap();
             let blocks = parse_document(&block("old", "new")).unwrap();
             let planned = preflight(&dir, PathBuf::from("link.txt"), blocks, false).unwrap();
@@ -2067,6 +2212,7 @@ mod edit {
                 &planned.content,
                 true,
                 Some(planned.original.as_bytes()),
+                Some(planned.permissions.clone()),
             )
             .unwrap();
 
@@ -2077,10 +2223,7 @@ mod edit {
                     .is_symlink()
             );
             assert_eq!(fs::read_to_string(&target).unwrap(), "new");
-            assert_eq!(
-                fs::metadata(&target).unwrap().permissions().mode() & 0o777,
-                0o640
-            );
+            assert!(fs::metadata(&target).unwrap().permissions().readonly());
             fs::remove_dir_all(dir).unwrap();
         }
     }
@@ -2127,7 +2270,9 @@ mod view_image {
     }
 
     fn run(args: Args) -> anyhow::Result<()> {
-        let attachment = load_attachment(&args.path)?;
+        let cwd = std::env::current_dir().context("determining current directory")?;
+        let path = super::resolve_path(&cwd, &args.path)?;
+        let attachment = load_attachment(&path)?;
         if !attachment.media_type.starts_with("image/") {
             anyhow::bail!("unsupported image type: {}", attachment.media_type);
         }

@@ -8,7 +8,7 @@ license = "MIT"
 
 [features]
 default = []
-portable = ["reqwest/native-tls-vendored"]
+portable = []
 
 [dependencies]
 aho-corasick = "1.1.4"
@@ -16,8 +16,6 @@ anyhow = "1.0.104"
 chrono = { version = "0.4.45", default-features = false, features = ["clock", "std"] }
 clap = { version = "4.6.4", features = ["derive"] }
 jsonc-parser = { version = "0.33.0", features = ["serde"] }
-libc = "0.2.189"
-percent-encoding = "2.3.2"
 reqwest = { version = "0.13.4", default-features = false, features = ["json", "native-tls"] }
 pulldown-cmark = "0.13.4"
 serde = { version = "1.0.229", features = ["derive"] }
@@ -27,6 +25,14 @@ tokio = { version = "1.53.1", default-features = false, features = ["io-util", "
 async-trait = "0.1.91"
 unicode-width = "0.2.2"
 unicode-segmentation = "1.13.3"
+windows-sys = { version = "0.61.2", features = [
+  "Win32_Foundation", "Win32_Security", "Win32_Security_Authorization",
+  "Win32_Security_Cryptography", "Win32_Storage_FileSystem",
+  "Win32_System_Console", "Win32_System_Diagnostics_ToolHelp",
+  "Win32_System_Environment", "Win32_System_IO", "Win32_System_JobObjects",
+  "Win32_System_Memory", "Win32_System_Pipes", "Win32_System_SystemInformation",
+  "Win32_System_Threading", "Win32_System_WindowsProgramming",
+] }
 
 [profile.release]
 codegen-units = 1

@@ -6,7 +6,7 @@ description: Delegate independent work by recursively invoking mu in a fresh ses
 # Subagents
 
 Use this when a task benefits from independent `mu` turns with narrower instructions:
-broad reviews, parallel audits, focused investigation, or long-running async checks.
+broad reviews, focused investigation, or long-running synchronous checks.
 
 Subagents are ordinary `mu` processes. They run in fresh sessions by default.
 Read [the Mu CLI reference](cli) before invoking one; this skill adds the
@@ -64,22 +64,12 @@ Return:
 
 The parent should check the child exit status before trusting the answer.
 
-## Asynchronous Delegation
+## Process lifetime on Windows
 
-Async delegation is a background task whose command is `mu --output final`.
-Pass the prompt through the bash tool's `stdin` field and launch it with:
-
-```bash
-log=$(mktemp "${TMPDIR:-/tmp}/mu-bg.XXXXXX")
-setsid mu --output final <&0 >"$log" 2>&1 & sid=$!
-printf 'sid=%s start=%s log=%s\n' "$sid" "$(LC_ALL=C ps -o lstart= -p "$sid")" "$log"
-```
-
-The explicit `<&0` gives the background command the tool-provided stdin. Use
-the `background-task` skill to inspect or stop it, then read the log after it
-disappears. This is one-shot delegation: its exit status and Mu session id are
-not retained. Files needed by the parent must be saved at reported paths and
-inspected from a later foreground call.
+Delegate synchronously. Each Bash call owns a Windows Job Object; descendants
+are terminated when the call ends, even if they use `setsid` or `nohup`.
+Nested Mu calls remain subject to the outer call timeout and cancellation.
+Persistent services must be started and owned outside Mu's tool calls.
 
 ## Parent Responsibilities
 

@@ -82,11 +82,15 @@ pub fn assemble_prompt(
 
     let os = os_description();
     let date = Local::now().format("%Y-%m-%d").to_string();
-    let user = std::env::var("USER").unwrap_or_else(|_| "unknown".to_string());
-    let uid = unsafe { libc::geteuid() };
-    let mut runtime = format!("os: {os}\ndate: {date}\nuser: {user} (uid {uid})");
+    let user = std::env::var("USERNAME")
+        .or_else(|_| std::env::var("USER"))
+        .unwrap_or_else(|_| "unknown".to_string());
+    let mut runtime = format!("os: {os}\ndate: {date}\nuser: {user}");
     if let Some(project_root) = project_config_dir.and_then(Path::parent) {
-        runtime.push_str(&format!("\nmu project root: {}", project_root.display()));
+        runtime.push_str(&format!(
+            "\nmu project root: {}",
+            crate::windows_msys2::display_path(project_root)
+        ));
     }
     parts.push(format!("<runtime>\n{runtime}\n</runtime>"));
 
@@ -151,7 +155,7 @@ fn existing_env_paths(
     std::iter::once(global_config_dir.join(".env"))
         .chain(project_config_dir.map(|dir| dir.join(".env")))
         .filter(|path| path.is_file())
-        .filter_map(|path| path.canonicalize().ok())
+        .filter_map(|path| crate::windows_msys2::canonical_path(&path).ok())
         .collect()
 }
 
@@ -165,7 +169,7 @@ fn export_preamble(env_paths: &[std::path::PathBuf]) -> anyhow::Result<String> {
     if let Some(mu_doc) = mu_doc {
         preamble.push_str(&format!(
             "\nTo understand Mu, its configuration, and its CLI, read {}.",
-            mu_doc.display()
+            crate::windows_msys2::display_path(&mu_doc)
         ));
     }
     if !env_paths.is_empty() {
@@ -173,7 +177,7 @@ fn export_preamble(env_paths: &[std::path::PathBuf]) -> anyhow::Result<String> {
             "\nSkills may need environment values from these files (JSON strings), in global-to-project precedence: [{}]. Mu parses them as restricted shell-compatible assignments: blank lines and full-line `#` comments are ignored; assignments are `NAME=VALUE` with optional `export`; values are bare `[A-Za-z0-9_./:@%+,=-]*`, single-quoted, or double-quoted with only `\\\"`, `\\\\`, `\\$`, and `\\`` escapes. Expansion and other shell syntax are errors. Parse and load them when needed, but never display the files or expose secret values in output.",
             env_paths
                 .iter()
-                .map(|path| json_string_for_html_comment(&path.display().to_string()))
+                .map(|path| json_string_for_html_comment(&crate::windows_msys2::display_path(path)))
                 .collect::<Vec<_>>()
                 .join(", ")
         ));
@@ -216,8 +220,8 @@ fn assemble_context(
 
 fn agents_md_block(path: &Path, scope: &str) -> Option<String> {
     let contents = std::fs::read_to_string(path).ok()?;
-    let absolute_path = path.canonicalize().ok()?;
-    let escaped_path = xml_escape_attribute(&absolute_path.display().to_string());
+    let absolute_path = crate::windows_msys2::canonical_path(path).ok()?;
+    let escaped_path = xml_escape_attribute(&crate::windows_msys2::display_path(&absolute_path));
     let mut block = format!("<agents_md scope=\"{scope}\" path=\"{escaped_path}\">\n");
     block.push_str(&contents);
     if !contents.ends_with('\n') {
@@ -245,54 +249,12 @@ fn json_string_for_html_comment(value: &str) -> String {
 }
 
 fn os_description() -> String {
-    let os = std::env::consts::OS;
-    if os != "linux" {
-        return os.to_string();
-    }
-
-    ["/etc/os-release", "/usr/lib/os-release"]
-        .into_iter()
-        .find_map(|path| {
-            std::fs::read_to_string(path)
-                .ok()
-                .and_then(|contents| linux_distribution(&contents))
-        })
-        .map_or_else(
-            || os.to_string(),
-            |distribution| format!("{os} ({distribution})"),
-        )
-}
-
-fn linux_distribution(os_release: &str) -> Option<String> {
-    ["PRETTY_NAME", "NAME", "ID"]
-        .into_iter()
-        .find_map(|key| os_release_value(os_release, key))
-}
-
-fn os_release_value(os_release: &str, key: &str) -> Option<String> {
-    os_release.lines().find_map(|line| {
-        let (candidate, value) = line.split_once('=')?;
-        if candidate != key {
-            return None;
-        }
-
-        let value = value.trim();
-        let value = value
-            .strip_prefix('"')
-            .and_then(|value| value.strip_suffix('"'))
-            .or_else(|| {
-                value
-                    .strip_prefix('\'')
-                    .and_then(|value| value.strip_suffix('\''))
-            })
-            .unwrap_or(value);
-        (!value.is_empty()).then(|| value.replace("\\\"", "\"").replace("\\\\", "\\"))
-    })
+    "windows (MSYS2 UCRT64)".to_string()
 }
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
 
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -325,6 +287,15 @@ mod tests {
     }
 
     #[test]
+    fn role_preamble_reports_the_windows_runtime_without_unix_identity_fields() {
+        let prompt = assemble_prompt(&[], Path::new("/tmp/mu-test-global"), None);
+        assert!(prompt.starts_with(role_preamble()));
+        assert!(prompt.contains("os: windows (MSYS2 UCRT64)"));
+        assert!(prompt.contains("\nuser: "));
+        assert!(!prompt.contains("uid"));
+    }
+
+    #[test]
     fn assemble_context_emits_preamble_agents_and_skills_without_role_preamble() {
         let global = temp_dir("assemble-global");
         fs::write(global.join("AGENTS.md"), "Global mu instructions.").unwrap();
@@ -337,7 +308,7 @@ mod tests {
         assert!(context.starts_with(EXPORT_PREAMBLE));
         assert!(context.contains(&format!(
             "<agents_md scope=\"global\" path=\"{}\">\nGlobal mu instructions.\n</agents_md>",
-            agents_path.display()
+            crate::windows_msys2::display_path(&agents_path)
         )));
         assert!(context.contains("<skills>"));
         assert!(context.contains("\n</skills>"));
@@ -357,13 +328,9 @@ mod tests {
         fs::write(project.join("AGENTS.md"), "Project instructions.").unwrap();
 
         let prompt = assemble_prompt(&[], &global, Some(&project));
-        let global_path = global
-            .join("AGENTS.md")
-            .canonicalize()
-            .unwrap()
-            .display()
-            .to_string()
-            .replace('&', "&amp;");
+        let global_path =
+            crate::windows_msys2::display_path(&global.join("AGENTS.md").canonicalize().unwrap())
+                .replace('&', "&amp;");
         let project_path = project.join("AGENTS.md").canonicalize().unwrap();
         fs::remove_dir_all(&root).unwrap();
 
@@ -372,7 +339,7 @@ mod tests {
         );
         let project_block = format!(
             "<agents_md scope=\"project\" path=\"{}\">\nProject instructions.\n</agents_md>",
-            project_path.display()
+            crate::windows_msys2::display_path(&project_path)
         );
         assert!(prompt.contains(&global_block));
         assert!(prompt.contains(&project_block));
@@ -407,8 +374,8 @@ mod tests {
 
         assert!(preamble.starts_with(EXPORT_PREAMBLE));
         assert!(preamble.trim_end().ends_with("-->"));
-        assert!(preamble.contains(&global_env.display().to_string()));
-        assert!(preamble.contains(&project_env.display().to_string()));
+        assert!(preamble.contains(&crate::windows_msys2::display_path(&global_env)));
+        assert!(preamble.contains(&crate::windows_msys2::display_path(&project_env)));
         // On a packaged or source checkout the built-in reference exists, so the
         // pointer is appended; otherwise the preamble is just opened and closed.
         if ["mu-doc", "mu-doc.md"]
@@ -446,7 +413,7 @@ mod tests {
         fs::remove_dir_all(&global).unwrap();
 
         assert!(context.starts_with(EXPORT_PREAMBLE));
-        assert!(context.contains(&env_path.display().to_string()));
+        assert!(context.contains(&crate::windows_msys2::display_path(&env_path)));
         assert!(!context.contains("<skills>"));
         assert!(!context.contains("<agents_md"));
     }
@@ -475,7 +442,7 @@ mod tests {
 
         assert!(context.contains("(path: "));
         assert!(context.contains("brave-search"));
-        assert!(context.contains(&env_path.display().to_string()));
+        assert!(context.contains(&crate::windows_msys2::display_path(&env_path)));
         // `subagent` is a built-in skill; only the preamble's mu-doc
         // pointer may mention a built-in path, never the skills index.
         assert!(!context.contains("subagent"));

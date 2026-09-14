@@ -339,6 +339,15 @@ builtin cd "$worktree_scope_dir/src"
 _mu_zsh_bundle_active || fail "linked worktree activates the primary project bundle"
 [[ "$MU_ZSH_SESSION_ID" == session-primary ]] || fail "linked worktree reuses the primary project session"
 [[ "$_MU_ZSH_MODEL" == model-primary ]] || fail "linked worktree reuses the primary project model"
+
+if command -v cygpath >/dev/null 2>&1; then
+  native_git_dir=$(cygpath -aw -- "$primary_scope_dir/.git/worktrees/feature")
+  native_common_dir=$(cygpath -aw -- "$primary_scope_dir/.git")
+  print -r -- "gitdir: $native_git_dir" > "$worktree_scope_dir/.git"
+  print -r -- "$native_common_dir" > "$primary_scope_dir/.git/worktrees/feature/commondir"
+  [[ "$(current_scope_key)" == "$primary_scope_key" ]] || fail "native Git worktree pointers share the primary project scope"
+fi
+
 _mu_zsh_clear_session_state
 _mu_zsh_clear_model_state
 _MU_ZSH_TRACKED_SCOPE=

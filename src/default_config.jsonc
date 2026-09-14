@@ -5,14 +5,14 @@
   "trap": "destructive",
   // Automatically continue replayable incomplete assistant responses.
   "auto_resume": false,
-  // Catch Ctrl+\ to finish active work and leave unstarted Bash calls pending.
+  // Catch Ctrl-Break to finish active work and leave unstarted Bash calls pending.
   "soft_interrupt": true,
   // Providers and models. Relative order determines fallbacking order.
   "providers": {
     // Default provider: OpenCode Zen's free Big Pickle model. It needs no API
     // key, so mu works out of the box.
     "opencode": {
-      // Complete HTTP(S) URL or http+unix API request endpoint.
+      // Complete HTTP(S) API request endpoint.
       "endpoint": "https://opencode.ai/zen/v1/chat/completions",
       // Environment variable containing the API key; omit for keyless access.
       // "api_key_env": "OPENCODE_API_KEY",

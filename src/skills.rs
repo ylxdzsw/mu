@@ -1,6 +1,5 @@
 use std::collections::BTreeMap;
 use std::ffi::OsString;
-use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 
 use anyhow::{Context, Result};
@@ -149,15 +148,32 @@ pub fn format_skills_block(skills: &[SkillMeta]) -> String {
 }
 
 pub fn command_prompt(path: &Path) -> Result<CommandPrompt> {
-    let raw = std::fs::read_to_string(path)
-        .with_context(|| format!("reading custom command {}", path.display()))?;
+    let raw = std::fs::read_to_string(path).with_context(|| {
+        format!(
+            "reading custom command {}",
+            crate::windows_msys2::display_path(path)
+        )
+    })?;
     let shebang = parse_mu_shebang(raw.lines().next().unwrap_or_default())
-        .with_context(|| format!("invalid custom command {} shebang", path.display()))?
-        .with_context(|| format!("custom command {} has no mu shebang", path.display()))?;
+        .with_context(|| {
+            format!(
+                "invalid custom command {} shebang",
+                crate::windows_msys2::display_path(path)
+            )
+        })?
+        .with_context(|| {
+            format!(
+                "custom command {} has no mu shebang",
+                crate::windows_msys2::display_path(path)
+            )
+        })?;
     let body = strip_instruction_headers(&raw);
     let text = body.trim_end_matches(['\r', '\n']).to_string();
     if text.is_empty() {
-        anyhow::bail!("empty custom command {}", path.display());
+        anyhow::bail!(
+            "empty custom command {}",
+            crate::windows_msys2::display_path(path)
+        );
     }
     Ok(CommandPrompt {
         text,
@@ -230,7 +246,10 @@ fn scan_root(root: &Path, scope: InstructionScope, env: &EnvMap) -> Result<Instr
         let content = match std::fs::read_to_string(&path) {
             Ok(content) => content,
             Err(error) => {
-                eprintln!("warning: failed to read {}: {error}", path.display());
+                eprintln!(
+                    "warning: failed to read {}: {error}",
+                    crate::windows_msys2::display_path(&path)
+                );
                 continue;
             }
         };
@@ -239,7 +258,10 @@ fn scan_root(root: &Path, scope: InstructionScope, env: &EnvMap) -> Result<Instr
             match parse_skill_frontmatter(frontmatter) {
                 Ok(skill) => Some(skill),
                 Err(error) => {
-                    eprintln!("warning: invalid skill {}: {error}", path.display());
+                    eprintln!(
+                        "warning: invalid skill {}: {error}",
+                        crate::windows_msys2::display_path(&path)
+                    );
                     None
                 }
             }
@@ -249,15 +271,13 @@ fn scan_root(root: &Path, scope: InstructionScope, env: &EnvMap) -> Result<Instr
         if !is_command && skill.is_none() {
             continue;
         }
-        let absolute_path = path
-            .canonicalize()
-            .unwrap_or_else(|_| path.clone())
-            .display()
-            .to_string();
+        let absolute_path =
+            crate::windows_msys2::canonical_path(&path).unwrap_or_else(|_| path.clone());
+        let display_path = crate::windows_msys2::display_path(&absolute_path);
         if is_command {
             commands.push(CommandMeta {
                 name: relative.clone(),
-                path: absolute_path.clone(),
+                path: display_path.clone(),
                 scope,
             });
         }
@@ -273,11 +293,11 @@ fn scan_root(root: &Path, scope: InstructionScope, env: &EnvMap) -> Result<Instr
             };
             match expected {
                 Some(expected) if expected == skill.name => {
-                    if requirements_met(&skill.requirements, env) {
+                    if requirements_met(&skill.requirements, env)? {
                         skills.push(SkillMeta {
                             name: skill.name,
                             description: skill.description,
-                            path: absolute_path,
+                            path: display_path,
                             scope,
                             requirements: skill.requirements,
                         });
@@ -285,13 +305,13 @@ fn scan_root(root: &Path, scope: InstructionScope, env: &EnvMap) -> Result<Instr
                 }
                 Some(expected) => eprintln!(
                     "warning: skill {} has name {}, expected {}",
-                    path.display(),
+                    crate::windows_msys2::display_path(&path),
                     skill.name,
                     expected
                 ),
                 None => eprintln!(
                     "warning: skill {} has no valid inferred name",
-                    path.display()
+                    crate::windows_msys2::display_path(&path)
                 ),
             }
         }
@@ -401,28 +421,65 @@ fn valid_command_requirement(command: &str) -> bool {
             .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.'))
 }
 
-fn requirements_met(requirements: &SkillRequirements, env: &EnvMap) -> bool {
-    requirements
+fn requirements_met(requirements: &SkillRequirements, env: &EnvMap) -> Result<bool> {
+    let env_requirements_met = requirements
         .env
         .iter()
-        .all(|name| env.get(name).is_some_and(|value| !value.is_empty()))
-        && requirements
-            .commands
-            .iter()
-            .all(|command| command_in_path(command, env))
+        .all(|name| env.get(name).is_some_and(|value| !value.is_empty()));
+    if !env_requirements_met {
+        return Ok(false);
+    }
+    for command in &requirements.commands {
+        if !command_in_path(command, env)? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
-fn command_in_path(command: &str, env: &EnvMap) -> bool {
+fn command_in_path(command: &str, env: &EnvMap) -> Result<bool> {
     let Some(path) = env.get("PATH") else {
-        return false;
+        return Ok(false);
     };
-    std::env::split_paths(&OsString::from(path)).any(|dir| {
-        let candidate = dir.join(command);
-        candidate.is_file()
-            && candidate
-                .metadata()
-                .is_ok_and(|metadata| metadata.permissions().mode() & 0o111 != 0)
-    })
+    let extensions = ["", ".exe", ".com", ".bat", ".cmd"];
+    Ok(path_entries(path)?.into_iter().any(|dir| {
+        extensions
+            .iter()
+            .any(|extension| dir.join(format!("{command}{extension}")).is_file())
+    }))
+}
+
+fn path_entries(path: &str) -> Result<Vec<std::path::PathBuf>> {
+    if path.contains(';') {
+        return std::env::split_paths(&OsString::from(path))
+            .map(|entry| crate::windows_msys2::native_env_path_result(entry.as_os_str()))
+            .collect();
+    }
+
+    let mut entries = Vec::new();
+    let mut start = 0;
+    for (index, component) in path.char_indices() {
+        if component == ':' && !(index == 1 && path.as_bytes()[0].is_ascii_alphabetic()) {
+            if index > start {
+                entries.push(crate::windows_msys2::native_env_path_result(
+                    OsString::from(&path[start..index]).as_os_str(),
+                )?);
+            }
+            start = index + component.len_utf8();
+        }
+    }
+    if start < path.len() {
+        entries.push(crate::windows_msys2::native_env_path_result(
+            OsString::from(&path[start..]).as_os_str(),
+        )?);
+    }
+    if entries.is_empty() {
+        std::env::split_paths(&OsString::from(path))
+            .map(|entry| crate::windows_msys2::native_env_path_result(entry.as_os_str()))
+            .collect()
+    } else {
+        Ok(entries)
+    }
 }
 
 fn strip_closed_frontmatter(content: &str) -> Option<&str> {
@@ -515,7 +572,7 @@ mod tests {
             "#!/usr/bin/env mu\n---\nname: review\ndescription: Review changes.\n---\nReview it.\n",
         )
         .unwrap();
-        assert_eq!(fs::metadata(path).unwrap().permissions().mode() & 0o111, 0);
+        assert!(fs::metadata(path).unwrap().is_file());
 
         let env = env_map(&[]);
         let index = scan_instruction_index_with_builtins(None, &root, None, &env).unwrap();
@@ -597,9 +654,6 @@ mod tests {
         let bin = root.join("bin");
         fs::create_dir_all(&bin).unwrap();
         fs::write(bin.join("gh"), "#!/bin/sh\nexit 0\n").unwrap();
-        let mut permissions = fs::metadata(bin.join("gh")).unwrap().permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(bin.join("gh"), permissions).unwrap();
         fs::write(
             root.join("review.md"),
             "---\nname: review\ndescription: Review changes.\nrequires_commands: gh, jq\n---\nReview it.\n",
@@ -611,9 +665,6 @@ mod tests {
         assert!(index.skills.is_empty());
 
         fs::write(bin.join("jq"), "#!/bin/sh\nexit 0\n").unwrap();
-        let mut permissions = fs::metadata(bin.join("jq")).unwrap().permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(bin.join("jq"), permissions).unwrap();
         let present = env_map(&[("PATH", &bin.display().to_string())]);
         let index = scan_instruction_index_with_builtins(None, &root, None, &present).unwrap();
         assert_eq!(index.skills.len(), 1);
@@ -677,7 +728,7 @@ mod tests {
         assert_eq!(review_command.scope, InstructionScope::Project);
         assert_eq!(
             review_command.path,
-            project.join("review.md").display().to_string()
+            crate::windows_msys2::display_path(&project.join("review.md"))
         );
         fs::remove_dir_all(builtins).unwrap();
         fs::remove_dir_all(global).unwrap();

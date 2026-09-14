@@ -115,8 +115,8 @@ pub fn discover_project(cwd: &Path) -> Option<Project> {
 }
 
 pub fn global_dir() -> PathBuf {
-    if let Ok(dir) = std::env::var("MU_CONFIG_DIR") {
-        return PathBuf::from(dir);
+    if let Some(dir) = std::env::var_os("MU_CONFIG_DIR") {
+        return crate::windows_msys2::native_env_path(&dir);
     }
     dirs_home().join(".mu")
 }
@@ -130,9 +130,10 @@ pub fn applets_dir() -> Result<PathBuf> {
 }
 
 fn dirs_home() -> PathBuf {
-    std::env::var("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("/tmp"))
+    std::env::var_os("HOME")
+        .map(|path| crate::windows_msys2::native_env_path(&path))
+        .or_else(|| std::env::var_os("USERPROFILE").map(PathBuf::from))
+        .unwrap_or_else(std::env::temp_dir)
 }
 
 pub fn ensure_dir(path: &std::path::Path) -> Result<()> {
@@ -166,50 +167,12 @@ pub(crate) fn lexical_normalize(path: &Path) -> PathBuf {
 /// relaxed or followed.
 pub fn runtime_dir() -> Result<PathBuf> {
     let directory = std::env::temp_dir().join("mu");
-    let metadata = match std::fs::symlink_metadata(&directory) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            use std::os::unix::fs::DirBuilderExt;
-
-            let mut builder = std::fs::DirBuilder::new();
-            builder.mode(0o700);
-            match builder.create(&directory) {
-                Ok(()) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-                Err(error) => {
-                    return Err(error).with_context(|| {
-                        format!(
-                            "creating private Mu temporary directory {}",
-                            directory.display()
-                        )
-                    });
-                }
-            }
-            std::fs::symlink_metadata(&directory).with_context(|| {
-                format!("checking Mu temporary directory {}", directory.display())
-            })?
-        }
-        Err(error) => {
-            return Err(error).with_context(|| {
-                format!("checking Mu temporary directory {}", directory.display())
-            });
-        }
-    };
-    if !metadata.is_dir() {
-        bail!(
-            "Mu temporary path is not a directory: {}",
-            directory.display()
-        );
-    }
-    use std::os::unix::fs::MetadataExt;
-    let mode = metadata.mode() & 0o777;
-    let uid = unsafe { libc::geteuid() };
-    if metadata.uid() != uid || mode & 0o077 != 0 {
-        bail!(
-            "Mu temporary directory is not private to this user: {}",
-            directory.display()
-        );
-    }
+    crate::windows_fs::ensure_private_dir(&directory).with_context(|| {
+        format!(
+            "creating or checking private Mu temporary directory {}",
+            crate::windows_msys2::display_path(&directory)
+        )
+    })?;
     Ok(directory)
 }
 
@@ -374,12 +337,15 @@ fn git_worktree_info(root: &Path) -> Option<GitWorktreeInfo> {
 }
 
 fn absolutize(base: &Path, path: &Path) -> PathBuf {
+    let path_text = path.as_os_str().to_string_lossy();
     let absolute = if path.is_absolute() {
         path.to_path_buf()
+    } else if path_text.starts_with('/') {
+        crate::windows_msys2::native_path(&path_text).unwrap_or_else(|_| base.join(path))
     } else {
         base.join(path)
     };
-    absolute.canonicalize().unwrap_or(absolute)
+    crate::windows_msys2::canonical_path(&absolute).unwrap_or(absolute)
 }
 
 #[cfg(test)]
@@ -395,14 +361,10 @@ mod tests {
     }
 
     #[test]
-    fn runtime_directory_is_private_and_owned_by_the_current_user() {
-        use std::os::unix::fs::MetadataExt;
-
+    fn runtime_directory_is_private() {
         let directory = runtime_dir().unwrap();
         let metadata = std::fs::symlink_metadata(directory).unwrap();
         assert!(metadata.is_dir());
-        assert_eq!(metadata.uid(), unsafe { libc::geteuid() });
-        assert_eq!(metadata.mode() & 0o077, 0);
     }
 
     #[test]

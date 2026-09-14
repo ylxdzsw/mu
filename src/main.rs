@@ -30,6 +30,8 @@ mod runtime;
 mod skills;
 mod store;
 mod system_prompt;
+mod windows_fs;
+mod windows_msys2;
 
 #[cfg(test)]
 use attachment::MAX_ATTACHMENT_BYTES;
@@ -289,6 +291,10 @@ enum RunTurnMode<'a> {
 }
 
 fn main() {
+    if let Err(error) = windows_msys2::validate_environment() {
+        eprintln!("error: {error:#}");
+        process::exit(1);
+    }
     let argv0 = std::env::args_os().next().unwrap_or_default();
     if let Some(applet) = applets::from_argv0(&argv0) {
         process::exit(applets::dispatch(applet));
@@ -428,12 +434,12 @@ fn ensure_subagent_turn_allowed(depth: u32) -> Result<()> {
 }
 
 fn resolve_existing_dir(base: &Path, path: &Path) -> Result<PathBuf> {
-    let path = if path.is_absolute() {
-        path.to_path_buf()
+    let path = if path.is_absolute() || path.to_string_lossy().starts_with('/') {
+        windows_msys2::native_path(&path.to_string_lossy())?
     } else {
         base.join(path)
     };
-    let path = std::fs::canonicalize(&path)
+    let path = windows_msys2::canonical_path(&path)
         .with_context(|| format!("resolving directory {}", path.display()))?;
     if !path.is_dir() {
         bail!("not a directory: {}", path.display());
@@ -633,8 +639,11 @@ async fn run() -> Result<()> {
         Some(Command::Init { path, force }) => {
             let root = resolve_existing_dir(&cwd, path.as_deref().unwrap_or(&cwd))?;
             let result = paths::init_project_layout_at(&root, force)?;
-            println!("path: {}", result.root.display());
-            println!("project_root: {}", result.root.display());
+            println!("path: {}", windows_msys2::display_path(&result.root));
+            println!(
+                "project_root: {}",
+                windows_msys2::display_path(&result.root)
+            );
             println!("already_initialized: {}", result.already_initialized);
             println!(
                 "created_files: {}",
@@ -815,12 +824,14 @@ async fn run() -> Result<()> {
             let stored_trap = store.pending_trap_level(&session.id)?;
 
             store.select_session(&session.id)?;
-            std::env::set_current_dir(&session.cwd).with_context(|| {
-                format!(
-                    "restoring submitted working directory for retry: {}",
-                    session.cwd
-                )
-            })?;
+            std::env::set_current_dir(windows_msys2::native_path(&session.cwd)?).with_context(
+                || {
+                    format!(
+                        "restoring submitted working directory for retry: {}",
+                        session.cwd
+                    )
+                },
+            )?;
 
             let selection = resolve_retry_model_selection(
                 &store,
@@ -989,10 +1000,10 @@ async fn run_turn_from_source(
     let git_worktree_root = scope
         .project()
         .and_then(|project| project.worktree.as_ref())
-        .map(|worktree| worktree.root.display().to_string());
+        .map(|worktree| windows_msys2::display_path(&worktree.root));
     store.queue_prompt(
         &session_id,
-        &cwd.display().to_string(),
+        &windows_msys2::shell_path(cwd)?,
         git_worktree_root.as_deref(),
         &prompt_content,
         trap,
@@ -1096,7 +1107,9 @@ fn resolve_prompt_source(
         return Ok(PromptSource::Stdin);
     };
     if is_explicit_prompt_path(&path) {
-        return Ok(PromptSource::File(path));
+        return Ok(PromptSource::File(windows_msys2::native_path(
+            &path.to_string_lossy(),
+        )?));
     }
     let name = path.display().to_string();
     let project_config_dir = scope.project().map(|project| project.root.join(".mu"));
@@ -1104,7 +1117,7 @@ fn resolve_prompt_source(
         skills::scan_instruction_index(&paths::global_dir(), project_config_dir.as_deref())?;
     if let Some(command) = index.commands.iter().find(|command| command.name == name) {
         return Ok(PromptSource::Command {
-            path: PathBuf::from(&command.path),
+            path: windows_msys2::native_path(&command.path)?,
             scope: command.scope,
         });
     }
@@ -1144,6 +1157,8 @@ fn display_prompt_path(path: &Path, cwd: &Path) -> PathBuf {
 
 fn is_explicit_prompt_path(path: &Path) -> bool {
     path.is_absolute()
+        || path.to_string_lossy().starts_with('/')
+        || path.to_string_lossy().starts_with(".\\")
         || path
             .components()
             .next()
@@ -1603,7 +1618,7 @@ mod tests {
             PromptSource::Command {
                 path,
                 scope: skills::InstructionScope::Project,
-            } if path == command_path.canonicalize().unwrap()
+            } if path == windows_msys2::canonical_path(&command_path).unwrap()
         ));
         std::fs::remove_dir_all(root).unwrap();
     }

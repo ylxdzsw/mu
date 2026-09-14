@@ -1,9 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
-use std::os::fd::AsRawFd;
-use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -594,11 +591,11 @@ impl std::error::Error for UnsupportedSessionVersion {}
 impl Store {
     // Store setup and session discovery.
     pub fn open(root: &Path) -> Result<Self> {
-        ensure_private_dir(root)?;
+        ensure_store_root(root)?;
         ensure_private_dir(&root.join("sessions"))?;
         ensure_private_dir(&root.join("objects"))?;
-        let canonical = root.canonicalize()?;
-        let scope_key = hex(Sha256::digest(canonical.as_os_str().as_bytes()));
+        let canonical = crate::windows_msys2::canonical_path(root)?;
+        let scope_key = hex(Sha256::digest(canonical.to_string_lossy().as_bytes()));
         let attachment_scope = crate::paths::runtime_dir()?.join(scope_key);
         ensure_private_dir(&attachment_scope)?;
         Ok(Self {
@@ -614,14 +611,14 @@ impl Store {
         for _ in 0..16 {
             let suffix = hex(crate::random::random_bytes::<12>()?);
             let root = base.join(format!("mu-store-{suffix}"));
-            match std::fs::create_dir(&root) {
+            match ensure_private_dir(&root) {
                 Ok(()) => {
                     let mut store = Self::open(&root)?;
                     store.ephemeral = true;
                     return Ok(store);
                 }
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-                Err(error) => return Err(error.into()),
+                Err(_) if root.exists() => {}
+                Err(error) => return Err(error),
             }
         }
         bail!("could not create temporary session store")
@@ -675,13 +672,13 @@ impl Store {
             let id = next_id()?;
             let path = self.session_path(&id);
             let mut options = OpenOptions::new();
-            options.read(true).write(true).create_new(true).mode(0o600);
+            options.read(true).write(true).create_new(true);
             let mut file = match options.open(&path) {
                 Ok(file) => file,
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
                 Err(error) => return Err(error.into()),
             };
-            flock(&file, libc::LOCK_EX)?;
+            lock_exclusive(&file)?;
             let created_at = now();
             let meta = Meta {
                 kind: "meta".into(),
@@ -702,7 +699,7 @@ impl Store {
             )?;
             file.sync_all()?;
             sync_dir(&self.root.join("sessions"))?;
-            flock(&file, libc::LOCK_UN)?;
+            unlock(&file)?;
             return Ok(Session {
                 id,
                 cwd: String::new(),
@@ -785,14 +782,26 @@ impl Store {
     }
 
     pub fn current_session(&self) -> Result<Option<Session>> {
-        let target = match std::fs::read_link(self.root.join("current-session")) {
-            Ok(target) => target,
+        let path = self.root.join("current-session");
+        let target = match std::fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {
+                std::fs::read_to_string(&path)?
+            }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Ok(_) => bail!("current-session is not a regular file"),
             Err(error) => return Err(error.into()),
         };
+        let target = target.trim();
+        let target = Path::new(target);
+        if target.parent() != Some(Path::new("sessions"))
+            || target.extension().and_then(|value| value.to_str()) != Some("jsonl")
+        {
+            bail!("invalid current-session target")
+        }
         let id = target
             .file_stem()
             .and_then(|value| value.to_str())
+            .filter(|id| valid_session_id(id))
             .context("invalid current-session target")?;
         self.get_session(id)
     }
@@ -807,22 +816,29 @@ impl Store {
         for _ in 0..SESSION_ID_RETRIES {
             let suffix = hex(crate::random::random_bytes::<8>()?);
             let temporary = self.root.join(format!(".current-session.{suffix}"));
-            match std::os::unix::fs::symlink(
-                Path::new("sessions").join(format!("{session_id}.jsonl")),
-                &temporary,
-            ) {
-                Ok(()) => {}
+            let mut file = match OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create_new(true)
+                .open(&temporary)
+            {
+                Ok(file) => file,
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
                 Err(error) => return Err(error.into()),
-            }
-            if let Err(error) = std::fs::rename(&temporary, self.root.join("current-session")) {
+            };
+            file.write_all(format!("sessions/{session_id}.jsonl\n").as_bytes())?;
+            file.sync_all()?;
+            drop(file);
+            if let Err(error) =
+                crate::windows_fs::atomic_replace(&temporary, &self.root.join("current-session"))
+            {
                 let _ = std::fs::remove_file(&temporary);
                 return Err(error.into());
             }
             sync_dir(&self.root)?;
             return Ok(());
         }
-        bail!("could not allocate a temporary current-session link")
+        bail!("could not allocate a temporary current-session file")
     }
 
     pub fn latest_attempt_model(&self, session_id: &str) -> Result<Option<String>> {
@@ -2225,7 +2241,7 @@ impl Store {
         }
         match open_current_locked(&self.session_path(session_id)) {
             Ok(file) => {
-                flock(&file, libc::LOCK_UN)?;
+                unlock(&file)?;
                 Ok(false)
             }
             Err(error) if error.downcast_ref::<SessionBusy>().is_some() => Ok(true),
@@ -2915,7 +2931,7 @@ impl Store {
         drop(locks);
         let mut locked = self.open_locked_session(session_id)?;
         let result = operation(&mut locked);
-        flock(&locked.file, libc::LOCK_UN)?;
+        unlock(&locked.file)?;
         result
     }
 
@@ -3029,7 +3045,7 @@ impl Drop for SessionLock<'_> {
             .expect("session lock map poisoned")
             .remove(&self.session_id)
         {
-            let _ = flock(&locked.file, libc::LOCK_UN);
+            let _ = unlock(&locked.file);
         }
     }
 }
@@ -3047,9 +3063,9 @@ pub fn stage_bash_attachment(
     ensure_private_dir(parent)?;
     ensure_private_dir(objects_dir)?;
     let mut options = OpenOptions::new();
-    options.read(true).write(true).create(true).mode(0o600);
+    options.read(true).write(true).create(true);
     let mut file = options.open(manifest)?;
-    flock(&file, libc::LOCK_EX)?;
+    lock_exclusive(&file)?;
     let prefix = complete_prefix(&mut file, true)?;
     let entries = parse_manifest(&prefix)?;
     if entries
@@ -3058,7 +3074,7 @@ pub fn stage_bash_attachment(
         .count()
         >= MAX_BASH_ATTACHMENTS
     {
-        flock(&file, libc::LOCK_UN)?;
+        unlock(&file)?;
         bail!("Bash emitted more than {MAX_BASH_ATTACHMENTS} attachments")
     }
     let object = write_object_to(objects_dir, &attachment.data)?;
@@ -3074,7 +3090,7 @@ pub fn stage_bash_attachment(
         },
     )?;
     file.sync_data()?;
-    flock(&file, libc::LOCK_UN)?;
+    unlock(&file)?;
     Ok(())
 }
 
@@ -3088,16 +3104,16 @@ pub fn read_bash_attachments(
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(error) => return Err(error.into()),
     };
-    flock(&file, libc::LOCK_EX)?;
+    lock_exclusive(&file)?;
     let entries = parse_manifest(&complete_prefix(&mut file, true)?)?
         .into_iter()
         .filter(|entry| entry.call_id == call_id)
         .collect::<Vec<_>>();
     if entries.len() > MAX_BASH_ATTACHMENTS {
-        flock(&file, libc::LOCK_UN)?;
+        unlock(&file)?;
         bail!("Bash emitted more than {MAX_BASH_ATTACHMENTS} attachments")
     }
-    flock(&file, libc::LOCK_UN)?;
+    unlock(&file)?;
     let mut cache: HashMap<String, Vec<u8>> = HashMap::new();
     entries
         .into_iter()
@@ -3129,7 +3145,7 @@ fn cleanup_bash_attachments(manifest: &Path, call_id: i64) -> Result<()> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(error) => return Err(error.into()),
     };
-    flock(&file, libc::LOCK_EX)?;
+    lock_exclusive(&file)?;
     let entries = parse_manifest(&complete_prefix(&mut file, true)?)?;
     file.seek(SeekFrom::Start(0))?;
     file.set_len(0)?;
@@ -3137,7 +3153,7 @@ fn cleanup_bash_attachments(manifest: &Path, call_id: i64) -> Result<()> {
         write_json_line(&mut file, &entry)?;
     }
     file.sync_data()?;
-    flock(&file, libc::LOCK_UN)?;
+    unlock(&file)?;
     Ok(())
 }
 
@@ -3172,7 +3188,7 @@ fn write_object_to(objects_dir: &Path, bytes: &[u8]) -> Result<ObjectRef> {
     let path = objects_dir.join(&sha256);
     let mut created = false;
     let mut options = OpenOptions::new();
-    options.read(true).write(true).create_new(true).mode(0o600);
+    options.read(true).write(true).create_new(true);
     let mut file = match options.open(&path) {
         Ok(file) => {
             created = true;
@@ -3183,7 +3199,7 @@ fn write_object_to(objects_dir: &Path, bytes: &[u8]) -> Result<ObjectRef> {
         }
         Err(error) => return Err(error.into()),
     };
-    flock(&file, libc::LOCK_EX)?;
+    lock_exclusive(&file)?;
     let mut existing = Vec::new();
     file.read_to_end(&mut existing)?;
     if existing != bytes {
@@ -3195,17 +3211,15 @@ fn write_object_to(objects_dir: &Path, bytes: &[u8]) -> Result<ObjectRef> {
     if created {
         sync_dir(objects_dir)?;
     }
-    flock(&file, libc::LOCK_UN)?;
+    unlock(&file)?;
     Ok(ObjectRef { sha256 })
 }
 
 fn read_object_from(objects_dir: &Path, sha256: &str) -> Result<Vec<u8>> {
     let path = objects_dir.join(sha256);
     let mut file = File::open(&path).with_context(|| format!("opening object {sha256}"))?;
-    flock(&file, libc::LOCK_SH)?;
     let mut bytes = Vec::new();
     file.read_to_end(&mut bytes)?;
-    flock(&file, libc::LOCK_UN)?;
     if hex(Sha256::digest(&bytes)) != sha256 {
         bail!("object checksum mismatch: {sha256}")
     }
@@ -3229,19 +3243,20 @@ fn journal_version(file: &mut File) -> Result<u32> {
 fn open_current_locked(path: &Path) -> Result<File> {
     loop {
         let file = OpenOptions::new().read(true).write(true).open(path)?;
-        match flock_nonblocking(&file) {
+        match try_lock_exclusive(&file) {
             Ok(()) => {}
-            Err(error) if error.raw_os_error() == Some(libc::EWOULDBLOCK) => {
+            Err(error) if crate::windows_fs::is_lock_busy(&error) => {
                 return Err(anyhow::Error::new(SessionBusy));
             }
             Err(error) => return Err(error.into()),
         }
-        let opened = file.metadata()?;
-        let current = std::fs::metadata(path)?;
-        if opened.dev() == current.dev() && opened.ino() == current.ino() {
+        let opened = crate::windows_fs::file_identity(&file)?;
+        let current_file = File::open(path)?;
+        let current = crate::windows_fs::file_identity(&current_file)?;
+        if opened == current {
             return Ok(file);
         }
-        flock(&file, libc::LOCK_UN)?;
+        unlock(&file)?;
     }
 }
 
@@ -4104,19 +4119,29 @@ fn now() -> String {
 }
 
 fn ensure_private_dir(path: &Path) -> Result<()> {
-    match std::fs::create_dir(path) {
-        Ok(()) => {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
+    crate::windows_fs::ensure_private_dir(path)
+}
+
+fn ensure_store_root(path: &Path) -> Result<()> {
+    // A project .mu directory may also hold ordinary project configuration;
+    // privacy is enforced on the runtime directories below instead.
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                bail!("Mu store root is not a directory: {}", path.display());
+            }
+            Ok(())
         }
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-        Err(error) => return Err(error.into()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            crate::windows_fs::ensure_private_dir(path)
+        }
+        Err(error) => Err(error)
+            .with_context(|| format!("checking Mu store root directory {}", path.display())),
     }
-    Ok(())
 }
 
 fn sync_dir(path: &Path) -> Result<()> {
-    File::open(path)?.sync_all()?;
+    crate::windows_fs::flush_directory(path)?;
     Ok(())
 }
 
@@ -4126,17 +4151,16 @@ fn write_json_line(file: &mut File, value: &impl Serialize) -> Result<()> {
     Ok(())
 }
 
-fn flock(file: &File, operation: libc::c_int) -> std::io::Result<()> {
-    let result = unsafe { libc::flock(file.as_raw_fd(), operation) };
-    if result == 0 {
-        Ok(())
-    } else {
-        Err(std::io::Error::last_os_error())
-    }
+fn lock_exclusive(file: &File) -> std::io::Result<()> {
+    crate::windows_fs::lock_exclusive(file)
 }
 
-fn flock_nonblocking(file: &File) -> std::io::Result<()> {
-    flock(file, libc::LOCK_EX | libc::LOCK_NB)
+fn try_lock_exclusive(file: &File) -> std::io::Result<()> {
+    crate::windows_fs::try_lock_exclusive(file)
+}
+
+fn unlock(file: &File) -> std::io::Result<()> {
+    crate::windows_fs::unlock(file)
 }
 
 fn hex(bytes: impl AsRef<[u8]>) -> String {

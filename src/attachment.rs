@@ -14,6 +14,8 @@ pub fn load_attachments(paths: &[PathBuf]) -> Result<Vec<ContentPart>> {
 }
 
 pub fn load_attachment(path: &Path) -> Result<Attachment> {
+    let native = crate::windows_msys2::native_path(&path.to_string_lossy())?;
+    let path = native.as_path();
     let metadata = std::fs::metadata(path)
         .with_context(|| format!("reading attachment metadata {}", path.display()))?;
     if metadata.len() > MAX_ATTACHMENT_BYTES {

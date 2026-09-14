@@ -2,10 +2,9 @@ name: CI
 
 on:
   push:
-    branches: [master]
-    tags: ["v*"]
+    branches: ["msys2-v*"]
   pull_request:
-    branches: [master]
+    branches: ["msys2-v*"]
   workflow_dispatch:
 
 permissions:
@@ -13,36 +12,55 @@ permissions:
 
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: ${{ github.ref_type != 'tag' }}
+  cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
+  PYTHONUTF8: "1"
 
 jobs:
-  linux:
-    name: Linux master
-    if: >-
-      github.event_name == 'pull_request' ||
-      github.ref_type == 'tag' ||
-      github.ref == 'refs/heads/master'
-    runs-on: ubuntu-latest
+  windows:
+    name: Windows MSYS2 UCRT64
+    runs-on: windows-2025
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: msys2 {0}
 
     steps:
+      - name: Keep checkout line endings unchanged
+        shell: pwsh
+        run: |
+          git config --global core.autocrlf false
+          reg add "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\AppModelUnlock" /v AllowDevelopmentWithoutDevLicense /t REG_DWORD /d 1 /f
+
       - uses: actions/checkout@v6
         with:
           fetch-depth: 0
 
-      - name: Install system dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install --yes \
-            bsdextrautils fish jq libssl-dev pkg-config zsh
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: true
+          path-type: minimal
+          install: >-
+            base-devel git zsh
+            mingw-w64-ucrt-x86_64-rust
+            mingw-w64-ucrt-x86_64-jq
+            mingw-w64-ucrt-x86_64-python
+            mingw-w64-ucrt-x86_64-ripgrep
+            mingw-w64-ucrt-x86_64-curl
 
-      - name: Check formatting
-        run: cargo fmt --check
-
-      - name: Lint
+      - name: Verify native UCRT64 toolchain
         run: |
+          test "$MSYSTEM" = UCRT64
+          test "$(command -v cargo)" = /ucrt64/bin/cargo
+          rustc -vV
+          cargo -V
+
+      - name: Check formatting and lint
+        run: |
+          cargo fmt --check
           cargo clippy --all-targets -- -D warnings
           cargo clippy --all-targets --features portable -- -D warnings
 
@@ -51,327 +69,38 @@ jobs:
           cargo test -- --test-threads=1
           cargo test --features portable -- --test-threads=1
 
-      - name: Build binaries
-        run: |
-          cargo build --bins
-          smoke=$(mktemp -d)
-          mkdir "$smoke/bin"
-          cp target/debug/mu "$smoke/bin/"
-          env -u HOME -u XDG_CACHE_HOME "$smoke/bin/mu" --help >/dev/null
-          test ! -e "$smoke/share"
-          test ! -e "$smoke/libexec"
-          cargo tree -i openssl-sys >/dev/null
-          if cargo tree -i aws-lc-rs >/dev/null 2>&1; then
-            echo "native build unexpectedly includes AWS-LC" >&2
-            exit 1
-          fi
-          cargo build --bins --features portable
-
-      - name: Upload resolved Cargo.lock
-        uses: actions/upload-artifact@v7
-        with:
-          name: cargo-lock
-          path: Cargo.lock
-          if-no-files-found: error
-          retention-days: 14
-
-      - name: Test shell integrations
+      - name: Test zsh integration
         run: |
           zsh -n mu.zsh test.zsh
           MU_ZSH_SKIP_PTY=1 zsh test.zsh
-          fish -n mu.fish test.fish
 
-      - name: Check package recipe
-        run: bash -n PKGBUILD
-
-  linux-package:
-    name: Native Arch Linux package
-    if: >-
-      github.event_name == 'pull_request' ||
-      github.ref_type == 'tag' ||
-      github.ref == 'refs/heads/master'
-    runs-on: ubuntu-latest
-    container: archlinux:base-devel
-
-    steps:
-      - name: Install package dependencies
+      - name: Build and test portable distribution
         run: |
-          pacman -Syu --noconfirm
-          pacman -S --needed --noconfirm \
-            fish git jq openssl perl pkgconf rust util-linux zsh
+          cargo build --release --features portable
+          python test.windows.py target/release/mu.exe
+          mkdir -p dist
+          cp target/release/mu.exe dist/mu-windows-x86_64-msys2-ucrt64.exe
+          cp mu.zsh WINDOWS.md dist/
+          git rev-parse HEAD > dist/SOURCE_COMMIT
+          sha256sum dist/*.exe > dist/SHA256SUMS
 
-      - uses: actions/checkout@v6
-        with:
-          fetch-depth: 0
-
-      - name: Test Fish 4 integration
+      - name: Build and install UCRT64 package
         run: |
-          fish -c 'test (string split -m1 . $version)[1] -ge 4'
-          fish -n mu.fish test.fish
-          fish test.fish
-
-      - name: Build the native package from this revision
-        run: |
-          useradd --create-home builder
-          package_root=$(mktemp -d)
-          cp PKGBUILD "$package_root/"
-          chown -R builder:builder "$GITHUB_WORKSPACE" "$package_root"
-          git config --global --add safe.directory "$GITHUB_WORKSPACE"
-          git update-ref refs/heads/ci-package HEAD
-          (
-            cd "$package_root"
-            runuser -u builder -- env \
-              MU_SOURCE_URL="file://$GITHUB_WORKSPACE" \
-              MU_SOURCE_BRANCH=ci-package \
-              makepkg --noconfirm --cleanbuild --clean --force
-          )
-          package=$(find "$package_root" -maxdepth 1 \
-            -name 'mu-*.pkg.tar.zst' ! -name 'mu-debug-*' -print -quit)
-          test -n "$package"
-          cp "$package" "$GITHUB_WORKSPACE/"
-
-      - name: Upload the Arch package
-        uses: actions/upload-artifact@v7
-        with:
-          name: native-arch-package
-          path: mu-*.pkg.tar.zst
-          if-no-files-found: error
-          retention-days: 14
-
-      - name: Install and smoke-test the native package
-        run: |
-          package=$(find . -maxdepth 1 \
-            -name 'mu-*.pkg.tar.zst' ! -name 'mu-debug-*' -print -quit)
+          export MU_SOURCE_URL="file://$(cygpath -m "$GITHUB_WORKSPACE")"
+          export MU_SOURCE_COMMIT="$(git rev-parse HEAD)"
+          cd packaging/msys2
+          makepkg --noconfirm --cleanbuild --clean --force
+          package=$(find . -maxdepth 1 -name 'mingw-w64-ucrt-x86_64-mu-*.pkg.tar.zst' -print -quit)
           test -n "$package"
           pacman --noconfirm -U "$package"
-          test -f /usr/share/mu/config
-          test -f /usr/share/fish/vendor_conf.d/mu.fish
-          test -L /usr/libexec/mu/apply_patch
-          test ! -e /usr/bin/applets
-          before=$(find /usr/libexec/mu /usr/share/mu -type f -print0 \
-            | sort -z | xargs -0 sha256sum)
-          /usr/bin/mu --help >/dev/null
-          readelf -d /usr/bin/mu | grep -F 'Shared library: [libssl.so'
-          readelf -d /usr/bin/mu | grep -F 'Shared library: [libcrypto.so'
-          after=$(find /usr/libexec/mu /usr/share/mu -type f -print0 \
-            | sort -z | xargs -0 sha256sum)
-          test "$before" = "$after"
-          test ! -e /usr/bin/applets
-          smoke=$(mktemp -d)
-          printf '%s\n' \
-            '*** Begin Patch' \
-            '*** Add File: smoke.txt' \
-            '+works' \
-            '*** End Patch' \
-            | (cd "$smoke" && /usr/libexec/mu/apply_patch)
-          grep -qx works "$smoke/smoke.txt"
+          cp "$package" ../../dist/
+          cd ../..
+          python test.windows.py /ucrt64/bin/mu.exe
 
-  portable-linux:
-    name: Portable Linux x86-64
-    if: >-
-      github.event_name == 'pull_request' ||
-      github.ref_type == 'tag' ||
-      github.ref == 'refs/heads/master'
-    runs-on: ubuntu-latest
-
-    steps:
-      - uses: actions/checkout@v6
-
-      - name: Install the musl target
-        run: |
-          sudo apt-get update
-          sudo apt-get install --yes make musl-tools perl
-          rustup target add x86_64-unknown-linux-musl
-
-      - name: Build the portable binary
-        run: |
-          cargo build --release --target x86_64-unknown-linux-musl \
-            --features portable
-
-      - name: Smoke-test the standalone binary and generated applet
-        run: |
-          set -euo pipefail
-          binary=target/x86_64-unknown-linux-musl/release/mu
-          smoke=$(mktemp -d)
-          cp "$binary" "$smoke/mu"
-          XDG_CACHE_HOME="$smoke/cache" "$smoke/mu" --help >/dev/null
-          test -f "$smoke/cache/mu/builtins/config"
-          for applet in apply_patch edit view_image; do
-            test -L "$smoke/cache/mu/applets/$applet"
-            test "$(readlink "$smoke/cache/mu/applets/$applet")" = "$smoke/mu"
-          done
-          printf '%s\n' \
-            '*** Begin Patch' \
-            '*** Add File: smoke.txt' \
-            '+works' \
-            '*** End Patch' \
-            | (cd "$smoke" && "$smoke/cache/mu/applets/apply_patch")
-          grep -qx works "$smoke/smoke.txt"
-          printf old >"$smoke/edit.txt"
-          printf '%s\n' \
-            '<<<<<<< SEARCH' \
-            'old' \
-            '=======' \
-            'new' \
-            '>>>>>>> REPLACE' \
-            | (cd "$smoke" && "$smoke/cache/mu/applets/edit" edit.txt)
-          grep -qx new "$smoke/edit.txt"
-          "$smoke/cache/mu/applets/view_image" --help >/dev/null
-          if readelf -l "$binary" | grep -F 'Requesting program interpreter'; then
-            echo "portable Linux binary has a dynamic interpreter" >&2
-            exit 1
-          fi
-          if readelf -d "$binary" 2>/dev/null | grep -F '(NEEDED)'; then
-            echo "portable Linux binary has a dynamic library dependency" >&2
-            exit 1
-          fi
-          if cargo tree --target x86_64-unknown-linux-musl \
-            --features portable -i aws-lc-rs >/dev/null 2>&1; then
-            echo "portable Linux binary unexpectedly includes AWS-LC" >&2
-            exit 1
-          fi
-          cargo tree --target x86_64-unknown-linux-musl \
-            --features portable -i openssl-src >/dev/null
-
-      - name: Stage the portable binary
-        run: |
-          set -euo pipefail
-          mkdir -p dist
-          cp target/x86_64-unknown-linux-musl/release/mu \
-            dist/mu-linux-x86_64-musl
-
-      - name: Upload the portable binary
+      - name: Upload Windows build for manual release attachment
         uses: actions/upload-artifact@v7
         with:
-          name: portable-linux-x86_64-musl
-          path: dist/mu-linux-x86_64-musl
+          name: windows-msys2-ucrt64-${{ github.sha }}
+          path: dist/
           if-no-files-found: error
-          retention-days: 14
-
-  portable-macos:
-    name: Portable macOS ${{ matrix.arch }}
-    if: >-
-      github.event_name == 'pull_request' ||
-      github.ref_type == 'tag' ||
-      github.ref == 'refs/heads/master'
-    strategy:
-      matrix:
-        include:
-          - runner: macos-15
-            arch: aarch64
-            file_arch: arm64
-          - runner: macos-15-intel
-            arch: x86_64
-            file_arch: x86_64
-    runs-on: ${{ matrix.runner }}
-
-    steps:
-      - uses: actions/checkout@v6
-
-      - name: Build the portable binary
-        run: cargo build --release --features portable
-
-      - name: Smoke-test the standalone binary and generated applet
-        run: |
-          set -euo pipefail
-          smoke=$(mktemp -d)
-          cp target/release/mu "$smoke/mu"
-          XDG_CACHE_HOME="$smoke/cache" "$smoke/mu" --help >/dev/null
-          test -f "$smoke/cache/mu/builtins/config"
-          for applet in apply_patch edit view_image; do
-            test -L "$smoke/cache/mu/applets/$applet"
-            test "$(readlink "$smoke/cache/mu/applets/$applet")" = "$smoke/mu"
-          done
-          printf '%s\n' \
-            '*** Begin Patch' \
-            '*** Add File: smoke.txt' \
-            '+works' \
-            '*** End Patch' \
-            | (cd "$smoke" && "$smoke/cache/mu/applets/apply_patch")
-          grep -qx works "$smoke/smoke.txt"
-          printf old >"$smoke/edit.txt"
-          printf '%s\n' \
-            '<<<<<<< SEARCH' \
-            'old' \
-            '=======' \
-            'new' \
-            '>>>>>>> REPLACE' \
-            | (cd "$smoke" && "$smoke/cache/mu/applets/edit" edit.txt)
-          grep -qx new "$smoke/edit.txt"
-          "$smoke/cache/mu/applets/view_image" --help >/dev/null
-          file target/release/mu | grep -F '${{ matrix.file_arch }}'
-          if cargo tree --features portable -i aws-lc-rs >/dev/null 2>&1; then
-            echo "portable macOS binary unexpectedly includes AWS-LC" >&2
-            exit 1
-          fi
-          if otool -L target/release/mu | tail -n +2 | awk '{ print $1 }' \
-            | grep -Ev '^(/System/Library/|/usr/lib/)'; then
-            echo "portable macOS binary has a non-system library dependency" >&2
-            exit 1
-          fi
-
-      - name: Stage the portable binary
-        run: |
-          set -euo pipefail
-          mkdir -p dist
-          cp target/release/mu "dist/mu-macos-${{ matrix.arch }}"
-
-      - name: Upload the portable binary
-        uses: actions/upload-artifact@v7
-        with:
-          name: portable-macos-${{ matrix.arch }}
-          path: dist/mu-macos-${{ matrix.arch }}
-          if-no-files-found: error
-          retention-days: 14
-
-  release:
-    name: Publish release artifacts
-    if: github.ref_type == 'tag'
-    needs: [linux, linux-package, portable-linux, portable-macos]
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-
-    steps:
-      - uses: actions/checkout@v6
-      - uses: actions/download-artifact@v8
-        with:
-          pattern: portable-*
-          path: dist
-          merge-multiple: true
-      - uses: actions/download-artifact@v8
-        with:
-          name: native-arch-package
-          path: dist
-      - name: Stage shell integrations and verify release assets
-        run: |
-          set -euo pipefail
-          cp mu.zsh mu.fish dist/
-          expected=(
-            mu-linux-x86_64-musl
-            mu-macos-aarch64
-            mu-macos-x86_64
-            mu.zsh
-            mu.fish
-          )
-          package=$(find dist -maxdepth 1 \
-            -name 'mu-*.pkg.tar.zst' -print -quit)
-          test -n "$package"
-          expected+=("$(basename "$package")")
-          for asset in "${expected[@]}"; do
-            test -f "dist/$asset"
-          done
-          test "$(find dist -maxdepth 1 -type f | wc -l)" -eq "${#expected[@]}"
-
-      - name: Create or update the GitHub release
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
-            gh release upload "$GITHUB_REF_NAME" dist/* --clobber
-          else
-            gh release create "$GITHUB_REF_NAME" dist/* \
-              --verify-tag \
-              --generate-notes \
-              --title "$GITHUB_REF_NAME"
-          fi
+          retention-days: 30
