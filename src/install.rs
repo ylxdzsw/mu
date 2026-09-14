@@ -480,9 +480,24 @@ mod tests {
     }
 
     #[cfg(feature = "portable")]
+    fn set_directory_mtime(path: &Path, time: std::time::SystemTime) {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_FLAG_BACKUP_SEMANTICS, FILE_WRITE_ATTRIBUTES,
+        };
+
+        std::fs::OpenOptions::new()
+            .access_mode(FILE_WRITE_ATTRIBUTES)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+            .open(path)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(time))
+            .unwrap();
+    }
+
+    #[cfg(feature = "portable")]
     #[test]
     fn stale_directories_are_replaced() {
-        use std::fs::FileTimes;
         use std::time::{Duration, UNIX_EPOCH};
 
         let root = temp_root("stale");
@@ -498,10 +513,7 @@ mod tests {
         let old = UNIX_EPOCH + Duration::from_secs(1_000_000_000);
         let executable_mtime = old + Duration::from_secs(1);
         for directory in [&builtins, &applets] {
-            std::fs::File::open(directory)
-                .unwrap()
-                .set_times(FileTimes::new().set_modified(old))
-                .unwrap();
+            set_directory_mtime(directory, old);
         }
 
         initialize_builtins(&builtins, BUILTINS, executable_mtime).unwrap();
@@ -523,17 +535,13 @@ mod tests {
     #[cfg(feature = "portable")]
     #[test]
     fn equal_directory_mtime_is_fresh() {
-        use std::fs::FileTimes;
         use std::time::{Duration, UNIX_EPOCH};
 
         let root = temp_root("equal-mtime");
         let builtins = root.join("builtins");
         std::fs::create_dir_all(&builtins).unwrap();
         let mtime = UNIX_EPOCH + Duration::from_secs(1_000_000_000);
-        std::fs::File::open(&builtins)
-            .unwrap()
-            .set_times(FileTimes::new().set_modified(mtime))
-            .unwrap();
+        set_directory_mtime(&builtins, mtime);
 
         initialize_builtins(&builtins, BUILTINS, mtime).unwrap();
 
