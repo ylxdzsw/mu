@@ -308,6 +308,7 @@ _mu_zsh_build_mode_prompt() {
 
   # One jq pass extracts every prompt field as TSV; forking jq per field
   # dominates prompt-draw latency, so keep this to a single invocation.
+  # Native jq needs LF output and must not reinterpret filter arguments as paths.
   local tsv
   local -a fields
   if _mu_zsh_bundle_active; then
@@ -316,7 +317,7 @@ _mu_zsh_build_mode_prompt() {
   fi
   status_json=$(_mu_zsh_status_json) || status_json=
   if [[ -n "$status_json" ]] && command -v jq >/dev/null 2>&1; then
-    tsv=$(jq -r '[(.model.canonical // ""), (if ((.context_tokens | type) == "number" and (.context_window | type) == "number" and .context_window > 0) then (.context_tokens * 100 / .context_window) else "" end), (.project_root // ""), (if has("clean") then (.clean|tostring) else "" end), (.context_usage_source // ""), (if ((.context_tokens | type) == "number" and (.compaction_soft_threshold_tokens | type) == "number") then (.context_tokens > .compaction_soft_threshold_tokens) else false end)] | @tsv' <<< "$status_json" 2>/dev/null) || tsv=
+    tsv=$(MSYS2_ARG_CONV_EXCL='*' jq --binary -r '[(.model.canonical // ""), (if ((.context_tokens | type) == "number" and (.context_window | type) == "number" and .context_window > 0) then (.context_tokens * 100 / .context_window) else "" end), (.project_root // ""), (if has("clean") then (.clean|tostring) else "" end), (.context_usage_source // ""), (if ((.context_tokens | type) == "number" and (.compaction_soft_threshold_tokens | type) == "number") then (.context_tokens > .compaction_soft_threshold_tokens) else false end)] | @tsv' <<< "$status_json" 2>/dev/null) || tsv=
   fi
   fields=("${(@ps:\t:)tsv}")
   model=${fields[1]:-}
@@ -446,7 +447,7 @@ _mu_zsh_custom_slash_commands() {
   local json
   json=$(_mu_zsh_status_json --include-commands) || return 1
   command -v jq >/dev/null 2>&1 || return 1
-  jq -r '.commands[]?.name | "/" + .' <<< "$json"
+  MSYS2_ARG_CONV_EXCL='*' jq --binary -r '.commands[]?.name | "/" + .' <<< "$json"
 }
 
 _mu_zsh_has_custom_slash_command() {
@@ -467,7 +468,7 @@ _mu_zsh_model_completion_candidates() {
   _mu_zsh_bundle_active && [[ -n "$MU_ZSH_SESSION_ID" ]] && command+=(-s "$MU_ZSH_SESSION_ID")
   json=$("${command[@]}" 2>/dev/null) || return 1
   command -v jq >/dev/null 2>&1 || return 1
-  jq -r --arg fragment "$fragment" --arg suffix_only "$suffix_only" '
+  MSYS2_ARG_CONV_EXCL='*' jq --binary -r --arg fragment "$fragment" --arg suffix_only "$suffix_only" '
     def dedup:
       reduce .[] as $item ([]; if index($item) then . else . + [$item] end);
     def effort_rank:
@@ -520,7 +521,7 @@ _mu_zsh_model_completion_transition() {
   json=$("${command[@]}" 2>/dev/null) || return 1
   command -v jq >/dev/null 2>&1 || return 1
   result=("${(@f)$(
-    jq -r --arg fragment "$fragment" '
+    MSYS2_ARG_CONV_EXCL='*' jq --binary -r --arg fragment "$fragment" '
       def dedup:
         reduce .[] as $item ([]; if index($item) then . else . + [$item] end);
       def effort_rank:
@@ -814,7 +815,7 @@ _mu_zsh_validate_model_ref() {
   command=(mu status --json --model "$model")
   _mu_zsh_bundle_active && [[ -n "$MU_ZSH_SESSION_ID" ]] && command+=(-s "$MU_ZSH_SESSION_ID")
   status_json=$("${command[@]}" 2>/dev/null) || return 1
-  resolved=$(jq -r '.model.canonical // empty' <<< "$status_json" 2>/dev/null) || resolved=
+  resolved=$(MSYS2_ARG_CONV_EXCL='*' jq --binary -r '.model.canonical // empty' <<< "$status_json" 2>/dev/null) || resolved=
   REPLY=${resolved:-$model}
   return 0
 }
@@ -824,7 +825,7 @@ _mu_zsh_resolve_load_output() {
   local status_json output
 
   status_json=$(mu status --json -s "$session_id") || return $?
-  output=$(jq -r '.output // empty' <<< "$status_json" 2>/dev/null) || output=
+  output=$(MSYS2_ARG_CONV_EXCL='*' jq --binary -r '.output // empty' <<< "$status_json" 2>/dev/null) || output=
   case "$output" in
     final|concise|detail|full)
       REPLY=$output
@@ -846,7 +847,7 @@ _mu_zsh_resolve_load_session() {
   fi
 
   status_json=$(mu status --json --continue) || return $?
-  session_id=$(jq -r '.session_id // empty' <<< "$status_json" 2>/dev/null) || {
+  session_id=$(MSYS2_ARG_CONV_EXCL='*' jq --binary -r '.session_id // empty' <<< "$status_json" 2>/dev/null) || {
     print -u2 -- "mu mu.zsh: could not resolve current session from status"
     return 1
   }
@@ -1064,7 +1065,7 @@ _mu_zsh_run_slash_command() {
 _mu_zsh_enter_mode() {
   [[ "$_MU_ZSH_MODE" == mu ]] && return 0
   command -v jq >/dev/null 2>&1 || {
-    print -u2 -- "mu: mu.zsh requires jq; install it with your package manager (apt, brew, dnf, etc.)"
+    print -u2 -- "mu: mu.zsh requires jq; install mingw-w64-ucrt-x86_64-jq with pacman"
     return 1
   }
 

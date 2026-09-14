@@ -158,6 +158,8 @@ def main():
                 assert handle, ctypes.get_last_error()
                 status = ctypes.c_ulong()
                 assert kernel.GetExitCodeProcess(handle, ctypes.byref(status)) and status.value == 259
+                assert "crash fixture" in run("transcript", "-o", "detail")
+                run("retry", "--trap", "off", "-o", "final", code=2)
                 child.kill()
                 child.wait(timeout=10)
                 deadline = time.monotonic() + 10
