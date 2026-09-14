@@ -83,7 +83,9 @@ Journal writer ownership is a Windows byte-range lock outside the data range,
 so read-only status/transcript inspection remains possible. Locks are released
 by handle lifetime, not PID leases. `current-session` is a regular pointer file
 published atomically. Attachments use the current manifest/object-store
-channel. Private runtime directories use Windows ACLs.
+channel. Private runtime directories use Windows ACLs. File contents are
+flushed before publication; directory flushes are attempted where supported.
+This is not a promise of POSIX directory-fsync power-loss semantics.
 
 `http+unix` provider endpoints are rejected locally. `background-task` explains
 the Windows lifetime restriction rather than recommending Unix detachment.

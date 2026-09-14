@@ -253,8 +253,9 @@ fn reconcile_state_gitignore(path: &Path) -> Result<()> {
     use std::io::Write;
     file.write_all(updated.as_bytes())?;
     file.sync_all()?;
-    std::fs::rename(&temporary, path)?;
-    std::fs::File::open(path.parent().context(".gitignore has no parent")?)?.sync_all()?;
+    drop(file);
+    crate::windows_fs::atomic_replace(&temporary, path)?;
+    crate::windows_fs::flush_directory(path.parent().context(".gitignore has no parent")?)?;
     Ok(())
 }
 

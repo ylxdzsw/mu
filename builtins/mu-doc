@@ -6,7 +6,7 @@ description: Use when answering questions about Mu, configuring it, or working w
 # Mu
 
 Mu is a small, composable terminal agent: one prompt in, one completed agent
-turn out. It works as a Unix command and through zsh and Fish integrations.
+turn out. This Windows build runs inside MSYS2 UCRT64 and provides zsh integration.
 
 Project: https://github.com/ylxdzsw/mu
 
@@ -36,6 +36,6 @@ otherwise it uses global scope.
 - Immutable attachments and provider objects: `<scope>/objects/<sha256>`.
 - Last selected session: `<scope>/current-session`.
 - Shipped documentation and skills: Mu's built-in directory, normally
-  `/usr/share/mu`.
+  `/ucrt64/share/mu`.
 
 Session journals are append-only records, not disposable log files.

@@ -17,8 +17,9 @@ Then read the relevant files from the active scopes:
 - Global config directory: `~/.mu`, or `$MU_CONFIG_DIR` when set.
 - Project config directory: `<project>/.mu` when the current directory resolves
   to a project.
-- Built-ins: the directory containing `mu-doc`, normally `/usr/share/mu`;
-  portable builds may materialize it in the user cache.
+- Built-ins: the directory containing `mu-doc`, normally `/ucrt64/share/mu`;
+  portable builds materialize missing resources under `$XDG_CACHE_HOME/mu`
+  when set, otherwise `%LOCALAPPDATA%/mu`.
 
 `mu` discovers a project by walking upward from the invoking `pwd` until it
 finds `.mu` or `.git`. The walk stops before the user's home directory and

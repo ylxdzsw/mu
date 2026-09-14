@@ -289,7 +289,7 @@ mod tests {
     #[test]
     fn role_preamble_reports_the_windows_runtime_without_unix_identity_fields() {
         let prompt = assemble_prompt(&[], Path::new("/tmp/mu-test-global"), None);
-        assert!(prompt.starts_with(role_preamble()));
+        assert!(prompt.starts_with(&format!("<system_preamble>\n{}", role_preamble())));
         assert!(prompt.contains("os: windows (MSYS2 UCRT64)"));
         assert!(prompt.contains("\nuser: "));
         assert!(!prompt.contains("uid"));
