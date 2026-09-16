@@ -26,11 +26,14 @@ a workaround for reliable file editing without escaping (with the `stdin` argume
 It affects concurrent execution and retry (`readonly` calls are run in parallel and can auto retry), as well as trapping (`destructive` actions
 pause the execution by default).
 
-**Shebang Support**&emsp; Add `#!/usr/bin/env -S mu` to reusable prompt files to run them as regular commands. You can also specify the model,
-pin to a particular session, etc.
+**Shebang Support**&emsp; Add `#!/usr/bin/env mu` to reusable prompt files to run them as regular commands. To specify a model, use
+`#!/usr/bin/env -S mu --model <model-ref>`. Other options, such as session selection, belong on the command line, not in the shebang.
 
 **Skill System**&emsp; Skills are prompt files that auto loaded on demand by the agent, indicated by front matter. They can coexist
 with shebang, allowing a prompt file both manually invocable and automatically loadable.
+Built-in skills and reference documents are `.md` files; Mu ships no custom commands. Define your own in `~/.mu` (or `$MU_CONFIG_DIR`)
+or the project's `.mu` directory. Command names include the filename extension, so `review.md` is invoked as `mu review.md` or `/review.md`.
+The built-in Exa and Brave search skills become available when `EXA_API_KEY` and `BRAVE_API_KEY`, respectively, are set.
 
 **Multi-provider**&emsp; Supports Chat Completion, Responses, and Anthropic Messages APIs, with optional automatic fallback.
 Common quirks, like cache keys, opaque reasoning replay, context length errors, etc. are handled properly.
@@ -41,8 +44,8 @@ an extra "continue" user message.
 
 **Cache Friendly**&emsp; `mu` session history is strictly append-only. Refreshing of AGENTS.md or skill catalog only happens after compaction.
 
-**Compaction**&emsp; `mu` has two compaction thresholds: It prefers compaction after a complete turn, triggered by the soft threshold, but can
-also compacts during a turn, triggered by either the hard threshold or provider context length errors.
+**Compaction**&emsp; `mu` has two compaction thresholds: the soft threshold triggers before a new turn's first provider request, while the
+hard threshold triggers during a turn after tool results. Provider context length errors can also trigger emergency compaction.
 
 **Simple Installation**&emsp; `mu` is one single statically linked binary plus one single-file shell plugin. It can be droped anywhere and run.
 
@@ -140,6 +143,9 @@ For Claude Code, add a `SessionStart` hook to `~/.claude/settings.json`:
 ```
 
 ## Complete Guide
+
+Read the shipped [CLI reference](builtins/cli.md) and [configuration and skills guide](builtins/config.md).
+The [Mu documentation skill](builtins/mu-doc.md) points the agent to these references.
 
 Run this command to get an up-to-date, complete, and example-rich guide:
 

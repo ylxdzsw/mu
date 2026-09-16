@@ -2,7 +2,7 @@
 
 This is the reference for Mu configuration, environment overlays, durable
 instructions, custom commands, skills, scope, and precedence. For turn and
-management-command invocation, read [the Mu CLI reference](cli).
+management-command invocation, read [the Mu CLI reference](cli.md).
 
 ## First steps
 
@@ -17,7 +17,7 @@ Then read the relevant files from the active scopes:
 - Global config directory: `~/.mu`, or `$MU_CONFIG_DIR` when set.
 - Project config directory: `<project>/.mu` when the current directory resolves
   to a project.
-- Built-ins: the directory containing `mu-doc`, normally `/usr/share/mu`;
+- Built-ins: the directory containing `mu-doc.md`, normally `/usr/share/mu`;
   portable builds may materialize it in the user cache.
 
 `mu` discovers a project by walking upward from the invoking `pwd` until it
@@ -40,8 +40,9 @@ the installed `mu` package or this repository's shipped defaults.
 
 ## Config JSONC
 
-`config.jsonc` accepts comments and trailing commas. Global config is created
-automatically with a starter provider if it does not exist. Project config from
+`config.jsonc` accepts comments and trailing commas. Turns, `status`, `retry`,
+and `compact` create missing global config with a starter provider. `init`,
+`new`, `sessions`, `transcript`, `context`, and `cat` do not. Project config from
 `mu init` is only an overlay stub. Omitted non-provider fields inherit
 from bundled defaults; bundled providers are used only to create a missing
 global config. Objects merge recursively across scopes; scalars and arrays
@@ -51,7 +52,9 @@ replace inherited values.
 config or load `.env` files, and provider validation errors do not prevent it
 from using settings such as `output`.
 
-Complete shape, with default values where applicable:
+Complete shape, with bundled non-provider defaults and an illustrative
+provider/model block. The actual starter provider is OpenCode Zen's keyless
+`big-pickle` model; see `src/default_config.jsonc` in the Mu repository.
 
 ```jsonc
 {
@@ -113,8 +116,9 @@ When disabled, resumable responses are ordinary clean turn endings.
 Set `compaction.enabled` to `false` to disable automatic soft-threshold,
 hard-threshold, and context-overflow compaction. Context-length failures then
 abort the turn, while explicit `mu compact` remains available.
-Compaction requires a model `context_window` and runs only when context tokens
-are strictly greater than the applicable threshold. Before a new turn's first
+Automatic threshold compaction requires a model `context_window` and runs only
+when context tokens are strictly greater than the applicable threshold. Manual
+and emergency compaction do not require that metadata. Before a new turn's first
 provider request, `compaction.soft_fraction` sets the graceful threshold to
 `floor(context_window * soft_fraction)`. The submitted prompt is queued while
 Mu generates that out-of-turn checkpoint, then materialized afterward. After
@@ -129,12 +133,15 @@ Compaction asks the active model to summarize the exact current context as a
 normal persisted agent turn, then replaces the model-facing history with the
 system prompt and a session checkpoint. Each successful checkpoint increments
 the session context epoch; provider cache keys have the form
-`mu:<session>:epoch:<N>`. A context-length error starts emergency compaction,
-which temporarily replaces oldest Bash outputs and removes their attachments
-until their estimated reduction reaches the configured headroom. The journal,
+`mu:<session>:epoch:<N>`. When automatic compaction is enabled, a context-length
+error starts emergency compaction, which temporarily replaces oldest Bash
+outputs and removes their attachments until their estimated reduction reaches
+the configured headroom. The journal,
 Bash requests, commands, and stdin remain intact. The same error during an
-emergency attempt is fatal. Compaction requests do not add a provider
-output-token cap; `hard_headroom_tokens` must still be greater than zero.
+emergency attempt is fatal. An already-running manual compaction can also
+upgrade to emergency even when automatic compaction is disabled. Compaction
+requests do not add a provider output-token cap; `hard_headroom_tokens` must
+still be greater than zero.
 
 Context accounting uses the latest compatible provider-reported usage and
 estimates only later messages. Compatibility requires the same API and model
@@ -150,8 +157,10 @@ and bytes per line. The bell sounds only for turns lasting at least
 `min_duration_ms`.
 
 Model references use `provider/model[:effort]` for a fixed provider or
-`model[:effort]` for ordered provider fallback. A bare model includes every
-provider defining that model id; a session remembers its position per model.
+`model[:effort]` for ordered provider fallback. `(provider)/model[:effort]`
+starts a floating choice at that configured provider; quote it in the shell.
+A bare model includes every provider defining that model id; a session
+remembers its position per model.
 Provider and model object order controls the default model, fallback, status,
 and completion order, with project entries before inherited global entries.
 Effort strings are provider-defined and unrestricted; `supported_efforts` is
@@ -190,9 +199,10 @@ disables the defaults, and empty selected values are ignored.
 ## AGENTS.md
 
 `AGENTS.md` is durable guidance appended to the system prompt. Global
-`~/.mu/AGENTS.md` loads first. Project `.mu/AGENTS.md` loads after it and should
-hold repository-specific conventions, verification commands, review rules, and
-other guidance that should apply on every turn in that project.
+`AGENTS.md` in the global config directory (`$MU_CONFIG_DIR` or `~/.mu`) loads
+first. Project `.mu/AGENTS.md` loads after it and should hold repository-specific
+conventions, verification commands, review rules, and other guidance that
+should apply on every turn in that project.
 
 Keep `AGENTS.md` short. Put reusable task workflows in skills instead.
 
@@ -220,7 +230,7 @@ mu review
 ./.mu/review
 ```
 
-See [the Mu CLI reference](cli) for invocation, argument precedence, prompt
+See [the Mu CLI reference](cli.md) for invocation, argument precedence, prompt
 input, and `mu cat`.
 
 ## Skills

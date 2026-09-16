@@ -22,6 +22,8 @@ Session and model selection:
 - `-c|--continue`: continue the active scope's last selected session.
 - `-m|--model provider/model[:effort]`: use a fixed provider.
 - `-m|--model model[:effort]`: use ordered provider fallback.
+- `-m|--model '(provider)/model[:effort]'`: use fallback starting at that
+  configured provider. Quote the parentheses in shell commands.
 - `--trap off|destructive|reversible|all`: set the turn's Bash trap level.
 
 An explicit `-o|--output` overrides `config.jsonc`:
@@ -67,11 +69,13 @@ Summarize the current checkout.
 
 The shebang accepts no arguments or exactly `-m|--model <model-ref>` as separate
 tokens. An invocation model overrides the shebang; the shebang otherwise
-overrides the attached session or configured default for that turn without
-rewriting session model state.
+overrides the attached session or configured default. It does not change
+configuration, but becomes the session's latest recorded model once a provider
+request is persisted.
 
-Mu strips the shebang and optional skill frontmatter before submitting the
-prompt. File-backed turns do not read terminal stdin. Non-terminal stdin, when
+Mu strips the shebang and optional skill frontmatter from discovered commands.
+Explicit prompt files strip only the leading shebang, retaining frontmatter.
+File-backed turns do not read terminal stdin. Non-terminal stdin, when
 non-empty, is appended verbatim after `\n---\n\n` as a custom instruction.
 
 ```sh
@@ -84,26 +88,6 @@ files are recommended so they can also be invoked directly through their
 shebang, such as `./.mu/review`. In zsh and Fish prompt mode, a discovered
 command is invoked by its exact relative path, such as `/review` (or
 `/review.md` when that is the filename).
-
-### Built-in `/grill`
-
-`/grill <topic>` invokes the built-in `grill` custom command. The
-topic argument is required. Its agent conducts a structured design interview:
-it maps the topic's decisions as a tree, works the tree in frontier rounds
-(asking every unblocked question at once with a recommended answer), looks up
-facts from the environment via Bash rather than asking the user, and waits for
-answers before advancing to the next round. When the frontier is empty it
-writes a concise spec of all settled decisions to `grill-spec.md` in the
-current directory.
-
-### Built-in `/goal`
-
-`/goal <goal>` invokes the built-in `goal` custom command. The
-goal argument is required. Its agent acts only as a supervisor: it creates one
-fresh worker session, continues that same session until completion, and judges
-the result without planning or performing the work. The worker owns state
-inspection, planning, execution, and verification. Each continuation repeats
-the original goal verbatim to the worker to prevent drift.
 
 ## Management commands
 

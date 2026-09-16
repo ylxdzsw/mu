@@ -21,6 +21,9 @@ Only handle these formats in this skill:
 ## Workflow
 
 1. Confirm the input path exists and uses one of the supported formats.
+   The CLI can be installed without the optional dependencies for a particular
+   format. If conversion reports missing dependencies, report them and ask
+   before installing anything.
 2. Convert local files with the CLI for ordinary one-off extraction:
 
 ```bash

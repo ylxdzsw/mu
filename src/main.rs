@@ -1565,20 +1565,6 @@ mod tests {
     }
 
     #[test]
-    fn builtin_goal_receives_its_required_custom_instruction() {
-        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("builtins/goal");
-        let source = || PromptSource::Command {
-            path: path.clone(),
-            scope: skills::InstructionScope::Builtin,
-        };
-
-        let goal = "Finish the migration.\nKeep all tests green.";
-        let mut piped_stdin = Cursor::new(goal);
-        let with_goal = load_prompt_with_stdin(source(), false, &mut piped_stdin).unwrap();
-        assert!(with_goal.text.ends_with(&format!("\n---\n\n{goal}")));
-    }
-
-    #[test]
     fn bare_prompt_name_resolves_to_project_command() {
         let root = temp_file_path("resolve-project-command");
         let command_dir = root.join(".mu");

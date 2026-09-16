@@ -11,8 +11,8 @@ the rationale for consequential design choices. It is not a changelog,
 implementation diary, release manifest, or migration record. Exact
 configuration defaults live in [`src/default_config.jsonc`](src/default_config.jsonc);
 user-facing command and configuration references live in
-[`builtins/cli`](builtins/cli) and
-[`builtins/config`](builtins/config).
+[`builtins/cli.md`](builtins/cli.md) and
+[`builtins/config.md`](builtins/config.md).
 
 ---
 
@@ -512,8 +512,6 @@ turn, then passes that id explicitly. `MU_ZSH_SESSION_ID` or
 - `/retry` and `/compact` call the corresponding management operation.
 - Discovered custom commands accept the remainder of the slash input as their
   custom instruction.
-- `/goal <goal>` invokes the built-in `goal` custom command. Its required
-  custom instruction is the goal.
 
 Unknown or malformed slash input does not activate a new scope or mutate the
 bundle.
@@ -598,6 +596,8 @@ Other invalid content-block sequencing remains a fatal protocol error.
 - `provider/model[:effort]` is fixed.
 - `model[:effort]` expands to providers defining that model in merged
   configuration order.
+- `(provider)/model[:effort]` selects a floating choice starting at that
+  configured provider; shell invocations must quote the parentheses.
 - Model ids cannot contain `:`; it separates the optional effort.
 - `supported_efforts` is an ordered status/completion hint, not validation of
   manually entered effort strings.
@@ -668,22 +668,17 @@ supported Mu shebang. The shebang accepts no arguments or exactly
 `-m|--model <model-ref>`. Command names are exact relative instruction-root
 paths, including an extension when the file has one. Executable permission does
 not affect discovery, but suffixless executable command files are recommended
-so they can also be invoked directly through their shebang. Shipped flat
-built-in resources are suffixless, and shipped custom commands are executable.
+so they can also be invoked directly through their shebang. Shipped built-in
+skills and reference documents use `.md` filenames. Mu ships no custom commands;
+users can define them in global or project scope.
 
 A file may be both a command and a skill. Command invocation strips the shebang
 and supported frontmatter before submitting the prompt. An explicit invocation
-model overrides the shebang model; otherwise the shebang is turn-local and does
-not rewrite session model state.
-
-The built-in `goal` is a custom command, not a skill. It requires a goal as its
-custom instruction. The command agent acts only as supervisor: it
-creates one fresh worker session, repeatedly continues that same session, and
-judges completion without planning, diagnosing, or performing the work. The
-worker owns current-state inspection, planning, execution, and verification.
-Every continuation repeats the original goal verbatim to the worker. The loop
-ends when the supervisor verifies the goal or finds a genuine blocker requiring
-user input, permission, credentials, or unavailable external state.
+model overrides the shebang model; otherwise the shebang overrides the attached
+session or configured default. It does not change configuration, but becomes
+the session's latest recorded model once a provider request is persisted.
+Explicit prompt-file invocation strips the leading shebang but retains skill
+frontmatter; frontmatter stripping belongs to discovered command invocation.
 
 ---
 
@@ -819,9 +814,10 @@ Without a positional target, stdin is the complete prompt. A positional name
 first resolves to a discovered custom command unless it is an explicit path,
 then falls back to a prompt file. Exact management subcommand names win.
 
-File-backed prompts strip a supported shebang. Terminal stdin is left unread;
-non-terminal stdin, when non-empty, is appended after `\n---\n\n` as a custom
-instruction.
+File-backed prompts strip the leading shebang. Discovered custom commands also
+strip supported skill frontmatter; explicit prompt files retain it. Terminal
+stdin is left unread; non-terminal stdin, when non-empty, is appended after
+`\n---\n\n` as a custom instruction.
 
 Management commands:
 
@@ -994,7 +990,8 @@ bounded nonzero estimate. Mu does not ship a tokenizer.
 ### 11.5 Compaction
 
 Setting `compaction.enabled:false` disables every automatic compaction tier.
-Manual `mu compact` remains available.
+Manual `mu compact` remains available, and a context-length error during an
+already-running manual compaction can still upgrade it to emergency mode.
 
 Automatic context management has three triggers:
 
@@ -1006,9 +1003,12 @@ Automatic context management has three triggers:
    compact when context is strictly above the lower of the configured hard
    fraction and configured headroom boundary.
 3. **Emergency overflow.** A classified provider context-length error starts
-   emergency compaction. A context-length error during soft or hard compaction
-   upgrades that attempt to emergency; the same error during emergency
-   compaction is fatal.
+   emergency compaction. A context-length error during soft, hard, or manual
+   compaction upgrades that attempt to emergency; the same error during
+   emergency compaction is fatal.
+
+Soft and hard thresholds require model `context_window` metadata; manual and
+emergency compaction do not.
 
 Compaction is an ordinary synthetic turn in the current context. Its request
 uses the same model context, native replay, Bash tool, streaming, fallback,

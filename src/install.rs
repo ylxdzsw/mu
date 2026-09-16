@@ -12,28 +12,38 @@ use anyhow::{Context, Result};
 #[cfg(feature = "portable")]
 const BUILTINS: &[(&str, &str, bool)] = &[
     (
-        "agent-browser",
-        include_str!("../builtins/agent-browser"),
+        "agent-browser.md",
+        include_str!("../builtins/agent-browser.md"),
         false,
     ),
     (
-        "background-task",
-        include_str!("../builtins/background-task"),
+        "background-task.md",
+        include_str!("../builtins/background-task.md"),
         false,
     ),
     (
-        "brave-search",
-        include_str!("../builtins/brave-search"),
+        "brave-search.md",
+        include_str!("../builtins/brave-search.md"),
         false,
     ),
-    ("cli", include_str!("../builtins/cli"), false),
-    ("config", include_str!("../builtins/config"), false),
-    ("exa-search", include_str!("../builtins/exa-search"), false),
-    ("goal", include_str!("../builtins/goal"), true),
-    ("grill", include_str!("../builtins/grill"), true),
-    ("markitdown", include_str!("../builtins/markitdown"), false),
-    ("mu-doc", include_str!("../builtins/mu-doc"), false),
-    ("subagent", include_str!("../builtins/subagent"), false),
+    ("cli.md", include_str!("../builtins/cli.md"), false),
+    ("config.md", include_str!("../builtins/config.md"), false),
+    (
+        "exa-search.md",
+        include_str!("../builtins/exa-search.md"),
+        false,
+    ),
+    (
+        "markitdown.md",
+        include_str!("../builtins/markitdown.md"),
+        false,
+    ),
+    ("mu-doc.md", include_str!("../builtins/mu-doc.md"), false),
+    (
+        "subagent.md",
+        include_str!("../builtins/subagent.md"),
+        false,
+    ),
 ];
 
 #[cfg(feature = "portable")]

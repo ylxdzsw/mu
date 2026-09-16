@@ -10,8 +10,10 @@ Use this when a web task needs a rendered browser view: local development
 previews, file-backed pages, public unauthenticated pages, visual UI checks,
 screenshots, downloads, or small browser interactions.
 
-Use the `agent-browser` command. Check its help before using unfamiliar or
-advanced options.
+Use the `agent-browser` command. Load its version-matched workflow with
+`agent-browser skills get core --full`; check `agent-browser --help` if the
+installed version does not provide that command. Check help before using
+unfamiliar or advanced options.
 
 ## Typical Workflow
 

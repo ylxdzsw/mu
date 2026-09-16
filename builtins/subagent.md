@@ -9,7 +9,7 @@ Use this when a task benefits from independent `mu` turns with narrower instruct
 broad reviews, parallel audits, focused investigation, or long-running async checks.
 
 Subagents are ordinary `mu` processes. They run in fresh sessions by default.
-Read [the Mu CLI reference](cli) before invoking one; this skill adds the
+Read [the Mu CLI reference](cli.md) before invoking one; this skill adds the
 delegation-specific conventions.
 
 ## Synchronous Delegation
@@ -26,7 +26,7 @@ bash({
   risk: "readonly",
   command: "mu --output final",
   cwd: "/root/mu",
-  timeout: 600,
+  timeout: 1800,
   stdin: `You are a focused mu subagent.
 
 Task: Review SPEC.md for stale claims about the current CLI.
@@ -48,7 +48,7 @@ bash({
   risk: "reversible",
   command: "mu --output final",
   cwd: "/root/mu",
-  timeout: 600,
+  timeout: 1800,
   stdin: `You are a focused mu subagent.
 
 Task: Apply the agreed README wording change.
