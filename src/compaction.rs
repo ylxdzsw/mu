@@ -1,6 +1,7 @@
 use crate::config::Config;
-use crate::provider::{Message, UserContent};
+use crate::provider::{Attachment, ContentPart, Message, UserContent};
 use crate::store::{CompactionMode, CompactionTrigger};
+use sha2::{Digest, Sha256};
 
 pub const EMERGENCY_OUTPUT_UNAVAILABLE: &str =
     "[Bash output unavailable during emergency compaction.]";
@@ -103,15 +104,16 @@ pub fn should_compact(
 pub fn emergency_projection(
     messages: &[Message],
     headroom_tokens: u64,
+    preserved_message: Option<usize>,
 ) -> (Vec<Message>, Vec<String>) {
     let mut projected = messages.to_vec();
-    let mut saved_tokens = 0_u64;
+    let mut saved_tokens = strip_emergency_attachments(&mut projected, preserved_message);
     let mut elided = Vec::new();
-    if headroom_tokens == 0 {
-        return (projected, elided);
-    }
-    for message in &mut projected {
-        if !matches!(message, Message::Tool { .. }) {
+    for (index, message) in projected.iter_mut().enumerate() {
+        if saved_tokens >= headroom_tokens {
+            break;
+        }
+        if Some(index) == preserved_message || !matches!(message, Message::Tool { .. }) {
             continue;
         }
         let before = message.approx_tokens();
@@ -132,11 +134,58 @@ pub fn emergency_projection(
         let after = message.approx_tokens();
         saved_tokens = saved_tokens.saturating_add(before.saturating_sub(after));
         elided.push(call_id);
-        if saved_tokens >= headroom_tokens {
-            break;
-        }
     }
     (projected, elided)
+}
+
+pub fn strip_emergency_attachments(
+    messages: &mut [Message],
+    preserved_message: Option<usize>,
+) -> u64 {
+    let mut saved_tokens = 0_u64;
+    for (index, message) in messages.iter_mut().enumerate() {
+        if Some(index) == preserved_message {
+            continue;
+        }
+        let before = message.approx_tokens();
+        match message {
+            Message::User {
+                content: UserContent::Parts(parts),
+            } => {
+                for part in parts {
+                    if let ContentPart::Attachment { attachment } = part {
+                        *part = ContentPart::Text {
+                            text: omitted_attachment(attachment),
+                        };
+                    }
+                }
+            }
+            Message::Tool {
+                content,
+                attachments,
+                ..
+            } => {
+                for item in attachments.drain(..) {
+                    content.push('\n');
+                    content.push_str(&omitted_attachment(&item.attachment));
+                }
+            }
+            _ => {}
+        }
+        saved_tokens = saved_tokens.saturating_add(before.saturating_sub(message.approx_tokens()));
+    }
+    saved_tokens
+}
+
+fn omitted_attachment(attachment: &Attachment) -> String {
+    format!(
+        "[Attachment unavailable during emergency compaction: {} (object sha256: {}).]",
+        attachment.filename,
+        Sha256::digest(&attachment.data)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>(),
+    )
 }
 
 #[cfg(test)]
@@ -169,7 +218,7 @@ mod tests {
     }
 
     #[test]
-    fn emergency_projection_elides_oldest_results_first() {
+    fn emergency_projection_preserves_last_output() {
         let messages = vec![
             Message::Tool {
                 content: "a".repeat(8_000),
@@ -190,12 +239,105 @@ mod tests {
                 tool_call_id: "second".into(),
             },
         ];
-        let (projected, elided) = emergency_projection(&messages, 10_000);
-        assert_eq!(elided, ["first", "second"]);
+        let (projected, elided) = emergency_projection(&messages, 10_000, Some(1));
+        assert_eq!(elided, ["first"]);
         assert!(matches!(
             &projected[0],
             Message::Tool { content, attachments, .. }
                 if content == EMERGENCY_OUTPUT_UNAVAILABLE && attachments.is_empty()
         ));
+        assert!(
+            matches!(&projected[1], Message::Tool { content, .. } if content == &"b".repeat(8_000))
+        );
+    }
+
+    #[test]
+    fn emergency_attachments_are_pruned_independently_of_headroom() {
+        let attachment = Attachment {
+            filename: "plot.png".into(),
+            media_type: "image/png".into(),
+            data: vec![1, 2, 3],
+        };
+        let user = Message::User {
+            content: UserContent::Parts(vec![
+                ContentPart::Text {
+                    text: "compare".into(),
+                },
+                ContentPart::Attachment {
+                    attachment: attachment.clone(),
+                },
+                ContentPart::Attachment {
+                    attachment: attachment.clone(),
+                },
+            ]),
+        };
+        let tool = Message::Tool {
+            content: "output".into(),
+            attachments: vec![
+                ToolAttachment {
+                    attachment,
+                    detail: crate::provider::ImageDetail::Original,
+                    object_sha256: None,
+                };
+                2
+            ],
+            tool_call_id: "images".into(),
+        };
+        for last in [
+            user.clone(),
+            tool.clone(),
+            Message::User {
+                content: "text only".into(),
+            },
+        ] {
+            let messages = vec![
+                user.clone(),
+                tool.clone(),
+                last,
+                Message::User {
+                    content: "synthetic compaction".into(),
+                },
+            ];
+            for headroom in [0, 1, 100_000] {
+                let (projected, _) = emergency_projection(&messages, headroom, Some(2));
+                assert!(
+                    matches!(&projected[0], Message::User { content: UserContent::Parts(parts) }
+                    if parts.iter().all(|part| matches!(part, ContentPart::Text { .. })))
+                );
+                assert!(
+                    matches!(&projected[1], Message::Tool { attachments, .. } if attachments.is_empty())
+                );
+                match (&messages[2], &projected[2]) {
+                    (Message::User { content: before }, Message::User { content: after }) => {
+                        assert_eq!(before.text(), after.text());
+                        if let UserContent::Parts(parts) = after {
+                            assert_eq!(
+                                parts
+                                    .iter()
+                                    .filter(|part| matches!(part, ContentPart::Attachment { .. }))
+                                    .count(),
+                                2
+                            );
+                        }
+                    }
+                    (
+                        Message::Tool {
+                            content: before,
+                            attachments: before_images,
+                            ..
+                        },
+                        Message::Tool {
+                            content: after,
+                            attachments: after_images,
+                            ..
+                        },
+                    ) => {
+                        assert_eq!(before, after);
+                        assert_eq!(before_images, after_images);
+                    }
+                    _ => panic!("protected message changed type"),
+                }
+            }
+        }
     }
 }

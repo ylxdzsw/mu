@@ -114,8 +114,8 @@ a fixed or final candidate leaves the turn incomplete for `/retry`. A normal
 new prompt supersedes the pending resume without inserting the derived message.
 When disabled, resumable responses are ordinary clean turn endings.
 Set `compaction.enabled` to `false` to disable automatic soft-threshold,
-hard-threshold, and context-overflow compaction. Context-length failures then
-abort the turn, while explicit `mu compact` remains available.
+hard-threshold, and emergency-overflow compaction. Context-length and request-size
+failures then abort the turn, while explicit `mu compact` remains available.
 Automatic threshold compaction requires a model `context_window` and runs only
 when context tokens are strictly greater than the applicable threshold. Manual
 and emergency compaction do not require that metadata. Before a new turn's first
@@ -134,12 +134,19 @@ normal persisted agent turn, then replaces the model-facing history with the
 system prompt and a session checkpoint. Each successful checkpoint increments
 the session context epoch; provider cache keys have the form
 `mu:<session>:epoch:<N>`. When automatic compaction is enabled, a context-length
-error starts emergency compaction, which temporarily replaces oldest Bash
-outputs and removes their attachments until their estimated reduction reaches
-the configured headroom. The journal,
-Bash requests, commands, and stdin remain intact. The same error during an
-emergency attempt is fatal. An already-running manual compaction can also
-upgrade to emergency even when automatic compaction is disabled. Compaction
+or request-size error starts emergency compaction. It preserves the latest real
+user prompt or Bash output in full, including all its attachments, and replaces
+all earlier attachments with omission markers and object references. Synthetic
+compaction and resume messages do not count as the latest input. If the protected
+message has no attachments, no earlier attachments are retained. Attachment
+pruning is independent of the token-headroom target; its estimated savings count
+toward that target. If further reduction is needed, Mu replaces oldest Bash
+outputs, except the protected message, until the configured headroom is reached
+or no eligible outputs remain. The journal, stored attachments,
+Bash requests, commands, and stdin remain intact. Either overflow error during
+an emergency attempt is fatal; there is no further attachment-dropping fallback.
+An already-running manual compaction can also upgrade to emergency even when
+automatic compaction is disabled. Compaction
 requests do not add a provider output-token cap; `hard_headroom_tokens` must
 still be greater than zero.
 

@@ -571,14 +571,16 @@ Provider errors are classified by meaning rather than raw status text:
 
 | Class | Action |
 |---|---|
-| `context_length` | Apply context recovery when enabled. |
+| `context_length`, `request_too_large` | Apply emergency context recovery when enabled. |
 | `unavailable`, `auth` | Advance a floating provider candidate immediately. |
 | `overloaded`, `rate_limit`, `transport` | Retry the candidate, then advance if floating. |
-| `request_too_large`, `bad_request`, `protocol` | Fail immediately. |
+| `bad_request`, `protocol` | Fail immediately. |
 
 Classification uses structured provider codes before status/message
-heuristics. Invalid or malformed successful responses are protocol failures,
-not accepted partial progress.
+heuristics. HTTP 413 and the structured `request_too_large` code/type explicitly
+identify request-size overflow and take precedence over other classifications,
+including generic gateway errors. Invalid or malformed successful responses are
+protocol failures, not accepted partial progress.
 
 A fixed provider/model permits five retries after the initial attempt. A
 floating model permits three retries per candidate. Delays are deterministic
@@ -990,8 +992,9 @@ bounded nonzero estimate. Mu does not ship a tokenizer.
 ### 11.5 Compaction
 
 Setting `compaction.enabled:false` disables every automatic compaction tier.
-Manual `mu compact` remains available, and a context-length error during an
-already-running manual compaction can still upgrade it to emergency mode.
+Manual `mu compact` remains available, and a context-length or request-size error
+during an already-running manual compaction can still upgrade it to emergency
+mode.
 
 Automatic context management has three triggers:
 
@@ -1002,10 +1005,11 @@ Automatic context management has three triggers:
    has reached a result, and before sending those results back to the model,
    compact when context is strictly above the lower of the configured hard
    fraction and configured headroom boundary.
-3. **Emergency overflow.** A classified provider context-length error starts
-   emergency compaction. A context-length error during soft, hard, or manual
-   compaction upgrades that attempt to emergency; the same error during
-   emergency compaction is fatal.
+3. **Emergency overflow.** A classified provider context-length or request-size
+   error starts emergency compaction. Either error during soft, hard, or manual
+   compaction upgrades that attempt to emergency; either error during emergency
+   compaction is fatal, without another automatic attempt. Retry also recognizes
+   a persisted overflow failure as requiring emergency mode.
 
 Soft and hard thresholds require model `context_window` metadata; manual and
 emergency compaction do not.
@@ -1054,16 +1058,26 @@ Epoch-filtered transcripts place a compaction request, its streamed activity,
 and its result in `from_epoch`, matching the cache key used for that request.
 The checkpoint and subsequent provider activity appear in `to_epoch`.
 
-Emergency compaction makes a request-only projection that replaces oldest Bash
-results first with `[Bash output unavailable during emergency compaction.]`
-and removes their attachments until the estimated reduction reaches the
-configured hard headroom.
-Calls, arguments, stdin, and journal data are unchanged. Each emergency request
-recipe records the elided occurrence-stable durable call IDs for exact
-reconstruction; a successful compaction application derives them from its
-accepted request rather than copying them. If pruning every Bash result is
-insufficient, Mu still makes one emergency request; a context-length error from
-that request is fatal.
+Emergency compaction makes a request-only projection that preserves the latest
+real user prompt or Bash-result message in full, including all its attachments.
+Synthetic compaction prompts, location reminders, checkpoints, and resume
+messages do not select the protected message. If that message has no attachments,
+no earlier attachments are retained. All other user and Bash-result attachments
+are replaced by textual omission markers with filenames and object hashes,
+independently of the token-headroom target. Their estimated savings count toward
+the configured hard headroom; if more reduction is needed, oldest unprotected
+Bash results are replaced with
+`[Bash output unavailable during emergency compaction.]` until that target is
+reached or no eligible results remain. The protected message is never elided.
+
+Calls, arguments, stdin, journal data, and immutable attachment objects are
+unchanged. Each emergency request recipe records the protected message index
+in its context boundary and the elided occurrence-stable durable call IDs for
+exact reconstruction; a successful compaction application derives the elisions
+from its accepted request rather than copying them. If pruning is insufficient,
+Mu still makes one emergency request; a context-length or request-size error
+from that request is fatal. Mu does not drop the protected message's attachments
+as a further fallback.
 
 Compaction requests do not add a provider output-token cap. Mu rejects an empty
 summary, but it does not apply a post-compaction soft-limit test. A failed

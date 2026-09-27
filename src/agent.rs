@@ -319,19 +319,33 @@ impl<'a> AgentLoop<'a> {
                 let mut command_headers = StreamingCommandHeaders::default();
                 loop {
                     current_partial_output.clear();
+                    let emergency = active_compaction
+                        .as_ref()
+                        .is_some_and(|state| state.emergency);
+                    let emergency_context = if emergency {
+                        let (mut messages, last_input) =
+                            self.store.load_context_with_last_input(self.session_id)?;
+                        if self.store.resume_reminder_needed(self.session_id)? {
+                            messages.push(resume_message());
+                        }
+                        Some((messages, last_input))
+                    } else {
+                        None
+                    };
                     let request_context = crate::provider::filter_native_replay_for_config(
-                        &context,
+                        emergency_context
+                            .as_ref()
+                            .map_or(&context, |(messages, _)| messages),
                         self.config,
                         self.model.active_model(),
                         self.provider.api(),
                     );
-                    let (request_context, elided_provider_call_ids) = if active_compaction
-                        .as_ref()
-                        .is_some_and(|state| state.emergency)
-                    {
+                    let preserved_message = emergency_context.as_ref().and_then(|(_, last)| *last);
+                    let (request_context, elided_provider_call_ids) = if emergency {
                         compaction::emergency_projection(
                             &request_context,
                             self.config.compaction.hard_headroom_tokens,
+                            preserved_message,
                         )
                     } else {
                         (request_context, Vec::new())
@@ -374,6 +388,12 @@ impl<'a> AgentLoop<'a> {
                             })
                             .into(),
                         );
+                        if state.emergency {
+                            input.insert(
+                                "emergency_preserved_message".into(),
+                                serde_json::to_value(preserved_message)?,
+                            );
+                        }
                         if !state.elided_call_ids.is_empty() {
                             input.insert(
                                 "emergency_elided_call_ids".into(),
@@ -475,7 +495,9 @@ impl<'a> AgentLoop<'a> {
                     }
                     match result {
                         Ok(r) => break 'request_gate (exchange_id, r, command_headers),
-                        Err(error @ ProviderError::ContextLength { .. }) => {
+                        Err(error)
+                            if error.disposition() == ProviderDisposition::ContextRecovery =>
+                        {
                             self.store.fail_provider_exchange(
                                 self.session_id,
                                 &exchange_id,
@@ -490,14 +512,17 @@ impl<'a> AgentLoop<'a> {
                             }
                             if let Some(state) = active_compaction.as_mut() {
                                 if state.emergency {
-                                    bail!("context length exceeded during emergency compaction");
+                                    bail!("{} during emergency compaction: {error}", error.class());
                                 }
                                 state.emergency = true;
                                 self.renderer.compaction_trigger(
                                     CompactionTrigger::Emergency,
                                     request_context_tokens,
                                     state.pending.before_context_window,
-                                    Some("compaction request exceeded provider context"),
+                                    Some(&format!(
+                                        "compaction request exceeded provider limit ({})",
+                                        error.class()
+                                    )),
                                 )?;
                                 continue 'request_gate;
                             }
@@ -1923,6 +1948,40 @@ mod tests {
         counts: Arc<Mutex<(u32, u32)>>,
     }
 
+    struct SizeErrorProvider {
+        api: crate::provider::ModelApi,
+        failures: usize,
+        seen: Arc<Mutex<Vec<Value>>>,
+    }
+
+    #[async_trait(?Send)]
+    impl Provider for SizeErrorProvider {
+        fn api(&self) -> crate::provider::ModelApi {
+            self.api
+        }
+
+        async fn stream(
+            &self,
+            request: &Request,
+            _on_event: &mut dyn FnMut(StreamEvent) -> Result<(), ProviderError>,
+        ) -> Result<StreamResult, ProviderError> {
+            let mut seen = self.seen.lock().unwrap();
+            seen.push(request.json(self.api)?);
+            if seen.len() <= self.failures {
+                return Err(ProviderError::RequestTooLarge {
+                    status: Some(413),
+                    detail: "test request size limit".into(),
+                });
+            }
+            Ok(StreamResult {
+                message: Message::assistant(Some("done".into()), None, None, None),
+                finish_reason: FinishReason::Stop,
+                usage: None,
+                native_response: None,
+            })
+        }
+    }
+
     fn spawn_stop_server(
         seen_request: Arc<Mutex<String>>,
     ) -> (String, std::thread::JoinHandle<()>) {
@@ -2659,6 +2718,175 @@ mod tests {
         assert_eq!(first_seen.lock().unwrap().len(), retry_limit as usize + 1);
         assert!(seen_request.lock().unwrap().contains(RESUME_PROMPT));
         assert!(store.is_session_clean(&session.id).unwrap());
+    }
+
+    #[tokio::test]
+    async fn request_size_emergency_recovery_preserves_input_and_reconstructs_requests() {
+        use crate::provider::{Attachment, ContentPart, ModelApi, ToolAttachment};
+
+        for api in [
+            ModelApi::ChatCompletions,
+            ModelApi::Responses,
+            ModelApi::AnthropicMessages,
+        ] {
+            for (manual, enabled, failures, last_is_user) in [
+                (false, true, 1, true),
+                (false, true, 1, false),
+                (false, true, usize::MAX, true),
+                (true, false, usize::MAX, true),
+                (false, false, usize::MAX, true),
+            ] {
+                let store = Store::open_memory().unwrap();
+                let session = store.create_session_seeded("system").unwrap();
+                let image = Attachment {
+                    filename: "plot.png".into(),
+                    media_type: "image/png".into(),
+                    data: vec![1, 2, 3],
+                };
+                let prompt = UserContent::Parts(vec![
+                    ContentPart::Text {
+                        text: "compare these".into(),
+                    },
+                    ContentPart::Attachment {
+                        attachment: image.clone(),
+                    },
+                    ContentPart::Attachment {
+                        attachment: image.clone(),
+                    },
+                ]);
+                store
+                    .start_turn(&session.id, "/tmp", None, &prompt)
+                    .unwrap();
+                let (_, calls) = store
+                    .append_message_with_bash_calls(
+                        &session.id,
+                        &Message::assistant(
+                            None,
+                            None,
+                            Some(vec![ToolCall {
+                                id: "images".into(),
+                                arguments:
+                                    r#"{"title":"inspect","risk":"readonly","command":"true"}"#
+                                        .into(),
+                            }]),
+                            None,
+                        ),
+                    )
+                    .unwrap();
+                store
+                    .start_bash_attempt(&session.id, calls[0], false)
+                    .unwrap();
+                store
+                    .persist_bash_result(
+                        &session.id,
+                        BashResultRecord {
+                            bash_call_id: calls[0],
+                            outcome: "completed",
+                            exit_code: Some(0),
+                            duration_ms: Some(1),
+                        },
+                        &"old output".repeat(1000),
+                        &vec![
+                            ToolAttachment {
+                                attachment: image,
+                                detail: crate::provider::ImageDetail::Original,
+                                object_sha256: None,
+                            };
+                            2
+                        ],
+                    )
+                    .unwrap();
+                if last_is_user {
+                    store
+                        .append_message(
+                            &session.id,
+                            &Message::assistant(Some("observed".into()), None, None, None),
+                        )
+                        .unwrap();
+                    store
+                        .start_turn(&session.id, "/tmp", None, &prompt)
+                        .unwrap();
+                }
+                let initial_events = store.audit_events(&session.id).unwrap().len();
+                let mut config = test_config();
+                config.compaction.enabled = enabled;
+                let model = crate::models::resolve_model_ref(&config, "test/fake-model").unwrap();
+                let seen = Arc::new(Mutex::new(Vec::new()));
+                let mut renderer = Renderer::with_format(OutputFormat::Final);
+                let mut agent = AgentLoop {
+                    config: &config,
+                    system_prompt_source: SystemPromptSource::fixed("refreshed"),
+                    model: ResolvedModelChoice::fixed(model),
+                    provider: Box::new(SizeErrorProvider {
+                        api,
+                        failures,
+                        seen: seen.clone(),
+                    }),
+                    store: &store,
+                    session_id: &session.id,
+                    model_context_window: None,
+                    renderer: &mut renderer,
+                };
+                let result = if manual {
+                    agent.run_manual_compaction(None).await
+                } else {
+                    agent.run_turn().await
+                };
+                assert_eq!(result.is_ok(), failures == 1);
+                let count = if failures == 1 {
+                    3
+                } else if enabled || manual {
+                    2
+                } else {
+                    1
+                };
+                assert_eq!(seen.lock().unwrap().len(), count);
+                if enabled || manual {
+                    let emergency = seen.lock().unwrap()[1].to_string();
+                    assert_eq!(emergency.matches("image/png").count(), 2);
+                    assert!(
+                        emergency.contains("Attachment unavailable during emergency compaction")
+                    );
+                    assert_eq!(
+                        emergency.contains(compaction::EMERGENCY_OUTPUT_UNAVAILABLE),
+                        last_is_user
+                    );
+                    assert_eq!(
+                        emergency.contains(&"old output".repeat(1000)),
+                        !last_is_user
+                    );
+                    if failures != 1 {
+                        assert!(agent.resume_turn().await.is_err());
+                        let requests = seen.lock().unwrap();
+                        assert_eq!(requests.len(), count + 1);
+                        assert_eq!(requests[count], requests[count - 1]);
+                    }
+                }
+                let audit = store.audit_events(&session.id).unwrap();
+                let requests = audit
+                    .iter()
+                    .skip(initial_events)
+                    .filter(|event| event["type"] == "provider_requested")
+                    .collect::<Vec<_>>();
+                let seen = seen.lock().unwrap();
+                assert_eq!(requests.len(), seen.len());
+                for (event, native) in requests.iter().zip(seen.iter()) {
+                    assert_eq!(
+                        store
+                            .reconstruct_provider_request(
+                                &session.id,
+                                event["exchange_id"].as_str().unwrap()
+                            )
+                            .unwrap(),
+                        *native
+                    );
+                }
+                assert_eq!(
+                    store.context_epoch(&session.id).unwrap(),
+                    u64::from(failures == 1)
+                );
+            }
+        }
     }
 
     #[tokio::test]

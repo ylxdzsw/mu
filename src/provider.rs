@@ -944,14 +944,14 @@ impl ProviderError {
 
     pub fn disposition(&self) -> ProviderDisposition {
         match self {
-            Self::ContextLength { .. } => ProviderDisposition::ContextRecovery,
+            Self::ContextLength { .. } | Self::RequestTooLarge { .. } => {
+                ProviderDisposition::ContextRecovery
+            }
             Self::ModelUnavailable { .. } | Self::AuthFailed { .. } => ProviderDisposition::Advance,
             Self::Overloaded { .. } | Self::RateLimit { .. } | Self::Transport(_) => {
                 ProviderDisposition::Retry
             }
-            Self::RequestTooLarge { .. } | Self::BadRequestPermanent { .. } | Self::Protocol(_) => {
-                ProviderDisposition::Fail
-            }
+            Self::BadRequestPermanent { .. } | Self::Protocol(_) => ProviderDisposition::Fail,
         }
     }
 
@@ -1129,16 +1129,6 @@ fn classify_provider_error(
     raw: &str,
     retry_after: Option<Duration>,
 ) -> ProviderError {
-    if let Some(nested) = nested_gateway_error(error) {
-        let nested_status = embedded_status(&nested).or(status);
-        return classify_provider_error(
-            nested_status,
-            nested.get("error").unwrap_or(&nested),
-            &nested.to_string(),
-            retry_after,
-        );
-    }
-
     let code = error.get("code").and_then(Value::as_str).unwrap_or("");
     let error_type = error.get("type").and_then(Value::as_str).unwrap_or("");
     let message = error
@@ -1155,6 +1145,19 @@ fn classify_provider_error(
     let code_is = |expected: &str| {
         code.eq_ignore_ascii_case(expected) || error_type.eq_ignore_ascii_case(expected)
     };
+
+    if status == Some(413) || code_is("request_too_large") {
+        return ProviderError::RequestTooLarge { status, detail };
+    }
+    if let Some(nested) = nested_gateway_error(error) {
+        let nested_status = embedded_status(&nested).or(status);
+        return classify_provider_error(
+            nested_status,
+            nested.get("error").unwrap_or(&nested),
+            &nested.to_string(),
+            retry_after,
+        );
+    }
 
     if code_is("context_length_exceeded") || code_is("string_above_max_length") {
         return ProviderError::ContextLength { detail };
@@ -1239,7 +1242,6 @@ fn classify_provider_error(
     }
 
     match status {
-        Some(413) => ProviderError::RequestTooLarge { status, detail },
         Some(408 | 425 | 500 | 502 | 503 | 504 | 529) => ProviderError::Overloaded {
             status,
             retry_after,
@@ -1667,6 +1669,23 @@ mod tests {
     fn http_and_stream_errors_share_semantic_classification() {
         let cases = [
             (
+                400,
+                serde_json::json!({
+                    "type": "request_too_large",
+                    "message": "request exceeds 16 MB"
+                }),
+                "request_too_large",
+                ProviderDisposition::ContextRecovery,
+            ),
+            (
+                502,
+                serde_json::json!({
+                    "metadata": {"raw": "{\"status\":413,\"error\":{\"message\":\"payload too large\"}}"}
+                }),
+                "request_too_large",
+                ProviderDisposition::ContextRecovery,
+            ),
+            (
                 429,
                 serde_json::json!({
                     "code": "rate_limit_exceeded",
@@ -1781,6 +1800,16 @@ mod tests {
             classify_http_error(413, "Payload Too Large".into(), None),
             ProviderError::RequestTooLarge { .. }
         ));
+        assert_eq!(
+            classify_http_error(
+                413,
+                r#"{"error":{"type":"server_error","message":"input length exceeds maximum"}}"#
+                    .into(),
+                None
+            )
+            .disposition(),
+            ProviderDisposition::ContextRecovery,
+        );
         assert!(matches!(
             classify_http_error(
                 400,

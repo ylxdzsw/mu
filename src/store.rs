@@ -1351,7 +1351,7 @@ impl Store {
                     exchange_id,
                     error_class,
                     ..
-                } if error_class == "context_length"
+                } if matches!(error_class.as_str(), "context_length" | "request_too_large")
                     && exchange_attempts.get(exchange_id.as_str()).copied()
                         != Some(Some("emergency")) =>
                 {
@@ -1367,7 +1367,9 @@ impl Store {
                             trigger: CompactionTrigger::Emergency,
                             context_tokens: compaction.before_context_tokens,
                             context_window: compaction.before_context_window,
-                            reason: Some("compaction request exceeded provider context".into()),
+                            reason: Some(format!(
+                                "compaction request exceeded provider limit ({error_class})"
+                            )),
                         });
                     }
                 }
@@ -1411,6 +1413,16 @@ impl Store {
     pub fn load_context_messages(&self, session_id: &str) -> Result<Vec<Message>> {
         let journal = self.load(session_id)?;
         self.context(&journal)
+    }
+
+    /// The index identifies a real user prompt or Bash result, never a derived
+    /// location, checkpoint, compaction prompt, or resume message.
+    pub fn load_context_with_last_input(
+        &self,
+        session_id: &str,
+    ) -> Result<(Vec<Message>, Option<usize>)> {
+        let journal = self.load(session_id)?;
+        self.context_projection(&journal, i64::MAX, &HashSet::new())
     }
 
     // Append-only turn, tool, and provider events.
@@ -1614,7 +1626,7 @@ impl Store {
                         error_class,
                         ..
                     } if exchanges.contains_key(exchange_id.as_str()) => Some(
-                        error_class == "context_length"
+                        matches!(error_class.as_str(), "context_length" | "request_too_large")
                             || exchanges[exchange_id.as_str()] == Some("emergency"),
                     ),
                     Event::ProviderCompleted { exchange_id, .. }
@@ -2173,6 +2185,9 @@ impl Store {
             return Ok(false);
         }
         let through_seq = request_seq.saturating_sub(1);
+        if recipe.input.get("emergency_preserved_message").is_some() {
+            return Ok(false);
+        }
         if let Some(elided) = recipe.input.get("emergency_elided_call_ids") {
             let elided = serde_json::from_value::<Vec<i64>>(elided.clone())
                 .context("invalid emergency Bash elision ids in request recipe")?;
@@ -2551,7 +2566,13 @@ impl Store {
             })
             .transpose()?
             .unwrap_or_default();
-        let messages = self.context_until_with_elisions(journal, through_seq, &elided_call_ids)?;
+        let mut messages =
+            self.context_until_with_elisions(journal, through_seq, &elided_call_ids)?;
+        if let Some(preserved) = recipe.input.get("emergency_preserved_message") {
+            let preserved = serde_json::from_value::<Option<usize>>(preserved.clone())
+                .context("invalid emergency preserved message in request recipe")?;
+            crate::compaction::strip_emergency_attachments(&mut messages, preserved);
+        }
         let origins: Vec<ReplayOrigin> =
             serde_json::from_value(recipe.input["native_replay_origins"].clone())
                 .context("agent request recipe has no valid native replay origins")?;
@@ -2632,6 +2653,17 @@ impl Store {
         max_seq: i64,
         elided_call_ids: &HashSet<i64>,
     ) -> Result<Vec<Message>> {
+        Ok(self
+            .context_projection(journal, max_seq, elided_call_ids)?
+            .0)
+    }
+
+    fn context_projection(
+        &self,
+        journal: &Journal,
+        max_seq: i64,
+        elided_call_ids: &HashSet<i64>,
+    ) -> Result<(Vec<Message>, Option<usize>)> {
         let system = journal
             .events
             .iter()
@@ -2648,6 +2680,7 @@ impl Store {
         });
         let through_seq = applied.map(|line| line.seq);
         let mut messages = vec![Message::System { content: system }];
+        let mut last_input = None;
         let prompts = queued_prompt_records(journal);
         let exchange_origins = journal
             .events
@@ -2693,6 +2726,9 @@ impl Store {
                         turn.cwd.to_string(),
                         turn.git_worktree_root.map(str::to_string),
                     ));
+                    if matches!(event, Event::PromptMaterialized { .. }) {
+                        last_input = Some(messages.len());
+                    }
                     messages.push(Message::User {
                         content: self.hydrate_user_content(turn.prompt)?,
                     });
@@ -2740,6 +2776,7 @@ impl Store {
                     ..
                 } => {
                     let call = find_call(journal, *call_id).context("Bash result claim missing")?;
+                    last_input = Some(messages.len());
                     if elided_call_ids.contains(call_id) {
                         found_elisions.insert(*call_id);
                         messages.push(Message::Tool {
@@ -2763,6 +2800,7 @@ impl Store {
                 } => {
                     let call = find_call(journal, *call_id)
                         .context("not-attempted Bash result claim missing")?;
+                    last_input = Some(messages.len());
                     messages.push(Message::Tool {
                         content: output.clone(),
                         attachments: Vec::new(),
@@ -2775,7 +2813,7 @@ impl Store {
         if &found_elisions != elided_call_ids {
             bail!("emergency Bash elision references no visible tool result")
         }
-        Ok(messages)
+        Ok((messages, last_input))
     }
 
     // Content attachments and provider payload objects.
