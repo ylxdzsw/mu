@@ -213,6 +213,13 @@ should apply on every turn in that project.
 
 Keep `AGENTS.md` short. Put reusable task workflows in skills instead.
 
+The CLI flag `--no-context` omits both AGENTS.md blocks and all skill guidance
+when a system prompt is assembled, retaining the system preamble and runtime.
+It applies only to assembly during that invocation (session creation or
+successful compaction), not to an existing epoch's persisted prompt. It is not
+a config or session setting; later assembly without the flag restores normal
+injection. Configuration, environment loading, and custom commands are unchanged.
+
 ## Custom commands
 
 A custom command is a regular instruction file whose first line contains a

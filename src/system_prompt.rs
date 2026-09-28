@@ -22,15 +22,21 @@ const EXPORT_PREAMBLE_CLOSE: &str = " -->";
 pub struct SystemPromptSource {
     global_config_dir: PathBuf,
     project_config_dir: Option<PathBuf>,
+    no_context: bool,
     #[cfg(test)]
     fixed: Option<String>,
 }
 
 impl SystemPromptSource {
-    pub fn new(global_config_dir: &Path, project_config_dir: Option<&Path>) -> Self {
+    pub fn new(
+        global_config_dir: &Path,
+        project_config_dir: Option<&Path>,
+        no_context: bool,
+    ) -> Self {
         Self {
             global_config_dir: global_config_dir.to_path_buf(),
             project_config_dir: project_config_dir.map(Path::to_path_buf),
+            no_context,
             #[cfg(test)]
             fixed: None,
         }
@@ -41,7 +47,11 @@ impl SystemPromptSource {
         if let Some(prompt) = &self.fixed {
             return Ok(prompt.clone());
         }
-        build_system_prompt(&self.global_config_dir, self.project_config_dir.as_deref())
+        build_system_prompt(
+            &self.global_config_dir,
+            self.project_config_dir.as_deref(),
+            self.no_context,
+        )
     }
 
     #[cfg(test)]
@@ -49,6 +59,7 @@ impl SystemPromptSource {
         Self {
             global_config_dir: PathBuf::new(),
             project_config_dir: None,
+            no_context: false,
             fixed: Some(prompt.into()),
         }
     }
@@ -61,20 +72,8 @@ pub fn role_preamble() -> &'static str {
 pub fn build_system_prompt(
     global_config_dir: &Path,
     project_config_dir: Option<&Path>,
+    no_context: bool,
 ) -> anyhow::Result<String> {
-    let index = scan_instruction_index(global_config_dir, project_config_dir)?;
-    Ok(assemble_prompt(
-        &index.skills,
-        global_config_dir,
-        project_config_dir,
-    ))
-}
-
-pub fn assemble_prompt(
-    skills: &[SkillMeta],
-    global_config_dir: &Path,
-    project_config_dir: Option<&Path>,
-) -> String {
     let mut parts = vec![format!(
         "<system_preamble>\n{}\n</system_preamble>",
         role_preamble()
@@ -90,7 +89,12 @@ pub fn assemble_prompt(
     }
     parts.push(format!("<runtime>\n{runtime}\n</runtime>"));
 
-    let skills_block = format_skills_block(skills);
+    if no_context {
+        return Ok(parts.join("\n\n"));
+    }
+
+    let index = scan_instruction_index(global_config_dir, project_config_dir)?;
+    let skills_block = format_skills_block(&index.skills);
     if !skills_block.is_empty() {
         parts.push(skills_block);
     }
@@ -104,7 +108,7 @@ pub fn assemble_prompt(
         parts.push(local);
     }
 
-    parts.join("\n\n")
+    Ok(parts.join("\n\n"))
 }
 
 /// Build the portable export projection emitted by `mu context --export`.
@@ -298,7 +302,7 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::{
-        EXPORT_PREAMBLE, SystemPromptSource, assemble_context, assemble_prompt, build_context,
+        EXPORT_PREAMBLE, SystemPromptSource, assemble_context, build_context, build_system_prompt,
         export_preamble, json_string_for_html_comment, role_preamble,
     };
     use crate::skills::{InstructionScope, SkillMeta, SkillRequirements};
@@ -356,7 +360,7 @@ mod tests {
         fs::write(global.join("AGENTS.md"), "Global instructions.\n").unwrap();
         fs::write(project.join("AGENTS.md"), "Project instructions.").unwrap();
 
-        let prompt = assemble_prompt(&[], &global, Some(&project));
+        let prompt = build_system_prompt(&global, Some(&project), false).unwrap();
         let global_path = global
             .join("AGENTS.md")
             .canonicalize()
@@ -380,10 +384,51 @@ mod tests {
     }
 
     #[test]
+    fn no_context_keeps_only_preamble_and_runtime() {
+        let root = temp_dir("no-context");
+        let global = root.join("global");
+        let project = root.join("project/.mu");
+        fs::create_dir_all(&global).unwrap();
+        fs::create_dir_all(&project).unwrap();
+        fs::write(global.join("AGENTS.md"), "Global instructions.").unwrap();
+        fs::write(project.join("AGENTS.md"), "Project instructions.").unwrap();
+        fs::write(
+            project.join("example.md"),
+            "---\nname: example\ndescription: Example skill.\n---\nSkill instructions.\n",
+        )
+        .unwrap();
+
+        let full = build_system_prompt(&global, Some(&project), false).unwrap();
+        assert!(full.contains("<skills>"));
+        assert!(full.contains("Example skill."));
+        assert!(full.contains("Global instructions."));
+        assert!(full.contains("Project instructions."));
+
+        let source = SystemPromptSource::new(&global, Some(&project), true);
+        let reduced = source.build().unwrap();
+        assert!(reduced.starts_with(&format!(
+            "<system_preamble>\n{}\n</system_preamble>\n\n<runtime>\n",
+            role_preamble()
+        )));
+        assert!(reduced.contains(&format!(
+            "mu project root: {}",
+            project.parent().unwrap().display()
+        )));
+        assert!(reduced.ends_with("</runtime>"));
+        assert!(!reduced.contains("<skills>"));
+        assert!(!reduced.contains("<agents_md"));
+
+        // A later assembly from the same invocation still omits updated guidance.
+        fs::write(global.join("AGENTS.md"), "Updated instructions.").unwrap();
+        assert!(!source.build().unwrap().contains("Updated instructions."));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn system_prompt_source_reads_latest_instructions_on_each_build() {
         let global = temp_dir("prompt-source-global");
         fs::write(global.join("AGENTS.md"), "First instructions.").unwrap();
-        let source = SystemPromptSource::new(&global, None);
+        let source = SystemPromptSource::new(&global, None, false);
 
         assert!(source.build().unwrap().contains("First instructions."));
         fs::write(global.join("AGENTS.md"), "Second instructions.").unwrap();

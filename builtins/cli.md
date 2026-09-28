@@ -8,7 +8,7 @@ selected output, persists completed state, and exits. Run `mu --help` or
 
 ```text
 mu [-s <session-id> | -c] [-m <model>] [-a <file> ...]
-   [-o final|concise|detail|full]
+   [-o final|concise|detail|full] [--no-context]
 mu [turn options] <prompt-file-or-command>
 ```
 
@@ -25,6 +25,16 @@ Session and model selection:
 - `-m|--model '(provider)/model[:effort]'`: use fallback starting at that
   configured provider. Quote the parentheses in shell commands.
 - `--trap off|destructive|reversible|all`: set the turn's Bash trap level.
+
+`--no-context` skips skills (including built-ins and their loading guidance)
+and global/project `AGENTS.md` when assembling a system prompt. The system
+preamble and `<runtime>` remain. It applies only at session creation or a
+successful compaction during this invocation; it does not force compaction or
+change an existing epoch's prompt. The resulting prompt persists until the
+next compaction, where omitting the flag restores normal injection.
+Compaction itself uses the old prompt, and existing conversation/checkpoint
+content is not scrubbed. Configuration, `.env`, tools, location reminders, and
+explicit prompt/custom-command loading are unchanged.
 
 An explicit `-o|--output` overrides `config.jsonc`:
 
@@ -96,7 +106,7 @@ command is invoked by its exact relative path, such as `/review` (or
 Create minimal project metadata. It defaults to the current directory and
 refuses a nested Mu project unless `--force` is explicit.
 
-### `mu new`
+### `mu new [--no-context]`
 
 Create a model-free session and print its id. It does not select that session
 as `current-session`.
@@ -125,12 +135,15 @@ Inspect resolved session, model, context, scope, and output state.
 `--include-git`, `--include-session-details`, `--include-models`,
 `--include-commands`, and `--include-skills` add their corresponding data.
 
-### `mu context [--export]`
+### `mu context [--export | --no-context]`
 
 Without `--export`, print the assembled system prompt Mu would use.
 `--export` emits user `AGENTS.md`, non-built-in skills, environment-file
 guidance, and a pointer to `mu-doc` for a foreign agent. It never contacts a
 provider.
+
+`--no-context` previews only the system preamble and runtime. It cannot be
+combined with `--export`.
 
 ### `mu cat [<prompt-file-or-command>]`
 
@@ -139,7 +152,7 @@ creating session state. With no target, stdin is the prompt. Interactive output
 includes provenance and rendered Markdown; redirected output is the exact
 composed prompt.
 
-### `mu retry [selection options] [-o <format>] [--trap <level>]`
+### `mu retry [selection options] [-o <format>] [--trap <level>] [--no-context]`
 
 Resume an interrupted turn, defaulting to `current-session`. It normalizes the
 interrupted provider tail, restores the submitted working directory, resumes
@@ -148,12 +161,16 @@ continuing without a new user prompt. Started higher-risk calls are not
 repeated. A clean session is a no-op.
 Without `--trap`, retry reuses the persisted turn policy. An explicit value
 overrides it only for this invocation.
+`--no-context` affects only a new system prompt assembled when this invocation
+successfully applies compaction, including recovery of an already saved summary.
 
-### `mu compact [-s <id>] [-o <format>] [--trap <level>]`
+### `mu compact [-s <id>] [-o <format>] [--trap <level>] [--no-context]`
 
 Force compaction for a session, defaulting to `current-session` and the
 configured output density. `--output` overrides configuration. Non-terminal
 stdin is an optional custom focus instruction.
+`--no-context` omits skills and `AGENTS.md` from the new epoch's system prompt,
+not from the compaction request itself.
 
 Compaction itself is a persisted synthetic agent turn. If it is interrupted,
 that session rejects new prompts and another `mu compact`; use `mu retry` to

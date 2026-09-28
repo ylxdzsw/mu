@@ -91,6 +91,10 @@ struct TurnArgs {
     /// Trap Bash calls at this declared risk level
     #[arg(long, value_enum)]
     trap: Option<bash::TrapLevel>,
+
+    /// Omit skills and AGENTS.md when assembling a system prompt; keep preamble and runtime
+    #[arg(long)]
+    no_context: bool,
 }
 
 #[derive(ClapArgs, Debug, Clone)]
@@ -105,6 +109,10 @@ struct RetryArgs {
     /// Override the persisted trap level for this retry
     #[arg(long, value_enum)]
     trap: Option<bash::TrapLevel>,
+
+    /// Omit skills and AGENTS.md if this retry applies a compaction
+    #[arg(long)]
+    no_context: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, ValueEnum, Deserialize, Serialize)]
@@ -128,7 +136,11 @@ enum Command {
         force: bool,
     },
     /// Create a new session and print its id
-    New,
+    New {
+        /// Omit skills and AGENTS.md; keep the system preamble and runtime
+        #[arg(long)]
+        no_context: bool,
+    },
     /// List recent sessions
     Sessions {
         #[arg(long, default_value_t = 20)]
@@ -156,6 +168,10 @@ enum Command {
         /// instead of the raw system prompt mu itself would use.
         #[arg(long)]
         export: bool,
+
+        /// Omit skills and AGENTS.md; keep the system preamble and runtime
+        #[arg(long, conflicts_with = "export")]
+        no_context: bool,
     },
     /// Preview the resolved user prompt
     Cat {
@@ -176,6 +192,10 @@ enum Command {
         /// Trap Bash calls at this declared risk level
         #[arg(long, value_enum)]
         trap: Option<bash::TrapLevel>,
+
+        /// Omit skills and AGENTS.md from the new epoch's system prompt
+        #[arg(long)]
+        no_context: bool,
     },
 }
 
@@ -276,6 +296,7 @@ struct RunTurnArgs<'a> {
     model: ResolvedModelChoice,
     output: OutputFormat,
     trap: bash::TrapLevel,
+    no_context: bool,
     /// A short notice rendered before the turn (e.g. "resuming interrupted turn").
     preamble_notice: Option<&'a str>,
     model_fallback: Option<runtime::ModelFallback>,
@@ -646,13 +667,14 @@ async fn run() -> Result<()> {
             );
             return Ok(());
         }
-        Some(Command::New) => {
+        Some(Command::New { no_context }) => {
             let store_path = scope.session_store_path();
             paths::ensure_project_layout(&scope)?;
             let store = store::Store::open(&store_path)?;
             let session = store.create_session_seeded(&system_prompt::build_system_prompt(
                 &paths::global_dir(),
                 project_config_dir.as_deref(),
+                no_context,
             )?)?;
             println!("{}", session.id);
             return Ok(());
@@ -761,16 +783,15 @@ async fn run() -> Result<()> {
             }
             return Ok(());
         }
-        Some(Command::Context { export }) => {
-            // Introspection only: no provider, and no config load. Both builders
-            // scan the instruction index and read AGENTS.md directly, which
-            // tolerate a missing ~/.mu, so this works in any directory.
+        Some(Command::Context { export, no_context }) => {
+            // Introspection only: no provider or config load; missing ~/.mu is fine.
             let context = if export {
                 system_prompt::build_context(&paths::global_dir(), project_config_dir.as_deref())?
             } else {
                 system_prompt::build_system_prompt(
                     &paths::global_dir(),
                     project_config_dir.as_deref(),
+                    no_context,
                 )?
             };
             if !context.is_empty() {
@@ -837,6 +858,7 @@ async fn run() -> Result<()> {
                 model: selection.model,
                 output,
                 trap: retry_args.trap.unwrap_or(stored_trap),
+                no_context: retry_args.no_context,
                 preamble_notice: Some("[mu] resuming incomplete turn"),
                 model_fallback: selection.fallback,
                 mode: RunTurnMode::Resume,
@@ -849,6 +871,7 @@ async fn run() -> Result<()> {
             session,
             output,
             trap,
+            no_context,
         }) => {
             let custom_focus = load_optional_stdin_instruction()?;
             let config =
@@ -886,6 +909,7 @@ async fn run() -> Result<()> {
                 model,
                 output,
                 trap,
+                no_context,
                 preamble_notice: None,
                 model_fallback: None,
                 mode: RunTurnMode::ManualCompaction(custom_focus.as_deref()),
@@ -919,7 +943,8 @@ fn validate_cli_args(args: &Args) -> Result<()> {
         || args.turn.selection.model.is_some()
         || !args.turn.attachments.is_empty()
         || args.turn.output.is_some()
-        || args.turn.trap.is_some();
+        || args.turn.trap.is_some()
+        || args.turn.no_context;
     let reserved_prompt = args
         .prompt_file
         .as_ref()
@@ -967,6 +992,7 @@ async fn run_turn_from_source(
         store.create_session_seeded(&system_prompt::build_system_prompt(
             &paths::global_dir(),
             project_config_dir,
+            turn.no_context,
         )?)?
     };
     let session_id = session.id.clone();
@@ -1009,6 +1035,7 @@ async fn run_turn_from_source(
         model: resolved.model,
         output,
         trap,
+        no_context: turn.no_context,
         preamble_notice: None,
         model_fallback: resolved.model_fallback,
         mode: RunTurnMode::QueuedPrompt,
@@ -1187,6 +1214,7 @@ async fn run_turn(args: RunTurnArgs<'_>) -> Result<()> {
         model,
         output,
         trap,
+        no_context,
         preamble_notice,
         model_fallback,
         mode,
@@ -1218,6 +1246,7 @@ async fn run_turn(args: RunTurnArgs<'_>) -> Result<()> {
         system_prompt_source: system_prompt::SystemPromptSource::new(
             &paths::global_dir(),
             project_config_dir,
+            no_context,
         ),
         model,
         provider,
@@ -1443,6 +1472,32 @@ mod tests {
     }
 
     #[test]
+    fn no_context_is_local_to_prompt_assembling_commands() {
+        assert!(
+            Args::try_parse_from(["mu", "--no-context"])
+                .unwrap()
+                .turn
+                .no_context
+        );
+        for name in ["new", "context", "retry", "compact"] {
+            let args = Args::try_parse_from(["mu", name, "--no-context"]).unwrap();
+            validate_cli_args(&args).unwrap();
+            let enabled = match args.command.unwrap() {
+                Command::New { no_context }
+                | Command::Context { no_context, .. }
+                | Command::Compact { no_context, .. } => no_context,
+                Command::Retry(args) => args.no_context,
+                other => panic!("unexpected command: {other:?}"),
+            };
+            assert!(enabled);
+        }
+        assert!(Args::try_parse_from(["mu", "context", "--export", "--no-context"]).is_err());
+        assert!(Args::try_parse_from(["mu", "status", "--no-context"]).is_err());
+        let misplaced = Args::try_parse_from(["mu", "--no-context", "new"]).unwrap();
+        assert!(validate_cli_args(&misplaced).is_err());
+    }
+
+    #[test]
     fn flattened_commands_use_command_local_arguments() {
         let compact = Args::try_parse_from(["mu", "compact"]).unwrap();
         assert!(matches!(
@@ -1451,6 +1506,7 @@ mod tests {
                 session: None,
                 output: None,
                 trap: None,
+                no_context: false,
             })
         ));
         let selected_compact =
@@ -1461,6 +1517,7 @@ mod tests {
                 session: Some(ref session),
                 output: Some(OutputFormat::Full),
                 trap: None,
+                no_context: false,
             }) if session == "ses_example"
         ));
 

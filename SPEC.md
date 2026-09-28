@@ -796,6 +796,21 @@ session only at a successful compaction boundary. Its fixed order is:
 4. global `<agents_md>`;
 5. project `<agents_md>`.
 
+`--no-context` omits the skills document (including built-in skills and loading
+guidance) and both AGENTS.md blocks, retaining the system preamble and runtime.
+It controls assembly during the current invocation, not a persistent session
+setting. It neither rebuilds an existing epoch nor forces compaction. The
+assembled prompt remains in effect until the next successful compaction; an
+assembly without the flag restores normal injection.
+
+The flag applies to ordinary turns, `new`, `compact`, and `retry`, and to the
+`context` preview. On retry it matters only if compaction is successfully
+applied, including recovery of a durable summary awaiting application. The
+compaction request still uses the old epoch's prompt. Existing conversation or
+checkpoint content is not scrubbed. Configuration, environment loading, tools,
+turn-location reminders, and explicit prompt/custom-command loading are
+unchanged. `context --no-context` conflicts with `--export`.
+
 Current working directory and Git worktree root are turn facts, not permanent
 system facts. Context projection adds location information when retained turns
 move between directories.
@@ -809,7 +824,7 @@ A default invocation runs one turn:
 
 ```text
 mu [-s ID | -c] [-m MODEL] [-a FILE ...]
-   [-o final|concise|detail|full] [PROMPT_FILE_OR_COMMAND]
+   [-o final|concise|detail|full] [--no-context] [PROMPT_FILE_OR_COMMAND]
 ```
 
 Without a positional target, stdin is the complete prompt. A positional name
