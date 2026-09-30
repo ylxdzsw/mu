@@ -1,5 +1,5 @@
 pkgname=mu
-pkgver=0.3.0
+pkgver=0.4.0
 pkgrel=1
 pkgdesc='Small composable agent runtime for the terminal'
 arch=('x86_64')
