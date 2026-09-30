@@ -471,12 +471,12 @@ _mu_zsh_model_completion_candidates() {
             )
           | $model.efforts[]? | ":" + .
         elif ($fragment | contains(":")) then
-          ($models[] as $model | $model.efforts[]? as $effort
-            | "\($model.canonical):\($effort)",
-              "\($model.short):\($effort)")
+          ("short", "canonical") as $key
+          | $models[] as $model | $model.efforts[]? as $effort
+          | "\($model[$key]):\($effort)"
         else
-          $models[]
-          | .canonical, .short
+          ("short", "canonical") as $key
+          | $models[] | .[$key]
         end
       ]
     | dedup
@@ -642,7 +642,10 @@ _mu_zsh_fallback_completion() {
   (( ${#candidates[@]} )) || return 1
 
   suffix=' '
-  [[ "$left" == "/model "* ]] && suffix=''
+  if [[ "$left" == "/model "* ]]; then
+    compadd -V mu-model -Q -S '' -- "${candidates[@]}"
+    return
+  fi
   [[ "$left" == "/trap "* ]] && suffix=''
   compadd -Q -S "$suffix" -- "${candidates[@]}"
 }
@@ -682,7 +685,11 @@ _mu_zsh_completion_system() {
   (( ${#candidates[@]} )) || return 1
 
   suffix=' '
-  [[ "$left" == "/model "* ]] && suffix=''
+  if [[ "$left" == "/model "* ]]; then
+    _wanted -V mu-model expl 'model' \
+      compadd -Q -S '' -- "${candidates[@]}"
+    return
+  fi
   [[ "$left" == "/trap "* ]] && suffix=''
   _wanted mu-slash-command expl 'mu slash command' \
     compadd -Q -S "$suffix" -- "${candidates[@]}"

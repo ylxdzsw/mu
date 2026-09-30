@@ -459,22 +459,22 @@ function _mu_fish_model_candidates --argument-names fragment
     test (count $records) -gt 0; or return 0
 
     set -l matches
-    for record in $records
-        set -l fields (string split \t -- "$record")
-        set -l canonical "$fields[1]"
-        set -l model_id "$fields[2]"
-        set -l efforts
-        set -q fields[3]; and set efforts (string split , -- "$fields[3]")
+    for field_index in 2 1
+        for record in $records
+            set -l fields (string split \t -- "$record")
+            set -l model "$fields[$field_index]"
+            test -n "$model"; or continue
+            set -l efforts
+            set -q fields[3]; and set efforts (string split , -- "$fields[3]")
 
-        if string match -q '*:*' -- "$fragment"
-            for effort in $efforts
-                test -n "$effort"; or continue
-                test -n "$canonical"; and not contains -- "$canonical:$effort" $matches; and set -a matches "$canonical:$effort"
-                test -n "$model_id"; and not contains -- "$model_id:$effort" $matches; and set -a matches "$model_id:$effort"
+            if string match -q '*:*' -- "$fragment"
+                for effort in $efforts
+                    test -n "$effort"; or continue
+                    contains -- "$model:$effort" $matches; or set -a matches "$model:$effort"
+                end
+            else
+                contains -- "$model" $matches; or set -a matches "$model"
             end
-        else
-            test -n "$canonical"; and not contains -- "$canonical" $matches; and set -a matches "$canonical"
-            test -n "$model_id"; and not contains -- "$model_id" $matches; and set -a matches "$model_id"
         end
     end
 
