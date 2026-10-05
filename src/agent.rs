@@ -136,7 +136,6 @@ impl<'a> AgentLoop<'a> {
     }
 
     pub async fn run_queued_turn(&mut self) -> Result<TurnResult> {
-        let mut compaction_usage = Usage::default();
         let queued = self
             .store
             .queued_prompt(self.session_id)?
@@ -164,56 +163,19 @@ impl<'a> AgentLoop<'a> {
                 candidate_tokens,
                 None,
             )?;
-            let compacted = self
-                .run_turn_inner(&mut String::new(), NextRequest::User)
-                .await?;
-            if !compacted.awaiting_user {
-                return Ok(compacted);
-            }
-            compaction_usage = compacted.usage;
+        } else {
+            self.store
+                .materialize_queued_prompt(self.session_id)?
+                .ok_or_else(|| anyhow::anyhow!("queued prompt disappeared"))?;
         }
-        self.store
-            .materialize_queued_prompt(self.session_id)?
-            .ok_or_else(|| anyhow::anyhow!("queued prompt disappeared"))?;
-        let mut result = self
-            .run_turn_inner(&mut String::new(), NextRequest::User)
-            .await?;
-        merge_usage(&mut result.usage, &compaction_usage);
-        Ok(result)
+        self.run_turn_inner(&mut String::new(), NextRequest::User)
+            .await
     }
 
     pub async fn resume_turn(&mut self) -> Result<TurnResult> {
-        if let Some(pending) = self.store.pending_compaction(self.session_id)? {
-            let compacted = if let Some(summary) = self
-                .store
-                .pending_compaction_summary(self.session_id, &pending.turn_id)?
-            {
-                let mode = pending.mode;
-                self.finish_compaction(&pending)?;
-                let context = self.current_context_estimate()?;
-                TurnResult {
-                    usage: Usage::default(),
-                    context_tokens: context.tokens,
-                    context_estimated: !context.reported,
-                    context_window: self.model_context_window,
-                    final_assistant: Some(summary),
-                    awaiting_user: mode == CompactionMode::AwaitUser,
-                    soft_interrupted: false,
-                    trapped: false,
-                    pending_bash_calls: 0,
-                }
-            } else {
-                self.run_turn_inner(&mut String::new(), NextRequest::Continue)
-                    .await?
-            };
-            if !compacted.awaiting_user {
-                return Ok(compacted);
-            }
-            if self.store.queued_prompt(self.session_id)?.is_none() {
-                return Ok(compacted);
-            }
-        }
-        if self.store.queued_prompt(self.session_id)?.is_some() {
+        if self.store.pending_compaction(self.session_id)?.is_none()
+            && self.store.queued_prompt(self.session_id)?.is_some()
+        {
             return self.run_queued_turn().await;
         }
         self.run_turn_inner(&mut String::new(), NextRequest::Continue)
@@ -282,6 +244,33 @@ impl<'a> AgentLoop<'a> {
 
         let mut live_provider_retries = 0;
         loop {
+            // A live completion and a summary recovered after a crash share the
+            // same application and handoff, without another summary request.
+            if let Some(state) = &active_compaction
+                && self
+                    .store
+                    .pending_compaction_summary(self.session_id, &state.pending.turn_id)?
+                    .is_some()
+            {
+                self.finish_compaction(&state.pending)?;
+                next_request = match state.pending.mode {
+                    CompactionMode::AwaitUser => {
+                        if self
+                            .store
+                            .materialize_queued_prompt(self.session_id)?
+                            .is_none()
+                        {
+                            awaiting_user = true;
+                            break;
+                        }
+                        NextRequest::User
+                    }
+                    CompactionMode::ContinueTurn => NextRequest::Continue,
+                };
+                active_compaction = None;
+                context = self.load_context()?;
+                live_provider_retries = 0;
+            }
             if bash::soft_interrupt_requested() {
                 return self.soft_interrupt_result(total_usage);
             }
@@ -609,14 +598,7 @@ impl<'a> AgentLoop<'a> {
             };
 
             if let Some(u) = &stream_result.usage {
-                total_usage.input_tokens += u.input_tokens;
-                total_usage.cache_read_input_tokens += u.cache_read_input_tokens;
-                if let Some(cache_write_tokens) = u.cache_write_input_tokens {
-                    *total_usage.cache_write_input_tokens.get_or_insert(0) += cache_write_tokens;
-                }
-                total_usage.output_tokens += u.output_tokens;
-                total_usage.reasoning_output_tokens += u.reasoning_output_tokens;
-                total_usage.total_tokens += u.total_tokens;
+                merge_usage(&mut total_usage, u);
             }
 
             // Only a provider-declared tool-call completion makes streamed calls
@@ -676,25 +658,13 @@ impl<'a> AgentLoop<'a> {
 
             match stream_result.finish_reason {
                 FinishReason::Stop => {
-                    if let Some(state) = active_compaction.take() {
+                    if active_compaction.is_some() {
                         if accepted_message
                             .assistant_text()
                             .is_none_or(|summary| summary.trim().is_empty())
                         {
                             bail!("compaction ended without a nonempty assistant summary")
                         }
-                        let mode = state.pending.mode;
-                        self.finish_compaction(&state.pending)?;
-                        context = self.load_context()?;
-                        live_provider_retries = 0;
-                        if mode == CompactionMode::AwaitUser {
-                            awaiting_user = true;
-                            break;
-                        }
-                        if bash::soft_interrupt_requested() {
-                            return self.soft_interrupt_result(total_usage);
-                        }
-                        next_request = NextRequest::Continue;
                         continue;
                     } else {
                         final_assistant = accepted_message.assistant_text();
@@ -3295,10 +3265,12 @@ mod tests {
                 ),
                 finish_reason: FinishReason::Stop,
                 usage: Some(Usage {
-                    input_tokens: 1,
-                    output_tokens: 1,
-                    total_tokens: 2,
-                    ..Usage::default()
+                    input_tokens: 10,
+                    cache_read_input_tokens: 2,
+                    cache_write_input_tokens: Some(3),
+                    output_tokens: 5,
+                    reasoning_output_tokens: 1,
+                    total_tokens: 15,
                 }),
                 native_response: None,
             })
@@ -3461,7 +3433,7 @@ mod tests {
             renderer: &mut renderer,
         };
 
-        agent.run_turn().await.unwrap();
+        let result = agent.run_turn().await.unwrap();
 
         // Proactive compaction ran mid-turn and produced a summary row.
         assert!(
@@ -3471,6 +3443,7 @@ mod tests {
                 .is_some()
         );
         // The turn still completed cleanly after compaction.
+        assert_eq!(result.usage.total_tokens, 32);
         let messages = store.load_context_messages(&session.id).unwrap();
         assert!(matches!(
             &messages[0],
@@ -3540,7 +3513,9 @@ mod tests {
                 bash::TrapLevel::Destructive,
             )
             .unwrap();
-        new_turn_agent.run_queued_turn().await.unwrap();
+        let result = new_turn_agent.run_queued_turn().await.unwrap();
+        assert_eq!(result.final_assistant.as_deref(), Some("done"));
+        assert_eq!(result.usage.total_tokens, 30);
         assert!(
             store
                 .latest_summary_sequence(&new_turn_session.id)
@@ -3566,6 +3541,128 @@ mod tests {
             store.latest_summary_sequence(&retry_session.id).unwrap(),
             None
         );
+    }
+
+    #[tokio::test]
+    async fn compaction_retry_shares_completion_and_usage_across_modes() {
+        for (mode, queued) in [
+            (CompactionMode::AwaitUser, false),
+            (CompactionMode::AwaitUser, true),
+            (CompactionMode::ContinueTurn, false),
+        ] {
+            for durable_summary in [false, true] {
+                let store = Store::open_memory().unwrap();
+                let session = store.create_session_seeded("system").unwrap();
+                store
+                    .start_turn(&session.id, "/tmp", None, &"work".into())
+                    .unwrap();
+                if mode == CompactionMode::AwaitUser {
+                    store
+                        .append_message(
+                            &session.id,
+                            &Message::assistant(Some("previous reply".into()), None, None, None),
+                        )
+                        .unwrap();
+                }
+                if queued {
+                    store
+                        .queue_prompt(
+                            &session.id,
+                            "/tmp",
+                            None,
+                            &"queued work".into(),
+                            bash::TrapLevel::Destructive,
+                        )
+                        .unwrap();
+                }
+                let config = test_config();
+                let model = crate::models::resolve_model_ref(&config, "test/fake-model").unwrap();
+                let mut renderer = Renderer::with_format(OutputFormat::Final);
+                let mut agent = AgentLoop {
+                    config: &config,
+                    system_prompt_source: SystemPromptSource::fixed("refreshed system prompt"),
+                    model: ResolvedModelChoice::fixed(model),
+                    provider: Box::new(BoundaryCompactionProvider),
+                    store: &store,
+                    session_id: &session.id,
+                    model_context_window: None,
+                    renderer: &mut renderer,
+                };
+                agent
+                    .begin_compaction(CompactionTrigger::Manual, mode, 100, None)
+                    .unwrap();
+                if durable_summary {
+                    store
+                        .append_message(
+                            &session.id,
+                            &Message::assistant(Some("summary".into()), None, None, None),
+                        )
+                        .unwrap();
+                }
+                let before = store.audit_events(&session.id).unwrap().len();
+
+                let result = agent.resume_turn().await.unwrap();
+
+                let awaiting_user = mode == CompactionMode::AwaitUser && !queued;
+                assert_eq!(result.awaiting_user, awaiting_user);
+                assert_eq!(
+                    result.final_assistant.as_deref(),
+                    (!awaiting_user).then_some("done")
+                );
+                assert!(!result.soft_interrupted && !result.trapped);
+                assert!(store.is_session_clean(&session.id).unwrap());
+                assert!(store.queued_prompt(&session.id).unwrap().is_none());
+                assert!(store.pending_compaction(&session.id).unwrap().is_none());
+                assert_eq!(store.context_epoch(&session.id).unwrap(), 1);
+                let messages = store.load_context_messages(&session.id).unwrap();
+                assert!(matches!(
+                    &messages[0],
+                    Message::System { content } if content == "refreshed system prompt"
+                ));
+                assert!(matches!(
+                    &messages[1],
+                    Message::User { content } if content.text() == compaction::checkpoint("summary", mode, 1)
+                ));
+
+                let calls = u64::from(!durable_summary) + u64::from(!awaiting_user);
+                assert_eq!(result.usage.input_tokens, 10 * calls);
+                assert_eq!(result.usage.cache_read_input_tokens, 2 * calls);
+                assert_eq!(
+                    result.usage.cache_write_input_tokens,
+                    (calls > 0).then_some(3 * calls)
+                );
+                assert_eq!(result.usage.output_tokens, 5 * calls);
+                assert_eq!(result.usage.reasoning_output_tokens, calls);
+                assert_eq!(result.usage.total_tokens, 15 * calls);
+                let audit = store.audit_events(&session.id).unwrap();
+                let requests = audit[before..]
+                    .iter()
+                    .filter(|event| event["type"] == "provider_requested")
+                    .collect::<Vec<_>>();
+                assert_eq!(requests.len() as u64, calls);
+                for (index, event) in requests.iter().enumerate() {
+                    let summarizing = !durable_summary && index == 0;
+                    let request = store
+                        .reconstruct_provider_request(
+                            &session.id,
+                            event["exchange_id"].as_str().unwrap(),
+                        )
+                        .unwrap();
+                    assert_eq!(
+                        request["prompt_cache_key"],
+                        format!("mu:{}:epoch:{}", session.id, u64::from(!summarizing))
+                    );
+                    assert_eq!(
+                        request["messages"][0]["content"],
+                        if summarizing {
+                            "system"
+                        } else {
+                            "refreshed system prompt"
+                        }
+                    );
+                }
+            }
+        }
     }
 
     /// Two model calls in one turn: a `readonly` bash call, then a stop. Each
