@@ -8,7 +8,7 @@ use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
 use crate::bash;
-use crate::bash::{ExecutionMode, ToolContext, ToolResult};
+use crate::bash::{BashRisk, ToolContext, ToolResult};
 use crate::compaction;
 use crate::config::Config;
 use crate::models::ResolvedModelChoice;
@@ -58,7 +58,6 @@ pub struct TurnResult {
     pub context_estimated: bool,
     pub context_window: Option<u64>,
     pub final_assistant: Option<String>,
-    pub awaiting_user: bool,
     pub soft_interrupted: bool,
     pub trapped: bool,
     pub pending_bash_calls: usize,
@@ -85,7 +84,7 @@ struct ActiveCompaction {
 struct ConcurrentBashExecution<'a> {
     call: &'a ToolCall,
     args: Value,
-    running: Option<RunningBash>,
+    running: RunningBash,
 }
 
 #[derive(Default)]
@@ -127,8 +126,7 @@ pub struct AgentLoop<'a> {
 impl<'a> AgentLoop<'a> {
     #[cfg(test)]
     pub async fn run_turn(&mut self) -> Result<TurnResult> {
-        self.run_turn_inner(&mut String::new(), NextRequest::User)
-            .await
+        self.run_turn_inner(NextRequest::User).await
     }
 
     pub async fn run_queued_turn(&mut self) -> Result<TurnResult> {
@@ -164,8 +162,7 @@ impl<'a> AgentLoop<'a> {
                 .materialize_queued_prompt(self.session_id)?
                 .ok_or_else(|| anyhow::anyhow!("queued prompt disappeared"))?;
         }
-        self.run_turn_inner(&mut String::new(), NextRequest::User)
-            .await
+        self.run_turn_inner(NextRequest::User).await
     }
 
     pub async fn resume_turn(&mut self) -> Result<TurnResult> {
@@ -174,8 +171,7 @@ impl<'a> AgentLoop<'a> {
         {
             return self.run_queued_turn().await;
         }
-        self.run_turn_inner(&mut String::new(), NextRequest::Continue)
-            .await
+        self.run_turn_inner(NextRequest::Continue).await
     }
 
     pub async fn run_manual_compaction(&mut self, focus: Option<&str>) -> Result<TurnResult> {
@@ -193,15 +189,10 @@ impl<'a> AgentLoop<'a> {
         };
         let before = self.current_context_tokens()?;
         self.begin_compaction(CompactionTrigger::Manual, mode, before, focus)?;
-        self.run_turn_inner(&mut String::new(), NextRequest::Continue)
-            .await
+        self.run_turn_inner(NextRequest::Continue).await
     }
 
-    async fn run_turn_inner(
-        &mut self,
-        current_partial_output: &mut String,
-        mut next_request: NextRequest,
-    ) -> Result<TurnResult> {
+    async fn run_turn_inner(&mut self, mut next_request: NextRequest) -> Result<TurnResult> {
         let mut context = self.load_context()?;
         let mut active_compaction =
             self.store
@@ -213,7 +204,6 @@ impl<'a> AgentLoop<'a> {
 
         let mut total_usage = Usage::default();
         let mut final_assistant = None;
-        let mut awaiting_user = false;
 
         if next_request == NextRequest::Continue {
             let pending_calls = self.store.pending_bash_calls(self.session_id)?;
@@ -253,7 +243,6 @@ impl<'a> AgentLoop<'a> {
                             .materialize_queued_prompt(self.session_id)?
                             .is_none()
                         {
-                            awaiting_user = true;
                             break;
                         }
                         NextRequest::User
@@ -297,9 +286,9 @@ impl<'a> AgentLoop<'a> {
                     }
                 }
 
-                let mut command_headers = StreamingCommandHeaders::default();
                 loop {
-                    current_partial_output.clear();
+                    let mut current_partial_output = String::new();
+                    let mut command_headers = StreamingCommandHeaders::default();
                     let emergency = active_compaction
                         .as_ref()
                         .is_some_and(|state| state.emergency);
@@ -439,54 +428,41 @@ impl<'a> AgentLoop<'a> {
                             };
                         self.provider.stream(&request, &mut on_stream_event).await
                     };
-                    if let Some(error) = renderer_error {
+                    let render_result = (|| {
+                        if let Some(error) = renderer_error {
+                            return Err(error);
+                        }
+                        self.renderer.assistant_end()?;
+                        match &result {
+                            Ok(stream_result) => {
+                                let usage = stream_result
+                                    .usage
+                                    .as_ref()
+                                    .map(|u| (u.visible_input_tokens(), u.visible_output_tokens()));
+                                self.renderer.reasoning_end(usage)
+                            }
+                            Err(_) => self.renderer.cancel_live_state(),
+                        }
+                    })();
+                    if let Err(error) = render_result {
                         self.store
                             .interrupt_provider_exchange(self.session_id, &exchange_id)?;
-                        current_partial_output.clear();
                         return Err(error.into());
                     }
-                    if let Err(error) = self.renderer.assistant_end() {
-                        self.store
-                            .interrupt_provider_exchange(self.session_id, &exchange_id)?;
-                        current_partial_output.clear();
-                        return Err(error.into());
-                    }
-                    match &result {
-                        Ok(stream_result) => {
-                            let usage = stream_result
-                                .usage
-                                .as_ref()
-                                .map(|u| (u.visible_input_tokens(), u.visible_output_tokens()));
-                            if let Err(error) = self.renderer.reasoning_end(usage) {
-                                self.store
-                                    .interrupt_provider_exchange(self.session_id, &exchange_id)?;
-                                current_partial_output.clear();
-                                return Err(error.into());
-                            }
-                        }
-                        Err(_) => {
-                            if let Err(error) = self.renderer.cancel_live_state() {
-                                self.store
-                                    .interrupt_provider_exchange(self.session_id, &exchange_id)?;
-                                current_partial_output.clear();
-                                return Err(error.into());
-                            }
-                        }
-                    }
-                    match result {
+                    let error = match result {
                         Ok(r) => break 'request_gate (exchange_id, r, command_headers),
-                        Err(error)
-                            if error.disposition() == ProviderDisposition::ContextRecovery =>
-                        {
-                            self.store.fail_provider_exchange(
-                                self.session_id,
-                                &exchange_id,
-                                error.class(),
-                                error.diagnostic(),
-                                partial_response(current_partial_output).as_ref(),
-                                None,
-                            )?;
-                            current_partial_output.clear();
+                        Err(error) => error,
+                    };
+                    self.store.fail_provider_exchange(
+                        self.session_id,
+                        &exchange_id,
+                        error.class(),
+                        error.diagnostic(),
+                        partial_response(&current_partial_output).as_ref(),
+                        None,
+                    )?;
+                    match error.disposition() {
+                        ProviderDisposition::ContextRecovery => {
                             if !self.config.compaction.enabled && active_compaction.is_none() {
                                 return Err(error.into());
                             }
@@ -523,24 +499,13 @@ impl<'a> AgentLoop<'a> {
                             next_request = NextRequest::User;
                             continue 'request_gate;
                         }
-                        Err(error)
-                            if error.disposition() == ProviderDisposition::Retry
-                                && error
-                                    .retry_after()
-                                    .is_none_or(|wait| wait <= MAX_PROVIDER_RETRY_AFTER)
+                        ProviderDisposition::Retry
+                            if error
+                                .retry_after()
+                                .is_none_or(|wait| wait <= MAX_PROVIDER_RETRY_AFTER)
                                 && live_provider_retries < provider_retry_limit(&self.model) =>
                         {
-                            self.store.fail_provider_exchange(
-                                self.session_id,
-                                &exchange_id,
-                                error.class(),
-                                error.diagnostic(),
-                                partial_response(current_partial_output).as_ref(),
-                                None,
-                            )?;
-                            current_partial_output.clear();
                             live_provider_retries += 1;
-                            command_headers = StreamingCommandHeaders::default();
                             let retry_limit = provider_retry_limit(&self.model);
                             let delay = effective_retry_delay(&error, live_provider_retries);
                             self.renderer.turn_retry(
@@ -552,16 +517,7 @@ impl<'a> AgentLoop<'a> {
                             sleep(delay).await;
                             context = self.load_context()?;
                         }
-                        Err(error) => {
-                            self.store.fail_provider_exchange(
-                                self.session_id,
-                                &exchange_id,
-                                error.class(),
-                                error.diagnostic(),
-                                partial_response(current_partial_output).as_ref(),
-                                None,
-                            )?;
-                            current_partial_output.clear();
+                        _ => {
                             if !self.model.is_floating()
                                 && error
                                     .retry_after()
@@ -637,7 +593,6 @@ impl<'a> AgentLoop<'a> {
                     context_output_complete,
                 },
             )?;
-            current_partial_output.clear();
             context.push(accepted_message.clone());
 
             if bash::soft_interrupt_requested()
@@ -744,7 +699,6 @@ impl<'a> AgentLoop<'a> {
             context_estimated: !context_estimate.reported,
             context_window: self.model_context_window(),
             final_assistant,
-            awaiting_user,
             soft_interrupted: false,
             trapped: false,
             pending_bash_calls: 0,
@@ -768,7 +722,6 @@ impl<'a> AgentLoop<'a> {
             context_estimated: !context.reported,
             context_window: self.model_context_window(),
             final_assistant: None,
-            awaiting_user: false,
             soft_interrupted: true,
             trapped: false,
             pending_bash_calls,
@@ -783,7 +736,6 @@ impl<'a> AgentLoop<'a> {
             context_estimated: !context.reported,
             context_window: self.model_context_window(),
             final_assistant: None,
-            awaiting_user: false,
             soft_interrupted: false,
             trapped: true,
             pending_bash_calls,
@@ -840,11 +792,15 @@ impl<'a> AgentLoop<'a> {
                 return Ok(BashCallStop::Trapped(calls.len() - cursor));
             }
 
-            if self.concurrent_tool_call_eligible(&args) {
+            if bash_args.risk == BashRisk::Readonly {
                 let mut end = cursor + 1;
                 while end < calls.len() {
-                    let next_args = parse_tool_args(&calls[end].call)?;
-                    if !self.concurrent_tool_call_eligible(&next_args) {
+                    // Invalid lookahead ends the batch; the ordinary path
+                    // handles argument errors when it reaches this call.
+                    if !parse_tool_args(&calls[end].call)
+                        .and_then(|args| bash::parse_args::<bash::BashArgs>(&args))
+                        .is_ok_and(|args| args.risk == BashRisk::Readonly)
+                    {
                         break;
                     }
                     end += 1;
@@ -905,7 +861,6 @@ impl<'a> AgentLoop<'a> {
                 tool_result,
                 started.elapsed(),
                 context,
-                true,
             )?;
             cursor += 1;
         }
@@ -1049,13 +1004,10 @@ impl<'a> AgentLoop<'a> {
         result: Result<ToolResult>,
         elapsed: Duration,
         context: &mut Vec<Message>,
-        emit_renderer: bool,
     ) -> Result<()> {
         let (output, attachments, outcome, exit_code) = match result {
             Ok(result) => {
-                if emit_renderer {
-                    self.renderer.tool_finished(result.exit_code, elapsed)?;
-                }
+                self.renderer.tool_finished(result.exit_code, elapsed)?;
                 (
                     result.output,
                     result.attachments,
@@ -1065,9 +1017,7 @@ impl<'a> AgentLoop<'a> {
             }
             Err(error) => {
                 let message = bash::model_failure_output(&error, &self.config.limits);
-                if emit_renderer {
-                    self.renderer.tool_failed(&error.to_string(), elapsed)?;
-                }
+                self.renderer.tool_failed(&error.to_string(), elapsed)?;
                 (message, Vec::new(), "error", None)
             }
         };
@@ -1089,16 +1039,6 @@ impl<'a> AgentLoop<'a> {
             tool_call_id: call.id.clone(),
         });
         Ok(())
-    }
-
-    fn concurrent_tool_call_eligible(&self, args: &Value) -> bool {
-        // Schema-invalid readonly calls must take the sequential path so the
-        // normal tool-error persistence can return the validation failure to
-        // the model instead of aborting while preparing a concurrent batch.
-        if bash::parse_args::<bash::BashArgs>(args).is_err() {
-            return false;
-        }
-        bash::execution_mode(args) == ExecutionMode::Concurrent
     }
 
     async fn execute_concurrent_bash_batch(
@@ -1129,24 +1069,25 @@ impl<'a> AgentLoop<'a> {
             executions.push(ConcurrentBashExecution {
                 call: &pending.call,
                 args,
-                running: Some(bash::start_bash_task(
+                running: bash::start_bash_task(
                     bash_args,
                     self.config,
                     Some(&manifest),
                     Some(&objects_dir),
                     pending.call_id,
-                )?),
+                )?,
             });
         }
 
-        for (index, exec) in executions.iter_mut().enumerate() {
+        let started = executions.len();
+        for (index, exec) in executions.into_iter().enumerate() {
             finish_command_header(
                 self.renderer,
                 command_headers,
                 header_start_index + index,
                 &exec.args,
             )?;
-            let running = exec.running.take().expect("running bash present");
+            let running = exec.running;
             for warning in running.warnings() {
                 self.renderer.notice(&format!("[redaction] {warning}"))?;
             }
@@ -1154,20 +1095,13 @@ impl<'a> AgentLoop<'a> {
             self.stream_running_bash(&running).await?;
             let (result, elapsed, final_output) = running.finish().await;
             self.renderer.bash_output(&final_output)?;
-            self.persist_bash_result(
-                batch[index].call_id,
-                exec.call,
-                result,
-                elapsed,
-                context,
-                true,
-            )?;
+            self.persist_bash_result(batch[index].call_id, exec.call, result, elapsed, context)?;
         }
 
         if hard_interrupted {
             bail!("turn interrupted");
         }
-        Ok(executions.len())
+        Ok(started)
     }
 
     async fn stream_running_bash(&mut self, running: &RunningBash) -> Result<()> {
@@ -3534,7 +3468,6 @@ mod tests {
 
                 let awaiting_user = mode == CompactionMode::AwaitUser && !queued;
                 let soft_interrupted = interrupt && !awaiting_user;
-                assert_eq!(result.awaiting_user, awaiting_user);
                 assert_eq!(
                     result.final_assistant.as_deref(),
                     (!awaiting_user && !interrupt).then_some("done")

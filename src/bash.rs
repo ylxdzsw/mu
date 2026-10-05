@@ -61,12 +61,6 @@ pub struct ToolContext<'a> {
     pub bash_call_id: i64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ExecutionMode {
-    Sequential,
-    Concurrent,
-}
-
 pub fn resolve_path(path: &str) -> PathBuf {
     let p = PathBuf::from(path);
     if p.is_absolute() {
@@ -74,15 +68,6 @@ pub fn resolve_path(path: &str) -> PathBuf {
     } else {
         std::env::current_dir().unwrap_or_default().join(p)
     }
-}
-
-pub fn apply_truncation(
-    output: String,
-    limits: &LimitsConfig,
-    prefix: &str,
-    use_tail: bool,
-) -> String {
-    truncate_output(&output, limits, prefix, use_tail)
 }
 
 pub(crate) fn model_failure_output(error: &anyhow::Error, limits: &LimitsConfig) -> String {
@@ -95,12 +80,7 @@ pub(crate) fn model_failure_output(error: &anyhow::Error, limits: &LimitsConfig)
         return message;
     }
     message.push_str("\npartial output:\n");
-    message.push_str(&apply_truncation(
-        partial_output.to_string(),
-        limits,
-        "bash",
-        true,
-    ));
+    message.push_str(&truncate_bash_output(partial_output, limits));
     if error.redacted {
         message.push_str("\n\n");
         message.push_str(REDACTION_REMINDER);
@@ -108,12 +88,7 @@ pub(crate) fn model_failure_output(error: &anyhow::Error, limits: &LimitsConfig)
     message
 }
 
-fn truncate_output(
-    output: &str,
-    limits: &LimitsConfig,
-    spill_prefix: &str,
-    use_tail: bool,
-) -> String {
+fn truncate_bash_output(output: &str, limits: &LimitsConfig) -> String {
     let lines: Vec<&str> = output.lines().collect();
     let total_lines = lines.len();
 
@@ -124,26 +99,17 @@ fn truncate_output(
         return output.to_string();
     }
 
-    let preview = if use_tail {
-        build_tail_preview(
-            &lines,
-            limits.max_lines,
-            limits.max_bytes,
-            limits.max_line_bytes,
-        )
-    } else {
-        build_head_preview(
-            &lines,
-            limits.max_lines,
-            limits.max_bytes,
-            limits.max_line_bytes,
-        )
-    };
+    let preview = build_tail_preview(
+        &lines,
+        limits.max_lines,
+        limits.max_bytes,
+        limits.max_line_bytes,
+    );
 
     // The spill is best-effort: by this point the command has already run, so
     // an unavailable runtime directory or disk-full error must degrade to a
     // preview-only note, never fail the tool result.
-    let spill_note = match write_spill(output, spill_prefix) {
+    let spill_note = match write_spill(output) {
         Ok(spill_path) => format!(
             "full output was written to temporary file {}; it may disappear at any time",
             spill_path.display()
@@ -157,35 +123,12 @@ fn truncate_output(
     format!("{preview}\n[… {elided_lines} lines elided; {spill_note}]")
 }
 
-fn write_spill(output: &str, spill_prefix: &str) -> Result<PathBuf> {
+fn write_spill(output: &str) -> Result<PathBuf> {
     let directory = crate::paths::runtime_dir()?;
     let (mut file, spill_path) =
-        crate::random::create_temp_file(&directory, &format!("spill-{spill_prefix}-"), ".txt")?;
+        crate::random::create_temp_file(&directory, "spill-bash-", ".txt")?;
     file.write_all(output.as_bytes())?;
     Ok(spill_path)
-}
-
-fn build_head_preview(
-    lines: &[&str],
-    max_lines: usize,
-    max_bytes: usize,
-    max_line_bytes: usize,
-) -> String {
-    let mut out = String::new();
-    for (count, line) in lines.iter().enumerate() {
-        if count >= max_lines {
-            break;
-        }
-        let truncated_line = truncate_line(line, max_line_bytes);
-        if out.len() + truncated_line.len() + 1 > max_bytes {
-            break;
-        }
-        if count > 0 {
-            out.push('\n');
-        }
-        out.push_str(&truncated_line);
-    }
-    out
 }
 
 fn build_tail_preview(
@@ -342,15 +285,6 @@ fn parse_subagent_depth(value: Option<&str>) -> u32 {
 
 fn next_subagent_depth_env() -> String {
     (subagent_depth_from_env() + 1).to_string()
-}
-
-pub fn execution_mode(args: &Value) -> ExecutionMode {
-    matches!(
-        args.get("risk").and_then(|value| value.as_str()),
-        Some("readonly")
-    )
-    .then_some(ExecutionMode::Concurrent)
-    .unwrap_or(ExecutionMode::Sequential)
 }
 
 pub fn parameters_schema() -> Value {
@@ -565,7 +499,7 @@ fn execute_bash(
     };
     let full = format!("{output}\n[exit code: {exit_code}]");
     Ok(ToolResult {
-        output: apply_truncation(full, &config.limits, "bash", true),
+        output: truncate_bash_output(&full, &config.limits),
         exit_code,
         attachments,
     })
@@ -680,35 +614,16 @@ fn run_bash(
     let mut output = String::new();
     let mut status: Option<ExitStatus> = None;
     let mut stdout_closed = false;
-    let mut interrupted = false;
-    let mut terminal_error: Option<BashExecutionError> = None;
-
-    loop {
+    let terminal_reason = loop {
         if cancellation_requested() {
-            interrupted = true;
-            terminate_child_group(child_id, &mut child);
-            drain_available(&rx, target, &mut output, redactor)?;
-            flush_redactor(target, &mut output, redactor)?;
-            let _ = child.wait();
-            terminal_error = Some(BashExecutionError::new(
-                format!("command interrupted by {}", signal_name(last_signal())),
-                std::mem::take(&mut output),
-                redactor.did_redact(),
+            break Some(format!(
+                "command interrupted by {}",
+                signal_name(last_signal())
             ));
-            break;
         }
 
         if Instant::now() >= deadline {
-            terminate_child_group(child_id, &mut child);
-            drain_available(&rx, target, &mut output, redactor)?;
-            flush_redactor(target, &mut output, redactor)?;
-            let _ = child.wait();
-            terminal_error = Some(BashExecutionError::new(
-                format!("command timed out after {timeout_secs}s"),
-                std::mem::take(&mut output),
-                redactor.did_redact(),
-            ));
-            break;
+            break Some(format!("command timed out after {timeout_secs}s"));
         }
 
         if status.is_none() {
@@ -721,19 +636,10 @@ fn run_bash(
                 output.push_str(&redacted);
                 target.push_output(&redacted)?;
                 if output.len() > MAX_OUTPUT_BYTES {
-                    terminate_child_group(child_id, &mut child);
-                    drain_available(&rx, target, &mut output, redactor)?;
-                    flush_redactor(target, &mut output, redactor)?;
-                    let _ = child.wait();
-                    terminal_error = Some(BashExecutionError::new(
-                        format!(
-                            "command killed: output exceeded {} MB limit",
-                            MAX_OUTPUT_BYTES / (1024 * 1024)
-                        ),
-                        std::mem::take(&mut output),
-                        redactor.did_redact(),
+                    break Some(format!(
+                        "command killed: output exceeded {} MB limit",
+                        MAX_OUTPUT_BYTES / (1024 * 1024)
                     ));
-                    break;
                 }
             }
             Err(RecvTimeoutError::Timeout) => {}
@@ -743,16 +649,21 @@ fn run_bash(
         }
 
         if status.is_some() && stdout_closed {
-            break;
+            break None;
         }
+    };
+
+    if let Some(reason) = terminal_reason {
+        terminate_child_group(child_id, &mut child);
+        drain_available(&rx, target, &mut output, redactor)?;
+        flush_redactor(target, &mut output, redactor)?;
+        let _ = child.wait();
+        return Err(BashExecutionError::new(reason, output, redactor.did_redact()).into());
     }
 
     let status = status.unwrap_or_else(|| child.wait().expect("bash status"));
     flush_redactor(target, &mut output, redactor)?;
-    if let Some(error) = terminal_error {
-        return Err(error.into());
-    }
-    if interrupted || (cancellation_requested() && status.signal().is_some()) {
+    if cancellation_requested() && status.signal().is_some() {
         return Err(BashExecutionError::new(
             format!("command interrupted by {}", signal_name(last_signal())),
             output,
@@ -946,7 +857,7 @@ fn terminate_child_group(child_id: u32, child: &mut std::process::Child) {
             let _ = child.kill();
         }
     }
-    let _ = wait_for_exit(child, KILL_GRACE);
+    wait_for_exit(child, KILL_GRACE);
     unsafe {
         if libc::kill(pgid, libc::SIGKILL) != 0 {
             let _ = child.kill();
@@ -954,15 +865,14 @@ fn terminate_child_group(child_id: u32, child: &mut std::process::Child) {
     }
 }
 
-fn wait_for_exit(child: &mut std::process::Child, grace: Duration) -> bool {
+fn wait_for_exit(child: &mut std::process::Child, grace: Duration) {
     let deadline = Instant::now() + grace;
     while Instant::now() < deadline {
         if matches!(child.try_wait(), Ok(Some(_))) {
-            return true;
+            return;
         }
         std::thread::sleep(Duration::from_millis(25));
     }
-    false
 }
 
 #[cfg(test)]
@@ -973,7 +883,7 @@ mod tests {
 
     use super::{
         AttachmentContext, BashArgs, BashExecutionError, BashRisk, REDACTION_REMINDER, ToolContext,
-        apply_truncation, model_failure_output, run_bash,
+        model_failure_output, run_bash, truncate_bash_output,
     };
     use crate::config::EnvMap;
     use crate::config::{CompactionConfig, Config, LimitsConfig, ProviderConfig, RedactionConfig};
@@ -1320,12 +1230,7 @@ mod tests {
 
     #[test]
     fn truncation_spills_full_output_to_the_runtime_directory() {
-        let clamped = apply_truncation(
-            "one\ntwo\nthree\nfour".into(),
-            &tight_limits(),
-            "bash",
-            true,
-        );
+        let clamped = truncate_bash_output("one\ntwo\nthree\nfour", &tight_limits());
 
         assert_ne!(clamped, "one\ntwo\nthree\nfour");
         let spill = spill_path(&clamped);

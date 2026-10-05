@@ -7,7 +7,7 @@ use crate::provider::{
     AssistantItem, ContentPart, FinishReason, HttpProvider, Message, NativeReplay,
     NativeReplayPayload, ProviderError, ReasoningVisibility, Request, SseEvent, StreamEvent,
     StreamResult, ToolCall, ToolCallDelta as ProviderToolCallDelta, Usage, UserContent,
-    base64_encode, classify_stream_error, validate_completed_tool_arguments,
+    assistant_text, base64_encode, classify_stream_error, validate_completed_tool_arguments,
 };
 
 #[derive(Debug, Deserialize)]
@@ -79,32 +79,14 @@ struct CompletionTokensDetailsJson {
 
 type ToolCallAccumulator = BTreeMap<usize, (Option<String>, Option<String>, String)>;
 
+#[derive(Default)]
 struct StreamParseState {
     content: String,
-    reasoning_content: String,
-    reasoning_content_present: bool,
+    reasoning_content: Option<String>,
     tool_accum: ToolCallAccumulator,
-    finish_reason: FinishReason,
-    terminal_finish_seen: bool,
+    finish_reason: Option<FinishReason>,
     usage: Option<Usage>,
     reasoning_active: bool,
-    tool_call_started: bool,
-}
-
-impl Default for StreamParseState {
-    fn default() -> Self {
-        Self {
-            content: String::new(),
-            reasoning_content: String::new(),
-            reasoning_content_present: false,
-            tool_accum: BTreeMap::new(),
-            finish_reason: FinishReason::Stop,
-            terminal_finish_seen: false,
-            usage: None,
-            reasoning_active: false,
-            tool_call_started: false,
-        }
-    }
 }
 
 pub(crate) async fn stream(
@@ -123,17 +105,15 @@ pub(crate) async fn stream(
     if state.reasoning_active {
         on_event(StreamEvent::ReasoningEnd)?;
     }
-    state.finish_reason = finalized_finish_reason(&state);
+    let finish_reason = finalized_finish_reason(&state);
 
     let has_tool_calls = !state.tool_accum.is_empty();
-    let validate_arguments = matches!(state.finish_reason, FinishReason::ToolCalls);
+    let validate_arguments = matches!(finish_reason, FinishReason::ToolCalls);
     let tool_calls = has_tool_calls
         .then(|| completed_tool_calls(state.tool_accum, validate_arguments))
         .transpose()?;
     let content = (!state.content.is_empty()).then_some(state.content);
-    let reasoning_content = state
-        .reasoning_content_present
-        .then_some(state.reasoning_content.clone());
+    let reasoning_content = state.reasoning_content;
     let native_response = Some(serde_json::json!({
         "object": "chat.completion",
         "model": request.model.model_id,
@@ -152,7 +132,7 @@ pub(crate) async fn stream(
                     },
                 })).collect::<Vec<_>>()),
             },
-            "finish_reason": match &state.finish_reason {
+            "finish_reason": match &finish_reason {
                 FinishReason::Stop => "stop",
                 FinishReason::ToolCalls => "tool_calls",
                 FinishReason::Resume => "stop",
@@ -172,16 +152,19 @@ pub(crate) async fn stream(
             },
         })),
     }));
-    let native_replay = (state.reasoning_content_present && has_tool_calls).then(|| NativeReplay {
-        provider_id: request.model.provider_id.clone(),
-        endpoint: provider.endpoint.clone(),
-        model: request.model.model_id.clone(),
-        payload: NativeReplayPayload::ChatReasoning(state.reasoning_content),
-    });
+    let native_replay = reasoning_content
+        .as_ref()
+        .filter(|_| has_tool_calls)
+        .map(|reasoning| NativeReplay {
+            provider_id: request.model.provider_id.clone(),
+            endpoint: provider.endpoint.clone(),
+            model: request.model.model_id.clone(),
+            payload: NativeReplayPayload::ChatReasoning(reasoning.clone()),
+        });
     let message = Message::assistant(content, reasoning_content, tool_calls, native_replay);
     Ok(StreamResult {
         message,
-        finish_reason: state.finish_reason,
+        finish_reason,
         usage: state.usage,
         native_response,
     })
@@ -238,17 +221,7 @@ fn chat_message_json(message: &Message) -> Vec<Value> {
             items,
             native_replay,
         } => {
-            let content = items
-                .iter()
-                .filter_map(|item| match item {
-                    AssistantItem::Text { text } => Some(text.as_str()),
-                    _ => None,
-                })
-                .collect::<String>();
-            let content = items
-                .iter()
-                .any(|item| matches!(item, AssistantItem::Text { .. }))
-                .then_some(content);
+            let content = assistant_text(items);
             let tool_calls = items.iter().filter_map(|item| match item {
                 AssistantItem::BashCall(call) => Some(call),
                 _ => None,
@@ -405,16 +378,13 @@ fn consume_event(
     }
 
     if let Some(choice) = parsed.choices.first() {
-        if choice.delta.reasoning_content.is_some() {
-            state.reasoning_content_present = true;
-        }
-        let reasoning_delta = choice
-            .delta
-            .reasoning_content
-            .as_ref()
-            .and_then(reasoning_text_from_value);
+        let reasoning_delta = choice.delta.reasoning_content.as_ref().and_then(|value| {
+            let reasoning = state.reasoning_content.get_or_insert_default();
+            let text = reasoning_text_from_value(value)?;
+            reasoning.push_str(&text);
+            Some(text)
+        });
         if let Some(text) = reasoning_delta {
-            state.reasoning_content.push_str(&text);
             if !state.reasoning_active {
                 on_event(StreamEvent::ReasoningStart(
                     ReasoningVisibility::StreamedTrace,
@@ -461,12 +431,10 @@ fn consume_event(
                     index: tc.index,
                     arguments_delta,
                 }))?;
-                state.tool_call_started = true;
             }
         }
         if let Some(ref reason) = choice.finish_reason {
-            state.terminal_finish_seen = true;
-            state.finish_reason = match reason.as_str() {
+            state.finish_reason = Some(match reason.as_str() {
                 "stop" => FinishReason::Stop,
                 "tool_calls" => FinishReason::ToolCalls,
                 // Some gateways encode transport failures as terminal finish reasons.
@@ -476,7 +444,7 @@ fn consume_event(
                     ));
                 }
                 other => FinishReason::Other(other.to_string()),
-            };
+            });
         }
     }
 
@@ -484,15 +452,17 @@ fn consume_event(
 }
 
 fn finalized_finish_reason(state: &StreamParseState) -> FinishReason {
-    if state.terminal_finish_seen
-        && state.finish_reason == FinishReason::Stop
-        && !state.reasoning_content.is_empty()
+    if state.finish_reason == Some(FinishReason::Stop)
+        && state
+            .reasoning_content
+            .as_ref()
+            .is_some_and(|text| !text.is_empty())
         && state.content.is_empty()
         && state.tool_accum.is_empty()
     {
         FinishReason::Resume
     } else {
-        state.finish_reason.clone()
+        state.finish_reason.clone().unwrap_or(FinishReason::Stop)
     }
 }
 
@@ -629,7 +599,7 @@ mod tests {
             "{\"title\":\"Inspect\",\"risk\":\"readonly\",\"command\":"
         );
         assert_eq!(tool_call_deltas[1].arguments_delta, "\"pwd\"}");
-        assert_eq!(state.finish_reason, FinishReason::ToolCalls);
+        assert_eq!(state.finish_reason, Some(FinishReason::ToolCalls));
         let usage = state.usage.unwrap();
         assert_eq!(usage.cache_read_input_tokens, 3);
         assert_eq!(usage.cache_write_input_tokens, Some(2));
@@ -643,13 +613,12 @@ mod tests {
             "{\"choices\":[{\"delta\":{\"reasoning_content\":\"\"},\"finish_reason\":null}]}";
         let mut state = StreamParseState::default();
         consume_event(data, &mut state, &mut on_event).unwrap();
-        assert!(state.reasoning_content_present);
-        assert!(state.reasoning_content.is_empty());
+        assert_eq!(state.reasoning_content.as_deref(), Some(""));
 
         let data = "{\"choices\":[{\"delta\":{},\"finish_reason\":null}]}";
         let mut state = StreamParseState::default();
         consume_event(data, &mut state, &mut on_event).unwrap();
-        assert!(!state.reasoning_content_present);
+        assert!(state.reasoning_content.is_none());
     }
 
     #[test]
@@ -810,7 +779,10 @@ mod tests {
             consume_event(data, &mut state, &mut on_event).unwrap();
         }
 
-        assert_eq!(state.reasoning_content, "  first line\n\tsecond line  ");
+        assert_eq!(
+            state.reasoning_content.as_deref(),
+            Some("  first line\n\tsecond line  ")
+        );
     }
 
     #[test]

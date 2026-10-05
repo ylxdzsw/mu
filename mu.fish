@@ -481,33 +481,7 @@ function _mu_fish_model_candidates --argument-names fragment
     printf '%s\n' $matches
 end
 
-function _mu_fish_model_effort_suffixes --argument-names fragment
-    set -e argv[1]
-    test -n "$fragment"; or return 0
-    set -l base "$fragment"
-    string match -q '*:' -- "$base"; and set base (string replace -r ':$' '' -- "$base")
-
-    set -l records $argv
-    test (count $records) -gt 0; or set records (_mu_fish_model_records 2>/dev/null)
-    set -l matches
-    for record in $records
-        set -l fields (string split \t -- "$record")
-        set -l canonical "$fields[1]"
-        set -l model_id "$fields[2]"
-        if test "$base" != "$canonical"; and test "$base" != "$model_id"
-            continue
-        end
-        set -q fields[3]; or continue
-        for effort in (string split , -- "$fields[3]")
-            test -n "$effort"; or continue
-            not contains -- ":$effort" $matches; and set -a matches ":$effort"
-        end
-    end
-    printf '%s\n' $matches
-end
-
 function _mu_fish_model_completion_transition --argument-names fragment
-    set -l efforts
     set -l records $argv[2..-1]
     test (count $records) -gt 0; or set records (_mu_fish_model_records 2>/dev/null)
     set -l qualified 0
@@ -536,27 +510,16 @@ function _mu_fish_model_completion_transition --argument-names fragment
     end
 
     if test "$qualified" -eq 1
-        set -l fields (string split \t -- "$exact[1]")
-        set -q fields[3]; or return 1
+        set exact "$exact[1]"
+    end
+    for record in $exact
+        set -l fields (string split \t -- "$record")
+        set -q fields[3]; or continue
         for effort in (string split , -- "$fields[3]")
-            test -n "$effort"; or continue
-            if not contains -- ":$effort" $efforts
-                set -a efforts ":$effort"
-            end
-        end
-    else
-        for record in $exact
-            set -l fields (string split \t -- "$record")
-            set -q fields[3]; or continue
-            for effort in (string split , -- "$fields[3]")
-                test -n "$effort"; or continue
-                if not contains -- ":$effort" $efforts
-                    set -a efforts ":$effort"
-                end
-            end
+            test -n "$effort"; and return 0
         end
     end
-    test (count $efforts) -gt 0
+    return 1
 end
 
 function _mu_fish_native_model_candidates
@@ -1093,36 +1056,6 @@ function _mu_fish_speculative_backspace
     commandline -f backward-delete-char
 end
 
-function _mu_fish_speculative_delete
-    _mu_fish_commit_speculative_model_colon
-    commandline -f delete-char
-end
-
-function _mu_fish_speculative_left
-    _mu_fish_commit_speculative_model_colon
-    commandline -f backward-char
-end
-
-function _mu_fish_speculative_right
-    _mu_fish_commit_speculative_model_colon
-    commandline -f forward-char
-end
-
-function _mu_fish_speculative_home
-    _mu_fish_commit_speculative_model_colon
-    commandline -f beginning-of-line
-end
-
-function _mu_fish_speculative_end
-    _mu_fish_commit_speculative_model_colon
-    commandline -f end-of-line
-end
-
-function _mu_fish_speculative_delete_or_exit
-    _mu_fish_commit_speculative_model_colon
-    commandline -f delete-or-exit
-end
-
 function _mu_fish_configure_keymap
     set -g _MU_FISH_INPUT_FUNCTIONS (bind --function-names)
     _mu_fish_capture_tab_binding default _MU_FISH_DEFAULT_TAB_BINDING
@@ -1137,13 +1070,13 @@ function _mu_fish_configure_keymap
     bind -M mumode / _mu_fish_slash
     bind -M mumode ':' _mu_fish_model_colon
     bind -M mumode backspace _mu_fish_speculative_backspace
-    bind -M mumode delete _mu_fish_speculative_delete
-    bind -M mumode left _mu_fish_speculative_left
-    bind -M mumode right _mu_fish_speculative_right
-    bind -M mumode home _mu_fish_speculative_home
-    bind -M mumode end _mu_fish_speculative_end
+    bind -M mumode delete _mu_fish_commit_speculative_model_colon delete-char
+    bind -M mumode left _mu_fish_commit_speculative_model_colon backward-char
+    bind -M mumode right _mu_fish_commit_speculative_model_colon forward-char
+    bind -M mumode home _mu_fish_commit_speculative_model_colon beginning-of-line
+    bind -M mumode end _mu_fish_commit_speculative_model_colon end-of-line
     bind -M mumode ctrl-c _mu_fish_clear_speculative_model_colon _mu_fish_reset_history_navigation cancel-commandline
-    bind -M mumode ctrl-d _mu_fish_speculative_delete_or_exit
+    bind -M mumode ctrl-d _mu_fish_commit_speculative_model_colon delete-or-exit
     bind -M mumode up _mu_fish_history_up
     bind -M mumode down _mu_fish_history_down
     bind -M mumode \e\[13\;2u _mu_fish_insert_newline

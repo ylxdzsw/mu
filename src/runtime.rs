@@ -11,10 +11,16 @@ use crate::models::{
 use crate::skills::{CommandMeta, SkillMeta};
 use crate::store::{Session, Store, UnsupportedSessionVersion};
 
-#[derive(Debug, Clone, Default)]
+#[derive(clap::Args, Debug, Clone, Default)]
 pub struct InvocationOverrides {
+    #[arg(short = 's', long, conflicts_with = "continue_current")]
     pub session: Option<String>,
+
+    /// Continue the last selected session in this scope
+    #[arg(short = 'c', long = "continue", conflicts_with = "session")]
     pub continue_current: bool,
+
+    #[arg(short = 'm', long)]
     pub model: Option<String>,
 }
 
@@ -165,24 +171,20 @@ pub fn resolve_invocation(
     } else {
         None
     };
-    let mut selection = if let Some(model_ref) = overrides.model.as_deref() {
-        RememberedModelSelection {
-            model: resolve_model_choice(config, model_ref)?,
-            unavailable: None,
-        }
-    } else if let Some(session) = attached_session.as_ref() {
-        resolve_session_selection(store, config, session)?
+    let selection = if let Some(session) = attached_session.as_ref() {
+        resolve_session_model_selection(store, config, session, overrides.model.as_deref())?
     } else {
-        resolve_scope_selection(config, remembered)?
-    };
-    if attached_session.is_none() {
+        let mut selection = if let Some(model_ref) = overrides.model.as_deref() {
+            RememberedModelSelection {
+                model: resolve_model_choice(config, model_ref)?,
+                unavailable: None,
+            }
+        } else {
+            resolve_scope_selection(config, remembered)?
+        };
         selection.model.reset();
-    } else if overrides.model.is_some()
-        && let Some(session) = attached_session.as_ref()
-    {
-        resume_session_fallback(store, config, &session.id, &mut selection.model)?;
-    }
-    let selection = finish_selection(selection);
+        finish_selection(selection)
+    };
 
     Ok(ResolvedInvocation {
         attached_session,
@@ -228,16 +230,21 @@ pub fn resolve_session_model(
     config: &Config,
     session: &Session,
 ) -> Result<ResolvedModelChoice> {
-    Ok(resolve_session_selection(store, config, session)?.model)
+    Ok(resolve_session_model_selection(store, config, session, None)?.model)
 }
 
-fn resolve_session_selection(
+pub fn resolve_session_model_selection(
     store: &Store,
     config: &Config,
     session: &Session,
-) -> Result<RememberedModelSelection> {
-    let mut selection = match session.last_model.as_deref() {
-        Some(model_ref) => match resolve_model_choice(config, model_ref) {
+    override_ref: Option<&str>,
+) -> Result<ResolvedModelSelection> {
+    let mut selection = match (override_ref, session.last_model.as_deref()) {
+        (Some(model_ref), _) => RememberedModelSelection {
+            model: resolve_model_choice(config, model_ref)?,
+            unavailable: None,
+        },
+        (None, Some(model_ref)) => match resolve_model_choice(config, model_ref) {
             Ok(model) => RememberedModelSelection {
                 model,
                 unavailable: None,
@@ -249,10 +256,10 @@ fn resolve_session_selection(
                 selection
             }
         },
-        None => resolve_scope_selection(config, remembered_scope_model(store)?.0)?,
+        (None, None) => resolve_scope_selection(config, remembered_scope_model(store)?.0)?,
     };
     resume_session_fallback(store, config, &session.id, &mut selection.model)?;
-    Ok(selection)
+    Ok(finish_selection(selection))
 }
 
 #[cfg(test)]
@@ -262,36 +269,7 @@ pub fn resolve_retry_model(
     session: &Session,
     override_ref: Option<&str>,
 ) -> Result<ResolvedModelChoice> {
-    Ok(resolve_retry_model_selection(store, config, session, override_ref)?.model)
-}
-
-pub fn resolve_retry_model_selection(
-    store: &Store,
-    config: &Config,
-    session: &Session,
-    override_ref: Option<&str>,
-) -> Result<ResolvedModelSelection> {
-    if let Some(model) = override_ref {
-        let mut choice = resolve_model_choice(config, model)?;
-        resume_session_fallback(store, config, &session.id, &mut choice)?;
-        return Ok(finish_selection(RememberedModelSelection {
-            model: choice,
-            unavailable: None,
-        }));
-    }
-    if let Some(model) = store.latest_attempt_model(&session.id)? {
-        if let Ok(mut choice) = resolve_model_choice(config, &model) {
-            resume_session_fallback(store, config, &session.id, &mut choice)?;
-            return Ok(finish_selection(RememberedModelSelection {
-                model: choice,
-                unavailable: None,
-            }));
-        }
-        let mut selection = resolve_session_selection(store, config, session)?;
-        selection.unavailable = Some(model);
-        return Ok(finish_selection(selection));
-    }
-    resolve_session_selection(store, config, session).map(finish_selection)
+    Ok(resolve_session_model_selection(store, config, session, override_ref)?.model)
 }
 
 fn finish_selection(selection: RememberedModelSelection) -> ResolvedModelSelection {
@@ -759,7 +737,8 @@ mod tests {
             },
         )
         .unwrap();
-        let retry = resolve_retry_model_selection(&store, &test_config(), &attached, None).unwrap();
+        let retry =
+            resolve_session_model_selection(&store, &test_config(), &attached, None).unwrap();
 
         assert_eq!(
             resolved.model.active_model().canonical,

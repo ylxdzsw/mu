@@ -306,8 +306,8 @@ pub(crate) fn consume_event(
                 .unwrap_or("incomplete");
             state.finish_reason = Some(FinishReason::Other(reason.to_string()));
         }
-        "response.failed" => return Err(responses_stream_error(&value["response"]["error"])),
-        "error" => return Err(responses_stream_error(&value)),
+        "response.failed" => return Err(classify_stream_error(&value["response"]["error"])),
+        "error" => return Err(classify_stream_error(&value)),
         _ => {}
     }
 
@@ -376,10 +376,6 @@ fn same_output_item(left: &Value, right: &Value) -> bool {
             .zip(right[key].as_str())
             .is_some_and(|(left, right)| !left.is_empty() && left == right)
     })
-}
-
-fn responses_stream_error(error: &Value) -> ProviderError {
-    classify_stream_error(error)
 }
 
 fn responses_usage(value: &Value) -> Option<Usage> {

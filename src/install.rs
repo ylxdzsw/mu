@@ -10,40 +10,25 @@ use anyhow::bail;
 use anyhow::{Context, Result};
 
 #[cfg(feature = "portable")]
-const BUILTINS: &[(&str, &str, bool)] = &[
+const BUILTINS: &[(&str, &str)] = &[
     (
         "agent-browser.md",
         include_str!("../builtins/agent-browser.md"),
-        false,
     ),
     (
         "background-task.md",
         include_str!("../builtins/background-task.md"),
-        false,
     ),
     (
         "brave-search.md",
         include_str!("../builtins/brave-search.md"),
-        false,
     ),
-    ("cli.md", include_str!("../builtins/cli.md"), false),
-    ("config.md", include_str!("../builtins/config.md"), false),
-    (
-        "exa-search.md",
-        include_str!("../builtins/exa-search.md"),
-        false,
-    ),
-    (
-        "markitdown.md",
-        include_str!("../builtins/markitdown.md"),
-        false,
-    ),
-    ("mu-doc.md", include_str!("../builtins/mu-doc.md"), false),
-    (
-        "subagent.md",
-        include_str!("../builtins/subagent.md"),
-        false,
-    ),
+    ("cli.md", include_str!("../builtins/cli.md")),
+    ("config.md", include_str!("../builtins/config.md")),
+    ("exa-search.md", include_str!("../builtins/exa-search.md")),
+    ("markitdown.md", include_str!("../builtins/markitdown.md")),
+    ("mu-doc.md", include_str!("../builtins/mu-doc.md")),
+    ("subagent.md", include_str!("../builtins/subagent.md")),
 ];
 
 #[cfg(feature = "portable")]
@@ -261,7 +246,7 @@ fn initialize_cache_root(cache_root: &Path) -> Result<()> {
 #[cfg(feature = "portable")]
 fn initialize_builtins(
     directory: &Path,
-    builtins: &[(&str, &str, bool)],
+    builtins: &[(&str, &str)],
     executable_mtime: std::time::SystemTime,
 ) -> Result<()> {
     if !prepare_cache_directory(directory, "built-in", executable_mtime)? {
@@ -271,15 +256,12 @@ fn initialize_builtins(
     std::fs::create_dir(directory)
         .with_context(|| format!("creating portable built-ins {}", directory.display()))?;
     let result = (|| {
-        for (name, contents, executable) in builtins {
+        for (name, contents) in builtins {
             let path = directory.join(name);
             std::fs::write(&path, contents)
                 .with_context(|| format!("writing portable built-in {}", path.display()))?;
-            std::fs::set_permissions(
-                &path,
-                std::fs::Permissions::from_mode(if *executable { 0o755 } else { 0o644 }),
-            )
-            .with_context(|| format!("setting portable built-in mode {}", path.display()))?;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))
+                .with_context(|| format!("setting portable built-in mode {}", path.display()))?;
         }
         Ok(())
     })();
@@ -377,19 +359,19 @@ mod tests {
     fn embedded_builtins_exactly_cover_the_shipped_files_and_modes() {
         let mut embedded = BUILTINS
             .iter()
-            .map(|(name, _, executable)| ((*name).to_string(), *executable))
+            .map(|(name, contents)| ((*name).to_string(), (*contents).to_string()))
             .collect::<Vec<_>>();
         embedded.sort_unstable();
         let mut shipped = std::fs::read_dir(Path::new(env!("CARGO_MANIFEST_DIR")).join("builtins"))
             .unwrap()
             .map(|entry| {
                 let entry = entry.unwrap();
-                let executable = entry.metadata().unwrap().permissions().mode() & 0o111 != 0;
+                assert_eq!(entry.metadata().unwrap().permissions().mode() & 0o111, 0);
                 let name = entry
                     .file_name()
                     .into_string()
                     .expect("built-in names are UTF-8");
-                (name, executable)
+                (name, std::fs::read_to_string(entry.path()).unwrap())
             })
             .collect::<Vec<_>>();
         shipped.sort_unstable();
@@ -485,13 +467,10 @@ mod tests {
         initialize_builtins(&builtins, BUILTINS, std::time::UNIX_EPOCH).unwrap();
         initialize_applets(&executable, &applets, APPLET_NAMES, std::time::UNIX_EPOCH).unwrap();
 
-        for (name, _, executable) in BUILTINS {
+        for (name, contents) in BUILTINS {
             let path = builtins.join(name);
-            assert!(path.is_file());
-            assert_eq!(
-                path.metadata().unwrap().permissions().mode() & 0o111 != 0,
-                *executable
-            );
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), *contents);
+            assert_eq!(path.metadata().unwrap().permissions().mode() & 0o777, 0o644);
         }
         for name in APPLET_NAMES {
             assert_eq!(std::fs::read_link(applets.join(name)).unwrap(), executable);
@@ -555,7 +534,7 @@ mod tests {
         initialize_applets(&executable, &applets, APPLET_NAMES, executable_mtime).unwrap();
 
         assert!(!builtins.join("obsolete").exists());
-        for (name, contents, _) in BUILTINS {
+        for (name, contents) in BUILTINS {
             assert_eq!(
                 std::fs::read_to_string(builtins.join(name)).unwrap(),
                 *contents
@@ -597,7 +576,7 @@ mod tests {
         assert!(
             initialize_builtins(
                 &builtins,
-                &[("missing/child", "contents", false)],
+                &[("missing/child", "contents")],
                 std::time::UNIX_EPOCH,
             )
             .is_err()

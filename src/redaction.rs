@@ -7,18 +7,10 @@ use crate::config::{Config, redaction_suffix};
 
 const SHORT_SECRET_LEN: usize = 8;
 
-#[derive(Debug, Clone)]
-struct Secret {
-    name: String,
-    value: String,
-    replacement: Vec<u8>,
-}
-
 #[derive(Debug, Clone, Default)]
 pub struct SecretRedactor {
-    secrets: Vec<Secret>,
+    replacements: Vec<Vec<u8>>,
     matcher: Option<AhoCorasick>,
-    max_secret_bytes: usize,
     pending: Vec<u8>,
     utf8_pending: Vec<u8>,
     redacted: bool,
@@ -64,41 +56,24 @@ impl SecretRedactor {
             values.entry(value.clone()).or_insert_with(|| name.clone());
         }
 
-        let mut secrets: Vec<_> = values
-            .into_iter()
-            .map(|(value, name)| Secret {
-                replacement: format!("[redacted:{name}]").into_bytes(),
-                name,
-                value,
-            })
-            .collect();
-        secrets.sort_by(|a, b| {
-            b.value
-                .len()
-                .cmp(&a.value.len())
-                .then_with(|| a.name.cmp(&b.name))
-        });
-
-        let max_secret_bytes = secrets
-            .iter()
-            .map(|secret| secret.value.len())
-            .max()
-            .unwrap_or_default();
-        let matcher = if secrets.is_empty() {
+        let matcher = if values.is_empty() {
             None
         } else {
             Some(
                 AhoCorasick::builder()
                     .match_kind(MatchKind::LeftmostLongest)
-                    .build(secrets.iter().map(|secret| secret.value.as_bytes()))
+                    .build(values.keys())
                     .context("building secret redaction matcher")?,
             )
         };
+        let replacements = values
+            .values()
+            .map(|name| format!("[redacted:{name}]").into_bytes())
+            .collect();
 
         Ok(Self {
-            secrets,
+            replacements,
             matcher,
-            max_secret_bytes,
             pending: Vec::new(),
             utf8_pending: Vec::new(),
             redacted: false,
@@ -115,12 +90,12 @@ impl SecretRedactor {
     }
 
     pub fn redact_chunk(&mut self, bytes: &[u8]) -> String {
-        if self.matcher.is_none() {
+        let Some(matcher) = &self.matcher else {
             return self.decode_utf8(bytes, false);
-        }
+        };
 
         self.pending.extend_from_slice(bytes);
-        let keep_bytes = self.max_secret_bytes.saturating_sub(1);
+        let keep_bytes = matcher.max_pattern_len().saturating_sub(1);
         if self.pending.len() <= keep_bytes {
             return String::new();
         }
@@ -155,7 +130,7 @@ impl SecretRedactor {
                 break;
             }
             output.extend_from_slice(&self.pending[cursor..matched.start()]);
-            output.extend_from_slice(&self.secrets[matched.pattern()].replacement);
+            output.extend_from_slice(&self.replacements[matched.pattern()]);
             cursor = matched.end();
             consumed = consumed.max(cursor);
             self.redacted = true;

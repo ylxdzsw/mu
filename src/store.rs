@@ -18,7 +18,8 @@ use crate::models::ResolvedModelRef;
 use crate::provider::{
     AssistantItem, Attachment, ContentPart, ImageDetail, Message, ModelApi, NativeReplay,
     NativeReplayPayload, ReplayOrigin, Request, ToolAttachment, ToolCall, Usage, UserContent,
-    estimate_messages_tokens, filter_native_replay_for_config, native_replay_origins,
+    estimate_messages_tokens, filter_native_replay_for_config, native_replay_compatible_for_config,
+    native_replay_origins,
 };
 
 pub const BASH_CALL_ID_ENV: &str = "MU_BASH_CALL_ID";
@@ -829,21 +830,6 @@ impl Store {
             return Ok(());
         }
         bail!("could not allocate a temporary current-session link")
-    }
-
-    pub fn latest_attempt_model(&self, session_id: &str) -> Result<Option<String>> {
-        self.with_journal(session_id, |journal| {
-            Ok(journal
-                .events
-                .iter()
-                .rev()
-                .find_map(|line| match &line.event {
-                    Event::ProviderRequested { origin, .. } => {
-                        Some(origin.canonical_model_ref.clone())
-                    }
-                    _ => None,
-                }))
-        })
     }
 
     pub fn latest_floating_provider(
@@ -2001,37 +1987,27 @@ impl Store {
                     else {
                         continue;
                     };
-                    if !self.request_context_compatible(
+                    let Some(input_message_count) = self.request_context_compatible(
                         journal,
                         *request_seq,
                         origin,
                         recipe,
                         replay_target,
-                    )? {
+                    )?
+                    else {
                         continue;
-                    }
-                    let through_seq = request_seq.saturating_sub(1);
-                    let input_message_count = self.context_until(journal, through_seq)?.len();
+                    };
                     let output_complete = *context_output_complete
                         && (native_replay.is_some()
                             || !items.iter().any(|item| {
                                 matches!(item, PersistedAssistantItem::Reasoning { .. })
                             }))
                         && native_replay.as_ref().is_none_or(|native| {
-                            let message = Message::Assistant {
-                                items: items
-                                    .iter()
-                                    .map(PersistedAssistantItem::assistant_item)
-                                    .collect(),
-                                native_replay: Some(hydrate_native_replay(native, origin)),
-                            };
-                            matches!(
-                                filter_native_replay_for_config(&[message], config, target, api)
-                                    .as_slice(),
-                                [Message::Assistant {
-                                    native_replay: Some(_),
-                                    ..
-                                }]
+                            native_replay_compatible_for_config(
+                                &hydrate_native_replay(native, origin),
+                                config,
+                                target,
+                                api,
                             )
                         });
                     if output_complete && let Some(tokens) = usage.context_total() {
@@ -2054,25 +2030,25 @@ impl Store {
         origin: &ProviderOrigin,
         recipe: &RequestRecipe,
         target: ReplayTarget<'_>,
-    ) -> Result<bool> {
+    ) -> Result<Option<usize>> {
         if !request_format_is_current(&origin.api, &recipe.format)
             || !context_origin_compatible(target.config, origin, target.model, target.api)
         {
-            return Ok(false);
+            return Ok(None);
         }
         let through_seq = request_seq.saturating_sub(1);
         if recipe.input.get("emergency_preserved_message").is_some() {
-            return Ok(false);
+            return Ok(None);
         }
         if let Some(elided) = recipe.input.get("emergency_elided_call_ids") {
             let elided = serde_json::from_value::<Vec<i64>>(elided.clone())
                 .context("invalid emergency Bash elision ids in request recipe")?;
             if !elided.is_empty() {
-                return Ok(false);
+                return Ok(None);
             }
         }
         let Some(origins) = recipe.input.get("native_replay_origins") else {
-            return Ok(false);
+            return Ok(None);
         };
         let recorded = serde_json::from_value::<Vec<ReplayOrigin>>(origins.clone())
             .context("invalid native replay origins in request recipe")?;
@@ -2083,7 +2059,8 @@ impl Store {
             target.model,
             target.api,
         );
-        Ok(native_replay_origins(&current_projection) == recorded)
+        Ok((native_replay_origins(&current_projection) == recorded)
+            .then_some(historical_context.len()))
     }
 
     pub fn acquire_session_lock(&self, session_id: &str) -> Result<SessionLock<'_>> {
@@ -3227,7 +3204,7 @@ fn validate_events(events: &[EventLine]) -> Result<()> {
     let mut exchanges = HashMap::new();
     let mut terminal = HashSet::new();
     let mut calls = HashMap::new();
-    let mut starts = HashMap::<i64, usize>::new();
+    let mut starts = HashSet::new();
     let mut results = HashSet::new();
     let mut queued_prompts = HashSet::new();
     let mut unresolved_prompt = None;
@@ -3357,8 +3334,7 @@ fn validate_events(events: &[EventLine]) -> Result<()> {
                             {
                                 bail!("Bash claim arguments are not a JSON object")
                             }
-                            let turn_id = exchange.0.clone();
-                            if calls.insert(*call_id, turn_id).is_some() {
+                            if calls.insert(*call_id, arguments.as_str()).is_some() {
                                 bail!("duplicate Bash call id: {call_id}")
                             }
                         }
@@ -3386,20 +3362,16 @@ fn validate_events(events: &[EventLine]) -> Result<()> {
                 }
             }
             Event::BashStarted { call_id } => {
-                let Some(_) = calls.get(call_id) else {
+                let Some(arguments) = calls.get(call_id) else {
                     bail!("Bash start references unknown call: {call_id}")
                 };
                 if results.contains(call_id) {
                     bail!("Bash start follows its result: {call_id}")
                 }
-                let (_, arguments) =
-                    find_call_in_events(events, *call_id).context("Bash start claim missing")?;
                 let risk = bash_risk(arguments)?;
-                let attempts = starts.entry(*call_id).or_default();
-                if *attempts > 0 && risk != crate::bash::BashRisk::Readonly {
+                if !starts.insert(*call_id) && risk != crate::bash::BashRisk::Readonly {
                     bail!("non-readonly Bash claim has multiple starts: {call_id}")
                 }
-                *attempts += 1;
             }
             Event::BashCompleted {
                 call_id,
@@ -3410,7 +3382,7 @@ fn validate_events(events: &[EventLine]) -> Result<()> {
                 if !calls.contains_key(call_id) {
                     bail!("Bash result references unknown call: {call_id}")
                 }
-                if !starts.contains_key(call_id) {
+                if !starts.contains(call_id) {
                     bail!("Bash result references an unstarted call: {call_id}")
                 }
                 if !results.insert(call_id) {
@@ -3426,7 +3398,7 @@ fn validate_events(events: &[EventLine]) -> Result<()> {
                 if !calls.contains_key(call_id) {
                     bail!("not-attempted Bash result references unknown call: {call_id}")
                 }
-                if starts.contains_key(call_id) {
+                if starts.contains(call_id) {
                     bail!("not-attempted Bash result references a started call: {call_id}")
                 }
                 if !results.insert(call_id) {
@@ -4070,46 +4042,7 @@ fn hex(bytes: impl AsRef<[u8]>) -> String {
 }
 
 fn canonical_json(value: &Value) -> Vec<u8> {
-    fn write(value: &Value, output: &mut Vec<u8>) {
-        match value {
-            Value::Null => output.extend_from_slice(b"null"),
-            Value::Bool(value) => output.extend_from_slice(value.to_string().as_bytes()),
-            Value::Number(value) => output.extend_from_slice(value.to_string().as_bytes()),
-            Value::String(value) => output.extend_from_slice(
-                serde_json::to_string(value)
-                    .expect("serializing a JSON string cannot fail")
-                    .as_bytes(),
-            ),
-            Value::Array(values) => {
-                output.push(b'[');
-                for (index, value) in values.iter().enumerate() {
-                    if index > 0 {
-                        output.push(b',');
-                    }
-                    write(value, output);
-                }
-                output.push(b']');
-            }
-            Value::Object(values) => {
-                output.push(b'{');
-                let mut entries = values.iter().collect::<Vec<_>>();
-                entries.sort_unstable_by(|left, right| left.0.cmp(right.0));
-                for (index, (key, value)) in entries.into_iter().enumerate() {
-                    if index > 0 {
-                        output.push(b',');
-                    }
-                    write(&Value::String(key.clone()), output);
-                    output.push(b':');
-                    write(value, output);
-                }
-                output.push(b'}');
-            }
-        }
-    }
-
-    let mut output = Vec::new();
-    write(value, &mut output);
-    output
+    serde_json::to_vec(value).expect("serializing a JSON value cannot fail")
 }
 
 #[cfg(test)]

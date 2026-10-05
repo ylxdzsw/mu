@@ -385,7 +385,6 @@ impl Renderer {
             reasoning_chars: 0,
             summary: String::new(),
             title: None,
-            committed: false,
             full_output_started: false,
             full_summary_part: None,
         });
@@ -409,9 +408,6 @@ impl Renderer {
         reasoning.reasoning_chars = reasoning
             .reasoning_chars
             .saturating_add(text.chars().count());
-        if reasoning.committed {
-            return Ok(());
-        }
         if self.format == OutputFormat::Full {
             return self.full_reasoning_text(text, None);
         }
@@ -436,7 +432,7 @@ impl Renderer {
             let Some(reasoning) = self.reasoning.as_mut() else {
                 return Ok(());
             };
-            if reasoning.committed || reasoning.visibility != ReasoningVisibility::Opaque {
+            if reasoning.visibility != ReasoningVisibility::Opaque {
                 return Ok(());
             }
             reasoning.summary.push_str(text);
@@ -466,16 +462,9 @@ impl Renderer {
     }
 
     pub fn reasoning_end(&mut self, usage: Option<(u64, u64)>) -> io::Result<()> {
-        if self.format == OutputFormat::Final {
-            return Ok(());
-        }
-        let one_line_width = self.one_line_width();
-        let Some(reasoning) = self.reasoning.as_mut() else {
+        let Some(mut reasoning) = self.reasoning.take() else {
             return Ok(());
         };
-        if reasoning.committed {
-            return Ok(());
-        }
         if self.format != OutputFormat::Full && reasoning.title.is_none() {
             reasoning.title = extract_reasoning_summary_title(&reasoning.summary, true);
         }
@@ -483,15 +472,12 @@ impl Renderer {
             self.reasoning_run_title = Some(title);
         }
         if self.format == OutputFormat::Concise {
-            reasoning.committed = true;
             self.clear_live_line()?;
             self.live_line = None;
             return Ok(());
         }
         if self.format == OutputFormat::Full {
-            let output_started = reasoning.full_output_started;
-            reasoning.committed = true;
-            if output_started {
+            if reasoning.full_output_started {
                 self.ensure_line_start()?;
             }
             return Ok(());
@@ -515,10 +501,9 @@ impl Renderer {
                 self.styled,
             )
         );
-        if let Some(width) = one_line_width {
+        if let Some(width) = self.one_line_width() {
             line = truncate_styled_line(&line, width);
         }
-        reasoning.committed = true;
         self.live_line = None;
         self.ensure_block_separator_if_needed()?;
         self.write_committed(&line)
@@ -1093,9 +1078,6 @@ impl Renderer {
         let Some(reasoning) = self.reasoning.as_ref() else {
             return Ok(());
         };
-        if reasoning.committed {
-            return Ok(());
-        }
         let starts_new_part = reasoning.full_output_started
             && summary_part.is_some()
             && reasoning.full_summary_part != summary_part;
@@ -1716,7 +1698,7 @@ struct LineStreamPrefix {
 #[derive(Default)]
 struct InlineStream {
     pending: String,
-    base_styles: Vec<MdStyle>,
+    base_styles: &'static [MdStyle],
     previous_source_char: Option<char>,
     format: OutputFormat,
 }
@@ -1753,7 +1735,6 @@ struct ReasoningState {
     reasoning_chars: usize,
     summary: String,
     title: Option<String>,
-    committed: bool,
     full_output_started: bool,
     full_summary_part: Option<usize>,
 }
@@ -1927,13 +1908,13 @@ impl MarkdownStream {
     }
 
     fn push_line_stream_text(&mut self, text: &str, out: &mut Vec<String>) {
-        let mut rendered = Vec::new();
+        let mut rendered = String::new();
         self.inline_stream.push(text, &mut rendered);
         if rendered.is_empty() {
             return;
         }
         let mut combined = self.take_rendered_line_prefix();
-        combined.push_str(&rendered.concat());
+        combined.push_str(&rendered);
         self.emit_wrappable(&combined, out);
     }
 
@@ -1952,24 +1933,24 @@ impl MarkdownStream {
         let Some(state) = self.line_stream.take() else {
             return;
         };
-        let mut rendered = Vec::new();
+        let mut rendered = String::new();
         self.inline_stream.finish(&mut rendered);
         let raw_fallback = self
             .line_prefix
             .as_ref()
             .is_some_and(|prefix| !prefix.emitted);
-        let mut combined = String::new();
         if raw_fallback {
+            let mut combined = String::new();
             if let Some(prefix) = self.line_prefix.take() {
                 combined.push_str(&prefix.raw);
             }
-            combined.push_str(&rendered.concat());
+            combined.push_str(&rendered);
             combined.push('\n');
             self.emit_wrappable(&combined, out);
             return;
         }
         self.line_prefix = None;
-        combined.push_str(&rendered.concat());
+        let mut combined = rendered;
         if matches!(
             state,
             LineStreamState::Heading { .. } | LineStreamState::Quote
@@ -2569,38 +2550,39 @@ fn render_inline_markdown(markdown: &str, format: OutputFormat) -> Option<String
 
 impl InlineStream {
     fn set_base(&mut self, styles: &'static [MdStyle]) {
-        self.base_styles.clear();
-        self.base_styles.extend_from_slice(styles);
+        self.base_styles = styles;
     }
 
-    fn push(&mut self, text: &str, out: &mut Vec<String>) {
+    fn push(&mut self, text: &str, out: &mut String) {
         self.pending.push_str(text);
         self.flush_available(out);
     }
 
-    fn finish(&mut self, out: &mut Vec<String>) {
-        if !self.pending.is_empty() {
-            out.push(std::mem::take(&mut self.pending));
-        }
-        self.base_styles.clear();
+    fn finish(&mut self, out: &mut String) {
+        out.push_str(&self.pending);
+        self.pending.clear();
+        self.base_styles = &[];
         self.previous_source_char = None;
     }
 
-    fn flush_available(&mut self, out: &mut Vec<String>) {
+    fn flush_available(&mut self, out: &mut String) {
         loop {
             let Some(marker) = earliest_inline_marker(&self.pending) else {
                 if !self.pending.is_empty() {
-                    let text = std::mem::take(&mut self.pending);
-                    self.previous_source_char =
-                        text.chars().next_back().or(self.previous_source_char);
-                    out.push(text);
+                    self.previous_source_char = self
+                        .pending
+                        .chars()
+                        .next_back()
+                        .or(self.previous_source_char);
+                    out.push_str(&self.pending);
+                    self.pending.clear();
                 }
                 return;
             };
             if marker > 0 {
-                let text = self.pending[..marker].to_string();
+                let text = &self.pending[..marker];
                 self.previous_source_char = text.chars().next_back().or(self.previous_source_char);
-                out.push(text);
+                out.push_str(text);
                 self.pending.replace_range(..marker, "");
             }
             let Some((rendered, consumed)) = self.render_span_at_start() else {
@@ -2610,7 +2592,7 @@ impl InlineStream {
                 .chars()
                 .next_back()
                 .or(self.previous_source_char);
-            out.push(rendered);
+            out.push_str(&rendered);
             self.pending.replace_range(..consumed, "");
         }
     }
@@ -2714,7 +2696,7 @@ impl InlineStream {
     }
 
     fn reapply_base(&self, out: &mut String) {
-        for style in &self.base_styles {
+        for style in self.base_styles {
             out.push_str(style.ansi());
         }
     }
@@ -3196,10 +3178,10 @@ fn render_stacked_table(table: &TableState, max_width: usize) -> String {
             .map(|idx| format!("Column {idx}"))
             .collect::<Vec<_>>()
     };
-    let records = if has_body {
-        table.rows.clone()
+    let records: &[Vec<String>] = if has_body {
+        &table.rows
     } else {
-        vec![table.header.clone()]
+        std::slice::from_ref(&table.header)
     };
 
     let label_width = labels
@@ -3238,7 +3220,7 @@ fn render_stacked_table(table: &TableState, max_width: usize) -> String {
         return out;
     }
 
-    render_linear_table(&labels, &records, max_width)
+    render_linear_table(&labels, records, max_width)
 }
 
 fn render_linear_table(labels: &[String], records: &[Vec<String>], max_width: usize) -> String {
@@ -3318,7 +3300,7 @@ fn wrap_table_cell(cell: &str, width: usize) -> Vec<String> {
     let units = styled_graphemes(cell);
     wrap_styled_graphemes(&units, width)
         .into_iter()
-        .map(|line| render_styled_graphemes(&line))
+        .map(render_styled_graphemes)
         .collect()
 }
 
@@ -3401,7 +3383,7 @@ fn ansi_sequence_end(input: &str, start: usize) -> usize {
     }
 }
 
-fn wrap_styled_graphemes(units: &[StyledGrapheme], width: usize) -> Vec<Vec<StyledGrapheme>> {
+fn wrap_styled_graphemes(units: &[StyledGrapheme], width: usize) -> Vec<&[StyledGrapheme]> {
     let mut lines = Vec::new();
     let mut idx = 0;
 
@@ -3420,7 +3402,7 @@ fn wrap_styled_graphemes(units: &[StyledGrapheme], width: usize) -> Vec<Vec<Styl
             hard_end += 1;
         }
         if hard_end == units.len() {
-            lines.push(units[idx..].to_vec());
+            lines.push(&units[idx..]);
             break;
         }
 
@@ -3433,18 +3415,18 @@ fn wrap_styled_graphemes(units: &[StyledGrapheme], width: usize) -> Vec<Vec<Styl
                     <= WRAP_LOOKBEHIND_CELLS
         });
         if let Some(boundary) = boundary {
-            lines.push(units[idx..boundary].to_vec());
+            lines.push(&units[idx..boundary]);
             idx = boundary + 1;
             while idx < units.len() && units[idx].whitespace {
                 idx += 1;
             }
         } else {
-            lines.push(units[idx..hard_end].to_vec());
+            lines.push(&units[idx..hard_end]);
             idx = hard_end;
         }
     }
     if lines.is_empty() {
-        lines.push(Vec::new());
+        lines.push(&[]);
     }
     lines
 }
@@ -4011,15 +3993,7 @@ fn normalize_trailing_fragment(fragment: &str, finalizing: bool) -> String {
 }
 
 fn trim_to_last_bytes(text: &str, max_bytes: usize) -> String {
-    if text.len() <= max_bytes {
-        return text.to_string();
-    }
-    let start = text
-        .char_indices()
-        .find(|(idx, _)| text.len() - idx <= max_bytes)
-        .map(|(idx, _)| idx)
-        .unwrap_or(text.len());
-    text[start..].to_string()
+    text[text.ceil_char_boundary(text.len().saturating_sub(max_bytes))..].to_owned()
 }
 
 fn cap_tail_line(line: &str, complete_line: bool, max_cells: Option<usize>) -> (String, usize) {
@@ -4185,16 +4159,7 @@ fn trim_to_last_cells(text: &str, max_cells: usize) -> String {
 }
 
 fn trim_to_first_bytes(text: &str, max_bytes: usize) -> String {
-    if text.len() <= max_bytes {
-        return text.to_string();
-    }
-    let end = text
-        .char_indices()
-        .take_while(|(idx, ch)| idx + ch.len_utf8() <= max_bytes)
-        .last()
-        .map(|(idx, ch)| idx + ch.len_utf8())
-        .unwrap_or(0);
-    text[..end].to_string()
+    text[..text.floor_char_boundary(max_bytes)].to_owned()
 }
 
 fn append_ellipsis_in_place(text: &mut String, max_bytes: usize) {

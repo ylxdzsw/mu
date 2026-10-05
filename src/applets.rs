@@ -655,7 +655,7 @@ mod apply_patch {
         let mut completed = Vec::new();
         for change in changes {
             let result = match change {
-                PlannedChange::Add { path, content } => atomic_write(path, content, false, None),
+                PlannedChange::Add { path, content } => atomic_write(path, content, None),
                 PlannedChange::Delete { path, .. } => {
                     fs::remove_file(path).with_context(|| format!("deleting {}", path.display()))
                 }
@@ -664,7 +664,7 @@ mod apply_patch {
                     reported_path: _,
                     original,
                     content,
-                } => atomic_write(path, content, true, Some(original.as_slice())),
+                } => atomic_write(path, content, Some(original.as_slice())),
                 PlannedChange::Move {
                     from,
                     to,
@@ -674,7 +674,7 @@ mod apply_patch {
                     fs::rename(from, to).with_context(|| {
                         format!("moving {} to {}", from.display(), to.display())
                     })?;
-                    if let Err(error) = atomic_write(to, content, true, Some(original.as_slice())) {
+                    if let Err(error) = atomic_write(to, content, Some(original.as_slice())) {
                         return match fs::rename(to, from) {
                             Ok(()) => Err(error.context(format!(
                                 "updating moved file {}; move rolled back",
@@ -703,8 +703,7 @@ mod apply_patch {
                         format!("moving symlink {} to {}", from.display(), to.display())
                     })?;
                     if let Some((target, original, content)) = target_update
-                        && let Err(error) =
-                            atomic_write(target, content, true, Some(original.as_slice()))
+                        && let Err(error) = atomic_write(target, content, Some(original.as_slice()))
                     {
                         return match fs::rename(to, from) {
                             Ok(()) => Err(error.context(format!(
@@ -735,41 +734,41 @@ mod apply_patch {
         Ok(())
     }
 
-    pub(super) fn atomic_write(
-        path: &Path,
-        content: &str,
-        replace: bool,
-        expected: Option<&[u8]>,
-    ) -> Result<()> {
+    pub(super) fn atomic_write(path: &Path, content: &str, expected: Option<&[u8]>) -> Result<()> {
         let parent = path.parent().unwrap_or_else(|| Path::new("."));
         fs::create_dir_all(parent)
             .with_context(|| format!("creating parent directory {}", parent.display()))?;
-        if replace {
-            return overwrite_existing(path, content.as_bytes(), expected);
+        match expected {
+            Some(expected) => overwrite_existing(path, content.as_bytes(), expected),
+            None => {
+                let filename = path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or("file");
+                let (mut file, temporary) = crate::random::create_temp_file(
+                    parent,
+                    &format!(".{filename}.mu-tmp-"),
+                    ".tmp",
+                )?;
+                let result = (|| -> Result<()> {
+                    file.write_all(content.as_bytes())?;
+                    file.sync_all()?;
+                    drop(file);
+                    fs::hard_link(&temporary, path).with_context(|| {
+                        format!("creating {} without overwriting", path.display())
+                    })?;
+                    fs::remove_file(&temporary)?;
+                    Ok(())
+                })();
+                if result.is_err() {
+                    let _ = fs::remove_file(&temporary);
+                }
+                result
+            }
         }
-
-        let filename = path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("file");
-        let (mut file, temporary) =
-            crate::random::create_temp_file(parent, &format!(".{filename}.mu-tmp-"), ".tmp")?;
-        let result = (|| -> Result<()> {
-            file.write_all(content.as_bytes())?;
-            file.sync_all()?;
-            drop(file);
-            fs::hard_link(&temporary, path)
-                .with_context(|| format!("creating {} without overwriting", path.display()))?;
-            fs::remove_file(&temporary)?;
-            Ok(())
-        })();
-        if result.is_err() {
-            let _ = fs::remove_file(&temporary);
-        }
-        result
     }
 
-    fn overwrite_existing(path: &Path, content: &[u8], expected: Option<&[u8]>) -> Result<()> {
+    fn overwrite_existing(path: &Path, content: &[u8], expected: &[u8]) -> Result<()> {
         let mut target = OpenOptions::new()
             .read(true)
             .write(true)
@@ -781,9 +780,7 @@ mod apply_patch {
         target.seek(SeekFrom::Start(0))?;
         let mut old = Vec::new();
         target.read_to_end(&mut old)?;
-        if let Some(expected) = expected
-            && old != expected
-        {
+        if old != expected {
             bail!(
                 "file changed while the edit was being prepared; re-read {} and retry",
                 path.display()
@@ -805,22 +802,15 @@ mod apply_patch {
         }
         drop(backup);
 
-        let result = (|| -> Result<()> {
+        let mut rewrite = |bytes: &[u8]| -> Result<()> {
             target.set_len(0)?;
             target.seek(SeekFrom::Start(0))?;
-            target.write_all(content)?;
+            target.write_all(bytes)?;
             target.sync_all()?;
             Ok(())
-        })();
-        if let Err(error) = result {
-            let restore = (|| -> Result<()> {
-                target.set_len(0)?;
-                target.seek(SeekFrom::Start(0))?;
-                target.write_all(&old)?;
-                target.sync_all()?;
-                Ok(())
-            })();
-            if restore.is_ok() {
+        };
+        if let Err(error) = rewrite(content) {
+            if rewrite(&old).is_ok() {
                 let _ = fs::remove_file(&backup_path);
                 return Err(error.context("edit failed; the original file was restored"));
             }
@@ -936,7 +926,7 @@ mod apply_patch {
             fs::hard_link(&path, &hardlink).unwrap();
             let before = fs::metadata(&path).unwrap();
 
-            atomic_write(&path, "new\n", true, Some(b"old\n")).unwrap();
+            atomic_write(&path, "new\n", Some(b"old\n")).unwrap();
 
             let after = fs::metadata(&path).unwrap();
             assert_eq!((after.dev(), after.ino()), (before.dev(), before.ino()));
@@ -958,7 +948,7 @@ mod apply_patch {
             let path = dir.join("file.txt");
             fs::write(&path, "changed\n").unwrap();
 
-            let error = atomic_write(&path, "new\n", true, Some(b"old\n")).unwrap_err();
+            let error = atomic_write(&path, "new\n", Some(b"old\n")).unwrap_err();
 
             assert!(
                 error
@@ -1005,7 +995,7 @@ mod apply_patch {
                     }
                     std::thread::sleep(std::time::Duration::from_millis(10));
                 }
-                atomic_write(&path, "new\n", true, Some(b"old\n")).unwrap_err();
+                atomic_write(&path, "new\n", Some(b"old\n")).unwrap_err();
                 assert_eq!(fs::read_to_string(&path).unwrap(), "old\n");
                 Ok(())
             })();
@@ -1013,7 +1003,7 @@ mod apply_patch {
             let _ = holder.kill();
             let _ = holder.wait();
             contention.unwrap();
-            atomic_write(&path, "new\n", true, Some(b"old\n")).unwrap();
+            atomic_write(&path, "new\n", Some(b"old\n")).unwrap();
             assert_eq!(fs::read_to_string(&path).unwrap(), "new\n");
             fs::remove_dir_all(dir).unwrap();
         }
@@ -1380,7 +1370,6 @@ mod edit {
         super::apply_patch::atomic_write(
             &planned.target,
             &planned.content,
-            true,
             Some(planned.original.as_bytes()),
         )?;
         Ok(format_summary(&planned, &cwd))
@@ -1939,7 +1928,6 @@ mod edit {
             super::super::apply_patch::atomic_write(
                 &planned.target,
                 &planned.content,
-                true,
                 Some(planned.original.as_bytes()),
             )
             .unwrap();
@@ -2065,7 +2053,6 @@ mod edit {
             super::super::apply_patch::atomic_write(
                 &planned.target,
                 &planned.content,
-                true,
                 Some(planned.original.as_bytes()),
             )
             .unwrap();

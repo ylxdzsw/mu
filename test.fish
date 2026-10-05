@@ -245,11 +245,11 @@ set models (_mu_fish_model_candidates gp)
 contains gpt $models; or fail 'model candidates include unique shorthand'
 contains openai/gpt $models; or fail 'model candidates include canonical id'
 contains shared $models; or fail 'model candidates include shared floating choice'
-set efforts (_mu_fish_model_effort_suffixes gpt)
-contains :low $efforts; or fail 'effort candidates include low'
-contains :high $efforts; or fail 'effort candidates include high'
-set shared_efforts (_mu_fish_model_effort_suffixes shared)
-contains :medium $shared_efforts; or fail 'floating effort candidates merge provider suggestions'
+set efforts (_mu_fish_model_candidates gpt:)
+contains gpt:low $efforts; or fail 'effort candidates include low'
+contains gpt:high $efforts; or fail 'effort candidates include high'
+set shared_efforts (_mu_fish_model_candidates shared:)
+contains shared:medium $shared_efforts; or fail 'floating effort candidates merge provider suggestions'
 set model_records (_mu_fish_model_records)
 _mu_fish_model_completion_transition gpt $model_records; or fail 'unshadowed exact models transition to efforts'
 _mu_fish_model_completion_transition shared $model_records; or fail 'floating exact models transition to efforts'
@@ -552,7 +552,7 @@ not test -s "$capture_calls"; or fail 'model effort completion should not submit
 set speculative_colon_transcript "$TEST_TMPDIR/speculative-colon-transcript"
 set speculative_colon_setup (string join '; ' -- \
     "$interactive_setup" \
-    'function _mu_test_speculative_colon_state; commandline -r "/model gpt"; commandline -C 10; _mu_fish_append_speculative_model_colon; _mu_fish_model_colon; set explicit (string join , -- (commandline | string collect) (commandline -C)); commandline -r "/model gpt"; commandline -C 10; _mu_fish_append_speculative_model_colon; _mu_fish_speculative_backspace; set back (string join , -- (commandline | string collect) (commandline -C)); commandline -r "/model gpt"; commandline -C 10; _mu_fish_append_speculative_model_colon; _mu_fish_speculative_delete; set delete (string join , -- (commandline | string collect) (commandline -C)); commandline -r "/model gpt"; commandline -C 10; _mu_fish_append_speculative_model_colon; commandline -C 10; _mu_fish_commit_speculative_model_colon_if_changed; set moved (string join , -- (commandline | string collect) (commandline -C)); commandline -r "/model gpt"; commandline -C 10; _mu_fish_append_speculative_model_colon; _mu_fish_strip_speculative_model_colon; set entered (string join , -- (commandline | string collect) (commandline -C)); printf "\n[explicit=%s back=%s delete=%s moved=%s entered=%s]\n" $explicit $back $delete $moved $entered; commandline -r ""; commandline -f repaint; end' \
+    'function _mu_test_speculative_colon_state; commandline -r "/model gpt"; commandline -C 10; _mu_fish_append_speculative_model_colon; _mu_fish_model_colon; set explicit (string join , -- (commandline | string collect) (commandline -C)); commandline -r "/model gpt"; commandline -C 10; _mu_fish_append_speculative_model_colon; _mu_fish_speculative_backspace; set back (string join , -- (commandline | string collect) (commandline -C)); commandline -r "/model gpt"; commandline -C 10; _mu_fish_append_speculative_model_colon; _mu_fish_commit_speculative_model_colon; commandline -f delete-char; set delete (string join , -- (commandline | string collect) (commandline -C)); commandline -r "/model gpt"; commandline -C 10; _mu_fish_append_speculative_model_colon; commandline -C 10; _mu_fish_commit_speculative_model_colon_if_changed; set moved (string join , -- (commandline | string collect) (commandline -C)); commandline -r "/model gpt"; commandline -C 10; _mu_fish_append_speculative_model_colon; _mu_fish_strip_speculative_model_colon; set entered (string join , -- (commandline | string collect) (commandline -C)); printf "\n[explicit=%s back=%s delete=%s moved=%s entered=%s]\n" $explicit $back $delete $moved $entered; commandline -r ""; commandline -f repaint; end' \
     'bind -M mumode ctrl-y _mu_test_speculative_colon_state')
 rm -f "$interactive_ready"
 begin

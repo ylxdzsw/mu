@@ -5,7 +5,7 @@ use serde_json::Value;
 use crate::provider::{
     AssistantItem, Attachment, ContentPart, FinishReason, HttpProvider, Message, NativeReplay,
     NativeReplayPayload, ProviderError, ReasoningVisibility, Request, SseEvent, StreamEvent,
-    StreamResult, ToolCall, ToolCallDelta, Usage, UserContent, base64_encode,
+    StreamResult, ToolCall, ToolCallDelta, Usage, UserContent, assistant_text, base64_encode,
     classify_stream_error, parse_completed_tool_arguments,
 };
 
@@ -31,8 +31,11 @@ pub(crate) async fn stream(
         ));
     }
     let blocks = state.completed_blocks()?;
-    let tool_calls = tool_calls_from_blocks(&blocks)?;
-    if state.stop_reason.as_deref() == Some("tool_use") && tool_calls.is_empty() {
+    let items = items_from_blocks(&blocks)?;
+    let has_tools = items
+        .iter()
+        .any(|item| matches!(item, AssistantItem::BashCall(_)));
+    if state.stop_reason.as_deref() == Some("tool_use") && !has_tools {
         return Err(ProviderError::Protocol(
             "Anthropic stopped for tool_use without a tool_use block".into(),
         ));
@@ -42,7 +45,7 @@ pub(crate) async fn stream(
             detail: "Anthropic reported model_context_window_exceeded".into(),
         });
     }
-    let finish_reason = finish_reason(state.stop_reason.as_deref(), &blocks, &tool_calls);
+    let finish_reason = finish_reason(state.stop_reason.as_deref(), &blocks, has_tools);
     let usage = state.usage.finish();
     let native_response = Some(serde_json::json!({
         "type": "message",
@@ -61,7 +64,7 @@ pub(crate) async fn stream(
 
     Ok(StreamResult {
         message: Message::Assistant {
-            items: items_from_blocks(&blocks)?,
+            items,
             native_replay: Some(NativeReplay {
                 provider_id: request.model.provider_id.clone(),
                 endpoint: provider.endpoint.clone(),
@@ -242,17 +245,7 @@ fn assistant_blocks(
     }
 
     let mut blocks = Vec::new();
-    let content = items
-        .iter()
-        .filter_map(|item| match item {
-            AssistantItem::Text { text } => Some(text.as_str()),
-            _ => None,
-        })
-        .collect::<String>();
-    if items
-        .iter()
-        .any(|item| matches!(item, AssistantItem::Text { .. }))
-    {
+    if let Some(content) = assistant_text(items) {
         blocks.push(serde_json::json!({
             "type": "text",
             "text": content,
@@ -521,7 +514,7 @@ fn consume_event(
             state.usage.update(&value["usage"]);
         }
         "message_stop" => state.terminal = true,
-        "error" => return Err(stream_error(&value["error"])),
+        "error" => return Err(classify_stream_error(&value["error"])),
         "ping" => {}
         _ => {}
     }
@@ -551,10 +544,6 @@ fn append_json_string(value: &mut Value, key: &str, suffix: &str) {
     } else {
         value[key] = Value::String(suffix.to_string());
     }
-}
-
-fn stream_error(error: &Value) -> ProviderError {
-    classify_stream_error(error)
 }
 
 fn items_from_blocks(blocks: &[Value]) -> Result<Vec<AssistantItem>, ProviderError> {
@@ -605,17 +594,9 @@ fn tool_call_from_block(block: &Value) -> Result<ToolCall, ProviderError> {
     })
 }
 
-fn tool_calls_from_blocks(blocks: &[Value]) -> Result<Vec<ToolCall>, ProviderError> {
-    blocks
-        .iter()
-        .filter(|block| block["type"] == "tool_use")
-        .map(tool_call_from_block)
-        .collect()
-}
-
-fn finish_reason(reason: Option<&str>, blocks: &[Value], tool_calls: &[ToolCall]) -> FinishReason {
+fn finish_reason(reason: Option<&str>, blocks: &[Value], has_tools: bool) -> FinishReason {
     if reason == Some("end_turn")
-        && tool_calls.is_empty()
+        && !has_tools
         && !blocks.is_empty()
         && blocks.iter().all(|block| {
             matches!(
@@ -630,7 +611,7 @@ fn finish_reason(reason: Option<&str>, blocks: &[Value], tool_calls: &[ToolCall]
         Some("end_turn" | "stop_sequence") => FinishReason::Stop,
         Some("tool_use") => FinishReason::ToolCalls,
         Some(other) => FinishReason::Other(other.to_string()),
-        None if tool_calls.is_empty() => FinishReason::Stop,
+        None if !has_tools => FinishReason::Stop,
         None => FinishReason::ToolCalls,
     }
 }
@@ -723,19 +704,19 @@ mod tests {
         let text = serde_json::json!({ "type": "text", "text": "done" });
 
         assert_eq!(
-            finish_reason(Some("end_turn"), std::slice::from_ref(&thinking), &[]),
+            finish_reason(Some("end_turn"), std::slice::from_ref(&thinking), false),
             FinishReason::Resume
         );
         assert_eq!(
-            finish_reason(Some("end_turn"), &[redacted], &[]),
+            finish_reason(Some("end_turn"), &[redacted], false),
             FinishReason::Resume
         );
         assert_eq!(
-            finish_reason(Some("end_turn"), &[thinking, text], &[]),
+            finish_reason(Some("end_turn"), &[thinking, text], false),
             FinishReason::Stop
         );
         assert_eq!(
-            finish_reason(Some("end_turn"), &[], &[]),
+            finish_reason(Some("end_turn"), &[], false),
             FinishReason::Stop
         );
     }
@@ -935,25 +916,29 @@ mod tests {
         assert_eq!(blocks[0]["signature"], "sig");
         assert_eq!(blocks[1]["input"]["command"], "pwd");
         assert_eq!(blocks[2]["text"], "done");
-        let calls = tool_calls_from_blocks(&blocks).unwrap();
-        assert_eq!(calls[0].id, "toolu_1");
-        assert_eq!(calls[0].arguments, r#"{"command":"pwd"}"#);
+        let items = items_from_blocks(&blocks).unwrap();
         let mut unsupported = blocks.clone();
         unsupported[1]["name"] = Value::String("python".into());
         assert!(matches!(
-            tool_calls_from_blocks(&unsupported),
+            items_from_blocks(&unsupported),
             Err(ProviderError::Protocol(_))
         ));
         assert!(matches!(
-            items_from_blocks(&blocks).unwrap().as_slice(),
+            items.as_slice(),
             [
                 AssistantItem::Reasoning { text: None },
-                AssistantItem::BashCall(ToolCall { id, .. }),
+                AssistantItem::BashCall(ToolCall { id, arguments }),
                 AssistantItem::Text { text },
-            ] if id == "toolu_1" && text == "done"
+            ] if id == "toolu_1" && arguments == r#"{"command":"pwd"}"# && text == "done"
         ));
         assert!(matches!(
-            finish_reason(state.stop_reason.as_deref(), &blocks, &calls),
+            finish_reason(
+                state.stop_reason.as_deref(),
+                &blocks,
+                items
+                    .iter()
+                    .any(|item| matches!(item, AssistantItem::BashCall(_))),
+            ),
             FinishReason::ToolCalls
         ));
 

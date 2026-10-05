@@ -41,7 +41,7 @@ use provider::{ContentPart, UserContent};
 use renderer::{CompactionReport, Renderer};
 use runtime::{
     InvocationOverrides, StatusIncludes, StatusReport, build_status_report, resolve_invocation,
-    resolve_retry_model_selection, resolve_session_model,
+    resolve_session_model, resolve_session_model_selection,
 };
 
 #[derive(Parser, Debug)]
@@ -63,23 +63,10 @@ struct Args {
     command: Option<Command>,
 }
 
-#[derive(ClapArgs, Debug, Clone, Default)]
-struct SelectionArgs {
-    #[arg(short = 's', long, conflicts_with = "continue_current")]
-    session: Option<String>,
-
-    /// Continue the last selected session in this scope
-    #[arg(short = 'c', long = "continue", conflicts_with = "session")]
-    continue_current: bool,
-
-    #[arg(short = 'm', long)]
-    model: Option<String>,
-}
-
 #[derive(ClapArgs, Debug, Clone)]
 struct TurnArgs {
     #[command(flatten)]
-    selection: SelectionArgs,
+    selection: InvocationOverrides,
 
     #[arg(short = 'a', long = "attach", value_name = "FILE")]
     attachments: Vec<PathBuf>,
@@ -100,7 +87,7 @@ struct TurnArgs {
 #[derive(ClapArgs, Debug, Clone)]
 struct RetryArgs {
     #[command(flatten)]
-    selection: SelectionArgs,
+    selection: InvocationOverrides,
 
     /// Output density (overrides config)
     #[arg(short = 'o', long, value_enum)]
@@ -202,7 +189,7 @@ enum Command {
 #[derive(ClapArgs, Debug, Clone)]
 struct StatusArgs {
     #[command(flatten)]
-    selection: SelectionArgs,
+    selection: InvocationOverrides,
 
     #[arg(long)]
     json: bool,
@@ -356,30 +343,19 @@ fn exit_code_for(error: &anyhow::Error) -> i32 {
 fn error_output_format() -> OutputFormat {
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
-        if arg == "--output" || arg == "-o" {
-            return match args.next().as_deref() {
-                Some("final") => OutputFormat::Final,
-                Some("concise") => OutputFormat::Concise,
-                Some("full") => OutputFormat::Full,
-                _ => OutputFormat::Detail,
-            };
-        }
-        if let Some(value) = arg.strip_prefix("--output=") {
-            return match value {
-                "final" => OutputFormat::Final,
-                "concise" => OutputFormat::Concise,
-                "full" => OutputFormat::Full,
-                _ => OutputFormat::Detail,
-            };
-        }
-        if let Some(value) = arg.strip_prefix("-o").filter(|value| !value.is_empty()) {
-            return match value {
-                "final" => OutputFormat::Final,
-                "concise" => OutputFormat::Concise,
-                "full" => OutputFormat::Full,
-                _ => OutputFormat::Detail,
-            };
-        }
+        let next;
+        let value = if arg == "--output" || arg == "-o" {
+            next = args.next();
+            next.as_deref().unwrap_or_default()
+        } else if let Some(value) = arg
+            .strip_prefix("--output=")
+            .or_else(|| arg.strip_prefix("-o"))
+        {
+            value
+        } else {
+            continue;
+        };
+        return <OutputFormat as ValueEnum>::from_str(value, false).unwrap_or(OutputFormat::Detail);
     }
     match RESOLVED_OUTPUT.load(Ordering::Relaxed) {
         OUTPUT_FINAL => OutputFormat::Final,
@@ -668,7 +644,7 @@ async fn run() -> Result<()> {
             return Ok(());
         }
         Some(Command::New { no_context }) => {
-            let store_path = scope.session_store_path();
+            let store_path = scope.state_dir();
             paths::ensure_project_layout(&scope)?;
             let store = store::Store::open(&store_path)?;
             let session = store.create_session_seeded(&system_prompt::build_system_prompt(
@@ -680,7 +656,7 @@ async fn run() -> Result<()> {
             return Ok(());
         }
         Some(Command::Sessions { limit }) => {
-            let store_path = scope.session_store_path();
+            let store_path = scope.state_dir();
             if !store_path.join("sessions").exists() {
                 return Ok(());
             }
@@ -704,7 +680,7 @@ async fn run() -> Result<()> {
             let config =
                 Config::load_for_scope(project_config_dir.as_deref(), ConfigLoadMode::Permissive)?;
             let output = resolve_output(output, config.output);
-            let store_path = scope.session_store_path();
+            let store_path = scope.state_dir();
             if !store_path.exists() {
                 return Err(session.as_deref().map_or_else(
                     || anyhow::anyhow!("no sessions found in active scope"),
@@ -736,7 +712,7 @@ async fn run() -> Result<()> {
         Some(Command::Status(status_args)) => {
             let config =
                 Config::load_for_scope(project_config_dir.as_deref(), ConfigLoadMode::Runtime)?;
-            let store_path = scope.session_store_path();
+            let store_path = scope.state_dir();
             let store = if store_path.exists() {
                 store::Store::open(&store_path)?
             } else {
@@ -762,11 +738,7 @@ async fn run() -> Result<()> {
             let report = build_status_report(
                 &store,
                 &config,
-                &InvocationOverrides {
-                    session: status_args.selection.session,
-                    continue_current: status_args.selection.continue_current,
-                    model: status_args.selection.model,
-                },
+                &status_args.selection,
                 scope.project(),
                 StatusIncludes {
                     git: status_args.include_git || !status_args.json,
@@ -819,14 +791,12 @@ async fn run() -> Result<()> {
             set_resolved_output(output);
 
             paths::ensure_project_layout(&scope)?;
-            let state_dir = scope.state_dir();
-            paths::ensure_dir(&state_dir)?;
-
-            let store_path = scope.session_store_path();
+            let store_path = scope.state_dir();
             let store = store::Store::open(&store_path)?;
-            let session = resolve_retry_session(&store, &retry_args)?
-                .ok_or_else(|| anyhow::anyhow!("no sessions found in active scope"))?;
+            let session =
+                resolve_session_or_current(&store, retry_args.selection.session.as_deref())?;
             let _lock = acquire_session_lock_or_exit(&store, &session.id, output)?;
+            let session = resolve_session_or_current(&store, Some(&session.id))?;
             store.recover_interrupted_tail_for_retry(&session.id)?;
 
             // Nothing to resume on a session whose last turn already finished.
@@ -846,7 +816,7 @@ async fn run() -> Result<()> {
                 )
             })?;
 
-            let selection = resolve_retry_model_selection(
+            let selection = resolve_session_model_selection(
                 &store,
                 &config,
                 &session,
@@ -882,7 +852,7 @@ async fn run() -> Result<()> {
             let output = resolve_output(output, config.output);
             let trap = trap.unwrap_or(config.trap);
             set_resolved_output(output);
-            let store_path = scope.session_store_path();
+            let store_path = scope.state_dir();
             if !store_path.join("sessions").exists() {
                 return Err(session.as_deref().map_or_else(
                     || anyhow::anyhow!("no sessions found in active scope"),
@@ -964,7 +934,7 @@ async fn run_turn_from_source(
     scope: &paths::Scope,
     project_config_dir: Option<&Path>,
     config: &Config,
-    turn: TurnArgs,
+    mut turn: TurnArgs,
     output: OutputFormat,
     prompt_source: PromptSource,
 ) -> Result<()> {
@@ -972,20 +942,10 @@ async fn run_turn_from_source(
     let prompt = loaded_prompt.text;
 
     paths::ensure_project_layout(scope)?;
-    let state_dir = scope.state_dir();
-    paths::ensure_dir(&state_dir)?;
-
-    let store_path = scope.session_store_path();
+    let store_path = scope.state_dir();
     let store = store::Store::open(&store_path)?;
-    let resolved = resolve_invocation(
-        &store,
-        config,
-        &InvocationOverrides {
-            session: turn.selection.session.clone(),
-            continue_current: turn.selection.continue_current,
-            model: turn.selection.model.clone().or(loaded_prompt.model),
-        },
-    )?;
+    turn.selection.model = turn.selection.model.or(loaded_prompt.model);
+    let resolved = resolve_invocation(&store, config, &turn.selection)?;
     if let Some(error) = &resolved.ignored_current_session {
         warn_unsupported_session(error, "starting a new session");
     }
@@ -1058,35 +1018,50 @@ fn load_prompt_with_stdin(
     stdin_is_terminal: bool,
     stdin: &mut impl Read,
 ) -> Result<LoadedPrompt> {
-    match source {
+    let mut prompt = match &source {
         PromptSource::Stdin => {
-            let mut prompt = String::new();
-            stdin.read_to_string(&mut prompt)?;
-            Ok(LoadedPrompt {
-                text: normalize_prompt(&prompt, false)?,
-                model: None,
-            })
+            let mut text = String::new();
+            stdin.read_to_string(&mut text)?;
+            LoadedPrompt { text, model: None }
         }
-        PromptSource::File(path) => {
-            let raw = std::fs::read_to_string(&path)
-                .with_context(|| format!("reading prompt file {}", path.display()))?;
-            let model = skills::parse_mu_shebang(raw.lines().next().unwrap_or_default())
-                .with_context(|| format!("invalid prompt file {} shebang", path.display()))?
-                .and_then(|shebang| shebang.model);
-            let prompt = normalize_prompt(&raw, true)?;
-            Ok(LoadedPrompt {
-                text: append_stdin_instruction(prompt, stdin_is_terminal, stdin)?,
-                model,
-            })
+        PromptSource::File(path) | PromptSource::Command { path, .. } => {
+            let is_command = matches!(source, PromptSource::Command { .. });
+            let kind = if is_command {
+                "custom command"
+            } else {
+                "prompt file"
+            };
+            let raw = std::fs::read_to_string(path)
+                .with_context(|| format!("reading {kind} {}", path.display()))?;
+            let shebang = skills::parse_mu_shebang(raw.lines().next().unwrap_or_default())
+                .with_context(|| format!("invalid {kind} {} shebang", path.display()))?;
+            let body = if is_command {
+                shebang.as_ref().with_context(|| {
+                    format!("custom command {} has no mu shebang", path.display())
+                })?;
+                skills::strip_instruction_headers(&raw)
+            } else {
+                trim_shebang_line(&raw)
+            };
+            LoadedPrompt {
+                text: body.to_string(),
+                model: shebang.and_then(|shebang| shebang.model),
+            }
         }
-        PromptSource::Command { path, .. } => {
-            let prompt = skills::command_prompt(&path)?;
-            Ok(LoadedPrompt {
-                text: append_stdin_instruction(prompt.text, stdin_is_terminal, stdin)?,
-                model: prompt.model,
-            })
+    };
+    prompt
+        .text
+        .truncate(trim_trailing_newlines(&prompt.text).len());
+    if prompt.text.is_empty() {
+        if let PromptSource::Command { path, .. } = &source {
+            bail!("empty custom command {}", path.display());
         }
+        bail!("empty prompt");
     }
+    if !matches!(source, PromptSource::Stdin) {
+        prompt.text = append_stdin_instruction(prompt.text, stdin_is_terminal, stdin)?;
+    }
+    Ok(prompt)
 }
 
 fn load_optional_stdin_instruction() -> Result<Option<String>> {
@@ -1179,19 +1154,6 @@ fn is_explicit_prompt_path(path: &Path) -> bool {
             .next()
             .is_some_and(|component| matches!(component, std::path::Component::ParentDir))
         || path.to_string_lossy().starts_with("./")
-}
-
-fn normalize_prompt(raw: &str, trim_shebang: bool) -> Result<String> {
-    let raw = if trim_shebang {
-        trim_shebang_line(raw)
-    } else {
-        raw
-    };
-    let prompt = trim_trailing_newlines(raw).to_string();
-    if prompt.is_empty() {
-        bail!("empty prompt");
-    }
-    Ok(prompt)
 }
 
 fn trim_shebang_line(text: &str) -> &str {
@@ -1325,23 +1287,6 @@ fn build_prompt_content(prompt: &str, attachments: Vec<ContentPart>) -> UserCont
     }];
     parts.extend(attachments);
     UserContent::Parts(parts)
-}
-
-fn resolve_retry_session(
-    store: &store::Store,
-    retry: &RetryArgs,
-) -> Result<Option<store::Session>> {
-    if retry.selection.session.is_some() && retry.selection.continue_current {
-        bail!("use either -s/--session or -c/--continue, not both");
-    }
-    if let Some(id) = retry.selection.session.as_deref() {
-        return Ok(Some(
-            store
-                .get_session(id)?
-                .ok_or_else(|| ExitError::session_not_found(id))?,
-        ));
-    }
-    store.current_session()
 }
 
 fn print_status_report(report: &StatusReport) {

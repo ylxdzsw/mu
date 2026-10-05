@@ -105,7 +105,7 @@ fn env_parse_error(line: usize, reason: &'static str) -> EnvParseError {
     EnvParseError { line, reason }
 }
 
-fn valid_env_name(name: &str) -> bool {
+pub(crate) fn valid_env_name(name: &str) -> bool {
     let mut bytes = name.bytes();
     matches!(bytes.next(), Some(b'A'..=b'Z' | b'a'..=b'z' | b'_'))
         && bytes.all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')

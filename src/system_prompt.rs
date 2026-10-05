@@ -99,14 +99,7 @@ pub fn build_system_prompt(
         parts.push(skills_block);
     }
 
-    if let Some(global) = agents_md_block(&global_config_dir.join("AGENTS.md"), "global") {
-        parts.push(global);
-    }
-    if let Some(project_config_dir) = project_config_dir
-        && let Some(local) = agents_md_block(&project_config_dir.join("AGENTS.md"), "project")
-    {
-        parts.push(local);
-    }
+    parts.extend(agents_md_blocks(global_config_dir, project_config_dir));
 
     Ok(parts.join("\n\n"))
 }
@@ -130,24 +123,9 @@ pub fn build_context(
         .into_iter()
         .filter(|skill| skill.scope != InstructionScope::Builtin)
         .collect::<Vec<_>>();
-    let env_paths = existing_env_paths(global_config_dir, project_config_dir);
-    let preamble = export_preamble(&env_paths)?;
-    let context = assemble_context(
-        &user_skills,
-        global_config_dir,
-        project_config_dir,
-        &preamble,
-    );
-    Ok(if context.is_empty() && !env_paths.is_empty() {
-        preamble
-    } else {
-        context
-    })
+    assemble_context(&user_skills, global_config_dir, project_config_dir)
 }
 
-/// Assemble the `--export` preamble, appending a pointer to the `mu-doc`
-/// reference when that built-in file is present so a foreign agent can find
-/// Mu's documentation on demand.
 fn existing_env_paths(
     global_config_dir: &Path,
     project_config_dir: Option<&Path>,
@@ -159,6 +137,9 @@ fn existing_env_paths(
         .collect()
 }
 
+/// Assemble the `--export` preamble, appending a pointer to the `mu-doc`
+/// reference when that built-in file is present so a foreign agent can find
+/// Mu's documentation on demand.
 fn export_preamble(env_paths: &[std::path::PathBuf]) -> anyhow::Result<String> {
     let mut preamble = EXPORT_PREAMBLE.to_string();
     let builtins = crate::paths::builtins_dir()?;
@@ -190,32 +171,29 @@ fn assemble_context(
     skills: &[SkillMeta],
     global_config_dir: &Path,
     project_config_dir: Option<&Path>,
-    preamble: &str,
-) -> String {
-    let mut parts = Vec::new();
-
-    if let Some(global) = agents_md_block(&global_config_dir.join("AGENTS.md"), "global") {
-        parts.push(global);
-    }
-    if let Some(project_config_dir) = project_config_dir
-        && let Some(local) = agents_md_block(&project_config_dir.join("AGENTS.md"), "project")
-    {
-        parts.push(local);
-    }
+) -> anyhow::Result<String> {
+    let env_paths = existing_env_paths(global_config_dir, project_config_dir);
+    let preamble = export_preamble(&env_paths)?;
+    let mut parts = agents_md_blocks(global_config_dir, project_config_dir);
 
     let skills_block = format_skills_block(skills);
     if !skills_block.is_empty() {
         parts.push(skills_block);
     }
 
-    // The preamble only wraps real user content; with nothing to export we emit
-    // an empty string so a SessionStart hook injects nothing.
-    if parts.is_empty() {
-        return String::new();
+    // Environment-only exports still need guidance; an entirely empty setup
+    // injects nothing into a foreign agent's SessionStart hook.
+    if !parts.is_empty() || !env_paths.is_empty() {
+        parts.insert(0, preamble);
     }
+    Ok(parts.join("\n\n"))
+}
 
-    parts.insert(0, preamble.to_string());
-    parts.join("\n\n")
+fn agents_md_blocks(global_config_dir: &Path, project_config_dir: Option<&Path>) -> Vec<String> {
+    std::iter::once((global_config_dir, "global"))
+        .chain(project_config_dir.map(|dir| (dir, "project")))
+        .filter_map(|(dir, scope)| agents_md_block(&dir.join("AGENTS.md"), scope))
+        .collect()
 }
 
 fn agents_md_block(path: &Path, scope: &str) -> Option<String> {
@@ -334,7 +312,7 @@ mod tests {
         fs::write(global.join("AGENTS.md"), "Global mu instructions.").unwrap();
         let skills = [skill("brave-search", InstructionScope::Global)];
 
-        let context = assemble_context(&skills, &global, None, EXPORT_PREAMBLE);
+        let context = assemble_context(&skills, &global, None).unwrap();
         let agents_path = global.join("AGENTS.md").canonicalize().unwrap();
         fs::remove_dir_all(&global).unwrap();
 

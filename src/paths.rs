@@ -69,10 +69,6 @@ impl Scope {
         }
     }
 
-    pub fn session_store_path(&self) -> PathBuf {
-        self.state_dir()
-    }
-
     pub fn project(&self) -> Option<&Project> {
         match self {
             Scope::Project(project) => Some(project),
@@ -133,11 +129,6 @@ fn dirs_home() -> PathBuf {
     std::env::var("HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from("/tmp"))
-}
-
-pub fn ensure_dir(path: &std::path::Path) -> Result<()> {
-    std::fs::create_dir_all(path)?;
-    Ok(())
 }
 
 pub(crate) fn lexical_normalize(path: &Path) -> PathBuf {
@@ -235,11 +226,9 @@ pub fn init_project_layout_at(root: &Path, force: bool) -> Result<ProjectInitRes
 fn ensure_state_layout(dir: &Path, layout: StateLayout) -> Result<Vec<&'static str>> {
     let mut created_files = Vec::new();
     if !dir.exists() {
-        ensure_dir(dir)?;
         created_files.push(".mu/");
-    } else {
-        ensure_dir(dir)?;
     }
+    std::fs::create_dir_all(dir)?;
     if layout == StateLayout::ExplicitProject {
         let config = dir.join("config.jsonc");
         if !config.exists() {
@@ -446,10 +435,7 @@ mod tests {
                 common_dir: Some(repository.join(".git")),
             })
         );
-        assert_eq!(
-            Scope::Project(project).session_store_path(),
-            repository.join(".mu")
-        );
+        assert_eq!(Scope::Project(project).state_dir(), repository.join(".mu"));
         assert!(validate_project_init_root(&worktree, false).is_err());
         assert!(validate_project_init_root(&worktree, true).is_ok());
 

@@ -71,6 +71,10 @@ cat > "$prompt_fake_bin/mu" <<'EOF'
 #!/usr/bin/env zsh
 if [[ "$1" == "status" ]]; then
   [[ -n "${MU_ZSH_TEST_STATUS_LOG:-}" ]] && print -r -- "$*" >> "$MU_ZSH_TEST_STATUS_LOG"
+  if [[ -n "${MU_ZSH_TEST_STATUS_JSON:-}" ]]; then
+    print -r -- "$MU_ZSH_TEST_STATUS_JSON"
+    exit 0
+  fi
   model=prompt-test-model
   session=
   include_models=0
@@ -166,41 +170,15 @@ expected_prompt="%F{12}prompt-test-model%f %F{6}${escaped_pwd}%f
 mu> "
 [[ "$PROMPT" == "$expected_prompt" ]] || fail "renders two-line mu prompt"
 
-short_fake_bin=$tmpdir/short-bin
-mkdir -p -- "$short_fake_bin"
-cat > "$short_fake_bin/mu" <<'EOF'
-#!/usr/bin/env zsh
-if [[ "$1" == "status" ]]; then
-  print -r -- '{"model":{"provider_id":"test","model_id":"m","effort":null,"canonical":"m"},"context_tokens":0,"context_window":100,"context_usage_source":"estimated","project_root":null}'
-  exit 0
-fi
-exit 1
-EOF
-chmod +x "$short_fake_bin/mu"
 MU_ZSH_SESSION_ID=short-session
 _MU_ZSH_TRACKED_SCOPE=$(current_scope_key)
-path=("$short_fake_bin" $path)
-short_prompt=$(_mu_zsh_build_mode_prompt)
-path=("$prompt_fake_bin" $path)
+short_prompt=$(MU_ZSH_TEST_STATUS_JSON='{"model":{"provider_id":"test","model_id":"m","effort":null,"canonical":"m"},"context_tokens":0,"context_window":100,"context_usage_source":"estimated","project_root":null}' _mu_zsh_build_mode_prompt)
 _mu_zsh_clear_session_state
 [[ "$short_prompt" == *"%F{5}~0%%%f"* ]] || fail "marks estimated context for an attached short session"
 
-compact_fake_bin=$tmpdir/compact-bin
-mkdir -p -- "$compact_fake_bin"
-cat > "$compact_fake_bin/mu" <<'EOF'
-#!/usr/bin/env zsh
-if [[ "$1" == "status" ]]; then
-  print -r -- '{"model":{"provider_id":"test","model_id":"m","effort":null,"canonical":"m"},"context_tokens":140001,"context_window":200000,"compaction_soft_threshold_tokens":140000,"project_root":null}'
-  exit 0
-fi
-exit 1
-EOF
-chmod +x "$compact_fake_bin/mu"
 MU_ZSH_SESSION_ID=compact-session
 _MU_ZSH_TRACKED_SCOPE=$(current_scope_key)
-path=("$compact_fake_bin" $path)
-compact_prompt=$(_mu_zsh_build_mode_prompt)
-path=("$prompt_fake_bin" $path)
+compact_prompt=$(MU_ZSH_TEST_STATUS_JSON='{"model":{"provider_id":"test","model_id":"m","effort":null,"canonical":"m"},"context_tokens":140001,"context_window":200000,"compaction_soft_threshold_tokens":140000,"project_root":null}' _mu_zsh_build_mode_prompt)
 _mu_zsh_clear_session_state
 [[ "$compact_prompt" == *"%F{5}[to compact]%f"* ]] || fail "marks sessions above the soft compaction threshold"
 
@@ -256,58 +234,19 @@ nested_pwd=$worktree_root/src
 escaped_nested_pwd=${nested_pwd//\%/%%}
 [[ "$worktree_prompt" == *"%F{6}${escaped_nested_pwd}%f %F{8}(${escaped_primary_root})%f"* ]] || fail "shows primary project root from a linked worktree"
 
-global_fake_bin=$tmpdir/global-bin
-mkdir -p -- "$global_fake_bin"
-cat > "$global_fake_bin/mu" <<'EOF'
-#!/usr/bin/env zsh
-if [[ "$1" == "status" ]]; then
-  print -r -- '{"model":{"provider_id":"test","model_id":"global-model","effort":null,"canonical":"global-model"},"context_tokens":5,"context_window":100,"project_root":null}'
-  exit 0
-fi
-exit 1
-EOF
-chmod +x "$global_fake_bin/mu"
 global_pwd=$tmpdir/global-scope
 mkdir -p -- "$global_pwd"
 saved_pwd=$PWD
-path=("$global_fake_bin" $path)
 builtin cd "$global_pwd"
-global_prompt=$(_mu_zsh_build_mode_prompt)
+global_prompt=$(MU_ZSH_TEST_STATUS_JSON='{"model":{"provider_id":"test","model_id":"global-model","effort":null,"canonical":"global-model"},"context_tokens":5,"context_window":100,"project_root":null}' _mu_zsh_build_mode_prompt)
 builtin cd "$saved_pwd"
-path=("$prompt_fake_bin" $path)
 escaped_global_pwd=${global_pwd//\%/%%}
 [[ "$global_prompt" == *"%F{6}${escaped_global_pwd}%f %F{8}(global)%f"* ]] || fail "shows global marker outside project scope"
 
-unclean_fake_bin=$tmpdir/unclean-bin
-mkdir -p -- "$unclean_fake_bin"
-cat > "$unclean_fake_bin/mu" <<'EOF'
-#!/usr/bin/env zsh
-if [[ "$1" == "status" ]]; then
-  print -r -- '{"model":{"provider_id":"test","model_id":"m","effort":null,"canonical":"m"},"context_tokens":25,"context_window":100,"project_root":null,"clean":false}'
-  exit 0
-fi
-exit 1
-EOF
-chmod +x "$unclean_fake_bin/mu"
-path=("$unclean_fake_bin" $path)
-unclean_prompt=$(_mu_zsh_build_mode_prompt)
-path=("$prompt_fake_bin" $path)
+unclean_prompt=$(MU_ZSH_TEST_STATUS_JSON='{"model":{"provider_id":"test","model_id":"m","effort":null,"canonical":"m"},"context_tokens":25,"context_window":100,"project_root":null,"clean":false}' _mu_zsh_build_mode_prompt)
 [[ "$unclean_prompt" == *"%F{9}[interrupted · /retry]%f"* ]] || fail "shows unclean marker when last turn was interrupted"
 
-clean_fake_bin=$tmpdir/clean-bin
-mkdir -p -- "$clean_fake_bin"
-cat > "$clean_fake_bin/mu" <<'EOF'
-#!/usr/bin/env zsh
-if [[ "$1" == "status" ]]; then
-  print -r -- '{"model":{"provider_id":"test","model_id":"m","effort":null,"canonical":"m"},"context_tokens":25,"context_window":100,"project_root":null,"clean":true}'
-  exit 0
-fi
-exit 1
-EOF
-chmod +x "$clean_fake_bin/mu"
-path=("$clean_fake_bin" $path)
-clean_prompt=$(_mu_zsh_build_mode_prompt)
-path=("$prompt_fake_bin" $path)
+clean_prompt=$(MU_ZSH_TEST_STATUS_JSON='{"model":{"provider_id":"test","model_id":"m","effort":null,"canonical":"m"},"context_tokens":25,"context_window":100,"project_root":null,"clean":true}' _mu_zsh_build_mode_prompt)
 [[ "$clean_prompt" != *"[interrupted · /retry]"* ]] || fail "omits unclean marker when last turn was clean"
 
 _MU_ZSH_ORIGINAL_TAB_WIDGET=

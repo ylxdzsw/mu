@@ -47,6 +47,16 @@ pub enum AssistantItem {
     BashCall(ToolCall),
 }
 
+pub(crate) fn assistant_text(items: &[AssistantItem]) -> Option<String> {
+    let mut text = None::<String>;
+    for item in items {
+        if let AssistantItem::Text { text: part } = item {
+            text.get_or_insert_default().push_str(part);
+        }
+    }
+    text
+}
+
 impl Message {
     pub fn assistant(
         content: Option<String>,
@@ -77,15 +87,7 @@ impl Message {
         let Self::Assistant { items, .. } = self else {
             return None;
         };
-        let mut text = String::new();
-        let mut present = false;
-        for item in items {
-            if let AssistantItem::Text { text: part } = item {
-                text.push_str(part);
-                present = true;
-            }
-        }
-        present.then_some(text)
+        assistant_text(items)
     }
 
     pub fn assistant_tool_calls(&self) -> Vec<&ToolCall> {
@@ -270,7 +272,7 @@ pub fn estimate_messages_tokens(
         .sum()
 }
 
-fn native_replay_compatible_for_config(
+pub(crate) fn native_replay_compatible_for_config(
     native: &NativeReplay,
     config: &Config,
     target: &ResolvedModelRef,
@@ -1244,18 +1246,9 @@ fn classify_provider_error(
     }
 
     match status {
-        Some(408 | 425 | 500 | 502 | 503 | 504 | 529) => ProviderError::Overloaded {
+        Some(408 | 425 | 500..=599) => ProviderError::Overloaded {
             status,
             retry_after,
-            detail,
-        },
-        Some(status @ 500..=599) => ProviderError::Overloaded {
-            status: Some(status),
-            retry_after,
-            detail,
-        },
-        Some(status @ 400..=499) => ProviderError::BadRequestPermanent {
-            status: Some(status),
             detail,
         },
         _ => ProviderError::BadRequestPermanent { status, detail },

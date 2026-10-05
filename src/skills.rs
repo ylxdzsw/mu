@@ -5,7 +5,7 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 
-use crate::config::EnvMap;
+use crate::config::{EnvMap, valid_env_name};
 
 const MAX_NAME_LEN: usize = 64;
 const MAX_DESCRIPTION_LEN: usize = 256;
@@ -30,12 +30,6 @@ pub struct CommandMeta {
     pub name: String,
     pub path: String,
     pub scope: InstructionScope,
-}
-
-#[derive(Debug)]
-pub struct CommandPrompt {
-    pub text: String,
-    pub model: Option<String>,
 }
 
 #[derive(Debug, PartialEq)]
@@ -146,23 +140,6 @@ pub fn format_skills_block(skills: &[SkillMeta]) -> String {
     }
     lines.push("</skills>".into());
     lines.join("\n")
-}
-
-pub fn command_prompt(path: &Path) -> Result<CommandPrompt> {
-    let raw = std::fs::read_to_string(path)
-        .with_context(|| format!("reading custom command {}", path.display()))?;
-    let shebang = parse_mu_shebang(raw.lines().next().unwrap_or_default())
-        .with_context(|| format!("invalid custom command {} shebang", path.display()))?
-        .with_context(|| format!("custom command {} has no mu shebang", path.display()))?;
-    let body = strip_instruction_headers(&raw);
-    let text = body.trim_end_matches(['\r', '\n']).to_string();
-    if text.is_empty() {
-        anyhow::bail!("empty custom command {}", path.display());
-    }
-    Ok(CommandPrompt {
-        text,
-        model: shebang.model,
-    })
 }
 
 pub fn parse_mu_shebang(line: &str) -> Result<Option<MuShebang>> {
@@ -300,7 +277,7 @@ fn scan_root(root: &Path, scope: InstructionScope, env: &EnvMap) -> Result<Instr
     Ok(InstructionIndex { skills, commands })
 }
 
-fn strip_instruction_headers(content: &str) -> &str {
+pub(crate) fn strip_instruction_headers(content: &str) -> &str {
     let (after_shebang, _) = strip_optional_mu_shebang(content);
     strip_closed_frontmatter(after_shebang).unwrap_or(after_shebang)
 }
@@ -372,7 +349,7 @@ fn parse_requirement_list(value: &str) -> Result<Vec<String>> {
 
 fn validate_requirements(requirements: &SkillRequirements) -> Result<()> {
     for name in &requirements.env {
-        if !valid_env_requirement(name) {
+        if !valid_env_name(name) {
             anyhow::bail!("invalid env requirement `{name}`");
         }
     }
@@ -382,15 +359,6 @@ fn validate_requirements(requirements: &SkillRequirements) -> Result<()> {
         }
     }
     Ok(())
-}
-
-fn valid_env_requirement(name: &str) -> bool {
-    let mut chars = name.chars();
-    let Some(first) = chars.next() else {
-        return false;
-    };
-    (first.is_ascii_alphabetic() || first == '_')
-        && chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
 }
 
 fn valid_command_requirement(command: &str) -> bool {
