@@ -908,7 +908,7 @@ impl<'a> AgentLoop<'a> {
                 objects_dir: Some(&objects_dir),
                 bash_call_id: pending.call_id,
             };
-            let tool_result = bash::execute(args, &mut ctx).await;
+            let tool_result = bash::execute(args, &mut ctx);
             self.persist_bash_result(
                 pending.call_id,
                 &pending.call,

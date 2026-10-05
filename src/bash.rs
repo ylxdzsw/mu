@@ -386,14 +386,9 @@ pub fn parameters_schema() -> Value {
     })
 }
 
-pub async fn execute(args: Value, ctx: &mut ToolContext<'_>) -> Result<ToolResult> {
+pub fn execute(args: Value, ctx: &mut ToolContext<'_>) -> Result<ToolResult> {
     let args: BashArgs = parse_args(&args)?;
     let _ = (&args.title, args.risk);
-    let timeout = args.timeout.unwrap_or(DEFAULT_TIMEOUT_SECS);
-    if timeout == 0 {
-        bail!("timeout must be greater than 0");
-    }
-
     let redactor = SecretRedactor::from_config(ctx.config)?;
     for warning in redactor.warnings() {
         ctx.renderer.notice(&format!("[redaction] {warning}"))?;
@@ -407,28 +402,13 @@ pub async fn execute(args: Value, ctx: &mut ToolContext<'_>) -> Result<ToolResul
                 objects_dir: objects_dir.to_path_buf(),
                 bash_call_id: ctx.bash_call_id,
             });
-    let result = run_bash(
+    execute_bash(
         args,
-        timeout,
+        ctx.config,
         ctx.renderer,
-        &ctx.config.env,
         redactor,
         attachment_context.as_ref(),
-    )?;
-    let exit_code = result.exit_code;
-    let attachments = result.attachments;
-
-    let output = if result.redacted {
-        format!("{}\n\n{}", result.output, REDACTION_REMINDER)
-    } else {
-        result.output
-    };
-    let full = format!("{}\n[exit code: {}]", output, exit_code);
-    Ok(ToolResult {
-        output: apply_truncation(full, &ctx.config.limits, "bash", true),
-        exit_code,
-        attachments,
-    })
+    )
 }
 
 #[derive(Debug)]
@@ -556,10 +536,10 @@ pub fn start_bash_task(
     let shared_for_task = Arc::clone(&shared);
     let task = tokio::task::spawn_blocking(move || {
         let started = Instant::now();
-        let result = execute_bash_task(
+        let result = execute_bash(
             args,
             &config,
-            Arc::clone(&shared_for_task),
+            &mut BufferedBashTarget::new(Arc::clone(&shared_for_task)),
             redactor,
             attachment_context.as_ref(),
         );
@@ -573,24 +553,6 @@ pub fn start_bash_task(
     })
 }
 
-fn run_bash(
-    args: BashArgs,
-    timeout_secs: u64,
-    renderer: &mut Renderer,
-    env: &EnvMap,
-    mut redactor: SecretRedactor,
-    attachment_context: Option<&AttachmentContext>,
-) -> Result<BashRunResult> {
-    run_bash_inner(
-        args,
-        timeout_secs,
-        renderer,
-        env,
-        &mut redactor,
-        attachment_context,
-    )
-}
-
 #[derive(Debug, Clone)]
 struct AttachmentContext {
     manifest: PathBuf,
@@ -598,10 +560,10 @@ struct AttachmentContext {
     bash_call_id: i64,
 }
 
-fn execute_bash_task(
+fn execute_bash(
     args: BashArgs,
     config: &Config,
-    shared: Arc<SharedBashState>,
+    target: &mut impl BashOutputTarget,
     mut redactor: SecretRedactor,
     attachment_context: Option<&AttachmentContext>,
 ) -> Result<ToolResult> {
@@ -610,11 +572,10 @@ fn execute_bash_task(
         bail!("timeout must be greater than 0");
     }
 
-    let mut target = BufferedBashTarget::new(shared);
-    let result = run_bash_inner(
+    let result = run_bash(
         args,
         timeout,
-        &mut target,
+        target,
         &config.env,
         &mut redactor,
         attachment_context,
@@ -634,7 +595,7 @@ fn execute_bash_task(
     })
 }
 
-fn run_bash_inner(
+fn run_bash(
     args: BashArgs,
     timeout_secs: u64,
     target: &mut impl BashOutputTarget,
@@ -1125,7 +1086,7 @@ mod tests {
             5,
             &mut renderer,
             &empty_env(),
-            SecretRedactor::default(),
+            &mut SecretRedactor::default(),
             None,
         )
         .unwrap();
@@ -1139,7 +1100,7 @@ mod tests {
             5,
             &mut renderer,
             &empty_env(),
-            SecretRedactor::default(),
+            &mut SecretRedactor::default(),
             None,
         )
         .unwrap();
@@ -1161,7 +1122,7 @@ mod tests {
             5,
             &mut renderer,
             &env,
-            SecretRedactor::default(),
+            &mut SecretRedactor::default(),
             None,
         )
         .unwrap();
@@ -1177,7 +1138,7 @@ mod tests {
             5,
             &mut renderer,
             &empty_env(),
-            SecretRedactor::default(),
+            &mut SecretRedactor::default(),
             None,
         )
         .unwrap();
@@ -1202,15 +1163,15 @@ mod tests {
             5,
             &mut renderer,
             &empty_env(),
-            SecretRedactor::default(),
+            &mut SecretRedactor::default(),
             Some(&context),
         )
         .unwrap();
         assert_eq!(result.output, "/tmp/attachments.jsonl|42|/tmp/objects");
     }
 
-    #[tokio::test]
-    async fn bash_receives_env_and_redacts_configured_values() {
+    #[test]
+    fn bash_receives_env_and_redacts_configured_values() {
         let mut renderer = Renderer::new();
         let config = test_config(
             &[
@@ -1232,7 +1193,7 @@ mod tests {
             "command": "printf '%s|%s' \"$OPENAI_API_KEY\" \"$CUSTOM_SECRET\""
         });
 
-        let result = super::execute(args, &mut ctx).await.unwrap();
+        let result = super::execute(args, &mut ctx).unwrap();
 
         assert!(result.output.contains("[redacted:OPENAI_API_KEY]"));
         assert!(result.output.contains("[redacted:CUSTOM_SECRET]"));
@@ -1256,7 +1217,7 @@ mod tests {
             5,
             &mut renderer,
             &empty_env(),
-            SecretRedactor::default(),
+            &mut SecretRedactor::default(),
             None,
         )
         .unwrap();
@@ -1294,7 +1255,7 @@ mod tests {
             5,
             &mut renderer,
             &empty_env(),
-            SecretRedactor::default(),
+            &mut SecretRedactor::default(),
             None,
         )
         .unwrap();
@@ -1324,7 +1285,7 @@ mod tests {
             3,
             &mut renderer,
             &empty_env(),
-            SecretRedactor::default(),
+            &mut SecretRedactor::default(),
             None,
         );
         assert!(result.is_err(), "expected timeout");
