@@ -70,6 +70,7 @@ export MU_ZSH_TEST_PROJECT_ROOT=$root
 cat > "$prompt_fake_bin/mu" <<'EOF'
 #!/usr/bin/env zsh
 if [[ "$1" == "status" ]]; then
+  [[ -n "${MU_ZSH_TEST_STATUS_LOG:-}" ]] && print -r -- "$*" >> "$MU_ZSH_TEST_STATUS_LOG"
   model=prompt-test-model
   session=
   include_models=0
@@ -413,7 +414,8 @@ BUFFER="/unknown"
 CURSOR=${#BUFFER}
 completion_candidates=("${(@f)$(_mu_zsh_completion_candidates)}")
 [[ "${(j:,:)completion_candidates}" == "/attach,/load,/model,/trap,/new,/retry,/compact,/review.md" ]] || fail "keeps freeform slash input advisory: ${(j:,:)completion_candidates}"
-model_candidates=("${(@f)$(_mu_zsh_model_completion_candidates "")}")
+model_candidates=("${(@f)$(_mu_zsh_model_query "")}")
+[[ "${(j:,:)model_candidates}" == "solo,shared,gpt,gpt-5.6-luna,local/solo,local/shared,openai/gpt,openai/gpt-5.6-luna,openai/shared" ]] || fail "model discovery preserves provider order and deduplicates floating names"
 [[ " ${(j: :)model_candidates} " == *" openai/gpt "* ]] || fail "offers provider-qualified model"
 [[ " ${(j: :)model_candidates} " == *" gpt "* ]] || fail "offers unique unqualified model"
 [[ " ${(j: :)model_candidates} " == *" local/solo "* ]] || fail "offers second provider-qualified model"
@@ -422,16 +424,16 @@ model_candidates=("${(@f)$(_mu_zsh_model_completion_candidates "")}")
 [[ " ${(j: :)model_candidates} " == *" local/shared "* ]] || fail "offers other ambiguous model qualified"
 [[ " ${(j: :)model_candidates} " == *" shared "* ]] || fail "offers shared model as floating choice"
 [[ " ${(j: :)model_candidates} " != *":low "* ]] || fail "does not show variants before colon"
-model_candidates=("${(@f)$(_mu_zsh_model_completion_candidates "gpt")}")
+model_candidates=("${(@f)$(_mu_zsh_model_query "gpt")}")
 [[ " ${(j: :)model_candidates} " == *" gpt "* ]] || fail "keeps all base models available for zsh matching"
 [[ " ${(j: :)model_candidates} " != *":high "* ]] || fail "does not show variants until colon"
-effort_suffixes=("${(@f)$(_mu_zsh_model_completion_candidates "gpt" 1)}")
+effort_suffixes=("${(@f)$(_mu_zsh_model_query "gpt" suffix)}")
 [[ "${(j:,:)effort_suffixes}" == ":minimal,:low,:medium,:high,:xhigh,:max,:provider-custom" ]] ||
   fail "sorts recognized exact-model efforts by strength and leaves custom efforts last: ${(j:,:)effort_suffixes}"
-qualified_effort_suffixes=("${(@f)$(_mu_zsh_model_completion_candidates "openai/gpt" 1)}")
+qualified_effort_suffixes=("${(@f)$(_mu_zsh_model_query "openai/gpt" suffix)}")
 [[ "${(j:,:)qualified_effort_suffixes}" == "${(j:,:)effort_suffixes}" ]] ||
   fail "provider-qualified exact models use the same sorted effort menu"
-prefix_effort_suffixes=("${(@f)$(_mu_zsh_model_completion_candidates "gp" 1)}")
+prefix_effort_suffixes=("${(@f)$(_mu_zsh_model_query "gp" suffix)}")
 prefix_effort_suffixes=("${(@)prefix_effort_suffixes:#}")
 (( ${#prefix_effort_suffixes[@]} == 0 )) ||
   fail "model prefixes do not switch to the effort menu"
@@ -457,14 +459,14 @@ for effort in minimal low medium high xhigh max provider-custom; do
   [[ ",$captured_compadd_calls[1]," == *",$effort,"* ]] ||
     fail "exact-model effort menu includes $effort"
 done
-model_candidates=("${(@f)$(_mu_zsh_model_completion_candidates "gpt:")}")
+model_candidates=("${(@f)$(_mu_zsh_model_query "gpt:")}")
 [[ " ${(j: :)model_candidates} " == *" gpt:low "* ]] || fail "shows unqualified variants after colon"
 [[ " ${(j: :)model_candidates} " == *" openai/gpt:high "* ]] || fail "shows provider-qualified variants after colon"
 [[ " ${(j: :)model_candidates} " == *" gpt:provider-custom "* ]] || fail "shows provider-defined effort strings"
 [[ " ${(j: :)model_candidates} " == *" shared:low "* ]] || fail "merges first floating-model provider efforts"
 [[ " ${(j: :)model_candidates} " == *" shared:medium "* ]] || fail "merges floating-model effort suggestions"
 _MU_ZSH_MODEL=invalid/removed
-model_candidates=("${(@f)$(_mu_zsh_model_completion_candidates "")}")
+model_candidates=("${(@f)$(_mu_zsh_model_query "")}")
 [[ " ${(j: :)model_candidates} " == *" openai/gpt "* ]] || fail "stale model override does not block model discovery"
 _mu_zsh_clear_model_state
 BUFFER="/model openai/gpt:h"
@@ -480,7 +482,9 @@ _MU_ZSH_MODEL=openai/gpt
 _MU_ZSH_PENDING_ATTACHMENTS=("$attachment_one")
 rm -f "$MU_ZSH_FAKE_LOG"
 load_output=$tmpdir/load-output
+export MU_ZSH_TEST_STATUS_LOG=$tmpdir/load-status
 _mu_zsh_run_slash_command "/load ses_0000000b" > "$load_output"
+[[ $(<"$MU_ZSH_TEST_STATUS_LOG") == 'status --json -s ses_0000000b' ]] || fail "explicit load uses one model-free status preflight"
 [[ "$MU_ZSH_SESSION_ID" == ses_0000000b ]] || fail "load attaches the selected session"
 [[ "$_MU_ZSH_MODEL" == openai/gpt ]] || fail "load preserves the model override"
 (( ${#_MU_ZSH_PENDING_ATTACHMENTS[@]} == 1 )) || fail "load preserves pending attachments"
@@ -489,18 +493,24 @@ grep -Fq -- "[mu] loaded session ses_0000000b" "$load_output" || fail "load conf
 grep -Fq -- "transcript --session ses_0000000b --output concise" "$MU_ZSH_FAKE_LOG" ||
   fail "load uses the configured output density"
 rm -f "$MU_ZSH_FAKE_LOG"
+_MU_ZSH_MODEL=invalid/removed
 _mu_zsh_run_slash_command "/load ses_0000000c" >/dev/null
+_MU_ZSH_MODEL=openai/gpt
 grep -Fq -- "transcript --session ses_0000000c --output concise" "$MU_ZSH_FAKE_LOG" ||
   fail "load resolves each session output density"
 rm -f "$MU_ZSH_FAKE_LOG"
+: > "$MU_ZSH_TEST_STATUS_LOG"
 load_output=$tmpdir/load-current-output
 _mu_zsh_run_slash_command "/load" > "$load_output"
+[[ $(<"$MU_ZSH_TEST_STATUS_LOG") == 'status --json --continue' ]] || fail "bare load resolves session and output from one status preflight"
+unset MU_ZSH_TEST_STATUS_LOG
 [[ "$MU_ZSH_SESSION_ID" == ses_0000000d ]] || fail "argument-free load attaches current-session"
 grep -Fq -- "transcript --session ses_0000000d --output concise" "$MU_ZSH_FAKE_LOG" ||
   fail "argument-free load replays current-session explicitly"
 grep -Fq -- "[mu] loaded session ses_0000000d" "$load_output" ||
   fail "argument-free load confirms the resolved session"
 export MU_ZSH_TEST_NO_CURRENT=1
+rm -f "$MU_ZSH_FAKE_LOG"
 if _mu_zsh_run_slash_command "/load" >/dev/null; then
   fail "argument-free load should reject a missing current-session"
 fi
@@ -510,6 +520,7 @@ if _mu_zsh_run_slash_command "/load ses_missing" >/dev/null 2>&1; then
   fail "load should reject a missing session"
 fi
 [[ "$MU_ZSH_SESSION_ID" == ses_0000000d ]] || fail "failed load preserves the attached session"
+[[ ! -e "$MU_ZSH_FAKE_LOG" ]] || fail "failed status preflight must not run transcript"
 if _mu_zsh_run_slash_command "/load ses_0000000b extra" >/dev/null; then
   fail "load should accept exactly one session id"
 fi
@@ -776,6 +787,7 @@ if [ "$1" = "status" ]; then
   [ "$provider" = "$model" ] && provider=test
   model_json="\"model\":{\"provider_id\":\"$provider\",\"model_id\":\"$model_id\",\"effort\":null,\"canonical\":\"$model\"}"
   if [ "$include_models" -eq 1 ]; then
+    [ -z "$TEST_MODEL_QUERIES" ] || printf x >> "$TEST_MODEL_QUERIES"
     printf '%s\n' "{$model_json,\"context_tokens\":25,\"context_window\":100,\"project_root\":\"$MU_ZSH_TEST_PROJECT_ROOT\",\"available_models\":{\"providers\":[{\"id\":\"local\",\"models\":[{\"id\":\"local/solo\",\"model_id\":\"solo\",\"supported_efforts\":[\"max\"]},{\"id\":\"local/shared\",\"model_id\":\"shared\",\"supported_efforts\":[\"low\"]}]},{\"id\":\"openai\",\"models\":[{\"id\":\"openai/gpt\",\"model_id\":\"gpt\",\"supported_efforts\":[\"low\",\"high\"]},{\"id\":\"openai/gpt-5.6-luna\",\"model_id\":\"gpt-5.6-luna\",\"supported_efforts\":[\"none\",\"max\"]},{\"id\":\"openai/shared\",\"model_id\":\"shared\",\"supported_efforts\":[\"medium\"]}]}]}}"
   elif [ "$include_commands" -eq 1 ] && [ -n "$TEST_EXTRA_COMMAND" ]; then
     printf '%s\n' "{$model_json,\"context_tokens\":25,\"context_window\":100,\"project_root\":\"$MU_ZSH_TEST_PROJECT_ROOT\",\"commands\":[{\"name\":\"$TEST_EXTRA_COMMAND\",\"path\":\"$MU_ZSH_TEST_PROJECT_ROOT/.mu/$TEST_EXTRA_COMMAND\",\"scope\":\"project\"}]}"
@@ -1046,11 +1058,12 @@ normalized=$(perl -pe 's/\e\[[0-?]*[ -\/]*[@-~]//g' "$common_prefix_transcript" 
 
 model_effort_transcript=$tmpdir/model-effort-transcript
 model_effort_setup="$interactive_setup; zstyle ':completion:*' matcher-list 'm:{a-zA-Z-_}={A-Za-z_-}' 'r:|=*' 'l:|=* r:|=*'; _mu_test_model_effort_completion() { BUFFER='/model luna'; CURSOR=\${#BUFFER}; _mu_zsh_complete_slash; zle -I; print -r -- \"[first-buffer=\$BUFFER first-cursor=\$CURSOR]\"; BUFFER=; CURSOR=0; _mu_zsh_reset_mode_prompt; }; zle -N _mu_test_model_effort_completion; bindkey -M mumode '^T' _mu_test_model_effort_completion"
+model_effort_setup+="; export TEST_MODEL_QUERIES=${(q)tmpdir}/model-queries"
 rm -f -- "$interactive_capture_args" "$interactive_capture_stdin" "$interactive_capture_calls"
 interactive_status=0
 {
   send_interactive_setup "$model_effort_setup"
-  print -rn -- $'\t\x14'
+  print -rn -- $'\t\x14\x14'
   sleep 0.4
   print -rn -- $'\x04'
 } | timeout 10 script -qfec 'TERM=xterm-256color zsh -df' "$model_effort_transcript" >/dev/null || interactive_status=$?
@@ -1061,6 +1074,8 @@ raw_transcript=$(<"$model_effort_transcript")
 [[ "$normalized" == *'[first-buffer=/model gpt-5.6-luna: first-cursor=20]'* ]] || fail "infix model completion should append a speculative colon"
 [[ "$raw_transcript" == *'none'* && "$raw_transcript" == *'max'* ]] || fail "one model completion should immediately list supported efforts"
 [[ ! -e "$interactive_capture_calls" || ! -s "$interactive_capture_calls" ]] || fail "model effort completion should not submit a prompt"
+
+[[ $(<"$tmpdir/model-queries") == xx ]] || fail "each model completion fetches one fresh snapshot shared with its callbacks"
 
 effort_menu_transcript=$tmpdir/effort-menu-transcript
 effort_menu_setup="$interactive_setup; zstyle ':completion:*' menu select; MU_ZSH_TEST_MENU_CAPTURE=0; _mu_test_capture_effort_menu() { (( MU_ZSH_TEST_MENU_CAPTURE += 1 )); zle -I; print -r -- \"[menu-\$MU_ZSH_TEST_MENU_CAPTURE-buffer=\$BUFFER cursor=\$CURSOR]\"; BUFFER=; CURSOR=0; _mu_zsh_reset_mode_prompt; }; zle -N _mu_test_capture_effort_menu; bindkey -M mumode '^T' _mu_test_capture_effort_menu"

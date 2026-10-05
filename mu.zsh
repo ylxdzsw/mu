@@ -200,36 +200,8 @@ _mu_zsh_reset_history_navigation() {
 
 _mu_zsh_record_history() {
   local input=$1
-  local scope=${2:-}
-  local session_id
-  local model
-  local trap
-  local quoted=${(qqq)input}
-  if _mu_zsh_bundle_active "$scope"; then
-    session_id=$MU_ZSH_SESSION_ID
-    model=$_MU_ZSH_MODEL
-    trap=$_MU_ZSH_TRAP
-  fi
-
-  local attachments=
-  local trap_arg=
-  local replay
-  local attachment
-  for attachment in "${_MU_ZSH_PENDING_ATTACHMENTS[@]}"; do
-    attachments+=" -a ${(q)attachment}"
-  done
-  [[ -n "$trap" ]] && trap_arg=" --trap ${(q)trap}"
-  if [[ -n "$session_id" ]]; then
-    if [[ -n "$model" ]]; then
-      replay="mu -s ${(q)session_id} --model ${(q)model}${trap_arg}${attachments} <<< $quoted"
-    else
-      replay="mu -s ${(q)session_id}${trap_arg}${attachments} <<< $quoted"
-    fi
-  elif [[ -n "$model" ]]; then
-    replay="mu --model ${(q)model}${trap_arg}${attachments} <<< $quoted"
-  else
-    replay="mu${trap_arg}${attachments} <<< $quoted"
-  fi
+  shift
+  local replay="${(j: :)${(q)@}} <<< ${(qqq)input}"
   _mu_zsh_append_history "$input" "$replay"
 }
 
@@ -439,16 +411,23 @@ _mu_zsh_has_custom_slash_command() {
   return 1
 }
 
-_mu_zsh_model_completion_candidates() {
-  local fragment=$1
-  local suffix_only=${2:-0}
+_mu_zsh_models_json() {
   local -a command
-  local json
   command=(mu status --json --include-models)
   _mu_zsh_bundle_active && [[ -n "$MU_ZSH_SESSION_ID" ]] && command+=(-s "$MU_ZSH_SESSION_ID")
-  json=$("${command[@]}" 2>/dev/null) || return 1
+  "${command[@]}" 2>/dev/null
+}
+
+_mu_zsh_model_query() {
+  local fragment=$1 mode=${2:-candidates}
+  local json
+  if (( ${+_mu_zsh_completion_models} )); then
+    json=$_mu_zsh_completion_models
+  else
+    json=$(_mu_zsh_models_json) || return 1
+  fi
   command -v jq >/dev/null 2>&1 || return 1
-  jq -r --arg fragment "$fragment" --arg suffix_only "$suffix_only" '
+  jq -r --arg fragment "$fragment" --arg mode "$mode" '
     def dedup:
       reduce .[] as $item ([]; if index($item) then . else . + [$item] end);
     def effort_rank:
@@ -461,95 +440,41 @@ _mu_zsh_model_completion_candidates() {
       short: (.model_id // ""),
       efforts: (.supported_efforts // [])
     }] as $models
-    | [
-        if $suffix_only == "1" then
-          ($fragment | if endswith(":") then .[:-1] else . end) as $base
-          | $models[] as $model
-          | select(
-              $base == $model.canonical
-              or $base == $model.short
-            )
-          | $model.efforts[]? | ":" + .
-        elif ($fragment | contains(":")) then
+    | if $mode == "candidates" then
+        [
           ("short", "canonical") as $key
-          | $models[] as $model | $model.efforts[]? as $effort
-          | "\($model[$key]):\($effort)"
-        else
-          ("short", "canonical") as $key
-          | $models[] | .[$key]
-        end
-      ]
-    | dedup
-    | if $suffix_only == "1" then
-        to_entries
-        | sort_by((.value | ltrimstr(":") | effort_rank), .key)
-        | .[].value
+          | $models[]
+          | if ($fragment | contains(":")) then
+              .[$key] as $model | .efforts[]? | "\($model):\(.)"
+            else .[$key]
+            end
+        ] | dedup | .[]
       else
-        .[]
+        (if $mode == "transition" then
+          ($fragment | if contains("/") then "canonical" else "short" end) as $key
+          | select(all($models[];
+              .[$key] == $fragment or (.[$key] | startswith($fragment) | not)))
+          | [$models[] | select(.[$key] == $fragment)]
+          | if $key == "canonical" then .[:1] else . end
+        else
+          ($fragment | rtrimstr(":")) as $base
+          | [$models[] | select(.canonical == $base or .short == $base)]
+        end)
+        | [.[].efforts[]?] | dedup
+        | to_entries
+        | sort_by((.value | effort_rank), .key)
+        | .[].value | ":" + .
       end
   ' <<< "$json"
 }
 
 _mu_zsh_model_completion_transition() {
-  local fragment=$1
-  local target=$2
-  local -a command result
-  local json
-
-  command=(mu status --json --include-models)
-  _mu_zsh_bundle_active && [[ -n "$MU_ZSH_SESSION_ID" ]] && command+=(-s "$MU_ZSH_SESSION_ID")
-  json=$("${command[@]}" 2>/dev/null) || return 1
-  command -v jq >/dev/null 2>&1 || return 1
-  result=("${(@f)$(
-    jq -r --arg fragment "$fragment" '
-      def dedup:
-        reduce .[] as $item ([]; if index($item) then . else . + [$item] end);
-      def effort_rank:
-        . as $effort
-        | if $effort == "minimal" or $effort == "minimum" then 0
-          else ((["low", "medium", "high", "xhigh", "max"] | index($effort)) // 5) + 1
-          end;
-      [.available_models.providers[]?.models[]? | {
-        canonical: (.id // ""),
-        short: (.model_id // ""),
-        efforts: (.supported_efforts // [])
-      }] as $models
-      | if ($fragment | contains("/")) then
-          ($models | map(select(.canonical == $fragment)) | .[0]) as $model
-          | select($model != null)
-          | select(([
-              $models[]
-              | select(.canonical != $fragment and (.canonical | startswith($fragment)))
-            ] | length) == 0)
-          | [$fragment]
-            + (($model.efforts | dedup)
-              | to_entries
-              | sort_by((.value | effort_rank), .key)
-              | map(":" + .value))
-        else
-          select(([
-            $models[] | select(.short == $fragment)
-          ] | length) > 0)
-          | select(([
-              $models[]
-              | select(.short != $fragment and (.short | startswith($fragment)))
-            ] | length) == 0)
-          | [$fragment]
-            + ([
-                $models[]
-                | select(.short == $fragment)
-                | .efforts[]?
-              ] | dedup
-              | to_entries
-              | sort_by((.value | effort_rank), .key)
-              | map(":" + .value))
-        end
-      | .[]
-    ' <<< "$json"
-  )}")
-  (( ${#result[@]} > 1 )) || return 1
-  set -A "$target" "${result[@]:1}"
-  return 0
+  local fragment=$1 target=$2
+  local -a result
+  result=("${(@f)$(_mu_zsh_model_query "$fragment" transition)}")
+  result=("${(@)result:#}")
+  (( ${#result[@]} )) || return 1
+  set -A "$target" "${result[@]}"
 }
 
 _mu_zsh_model_command_transition_allowed() {
@@ -596,7 +521,7 @@ _mu_zsh_completion_candidates() {
   if [[ "$left" == "/model "* ]]; then
     arg=${left#"/model "}
     [[ "$arg" != *[[:space:]]* ]] || return 1
-    _mu_zsh_model_completion_candidates "$arg"
+    _mu_zsh_model_query "$arg"
     return
   fi
 
@@ -616,83 +541,61 @@ _mu_zsh_completion_candidates() {
 }
 
 _mu_zsh_fallback_completion() {
-  local left arg model_fragment suffix effort_suffix
-  local -a candidates effort_suffixes effort_candidates
-
-  left=${BUFFER[1,$CURSOR]}
-  if [[ "$left" == "/model "* ]]; then
-    arg=${left#"/model "}
-    if [[ "$arg" == *:* ]]; then
-      model_fragment=${arg%:*}
-      effort_suffixes=("${(@f)$(_mu_zsh_model_completion_candidates "$model_fragment:" 1)}")
-      effort_suffixes=("${(@)effort_suffixes:#}")
-      if (( ${#effort_suffixes[@]} )); then
-        compset -P '*:' 2>/dev/null || true
-        for effort_suffix in "${effort_suffixes[@]}"; do
-          effort_candidates+=("${effort_suffix#:}")
-        done
-        compadd -V mu-model-effort -Q -S '' -- "${effort_candidates[@]}"
-        return
-      fi
-    fi
-  fi
-
-  candidates=("${(@f)$(_mu_zsh_completion_candidates)}")
-  candidates=("${(@)candidates:#}")
-  (( ${#candidates[@]} )) || return 1
-
-  suffix=' '
-  if [[ "$left" == "/model "* ]]; then
-    compadd -V mu-model -Q -S '' -- "${candidates[@]}"
-    return
-  fi
-  [[ "$left" == "/trap "* ]] && suffix=''
-  compadd -Q -S "$suffix" -- "${candidates[@]}"
+  _mu_zsh_complete_candidates fallback
 }
 
 _mu_zsh_completion_system() {
-  local left arg model_fragment suffix effort_suffix
-  local -a candidates effort_suffixes effort_candidates
-  local expl
+  _mu_zsh_complete_candidates compsys
+}
 
-  left=${BUFFER[1,$CURSOR]}
-  if [[ "$left" == "/attach "* ]]; then
+_mu_zsh_complete_candidates() {
+  local adapter=$1
+  local left=${BUFFER[1,$CURSOR]} arg effort_suffix expl
+  local group=mu-slash-command description='mu slash command' suffix=' '
+  local -a candidates effort_suffixes ordering
+
+  if [[ "$adapter" == compsys && "$left" == "/attach "* ]]; then
     compset -P '/attach '
     _files
     return
   fi
 
   if [[ "$left" == "/model "* ]]; then
+    # Direct native/list-choices entry points also get one local snapshot.
+    if (( ! ${+_mu_zsh_completion_models} )); then
+      local _mu_zsh_completion_models
+      _mu_zsh_completion_models=$(_mu_zsh_models_json) || return 1
+    fi
+    group=mu-model description=model suffix=''
     arg=${left#"/model "}
     if [[ "$arg" == *:* ]]; then
-      model_fragment=${arg%:*}
-      effort_suffixes=("${(@f)$(_mu_zsh_model_completion_candidates "$model_fragment:" 1)}")
+      effort_suffixes=("${(@f)$(_mu_zsh_model_query "${arg%:*}:" suffix)}")
       effort_suffixes=("${(@)effort_suffixes:#}")
       if (( ${#effort_suffixes[@]} )); then
         compset -P '*:' 2>/dev/null || true
         for effort_suffix in "${effort_suffixes[@]}"; do
-          effort_candidates+=("${effort_suffix#:}")
+          candidates+=("${effort_suffix#:}")
         done
-        _wanted -V mu-model-effort expl 'model effort' \
-          compadd -Q -S '' -- "${effort_candidates[@]}"
-        return
+        group=mu-model-effort description='model effort'
       fi
     fi
   fi
 
-  candidates=("${(@f)$(_mu_zsh_completion_candidates)}")
-  candidates=("${(@)candidates:#}")
-  (( ${#candidates[@]} )) || return 1
-
-  suffix=' '
-  if [[ "$left" == "/model "* ]]; then
-    _wanted -V mu-model expl 'model' \
-      compadd -Q -S '' -- "${candidates[@]}"
-    return
+  if (( ! ${#candidates[@]} )); then
+    candidates=("${(@f)$(_mu_zsh_completion_candidates)}")
+    candidates=("${(@)candidates:#}")
   fi
+  (( ${#candidates[@]} )) || return 1
   [[ "$left" == "/trap "* ]] && suffix=''
-  _wanted mu-slash-command expl 'mu slash command' \
-    compadd -Q -S "$suffix" -- "${candidates[@]}"
+  [[ "$group" != mu-slash-command ]] && ordering=(-V)
+
+  if [[ "$adapter" == compsys ]]; then
+    _wanted "${ordering[@]}" "$group" expl "$description" \
+      compadd -Q -S "$suffix" -- "${candidates[@]}"
+  else
+    (( ${#ordering[@]} )) && ordering+=("$group")
+    compadd "${ordering[@]}" -Q -S "$suffix" -- "${candidates[@]}"
+  fi
 }
 
 _mu_zsh_use_completion_system() {
@@ -711,9 +614,12 @@ _mu_zsh_complete_slash() {
 
   _mu_zsh_slash_completion_context || return 1
   if [[ "$before_left" == "/model "* ]]; then
+    # Dynamically scoped through ZLE callbacks, and discarded after this Tab.
+    local _mu_zsh_completion_models
+    _mu_zsh_completion_models=$(_mu_zsh_models_json) || return 1
     model_arg=${before_left#"/model "}
     if [[ "$model_arg" == *: ]]; then
-      effort_suffixes=("${(@f)$(_mu_zsh_model_completion_candidates "$model_arg" 1)}")
+      effort_suffixes=("${(@f)$(_mu_zsh_model_query "$model_arg" suffix)}")
       effort_suffixes=("${(@)effort_suffixes:#}")
       # An empty effort token needs menu-complete; expand-or-complete would
       # spend this Tab rebuilding the already-visible candidate list.
@@ -807,37 +713,25 @@ _mu_zsh_validate_model_ref() {
   return 0
 }
 
-_mu_zsh_resolve_load_output() {
-  local session_id=$1
-  local status_json output
-
-  status_json=$(mu status --json -s "$session_id") || return $?
-  output=$(jq -r '.output // empty' <<< "$status_json" 2>/dev/null) || output=
-  case "$output" in
-    final|concise|detail|full)
-      REPLY=$output
-      ;;
-    *)
-      print -u2 -- "mu mu.zsh: status returned an invalid output density"
-      return 1
-      ;;
-  esac
-}
-
-_mu_zsh_resolve_load_session() {
+_mu_zsh_resolve_load() {
   local requested_session=$1
-  local status_json session_id
+  local target=$2
+  local status_json session_id output
+  local -a command fields
 
+  command=(mu status --json)
   if [[ -n "$requested_session" ]]; then
-    REPLY=$requested_session
-    return 0
+    command+=(-s "$requested_session")
+  else
+    command+=(--continue)
   fi
-
-  status_json=$(mu status --json --continue) || return $?
-  session_id=$(jq -r '.session_id // empty' <<< "$status_json" 2>/dev/null) || {
+  status_json=$("${command[@]}") || return $?
+  fields=("${(@ps:\t:)$(jq -r '[(.session_id // ""), (.output // "")] | @tsv' <<< "$status_json" 2>/dev/null)}") || {
     print -u2 -- "mu mu.zsh: could not resolve current session from status"
     return 1
   }
+  session_id=${fields[1]:-}
+  output=${fields[2]:-}
   if [[ -z "$session_id" ]]; then
     _mu_zsh_print_block_message "[mu] no sessions found in active scope"
     return 1
@@ -846,45 +740,19 @@ _mu_zsh_resolve_load_session() {
     print -u2 -- "mu mu.zsh: status returned an invalid session id"
     return 1
   fi
-  REPLY=$session_id
-}
-
-_mu_zsh_run_custom_slash_command() {
-  local slash_command=$1
-  local instruction=${2-}
-  local name=${slash_command#/}
-  local exit_status scope session_id
-  local -a command
-
-  _mu_zsh_set_scope_key_for_dir "$PWD"
-  scope=$REPLY
-  _mu_zsh_activate_scope "$scope"
-  [[ -n "$MU_ZSH_SESSION_ID" ]] ||
-    _mu_zsh_create_session_for_scope "$scope" || return $?
-  _mu_zsh_base_command command "$scope"
-  session_id=$MU_ZSH_SESSION_ID
-
-  local attachment
-  for attachment in "${_MU_ZSH_PENDING_ATTACHMENTS[@]}"; do
-    command+=(-a "$attachment")
-  done
-  command+=("$name")
-  _MU_ZSH_PENDING_ATTACHMENTS=()
-
-  if [[ -n "$instruction" ]]; then
-    print -rn -- "$instruction" | "${command[@]}"
-    exit_status=${pipestatus[2]}
-  else
-    "${command[@]}"
-    exit_status=$?
-  fi
-
-  return $exit_status
+  case "$output" in
+    final|concise|detail|full) ;;
+    *)
+      print -u2 -- "mu mu.zsh: status returned an invalid output density"
+      return 1
+      ;;
+  esac
+  set -A "$target" "$session_id" "$output"
 }
 
 _mu_zsh_run_slash_command() {
   local line=$1
-  local command instruction rest session_id scope resolved_model load_output
+  local command instruction rest session_id scope resolved_model
   local exit_status=0
 
   command=${line%%[[:space:]]*}
@@ -985,11 +853,10 @@ _mu_zsh_run_slash_command() {
         _mu_zsh_print_block_message "[mu] /load accepts exactly one session id"
         return 1
       fi
-      _mu_zsh_resolve_load_session "$rest" || return $?
-      session_id=$REPLY
-      _mu_zsh_resolve_load_output "$session_id" || return $?
-      load_output=$REPLY
-      mu transcript --session "$session_id" --output "$load_output" || return $?
+      local -a load
+      _mu_zsh_resolve_load "$rest" load || return $?
+      session_id=$load[1]
+      mu transcript --session "$session_id" --output "$load[2]" || return $?
       _mu_zsh_activate_scope "$scope"
       MU_ZSH_SESSION_ID=$session_id
       _mu_zsh_print_block_message "[mu] loaded session $session_id"
@@ -1037,7 +904,7 @@ _mu_zsh_run_slash_command() {
       ;;
     *)
       if _mu_zsh_has_custom_slash_command "$command"; then
-        _mu_zsh_run_custom_slash_command "$command" "$instruction"
+        _mu_zsh_submit_prompt "$instruction" "${command#/}"
         exit_status=$?
       else
         _mu_zsh_print_block_message "[mu] unknown slash command: $command"
@@ -1163,8 +1030,8 @@ _mu_zsh_history_down() {
 
 _mu_zsh_submit_prompt() {
   local input=$1
-  local exit_status
-  local scope session_id
+  local target=${2:-}
+  local scope attachment
   local -a command
 
   _mu_zsh_set_scope_key_for_dir "$PWD"
@@ -1172,21 +1039,26 @@ _mu_zsh_submit_prompt() {
   _mu_zsh_activate_scope "$scope"
   [[ -n "$MU_ZSH_SESSION_ID" ]] ||
     _mu_zsh_create_session_for_scope "$scope" || return $?
-  # Create the session before recording history so the replay command can
-  # address the exact session even for the first turn in a scope.
-  _mu_zsh_record_history "$input" "$scope"
   _mu_zsh_base_command command "$scope"
-  session_id=$MU_ZSH_SESSION_ID
-  local attachment
   for attachment in "${_MU_ZSH_PENDING_ATTACHMENTS[@]}"; do
     command+=(-a "$attachment")
   done
+  if [[ -n "$target" ]]; then
+    command+=("$target")
+  else
+    # Record the actual command after model-free session creation.
+    _mu_zsh_record_history "$input" "${command[@]}"
+  fi
   _MU_ZSH_PENDING_ATTACHMENTS=()
 
-  "${command[@]}" <<< "$input"
-  exit_status=$?
-
-  return $exit_status
+  if [[ -z "$target" ]]; then
+    "${command[@]}" <<< "$input"
+  elif [[ -n "$input" ]]; then
+    print -rn -- "$input" | "${command[@]}"
+    return ${pipestatus[2]}
+  else
+    "${command[@]}"
+  fi
 }
 
 _mu_zsh_tab() {

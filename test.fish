@@ -88,6 +88,7 @@ mkdir "$fake_bin"
 begin
     printf '%s\n' '#!/bin/sh'
     printf '%s\n' 'if [ "$1" = status ]; then'
+    printf '%s\n' '  [ -z "$TEST_CAPTURE_STATUS" ] || printf "%s\n" "$*" >>"$TEST_CAPTURE_STATUS"'
     printf '%s\n' '  model=local/test'
     printf '%s\n' '  session='
     printf '%s\n' '  include_commands=0'
@@ -163,7 +164,9 @@ printf image >"$attachment"
 set -g _MU_FISH_MODEL openai/gpt
 set -g _MU_FISH_PENDING_ATTACHMENTS "$attachment"
 rm -f "$capture_args" "$capture_calls"
+set -gx TEST_CAPTURE_STATUS "$TEST_TMPDIR/load-status"
 set load_output (_mu_fish_run_slash_command '/load ses_0000000b' | string collect)
+assert_equal (cat "$TEST_CAPTURE_STATUS" | string collect) 'status --json -s ses_0000000b' 'explicit /load uses one model-free status preflight'
 assert_equal "$MU_FISH_SESSION_ID" ses_0000000b '/load attaches the selected session'
 assert_equal "$_MU_FISH_MODEL" openai/gpt '/load preserves the model override'
 set -q _MU_FISH_PENDING_ATTACHMENTS[1]; or fail '/load preserves pending attachments'
@@ -172,21 +175,28 @@ assert_contains "$load_output" '[mu] loaded session ses_0000000b' '/load confirm
 set load_args (cat "$capture_args")
 assert_equal (string join \x1e -- $load_args) (string join \x1e -- transcript --session ses_0000000b --output concise) '/load uses the configured output density'
 rm -f "$capture_args" "$capture_calls"
+set -g _MU_FISH_MODEL unknown
 _mu_fish_run_slash_command '/load ses_0000000c' >/dev/null
+set -g _MU_FISH_MODEL openai/gpt
 set load_args (cat "$capture_args")
 assert_equal (string join \x1e -- $load_args) (string join \x1e -- transcript --session ses_0000000c --output concise) '/load resolves each session output density'
 rm -f "$capture_args" "$capture_calls"
+printf '' >"$TEST_CAPTURE_STATUS"
 set load_output (_mu_fish_run_slash_command '/load' | string collect)
+assert_equal (cat "$TEST_CAPTURE_STATUS" | string collect) 'status --json --continue' 'bare /load resolves session and output from one status preflight'
+set -e TEST_CAPTURE_STATUS
 assert_equal "$MU_FISH_SESSION_ID" ses_0000000d 'argument-free /load attaches current-session'
 set load_args (cat "$capture_args")
 assert_equal (string join \x1e -- $load_args) (string join \x1e -- transcript --session ses_0000000d --output concise) 'argument-free /load replays current-session explicitly'
 assert_contains "$load_output" '[mu] loaded session ses_0000000d' 'argument-free /load confirms the resolved session'
 set -gx MU_FISH_TEST_NO_CURRENT 1
+rm -f "$capture_args" "$capture_calls"
 _mu_fish_run_slash_command '/load' >/dev/null; and fail 'argument-free /load should reject a missing current-session'
 set -e MU_FISH_TEST_NO_CURRENT
 assert_equal "$MU_FISH_SESSION_ID" ses_0000000d 'failed current load preserves the attached session'
 _mu_fish_run_slash_command '/load ses_missing' >/dev/null 2>&1; and fail '/load should reject a missing session'
 assert_equal "$MU_FISH_SESSION_ID" ses_0000000d 'failed load preserves the attached session'
+not test -e "$capture_calls"; or fail 'failed status preflight must not run transcript'
 _mu_fish_run_slash_command '/load ses_0000000b extra' >/dev/null; and fail '/load should accept exactly one session id'
 set -g MU_FISH_SESSION_ID ses_0000000a
 _mu_fish_clear_model_state

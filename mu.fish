@@ -595,33 +595,24 @@ function _mu_fish_validate_model_ref --argument-names model
     printf '%s' "$resolved"
 end
 
-function _mu_fish_resolve_load_output --argument-names session_id
-    set -l json (mu status --json -s "$session_id" | string collect)
-    set -l command_status $pipestatus[1]
-    test $command_status -eq 0; or return $command_status
-    set -l output (printf '%s' "$json" | jq -r '.output // empty' 2>/dev/null); or return 1
-    contains -- "$output" final concise detail full; or begin
-        printf '%s\n' 'mu mu.fish: status returned an invalid output density' >&2
-        return 1
-    end
-    printf '%s' "$output"
-end
-
-function _mu_fish_resolve_load_session --argument-names requested_session
+function _mu_fish_resolve_load --argument-names requested_session
+    set -l command mu status --json
     if test -n "$requested_session"
-        printf '%s' "$requested_session"
-        return 0
+        set -a command -s "$requested_session"
+    else
+        set -a command --continue
     end
-
-    set -l json (mu status --json --continue | string collect)
+    set -l json ($command | string collect)
     set -l command_status $pipestatus[1]
     test $command_status -eq 0; or return $command_status
-    set -l session (printf '%s' "$json" | jq -r '.session_id // empty' 2>/dev/null)
+    set -l fields (printf '%s' "$json" | jq -r '[(.session_id // ""), (.output // "")] | @tsv' 2>/dev/null | string split \t)
     set -l jq_status $pipestatus[2]
     if test $jq_status -ne 0
         printf '%s\n' 'mu mu.fish: could not resolve current session from status' >&2
         return 1
     end
+    set -l session "$fields[1]"
+    set -l output "$fields[2]"
     if test -z "$session"
         _mu_fish_print_block_message '[mu] no sessions found in active scope'
         return 1
@@ -630,28 +621,11 @@ function _mu_fish_resolve_load_session --argument-names requested_session
         printf '%s\n' 'mu mu.fish: status returned an invalid session id' >&2
         return 1
     end
-    printf '%s' "$session"
-end
-
-function _mu_fish_run_custom_slash_command --argument-names slash_command instruction
-    set -l scope (_mu_fish_current_scope)
-    _mu_fish_activate_scope "$scope"
-    if not set -q MU_FISH_SESSION_ID[1]; or test -z "$MU_FISH_SESSION_ID"
-        _mu_fish_create_session_for_scope "$scope"; or return $status
+    contains -- "$output" final concise detail full; or begin
+        printf '%s\n' 'mu mu.fish: status returned an invalid output density' >&2
+        return 1
     end
-
-    set -l command (_mu_fish_base_command "$scope")
-    for attachment in $_MU_FISH_PENDING_ATTACHMENTS
-        set -a command -a "$attachment"
-    end
-    set -a command (string replace -r '^/' '' -- "$slash_command")
-    set -g _MU_FISH_PENDING_ATTACHMENTS
-
-    if test -n "$instruction"
-        printf '%s' "$instruction" | $command
-        return $pipestatus[2]
-    end
-    $command
+    printf '%s\n' "$session" "$output"
 end
 
 function _mu_fish_run_slash_command --argument-names line
@@ -746,9 +720,9 @@ function _mu_fish_run_slash_command --argument-names line
                 _mu_fish_print_block_message '[mu] /load accepts exactly one session id'
                 return 1
             end
-            set -l session_id "$(_mu_fish_resolve_load_session "$rest")"; or return $status
-            set -l load_output "$(_mu_fish_resolve_load_output "$session_id")"; or return $status
-            mu transcript --session "$session_id" --output "$load_output"
+            set -l load (_mu_fish_resolve_load "$rest"); or return $status
+            set -l session_id "$load[1]"
+            mu transcript --session "$session_id" --output "$load[2]"
             set exit_status $status
             test $exit_status -eq 0; or return $exit_status
             _mu_fish_activate_scope "$scope"
@@ -794,7 +768,7 @@ function _mu_fish_run_slash_command --argument-names line
 
         case '*'
             if _mu_fish_has_custom_slash_command "$slash_command"
-                _mu_fish_run_custom_slash_command "$slash_command" "$instruction"
+                _mu_fish_submit_prompt "$instruction" (string replace -r '^/' '' -- "$slash_command")
                 set exit_status $status
             else
                 _mu_fish_print_block_message "[mu] unknown slash command: $slash_command"
@@ -805,7 +779,7 @@ function _mu_fish_run_slash_command --argument-names line
     return $exit_status
 end
 
-function _mu_fish_submit_prompt --argument-names input
+function _mu_fish_submit_prompt --argument-names input target
     set -l scope (_mu_fish_current_scope)
     _mu_fish_activate_scope "$scope"
     if not set -q MU_FISH_SESSION_ID[1]; or test -z "$MU_FISH_SESSION_ID"
@@ -816,11 +790,21 @@ function _mu_fish_submit_prompt --argument-names input
     for attachment in $_MU_FISH_PENDING_ATTACHMENTS
         set -a command -a "$attachment"
     end
-    _mu_fish_record_turn_history "$input" $command
+    if test -n "$target"
+        set -a command "$target"
+    else
+        _mu_fish_record_turn_history "$input" $command
+    end
     set -g _MU_FISH_PENDING_ATTACHMENTS
 
-    printf '%s\n' "$input" | $command
-    return $pipestatus[2]
+    if test -z "$target"
+        printf '%s\n' "$input" | $command
+        return $pipestatus[2]
+    else if test -n "$input"
+        printf '%s' "$input" | $command
+        return $pipestatus[2]
+    end
+    $command
 end
 
 function _mu_fish_common_prefix
