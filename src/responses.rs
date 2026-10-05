@@ -6,7 +6,7 @@ use crate::provider::{
     AssistantItem, ContentPart, FinishReason, HttpProvider, Message, NativeReplay,
     NativeReplayPayload, ProviderError, ReasoningVisibility, Request, SseEvent, StreamEvent,
     StreamResult, ToolCall, ToolCallDelta as ProviderToolCallDelta, Usage, UserContent,
-    base64_encode, classify_stream_error, next_event_boundary, validate_completed_tool_arguments,
+    base64_encode, classify_stream_error, validate_completed_tool_arguments,
 };
 
 pub(crate) async fn stream(
@@ -19,10 +19,7 @@ pub(crate) async fn stream(
     provider
         .stream_sse(&body, &mut |event| match event {
             SseEvent::Tick => on_event(StreamEvent::Tick),
-            SseEvent::Data(data) => {
-                let mut frame = format!("data: {data}\n\n");
-                consume_responses_sse_buffer(&mut frame, &mut state, on_event)
-            }
+            SseEvent::Data(data) => consume_event(&data, &mut state, on_event),
         })
         .await?;
     if state.reasoning_active {
@@ -235,108 +232,99 @@ pub(crate) struct ResponsesStreamState {
     pub(crate) tool_indexes: BTreeMap<usize, usize>,
 }
 
-pub(crate) fn consume_responses_sse_buffer(
-    buffer: &mut String,
+pub(crate) fn consume_event(
+    data: &str,
     state: &mut ResponsesStreamState,
     on_event: &mut dyn FnMut(StreamEvent) -> Result<(), ProviderError>,
 ) -> Result<(), ProviderError> {
-    while let Some((pos, sep_len)) = next_event_boundary(buffer) {
-        let event = buffer[..pos].to_string();
-        buffer.replace_range(..pos + sep_len, "");
-        let data = event
-            .lines()
-            .filter_map(|line| line.trim().strip_prefix("data:"))
-            .map(str::trim_start)
-            .collect::<Vec<_>>()
-            .join("\n");
-        if data.is_empty() || data == "[DONE]" {
-            continue;
-        }
-        let value: Value = serde_json::from_str(&data)
-            .map_err(|error| ProviderError::Protocol(error.to_string()))?;
-        let event_type = value.get("type").and_then(Value::as_str).unwrap_or("");
-        match event_type {
-            "response.output_item.added" => {
-                let item = &value["item"];
-                let output_index = value["output_index"].as_u64().unwrap_or(0) as usize;
-                merge_output_item(&mut state.streamed_output, output_index, item);
-                if item["type"] == "reasoning" && !state.reasoning_active {
-                    state.reasoning_active = true;
-                    state.reasoning_output_index = Some(output_index);
-                    on_event(StreamEvent::ReasoningStart(ReasoningVisibility::Opaque))?;
-                } else if item["type"] == "function_call" {
-                    let tool_index = state.tool_indexes.len();
-                    state.tool_indexes.insert(output_index, tool_index);
-                    on_event(StreamEvent::ToolCallDelta(ProviderToolCallDelta {
-                        index: tool_index,
-                        arguments_delta: item["arguments"].as_str().unwrap_or("").to_string(),
-                    }))?;
-                }
-            }
-            "response.output_item.done" => {
-                let output_index = value["output_index"].as_u64().unwrap_or(0) as usize;
-                merge_output_item(&mut state.streamed_output, output_index, &value["item"]);
-                if value["item"]["type"] == "reasoning"
-                    && state.reasoning_active
-                    && state.reasoning_output_index == Some(output_index)
-                {
-                    state.reasoning_active = false;
-                    state.reasoning_output_index = None;
-                    on_event(StreamEvent::ReasoningEnd)?;
-                }
-            }
-            "response.reasoning_summary_text.delta" => {
-                let output_index = value["output_index"].as_u64().unwrap_or(u64::MAX) as usize;
-                let summary_index = value["summary_index"].as_u64().unwrap_or(u64::MAX) as usize;
-                if state.reasoning_active
-                    && state.reasoning_output_index == Some(output_index)
-                    && let Some(delta) = value["delta"].as_str()
-                {
-                    on_event(StreamEvent::ReasoningSummaryDelta {
-                        part_index: summary_index,
-                        text: delta.to_string(),
-                    })?;
-                }
-            }
-            "response.output_text.delta" | "response.refusal.delta" => {
-                if let Some(delta) = value["delta"].as_str() {
-                    state.content.push_str(delta);
-                    on_event(StreamEvent::TextDelta(delta.to_string()))?;
-                }
-            }
-            "response.function_call_arguments.delta" => {
-                let output_index = value["output_index"].as_u64().unwrap_or(0) as usize;
-                let index = state
-                    .tool_indexes
-                    .get(&output_index)
-                    .copied()
-                    .unwrap_or(output_index);
-                let delta = value["delta"].as_str().unwrap_or("").to_string();
+    if data.is_empty() || data == "[DONE]" {
+        return Ok(());
+    }
+    let value: Value =
+        serde_json::from_str(data).map_err(|error| ProviderError::Protocol(error.to_string()))?;
+    let event_type = value.get("type").and_then(Value::as_str).unwrap_or("");
+    match event_type {
+        "response.output_item.added" => {
+            let item = &value["item"];
+            let output_index = value["output_index"].as_u64().unwrap_or(0) as usize;
+            merge_output_item(&mut state.streamed_output, output_index, item);
+            if item["type"] == "reasoning" && !state.reasoning_active {
+                state.reasoning_active = true;
+                state.reasoning_output_index = Some(output_index);
+                on_event(StreamEvent::ReasoningStart(ReasoningVisibility::Opaque))?;
+            } else if item["type"] == "function_call" {
+                let tool_index = state.tool_indexes.len();
+                state.tool_indexes.insert(output_index, tool_index);
                 on_event(StreamEvent::ToolCallDelta(ProviderToolCallDelta {
-                    index,
-                    arguments_delta: delta,
+                    index: tool_index,
+                    arguments_delta: item["arguments"].as_str().unwrap_or("").to_string(),
                 }))?;
             }
-            "response.completed" => {
-                state.terminal = true;
-                state.replayable = true;
-                retain_native_response(state, &value["response"]);
-                state.usage = responses_usage(&value["response"]["usage"]);
-            }
-            "response.incomplete" => {
-                state.terminal = true;
-                retain_native_response(state, &value["response"]);
-                state.usage = responses_usage(&value["response"]["usage"]);
-                let reason = value["response"]["incomplete_details"]["reason"]
-                    .as_str()
-                    .unwrap_or("incomplete");
-                state.finish_reason = Some(FinishReason::Other(reason.to_string()));
-            }
-            "response.failed" => return Err(responses_stream_error(&value["response"]["error"])),
-            "error" => return Err(responses_stream_error(&value)),
-            _ => {}
         }
+        "response.output_item.done" => {
+            let output_index = value["output_index"].as_u64().unwrap_or(0) as usize;
+            merge_output_item(&mut state.streamed_output, output_index, &value["item"]);
+            if value["item"]["type"] == "reasoning"
+                && state.reasoning_active
+                && state.reasoning_output_index == Some(output_index)
+            {
+                state.reasoning_active = false;
+                state.reasoning_output_index = None;
+                on_event(StreamEvent::ReasoningEnd)?;
+            }
+        }
+        "response.reasoning_summary_text.delta" => {
+            let output_index = value["output_index"].as_u64().unwrap_or(u64::MAX) as usize;
+            let summary_index = value["summary_index"].as_u64().unwrap_or(u64::MAX) as usize;
+            if state.reasoning_active
+                && state.reasoning_output_index == Some(output_index)
+                && let Some(delta) = value["delta"].as_str()
+            {
+                on_event(StreamEvent::ReasoningSummaryDelta {
+                    part_index: summary_index,
+                    text: delta.to_string(),
+                })?;
+            }
+        }
+        "response.output_text.delta" | "response.refusal.delta" => {
+            if let Some(delta) = value["delta"].as_str() {
+                state.content.push_str(delta);
+                on_event(StreamEvent::TextDelta(delta.to_string()))?;
+            }
+        }
+        "response.function_call_arguments.delta" => {
+            let output_index = value["output_index"].as_u64().unwrap_or(0) as usize;
+            let index = state
+                .tool_indexes
+                .get(&output_index)
+                .copied()
+                .unwrap_or(output_index);
+            let delta = value["delta"].as_str().unwrap_or("").to_string();
+            on_event(StreamEvent::ToolCallDelta(ProviderToolCallDelta {
+                index,
+                arguments_delta: delta,
+            }))?;
+        }
+        "response.completed" => {
+            state.terminal = true;
+            state.replayable = true;
+            retain_native_response(state, &value["response"]);
+            state.usage = responses_usage(&value["response"]["usage"]);
+        }
+        "response.incomplete" => {
+            state.terminal = true;
+            retain_native_response(state, &value["response"]);
+            state.usage = responses_usage(&value["response"]["usage"]);
+            let reason = value["response"]["incomplete_details"]["reason"]
+                .as_str()
+                .unwrap_or("incomplete");
+            state.finish_reason = Some(FinishReason::Other(reason.to_string()));
+        }
+        "response.failed" => return Err(responses_stream_error(&value["response"]["error"])),
+        "error" => return Err(responses_stream_error(&value)),
+        _ => {}
     }
+
     Ok(())
 }
 
@@ -486,9 +474,9 @@ mod tests {
     fn consume(
         state: &mut ResponsesStreamState,
         events: &mut Vec<StreamEvent>,
-        buffer: &mut String,
+        data: &str,
     ) -> Result<(), ProviderError> {
-        consume_responses_sse_buffer(buffer, state, &mut |event| {
+        consume_event(data, state, &mut |event| {
             events.push(event);
             Ok(())
         })
@@ -498,14 +486,13 @@ mod tests {
     fn accumulates_text_refusal_and_usage() {
         let mut state = ResponsesStreamState::default();
         let mut events = Vec::new();
-        let mut buffer = concat!(
-            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"hello\"}\n\n",
-            "data: {\"type\":\"response.refusal.delta\",\"delta\":\" no\"}\n\n",
-            "data: {\"type\":\"response.completed\",\"response\":{\"output\":[],\"usage\":{\"input_tokens\":12,\"input_tokens_details\":{\"cached_tokens\":3,\"cache_creation_tokens\":2},\"output_tokens\":5,\"output_tokens_details\":{\"reasoning_tokens\":4},\"total_tokens\":17}}}\n\n",
-        )
-        .to_string();
-
-        consume(&mut state, &mut events, &mut buffer).unwrap();
+        for data in [
+            "{\"type\":\"response.output_text.delta\",\"delta\":\"hello\"}",
+            "{\"type\":\"response.refusal.delta\",\"delta\":\" no\"}",
+            "{\"type\":\"response.completed\",\"response\":{\"output\":[],\"usage\":{\"input_tokens\":12,\"input_tokens_details\":{\"cached_tokens\":3,\"cache_creation_tokens\":2},\"output_tokens\":5,\"output_tokens_details\":{\"reasoning_tokens\":4},\"total_tokens\":17}}}",
+        ] {
+            consume(&mut state, &mut events, data).unwrap();
+        }
 
         assert_eq!(state.content, "hello no");
         assert!(state.terminal);
@@ -523,14 +510,13 @@ mod tests {
     fn retains_streamed_encrypted_reasoning_missing_from_terminal_snapshot() {
         let mut state = ResponsesStreamState::default();
         let mut events = Vec::new();
-        let mut buffer = concat!(
-            "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"reasoning\",\"summary\":[]}}\n\n",
-            "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"reasoning\",\"summary\":[],\"encrypted_content\":\"opaque-state\"}}\n\n",
-            "data: {\"type\":\"response.completed\",\"response\":{\"output\":[{\"type\":\"reasoning\",\"summary\":[{\"type\":\"summary_text\",\"text\":\"visible\"}]}],\"usage\":{}}}\n\n",
-        )
-        .to_string();
-
-        consume(&mut state, &mut events, &mut buffer).unwrap();
+        for data in [
+            "{\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"reasoning\",\"summary\":[]}}",
+            "{\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"reasoning\",\"summary\":[],\"encrypted_content\":\"opaque-state\"}}",
+            "{\"type\":\"response.completed\",\"response\":{\"output\":[{\"type\":\"reasoning\",\"summary\":[{\"type\":\"summary_text\",\"text\":\"visible\"}]}],\"usage\":{}}}",
+        ] {
+            consume(&mut state, &mut events, data).unwrap();
+        }
 
         assert_eq!(state.output[0]["encrypted_content"], "opaque-state");
         assert_eq!(state.output[0]["summary"][0]["text"], "visible");
@@ -544,15 +530,14 @@ mod tests {
     fn terminal_subset_merges_with_streamed_output_by_item_identity() {
         let mut state = ResponsesStreamState::default();
         let mut events = Vec::new();
-        let mut buffer = concat!(
-            "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"reasoning\",\"id\":\"rs_1\"}}\n\n",
-            "data: {\"type\":\"response.output_item.added\",\"output_index\":1,\"item\":{\"type\":\"function_call\",\"id\":\"fc_1\",\"call_id\":\"call_1\",\"name\":\"bash\",\"arguments\":\"\"}}\n\n",
-            "data: {\"type\":\"response.function_call_arguments.delta\",\"output_index\":1,\"delta\":\"{\\\"command\\\":\\\"pwd\\\"}\"}\n\n",
-            "data: {\"type\":\"response.completed\",\"response\":{\"output\":[{\"type\":\"function_call\",\"id\":\"fc_1\",\"call_id\":\"call_1\",\"name\":\"bash\",\"arguments\":\"{\\\"command\\\":\\\"pwd\\\"}\"}]}}\n\n"
-        )
-        .to_string();
-
-        consume(&mut state, &mut events, &mut buffer).unwrap();
+        for data in [
+            "{\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"reasoning\",\"id\":\"rs_1\"}}",
+            "{\"type\":\"response.output_item.added\",\"output_index\":1,\"item\":{\"type\":\"function_call\",\"id\":\"fc_1\",\"call_id\":\"call_1\",\"name\":\"bash\",\"arguments\":\"\"}}",
+            "{\"type\":\"response.function_call_arguments.delta\",\"output_index\":1,\"delta\":\"{\\\"command\\\":\\\"pwd\\\"}\"}",
+            "{\"type\":\"response.completed\",\"response\":{\"output\":[{\"type\":\"function_call\",\"id\":\"fc_1\",\"call_id\":\"call_1\",\"name\":\"bash\",\"arguments\":\"{\\\"command\\\":\\\"pwd\\\"}\"}]}}",
+        ] {
+            consume(&mut state, &mut events, data).unwrap();
+        }
 
         assert_eq!(responses_tool_calls(&state.output).unwrap().len(), 1);
         assert!(state.output.iter().any(|item| item["id"] == "rs_1"));
@@ -562,15 +547,14 @@ mod tests {
     fn keeps_dense_indexes_for_interleaved_tool_calls() {
         let mut state = ResponsesStreamState::default();
         let mut events = Vec::new();
-        let mut buffer = concat!(
-            "data: {\"type\":\"response.output_item.added\",\"output_index\":5,\"item\":{\"type\":\"function_call\",\"call_id\":\"call_a\",\"name\":\"bash\",\"arguments\":\"\"}}\n\n",
-            "data: {\"type\":\"response.output_item.added\",\"output_index\":2,\"item\":{\"type\":\"function_call\",\"call_id\":\"call_b\",\"name\":\"bash\",\"arguments\":\"\"}}\n\n",
-            "data: {\"type\":\"response.function_call_arguments.delta\",\"output_index\":2,\"delta\":\"second\"}\n\n",
-            "data: {\"type\":\"response.function_call_arguments.delta\",\"output_index\":5,\"delta\":\"first\"}\n\n",
-        )
-        .to_string();
-
-        consume(&mut state, &mut events, &mut buffer).unwrap();
+        for data in [
+            "{\"type\":\"response.output_item.added\",\"output_index\":5,\"item\":{\"type\":\"function_call\",\"call_id\":\"call_a\",\"name\":\"bash\",\"arguments\":\"\"}}",
+            "{\"type\":\"response.output_item.added\",\"output_index\":2,\"item\":{\"type\":\"function_call\",\"call_id\":\"call_b\",\"name\":\"bash\",\"arguments\":\"\"}}",
+            "{\"type\":\"response.function_call_arguments.delta\",\"output_index\":2,\"delta\":\"second\"}",
+            "{\"type\":\"response.function_call_arguments.delta\",\"output_index\":5,\"delta\":\"first\"}",
+        ] {
+            consume(&mut state, &mut events, data).unwrap();
+        }
 
         let deltas = events
             .iter()
@@ -624,39 +608,35 @@ mod tests {
 
     #[test]
     fn classifies_response_error_envelopes() {
-        for (buffer, class, disposition) in [
+        for (data, class, disposition) in [
             (
-                "data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"code\":\"server_error\",\"message\":\"generation failed\"}}}\n\n",
+                "{\"type\":\"response.failed\",\"response\":{\"error\":{\"code\":\"server_error\",\"message\":\"generation failed\"}}}",
                 "overloaded",
                 ProviderDisposition::Retry,
             ),
             (
-                "data: {\"type\":\"error\",\"error\":{\"code\":\"stream_read_error\",\"message\":\"upstream disconnected\",\"type\":\"upstream_error\"}}\n\n",
+                "{\"type\":\"error\",\"error\":{\"code\":\"stream_read_error\",\"message\":\"upstream disconnected\",\"type\":\"upstream_error\"}}",
                 "transport",
                 ProviderDisposition::Retry,
             ),
             (
-                "data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"code\":\"stream_read_error\",\"message\":\"upstream disconnected\",\"type\":\"upstream_error\"}}}\n\n",
+                "{\"type\":\"response.failed\",\"response\":{\"error\":{\"code\":\"stream_read_error\",\"message\":\"upstream disconnected\",\"type\":\"upstream_error\"}}}",
                 "transport",
                 ProviderDisposition::Retry,
             ),
             (
-                "data: {\"type\":\"error\",\"code\":\"rate_limit_exceeded\",\"message\":\"slow down\"}\n\n",
+                "{\"type\":\"error\",\"code\":\"rate_limit_exceeded\",\"message\":\"slow down\"}",
                 "rate_limit",
                 ProviderDisposition::Retry,
             ),
             (
-                "data: {\"type\":\"error\",\"code\":\"invalid_prompt\",\"message\":\"unsupported input\"}\n\n",
+                "{\"type\":\"error\",\"code\":\"invalid_prompt\",\"message\":\"unsupported input\"}",
                 "bad_request",
                 ProviderDisposition::Fail,
             ),
         ] {
-            let error = consume(
-                &mut ResponsesStreamState::default(),
-                &mut Vec::new(),
-                &mut buffer.to_string(),
-            )
-            .unwrap_err();
+            let error =
+                consume(&mut ResponsesStreamState::default(), &mut Vec::new(), data).unwrap_err();
             assert_eq!(error.class(), class);
             assert_eq!(error.disposition(), disposition);
         }
@@ -666,10 +646,9 @@ mod tests {
     fn malformed_json_is_a_parse_error_without_partial_state() {
         let mut state = ResponsesStreamState::default();
         let mut events = Vec::new();
-        let mut buffer =
-            "data: {\"type\":\"response.output_text.delta\",\"delta\":}\n\n".to_string();
+        let data = "{\"type\":\"response.output_text.delta\",\"delta\":}";
 
-        let error = consume(&mut state, &mut events, &mut buffer).unwrap_err();
+        let error = consume(&mut state, &mut events, data).unwrap_err();
 
         assert!(matches!(error, ProviderError::Protocol(_)));
         assert!(state.content.is_empty());

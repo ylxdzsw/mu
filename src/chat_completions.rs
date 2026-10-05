@@ -7,7 +7,7 @@ use crate::provider::{
     AssistantItem, ContentPart, FinishReason, HttpProvider, Message, NativeReplay,
     NativeReplayPayload, ProviderError, ReasoningVisibility, Request, SseEvent, StreamEvent,
     StreamResult, ToolCall, ToolCallDelta as ProviderToolCallDelta, Usage, UserContent,
-    base64_encode, classify_stream_error, next_event_boundary, validate_completed_tool_arguments,
+    base64_encode, classify_stream_error, validate_completed_tool_arguments,
 };
 
 #[derive(Debug, Deserialize)]
@@ -117,10 +117,7 @@ pub(crate) async fn stream(
     provider
         .stream_sse(&body, &mut |event| match event {
             SseEvent::Tick => on_event(StreamEvent::Tick),
-            SseEvent::Data(data) => {
-                let mut frame = format!("data: {data}\n\n");
-                consume_sse_buffer(&mut frame, &mut state, on_event)
-            }
+            SseEvent::Data(data) => consume_event(&data, &mut state, on_event),
         })
         .await?;
     if state.reasoning_active {
@@ -366,134 +363,120 @@ fn content_part_json(part: &ContentPart) -> Value {
     }
 }
 
-fn consume_sse_buffer(
-    buffer: &mut String,
+fn consume_event(
+    data: &str,
     state: &mut StreamParseState,
     on_event: &mut dyn FnMut(StreamEvent) -> Result<(), ProviderError>,
 ) -> Result<(), ProviderError> {
-    while let Some((pos, sep_len)) = next_event_boundary(buffer) {
-        let event = buffer[..pos].to_string();
-        buffer.replace_range(..pos + sep_len, "");
+    if data == "[DONE]" {
+        return Ok(());
+    }
+    let parsed: ChunkResponse =
+        serde_json::from_str(data).map_err(|e| ProviderError::Protocol(e.to_string()))?;
 
-        for line in event.lines() {
-            let line = line.trim();
-            if !line.starts_with("data:") {
-                continue;
-            }
-            let data = line[5..].trim_start();
-            if data == "[DONE]" {
-                continue;
-            }
-            let parsed: ChunkResponse =
-                serde_json::from_str(data).map_err(|e| ProviderError::Protocol(e.to_string()))?;
+    if let Some(error) = parsed.error {
+        return Err(classify_stream_error(&error));
+    }
 
-            if let Some(error) = parsed.error {
-                return Err(classify_stream_error(&error));
-            }
+    if let Some(u) = parsed.usage {
+        let prompt_tokens_details = u.prompt_tokens_details.unwrap_or_default();
+        let completion_tokens_details = u.completion_tokens_details.unwrap_or_default();
+        let prompt_tokens = u.prompt_tokens.unwrap_or(0);
+        let completion_tokens = u.completion_tokens.unwrap_or(0);
+        let prompt_cache_hit_tokens = u.prompt_cache_hit_tokens.unwrap_or(0);
+        let prompt_cache_miss_tokens = u.prompt_cache_miss_tokens.unwrap_or(0);
+        let cache_read = prompt_tokens_details
+            .cached_tokens
+            .unwrap_or(0)
+            .max(prompt_cache_hit_tokens);
+        let input_tokens =
+            prompt_tokens.max(prompt_cache_hit_tokens.saturating_add(prompt_cache_miss_tokens));
+        let total_tokens = u
+            .total_tokens
+            .unwrap_or_else(|| input_tokens.saturating_add(completion_tokens));
+        state.usage = Some(Usage {
+            input_tokens,
+            cache_read_input_tokens: cache_read,
+            cache_write_input_tokens: prompt_tokens_details.cache_creation_tokens,
+            output_tokens: completion_tokens,
+            reasoning_output_tokens: completion_tokens_details.reasoning_tokens.unwrap_or(0),
+            total_tokens,
+        });
+    }
 
-            if let Some(u) = parsed.usage {
-                let prompt_tokens_details = u.prompt_tokens_details.unwrap_or_default();
-                let completion_tokens_details = u.completion_tokens_details.unwrap_or_default();
-                let prompt_tokens = u.prompt_tokens.unwrap_or(0);
-                let completion_tokens = u.completion_tokens.unwrap_or(0);
-                let prompt_cache_hit_tokens = u.prompt_cache_hit_tokens.unwrap_or(0);
-                let prompt_cache_miss_tokens = u.prompt_cache_miss_tokens.unwrap_or(0);
-                let cache_read = prompt_tokens_details
-                    .cached_tokens
-                    .unwrap_or(0)
-                    .max(prompt_cache_hit_tokens);
-                let input_tokens = prompt_tokens
-                    .max(prompt_cache_hit_tokens.saturating_add(prompt_cache_miss_tokens));
-                let total_tokens = u
-                    .total_tokens
-                    .unwrap_or_else(|| input_tokens.saturating_add(completion_tokens));
-                state.usage = Some(Usage {
-                    input_tokens,
-                    cache_read_input_tokens: cache_read,
-                    cache_write_input_tokens: prompt_tokens_details.cache_creation_tokens,
-                    output_tokens: completion_tokens,
-                    reasoning_output_tokens: completion_tokens_details
-                        .reasoning_tokens
-                        .unwrap_or(0),
-                    total_tokens,
-                });
+    if let Some(choice) = parsed.choices.first() {
+        if choice.delta.reasoning_content.is_some() {
+            state.reasoning_content_present = true;
+        }
+        let reasoning_delta = choice
+            .delta
+            .reasoning_content
+            .as_ref()
+            .and_then(reasoning_text_from_value);
+        if let Some(text) = reasoning_delta {
+            state.reasoning_content.push_str(&text);
+            if !state.reasoning_active {
+                on_event(StreamEvent::ReasoningStart(
+                    ReasoningVisibility::StreamedTrace,
+                ))?;
+                state.reasoning_active = true;
             }
+            on_event(StreamEvent::ReasoningDelta(text))?;
+        } else if state.reasoning_active
+            && (choice.delta.content.is_some()
+                || choice.delta.tool_calls.is_some()
+                || choice.finish_reason.is_some())
+        {
+            on_event(StreamEvent::ReasoningEnd)?;
+            state.reasoning_active = false;
+        }
 
-            if let Some(choice) = parsed.choices.first() {
-                if choice.delta.reasoning_content.is_some() {
-                    state.reasoning_content_present = true;
+        if let Some(text) = choice.delta.content.clone() {
+            on_event(StreamEvent::TextDelta(text.clone()))?;
+            state.content.push_str(&text);
+        }
+        if let Some(ref tcs) = choice.delta.tool_calls {
+            for tc in tcs {
+                let entry = state
+                    .tool_accum
+                    .entry(tc.index)
+                    .or_insert_with(|| (None, None, String::new()));
+                if let Some(id) = tc.id.as_deref().filter(|id| !id.is_empty()) {
+                    entry.0 = Some(id.to_string());
                 }
-                let reasoning_delta = choice
-                    .delta
-                    .reasoning_content
+                if let Some(ref f) = tc.function {
+                    if let Some(name) = f.name.as_deref().filter(|name| !name.is_empty()) {
+                        entry.1 = Some(name.to_string());
+                    }
+                    if let Some(ref args) = f.arguments {
+                        entry.2.push_str(args);
+                    }
+                }
+                let arguments_delta = tc
+                    .function
                     .as_ref()
-                    .and_then(reasoning_text_from_value);
-                if let Some(text) = reasoning_delta {
-                    state.reasoning_content.push_str(&text);
-                    if !state.reasoning_active {
-                        on_event(StreamEvent::ReasoningStart(
-                            ReasoningVisibility::StreamedTrace,
-                        ))?;
-                        state.reasoning_active = true;
-                    }
-                    on_event(StreamEvent::ReasoningDelta(text))?;
-                } else if state.reasoning_active
-                    && (choice.delta.content.is_some()
-                        || choice.delta.tool_calls.is_some()
-                        || choice.finish_reason.is_some())
-                {
-                    on_event(StreamEvent::ReasoningEnd)?;
-                    state.reasoning_active = false;
-                }
-
-                if let Some(text) = choice.delta.content.clone() {
-                    on_event(StreamEvent::TextDelta(text.clone()))?;
-                    state.content.push_str(&text);
-                }
-                if let Some(ref tcs) = choice.delta.tool_calls {
-                    for tc in tcs {
-                        let entry = state
-                            .tool_accum
-                            .entry(tc.index)
-                            .or_insert_with(|| (None, None, String::new()));
-                        if let Some(id) = tc.id.as_deref().filter(|id| !id.is_empty()) {
-                            entry.0 = Some(id.to_string());
-                        }
-                        if let Some(ref f) = tc.function {
-                            if let Some(name) = f.name.as_deref().filter(|name| !name.is_empty()) {
-                                entry.1 = Some(name.to_string());
-                            }
-                            if let Some(ref args) = f.arguments {
-                                entry.2.push_str(args);
-                            }
-                        }
-                        let arguments_delta = tc
-                            .function
-                            .as_ref()
-                            .and_then(|f| f.arguments.clone())
-                            .unwrap_or_default();
-                        on_event(StreamEvent::ToolCallDelta(ProviderToolCallDelta {
-                            index: tc.index,
-                            arguments_delta,
-                        }))?;
-                        state.tool_call_started = true;
-                    }
-                }
-                if let Some(ref reason) = choice.finish_reason {
-                    state.terminal_finish_seen = true;
-                    state.finish_reason = match reason.as_str() {
-                        "stop" => FinishReason::Stop,
-                        "tool_calls" => FinishReason::ToolCalls,
-                        // Some gateways encode transport failures as terminal finish reasons.
-                        "network_error" => {
-                            return Err(ProviderError::Transport(
-                                "provider ended response with finish_reason=network_error".into(),
-                            ));
-                        }
-                        other => FinishReason::Other(other.to_string()),
-                    };
-                }
+                    .and_then(|f| f.arguments.clone())
+                    .unwrap_or_default();
+                on_event(StreamEvent::ToolCallDelta(ProviderToolCallDelta {
+                    index: tc.index,
+                    arguments_delta,
+                }))?;
+                state.tool_call_started = true;
             }
+        }
+        if let Some(ref reason) = choice.finish_reason {
+            state.terminal_finish_seen = true;
+            state.finish_reason = match reason.as_str() {
+                "stop" => FinishReason::Stop,
+                "tool_calls" => FinishReason::ToolCalls,
+                // Some gateways encode transport failures as terminal finish reasons.
+                "network_error" => {
+                    return Err(ProviderError::Transport(
+                        "provider ended response with finish_reason=network_error".into(),
+                    ));
+                }
+                other => FinishReason::Other(other.to_string()),
+            };
         }
     }
 
@@ -584,7 +567,7 @@ mod tests {
     use super::*;
     use crate::models::ResolvedModelRef;
     use crate::provider::{ModelApi, Provider};
-    use crate::responses::{ResponsesStreamState, consume_responses_sse_buffer};
+    use crate::responses::{ResponsesStreamState, consume_event as consume_responses_event};
     use std::time::Duration;
     fn test_model(effort: Option<&str>) -> ResolvedModelRef {
         ResolvedModelRef {
@@ -629,17 +612,15 @@ mod tests {
             Ok(())
         };
 
-        let mut buffer = String::new();
         let mut state = StreamParseState::default();
 
-        for chunk in [
-            "data: {\"choices\":[{\"delta\":{\"content\":\"hel\"},\"finish_reason\":null}]}\n\n",
-            "data: {\"choices\":[{\"delta\":{\"content\":\"lo\",\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"bash\",\"arguments\":\"{\\\"title\\\":\\\"Inspect\\\",\\\"risk\\\":\\\"readonly\\\",\\\"command\\\":\"}}]},\"finish_reason\":null}]}\n\n",
-            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"name\":\"\",\"arguments\":\"\\\"pwd\\\"}\"}}]},\"finish_reason\":\"tool_calls\"}],\"usage\":{\"prompt_tokens\":12,\"completion_tokens\":5,\"total_tokens\":17,\"prompt_tokens_details\":{\"cached_tokens\":3,\"cache_creation_tokens\":2},\"completion_tokens_details\":{\"reasoning_tokens\":4}}}\n\n",
-            "data: [DONE]\n\n",
+        for data in [
+            "{\"choices\":[{\"delta\":{\"content\":\"hel\"},\"finish_reason\":null}]}",
+            "{\"choices\":[{\"delta\":{\"content\":\"lo\",\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"bash\",\"arguments\":\"{\\\"title\\\":\\\"Inspect\\\",\\\"risk\\\":\\\"readonly\\\",\\\"command\\\":\"}}]},\"finish_reason\":null}]}",
+            "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"name\":\"\",\"arguments\":\"\\\"pwd\\\"}\"}}]},\"finish_reason\":\"tool_calls\"}],\"usage\":{\"prompt_tokens\":12,\"completion_tokens\":5,\"total_tokens\":17,\"prompt_tokens_details\":{\"cached_tokens\":3,\"cache_creation_tokens\":2},\"completion_tokens_details\":{\"reasoning_tokens\":4}}}",
+            "[DONE]",
         ] {
-            buffer.push_str(chunk);
-            consume_sse_buffer(&mut buffer, &mut state, &mut on_event).unwrap();
+            consume_event(data, &mut state, &mut on_event).unwrap();
         }
 
         assert_eq!(seen, "hello");
@@ -660,34 +641,31 @@ mod tests {
     #[test]
     fn distinguishes_omitted_reasoning_from_explicit_empty_reasoning() {
         let mut on_event = |_event: StreamEvent| -> Result<(), ProviderError> { Ok(()) };
-        let mut buffer =
-            "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"\"},\"finish_reason\":null}]}\n\n"
-                .to_string();
+        let data =
+            "{\"choices\":[{\"delta\":{\"reasoning_content\":\"\"},\"finish_reason\":null}]}";
         let mut state = StreamParseState::default();
-        consume_sse_buffer(&mut buffer, &mut state, &mut on_event).unwrap();
+        consume_event(data, &mut state, &mut on_event).unwrap();
         assert!(state.reasoning_content_present);
         assert!(state.reasoning_content.is_empty());
 
-        let mut buffer =
-            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":null}]}\n\n".to_string();
+        let data = "{\"choices\":[{\"delta\":{},\"finish_reason\":null}]}";
         let mut state = StreamParseState::default();
-        consume_sse_buffer(&mut buffer, &mut state, &mut on_event).unwrap();
+        consume_event(data, &mut state, &mut on_event).unwrap();
         assert!(!state.reasoning_content_present);
     }
 
     #[test]
     fn accepts_usage_chunk_with_empty_choices_and_null_details() {
         let mut on_event = |_event: StreamEvent| -> Result<(), ProviderError> { Ok(()) };
-        let mut buffer = "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":8,\"completion_tokens\":3,\"prompt_tokens_details\":null,\"completion_tokens_details\":null}}\n\n".to_string();
+        let data = "{\"choices\":[],\"usage\":{\"prompt_tokens\":8,\"completion_tokens\":3,\"prompt_tokens_details\":null,\"completion_tokens_details\":null}}";
         let mut state = StreamParseState::default();
-        consume_sse_buffer(&mut buffer, &mut state, &mut on_event).unwrap();
+        consume_event(data, &mut state, &mut on_event).unwrap();
         let usage = state.usage.unwrap();
         assert_eq!(usage.total_tokens, 11);
 
-        let mut buffer =
-            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":\"8\"}}\n\n".to_string();
+        let data = "{\"choices\":[],\"usage\":{\"prompt_tokens\":\"8\"}}";
         assert!(matches!(
-            consume_sse_buffer(&mut buffer, &mut StreamParseState::default(), &mut on_event),
+            consume_event(data, &mut StreamParseState::default(), &mut on_event),
             Err(ProviderError::Protocol(_))
         ));
     }
@@ -745,13 +723,13 @@ mod tests {
     #[test]
     fn maps_deepseek_prompt_cache_hit_and_miss_usage() {
         let mut on_event = |_event: StreamEvent| -> Result<(), ProviderError> { Ok(()) };
-        let mut buffer = concat!(
-            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":12,\"completion_tokens\":5,\"total_tokens\":17,\"prompt_cache_hit_tokens\":7,\"prompt_cache_miss_tokens\":5}}\n\n",
-            "data: [DONE]\n\n",
-        )
-        .to_string();
         let mut state = StreamParseState::default();
-        consume_sse_buffer(&mut buffer, &mut state, &mut on_event).unwrap();
+        for data in [
+            "{\"choices\":[],\"usage\":{\"prompt_tokens\":12,\"completion_tokens\":5,\"total_tokens\":17,\"prompt_cache_hit_tokens\":7,\"prompt_cache_miss_tokens\":5}}",
+            "[DONE]",
+        ] {
+            consume_event(data, &mut state, &mut on_event).unwrap();
+        }
 
         let usage = state.usage.unwrap();
         assert_eq!(usage.input_tokens, 12);
@@ -762,24 +740,20 @@ mod tests {
     #[test]
     fn classifies_in_stream_error_payload() {
         let mut on_event = |_event: StreamEvent| -> Result<(), ProviderError> { Ok(()) };
-        let mut frame =
-            "data: {\"error\":{\"message\":\"upstream unavailable\",\"type\":\"server_error\"}}\n\n"
-                .to_string();
+        let data = "{\"error\":{\"message\":\"upstream unavailable\",\"type\":\"server_error\"}}";
         assert!(matches!(
-            consume_sse_buffer(
-                &mut frame,
+            consume_event(
+                data,
                 &mut StreamParseState::default(),
                 &mut on_event
             ),
             Err(ProviderError::Overloaded { detail, .. }) if detail == "upstream unavailable"
         ));
 
-        let mut frame =
-            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"network_error\"}]}\n\n"
-                .to_string();
+        let data = "{\"choices\":[{\"delta\":{},\"finish_reason\":\"network_error\"}]}";
         assert!(matches!(
-            consume_sse_buffer(
-                &mut frame,
+            consume_event(
+                data,
                 &mut StreamParseState::default(),
                 &mut on_event
             ),
@@ -790,8 +764,8 @@ mod tests {
     #[test]
     fn reasoning_only_stop_is_resumable() {
         let mut state = StreamParseState::default();
-        let mut frame = "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"still working\"},\"finish_reason\":\"stop\"}]}\n\n".to_string();
-        consume_sse_buffer(&mut frame, &mut state, &mut |_| Ok(())).unwrap();
+        let data = "{\"choices\":[{\"delta\":{\"reasoning_content\":\"still working\"},\"finish_reason\":\"stop\"}]}";
+        consume_event(data, &mut state, &mut |_| Ok(())).unwrap();
 
         assert_eq!(finalized_finish_reason(&state), FinishReason::Resume);
     }
@@ -804,16 +778,14 @@ mod tests {
             Ok(())
         };
 
-        let mut buffer = String::new();
         let mut state = StreamParseState::default();
 
-        for chunk in [
-            "data: {\"choices\":[{\"delta\":{\"reasoning_content\":[{\"type\":\"reasoning_text\",\"text\":\"step 1\"}]},\"finish_reason\":null}]}\n\n",
-            "data: {\"choices\":[{\"delta\":{\"content\":\"done\"},\"finish_reason\":\"stop\"}]}\n\n",
-            "data: [DONE]\n\n",
+        for data in [
+            "{\"choices\":[{\"delta\":{\"reasoning_content\":[{\"type\":\"reasoning_text\",\"text\":\"step 1\"}]},\"finish_reason\":null}]}",
+            "{\"choices\":[{\"delta\":{\"content\":\"done\"},\"finish_reason\":\"stop\"}]}",
+            "[DONE]",
         ] {
-            buffer.push_str(chunk);
-            consume_sse_buffer(&mut buffer, &mut state, &mut on_event).unwrap();
+            consume_event(data, &mut state, &mut on_event).unwrap();
         }
 
         assert!(matches!(
@@ -829,17 +801,15 @@ mod tests {
     }
 
     #[test]
-    fn preserves_reasoning_content_verbatim_across_stream_chunks() {
+    fn preserves_reasoning_content_verbatim_across_events() {
         let mut on_event = |_event: StreamEvent| -> Result<(), ProviderError> { Ok(()) };
-        let mut buffer = String::new();
         let mut state = StreamParseState::default();
 
-        for chunk in [
-            "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"  first line\\n\"},\"finish_reason\":null}]}\n\n",
-            "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"\\tsecond line  \"},\"finish_reason\":\"tool_calls\"}]}\n\n",
+        for data in [
+            "{\"choices\":[{\"delta\":{\"reasoning_content\":\"  first line\\n\"},\"finish_reason\":null}]}",
+            "{\"choices\":[{\"delta\":{\"reasoning_content\":\"\\tsecond line  \"},\"finish_reason\":\"tool_calls\"}]}",
         ] {
-            buffer.push_str(chunk);
-            consume_sse_buffer(&mut buffer, &mut state, &mut on_event).unwrap();
+            consume_event(data, &mut state, &mut on_event).unwrap();
         }
 
         assert_eq!(state.reasoning_content, "  first line\n\tsecond line  ");
@@ -1054,17 +1024,16 @@ mod tests {
             events.push(event);
             Ok(())
         };
-        let mut buffer = concat!(
-            "data: {\"type\":\"response.output_item.added\",\"output_index\":2,\"item\":{\"type\":\"reasoning\",\"id\":\"rs_1\"}}\n\n",
-            "data: {\"type\":\"response.reasoning_summary_text.delta\",\"output_index\":1,\"summary_index\":0,\"delta\":\"ignored output\"}\n\n",
-            "data: {\"type\":\"response.reasoning_summary_text.delta\",\"output_index\":2,\"summary_index\":1,\"delta\":\"ignored part\"}\n\n",
-            "data: {\"type\":\"response.reasoning_summary_text.delta\",\"output_index\":2,\"summary_index\":0,\"delta\":\"**Inspecting\"}\n\n",
-            "data: {\"type\":\"response.reasoning_summary_text.delta\",\"output_index\":2,\"summary_index\":0,\"delta\":\" renderer**\\n\"}\n\n",
-            "data: {\"type\":\"response.output_item.done\",\"output_index\":2,\"item\":{\"type\":\"reasoning\"}}\n\n",
-        )
-        .to_string();
-
-        consume_responses_sse_buffer(&mut buffer, &mut state, &mut on_event).unwrap();
+        for data in [
+            "{\"type\":\"response.output_item.added\",\"output_index\":2,\"item\":{\"type\":\"reasoning\",\"id\":\"rs_1\"}}",
+            "{\"type\":\"response.reasoning_summary_text.delta\",\"output_index\":1,\"summary_index\":0,\"delta\":\"ignored output\"}",
+            "{\"type\":\"response.reasoning_summary_text.delta\",\"output_index\":2,\"summary_index\":1,\"delta\":\"ignored part\"}",
+            "{\"type\":\"response.reasoning_summary_text.delta\",\"output_index\":2,\"summary_index\":0,\"delta\":\"**Inspecting\"}",
+            "{\"type\":\"response.reasoning_summary_text.delta\",\"output_index\":2,\"summary_index\":0,\"delta\":\" renderer**\\n\"}",
+            "{\"type\":\"response.output_item.done\",\"output_index\":2,\"item\":{\"type\":\"reasoning\"}}",
+        ] {
+            consume_responses_event(data, &mut state, &mut on_event).unwrap();
+        }
 
         assert!(matches!(
             events.first(),
@@ -1093,8 +1062,8 @@ mod tests {
     fn responses_incomplete_maps_finish_reason_without_replayable_completion() {
         let mut state = ResponsesStreamState::default();
         let mut on_event = |_event| Ok(());
-        let mut buffer = "data: {\"type\":\"response.incomplete\",\"response\":{\"output\":[],\"incomplete_details\":{\"reason\":\"max_output_tokens\"},\"usage\":{\"input_tokens\":2,\"output_tokens\":3,\"total_tokens\":5}}}\n\n".to_string();
-        consume_responses_sse_buffer(&mut buffer, &mut state, &mut on_event).unwrap();
+        let data = "{\"type\":\"response.incomplete\",\"response\":{\"output\":[],\"incomplete_details\":{\"reason\":\"max_output_tokens\"},\"usage\":{\"input_tokens\":2,\"output_tokens\":3,\"total_tokens\":5}}}";
+        consume_responses_event(data, &mut state, &mut on_event).unwrap();
 
         assert!(state.terminal);
         assert!(!state.replayable);
@@ -1155,64 +1124,86 @@ mod tests {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         use tokio::net::UnixListener;
 
-        let tmp = crate::random::create_temp_dir(&std::env::temp_dir(), "mu-http-unix-").unwrap();
-        let socket_path = tmp.join("provider.sock");
-        let listener = UnixListener::bind(&socket_path).unwrap();
+        for (path, body) in [
+            (
+                "chat/completions",
+                concat!(
+                    "data: {\"choices\":[{\"delta\":{\"content\":\"socket ok\"},\r\n",
+                    "data: \"finish_reason\":\"stop\"}]}\r\n\r\n",
+                    "data: [DONE]\n\n"
+                ),
+            ),
+            (
+                "responses",
+                concat!(
+                    "data: {\"type\":\"response.output_text.delta\",\n",
+                    "data: \"delta\":\"socket ok\"}\n\n",
+                    "data: {\"type\":\"response.completed\",\r\n",
+                    "data: \"response\":{\"output\":[]}}\r\n\r\n",
+                    "data: [DONE]\n\n"
+                ),
+            ),
+        ] {
+            let tmp =
+                crate::random::create_temp_dir(&std::env::temp_dir(), "mu-http-unix-").unwrap();
+            let socket_path = tmp.join("provider.sock");
+            let listener = UnixListener::bind(&socket_path).unwrap();
 
-        let server = tokio::spawn(async move {
-            let (mut socket, _) = listener.accept().await.unwrap();
-            let mut request = Vec::new();
-            loop {
-                let mut chunk = [0; 4096];
-                let read = socket.read(&mut chunk).await.unwrap();
-                if read == 0 {
-                    break;
+            let server = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                loop {
+                    let mut chunk = [0; 4096];
+                    let read = socket.read(&mut chunk).await.unwrap();
+                    if read == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&chunk[..read]);
+                    if request.windows(4).any(|part| part == b"\r\n\r\n") {
+                        break;
+                    }
                 }
-                request.extend_from_slice(&chunk[..read]);
-                if request.windows(4).any(|part| part == b"\r\n\r\n") {
-                    break;
+
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\
+                     Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                socket.write_all(response.as_bytes()).await.unwrap();
+                String::from_utf8(request).unwrap()
+            });
+
+            let encoded_socket = socket_path.to_str().unwrap().replace('/', "%2F");
+            let endpoint = format!("http+unix://{encoded_socket}/{path}?route=local");
+            let provider = HttpProvider::new(endpoint, None).unwrap();
+
+            let mut text = String::new();
+            let mut on_event = |event| {
+                if let StreamEvent::TextDelta(delta) = event {
+                    text.push_str(&delta);
                 }
-            }
+                Ok(())
+            };
+            let result = provider
+                .stream(&request(None, vec![], false), &mut on_event)
+                .await
+                .unwrap();
 
-            let body = concat!(
-                "data: {\"choices\":[{\"delta\":{\"content\":\"socket ok\"},",
-                "\"finish_reason\":\"stop\"}]}\n\n",
-                "data: [DONE]\n\n"
+            let wire_request = server.await.unwrap();
+            assert!(wire_request.starts_with(&format!("POST /{path}?route=local HTTP/1.1\r\n")));
+            assert!(
+                wire_request
+                    .to_ascii_lowercase()
+                    .contains("\r\nhost: localhost\r\n")
             );
-            let response = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\
-                 Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                body.len()
+            assert_eq!(text, "socket ok");
+            assert_eq!(
+                result.message.assistant_text().as_deref(),
+                Some("socket ok")
             );
-            socket.write_all(response.as_bytes()).await.unwrap();
-            String::from_utf8(request).unwrap()
-        });
+            assert_eq!(result.finish_reason, FinishReason::Stop);
 
-        let encoded_socket = socket_path.to_str().unwrap().replace('/', "%2F");
-        let endpoint = format!("http+unix://{encoded_socket}/chat/completions?route=local");
-        let provider = HttpProvider::new(endpoint, None).unwrap();
-
-        let mut text = String::new();
-        let mut on_event = |event| {
-            if let StreamEvent::TextDelta(delta) = event {
-                text.push_str(&delta);
-            }
-            Ok(())
-        };
-        provider
-            .stream(&request(None, vec![], false), &mut on_event)
-            .await
-            .unwrap();
-
-        let wire_request = server.await.unwrap();
-        assert!(wire_request.starts_with("POST /chat/completions?route=local HTTP/1.1\r\n"));
-        assert!(
-            wire_request
-                .to_ascii_lowercase()
-                .contains("\r\nhost: localhost\r\n")
-        );
-        assert_eq!(text, "socket ok");
-
-        std::fs::remove_dir_all(tmp).unwrap();
+            std::fs::remove_dir_all(tmp).unwrap();
+        }
     }
 }

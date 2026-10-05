@@ -1380,7 +1380,7 @@ pub(crate) fn base64_encode(bytes: &[u8]) -> String {
     out
 }
 
-pub(crate) fn next_event_boundary(buffer: &str) -> Option<(usize, usize)> {
+fn next_event_boundary(buffer: &str) -> Option<(usize, usize)> {
     let lf = buffer.find("\n\n");
     let crlf = buffer.find("\r\n\r\n");
     match (lf, crlf) {
@@ -1402,6 +1402,34 @@ mod tests {
         TerminalBellConfig,
     };
     use crate::models::ResolvedModelRef;
+
+    #[test]
+    fn frames_sse_payloads_across_partial_and_mixed_boundaries() {
+        let mut buffer = String::new();
+        let mut payloads = Vec::new();
+        let chunks: [(&str, &[&str]); 4] = [
+            (": keepalive\n\nevent: delta\r\ndata: first\r", &[]),
+            ("\ndata: second\r\n\r", &[]),
+            (
+                "\nid: 1\ndata: third\n\ndata: [DO",
+                &["first\nsecond", "third"],
+            ),
+            ("NE]\n\n", &["first\nsecond", "third", "[DONE]"]),
+        ];
+        for (chunk, expected) in chunks {
+            buffer.push_str(chunk);
+            consume_sse_events(&mut buffer, &mut |event| {
+                let SseEvent::Data(data) = event else {
+                    panic!("framing emitted a tick");
+                };
+                payloads.push(data);
+                Ok(())
+            })
+            .unwrap();
+            assert_eq!(payloads, expected);
+        }
+        assert!(buffer.is_empty());
+    }
 
     #[test]
     fn assistant_constructor_uses_chat_canonical_order() {
