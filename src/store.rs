@@ -49,6 +49,14 @@ pub struct ContextTokenEstimate {
     pub reported: bool,
 }
 
+pub(crate) struct ContextProjection {
+    pub messages: Vec<Message>,
+    /// A real user prompt or Bash result, never a derived or synthetic message.
+    pub last_input: Option<usize>,
+    /// Message index to occurrence-stable durable Bash call ID.
+    pub result_call_ids: HashMap<usize, i64>,
+}
+
 #[derive(Debug, Clone)]
 pub struct SessionSummary {
     pub id: String,
@@ -1363,12 +1371,7 @@ impl Store {
         self.context(&journal)
     }
 
-    /// The index identifies a real user prompt or Bash result, never a derived
-    /// location, checkpoint, compaction prompt, or resume message.
-    pub fn load_context_with_last_input(
-        &self,
-        session_id: &str,
-    ) -> Result<(Vec<Message>, Option<usize>)> {
+    pub(crate) fn load_context_projection(&self, session_id: &str) -> Result<ContextProjection> {
         let journal = self.load(session_id)?;
         self.context_projection(&journal, i64::MAX, &HashSet::new())
     }
@@ -1580,64 +1583,6 @@ impl Store {
     ) -> Result<Option<String>> {
         self.with_journal(session_id, |journal| {
             Ok(compaction_summary_before(journal, turn_id, i64::MAX))
-        })
-    }
-
-    pub fn call_ids_for_provider_call_ids(
-        &self,
-        session_id: &str,
-        provider_call_ids: &[String],
-    ) -> Result<Vec<i64>> {
-        self.with_journal(session_id, |journal| {
-            let start_seq = journal
-                .events
-                .iter()
-                .rev()
-                .find_map(|line| match &line.event {
-                    Event::CompactionApplied { .. } => Some(line.seq),
-                    _ => None,
-                })
-                .unwrap_or(0);
-            let completed = journal
-                .events
-                .iter()
-                .filter_map(|line| match &line.event {
-                    Event::BashCompleted { call_id, .. }
-                    | Event::BashNotAttempted { call_id, .. } => Some(*call_id),
-                    _ => None,
-                })
-                .collect::<HashSet<_>>();
-            let visible_calls = journal
-                .events
-                .iter()
-                .filter(|line| line.seq > start_seq)
-                .flat_map(|line| match &line.event {
-                    Event::ProviderCompleted {
-                        projection: Projection::Assistant { items, .. },
-                        ..
-                    } => items.as_slice(),
-                    _ => &[],
-                })
-                .filter_map(|item| match item {
-                    PersistedAssistantItem::BashCall {
-                        call_id,
-                        provider_call_id,
-                        ..
-                    } if completed.contains(call_id) => Some((provider_call_id.as_str(), *call_id)),
-                    _ => None,
-                });
-            let mut visible_calls = visible_calls;
-            let mut call_ids = Vec::with_capacity(provider_call_ids.len());
-            for provider_call_id in provider_call_ids {
-                let Some((_, call_id)) = visible_calls
-                    .by_ref()
-                    .find(|(visible_provider_id, _)| *visible_provider_id == provider_call_id)
-                else {
-                    bail!("emergency Bash elision references no visible tool result")
-                };
-                call_ids.push(call_id);
-            }
-            Ok(call_ids)
         })
     }
 
@@ -2588,7 +2533,7 @@ impl Store {
     ) -> Result<Vec<Message>> {
         Ok(self
             .context_projection(journal, max_seq, elided_call_ids)?
-            .0)
+            .messages)
     }
 
     fn context_projection(
@@ -2596,7 +2541,7 @@ impl Store {
         journal: &Journal,
         max_seq: i64,
         elided_call_ids: &HashSet<i64>,
-    ) -> Result<(Vec<Message>, Option<usize>)> {
+    ) -> Result<ContextProjection> {
         let system = journal
             .events
             .iter()
@@ -2614,6 +2559,7 @@ impl Store {
         let through_seq = applied.map(|line| line.seq);
         let mut messages = vec![Message::System { content: system }];
         let mut last_input = None;
+        let mut result_call_ids = HashMap::new();
         let prompts = queued_prompt_records(journal);
         let exchange_origins = journal
             .events
@@ -2710,6 +2656,7 @@ impl Store {
                 } => {
                     let call = find_call(journal, *call_id).context("Bash result claim missing")?;
                     last_input = Some(messages.len());
+                    result_call_ids.insert(messages.len(), *call_id);
                     if elided_call_ids.contains(call_id) {
                         found_elisions.insert(*call_id);
                         messages.push(Message::Tool {
@@ -2734,8 +2681,14 @@ impl Store {
                     let call = find_call(journal, *call_id)
                         .context("not-attempted Bash result claim missing")?;
                     last_input = Some(messages.len());
+                    result_call_ids.insert(messages.len(), *call_id);
                     messages.push(Message::Tool {
-                        content: output.clone(),
+                        content: if elided_call_ids.contains(call_id) {
+                            found_elisions.insert(*call_id);
+                            crate::compaction::EMERGENCY_OUTPUT_UNAVAILABLE.into()
+                        } else {
+                            output.clone()
+                        },
                         attachments: Vec::new(),
                         tool_call_id: call.0.to_string(),
                     });
@@ -2746,7 +2699,11 @@ impl Store {
         if &found_elisions != elided_call_ids {
             bail!("emergency Bash elision references no visible tool result")
         }
-        Ok((messages, last_input))
+        Ok(ContextProjection {
+            messages,
+            last_input,
+            result_call_ids,
+        })
     }
 
     // Content attachments and provider payload objects.
@@ -5683,7 +5640,7 @@ mod tests {
     fn emergency_elision_maps_reused_provider_ids_in_context_order() {
         let (store, session) = test_session();
         let mut durable_ids = Vec::new();
-        for turn in 0..2 {
+        for turn in 0..3 {
             store
                 .start_turn(&session.id, "/work", None, &format!("turn {turn}").into())
                 .unwrap();
@@ -5702,22 +5659,33 @@ mod tests {
                     ),
                 )
                 .unwrap();
-            store
-                .start_bash_attempt(&session.id, call_ids[0], false)
-                .unwrap();
-            store
-                .persist_bash_result(
-                    &session.id,
-                    BashResultRecord {
-                        bash_call_id: call_ids[0],
-                        outcome: "completed",
-                        exit_code: Some(0),
-                        duration_ms: Some(1),
-                    },
-                    "output",
-                    &[],
-                )
-                .unwrap();
+            if turn == 2 {
+                store
+                    .persist_bash_not_attempted(
+                        &session.id,
+                        call_ids[0],
+                        BashNotAttemptedReason::Abandoned,
+                        "output",
+                    )
+                    .unwrap();
+            } else {
+                store
+                    .start_bash_attempt(&session.id, call_ids[0], false)
+                    .unwrap();
+                store
+                    .persist_bash_result(
+                        &session.id,
+                        BashResultRecord {
+                            bash_call_id: call_ids[0],
+                            outcome: "completed",
+                            exit_code: Some(0),
+                            duration_ms: Some(1),
+                        },
+                        "output",
+                        &[],
+                    )
+                    .unwrap();
+            }
             store
                 .append_message(
                     &session.id,
@@ -5727,21 +5695,31 @@ mod tests {
             durable_ids.push(call_ids[0]);
         }
 
+        let projection = store.load_context_projection(&session.id).unwrap();
+        let result_indices = projection
+            .messages
+            .iter()
+            .enumerate()
+            .filter_map(|(index, message)| matches!(message, Message::Tool { .. }).then_some(index))
+            .collect::<Vec<_>>();
+        assert_eq!(projection.result_call_ids.len(), durable_ids.len());
+        assert_eq!(projection.last_input, result_indices.last().copied());
         assert_eq!(
-            store
-                .call_ids_for_provider_call_ids(
-                    &session.id,
-                    &["reused-provider-id".into(), "reused-provider-id".into()],
-                )
-                .unwrap(),
+            result_indices
+                .iter()
+                .map(|index| projection.result_call_ids[index])
+                .collect::<Vec<_>>(),
             durable_ids
         );
+        let (_, elided_indices) = crate::compaction::emergency_projection(
+            &projection.messages,
+            10_000,
+            projection.last_input,
+        );
+        assert_eq!(elided_indices, result_indices[..2]);
+        let journal = store.load(&session.id).unwrap();
         let context = store
-            .context_until_with_elisions(
-                &store.load(&session.id).unwrap(),
-                i64::MAX,
-                &HashSet::from([durable_ids[1]]),
-            )
+            .context_until_with_elisions(&journal, i64::MAX, &HashSet::from([durable_ids[1]]))
             .unwrap();
         let outputs = context
             .iter()
@@ -5752,8 +5730,69 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(
             outputs,
-            ["output", crate::compaction::EMERGENCY_OUTPUT_UNAVAILABLE]
+            [
+                "output",
+                crate::compaction::EMERGENCY_OUTPUT_UNAVAILABLE,
+                "output"
+            ]
         );
+
+        // Skip an already-elided occurrence without rematching its provider ID.
+        let (projected, elided_indices) =
+            crate::compaction::emergency_projection(&context, 10_000, None);
+        assert_eq!(elided_indices, [result_indices[0], result_indices[2]]);
+        assert_eq!(
+            elided_indices
+                .iter()
+                .map(|index| projection.result_call_ids[index])
+                .collect::<Vec<_>>(),
+            [durable_ids[0], durable_ids[2]]
+        );
+        let reconstructed = store
+            .context_until_with_elisions(&journal, i64::MAX, &durable_ids.iter().copied().collect())
+            .unwrap();
+        let request = |messages| Request {
+            model: ResolvedModelRef {
+                canonical: "test/model".into(),
+                provider_id: "test".into(),
+                model_id: "model".into(),
+                effort: None,
+            },
+            cache_key: None,
+            messages,
+            bash: true,
+        };
+        let projected = request(projected);
+        let reconstructed = request(reconstructed);
+        for api in [
+            ModelApi::ChatCompletions,
+            ModelApi::Responses,
+            ModelApi::AnthropicMessages,
+        ] {
+            assert_eq!(
+                projected.json(api).unwrap(),
+                reconstructed.json(api).unwrap()
+            );
+        }
+
+        let second_result_seq = journal
+            .events
+            .iter()
+            .find(|line| matches!(line.event, Event::BashCompleted { call_id, .. } if call_id == durable_ids[1]))
+            .unwrap()
+            .seq;
+        for (boundary, call_id) in [
+            (i64::MAX, i64::MAX),
+            (second_result_seq - 1, durable_ids[1]),
+        ] {
+            let error = store
+                .context_until_with_elisions(&journal, boundary, &HashSet::from([call_id]))
+                .unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                "emergency Bash elision references no visible tool result"
+            );
+        }
     }
 
     #[test]

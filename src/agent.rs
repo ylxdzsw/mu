@@ -80,7 +80,6 @@ enum BashCallStop {
 struct ActiveCompaction {
     pending: PendingCompaction,
     emergency: bool,
-    elided_call_ids: Vec<i64>,
 }
 
 struct ConcurrentBashExecution<'a> {
@@ -212,7 +211,6 @@ impl<'a> AgentLoop<'a> {
                 .map(|pending| ActiveCompaction {
                     emergency: self.compaction_is_emergency(&pending),
                     pending,
-                    elided_call_ids: Vec::new(),
                 });
 
         let mut total_usage = Usage::default();
@@ -295,7 +293,6 @@ impl<'a> AgentLoop<'a> {
                                 .map(|pending| ActiveCompaction {
                                     pending,
                                     emergency: false,
-                                    elided_call_ids: Vec::new(),
                                 });
                         context = self.load_context()?;
                         next_request = NextRequest::User;
@@ -309,46 +306,46 @@ impl<'a> AgentLoop<'a> {
                         .as_ref()
                         .is_some_and(|state| state.emergency);
                     let emergency_context = if emergency {
-                        let (mut messages, last_input) =
-                            self.store.load_context_with_last_input(self.session_id)?;
+                        let mut projection = self.store.load_context_projection(self.session_id)?;
                         if self.store.resume_reminder_needed(self.session_id)? {
-                            messages.push(resume_message());
+                            projection.messages.push(resume_message());
                         }
-                        Some((messages, last_input))
+                        Some(projection)
                     } else {
                         None
                     };
                     let request_context = crate::provider::filter_native_replay_for_config(
                         emergency_context
                             .as_ref()
-                            .map_or(&context, |(messages, _)| messages),
+                            .map_or(&context, |projection| &projection.messages),
                         self.config,
                         self.model.active_model(),
                         self.provider.api(),
                     );
-                    let preserved_message = emergency_context.as_ref().and_then(|(_, last)| *last);
-                    let (request_context, elided_provider_call_ids) = if emergency {
-                        compaction::emergency_projection(
-                            &request_context,
-                            self.config.compaction.hard_headroom_tokens,
-                            preserved_message,
-                        )
-                    } else {
-                        (request_context, Vec::new())
-                    };
+                    let preserved_message = emergency_context
+                        .as_ref()
+                        .and_then(|projection| projection.last_input);
+                    let (request_context, elided_call_ids) =
+                        if let Some(projection) = &emergency_context {
+                            let (messages, elided_indices) = compaction::emergency_projection(
+                                &request_context,
+                                self.config.compaction.hard_headroom_tokens,
+                                preserved_message,
+                            );
+                            let call_ids = elided_indices
+                                .iter()
+                                .map(|index| projection.result_call_ids[index])
+                                .collect::<Vec<_>>();
+                            (messages, call_ids)
+                        } else {
+                            (request_context, Vec::new())
+                        };
                     let request_context_tokens = estimate_messages_tokens(
                         &request_context,
                         self.config,
                         self.model.active_model(),
                         self.provider.api(),
                     );
-                    let elided_call_ids = self.store.call_ids_for_provider_call_ids(
-                        self.session_id,
-                        &elided_provider_call_ids,
-                    )?;
-                    if let Some(state) = active_compaction.as_mut() {
-                        state.elided_call_ids = elided_call_ids;
-                    }
                     let epoch = self.store.context_epoch(self.session_id)?;
                     let request = Request {
                         model: self.model.active_model().clone(),
@@ -380,10 +377,10 @@ impl<'a> AgentLoop<'a> {
                                 serde_json::to_value(preserved_message)?,
                             );
                         }
-                        if !state.elided_call_ids.is_empty() {
+                        if !elided_call_ids.is_empty() {
                             input.insert(
                                 "emergency_elided_call_ids".into(),
-                                serde_json::to_value(&state.elided_call_ids)?,
+                                serde_json::to_value(&elided_call_ids)?,
                             );
                         }
                     }
@@ -524,7 +521,6 @@ impl<'a> AgentLoop<'a> {
                                 .map(|pending| ActiveCompaction {
                                     pending,
                                     emergency: true,
-                                    elided_call_ids: Vec::new(),
                                 });
                             context = self.load_context()?;
                             next_request = NextRequest::User;
@@ -2760,6 +2756,10 @@ mod tests {
                         .start_turn(&session.id, "/tmp", None, &prompt)
                         .unwrap();
                 }
+                let preserved_message = store
+                    .load_context_projection(&session.id)
+                    .unwrap()
+                    .last_input;
                 let initial_events = store.audit_events(&session.id).unwrap().len();
                 let mut config = test_config();
                 config.compaction.enabled = enabled;
@@ -2826,6 +2826,21 @@ mod tests {
                 let seen = seen.lock().unwrap();
                 assert_eq!(requests.len(), seen.len());
                 for (event, native) in requests.iter().zip(seen.iter()) {
+                    let input = &event["request_recipe"]["input"];
+                    if input["compaction_attempt"] == "emergency" {
+                        assert_eq!(
+                            input["emergency_preserved_message"],
+                            serde_json::json!(preserved_message)
+                        );
+                        assert_eq!(
+                            input["emergency_elided_call_ids"],
+                            if last_is_user {
+                                serde_json::json!(calls)
+                            } else {
+                                Value::Null
+                            }
+                        );
+                    }
                     assert_eq!(
                         store
                             .reconstruct_provider_request(

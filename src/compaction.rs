@@ -105,7 +105,7 @@ pub fn emergency_projection(
     messages: &[Message],
     headroom_tokens: u64,
     preserved_message: Option<usize>,
-) -> (Vec<Message>, Vec<String>) {
+) -> (Vec<Message>, Vec<usize>) {
     let mut projected = messages.to_vec();
     let mut saved_tokens = strip_emergency_attachments(&mut projected, preserved_message);
     let mut elided = Vec::new();
@@ -120,7 +120,7 @@ pub fn emergency_projection(
         let Message::Tool {
             content,
             attachments,
-            tool_call_id,
+            ..
         } = message
         else {
             unreachable!()
@@ -128,12 +128,11 @@ pub fn emergency_projection(
         if content == EMERGENCY_OUTPUT_UNAVAILABLE && attachments.is_empty() {
             continue;
         }
-        let call_id = tool_call_id.clone();
         *content = EMERGENCY_OUTPUT_UNAVAILABLE.into();
         attachments.clear();
         let after = message.approx_tokens();
         saved_tokens = saved_tokens.saturating_add(before.saturating_sub(after));
-        elided.push(call_id);
+        elided.push(index);
     }
     (projected, elided)
 }
@@ -240,7 +239,7 @@ mod tests {
             },
         ];
         let (projected, elided) = emergency_projection(&messages, 10_000, Some(1));
-        assert_eq!(elided, ["first"]);
+        assert_eq!(elided, [0]);
         assert!(matches!(
             &projected[0],
             Message::Tool { content, attachments, .. }
