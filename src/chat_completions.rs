@@ -581,12 +581,11 @@ mod tests {
         }
     }
 
-    fn request(effort: Option<&str>, messages: Vec<Message>, bash: bool) -> Request {
+    fn request(effort: Option<&str>, messages: Vec<Message>) -> Request {
         Request {
             model: test_model(effort),
             cache_key: None,
             messages,
-            bash,
         }
     }
 
@@ -594,9 +593,8 @@ mod tests {
         api: ModelApi,
         effort: Option<&str>,
         messages: Vec<Message>,
-        bash: bool,
     ) -> Result<Value, ProviderError> {
-        request(effort, messages, bash).json(api)
+        request(effort, messages).json(api)
     }
 
     #[test]
@@ -839,15 +837,17 @@ mod tests {
             ]),
         }];
 
-        let body = body(
-            ModelApi::ChatCompletions,
-            Some("provider-custom"),
-            messages,
-            false,
-        )
-        .unwrap();
+        let body = body(ModelApi::ChatCompletions, Some("provider-custom"), messages).unwrap();
 
         assert_eq!(body["reasoning_effort"], "provider-custom");
+        assert_eq!(body["tools"].as_array().unwrap().len(), 1);
+        assert_eq!(body["tools"][0]["type"], "function");
+        assert_eq!(body["tools"][0]["function"]["name"], "bash");
+        assert_eq!(body["tools"][0]["function"]["strict"], false);
+        assert_eq!(
+            body["tools"][0]["function"]["parameters"],
+            crate::bash::parameters_schema()
+        );
         assert_eq!(body["messages"][0]["content"][0]["type"], "text");
         assert_eq!(
             body["messages"][0]["content"][1]["image_url"]["url"],
@@ -878,7 +878,7 @@ mod tests {
                 },
             ]),
         }];
-        let body = body(ModelApi::Responses, Some("max"), messages, true).unwrap();
+        let body = body(ModelApi::Responses, Some("max"), messages).unwrap();
 
         assert_eq!(body["store"], false);
         assert_eq!(body["stream"], true);
@@ -887,8 +887,14 @@ mod tests {
         assert_eq!(body["reasoning"]["summary"], "auto");
         assert!(body.get("previous_response_id").is_none());
         assert!(body.get("conversation").is_none());
+        assert_eq!(body["tools"].as_array().unwrap().len(), 1);
+        assert_eq!(body["tools"][0]["type"], "function");
         assert_eq!(body["tools"][0]["name"], "bash");
         assert_eq!(body["tools"][0]["strict"], false);
+        assert_eq!(
+            body["tools"][0]["parameters"],
+            crate::bash::parameters_schema()
+        );
         assert!(body["tools"][0].get("function").is_none());
         assert_eq!(body["input"][0]["content"][0]["type"], "input_text");
         assert_eq!(
@@ -925,7 +931,7 @@ mod tests {
                 tool_call_id: "call_1".into(),
             },
         ];
-        let matching = body(ModelApi::Responses, None, messages, false).unwrap();
+        let matching = body(ModelApi::Responses, None, messages).unwrap();
         assert_eq!(matching["input"][0], native_items[0]);
         assert_eq!(matching["input"][1], native_items[1]);
         assert_eq!(matching["input"][2]["type"], "function_call_output");
@@ -948,12 +954,12 @@ mod tests {
             tool_call_id: "call-image".into(),
         }];
 
-        let responses = body(ModelApi::Responses, None, messages.clone(), false).unwrap();
+        let responses = body(ModelApi::Responses, None, messages.clone()).unwrap();
         assert_eq!(responses["input"][0]["output"][0]["type"], "input_text");
         assert_eq!(responses["input"][0]["output"][1]["type"], "input_image");
         assert_eq!(responses["input"][0]["output"][1]["detail"], "original");
 
-        let chat = body(ModelApi::ChatCompletions, None, messages, false).unwrap();
+        let chat = body(ModelApi::ChatCompletions, None, messages).unwrap();
         assert_eq!(chat["messages"][0]["role"], "tool");
         assert_eq!(chat["messages"][1]["role"], "user");
         assert_eq!(
@@ -985,7 +991,7 @@ mod tests {
                 tool_call_id: "call-2".into(),
             },
         ];
-        let chat = body(ModelApi::ChatCompletions, None, messages, false).unwrap();
+        let chat = body(ModelApi::ChatCompletions, None, messages).unwrap();
         assert_eq!(chat["messages"][0]["tool_call_id"], "call-1");
         assert_eq!(chat["messages"][1]["tool_call_id"], "call-2");
         assert_eq!(chat["messages"][2]["role"], "user");
@@ -1006,7 +1012,6 @@ mod tests {
                     },
                 }]),
             }],
-            false,
         )
         .unwrap_err();
         assert!(
@@ -1110,7 +1115,7 @@ mod tests {
             HttpProvider::new(format!("http://{addr}/chat/completions"), None).unwrap();
         provider.idle_timeout = Duration::from_millis(200);
 
-        let request = request(None, vec![], false);
+        let request = request(None, vec![]);
         let mut on_event = |_event: StreamEvent| -> Result<(), ProviderError> { Ok(()) };
         let result = provider.stream(&request, &mut on_event).await;
 
@@ -1185,7 +1190,7 @@ mod tests {
                 Ok(())
             };
             let result = provider
-                .stream(&request(None, vec![], false), &mut on_event)
+                .stream(&request(None, vec![]), &mut on_event)
                 .await
                 .unwrap();
 

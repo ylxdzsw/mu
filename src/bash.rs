@@ -67,19 +67,6 @@ pub enum ExecutionMode {
     Concurrent,
 }
 
-// Bump ModelApi request formats when this definition changes.
-pub fn tool_definitions() -> Vec<Value> {
-    vec![serde_json::json!({
-        "type": "function",
-        "function": {
-            "name": "bash",
-            "description": description(),
-            "parameters": parameters_schema(),
-            "strict": false
-        }
-    })]
-}
-
 pub fn resolve_path(path: &str) -> PathBuf {
     let p = PathBuf::from(path);
     if p.is_absolute() {

@@ -85,24 +85,10 @@ pub(crate) fn build_request_body(
     for message in &request.messages {
         responses_input_items(message, &mut input)?;
     }
-    let response_tools = tools
-        .iter()
-        .map(|tool| {
-            let function = tool.get("function").unwrap_or(tool);
-            let mut flat = serde_json::Map::new();
-            flat.insert("type".into(), Value::String("function".into()));
-            for key in ["name", "description", "parameters", "strict"] {
-                if let Some(value) = function.get(key) {
-                    flat.insert(key.into(), value.clone());
-                }
-            }
-            Value::Object(flat)
-        })
-        .collect::<Vec<_>>();
     let mut body = serde_json::json!({
         "model": request.model.model_id,
         "input": input,
-        "tools": response_tools,
+        "tools": tools,
         "stream": true,
         "store": false,
         "include": ["reasoning.encrypted_content"]

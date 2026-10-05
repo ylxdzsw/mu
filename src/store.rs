@@ -899,7 +899,6 @@ impl Store {
             },
             cache_key: None,
             messages: self.load_context_messages(session_id)?,
-            bash: true,
         };
         let native = request.json(ModelApi::ChatCompletions)?;
         let exchange_id = self.start_provider_request(
@@ -1674,7 +1673,6 @@ impl Store {
             },
             cache_key: None,
             messages,
-            bash: true,
         };
         let native_request = request.json(ModelApi::ChatCompletions)?;
         let recipe = self.request_recipe(
@@ -2474,7 +2472,6 @@ impl Store {
             },
             cache_key,
             messages,
-            bash: true,
         }
         .json(api)?;
         if hex(Sha256::digest(canonical_json(&request))) != recipe.canonical_sha256 {
@@ -4272,7 +4269,6 @@ mod tests {
             },
             cache_key: None,
             messages: store.load_context_messages(&session.id).unwrap(),
-            bash: true,
         };
         let native = request.json(ModelApi::ChatCompletions).unwrap();
         let exchange = store
@@ -4343,7 +4339,6 @@ mod tests {
             },
             cache_key: None,
             messages: replay_messages.clone(),
-            bash: true,
         };
         let replay_native = replay_request.json(ModelApi::Responses).unwrap();
         let replay_exchange = store
@@ -4441,7 +4436,6 @@ mod tests {
             model: target.clone(),
             cache_key: None,
             messages: messages.clone(),
-            bash: true,
         };
         let native = request.json(ModelApi::Responses).unwrap();
         let exchange = store
@@ -5044,7 +5038,6 @@ mod tests {
             },
             cache_key: Some(format!("mu:{}:agent", session.id)),
             messages,
-            bash: true,
         };
         let native = request.json(ModelApi::ChatCompletions).unwrap();
         let recipe = store
@@ -5133,7 +5126,6 @@ mod tests {
             },
             cache_key: None,
             messages: messages.clone(),
-            bash: true,
         };
         let native = request.json(ModelApi::AnthropicMessages).unwrap();
         let recipe = store
@@ -5239,7 +5231,6 @@ mod tests {
             },
             cache_key: None,
             messages: request_messages,
-            bash: true,
         };
         let endpoint = "https://target.test/v1/chat/completions";
         let native = request.json(ModelApi::ChatCompletions).unwrap();
@@ -5291,7 +5282,6 @@ mod tests {
             },
             cache_key: None,
             messages: store.load_context_messages(&session.id).unwrap(),
-            bash: true,
         };
         let native = request.json(ModelApi::ChatCompletions).unwrap();
         let mut recipe = store
@@ -5760,7 +5750,6 @@ mod tests {
             },
             cache_key: None,
             messages,
-            bash: true,
         };
         let projected = request(projected);
         let reconstructed = request(reconstructed);

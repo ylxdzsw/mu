@@ -147,12 +147,11 @@ pub(crate) fn build_request_body(
     let system = system.ok_or_else(|| {
         ProviderError::Protocol("Anthropic request is missing the leading system message".into())
     })?;
-    let anthropic_tools = tools.iter().map(convert_tool).collect::<Vec<_>>();
     let mut body = serde_json::json!({
         "model": request.model.model_id,
         "system": system,
         "messages": wire_messages,
-        "tools": anthropic_tools,
+        "tools": tools,
         "stream": true,
         "max_tokens": MAX_OUTPUT_TOKENS,
         "thinking": {
@@ -167,24 +166,6 @@ pub(crate) fn build_request_body(
         body["output_config"] = serde_json::json!({ "effort": effort });
     }
     Ok(body)
-}
-
-fn convert_tool(tool: &Value) -> Value {
-    let function = tool.get("function").unwrap_or(tool);
-    let mut converted = serde_json::Map::new();
-    for key in ["name", "description"] {
-        if let Some(value) = function.get(key) {
-            converted.insert(key.into(), value.clone());
-        }
-    }
-    converted.insert(
-        "input_schema".into(),
-        function
-            .get("parameters")
-            .cloned()
-            .unwrap_or_else(|| serde_json::json!({ "type": "object" })),
-    );
-    Value::Object(converted)
 }
 
 fn append_message(
@@ -662,7 +643,7 @@ mod tests {
 
     const ENDPOINT: &str = "https://api.anthropic.test/v1/messages";
 
-    fn request(effort: Option<&str>, messages: Vec<Message>, bash: bool) -> Request {
+    fn request(effort: Option<&str>, messages: Vec<Message>) -> Request {
         Request {
             model: ResolvedModelRef {
                 canonical: "anthropic/claude-opus-5".into(),
@@ -672,16 +653,11 @@ mod tests {
             },
             cache_key: None,
             messages,
-            bash,
         }
     }
 
-    fn request_body(
-        effort: Option<&str>,
-        messages: Vec<Message>,
-        bash: bool,
-    ) -> Result<Value, ProviderError> {
-        request(effort, messages, bash).json(ModelApi::AnthropicMessages)
+    fn request_body(effort: Option<&str>, messages: Vec<Message>) -> Result<Value, ProviderError> {
+        request(effort, messages).json(ModelApi::AnthropicMessages)
     }
 
     fn system() -> Message {
@@ -711,7 +687,6 @@ mod tests {
                     content: "hello".into(),
                 },
             ],
-            true,
         );
         request.cache_key = Some("mu:ses_test:agent".into());
         let body = request.json(ModelApi::AnthropicMessages).unwrap();
@@ -724,7 +699,13 @@ mod tests {
         assert_eq!(body["max_tokens"], MAX_OUTPUT_TOKENS);
         assert_eq!(body["cache_control"]["type"], "ephemeral");
         assert!(body.get("prompt_cache_key").is_none());
+        assert_eq!(body["tools"].as_array().unwrap().len(), 1);
         assert_eq!(body["tools"][0]["name"], "bash");
+        assert_eq!(
+            body["tools"][0]["input_schema"],
+            crate::bash::parameters_schema()
+        );
+        assert!(body["tools"][0].get("type").is_none());
         assert!(body["tools"][0].get("strict").is_none());
     }
 
@@ -799,7 +780,6 @@ mod tests {
                     tool_call_id: "toolu_1".into(),
                 },
             ],
-            false,
         )
         .unwrap();
 
@@ -825,7 +805,6 @@ mod tests {
                     }]),
                 },
             ],
-            false,
         )
         .unwrap_err();
         assert!(
@@ -865,7 +844,7 @@ mod tests {
             }),
         );
 
-        let matching = request_body(None, vec![system(), message], false).unwrap();
+        let matching = request_body(None, vec![system(), message]).unwrap();
         assert_eq!(
             matching["messages"][0]["content"],
             Value::Array(native_blocks)
@@ -1099,7 +1078,7 @@ mod tests {
             None,
         );
         assert!(matches!(
-            request_body(None, vec![system(), malformed], false),
+            request_body(None, vec![system(), malformed]),
             Err(ProviderError::Protocol(_))
         ));
     }

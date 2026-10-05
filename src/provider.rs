@@ -350,26 +350,42 @@ pub struct Request {
     pub model: ResolvedModelRef,
     pub cache_key: Option<String>,
     pub messages: Vec<Message>,
-    pub bash: bool,
 }
 
 impl Request {
     pub fn json(&self, api: ModelApi) -> Result<Value, ProviderError> {
-        let tools = self.tools();
+        let description = crate::bash::description();
+        let parameters = crate::bash::parameters_schema();
+        // Bump ModelApi request formats when this wire definition changes.
+        let tools = [match api {
+            ModelApi::ChatCompletions => serde_json::json!({
+                "type": "function",
+                "function": {
+                    "name": "bash",
+                    "description": description,
+                    "parameters": parameters,
+                    "strict": false,
+                },
+            }),
+            ModelApi::Responses => serde_json::json!({
+                "type": "function",
+                "name": "bash",
+                "description": description,
+                "parameters": parameters,
+                "strict": false,
+            }),
+            ModelApi::AnthropicMessages => serde_json::json!({
+                "name": "bash",
+                "description": description,
+                "input_schema": parameters,
+            }),
+        }];
         match api {
             ModelApi::ChatCompletions => {
                 Ok(crate::chat_completions::build_request_body(self, &tools))
             }
             ModelApi::Responses => crate::responses::build_request_body(self, &tools),
             ModelApi::AnthropicMessages => crate::anthropic::build_request_body(self, &tools),
-        }
-    }
-
-    pub fn tools(&self) -> Vec<Value> {
-        if self.bash {
-            crate::bash::tool_definitions()
-        } else {
-            Vec::new()
         }
     }
 }

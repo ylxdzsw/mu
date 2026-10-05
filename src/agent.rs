@@ -351,7 +351,6 @@ impl<'a> AgentLoop<'a> {
                         model: self.model.active_model().clone(),
                         cache_key: Some(format!("mu:{}:epoch:{epoch}", self.session_id)),
                         messages: request_context,
-                        bash: true,
                     };
                     let native_request = request.json(self.provider.api())?;
                     let mut recipe_input = serde_json::json!({
@@ -1882,7 +1881,7 @@ mod tests {
     }
 
     struct ContextAfterCompactionProvider {
-        counts: Arc<Mutex<(u32, u32)>>,
+        counts: Arc<Mutex<u32>>,
     }
 
     struct SizeErrorProvider {
@@ -1975,20 +1974,10 @@ mod tests {
     impl Provider for ContextAfterCompactionProvider {
         async fn stream(
             &self,
-            request: &Request,
+            _request: &Request,
             _on_event: &mut dyn FnMut(crate::provider::StreamEvent) -> Result<(), ProviderError>,
         ) -> Result<StreamResult, ProviderError> {
-            let mut counts = self.counts.lock().unwrap();
-            if !request.bash {
-                counts.1 += 1;
-                return Ok(StreamResult {
-                    message: Message::assistant(Some("summary".into()), None, None, None),
-                    finish_reason: FinishReason::Stop,
-                    usage: None,
-                    native_response: None,
-                });
-            }
-            counts.0 += 1;
+            *self.counts.lock().unwrap() += 1;
             Err(ProviderError::ContextLength {
                 detail: "test overflow".into(),
             })
@@ -2889,7 +2878,7 @@ mod tests {
             .unwrap();
         let config = test_config();
         let request_model = crate::models::resolve_model_ref(&config, "test/fake-model").unwrap();
-        let counts = Arc::new(Mutex::new((0, 0)));
+        let counts = Arc::new(Mutex::new(0));
         let mut renderer = Renderer::with_format(OutputFormat::Detail);
         let mut agent = AgentLoop {
             config: &config,
@@ -2906,7 +2895,7 @@ mod tests {
 
         init_test_signals(agent.config);
         assert!(agent.run_turn().await.is_err());
-        assert_eq!(*counts.lock().unwrap(), (2, 0));
+        assert_eq!(*counts.lock().unwrap(), 2);
     }
 
     #[tokio::test]
