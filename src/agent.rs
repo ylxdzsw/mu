@@ -97,7 +97,6 @@ struct StreamingCommandHeader {
 #[derive(Default)]
 struct StreamingCommandHeaders {
     entries: Vec<StreamingCommandHeader>,
-    next_to_render: usize,
 }
 
 #[derive(Default)]
@@ -813,12 +812,11 @@ impl<'a> AgentLoop<'a> {
             let bash_args = match parsed {
                 Ok(args) => args,
                 Err(error) => {
-                    let header_already_rendered =
-                        finish_command_header(self.renderer, command_headers, cursor, &args)?;
+                    finish_command_header(self.renderer, command_headers, cursor, &args)?;
                     if bash::soft_interrupt_requested() {
                         return Ok(BashCallStop::SoftInterrupted(calls.len() - cursor));
                     }
-                    self.renderer.tool_start(&args, header_already_rendered)?;
+                    self.renderer.tool_start()?;
                     self.renderer
                         .tool_failed(&error.to_string(), Duration::ZERO)?;
                     let output = format!("error: {error}");
@@ -881,8 +879,7 @@ impl<'a> AgentLoop<'a> {
                 continue;
             }
 
-            let header_already_rendered =
-                finish_command_header(self.renderer, command_headers, cursor, &args)?;
+            finish_command_header(self.renderer, command_headers, cursor, &args)?;
             if bash::soft_interrupt_requested() {
                 return Ok(BashCallStop::SoftInterrupted(calls.len() - cursor));
             }
@@ -891,7 +888,7 @@ impl<'a> AgentLoop<'a> {
                 pending.call_id,
                 pending.attempts > 0,
             )?;
-            self.renderer.tool_start(&args, header_already_rendered)?;
+            self.renderer.tool_start()?;
             let started = Instant::now();
 
             let (manifest, objects_dir) = self.store.attachment_paths(self.session_id)?;
@@ -1142,7 +1139,7 @@ impl<'a> AgentLoop<'a> {
         }
 
         for (index, exec) in executions.iter_mut().enumerate() {
-            let header_already_rendered = finish_command_header(
+            finish_command_header(
                 self.renderer,
                 command_headers,
                 header_start_index + index,
@@ -1152,8 +1149,7 @@ impl<'a> AgentLoop<'a> {
             for warning in running.warnings() {
                 self.renderer.notice(&format!("[redaction] {warning}"))?;
             }
-            self.renderer
-                .tool_start(&exec.args, header_already_rendered)?;
+            self.renderer.tool_start()?;
             self.stream_running_bash(&running).await?;
             let (result, elapsed, final_output) = running.finish().await;
             self.renderer.bash_output(&final_output)?;
@@ -1259,9 +1255,6 @@ fn handle_tool_call_delta(
                 },
             )?;
         }
-        if header.display.is_done() {
-            headers.next_to_render = headers.next_to_render.max(1);
-        }
     }
 
     Ok(())
@@ -1272,7 +1265,7 @@ fn finish_command_header(
     headers: &mut StreamingCommandHeaders,
     index: usize,
     args: &Value,
-) -> std::io::Result<bool> {
+) -> std::io::Result<()> {
     if index >= headers.entries.len() {
         headers
             .entries
@@ -1283,7 +1276,7 @@ fn finish_command_header(
 }
 
 impl StreamingCommandHeader {
-    fn finish(&mut self, renderer: &mut Renderer, args: &Value) -> std::io::Result<bool> {
+    fn finish(&mut self, renderer: &mut Renderer, args: &Value) -> std::io::Result<()> {
         let title = args.get("title").and_then(|value| value.as_str());
         let risk = args.get("risk").and_then(|value| value.as_str());
         let command = args.get("command").and_then(|value| value.as_str());
@@ -1298,19 +1291,11 @@ impl StreamingCommandHeader {
                 stdin: StringFieldState::from_final(stdin),
                 arguments_complete: true,
             },
-        )?;
-        Ok(self.display.started)
+        )
     }
 }
 
 impl CommandHeaderDisplay {
-    fn is_done(&self) -> bool {
-        self.title_line_done
-            && self.command_line_done
-            && self.cwd_line_done
-            && (!self.stdin_started || self.stdin_line_done)
-    }
-
     fn update(
         &mut self,
         renderer: &mut Renderer,
@@ -1325,7 +1310,8 @@ impl CommandHeaderDisplay {
             arguments_complete,
         } = update;
         if !self.started {
-            self.started = renderer.bash_header_start()?;
+            renderer.bash_header_start()?;
+            self.started = true;
         }
 
         if renderer.output_format() == crate::OutputFormat::Concise {
@@ -1340,20 +1326,6 @@ impl CommandHeaderDisplay {
             return Ok(());
         }
 
-        if renderer.output_format() == crate::OutputFormat::Full {
-            return self.update_full(
-                renderer,
-                FullCommandHeaderUpdate {
-                    title,
-                    risk,
-                    command,
-                    cwd,
-                    stdin,
-                    arguments_complete,
-                },
-            );
-        }
-
         if !self.title_line_done {
             if let Some(value) = title.value() {
                 if !self.title_started {
@@ -1380,98 +1352,13 @@ impl CommandHeaderDisplay {
             }
         }
 
-        let Some(risk) = risk.complete_value() else {
-            return Ok(());
-        };
-
-        if self.title_line_done && !self.command_started {
-            renderer.bash_header_command_start(Some(risk))?;
-            self.command_started = true;
-        }
-
-        if self.command_started
-            && !self.command_line_done
-            && let Some(value) = command.value()
-        {
-            let done = stream_first_line(
-                value,
-                command.is_complete(),
-                crate::renderer::BASH_COMMAND_PREVIEW_BYTES,
-                renderer.bash_header_preview_width(),
-                &mut self.command_displayed_bytes,
-                |text| renderer.bash_header_delta(text),
-            )?;
-            if done {
-                renderer.bash_header_command_end()?;
-                self.command_line_done = true;
-            }
-        }
-        if self.command_line_done && !self.cwd_line_done {
-            match cwd {
-                StringFieldState::Complete(value) => {
-                    renderer.bash_header_cwd_line(&value)?;
-                    self.cwd_line_done = true;
-                }
-                StringFieldState::Missing if arguments_complete => {
-                    self.cwd_line_done = true;
-                }
-                StringFieldState::Missing | StringFieldState::Partial(_) => {}
-            }
-        }
-        if self.command_line_done
-            && self.cwd_line_done
-            && !self.stdin_line_done
-            && let Some(value) = stdin.value()
-        {
-            self.stdin_started = true;
-            renderer.bash_header_stdin_summary(value.len(), stdin.is_complete())?;
-            if stdin.is_complete() {
-                self.stdin_line_done = true;
-            }
-        }
-        Ok(())
-    }
-
-    fn update_full(
-        &mut self,
-        renderer: &mut Renderer,
-        update: FullCommandHeaderUpdate,
-    ) -> std::io::Result<()> {
-        let FullCommandHeaderUpdate {
-            title,
-            risk,
-            command,
-            cwd,
-            stdin,
-            arguments_complete,
-        } = update;
-        if !self.title_line_done {
-            if let Some(value) = title.value() {
-                if !self.title_started {
-                    renderer.bash_header_title_start()?;
-                    self.title_started = true;
-                }
-                let done = stream_first_line(
-                    value,
-                    title.is_complete(),
-                    crate::renderer::BASH_TITLE_PREVIEW_BYTES,
-                    renderer.bash_header_preview_width(),
-                    &mut self.title_displayed_bytes,
-                    |text| renderer.bash_header_delta(text),
-                )?;
-                if done {
-                    renderer.bash_header_title_end()?;
-                    self.title_line_done = true;
-                }
-            } else if arguments_complete {
-                renderer.bash_header_title_start()?;
-                renderer.bash_header_title_end()?;
-                self.title_started = true;
-                self.title_line_done = true;
-            }
-        }
-
+        let full = renderer.output_format() == crate::OutputFormat::Full;
         let complete_risk = risk.complete_value();
+        // Detail waits for risk and command; full can close missing fields once
+        // the arguments are complete.
+        if !full && complete_risk.is_none() {
+            return Ok(());
+        }
         if self.title_line_done
             && !self.command_started
             && (complete_risk.is_some() || arguments_complete)
@@ -1481,17 +1368,28 @@ impl CommandHeaderDisplay {
         }
         if self.command_started && !self.command_line_done {
             if let Some(value) = command.value() {
-                let done = stream_all(
-                    value,
-                    command.is_complete(),
-                    &mut self.command_displayed_bytes,
-                    |text| renderer.bash_header_delta(text),
-                )?;
+                let done = if full {
+                    stream_all(
+                        value,
+                        command.is_complete(),
+                        &mut self.command_displayed_bytes,
+                        |text| renderer.bash_header_delta(text),
+                    )?
+                } else {
+                    stream_first_line(
+                        value,
+                        command.is_complete(),
+                        crate::renderer::BASH_COMMAND_PREVIEW_BYTES,
+                        renderer.bash_header_preview_width(),
+                        &mut self.command_displayed_bytes,
+                        |text| renderer.bash_header_delta(text),
+                    )?
+                };
                 if done {
                     renderer.bash_header_command_end()?;
                     self.command_line_done = true;
                 }
-            } else if arguments_complete {
+            } else if full && arguments_complete {
                 renderer.bash_header_command_end()?;
                 self.command_line_done = true;
             }
@@ -1508,21 +1406,30 @@ impl CommandHeaderDisplay {
         }
         if self.command_line_done && self.cwd_line_done && !self.stdin_line_done {
             if let Some(value) = stdin.value() {
-                if !self.stdin_started {
-                    renderer.bash_header_stdin_full_start()?;
+                let done = if full {
+                    if !self.stdin_started {
+                        renderer.bash_header_stdin_full_start()?;
+                        self.stdin_started = true;
+                    }
+                    let done = stream_all(
+                        value,
+                        stdin.is_complete(),
+                        &mut self.stdin_displayed_bytes,
+                        |text| renderer.bash_header_delta(text),
+                    )?;
+                    if done {
+                        renderer.bash_header_stdin_full_end()?;
+                    }
+                    done
+                } else {
                     self.stdin_started = true;
-                }
-                let done = stream_all(
-                    value,
-                    stdin.is_complete(),
-                    &mut self.stdin_displayed_bytes,
-                    |text| renderer.bash_header_delta(text),
-                )?;
+                    renderer.bash_header_stdin_summary(value.len(), stdin.is_complete())?;
+                    stdin.is_complete()
+                };
                 if done {
-                    renderer.bash_header_stdin_full_end()?;
                     self.stdin_line_done = true;
                 }
-            } else if arguments_complete {
+            } else if full && arguments_complete {
                 self.stdin_line_done = true;
             }
         }
@@ -1531,15 +1438,6 @@ impl CommandHeaderDisplay {
 }
 
 struct CommandHeaderUpdate {
-    title: StringFieldState,
-    risk: StringFieldState,
-    command: StringFieldState,
-    cwd: StringFieldState,
-    stdin: StringFieldState,
-    arguments_complete: bool,
-}
-
-struct FullCommandHeaderUpdate {
     title: StringFieldState,
     risk: StringFieldState,
     command: StringFieldState,

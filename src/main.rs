@@ -569,7 +569,7 @@ fn replay_transcript(
                             let args: serde_json::Value = serde_json::from_str(arguments)
                                 .context("parsing persisted Bash arguments")?;
                             renderer.bash_header_full(&args)?;
-                            renderer.tool_start(&args, true)?;
+                            renderer.tool_start()?;
                             match result {
                                 Some(result) if result.outcome == "completed" => {
                                     let exit_code = result

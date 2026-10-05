@@ -531,9 +531,9 @@ impl Renderer {
         Ok(())
     }
 
-    pub fn bash_header_start(&mut self) -> io::Result<bool> {
+    pub fn bash_header_start(&mut self) -> io::Result<()> {
         if self.format == OutputFormat::Final {
-            return Ok(true);
+            return Ok(());
         }
         self.assistant_end()?;
         self.end_reasoning_run()?;
@@ -542,7 +542,7 @@ impl Renderer {
             self.live_line = Some(LiveLine::ToolComposition);
             self.render_live_line()?;
         }
-        Ok(true)
+        Ok(())
     }
 
     pub fn bash_header_title_start(&mut self) -> io::Result<()> {
@@ -669,9 +669,9 @@ impl Renderer {
         self.write_stdout_committed(&format!("{}\n", format_stdin_summary(bytes, self.styled)))
     }
 
-    pub fn bash_header_full(&mut self, args: &serde_json::Value) -> io::Result<bool> {
+    pub fn bash_header_full(&mut self, args: &serde_json::Value) -> io::Result<()> {
         if self.format == OutputFormat::Final {
-            return Ok(true);
+            return Ok(());
         }
         let title = args
             .get("title")
@@ -685,7 +685,7 @@ impl Renderer {
         self.bash_header_start()?;
         if self.format == OutputFormat::Concise {
             self.concise_tool_ready(Some(title), risk)?;
-            return Ok(true);
+            return Ok(());
         }
         self.bash_header_title_start()?;
         let preview = preview_first_line_for_width(
@@ -719,7 +719,7 @@ impl Renderer {
                 self.bash_header_stdin_summary(stdin.len(), true)?;
             }
         }
-        Ok(true)
+        Ok(())
     }
 
     pub fn trapped_bash(
@@ -800,11 +800,7 @@ impl Renderer {
         Ok(())
     }
 
-    pub fn tool_start(
-        &mut self,
-        args: &serde_json::Value,
-        header_already_rendered: bool,
-    ) -> io::Result<()> {
+    pub fn tool_start(&mut self) -> io::Result<()> {
         if self.format == OutputFormat::Final {
             return Ok(());
         }
@@ -812,10 +808,7 @@ impl Renderer {
         self.end_reasoning_run()?;
         self.live_line = None;
         self.bash_preview = (self.format == OutputFormat::Detail).then(BashPreviewState::default);
-        if header_already_rendered {
-            return Ok(());
-        }
-        self.bash_header_full(args).map(|_| ())
+        Ok(())
     }
 
     pub fn bash_output(&mut self, text: &str) -> io::Result<()> {
@@ -4769,7 +4762,7 @@ mod tests {
             .collect::<String>();
 
         renderer.bash_header_full(&args).unwrap();
-        renderer.tool_start(&args, true).unwrap();
+        renderer.tool_start().unwrap();
         renderer.bash_output(&command_output).unwrap();
         renderer.tool_finished(0, Duration::from_millis(5)).unwrap();
 
