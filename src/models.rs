@@ -64,13 +64,6 @@ impl ResolvedModelChoice {
 }
 
 #[derive(Debug, Clone, Serialize)]
-pub struct ResolvedModelInfo {
-    pub context_window: Option<u64>,
-    pub supported_effort_levels: Vec<String>,
-    pub replay_key: String,
-}
-
-#[derive(Debug, Clone, Serialize)]
 pub struct AvailableModelsPayload {
     pub providers: Vec<AvailableProvider>,
 }
@@ -142,17 +135,6 @@ pub fn resolve_model_choice(config: &Config, raw: &str) -> Result<ResolvedModelC
     }
 
     bail!("model not configured: {model_id}")
-}
-
-pub fn resolve_model_info(config: &Config, model: &ResolvedModelRef) -> ResolvedModelInfo {
-    let cfg = config.model_config(&model.provider_id, &model.model_id);
-    ResolvedModelInfo {
-        context_window: cfg.and_then(|item| item.context_window),
-        supported_effort_levels: cfg
-            .and_then(|item| item.supported_efforts.clone())
-            .unwrap_or_default(),
-        replay_key: config.replay_key(&model.provider_id, &model.model_id),
-    }
 }
 
 pub fn available_models(config: &Config) -> AvailableModelsPayload {

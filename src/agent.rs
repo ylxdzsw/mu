@@ -11,10 +11,10 @@ use crate::bash;
 use crate::bash::{ExecutionMode, ToolContext, ToolResult};
 use crate::compaction;
 use crate::config::Config;
-use crate::models::{ResolvedModelChoice, resolve_model_info};
+use crate::models::ResolvedModelChoice;
 use crate::provider::{
     AssistantItem, FinishReason, MAX_PROVIDER_RETRY_AFTER, Message, Provider, ProviderDisposition,
-    ProviderError, Request, StreamEvent, ToolCall, ToolCallDelta, Usage, advance_provider,
+    ProviderError, Request, StreamEvent, ToolCall, ToolCallDelta, Usage, build_provider,
     effective_retry_delay, estimate_messages_tokens, provider_retry_limit,
 };
 use crate::renderer::{CompactionReport, Renderer};
@@ -121,7 +121,6 @@ pub struct AgentLoop<'a> {
     pub provider: Box<dyn Provider>,
     pub store: &'a Store,
     pub session_id: &'a str,
-    pub model_context_window: Option<u64>,
     pub renderer: &'a mut Renderer,
 }
 
@@ -151,7 +150,7 @@ impl<'a> AgentLoop<'a> {
                 self.config,
                 CompactionTrigger::Soft,
                 candidate_tokens,
-                self.model_context_window,
+                self.model_context_window(),
             )
         {
             self.begin_compaction(
@@ -278,7 +277,7 @@ impl<'a> AgentLoop<'a> {
                         self.config,
                         CompactionTrigger::Hard,
                         before,
-                        self.model_context_window,
+                        self.model_context_window(),
                     ) {
                         self.begin_compaction(
                             CompactionTrigger::Hard,
@@ -743,7 +742,7 @@ impl<'a> AgentLoop<'a> {
             usage: total_usage,
             context_tokens: context_estimate.tokens,
             context_estimated: !context_estimate.reported,
-            context_window: self.model_context_window,
+            context_window: self.model_context_window(),
             final_assistant,
             awaiting_user,
             soft_interrupted: false,
@@ -767,7 +766,7 @@ impl<'a> AgentLoop<'a> {
             usage,
             context_tokens: context.tokens,
             context_estimated: !context.reported,
-            context_window: self.model_context_window,
+            context_window: self.model_context_window(),
             final_assistant: None,
             awaiting_user: false,
             soft_interrupted: true,
@@ -782,7 +781,7 @@ impl<'a> AgentLoop<'a> {
             usage,
             context_tokens: context.tokens,
             context_estimated: !context.reported,
-            context_window: self.model_context_window,
+            context_window: self.model_context_window(),
             final_assistant: None,
             awaiting_user: false,
             soft_interrupted: false,
@@ -925,9 +924,11 @@ impl<'a> AgentLoop<'a> {
         Ok(context)
     }
 
-    fn update_model_context_window(&mut self) {
-        self.model_context_window =
-            resolve_model_info(self.config, self.model.active_model()).context_window;
+    fn model_context_window(&self) -> Option<u64> {
+        let model = self.model.active_model();
+        self.config
+            .model_config(&model.provider_id, &model.model_id)
+            .and_then(|model| model.context_window)
     }
 
     fn current_context_tokens(&self) -> Result<u64> {
@@ -974,13 +975,13 @@ impl<'a> AgentLoop<'a> {
                 trigger,
                 mode,
                 before_context_tokens,
-                before_context_window: self.model_context_window,
+                before_context_window: self.model_context_window(),
             },
         )?;
         self.renderer.compaction_trigger(
             trigger,
             before_context_tokens,
-            self.model_context_window,
+            self.model_context_window(),
             None,
         )?;
         Ok(())
@@ -1012,7 +1013,7 @@ impl<'a> AgentLoop<'a> {
             CompactionApplication {
                 system_prompt,
                 after_context_tokens_estimate,
-                after_context_window: self.model_context_window,
+                after_context_window: self.model_context_window(),
             },
         )?;
         self.renderer.compaction_result(&CompactionReport {
@@ -1021,23 +1022,23 @@ impl<'a> AgentLoop<'a> {
             before_context_tokens: pending.before_context_tokens,
             before_context_window: pending.before_context_window,
             after_context_tokens_estimate,
-            after_context_window: self.model_context_window,
+            after_context_window: self.model_context_window(),
             elapsed,
         })?;
         Ok(())
     }
 
     fn advance_provider(&mut self, reason: &str) -> Result<bool> {
-        let Some((previous, next_provider)) =
-            advance_provider(self.config, &mut self.model, &mut self.provider)?
-        else {
+        let previous = self.model.active_model().provider_id.clone();
+        if !self.model.advance() {
             return Ok(false);
-        };
+        }
+        let next_provider = &self.model.active_model().provider_id;
+        self.provider = build_provider(self.config, next_provider)?;
         self.renderer.cancel_live_state()?;
         self.renderer.notice(&format!(
             "[mu] switching provider {previous} -> {next_provider} after {reason}"
         ))?;
-        self.update_model_context_window();
         Ok(true)
     }
 
@@ -2252,7 +2253,6 @@ mod tests {
             provider,
             store: &store,
             session_id: &session.id,
-            model_context_window: None,
             renderer: &mut renderer,
         };
 
@@ -2324,7 +2324,6 @@ mod tests {
             provider,
             store: &store,
             session_id: &session.id,
-            model_context_window: None,
             renderer: &mut renderer,
         };
 
@@ -2383,7 +2382,6 @@ mod tests {
             }),
             store: &store,
             session_id: &session.id,
-            model_context_window: None,
             renderer: &mut renderer,
         };
 
@@ -2437,7 +2435,6 @@ mod tests {
             provider,
             store: &store,
             session_id: &session.id,
-            model_context_window: None,
             renderer: &mut renderer,
         };
 
@@ -2473,7 +2470,6 @@ mod tests {
             provider,
             store: &store,
             session_id: &session.id,
-            model_context_window: None,
             renderer: &mut renderer,
         };
 
@@ -2541,7 +2537,6 @@ mod tests {
             provider,
             store: &store,
             session_id: &session.id,
-            model_context_window: None,
             renderer: &mut renderer,
         };
 
@@ -2664,7 +2659,6 @@ mod tests {
                     }),
                     store: &store,
                     session_id: &session.id,
-                    model_context_window: None,
                     renderer: &mut renderer,
                 };
                 init_test_signals(agent.config);
@@ -2787,7 +2781,6 @@ mod tests {
             }),
             store: &store,
             session_id: &session.id,
-            model_context_window: None,
             renderer: &mut renderer,
         };
 
@@ -2838,7 +2831,6 @@ mod tests {
             provider,
             store: &store,
             session_id: &session.id,
-            model_context_window: None,
             renderer: &mut renderer,
         };
 
@@ -2909,7 +2901,6 @@ mod tests {
             provider,
             store: &store,
             session_id: &session.id,
-            model_context_window: None,
             renderer: &mut renderer,
         };
 
@@ -2995,7 +2986,6 @@ mod tests {
             }),
             store: &store,
             session_id: &session.id,
-            model_context_window: None,
             renderer: &mut renderer,
         };
 
@@ -3060,7 +3050,6 @@ mod tests {
             }),
             store: &store,
             session_id: &session.id,
-            model_context_window: None,
             renderer: &mut renderer,
         };
 
@@ -3092,7 +3081,6 @@ mod tests {
             }),
             store: &store,
             session_id: &session.id,
-            model_context_window: None,
             renderer: &mut renderer,
         };
         init_test_signals(same_policy_retry.config);
@@ -3113,7 +3101,6 @@ mod tests {
             }),
             store: &store,
             session_id: &session.id,
-            model_context_window: None,
             renderer: &mut renderer,
         };
         init_test_signals(retry.config);
@@ -3268,6 +3255,9 @@ mod tests {
         config.limits.max_bytes = 750_000;
         config.limits.max_line_bytes = 750_000;
         config.compaction.soft_fraction = 0.80;
+        // At 200K, the hard threshold is 168K tokens. The ~690KB tool result
+        // pushes the anchored estimate past it while the 80% soft target
+        // still accepts the retained current turn.
         config
             .providers
             .iter_mut()
@@ -3336,10 +3326,6 @@ mod tests {
             provider,
             store: &store,
             session_id: &session.id,
-            // At 200K, the hard threshold is 168K tokens. The ~690KB tool result
-            // pushes the anchored estimate past it while the 80% soft target
-            // still accepts the retained current turn.
-            model_context_window: Some(200_000),
             renderer: &mut renderer,
         };
 
@@ -3400,6 +3386,8 @@ mod tests {
         let mut config = test_config();
         config.compaction.soft_fraction = 0.01;
         config.soft_interrupt = true;
+        let (_, provider) = config.providers.iter_mut().next().unwrap();
+        provider.models.iter_mut().next().unwrap().1.context_window = Some(200_000);
         let request_model = crate::models::resolve_model_ref(&config, "test/fake-model").unwrap();
 
         let new_turn_session = store.create_session_seeded("system").unwrap();
@@ -3412,7 +3400,6 @@ mod tests {
             provider: Box::new(BoundaryCompactionProvider { interrupt: true }),
             store: &store,
             session_id: &new_turn_session.id,
-            model_context_window: Some(200_000),
             renderer: &mut renderer,
         };
         new_turn_agent
@@ -3469,7 +3456,6 @@ mod tests {
             provider: Box::new(BoundaryCompactionProvider { interrupt: false }),
             store: &store,
             session_id: &retry_session.id,
-            model_context_window: Some(200_000),
             renderer: &mut renderer,
         };
         init_test_signals(retry_agent.config);
@@ -3525,7 +3511,6 @@ mod tests {
                     provider: Box::new(BoundaryCompactionProvider { interrupt }),
                     store: &store,
                     session_id: &session.id,
-                    model_context_window: None,
                     renderer: &mut renderer,
                 };
                 agent
@@ -3713,7 +3698,6 @@ mod tests {
             provider,
             store: &store,
             session_id: &session.id,
-            model_context_window: None,
             renderer: &mut renderer,
         };
 
@@ -3805,7 +3789,6 @@ mod tests {
             provider,
             store: &store,
             session_id: &session.id,
-            model_context_window: None,
             renderer: &mut renderer,
         };
 

@@ -716,7 +716,10 @@ async fn run() -> Result<()> {
             let events = store.transcript_events_for_epoch(&session.id, epoch)?;
             let context_window = |model: &str| {
                 let choice = models::resolve_model_choice(&config, model).ok()?;
-                models::resolve_model_info(&config, choice.active_model()).context_window
+                let model = choice.active_model();
+                config
+                    .model_config(&model.provider_id, &model.model_id)?
+                    .context_window
             };
             let stdout = io::stdout();
             if stdout.is_terminal()
@@ -1223,7 +1226,6 @@ async fn run_turn(args: RunTurnArgs<'_>) -> Result<()> {
     invocation_config.trap = trap;
     let config = &invocation_config;
     let active_model = model.active_model();
-    let model_context_window = models::resolve_model_info(config, active_model).context_window;
     let provider = build_provider(config, &active_model.provider_id)?;
 
     let turn_done_bell_min_duration = config
@@ -1252,7 +1254,6 @@ async fn run_turn(args: RunTurnArgs<'_>) -> Result<()> {
         provider,
         store,
         session_id,
-        model_context_window,
         renderer: &mut renderer,
     };
 

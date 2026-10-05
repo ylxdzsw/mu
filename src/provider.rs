@@ -1079,20 +1079,6 @@ pub fn build_provider(config: &Config, provider_id: &str) -> anyhow::Result<Box<
     )?))
 }
 
-pub fn advance_provider(
-    config: &Config,
-    model: &mut ResolvedModelChoice,
-    provider: &mut Box<dyn Provider>,
-) -> anyhow::Result<Option<(String, String)>> {
-    let previous = model.active_model().provider_id.clone();
-    if !model.advance() {
-        return Ok(None);
-    }
-    let next = model.active_model().provider_id.clone();
-    *provider = build_provider(config, &next)?;
-    Ok(Some((previous, next)))
-}
-
 pub const MAX_PROVIDER_RETRY_AFTER: Duration = Duration::from_secs(60);
 
 pub fn provider_retry_limit(model: &ResolvedModelChoice) -> u32 {

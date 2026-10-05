@@ -6,7 +6,7 @@ use crate::compaction::soft_compaction_threshold;
 use crate::config::Config;
 use crate::models::{
     AvailableModelsPayload, ResolvedModelChoice, ResolvedModelRef, available_models,
-    first_model_choice, resolve_model_choice, resolve_model_info,
+    first_model_choice, resolve_model_choice,
 };
 use crate::skills::{CommandMeta, SkillMeta};
 use crate::store::{Session, Store, UnsupportedSessionVersion};
@@ -337,7 +337,9 @@ pub fn build_status_report(
     skills: Option<Vec<SkillMeta>>,
 ) -> Result<StatusReport> {
     let resolved = resolve_invocation(store, config, overrides)?;
-    let model_info = resolve_model_info(config, resolved.model.active_model());
+    let active_model = resolved.model.active_model();
+    let model_config = config.model_config(&active_model.provider_id, &active_model.model_id);
+    let context_window = model_config.and_then(|model| model.context_window);
     let (session_summary, active, compaction) = if includes.session_details {
         let session_summary = resolved
             .attached_session
@@ -374,11 +376,11 @@ pub fn build_status_report(
         .map(|session| store.is_session_clean(&session.id))
         .transpose()?
         .unwrap_or(true);
-    let model = status_model(config, resolved.model.active_model());
+    let model = status_model(config, active_model);
     let context_usage = context_usage(
         store,
         config,
-        resolved.model.active_model(),
+        active_model,
         resolved.attached_session.as_ref(),
     )?;
 
@@ -392,15 +394,16 @@ pub fn build_status_report(
         context_tokens: context_usage.map(|(tokens, _)| tokens),
         context_usage_source: context_usage.map(|(_, source)| source),
         project_root: project.map(|project| project.root.display().to_string()),
-        context_window: model_info.context_window,
+        context_window,
         compaction_soft_threshold_tokens: if config.compaction.enabled {
-            model_info
-                .context_window
+            context_window
                 .map(|window| soft_compaction_threshold(window, config.compaction.soft_fraction))
         } else {
             None
         },
-        supported_effort_levels: model_info.supported_effort_levels,
+        supported_effort_levels: model_config
+            .and_then(|model| model.supported_efforts.clone())
+            .unwrap_or_default(),
         git: includes.git.then(|| project.map(git_status)).flatten(),
         session: session_summary.map(status_session),
         active,
