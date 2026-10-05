@@ -194,9 +194,7 @@ pub struct PendingCompaction {
 
 #[derive(Debug, Clone)]
 pub struct QueuedPrompt {
-    pub prompt_id: String,
     pub epoch: u64,
-    pub trap: crate::bash::TrapLevel,
 }
 
 pub(crate) struct AssistantCompletion<'a> {
@@ -1032,65 +1030,15 @@ impl Store {
     }
 
     pub fn recover_interrupted_tail_for_retry(&self, session_id: &str) -> Result<usize> {
-        let journal = self.load(session_id)?;
-        let mut terminal = HashSet::new();
-        let mut requested = Vec::new();
-        let mut calls = HashSet::new();
-        let mut results = HashSet::new();
-        let mut starts = HashMap::<i64, usize>::new();
-        for line in journal.events.iter() {
-            match &line.event {
-                Event::ProviderRequested { exchange_id, .. } => {
-                    requested.push(exchange_id.clone());
-                }
-                Event::ProviderCompleted {
-                    exchange_id,
-                    projection,
-                    ..
-                } => {
-                    terminal.insert(exchange_id.clone());
-                    match projection {
-                        Projection::Assistant { items, .. } => {
-                            for call_id in items
-                                .iter()
-                                .filter_map(|item| item.bash_call().map(|call| call.0))
-                            {
-                                calls.insert(call_id);
-                            }
-                        }
-                    }
-                }
-                Event::ProviderFailed { exchange_id, .. }
-                | Event::ProviderInterrupted { exchange_id } => {
-                    terminal.insert(exchange_id.clone());
-                }
-                Event::BashStarted { call_id } => {
-                    *starts.entry(*call_id).or_default() += 1;
-                }
-                Event::BashCompleted { call_id, .. } | Event::BashNotAttempted { call_id, .. } => {
-                    results.insert(*call_id);
-                }
-                _ => {}
-            }
-        }
-        for exchange_id in requested
-            .into_iter()
-            .filter(|exchange_id| !terminal.contains(exchange_id))
-        {
-            self.append(session_id, Event::ProviderInterrupted { exchange_id })?;
-        }
-        let mut uncertain = calls
-            .iter()
-            .filter(|call_id| starts.contains_key(call_id) && !results.contains(call_id))
-            .copied()
-            .collect::<Vec<_>>();
-        uncertain.sort_unstable();
+        self.recover_unmatched_provider_requests(session_id)?;
+        let mut pending = self.pending_bash_calls(session_id)?;
+        pending.sort_unstable_by_key(|call| call.call_id);
         let mut normalized = 0;
-        for call_id in uncertain {
-            let (_, arguments) =
-                find_call(&journal, call_id).context("locating interrupted Bash claim")?;
-            if bash_risk(arguments)? != crate::bash::BashRisk::Readonly {
-                self.append_interrupted_bash_result(session_id, call_id)?;
+        for call in pending {
+            if call.attempts > 0
+                && bash_risk(&call.call.arguments)? != crate::bash::BashRisk::Readonly
+            {
+                self.append_interrupted_bash_result(session_id, call.call_id)?;
                 normalized += 1;
             }
         }
@@ -1476,13 +1424,15 @@ impl Store {
         prompt: &UserContent,
         trap: crate::bash::TrapLevel,
     ) -> Result<String> {
-        if self.pending_compaction(session_id)?.is_some() {
-            bail!("session compaction is incomplete; run `mu retry -s {session_id}`")
-        }
-        if self.queued_prompt(session_id)?.is_some() {
-            bail!("session already has a queued prompt; run `mu retry -s {session_id}`")
-        }
-        let prompt_id = format!("q{}", self.next_seq(session_id)?);
+        let prompt_id = self.with_journal(session_id, |journal| {
+            if compaction_start_before(journal, i64::MAX).is_some() {
+                bail!("session compaction is incomplete; run `mu retry -s {session_id}`")
+            }
+            if queued_prompt(journal).is_some() {
+                bail!("session already has a queued prompt; run `mu retry -s {session_id}`")
+            }
+            Ok(format!("q{}", journal.next_seq()))
+        })?;
         self.append(
             session_id,
             Event::PromptQueued {
@@ -1498,30 +1448,9 @@ impl Store {
 
     pub fn queued_prompt(&self, session_id: &str) -> Result<Option<QueuedPrompt>> {
         let journal = self.load(session_id)?;
-        let consumed = journal
-            .events
-            .iter()
-            .filter_map(|line| match &line.event {
-                Event::PromptMaterialized { prompt_id, .. } => Some(prompt_id.as_str()),
-                _ => None,
-            })
-            .collect::<HashSet<_>>();
-        journal
-            .events
-            .iter()
-            .rev()
-            .find_map(|line| match &line.event {
-                Event::PromptQueued {
-                    prompt_id, trap, ..
-                } if !consumed.contains(prompt_id.as_str()) => Some(QueuedPrompt {
-                    prompt_id: prompt_id.clone(),
-                    epoch: context_epoch(&journal, line.seq.saturating_sub(1)),
-                    trap: *trap,
-                }),
-                _ => None,
-            })
-            .map(Ok)
-            .transpose()
+        Ok(queued_prompt(&journal).map(|(line, _, _)| QueuedPrompt {
+            epoch: context_epoch(&journal, line.seq.saturating_sub(1)),
+        }))
     }
 
     pub fn pending_trap_level(&self, session_id: &str) -> Result<crate::bash::TrapLevel> {
@@ -1551,21 +1480,25 @@ impl Store {
         if compaction_mode.is_some() {
             return active.context("pending compaction has no turn policy");
         }
-        if let Some(queued) = self.queued_prompt(session_id)? {
-            return Ok(queued.trap);
+        if let Some((_, _, trap)) = queued_prompt(&journal) {
+            return Ok(trap);
         }
         active.context("session has no pending turn policy")
     }
 
     pub fn materialize_queued_prompt(&self, session_id: &str) -> Result<Option<String>> {
-        let Some(queued) = self.queued_prompt(session_id)? else {
+        let queued = self.with_journal(session_id, |journal| {
+            Ok(queued_prompt(journal).map(|(_, prompt_id, _)| {
+                (prompt_id.to_string(), format!("t{}", journal.next_seq()))
+            }))
+        })?;
+        let Some((prompt_id, turn_id)) = queued else {
             return Ok(None);
         };
-        let turn_id = format!("t{}", self.next_seq(session_id)?);
         self.append(
             session_id,
             Event::PromptMaterialized {
-                prompt_id: queued.prompt_id,
+                prompt_id,
                 turn_id: turn_id.clone(),
             },
         )?;
@@ -2049,7 +1982,7 @@ impl Store {
                 after_context_window: None,
             },
         });
-        if mode == CompactionMode::AwaitUser && self.queued_prompt(session_id)?.is_some() {
+        if mode == CompactionMode::AwaitUser && queued_prompt(&journal).is_some() {
             append_queued_turn_projection(&mut journal)?;
         }
         Ok(estimate_messages_tokens(
@@ -3611,6 +3544,20 @@ struct TurnProjection<'a> {
     compaction: Option<CompactionProjection>,
 }
 
+fn queued_prompt(journal: &Journal) -> Option<(&EventLine, &str, crate::bash::TrapLevel)> {
+    // Validation permits only one unresolved prompt, so the latest boundary is enough.
+    for line in journal.events.iter().rev() {
+        match &line.event {
+            Event::PromptQueued {
+                prompt_id, trap, ..
+            } => return Some((line, prompt_id, *trap)),
+            Event::PromptMaterialized { .. } => return None,
+            _ => {}
+        }
+    }
+    None
+}
+
 fn queued_prompt_records(
     journal: &Journal,
 ) -> HashMap<
@@ -3836,31 +3783,14 @@ fn resume_was_requested(journal: &Journal, turn_id: &str, after_seq: i64) -> boo
 }
 
 fn append_queued_turn_projection(journal: &mut Journal) -> Result<()> {
-    let consumed = journal
-        .events
-        .iter()
-        .filter_map(|line| match &line.event {
-            Event::PromptMaterialized { prompt_id, .. } => Some(prompt_id.as_str()),
-            _ => None,
-        })
-        .collect::<HashSet<_>>();
-    let queued = journal
-        .events
-        .iter()
-        .rev()
-        .find_map(|line| match &line.event {
-            Event::PromptQueued { prompt_id, .. } if !consumed.contains(prompt_id.as_str()) => {
-                Some(prompt_id.clone())
-            }
-            _ => None,
-        })
-        .context("session has no queued prompt")?;
+    let (_, prompt_id, _) = queued_prompt(journal).context("session has no queued prompt")?;
+    let prompt_id = prompt_id.to_string();
     let seq = journal.next_seq();
     Arc::make_mut(&mut journal.events).push(EventLine {
         seq,
         at: now(),
         event: Event::PromptMaterialized {
-            prompt_id: queued,
+            prompt_id,
             turn_id: format!("projected-t{seq}"),
         },
     });
