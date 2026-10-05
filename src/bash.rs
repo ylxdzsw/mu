@@ -421,8 +421,7 @@ struct BashRunResult {
 
 #[derive(Default)]
 struct SharedBashState {
-    output: Mutex<String>,
-    finished: AtomicBool,
+    pending_output: Mutex<String>,
 }
 
 impl SharedBashState {
@@ -430,24 +429,16 @@ impl SharedBashState {
         if text.is_empty() {
             return;
         }
-        if let Ok(mut output) = self.output.lock() {
+        if let Ok(mut output) = self.pending_output.lock() {
             output.push_str(text);
         }
     }
 
-    fn snapshot_output(&self) -> String {
-        self.output
+    fn drain_output(&self) -> String {
+        self.pending_output
             .lock()
-            .map(|output| output.clone())
+            .map(|mut output| std::mem::take(&mut *output))
             .unwrap_or_default()
-    }
-
-    fn mark_finished(&self) {
-        self.finished.store(true, Ordering::SeqCst);
-    }
-
-    fn is_finished(&self) -> bool {
-        self.finished.load(Ordering::SeqCst)
     }
 }
 
@@ -462,12 +453,12 @@ impl RunningBash {
         &self.warnings
     }
 
-    pub fn snapshot_output(&self) -> String {
-        self.shared.snapshot_output()
+    pub fn drain_output(&self) -> String {
+        self.shared.drain_output()
     }
 
     pub fn is_finished(&self) -> bool {
-        self.shared.is_finished()
+        self.task.is_finished()
     }
 
     pub async fn finish(self) -> (Result<ToolResult>, Duration, String) {
@@ -476,15 +467,14 @@ impl RunningBash {
             shared,
             task,
         } = self;
-        let final_output = shared.snapshot_output();
-        match task.await {
-            Ok((result, elapsed)) => (result, elapsed, shared.snapshot_output()),
+        let (result, elapsed) = match task.await {
+            Ok(result) => result,
             Err(error) => (
                 Err(anyhow::anyhow!("bash worker failed: {error}")),
                 Duration::ZERO,
-                final_output,
             ),
-        }
+        };
+        (result, elapsed, shared.drain_output())
     }
 }
 
@@ -539,11 +529,10 @@ pub fn start_bash_task(
         let result = execute_bash(
             args,
             &config,
-            &mut BufferedBashTarget::new(Arc::clone(&shared_for_task)),
+            &mut BufferedBashTarget::new(shared_for_task),
             redactor,
             attachment_context.as_ref(),
         );
-        shared_for_task.mark_finished();
         (result, started.elapsed())
     });
     Ok(RunningBash {

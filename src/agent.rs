@@ -87,7 +87,6 @@ struct ConcurrentBashExecution<'a> {
     call: &'a ToolCall,
     args: Value,
     running: Option<RunningBash>,
-    streamed_len: usize,
 }
 
 #[derive(Default)]
@@ -1144,7 +1143,6 @@ impl<'a> AgentLoop<'a> {
                     Some(&objects_dir),
                     pending.call_id,
                 )?),
-                streamed_len: 0,
             });
         }
 
@@ -1155,21 +1153,15 @@ impl<'a> AgentLoop<'a> {
                 header_start_index + index,
                 &exec.args,
             )?;
-            if let Some(running) = exec.running.as_ref() {
-                for warning in running.warnings() {
-                    self.renderer.notice(&format!("[redaction] {warning}"))?;
-                }
+            let running = exec.running.take().expect("running bash present");
+            for warning in running.warnings() {
+                self.renderer.notice(&format!("[redaction] {warning}"))?;
             }
             self.renderer
                 .tool_start(&exec.args, header_already_rendered)?;
-            self.stream_running_bash(exec).await?;
-            let (result, elapsed, final_output) = exec
-                .running
-                .take()
-                .expect("running bash present")
-                .finish()
-                .await;
-            self.flush_buffered_bash_output(exec, &final_output)?;
+            self.stream_running_bash(&running).await?;
+            let (result, elapsed, final_output) = running.finish().await;
+            self.renderer.bash_output(&final_output)?;
             self.persist_bash_result(
                 batch[index].call_id,
                 exec.call,
@@ -1186,34 +1178,15 @@ impl<'a> AgentLoop<'a> {
         Ok(executions.len())
     }
 
-    async fn stream_running_bash(&mut self, exec: &mut ConcurrentBashExecution<'_>) -> Result<()> {
+    async fn stream_running_bash(&mut self, running: &RunningBash) -> Result<()> {
         loop {
-            let (snapshot, finished) = if let Some(running) = exec.running.as_ref() {
-                (running.snapshot_output(), running.is_finished())
-            } else {
-                (String::new(), false)
-            };
-            self.flush_buffered_bash_output(exec, &snapshot)?;
-            if finished {
+            self.renderer.bash_output(&running.drain_output())?;
+            if running.is_finished() {
                 break;
             }
             sleep(Duration::from_millis(25)).await;
         }
         Ok(())
-    }
-
-    fn flush_buffered_bash_output(
-        &mut self,
-        exec: &mut ConcurrentBashExecution<'_>,
-        snapshot: &str,
-    ) -> Result<bool> {
-        if snapshot.len() <= exec.streamed_len {
-            return Ok(false);
-        }
-        let next = snapshot[exec.streamed_len..].to_string();
-        exec.streamed_len = snapshot.len();
-        self.renderer.bash_output(&next)?;
-        Ok(true)
     }
 }
 
@@ -2217,10 +2190,11 @@ mod tests {
             match current {
                 0 => {
                     let first_command = format!(
-                        "while [ ! -f '{}' ]; do sleep 0.05; done; printf first",
+                        "printf 'first-%s\\n' begin; while [ ! -f '{}' ]; do sleep 0.05; done; sleep 0.1; printf 'first-%s\\n' end",
                         self.barrier_path
                     );
-                    let second_command = format!("touch '{}'; printf second", self.barrier_path);
+                    let second_command =
+                        format!("printf 'second-%s\\n' done; touch '{}'", self.barrier_path);
                     Ok(StreamResult {
                         message: Message::assistant(
                             None,
@@ -2949,7 +2923,12 @@ mod tests {
             step: Mutex::new(0),
             barrier_path: tmp.join("second-started").display().to_string(),
         });
-        let mut renderer = Renderer::with_format(OutputFormat::Detail);
+        let transcript_path = tmp.join("transcript");
+        let mut renderer = Renderer::with_transcript_output(
+            OutputFormat::Full,
+            Box::new(std::fs::File::create_new(&transcript_path).unwrap()),
+            200,
+        );
         let mut agent = AgentLoop {
             config: &config,
             system_prompt_source: SystemPromptSource::fixed("refreshed system prompt"),
@@ -2980,9 +2959,15 @@ mod tests {
             .collect();
         assert_eq!(tool_messages.len(), 2);
         assert_eq!(tool_messages[0].0, "call_first");
-        assert!(tool_messages[0].1.contains("first"));
+        assert_eq!(tool_messages[0].1, "first-begin\nfirst-end\n[exit code: 0]");
         assert_eq!(tool_messages[1].0, "call_second");
-        assert!(tool_messages[1].1.contains("second"));
+        assert_eq!(tool_messages[1].1, "second-done\n[exit code: 0]");
+        let transcript = std::fs::read_to_string(transcript_path).unwrap();
+        for text in ["first-begin", "first-end", "second-done"] {
+            assert_eq!(transcript.matches(text).count(), 1, "{transcript}");
+        }
+        assert!(transcript.find("first-begin").unwrap() < transcript.find("first-end").unwrap());
+        assert!(transcript.find("first-end").unwrap() < transcript.find("second-done").unwrap());
         let _ = std::fs::remove_dir_all(tmp);
     }
 
