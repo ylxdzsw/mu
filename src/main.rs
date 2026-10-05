@@ -1256,6 +1256,8 @@ async fn run_turn(args: RunTurnArgs<'_>) -> Result<()> {
         renderer: &mut renderer,
     };
 
+    bash::reset_cancellation_state();
+    bash::install_signal_forwarder(config.soft_interrupt);
     let result = match mode {
         RunTurnMode::QueuedPrompt => agent.run_queued_turn().await,
         RunTurnMode::Resume => agent.resume_turn().await,

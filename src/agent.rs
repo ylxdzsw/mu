@@ -206,8 +206,6 @@ impl<'a> AgentLoop<'a> {
         current_partial_output: &mut String,
         mut next_request: NextRequest,
     ) -> Result<TurnResult> {
-        bash::reset_cancellation_state();
-        bash::install_signal_forwarder(self.config.soft_interrupt);
         let mut context = self.load_context()?;
         let mut active_compaction =
             self.store
@@ -2329,6 +2327,11 @@ mod tests {
         }
     }
 
+    fn init_test_signals(config: &Config) {
+        bash::reset_cancellation_state();
+        bash::install_signal_forwarder(config.soft_interrupt);
+    }
+
     fn test_config() -> Config {
         Config {
             providers: crate::config::OrderedMap::from_iter([(
@@ -2396,6 +2399,7 @@ mod tests {
             renderer: &mut renderer,
         };
 
+        init_test_signals(agent.config);
         let result = agent.run_turn().await.unwrap();
 
         // The transient provider error was retried in-process without adding a
@@ -2467,6 +2471,7 @@ mod tests {
             renderer: &mut renderer,
         };
 
+        init_test_signals(agent.config);
         let result = agent.run_turn().await.unwrap();
 
         assert_eq!(result.final_assistant.as_deref(), Some("done"));
@@ -2525,6 +2530,7 @@ mod tests {
             renderer: &mut renderer,
         };
 
+        init_test_signals(agent.config);
         let result = agent.run_turn().await.unwrap();
 
         assert_eq!(result.final_assistant.as_deref(), Some("done"));
@@ -2578,6 +2584,7 @@ mod tests {
             renderer: &mut renderer,
         };
 
+        init_test_signals(agent.config);
         let error = match agent.run_turn().await {
             Ok(_) => panic!("auto-resume should exhaust its retry quota"),
             Err(error) => error,
@@ -2613,6 +2620,7 @@ mod tests {
             renderer: &mut renderer,
         };
 
+        init_test_signals(retry.config);
         let result = retry.resume_turn().await.unwrap();
 
         assert_eq!(result.final_assistant.as_deref(), Some("done"));
@@ -2680,6 +2688,7 @@ mod tests {
             renderer: &mut renderer,
         };
 
+        init_test_signals(agent.config);
         let result = agent.run_turn().await.unwrap();
         server.join().unwrap();
 
@@ -2797,6 +2806,7 @@ mod tests {
                     model_context_window: None,
                     renderer: &mut renderer,
                 };
+                init_test_signals(agent.config);
                 let result = if manual {
                     agent.run_manual_compaction(None).await
                 } else {
@@ -2826,6 +2836,7 @@ mod tests {
                         !last_is_user
                     );
                     if failures != 1 {
+                        init_test_signals(agent.config);
                         assert!(agent.resume_turn().await.is_err());
                         let requests = seen.lock().unwrap();
                         assert_eq!(requests.len(), count + 1);
@@ -2904,6 +2915,7 @@ mod tests {
             renderer: &mut renderer,
         };
 
+        init_test_signals(agent.config);
         assert!(agent.run_turn().await.is_err());
         assert_eq!(*counts.lock().unwrap(), (2, 0));
     }
@@ -2949,6 +2961,7 @@ mod tests {
             renderer: &mut renderer,
         };
 
+        init_test_signals(agent.config);
         let result = agent.run_turn().await.unwrap();
 
         assert_eq!(result.final_assistant.as_deref(), Some("done"));
@@ -3013,6 +3026,7 @@ mod tests {
             renderer: &mut renderer,
         };
 
+        init_test_signals(agent.config);
         let result = agent.run_turn().await.unwrap();
 
         assert_eq!(result.final_assistant.as_deref(), Some("recovered"));
@@ -3098,6 +3112,7 @@ mod tests {
             renderer: &mut renderer,
         };
 
+        init_test_signals(agent.config);
         let result = agent.resume_turn().await.unwrap();
         assert_eq!(result.final_assistant.as_deref(), Some("done"));
         assert!(seen.lock().unwrap()[0].iter().any(|message| {
@@ -3162,6 +3177,7 @@ mod tests {
             renderer: &mut renderer,
         };
 
+        init_test_signals(agent.config);
         let trapped = agent.run_turn().await.unwrap();
         assert!(trapped.trapped);
         assert_eq!(trapped.pending_bash_calls, 1);
@@ -3192,6 +3208,7 @@ mod tests {
             model_context_window: None,
             renderer: &mut renderer,
         };
+        init_test_signals(same_policy_retry.config);
         let trapped_again = same_policy_retry.resume_turn().await.unwrap();
         assert!(trapped_again.trapped);
         assert_eq!(*step.lock().unwrap(), 1);
@@ -3212,6 +3229,7 @@ mod tests {
             model_context_window: None,
             renderer: &mut renderer,
         };
+        init_test_signals(retry.config);
         let completed = retry.resume_turn().await.unwrap();
         assert_eq!(completed.final_assistant.as_deref(), Some("done"));
         assert!(marker.exists());
@@ -3240,7 +3258,9 @@ mod tests {
         turn_step: Mutex<usize>,
     }
 
-    struct BoundaryCompactionProvider;
+    struct BoundaryCompactionProvider {
+        interrupt: bool,
+    }
 
     #[async_trait(?Send)]
     impl Provider for BoundaryCompactionProvider {
@@ -3249,6 +3269,9 @@ mod tests {
             request: &Request,
             _on_event: &mut dyn FnMut(crate::provider::StreamEvent) -> Result<(), ProviderError>,
         ) -> Result<StreamResult, ProviderError> {
+            if self.interrupt {
+                assert_eq!(unsafe { libc::raise(libc::SIGQUIT) }, 0);
+            }
             let summarizing = request.messages.iter().any(|message| {
                 matches!(
                     message,
@@ -3433,6 +3456,7 @@ mod tests {
             renderer: &mut renderer,
         };
 
+        init_test_signals(agent.config);
         let result = agent.run_turn().await.unwrap();
 
         // Proactive compaction ran mid-turn and produced a summary row.
@@ -3488,6 +3512,7 @@ mod tests {
         let store = Store::open_memory().unwrap();
         let mut config = test_config();
         config.compaction.soft_fraction = 0.01;
+        config.soft_interrupt = true;
         let request_model = crate::models::resolve_model_ref(&config, "test/fake-model").unwrap();
 
         let new_turn_session = store.create_session_seeded("system").unwrap();
@@ -3497,7 +3522,7 @@ mod tests {
             config: &config,
             system_prompt_source: SystemPromptSource::fixed("refreshed system prompt"),
             model: ResolvedModelChoice::fixed(request_model.clone()),
-            provider: Box::new(BoundaryCompactionProvider),
+            provider: Box::new(BoundaryCompactionProvider { interrupt: true }),
             store: &store,
             session_id: &new_turn_session.id,
             model_context_window: Some(200_000),
@@ -3513,15 +3538,39 @@ mod tests {
                 bash::TrapLevel::Destructive,
             )
             .unwrap();
-        let result = new_turn_agent.run_queued_turn().await.unwrap();
-        assert_eq!(result.final_assistant.as_deref(), Some("done"));
-        assert_eq!(result.usage.total_tokens, 30);
+        let before = store.audit_events(&new_turn_session.id).unwrap().len();
+        init_test_signals(new_turn_agent.config);
+        let compacted = new_turn_agent.run_queued_turn().await.unwrap();
+        assert!(compacted.soft_interrupted);
+        assert!(compacted.final_assistant.is_none());
+        assert_eq!(compacted.usage.total_tokens, 15);
+        assert!(!store.is_session_clean(&new_turn_session.id).unwrap());
+        assert_eq!(
+            store
+                .audit_events(&new_turn_session.id)
+                .unwrap()
+                .iter()
+                .skip(before)
+                .filter(|event| event["type"] == "provider_requested")
+                .count(),
+            1
+        );
         assert!(
             store
                 .latest_summary_sequence(&new_turn_session.id)
                 .unwrap()
                 .is_some()
         );
+
+        // A new invocation can proceed; a soft interrupt during its final
+        // user response is consumed as normal completion.
+        init_test_signals(new_turn_agent.config);
+        let result = new_turn_agent.resume_turn().await.unwrap();
+        assert!(bash::soft_interrupt_requested());
+        assert!(!result.soft_interrupted);
+        assert_eq!(result.final_assistant.as_deref(), Some("done"));
+        assert_eq!(compacted.usage.total_tokens + result.usage.total_tokens, 30);
+        assert!(store.is_session_clean(&new_turn_session.id).unwrap());
 
         let retry_session = store.create_session_seeded("system").unwrap();
         seed_history(&store, &retry_session.id);
@@ -3530,12 +3579,13 @@ mod tests {
             config: &config,
             system_prompt_source: SystemPromptSource::fixed("refreshed system prompt"),
             model: ResolvedModelChoice::fixed(request_model.clone()),
-            provider: Box::new(BoundaryCompactionProvider),
+            provider: Box::new(BoundaryCompactionProvider { interrupt: false }),
             store: &store,
             session_id: &retry_session.id,
             model_context_window: Some(200_000),
             renderer: &mut renderer,
         };
+        init_test_signals(retry_agent.config);
         retry_agent.resume_turn().await.unwrap();
         assert_eq!(
             store.latest_summary_sequence(&retry_session.id).unwrap(),
@@ -3550,7 +3600,9 @@ mod tests {
             (CompactionMode::AwaitUser, true),
             (CompactionMode::ContinueTurn, false),
         ] {
-            for durable_summary in [false, true] {
+            for (durable_summary, interrupt) in
+                [(false, false), (true, false), (false, true), (true, true)]
+            {
                 let store = Store::open_memory().unwrap();
                 let session = store.create_session_seeded("system").unwrap();
                 store
@@ -3575,14 +3627,15 @@ mod tests {
                         )
                         .unwrap();
                 }
-                let config = test_config();
+                let mut config = test_config();
+                config.soft_interrupt = true;
                 let model = crate::models::resolve_model_ref(&config, "test/fake-model").unwrap();
                 let mut renderer = Renderer::with_format(OutputFormat::Final);
                 let mut agent = AgentLoop {
                     config: &config,
                     system_prompt_source: SystemPromptSource::fixed("refreshed system prompt"),
                     model: ResolvedModelChoice::fixed(model),
-                    provider: Box::new(BoundaryCompactionProvider),
+                    provider: Box::new(BoundaryCompactionProvider { interrupt }),
                     store: &store,
                     session_id: &session.id,
                     model_context_window: None,
@@ -3601,16 +3654,25 @@ mod tests {
                 }
                 let before = store.audit_events(&session.id).unwrap().len();
 
+                init_test_signals(agent.config);
+                if durable_summary && interrupt {
+                    assert_eq!(unsafe { libc::raise(libc::SIGQUIT) }, 0);
+                }
                 let result = agent.resume_turn().await.unwrap();
 
                 let awaiting_user = mode == CompactionMode::AwaitUser && !queued;
+                let soft_interrupted = interrupt && !awaiting_user;
                 assert_eq!(result.awaiting_user, awaiting_user);
                 assert_eq!(
                     result.final_assistant.as_deref(),
-                    (!awaiting_user).then_some("done")
+                    (!awaiting_user && !interrupt).then_some("done")
                 );
-                assert!(!result.soft_interrupted && !result.trapped);
-                assert!(store.is_session_clean(&session.id).unwrap());
+                assert_eq!(result.soft_interrupted, soft_interrupted);
+                assert!(!result.trapped);
+                assert_eq!(
+                    store.is_session_clean(&session.id).unwrap(),
+                    !soft_interrupted
+                );
                 assert!(store.queued_prompt(&session.id).unwrap().is_none());
                 assert!(store.pending_compaction(&session.id).unwrap().is_none());
                 assert_eq!(store.context_epoch(&session.id).unwrap(), 1);
@@ -3624,7 +3686,7 @@ mod tests {
                     Message::User { content } if content.text() == compaction::checkpoint("summary", mode, 1)
                 ));
 
-                let calls = u64::from(!durable_summary) + u64::from(!awaiting_user);
+                let calls = u64::from(!durable_summary) + u64::from(!awaiting_user && !interrupt);
                 assert_eq!(result.usage.input_tokens, 10 * calls);
                 assert_eq!(result.usage.cache_read_input_tokens, 2 * calls);
                 assert_eq!(
@@ -3635,6 +3697,13 @@ mod tests {
                 assert_eq!(result.usage.reasoning_output_tokens, calls);
                 assert_eq!(result.usage.total_tokens, 15 * calls);
                 let audit = store.audit_events(&session.id).unwrap();
+                assert_eq!(
+                    audit
+                        .iter()
+                        .filter(|event| event["type"] == "compaction_applied")
+                        .count(),
+                    1
+                );
                 let requests = audit[before..]
                     .iter()
                     .filter(|event| event["type"] == "provider_requested")
@@ -3663,6 +3732,7 @@ mod tests {
                 }
             }
         }
+        bash::reset_cancellation_state();
     }
 
     /// Two model calls in one turn: a `readonly` bash call, then a stop. Each
@@ -3760,6 +3830,7 @@ mod tests {
             renderer: &mut renderer,
         };
 
+        init_test_signals(agent.config);
         let result = agent.run_turn().await.unwrap();
 
         // input/output are summed across both calls; total_tokens is now also
@@ -3851,6 +3922,7 @@ mod tests {
             renderer: &mut renderer,
         };
 
+        init_test_signals(agent.config);
         let result = agent.run_turn().await.unwrap();
 
         // A `length` finish still surfaces the streamed assistant text to
