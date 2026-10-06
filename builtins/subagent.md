@@ -12,10 +12,16 @@ Subagents are ordinary `mu` processes. They run in fresh sessions by default.
 Read [the Mu CLI reference](cli.md) before invoking one; this skill adds the
 delegation-specific conventions.
 
-## Synchronous Delegation
+Choose the output mode to suit the task:
 
-Use `--output final` for normal subagent calls. It prints only the final
-assistant message on success, which keeps the parent context small.
+- `-o final` (or `--output final`) prints only the final assistant message on
+  success. Use it when only the result matters, keeping the parent context small.
+- `-o concise` (or `--output concise`) streams assistant text, notices, and
+  compact tool outcomes. Use it for long-running tasks where progress visibility
+  matters. With async delegation, the caller can inspect the log while the
+  subagent runs; `final` suppresses that progress output.
+
+## Synchronous Delegation
 
 Increase the outer bash timeout to at least 30 minutes; subagent calls usually need
 longer than normal shell probes.
@@ -66,20 +72,69 @@ The parent should check the child exit status before trusting the answer.
 
 ## Asynchronous Delegation
 
-Async delegation is a background task whose command is `mu --output final`.
-Pass the prompt through the bash tool's `stdin` field and launch it with:
+Async delegation runs Mu as a background task. This example uses
+`--output concise` so the caller can monitor progress. Create a session explicitly so it
+can be steered later. Pass the prompt through the bash tool's `stdin` field and
+launch it with:
 
 ```bash
+session=$(mu new) || exit
 log=$(mktemp "${TMPDIR:-/tmp}/mu-bg.XXXXXX")
-setsid mu --output final <&0 >"$log" 2>&1 & sid=$!
-printf 'sid=%s start=%s log=%s\n' "$sid" "$(LC_ALL=C ps -o lstart= -p "$sid")" "$log"
+setsid mu --session "$session" --output concise <&0 >"$log" 2>&1 & sid=$!
+printf 'session=%s sid=%s start=%s log=%s\n' "$session" "$sid" "$(LC_ALL=C ps -o lstart= -p "$sid")" "$log"
 ```
 
 The explicit `<&0` gives the background command the tool-provided stdin. Use
 the `background-task` skill to inspect or stop it, then read the log after it
-disappears. This is one-shot delegation: its exit status and Mu session id are
-not retained. Files needed by the parent must be saved at reported paths and
-inspected from a later foreground call.
+finishes. Its exit status is not retained. Files needed by the parent must
+be saved at reported paths and inspected from a later foreground call.
+
+While it runs, check progress in a later tool call using the recorded log path:
+
+```bash
+tail -n 200 /tmp/mu-bg.ABCDEF
+```
+
+### Common Operations
+
+Substitute the recorded process SID, Mu session id, and log path in these
+examples; shell variables do not persist between tool calls. Before signaling,
+inspect the process and verify its PID equals SID, start time matches, and
+command is expected:
+
+```bash
+LC_ALL=C ps -o pid=,sid=,lstart=,command= -p 12345
+```
+
+1. **Interruption:** send `SIGINT` to the Mu process to cancel active work.
+   For session-wide cleanup or escalation, follow `background-task`.
+
+   ```bash
+   kill -INT 12345
+   ```
+
+2. **Steering:** interrupt the mu process, then run the same Mu
+   session with a new prompt. Use the original working directory and explicit
+   session id, not `--continue`, which another agent may have changed.
+
+   To keep the steered turn asynchronous, reuse the launch recipe with the recorded
+   session id instead of calling `mu new`.
+
+3. **Wait:** poll the process in a Bash loop, with a timeout on the tool call.
+
+   ```ts
+   bash({
+     title: "Wait for async subagent",
+     risk: "readonly",
+     command: "while kill -0 12345 2>/dev/null; do sleep 2; done; cat /tmp/mu-bg.ABCDEF",
+     cwd: "/root/mu",
+     timeout: 1800
+   })
+   ```
+
+   A timeout stops only the polling call, not the detached subagent. Inspect
+   it again before waiting longer or interrupting it. Process exit alone does
+   not establish success; inspect the log and any reported artifacts.
 
 ## Parent Responsibilities
 
