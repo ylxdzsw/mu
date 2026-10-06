@@ -692,50 +692,9 @@ fn merge_json(base: &mut serde_json::Value, overlay: serde_json::Value) {
 const DEFAULT_CONFIG: &str = include_str!("default_config.jsonc");
 
 #[cfg(test)]
-pub(crate) fn bundled_test_default<T>(pointer: &str) -> T
-where
-    T: serde::de::DeserializeOwned,
-{
-    let (value, _) = parse_config_source(
-        DEFAULT_CONFIG,
-        "bundled default config",
-        ConfigLoadMode::Runtime,
-    )
-    .expect("valid defaults");
-    serde_json::from_value(
-        value
-            .pointer(pointer)
-            .unwrap_or_else(|| panic!("missing bundled default at {pointer}"))
-            .clone(),
-    )
-    .unwrap_or_else(|error| panic!("invalid bundled default at {pointer}: {error}"))
-}
-
-#[cfg(test)]
-impl Default for CompactionConfig {
+impl Default for Config {
     fn default() -> Self {
-        bundled_test_default("/compaction")
-    }
-}
-
-#[cfg(test)]
-impl Default for LimitsConfig {
-    fn default() -> Self {
-        bundled_test_default("/limits")
-    }
-}
-
-#[cfg(test)]
-impl Default for TerminalBellConfig {
-    fn default() -> Self {
-        bundled_test_default("/terminal_bell")
-    }
-}
-
-#[cfg(test)]
-impl Default for RedactionConfig {
-    fn default() -> Self {
-        bundled_test_default("/redaction")
+        deserialize_config(serde_json::json!({}), false).unwrap()
     }
 }
 

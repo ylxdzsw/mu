@@ -1389,13 +1389,8 @@ fn next_event_boundary(buffer: &str) -> Option<(usize, usize)> {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
-
     use super::*;
-    use crate::config::{
-        CompactionConfig, LimitsConfig, ModelConfig, OrderedMap, ProviderConfig, RedactionConfig,
-        TerminalBellConfig,
-    };
+    use crate::config::{ModelConfig, OrderedMap, ProviderConfig};
     use crate::models::ResolvedModelRef;
 
     #[test]
@@ -1497,12 +1492,7 @@ mod tests {
             output: Default::default(),
             trap: crate::bash::TrapLevel::Off,
             auto_resume: false,
-            soft_interrupt: crate::config::bundled_test_default("/soft_interrupt"),
-            compaction: CompactionConfig::default(),
-            limits: LimitsConfig::default(),
-            terminal_bell: TerminalBellConfig::default(),
-            redaction: RedactionConfig::default(),
-            env: HashMap::new(),
+            ..Config::default()
         }
     }
 

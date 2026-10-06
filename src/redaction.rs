@@ -182,9 +182,7 @@ impl SecretRedactor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{
-        CompactionConfig, Config, LimitsConfig, OrderedMap, ProviderConfig, RedactionConfig,
-    };
+    use crate::config::{Config, OrderedMap, ProviderConfig, RedactionConfig};
 
     fn config(env: &[(&str, &str)], redaction_env: &[&str]) -> Config {
         Config {
@@ -199,10 +197,6 @@ mod tests {
             output: Default::default(),
             trap: crate::bash::TrapLevel::Off,
             auto_resume: false,
-            soft_interrupt: crate::config::bundled_test_default("/soft_interrupt"),
-            compaction: CompactionConfig::default(),
-            limits: LimitsConfig::default(),
-            terminal_bell: crate::config::TerminalBellConfig::default(),
             redaction: RedactionConfig {
                 env: redaction_env.iter().map(|name| name.to_string()).collect(),
             },
@@ -210,6 +204,7 @@ mod tests {
                 .iter()
                 .map(|(key, value)| (key.to_string(), value.to_string()))
                 .collect(),
+            ..Config::default()
         }
     }
 

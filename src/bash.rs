@@ -886,7 +886,7 @@ mod tests {
         model_failure_output, run_bash, truncate_bash_output,
     };
     use crate::config::EnvMap;
-    use crate::config::{CompactionConfig, Config, LimitsConfig, ProviderConfig, RedactionConfig};
+    use crate::config::{Config, LimitsConfig, ProviderConfig, RedactionConfig};
     use crate::redaction::SecretRedactor;
     use crate::renderer::Renderer;
 
@@ -946,10 +946,6 @@ mod tests {
             output: Default::default(),
             trap: crate::bash::TrapLevel::Off,
             auto_resume: false,
-            soft_interrupt: crate::config::bundled_test_default("/soft_interrupt"),
-            compaction: CompactionConfig::default(),
-            limits: LimitsConfig::default(),
-            terminal_bell: crate::config::TerminalBellConfig::default(),
             redaction: RedactionConfig {
                 env: redaction_env.iter().map(|name| name.to_string()).collect(),
             },
@@ -957,6 +953,7 @@ mod tests {
                 .iter()
                 .map(|(key, value)| (key.to_string(), value.to_string()))
                 .collect(),
+            ..Config::default()
         }
     }
 

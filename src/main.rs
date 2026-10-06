@@ -1362,35 +1362,10 @@ fn session_listing_title(title: Option<&str>) -> String {
 #[cfg(test)]
 mod tests {
     use std::io::Cursor;
-    use std::sync::{Arc, Mutex};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::*;
-
-    #[derive(Clone, Default)]
-    struct TranscriptBuffer(Arc<Mutex<Vec<u8>>>);
-
-    impl TranscriptBuffer {
-        fn text(&self) -> Result<String> {
-            Ok(String::from_utf8(
-                self.0.lock().expect("transcript buffer poisoned").clone(),
-            )?)
-        }
-    }
-
-    impl Write for TranscriptBuffer {
-        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-            self.0
-                .lock()
-                .expect("transcript buffer poisoned")
-                .extend_from_slice(buf);
-            Ok(buf.len())
-        }
-
-        fn flush(&mut self) -> io::Result<()> {
-            Ok(())
-        }
-    }
+    use crate::renderer::SharedOutput;
 
     fn temp_file_path(name: &str) -> PathBuf {
         let nanos = SystemTime::now()
@@ -1659,14 +1634,14 @@ mod tests {
                 internal: false,
             },
         ];
-        let buffer = TranscriptBuffer::default();
+        let buffer = SharedOutput::default();
         let mut renderer =
             Renderer::with_transcript_output(OutputFormat::Final, Box::new(buffer.clone()), 79);
 
         replay_transcript(&mut renderer, &events, OutputFormat::Final, |_| Some(100)).unwrap();
 
         assert_eq!(
-            buffer.text().unwrap(),
+            buffer.transcript(),
             "test/model ~42% /work\nmu> Question\n\nFinal answer\n"
         );
     }
@@ -1702,13 +1677,13 @@ mod tests {
             },
         ];
         for output in [OutputFormat::Detail, OutputFormat::Full] {
-            let buffer = TranscriptBuffer::default();
+            let buffer = SharedOutput::default();
             let mut renderer =
                 Renderer::with_transcript_output(output, Box::new(buffer.clone()), 79);
 
             replay_transcript(&mut renderer, &events, output, |_| None).unwrap();
 
-            let transcript = buffer.text().unwrap();
+            let transcript = buffer.transcript();
             assert_eq!(transcript.matches("✓ exit 0").count(), 1, "{transcript:?}");
             assert!(!transcript.contains("[exit code: 0]"), "{transcript:?}");
             assert!(transcript.contains("Running "));

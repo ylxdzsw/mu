@@ -2165,7 +2165,7 @@ impl Store {
         native_response: Option<&Value>,
         usage: Option<&Usage>,
     ) -> Result<(i64, Vec<i64>)> {
-        self.complete_assistant_exchange_inner(
+        self.complete_assistant_exchange_record(
             session_id,
             exchange_id,
             AssistantCompletion {
@@ -2188,7 +2188,7 @@ impl Store {
         native_response: Option<&Value>,
         usage: Option<&Usage>,
     ) -> Result<(i64, Vec<i64>)> {
-        self.complete_assistant_exchange_inner(
+        self.complete_assistant_exchange_record(
             session_id,
             exchange_id,
             AssistantCompletion {
@@ -2203,15 +2203,6 @@ impl Store {
     }
 
     pub(crate) fn complete_assistant_exchange_record(
-        &self,
-        session_id: &str,
-        exchange_id: &str,
-        completion: AssistantCompletion<'_>,
-    ) -> Result<(i64, Vec<i64>)> {
-        self.complete_assistant_exchange_inner(session_id, exchange_id, completion)
-    }
-
-    fn complete_assistant_exchange_inner(
         &self,
         session_id: &str,
         exchange_id: &str,
@@ -4048,10 +4039,7 @@ fn canonical_json(value: &Value) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{
-        CompactionConfig, LimitsConfig, ModelConfig, OrderedMap, ProviderConfig, RedactionConfig,
-        TerminalBellConfig,
-    };
+    use crate::config::{ModelConfig, OrderedMap, ProviderConfig};
     use crate::provider::{Message, NativeReplayPayload};
 
     fn test_session() -> (Store, Session) {
@@ -4081,12 +4069,7 @@ mod tests {
             output: Default::default(),
             trap: crate::bash::TrapLevel::Off,
             auto_resume: false,
-            soft_interrupt: crate::config::bundled_test_default("/soft_interrupt"),
-            compaction: CompactionConfig::default(),
-            limits: LimitsConfig::default(),
-            terminal_bell: TerminalBellConfig::default(),
-            redaction: RedactionConfig::default(),
-            env: Default::default(),
+            ..Config::default()
         }
     }
 

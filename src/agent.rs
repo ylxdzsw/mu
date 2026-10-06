@@ -1687,14 +1687,11 @@ fn stream_all(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
 
     use super::*;
     use crate::OutputFormat;
-    use crate::config::{
-        CompactionConfig, LimitsConfig, ProviderConfig, RedactionConfig, TerminalBellConfig,
-    };
+    use crate::config::ProviderConfig;
     use crate::provider::{FinishReason, ProviderError, StreamResult, Usage, UserContent};
     use async_trait::async_trait;
 
@@ -2043,9 +2040,9 @@ mod tests {
                         ),
                         finish_reason: FinishReason::ToolCalls,
                         usage: Some(Usage {
-                            input_tokens: 1,
-                            output_tokens: 1,
-                            total_tokens: 2,
+                            input_tokens: 100,
+                            output_tokens: 20,
+                            total_tokens: 120,
                             ..Usage::default()
                         }),
                         native_response: None,
@@ -2055,9 +2052,9 @@ mod tests {
                     message: Message::assistant(Some("done".into()), None, None, None),
                     finish_reason: FinishReason::Stop,
                     usage: Some(Usage {
-                        input_tokens: 1,
-                        output_tokens: 1,
-                        total_tokens: 2,
+                        input_tokens: 130,
+                        output_tokens: 10,
+                        total_tokens: 140,
                         ..Usage::default()
                     }),
                     native_response: None,
@@ -2144,12 +2141,7 @@ mod tests {
             output: Default::default(),
             trap: bash::TrapLevel::Off,
             auto_resume: false,
-            soft_interrupt: crate::config::bundled_test_default("/soft_interrupt"),
-            compaction: CompactionConfig::default(),
-            limits: LimitsConfig::default(),
-            terminal_bell: TerminalBellConfig::default(),
-            redaction: RedactionConfig::default(),
-            env: HashMap::new(),
+            ..Config::default()
         }
     }
 
@@ -2161,20 +2153,7 @@ mod tests {
         let config = test_config();
         let request_model = crate::models::resolve_model_ref(&config, "test/fake-model").unwrap();
         store
-            .append_message(
-                &session.id,
-                &Message::System {
-                    content: "system".into(),
-                },
-            )
-            .unwrap();
-        store
-            .append_message(
-                &session.id,
-                &Message::User {
-                    content: UserContent::Text("retry me".into()),
-                },
-            )
+            .start_turn(&session.id, "/tmp", None, &"retry me".into())
             .unwrap();
         let provider = Box::new(RetryThenStopProvider {
             step: Mutex::new(0),
@@ -2680,12 +2659,7 @@ mod tests {
         let session = store.create_session_seeded("system").unwrap();
         for index in 0..5 {
             store
-                .append_message(
-                    &session.id,
-                    &Message::User {
-                        content: UserContent::Text(format!("user {index}")),
-                    },
-                )
+                .start_turn(&session.id, "/tmp", None, &format!("user {index}").into())
                 .unwrap();
             store
                 .append_message(
@@ -2695,12 +2669,7 @@ mod tests {
                 .unwrap();
         }
         store
-            .append_message(
-                &session.id,
-                &Message::User {
-                    content: UserContent::Text("current".into()),
-                },
-            )
+            .start_turn(&session.id, "/tmp", None, &"current".into())
             .unwrap();
         let config = test_config();
         let request_model = crate::models::resolve_model_ref(&config, "test/fake-model").unwrap();
@@ -2733,20 +2702,7 @@ mod tests {
         let config = test_config();
         let request_model = crate::models::resolve_model_ref(&config, "test/fake-model").unwrap();
         store
-            .append_message(
-                &session.id,
-                &Message::System {
-                    content: "system".into(),
-                },
-            )
-            .unwrap();
-        store
-            .append_message(
-                &session.id,
-                &Message::User {
-                    content: UserContent::Text("run both".into()),
-                },
-            )
+            .start_turn(&session.id, "/tmp", None, &"run both".into())
             .unwrap();
         let provider = Box::new(TwoReadonlyThenStopProvider {
             step: Mutex::new(0),
@@ -2770,6 +2726,14 @@ mod tests {
 
         init_test_signals(agent.config);
         let result = agent.run_turn().await.unwrap();
+
+        // Turn usage accumulates; context fullness uses the final response.
+        assert_eq!(result.usage.input_tokens, 230);
+        assert_eq!(result.usage.output_tokens, 30);
+        assert_eq!(result.usage.total_tokens, 260);
+        assert!(result.usage.total_tokens >= result.usage.input_tokens);
+        assert_eq!(result.context_tokens, 140);
+        assert!(!result.context_estimated);
 
         assert_eq!(result.final_assistant.as_deref(), Some("done"));
         let tool_messages: Vec<_> = store
@@ -2809,20 +2773,7 @@ mod tests {
         let config = test_config();
         let request_model = crate::models::resolve_model_ref(&config, "test/fake-model").unwrap();
         store
-            .append_message(
-                &session.id,
-                &Message::System {
-                    content: "system".into(),
-                },
-            )
-            .unwrap();
-        store
-            .append_message(
-                &session.id,
-                &Message::User {
-                    content: UserContent::Text("run both".into()),
-                },
-            )
+            .start_turn(&session.id, "/tmp", None, &"run both".into())
             .unwrap();
         let provider = Box::new(InvalidReadonlyThenStopProvider {
             step: Mutex::new(0),
@@ -3205,25 +3156,12 @@ mod tests {
             .unwrap()
             .context_window = Some(200_000);
         let request_model = crate::models::resolve_model_ref(&config, "test/fake-model").unwrap();
-        store
-            .append_message(
-                &session.id,
-                &Message::System {
-                    content: "system".into(),
-                },
-            )
-            .unwrap();
 
         // Small prior history so the soft turn-boundary check does NOT compact; the huge
         // tool result produced mid-turn is what should push us over.
         for turn in ["one", "two", "three", "four"] {
             store
-                .append_message(
-                    &session.id,
-                    &Message::User {
-                        content: UserContent::Text(format!("turn {turn}")),
-                    },
-                )
+                .start_turn(&session.id, "/tmp", None, &format!("turn {turn}").into())
                 .unwrap();
             store
                 .append_message(
@@ -3233,12 +3171,7 @@ mod tests {
                 .unwrap();
         }
         store
-            .append_message(
-                &session.id,
-                &Message::User {
-                    content: UserContent::Text("turn five".into()),
-                },
-            )
+            .start_turn(&session.id, "/tmp", None, &"turn five".into())
             .unwrap();
 
         // No summary exists yet.
@@ -3300,12 +3233,7 @@ mod tests {
                 ("turn six".into(), "reply six"),
             ] {
                 store
-                    .append_message(
-                        session_id,
-                        &Message::User {
-                            content: UserContent::Text(user),
-                        },
-                    )
+                    .start_turn(session_id, "/tmp", None, &user.into())
                     .unwrap();
                 store
                     .append_message(
@@ -3540,116 +3468,6 @@ mod tests {
         bash::reset_cancellation_state();
     }
 
-    /// Two model calls in one turn: a `readonly` bash call, then a stop. Each
-    /// call reports its own `total_tokens` so the test can distinguish the
-    /// cumulative turn total from the last-call context size.
-    struct TwoCallUsageProvider {
-        step: Mutex<usize>,
-    }
-
-    #[async_trait(?Send)]
-    impl Provider for TwoCallUsageProvider {
-        async fn stream(
-            &self,
-            _request: &Request,
-            _on_event: &mut dyn FnMut(crate::provider::StreamEvent) -> Result<(), ProviderError>,
-        ) -> Result<StreamResult, ProviderError> {
-            let mut step = self.step.lock().unwrap();
-            let current = *step;
-            *step += 1;
-            match current {
-                0 => Ok(StreamResult {
-                    message: Message::assistant(
-                        None,
-                        None,
-                        Some(vec![ToolCall {
-                            id: "call_readonly".into(),
-                            arguments: serde_json::json!({
-                                "title": "noop",
-                                "risk": "readonly",
-                                "command": "true",
-                            })
-                            .to_string(),
-                        }]),
-                        None,
-                    ),
-                    finish_reason: FinishReason::ToolCalls,
-                    usage: Some(Usage {
-                        input_tokens: 100,
-                        output_tokens: 20,
-                        total_tokens: 120,
-                        ..Usage::default()
-                    }),
-                    native_response: None,
-                }),
-                _ => Ok(StreamResult {
-                    message: Message::assistant(Some("done".into()), None, None, None),
-                    finish_reason: FinishReason::Stop,
-                    usage: Some(Usage {
-                        input_tokens: 130,
-                        output_tokens: 10,
-                        total_tokens: 140,
-                        ..Usage::default()
-                    }),
-                    native_response: None,
-                }),
-            }
-        }
-    }
-
-    #[tokio::test]
-    async fn turn_usage_is_cumulative_but_context_tokens_is_last_call() {
-        let tmp = crate::random::create_temp_dir(&std::env::temp_dir(), "mu-agent-usage-").unwrap();
-        let store = Store::open(&tmp.join("mu.db")).unwrap();
-        let session = store.create_session("/tmp").unwrap();
-        let config = test_config();
-        let request_model = crate::models::resolve_model_ref(&config, "test/fake-model").unwrap();
-        store
-            .append_message(
-                &session.id,
-                &Message::System {
-                    content: "system".into(),
-                },
-            )
-            .unwrap();
-        store
-            .append_message(
-                &session.id,
-                &Message::User {
-                    content: UserContent::Text("go".into()),
-                },
-            )
-            .unwrap();
-        let provider = Box::new(TwoCallUsageProvider {
-            step: Mutex::new(0),
-        });
-        let mut renderer = Renderer::with_format(OutputFormat::Detail);
-        let mut agent = AgentLoop {
-            config: &config,
-            system_prompt_source: SystemPromptSource::fixed("refreshed system prompt"),
-            model: ResolvedModelChoice::fixed(request_model.clone()),
-            provider,
-            store: &store,
-            session_id: &session.id,
-            renderer: &mut renderer,
-        };
-
-        init_test_signals(agent.config);
-        let result = agent.run_turn().await.unwrap();
-
-        // input/output are summed across both calls; total_tokens is now also
-        // cumulative and therefore self-consistent (>= input_tokens).
-        assert_eq!(result.usage.input_tokens, 230);
-        assert_eq!(result.usage.output_tokens, 30);
-        assert_eq!(result.usage.total_tokens, 260);
-        assert!(result.usage.total_tokens >= result.usage.input_tokens);
-        // context_tokens reflects only the final call — the current context size.
-        assert_eq!(result.context_tokens, 140);
-        assert!(!result.context_estimated);
-
-        let _ = std::fs::remove_dir_all(tmp);
-    }
-
     /// A single model call that ends on a non-`stop`, non-`tool_calls` finish
     /// reason (e.g. `length`) while carrying assistant content and a partially
     /// accumulated tool call.
@@ -3698,20 +3516,7 @@ mod tests {
         let config = test_config();
         let request_model = crate::models::resolve_model_ref(&config, "test/fake-model").unwrap();
         store
-            .append_message(
-                &session.id,
-                &Message::System {
-                    content: "system".into(),
-                },
-            )
-            .unwrap();
-        store
-            .append_message(
-                &session.id,
-                &Message::User {
-                    content: UserContent::Text("write a lot".into()),
-                },
-            )
+            .start_turn(&session.id, "/tmp", None, &"write a lot".into())
             .unwrap();
         let provider = Box::new(LengthFinishProvider);
         let mut renderer = Renderer::with_format(OutputFormat::Detail);

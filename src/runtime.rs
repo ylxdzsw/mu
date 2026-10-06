@@ -494,102 +494,46 @@ fn parse_git_status_output(output: &[u8]) -> (Option<String>, Option<bool>) {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
-
     use super::*;
-    use crate::config::{
-        CompactionConfig, Config, LimitsConfig, ModelConfig, OrderedMap, ProviderConfig,
-        RedactionConfig, TerminalBellConfig,
-    };
+    use crate::config::{Config, ModelConfig, OrderedMap, ProviderConfig};
 
     fn test_config() -> Config {
         Config {
-            providers: OrderedMap::from_iter([
+            providers: [
+                ("alpha", "chat/completions", 100, "MU_TEST_KEY"),
+                ("beta", "responses", 200, ""),
+                ("gamma", "chat/completions", 300, ""),
+            ]
+            .into_iter()
+            .map(|(id, endpoint, context_window, api_key_env)| {
                 (
-                    "alpha".into(),
+                    id.into(),
                     ProviderConfig {
-                        endpoint: "http://localhost/chat/completions".into(),
-                        api_key_env: "MU_TEST_KEY".into(),
-                        models: OrderedMap::from_iter([
-                            (
-                                "default-model".into(),
-                                ModelConfig {
-                                    context_window: Some(100),
-                                    supported_efforts: Some(vec!["low".into(), "high".into()]),
-                                    replay_key: None,
-                                },
-                            ),
-                            (
-                                "other-model".into(),
-                                ModelConfig {
-                                    context_window: Some(100),
-                                    supported_efforts: None,
-                                    replay_key: None,
-                                },
-                            ),
-                        ]),
+                        endpoint: format!("http://localhost/{endpoint}"),
+                        api_key_env: api_key_env.into(),
+                        models: ["default-model", "other-model"]
+                            .into_iter()
+                            .map(|model| {
+                                (
+                                    model.into(),
+                                    ModelConfig {
+                                        context_window: Some(context_window),
+                                        supported_efforts: (id == "alpha"
+                                            && model == "default-model")
+                                            .then(|| vec!["low".into(), "high".into()]),
+                                        replay_key: None,
+                                    },
+                                )
+                            })
+                            .collect(),
                     },
-                ),
-                (
-                    "beta".into(),
-                    ProviderConfig {
-                        endpoint: "http://localhost/responses".into(),
-                        api_key_env: String::new(),
-                        models: OrderedMap::from_iter([
-                            (
-                                "default-model".into(),
-                                ModelConfig {
-                                    context_window: Some(200),
-                                    supported_efforts: None,
-                                    replay_key: None,
-                                },
-                            ),
-                            (
-                                "other-model".into(),
-                                ModelConfig {
-                                    context_window: Some(200),
-                                    supported_efforts: None,
-                                    replay_key: None,
-                                },
-                            ),
-                        ]),
-                    },
-                ),
-                (
-                    "gamma".into(),
-                    ProviderConfig {
-                        endpoint: "http://localhost/chat/completions".into(),
-                        api_key_env: String::new(),
-                        models: OrderedMap::from_iter([
-                            (
-                                "default-model".into(),
-                                ModelConfig {
-                                    context_window: Some(300),
-                                    supported_efforts: None,
-                                    replay_key: None,
-                                },
-                            ),
-                            (
-                                "other-model".into(),
-                                ModelConfig {
-                                    context_window: Some(300),
-                                    supported_efforts: None,
-                                    replay_key: None,
-                                },
-                            ),
-                        ]),
-                    },
-                ),
-            ]),
+                )
+            })
+            .collect(),
             output: Default::default(),
             trap: crate::bash::TrapLevel::Off,
             auto_resume: false,
-            soft_interrupt: crate::config::bundled_test_default("/soft_interrupt"),
-            compaction: CompactionConfig::default(),
-            limits: LimitsConfig::default(),
-            terminal_bell: TerminalBellConfig::default(),
-            redaction: RedactionConfig::default(),
-            env: HashMap::new(),
+            ..Config::default()
         }
     }
 

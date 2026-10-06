@@ -111,7 +111,7 @@ fn stdout_terminal_width(stdout: &io::Stdout) -> Option<usize> {
 
 #[cfg(test)]
 #[derive(Clone, Default)]
-struct SharedOutput(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+pub(crate) struct SharedOutput(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
 
 #[cfg(test)]
 impl SharedOutput {
@@ -119,8 +119,8 @@ impl SharedOutput {
         self.0.lock().unwrap().extend_from_slice(text.as_bytes());
     }
 
-    fn transcript(&self) -> String {
-        String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
+    pub(crate) fn transcript(&self) -> String {
+        String::from_utf8(self.0.lock().unwrap().clone()).unwrap()
     }
 }
 
