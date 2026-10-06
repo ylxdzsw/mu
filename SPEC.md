@@ -327,6 +327,19 @@ short grace period, then sends KILL; Linux also requests a parent-death signal
 for the direct child. Ordinary calls are expected not to outlive their tool
 result.
 
+Every Bash child receives `MU_SESSION_ID`, the session ID of the agent
+executing the tool, not the scope's `current-session`. Mu sets it after the
+configured environment, overriding inherited and `.env` values without
+changing its own process environment. Nested agents set their own session ID
+when executing their tools. The variable is informational: it does not select
+a session or model, enable continuation, or change scope.
+
+Within the calling agent's scope, `mu status -s "$MU_SESSION_ID" --json`
+inspects that session, including while it is running. Its model is the current
+resolved selection, not a snapshot tied to the Bash claim. Session IDs alone
+do not support cross-scope lookup. The literal ID is not added to the seeded
+system prompt.
+
 Recursive Mu delegation is bounded by `MU_SUBAGENT_DEPTH`: management commands
 remain available, but recursive agent turns beyond one nested level are
 rejected.

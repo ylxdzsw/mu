@@ -135,6 +135,17 @@ Inspect resolved session, model, context, scope, and output state.
 `--include-git`, `--include-session-details`, `--include-models`,
 `--include-commands`, and `--include-skills` add their corresponding data.
 
+Every Bash tool call receives `MU_SESSION_ID`, identifying the agent session
+executing the tool, not the scope's `current-session`. Mu overrides inherited
+and `.env` values for the Bash child; nested agents supply their own ID to
+their tools. The variable does not implicitly select a session or model.
+
+From the calling agent's scope, inspect its running session:
+
+```bash
+mu status -s "$MU_SESSION_ID" --json
+```
+
 ### `mu context [--export | --no-context]`
 
 Without `--export`, print the assembled system prompt Mu would use.

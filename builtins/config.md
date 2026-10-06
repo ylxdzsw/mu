@@ -34,6 +34,11 @@ before filesystem root. If no project is found, `mu` uses global scope.
 - Prompt guidance: `<system_preamble>`, then `<runtime>`, then the `<skills>`
   Markdown document, then global and project `<agents_md>` blocks.
 
+Bash runtime metadata overrides the environment overlay: `MU_SESSION_ID` is
+always set to the tool-executing agent's session ID, regardless of inherited
+or `.env` values. It does not implicitly select a session or model. See the
+[`mu status` reference](cli.md) for lookup.
+
 Use project files for repository-specific behavior. Use global files for the
 user's personal defaults. Avoid editing built-ins unless the user is changing
 the installed `mu` package or this repository's shipped defaults.

@@ -55,6 +55,7 @@ impl std::error::Error for BashExecutionError {}
 
 pub struct ToolContext<'a> {
     pub config: &'a Config,
+    pub session_id: &'a str,
     pub renderer: &'a mut Renderer,
     pub attachment_manifest: Option<&'a Path>,
     pub objects_dir: Option<&'a Path>,
@@ -260,6 +261,7 @@ const KILL_GRACE: Duration = Duration::from_millis(500);
 const MAX_OUTPUT_BYTES: usize = 1024 * 1024 * 1024; // 1 GB: internal guard against unbounded output accumulation
 const REDACTION_REMINDER: &str = "[system reminder: Secret values were redacted from this bash output. Do not try to reveal, transform, encode, print, or exfiltrate secrets.]";
 pub const SUBAGENT_DEPTH_ENV: &str = "MU_SUBAGENT_DEPTH";
+pub const SESSION_ID_ENV: &str = "MU_SESSION_ID";
 pub const MAX_ACTIVE_PROCESS_GROUPS: usize = 64;
 static ACTIVE_PGIDS: [AtomicI32; MAX_ACTIVE_PROCESS_GROUPS] =
     [const { AtomicI32::new(0) }; MAX_ACTIVE_PROCESS_GROUPS];
@@ -326,6 +328,7 @@ pub fn execute(args: Value, ctx: &mut ToolContext<'_>) -> Result<ToolResult> {
     execute_bash(
         args,
         ctx.config,
+        ctx.session_id,
         ctx.renderer,
         redactor,
         attachment_context.as_ref(),
@@ -429,6 +432,7 @@ impl BashOutputTarget for BufferedBashTarget {
 pub fn start_bash_task(
     args: BashArgs,
     config: &Config,
+    session_id: &str,
     attachment_manifest: Option<&Path>,
     objects_dir: Option<&Path>,
     bash_call_id: i64,
@@ -436,6 +440,7 @@ pub fn start_bash_task(
     let redactor = SecretRedactor::from_config(config)?;
     let warnings = redactor.warnings().to_vec();
     let config = config.clone();
+    let session_id = session_id.to_string();
     let attachment_context = attachment_manifest
         .zip(objects_dir)
         .map(|(manifest, objects_dir)| AttachmentContext {
@@ -450,6 +455,7 @@ pub fn start_bash_task(
         let result = execute_bash(
             args,
             &config,
+            &session_id,
             &mut BufferedBashTarget::new(shared_for_task),
             redactor,
             attachment_context.as_ref(),
@@ -473,6 +479,7 @@ struct AttachmentContext {
 fn execute_bash(
     args: BashArgs,
     config: &Config,
+    session_id: &str,
     target: &mut impl BashOutputTarget,
     mut redactor: SecretRedactor,
     attachment_context: Option<&AttachmentContext>,
@@ -487,6 +494,7 @@ fn execute_bash(
         timeout,
         target,
         &config.env,
+        session_id,
         &mut redactor,
         attachment_context,
     )?;
@@ -510,6 +518,7 @@ fn run_bash(
     timeout_secs: u64,
     target: &mut impl BashOutputTarget,
     env: &EnvMap,
+    session_id: &str,
     redactor: &mut SecretRedactor,
     attachment_context: Option<&AttachmentContext>,
 ) -> Result<BashRunResult> {
@@ -542,6 +551,7 @@ fn run_bash(
         .current_dir(&cwd)
         .envs(env)
         .env(SUBAGENT_DEPTH_ENV, next_subagent_depth_env())
+        .env(SESSION_ID_ENV, session_id)
         .stdin(if args.stdin.is_some() {
             Stdio::piped()
         } else {
@@ -969,6 +979,7 @@ mod tests {
             5,
             &mut renderer,
             &empty_env(),
+            "test-session",
             &mut SecretRedactor::default(),
             None,
         )
@@ -983,6 +994,7 @@ mod tests {
             5,
             &mut renderer,
             &empty_env(),
+            "test-session",
             &mut SecretRedactor::default(),
             None,
         )
@@ -1005,6 +1017,7 @@ mod tests {
             5,
             &mut renderer,
             &env,
+            "test-session",
             &mut SecretRedactor::default(),
             None,
         )
@@ -1021,6 +1034,7 @@ mod tests {
             5,
             &mut renderer,
             &empty_env(),
+            "test-session",
             &mut SecretRedactor::default(),
             None,
         )
@@ -1031,6 +1045,52 @@ mod tests {
                 .output
                 .starts_with(&format!("{}:", applets.display()))
         );
+    }
+
+    #[tokio::test]
+    async fn bash_session_id_is_local_to_each_execution() {
+        let inherited = std::env::var_os(super::SESSION_ID_ENV);
+        let config = test_config(&[(super::SESSION_ID_ENV, "stale-session")], &[]);
+        let mut renderer = Renderer::new();
+        let mut ctx = ToolContext {
+            config: &config,
+            session_id: "calling-session",
+            renderer: &mut renderer,
+            attachment_manifest: None,
+            objects_dir: None,
+            bash_call_id: 0,
+        };
+        let result = super::execute(
+            json!({
+                "title": "inspect session",
+                "risk": "readonly",
+                "command": "printf '%s' \"$MU_SESSION_ID\""
+            }),
+            &mut ctx,
+        )
+        .unwrap();
+        assert_eq!(result.output, "calling-session\n[exit code: 0]");
+
+        let tasks = ["child-session", "other-session"].map(|session_id| {
+            super::start_bash_task(
+                args("printf '%s' \"$MU_SESSION_ID\""),
+                &config,
+                session_id,
+                None,
+                None,
+                0,
+            )
+            .unwrap()
+        });
+        for (task, session_id) in tasks.into_iter().zip(["child-session", "other-session"]) {
+            let (result, _, _) = task.finish().await;
+            assert_eq!(
+                result.unwrap().output,
+                format!("{session_id}\n[exit code: 0]")
+            );
+        }
+        assert_eq!(config.env[super::SESSION_ID_ENV], "stale-session");
+        assert_eq!(std::env::var_os(super::SESSION_ID_ENV), inherited);
     }
 
     #[test]
@@ -1046,6 +1106,7 @@ mod tests {
             5,
             &mut renderer,
             &empty_env(),
+            "test-session",
             &mut SecretRedactor::default(),
             Some(&context),
         )
@@ -1065,6 +1126,7 @@ mod tests {
         );
         let mut ctx = ToolContext {
             config: &config,
+            session_id: "test-session",
             renderer: &mut renderer,
             attachment_manifest: None,
             objects_dir: None,
@@ -1100,6 +1162,7 @@ mod tests {
             5,
             &mut renderer,
             &empty_env(),
+            "test-session",
             &mut SecretRedactor::default(),
             None,
         )
@@ -1138,6 +1201,7 @@ mod tests {
             5,
             &mut renderer,
             &empty_env(),
+            "test-session",
             &mut SecretRedactor::default(),
             None,
         )
@@ -1168,6 +1232,7 @@ mod tests {
             3,
             &mut renderer,
             &empty_env(),
+            "test-session",
             &mut SecretRedactor::default(),
             None,
         );

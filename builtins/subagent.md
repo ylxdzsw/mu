@@ -136,6 +136,21 @@ LC_ALL=C ps -o pid=,sid=,lstart=,command= -p 12345
    it again before waiting longer or interrupting it. Process exit alone does
    not establish success; inspect the log and any reported artifacts.
 
+## Inspecting the Calling Agent
+
+Mu injects `MU_SESSION_ID` environment variable to the bash tool, containing the
+session ID of the agent executing the tool. It can be used to query the settings,
+such as the active model, of the calling agent:
+
+```bash
+mu status -s "$MU_SESSION_ID" --json | jq -r '.model.canonical'
+```
+
+The result includes effort and fixed/floating provider selection, resolved when status runs.
+It is preferred to use this method to explicitly assign the same model for the subagents,
+if the user has expressed no preference. Omitting `-m` causes the subagent to use the last
+model used in the scope, which may differ from the calling session.
+
 ## Parent Responsibilities
 
 - Include enough context: subagents run in fresh sessions and do not see conversation history.

@@ -849,6 +849,7 @@ impl<'a> AgentLoop<'a> {
             let (manifest, objects_dir) = self.store.attachment_paths(self.session_id)?;
             let mut ctx = ToolContext {
                 config: self.config,
+                session_id: self.session_id,
                 renderer: self.renderer,
                 attachment_manifest: Some(&manifest),
                 objects_dir: Some(&objects_dir),
@@ -1072,6 +1073,7 @@ impl<'a> AgentLoop<'a> {
                 running: bash::start_bash_task(
                     bash_args,
                     self.config,
+                    self.session_id,
                     Some(&manifest),
                     Some(&objects_dir),
                     pending.call_id,
