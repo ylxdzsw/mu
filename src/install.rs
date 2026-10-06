@@ -29,6 +29,7 @@ const BUILTINS: &[(&str, &str)] = &[
     ("markitdown.md", include_str!("../builtins/markitdown.md")),
     ("mu-doc.md", include_str!("../builtins/mu-doc.md")),
     ("subagent.md", include_str!("../builtins/subagent.md")),
+    ("ultracode", include_str!("../builtins/ultracode")),
 ];
 
 #[cfg(feature = "portable")]
@@ -260,7 +261,12 @@ fn initialize_builtins(
             let path = directory.join(name);
             std::fs::write(&path, contents)
                 .with_context(|| format!("writing portable built-in {}", path.display()))?;
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))
+            let mode = if contents.starts_with("#!") {
+                0o755
+            } else {
+                0o644
+            };
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode))
                 .with_context(|| format!("setting portable built-in mode {}", path.display()))?;
         }
         Ok(())
@@ -366,12 +372,18 @@ mod tests {
             .unwrap()
             .map(|entry| {
                 let entry = entry.unwrap();
-                assert_eq!(entry.metadata().unwrap().permissions().mode() & 0o111, 0);
                 let name = entry
                     .file_name()
                     .into_string()
                     .expect("built-in names are UTF-8");
-                (name, std::fs::read_to_string(entry.path()).unwrap())
+                let contents = std::fs::read_to_string(entry.path()).unwrap();
+                let mode = if contents.starts_with("#!") {
+                    0o755
+                } else {
+                    0o644
+                };
+                assert_eq!(entry.metadata().unwrap().permissions().mode() & 0o777, mode);
+                (name, contents)
             })
             .collect::<Vec<_>>();
         shipped.sort_unstable();
@@ -470,7 +482,12 @@ mod tests {
         for (name, contents) in BUILTINS {
             let path = builtins.join(name);
             assert_eq!(std::fs::read_to_string(&path).unwrap(), *contents);
-            assert_eq!(path.metadata().unwrap().permissions().mode() & 0o777, 0o644);
+            let mode = if contents.starts_with("#!") {
+                0o755
+            } else {
+                0o644
+            };
+            assert_eq!(path.metadata().unwrap().permissions().mode() & 0o777, mode);
         }
         for name in APPLET_NAMES {
             assert_eq!(std::fs::read_link(applets.join(name)).unwrap(), executable);
