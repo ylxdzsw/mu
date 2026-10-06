@@ -31,9 +31,6 @@ pause the execution by default).
 
 **Skill System**&emsp; Skills are prompt files that auto loaded on demand by the agent, indicated by front matter. They can coexist
 with shebang, allowing a prompt file both manually invocable and automatically loadable.
-Built-in skills and reference documents are `.md` files; Mu ships no custom commands. Define your own in `~/.mu` (or `$MU_CONFIG_DIR`)
-or the project's `.mu` directory. Command names include the filename extension, so `review.md` is invoked as `mu review.md` or `/review.md`.
-The built-in Exa and Brave search skills become available when `EXA_API_KEY` and `BRAVE_API_KEY`, respectively, are set.
 
 **Multi-provider**&emsp; Supports Chat Completion, Responses, and Anthropic Messages APIs, with optional automatic fallback.
 Common quirks, like cache keys, opaque reasoning replay, context length errors, etc. are handled properly.

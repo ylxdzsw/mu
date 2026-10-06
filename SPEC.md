@@ -684,8 +684,9 @@ supported Mu shebang. The shebang accepts no arguments or exactly
 paths, including an extension when the file has one. Executable permission does
 not affect discovery, but suffixless executable command files are recommended
 so they can also be invoked directly through their shebang. Shipped built-in
-skills and reference documents use `.md` filenames. Mu ships no custom commands;
-users can define them in global or project scope.
+skills and reference documents use `.md` filenames. Built-in commands use the
+same discovery and invocation rules; users can add or shadow commands in global
+or project scope.
 
 A file may be both a command and a skill. Command invocation strips the shebang
 and supported frontmatter before submitting the prompt. An explicit invocation
