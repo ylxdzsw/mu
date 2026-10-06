@@ -227,6 +227,9 @@ impl<'a> AgentLoop<'a> {
 
         let mut live_provider_retries = 0;
         loop {
+            if bash::cancellation_requested() {
+                bail!("turn interrupted");
+            }
             // A live completion and a summary recovered after a crash share the
             // same application and handoff, without another summary request.
             if let Some(state) = &active_compaction
@@ -287,6 +290,9 @@ impl<'a> AgentLoop<'a> {
                 }
 
                 loop {
+                    if bash::cancellation_requested() {
+                        bail!("turn interrupted");
+                    }
                     let mut current_partial_output = String::new();
                     let mut command_headers = StreamingCommandHeaders::default();
                     let emergency = active_compaction
@@ -863,6 +869,10 @@ impl<'a> AgentLoop<'a> {
                 started.elapsed(),
                 context,
             )?;
+            // Save interrupted output before stopping, even on the final call.
+            if bash::cancellation_requested() {
+                bail!("turn interrupted");
+            }
             cursor += 1;
         }
         Ok(BashCallStop::Complete)
