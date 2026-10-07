@@ -42,10 +42,14 @@ assert_command_reply() {
 
 tmpdir=$(mktemp -d)
 TRAPEXIT() {
-  local exit_code=$?
+  local exit_code=$? transcript
   if (( ZSH_SUBSHELL == 0 )); then
     if (( exit_code )); then
       print -u2 -- "test files: $tmpdir"
+      for transcript in "$tmpdir"/*transcript*(N.); do
+        print -u2 -- "transcript: $transcript"
+        cat -- "$transcript" >&2
+      done
     else
       rm -rf -- "$tmpdir"
     fi
@@ -706,7 +710,7 @@ printf '%s\n\n' "[mu] tokens: 12 in / 5 out  context: 25%" >&2
 EOF
 chmod +x "$interactive_fake_bin/mu"
 
-interactive_setup="PS1='> '; PATH=${(q)interactive_fake_bin}:\$PATH; export TEST_CAPTURE_ARGS=${(q)interactive_capture_args} TEST_CAPTURE_STDIN=${(q)interactive_capture_stdin} TEST_CAPTURE_CALLS=${(q)interactive_capture_calls}; autoload -Uz compinit; compinit -D; source ${(q)root}/mu.zsh"
+interactive_setup="PS1='> '; PATH=${(q)interactive_fake_bin}:\$PATH; export TEST_CAPTURE_ARGS=${(q)interactive_capture_args} TEST_CAPTURE_STDIN=${(q)interactive_capture_stdin} TEST_CAPTURE_CALLS=${(q)interactive_capture_calls}; autoload -Uz compinit; compinit -i -D; source ${(q)root}/mu.zsh"
 interactive_ready=$tmpdir/interactive-ready
 
 send_interactive_setup() {
