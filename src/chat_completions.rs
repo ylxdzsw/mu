@@ -106,7 +106,7 @@ pub(crate) async fn stream(
         .await;
     if state.refusal.is_none() {
         delivery?;
-        if request.output_schema.is_some() && state.finish_reason.is_none() {
+        if state.finish_reason.is_none() {
             return Err(ProviderError::Transport(
                 "Chat stream ended before a finish reason".into(),
             ));
@@ -492,10 +492,6 @@ fn finalized_finish_reason(state: &StreamParseState) -> FinishReason {
         });
     }
     if state.finish_reason == Some(FinishReason::Stop)
-        && state
-            .reasoning_content
-            .as_ref()
-            .is_some_and(|text| !text.is_empty())
         && state.content.is_empty()
         && state.tool_accum.is_empty()
     {
@@ -832,12 +828,17 @@ mod tests {
     }
 
     #[test]
-    fn reasoning_only_stop_is_resumable() {
-        let mut state = StreamParseState::default();
-        let data = "{\"choices\":[{\"delta\":{\"reasoning_content\":\"still working\"},\"finish_reason\":\"stop\"}]}";
-        consume_event(data, &mut state, &mut |_| Ok(())).unwrap();
-
-        assert_eq!(finalized_finish_reason(&state), FinishReason::Resume);
+    fn thinking_only_and_empty_stops_are_resumable() {
+        for delta in [
+            serde_json::json!({"reasoning_content":"still working"}),
+            serde_json::json!({}),
+        ] {
+            let mut state = StreamParseState::default();
+            let data =
+                serde_json::json!({"choices":[{"delta":delta,"finish_reason":"stop"}]}).to_string();
+            consume_event(&data, &mut state, &mut |_| Ok(())).unwrap();
+            assert_eq!(finalized_finish_reason(&state), FinishReason::Resume);
+        }
     }
 
     #[test]
@@ -1200,18 +1201,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn streams_over_http_unix_endpoint() {
+    async fn streams_over_http_unix_with_validated_completion_boundaries() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         use tokio::net::UnixListener;
 
-        for (path, body) in [
+        for (path, body, expected) in [
             (
                 "chat/completions",
                 concat!(
                     "data: {\"choices\":[{\"delta\":{\"content\":\"socket ok\"},\r\n",
-                    "data: \"finish_reason\":\"stop\"}]}\r\n\r\n",
-                    "data: [DONE]\n\n"
+                    "data: \"finish_reason\":\"stop\"}]}\r\n\r\n"
                 ),
+                Ok(FinishReason::Stop),
             ),
             (
                 "responses",
@@ -1222,6 +1223,61 @@ mod tests {
                     "data: \"response\":{\"output\":[]}}\r\n\r\n",
                     "data: [DONE]\n\n"
                 ),
+                Ok(FinishReason::Stop),
+            ),
+            (
+                "chat/completions",
+                "data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\ndata: [DONE]\n\n",
+                Err("transport"),
+            ),
+            ("chat/completions", "", Err("transport")),
+            (
+                "chat/completions",
+                "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+                Ok(FinishReason::Resume),
+            ),
+            (
+                "responses",
+                "data: {\"type\":\"response.output_text.delta\",\"delta\":\"partial\"}\n\n",
+                Err("transport"),
+            ),
+            (
+                "responses",
+                "data: {\"type\":\"response.completed\",\"response\":{}}\n\n",
+                Err("protocol"),
+            ),
+            (
+                "responses",
+                "data: {\"type\":\"response.incomplete\",\"response\":{}}\n\n",
+                Err("protocol"),
+            ),
+            (
+                "responses",
+                "data: {\"type\":\"response.completed\",\"response\":{\"output\":[]}}\n\n",
+                Ok(FinishReason::Resume),
+            ),
+            (
+                "responses",
+                "data: {\"type\":\"response.completed\",\"response\":{\"output\":[{\"type\":\"reasoning\",\"encrypted_content\":\"opaque\"}]}}\n\n",
+                Ok(FinishReason::Resume),
+            ),
+            (
+                "messages",
+                "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\n\n",
+                Err("transport"),
+            ),
+            (
+                "messages",
+                "data: {\"type\":\"message_stop\"}\n\n",
+                Err("protocol"),
+            ),
+            (
+                "messages",
+                concat!(
+                    "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\n\n",
+                    "data: {\"type\":\"message_stop\"}\n\n"
+                ),
+                Ok(FinishReason::Resume),
             ),
         ] {
             let tmp =
@@ -1265,9 +1321,16 @@ mod tests {
                 Ok(())
             };
             let result = provider
-                .stream(&request(None, vec![]), &mut on_event)
-                .await
-                .unwrap();
+                .stream(
+                    &request(
+                        None,
+                        vec![Message::System {
+                            content: "system".into(),
+                        }],
+                    ),
+                    &mut on_event,
+                )
+                .await;
 
             let wire_request = server.await.unwrap();
             assert!(wire_request.starts_with(&format!("POST /{path}?route=local HTTP/1.1\r\n")));
@@ -1276,12 +1339,23 @@ mod tests {
                     .to_ascii_lowercase()
                     .contains("\r\nhost: localhost\r\n")
             );
-            assert_eq!(text, "socket ok");
-            assert_eq!(
-                result.message.assistant_text().as_deref(),
-                Some("socket ok")
-            );
-            assert_eq!(result.finish_reason, FinishReason::Stop);
+            match expected {
+                Ok(finish) => {
+                    let result = result.unwrap();
+                    assert_eq!(result.finish_reason, finish);
+                    let expected_text = if finish == FinishReason::Stop {
+                        "socket ok"
+                    } else {
+                        ""
+                    };
+                    assert_eq!(text, expected_text);
+                    assert_eq!(
+                        result.message.assistant_text().unwrap_or_default(),
+                        expected_text
+                    );
+                }
+                Err(class) => assert_eq!(result.unwrap_err().class(), class, "{path}: {body}"),
+            }
 
             std::fs::remove_dir_all(tmp).unwrap();
         }

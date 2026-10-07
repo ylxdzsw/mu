@@ -535,7 +535,14 @@ fn consume_event(
             }
             state.usage.update(&value["usage"]);
         }
-        "message_stop" => state.terminal = true,
+        "message_stop" => {
+            if state.stop_reason.is_none() {
+                return Err(ProviderError::Protocol(
+                    "Anthropic message_stop is missing a stop reason".into(),
+                ));
+            }
+            state.terminal = true;
+        }
         "error" => return Err(classify_stream_error(&value["error"])),
         "ping" => {}
         _ => {}
@@ -619,12 +626,11 @@ fn tool_call_from_block(block: &Value) -> Result<ToolCall, ProviderError> {
 fn finish_reason(reason: Option<&str>, blocks: &[Value], has_tools: bool) -> FinishReason {
     if reason == Some("end_turn")
         && !has_tools
-        && !blocks.is_empty()
         && blocks.iter().all(|block| {
             matches!(
                 block["type"].as_str(),
                 Some("thinking" | "redacted_thinking")
-            )
+            ) || (block["type"] == "text" && block["text"].as_str() == Some(""))
         })
     {
         return FinishReason::Resume;
@@ -727,7 +733,7 @@ mod tests {
     }
 
     #[test]
-    fn classifies_only_thinking_only_end_turn_as_resumable() {
+    fn classifies_thinking_only_and_empty_end_turn_as_resumable() {
         let thinking = serde_json::json!({
             "type": "thinking",
             "thinking": "still working",
@@ -753,6 +759,18 @@ mod tests {
         );
         assert_eq!(
             finish_reason(Some("end_turn"), &[], false),
+            FinishReason::Resume
+        );
+        assert_eq!(
+            finish_reason(
+                Some("end_turn"),
+                &[serde_json::json!({"type":"text","text":""})],
+                false
+            ),
+            FinishReason::Resume
+        );
+        assert_eq!(
+            finish_reason(Some("stop_sequence"), &[], false),
             FinishReason::Stop
         );
     }

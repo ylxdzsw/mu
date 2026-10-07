@@ -597,6 +597,13 @@ identify request-size overflow and take precedence over other classifications,
 including generic gateway errors. Invalid or malformed successful responses are
 protocol failures, not accepted partial progress.
 
+Every non-refusal stream must reach its API completion boundary: a Chat finish
+reason, a Responses terminal response event with an output array, or Anthropic
+`message_stop` with a stop reason. EOF before that boundary is a transport
+failure even if text was streamed; retry restarts the request without accepting
+partial content or adding `Continue`. Chat does not require a trailing `[DONE]`
+after a finish reason. Malformed terminal payloads are protocol failures.
+
 An explicit provider refusal from any supported API is a dedicated refusal
 failure, not a retryable provider error: Mu does not automatically retry it or
 advance a floating provider choice. The audit retains provider-native refusal
@@ -646,10 +653,13 @@ configured model.
 
 ### 7.4 Automatic resume
 
-An adapter may classify a complete response as resumable. With
-`auto_resume:false`, that response is an ordinary clean ending. With
-`auto_resume:true`, Mu persists it, derives `Continue`, and continues the same
-turn using the current retry quota.
+Normally completed responses with no answer text or tool calls, including
+thinking-only and empty responses, are resumable across all three adapters.
+An explicit stop sequence or incomplete terminal state is not a normal
+completion. Ordinary turns do not otherwise require nonempty answer text. With
+`auto_resume:false`, those responses are ordinary clean endings. With
+`auto_resume:true`, Mu persists the response, derives `Continue`, and continues
+the same turn using the current retry quota.
 
 Progress resets the quota. Exhaustion advances a floating candidate; a fixed or
 final candidate exits nonzero and leaves the turn retryable. A normal new

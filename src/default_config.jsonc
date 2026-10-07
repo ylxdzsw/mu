@@ -3,7 +3,7 @@
   "output": "concise",
   // Bash trap level: off, destructive, reversible, or all.
   "trap": "destructive",
-  // Automatically continue replayable incomplete assistant responses.
+  // Automatically continue completed responses with no answer or tool calls.
   "auto_resume": false,
   // Catch Ctrl+\ to finish active work and leave unstarted Bash calls pending.
   "soft_interrupt": true,

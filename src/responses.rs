@@ -70,10 +70,15 @@ pub(crate) async fn stream(
         .filter(|item| matches!(item, AssistantItem::BashCall(_)))
         .count();
     let finish_reason = state.finish_reason.unwrap_or({
-        if tool_calls == 0 {
+        if tool_calls > 0 {
+            FinishReason::ToolCalls
+        } else if items
+            .iter()
+            .any(|item| matches!(item, AssistantItem::Text { text } if !text.is_empty()))
+        {
             FinishReason::Stop
         } else {
-            FinishReason::ToolCalls
+            FinishReason::Resume
         }
     });
     Ok(StreamResult {
@@ -327,22 +332,23 @@ pub(crate) fn consume_event(
                 arguments_delta: delta,
             }))?;
         }
-        "response.completed" => {
+        "response.completed" | "response.incomplete" => {
+            if !value["response"]["output"].is_array() {
+                return Err(ProviderError::Protocol(format!(
+                    "Responses {event_type} is missing an output array"
+                )));
+            }
             state.terminal = true;
-            state.replayable = true;
+            state.replayable = event_type == "response.completed";
             retain_native_response(state, &value["response"]);
             state.usage = responses_usage(&value["response"]["usage"]);
             collect_refusals(&state.output, &mut state.refusal);
-        }
-        "response.incomplete" => {
-            state.terminal = true;
-            retain_native_response(state, &value["response"]);
-            state.usage = responses_usage(&value["response"]["usage"]);
-            collect_refusals(&state.output, &mut state.refusal);
-            let reason = value["response"]["incomplete_details"]["reason"]
-                .as_str()
-                .unwrap_or("incomplete");
-            state.finish_reason = Some(FinishReason::Other(reason.to_string()));
+            if !state.replayable {
+                let reason = value["response"]["incomplete_details"]["reason"]
+                    .as_str()
+                    .unwrap_or("incomplete");
+                state.finish_reason = Some(FinishReason::Other(reason.to_string()));
+            }
         }
         "response.failed" => return Err(classify_stream_error(&value["response"]["error"])),
         "error" => return Err(classify_stream_error(&value)),

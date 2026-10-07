@@ -65,7 +65,7 @@ provider/model block. The actual starter provider is OpenCode Zen's keyless
 {
   "output": "concise",            // final | concise | detail | full
   "trap": "destructive",          // off | destructive | reversible | all
-  "auto_resume": false,           // continue replayable incomplete responses
+  "auto_resume": false,           // continue completed responses with no answer or tool calls
   "soft_interrupt": true,         // Ctrl+\\ finishes active work, leaves pending calls, then stops
   "providers": {
     "openai": {
@@ -112,12 +112,17 @@ CLI `--output`.
 `destructive` traps only claims declared destructive, `reversible` also traps
 reversible claims, `all` traps every Bash claim, and `off` traps none. Declared
 risk is model-supplied advisory metadata, not a security boundary.
-`auto_resume` preserves provider responses classified as resumable and
-continues the same turn with a derived user `Continue` message. Attempts share
-the provider retry quota. Exhaustion advances a floating provider candidate;
+`auto_resume` preserves normally completed thinking-only or empty responses
+without tool calls across all three APIs and continues the same turn with a
+derived user `Continue` message. Attempts share the provider retry quota.
+Exhaustion advances a floating provider candidate;
 a fixed or final candidate leaves the turn incomplete for `/retry`. A normal
 new prompt supersedes the pending resume without inserting the derived message.
 When disabled, resumable responses are ordinary clean turn endings.
+Streams missing their API completion boundary instead fail as transport errors
+and retry the request without preserving partial content or adding `Continue`.
+Malformed terminal payloads are protocol failures. Schema-constrained
+resumable responses fail as incomplete rather than automatically continuing.
 Set `compaction.enabled` to `false` to disable automatic soft-threshold,
 hard-threshold, and emergency-overflow compaction. Context-length and request-size
 failures then abort the turn, while explicit `mu compact` remains available.
