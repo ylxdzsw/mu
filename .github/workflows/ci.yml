@@ -36,7 +36,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install --yes \
-            bsdextrautils fish jq libssl-dev pkg-config zsh
+            bsdextrautils fish jq libssl-dev perl pkg-config util-linux zsh
 
       - name: Check formatting
         run: cargo fmt --check
@@ -75,10 +75,10 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
-      - name: Test shell integrations
+      - name: Test Zsh integration and Fish syntax
         run: |
           zsh -n mu.zsh test.zsh
-          MU_ZSH_SKIP_PTY=1 zsh test.zsh
+          zsh test.zsh
           fish -n mu.fish test.fish
 
       - name: Check package recipe
@@ -104,10 +104,12 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Test Fish 4 integration
+      - name: Test Zsh and Fish 4 integrations
         run: |
           fish -c 'test (string split -m1 . $version)[1] -ge 4'
+          zsh -n mu.zsh test.zsh
           fish -n mu.fish test.fish
+          zsh test.zsh
           fish test.fish
 
       - name: Build the native package from this revision

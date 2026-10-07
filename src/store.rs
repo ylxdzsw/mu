@@ -2146,11 +2146,25 @@ impl Store {
 
     pub fn turn_output_schema(&self, session_id: &str, turn_id: &str) -> Result<Option<Value>> {
         self.with_journal(session_id, |journal| {
+            let mut source_prompt_id = None;
             let prompt_id = journal.events.iter().find_map(|line| match &line.event {
                 Event::PromptMaterialized {
                     prompt_id,
                     turn_id: id,
-                } if id == turn_id => Some(prompt_id),
+                } => {
+                    source_prompt_id = Some(prompt_id);
+                    (id == turn_id).then_some(prompt_id)
+                }
+                Event::CompactionStarted {
+                    mode: CompactionMode::AwaitUser,
+                    ..
+                } => {
+                    source_prompt_id = None;
+                    None
+                }
+                Event::CompactionApplied { .. } if turn_id == format!("t{}", line.seq) => {
+                    source_prompt_id
+                }
                 _ => None,
             });
             let schema = journal.events.iter().find_map(|line| match &line.event {

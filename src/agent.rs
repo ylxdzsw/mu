@@ -3536,9 +3536,18 @@ mod tests {
             {
                 let store = Store::open_memory().unwrap();
                 let session = store.create_session_seeded("system").unwrap();
+                let schema = serde_json::json!({"type":"object"});
                 store
-                    .start_turn(&session.id, "/tmp", None, &"work".into())
+                    .queue_prompt(
+                        &session.id,
+                        "/tmp",
+                        None,
+                        &"work".into(),
+                        bash::TrapLevel::Destructive,
+                        Some(&schema),
+                    )
                     .unwrap();
+                store.materialize_queued_prompt(&session.id).unwrap();
                 if mode == CompactionMode::AwaitUser {
                     store
                         .append_message(
@@ -3658,6 +3667,10 @@ mod tests {
                         } else {
                             "refreshed system prompt"
                         }
+                    );
+                    assert_eq!(
+                        request.pointer("/response_format/json_schema/schema"),
+                        (mode == CompactionMode::ContinueTurn && !summarizing).then_some(&schema)
                     );
                 }
             }
