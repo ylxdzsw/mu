@@ -259,7 +259,7 @@ impl<'a> AgentLoop<'a> {
             if bash::soft_interrupt_requested() {
                 return self.soft_interrupt_result(total_usage);
             }
-            let (exchange_id, stream_result, mut command_headers) = 'request_gate: loop {
+            let (exchange_id, stream_result, mut command_headers, structured_output) = 'request_gate: loop {
                 if bash::soft_interrupt_requested() {
                     return self.soft_interrupt_result(total_usage);
                 }
@@ -340,9 +340,15 @@ impl<'a> AgentLoop<'a> {
                         self.provider.api(),
                     );
                     let epoch = self.store.context_epoch(self.session_id)?;
+                    let turn_id = self.store.current_turn_id(self.session_id)?;
                     let request = Request {
                         model: self.model.active_model().clone(),
                         cache_key: Some(format!("mu:{}:epoch:{epoch}", self.session_id)),
+                        output_schema: if active_compaction.is_none() {
+                            self.store.turn_output_schema(self.session_id, &turn_id)?
+                        } else {
+                            None
+                        },
                         messages: request_context,
                     };
                     let native_request = request.json(self.provider.api())?;
@@ -383,7 +389,7 @@ impl<'a> AgentLoop<'a> {
                     )?;
                     let exchange_id = self.store.start_provider_request(
                         self.session_id,
-                        &self.store.current_turn_id(self.session_id)?,
+                        &turn_id,
                         ProviderOrigin {
                             canonical_model_ref: request.model.canonical.clone(),
                             provider_id: request.model.provider_id.clone(),
@@ -456,7 +462,14 @@ impl<'a> AgentLoop<'a> {
                         return Err(error.into());
                     }
                     let error = match result {
-                        Ok(r) => break 'request_gate (exchange_id, r, command_headers),
+                        Ok(r) => {
+                            break 'request_gate (
+                                exchange_id,
+                                r,
+                                command_headers,
+                                request.output_schema.is_some(),
+                            );
+                        }
                         Err(error) => error,
                     };
                     self.store.fail_provider_exchange(
@@ -553,6 +566,41 @@ impl<'a> AgentLoop<'a> {
                 merge_usage(&mut total_usage, u);
             }
 
+            let failure = match &stream_result.finish_reason {
+                FinishReason::Refusal(detail) => {
+                    let error = ProviderError::Refusal {
+                        detail: detail.clone(),
+                    };
+                    Some((error.class(), anyhow::Error::new(error)))
+                }
+                reason
+                    if structured_output
+                        && !matches!(reason, FinishReason::Stop | FinishReason::ToolCalls) =>
+                {
+                    let reason = if let FinishReason::Other(reason) = reason {
+                        reason.as_str()
+                    } else {
+                        "reasoning_only"
+                    };
+                    Some((
+                        "incomplete",
+                        anyhow::anyhow!("structured output incomplete: finish_reason={reason}"),
+                    ))
+                }
+                _ => None,
+            };
+            if let Some((class, error)) = failure {
+                self.store.fail_provider_exchange(
+                    self.session_id,
+                    &exchange_id,
+                    class,
+                    serde_json::json!({"message": error.to_string()}),
+                    stream_result.native_response.as_ref(),
+                    stream_result.usage.as_ref(),
+                )?;
+                return Err(error);
+            }
+
             // Only a provider-declared tool-call completion makes streamed calls
             // executable. A length/content-filter stop can contain an incomplete
             // accumulated call; retain its native response for audit, but do not
@@ -608,6 +656,9 @@ impl<'a> AgentLoop<'a> {
             }
 
             match stream_result.finish_reason {
+                FinishReason::Refusal(_) => {
+                    unreachable!("refusals fail before accepting the exchange")
+                }
                 FinishReason::Stop => {
                     if active_compaction.is_some() {
                         if accepted_message
@@ -1711,6 +1762,42 @@ mod tests {
         step: Mutex<usize>,
     }
 
+    struct OutcomeProvider {
+        finish: FinishReason,
+        seen: Arc<Mutex<Vec<Option<Value>>>>,
+    }
+
+    #[async_trait(?Send)]
+    impl Provider for OutcomeProvider {
+        async fn stream(
+            &self,
+            request: &Request,
+            _: &mut dyn FnMut(StreamEvent) -> Result<(), ProviderError>,
+        ) -> Result<StreamResult, ProviderError> {
+            self.seen
+                .lock()
+                .unwrap()
+                .push(request.output_schema.clone());
+            let call = ToolCall {
+                id: "unaccepted".into(),
+                arguments:
+                    serde_json::json!({"command":"pwd","title":"Do not execute","risk":"readonly"})
+                        .to_string(),
+            };
+            Ok(StreamResult {
+                message: Message::assistant(Some("not JSON".into()), None, Some(vec![call]), None),
+                finish_reason: self.finish.clone(),
+                usage: Some(Usage {
+                    input_tokens: 9,
+                    output_tokens: 3,
+                    total_tokens: 12,
+                    ..Usage::default()
+                }),
+                native_response: Some(serde_json::json!({"audit":"native response"})),
+            })
+        }
+    }
+
     struct ResumeThenStopProvider {
         resumes_before_stop: usize,
         calls: Mutex<usize>,
@@ -2154,6 +2241,81 @@ mod tests {
             trap: bash::TrapLevel::Off,
             auto_resume: false,
             ..Config::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn output_contract_failures_are_audit_only_and_retry_reuses_schema() {
+        for finish in [
+            FinishReason::Refusal("denied".into()),
+            FinishReason::Other("max_tokens".into()),
+        ] {
+            let store = Store::open_memory().unwrap();
+            let session = store.create_session_seeded("system").unwrap();
+            let schema = serde_json::json!({"type":"object"});
+            store
+                .queue_prompt(
+                    &session.id,
+                    "/tmp",
+                    None,
+                    &"work".into(),
+                    bash::TrapLevel::Off,
+                    Some(&schema),
+                )
+                .unwrap();
+            let mut config = test_config();
+            config.auto_resume = true;
+            let model = crate::models::resolve_model_ref(&config, "test/fake-model").unwrap();
+            let seen = Arc::new(Mutex::new(Vec::new()));
+            let mut renderer = Renderer::with_format(OutputFormat::Final);
+            let mut agent = AgentLoop {
+                config: &config,
+                system_prompt_source: SystemPromptSource::fixed("system"),
+                model: ResolvedModelChoice::fixed(model),
+                provider: Box::new(OutcomeProvider {
+                    finish: finish.clone(),
+                    seen: seen.clone(),
+                }),
+                store: &store,
+                session_id: &session.id,
+                renderer: &mut renderer,
+            };
+            init_test_signals(&config);
+            assert!(agent.run_queued_turn().await.is_err());
+            assert_eq!(*seen.lock().unwrap(), vec![Some(schema.clone())]);
+            let events = store.audit_events(&session.id).unwrap();
+            let failure = events
+                .iter()
+                .find(|e| e["type"] == "provider_failed")
+                .unwrap();
+            assert_eq!(
+                failure["error_class"],
+                if matches!(finish, FinishReason::Refusal(_)) {
+                    "refusal"
+                } else {
+                    "incomplete"
+                }
+            );
+            assert_eq!(failure["usage"]["total_tokens"], 12);
+            assert!(failure["partial_response_json"].is_object());
+            assert!(
+                !events
+                    .iter()
+                    .any(|e| e["type"] == "provider_completed" || e["type"] == "bash_started")
+            );
+            assert!(store.pending_bash_calls(&session.id).unwrap().is_empty());
+            assert!(!store.is_session_clean(&session.id).unwrap());
+            agent.provider = Box::new(OutcomeProvider {
+                finish: FinishReason::Stop,
+                seen: seen.clone(),
+            });
+            init_test_signals(&config);
+            let result = agent.resume_turn().await.unwrap();
+            assert_eq!(result.final_assistant.as_deref(), Some("not JSON"));
+            assert_eq!(
+                *seen.lock().unwrap(),
+                vec![Some(schema.clone()), Some(schema)]
+            );
         }
     }
 
@@ -3284,6 +3446,7 @@ mod tests {
                 None,
                 &UserContent::Text("new request".into()),
                 bash::TrapLevel::Destructive,
+                Some(&serde_json::json!({"type":"object"})),
             )
             .unwrap();
         let before = store.audit_events(&new_turn_session.id).unwrap().len();
@@ -3319,6 +3482,27 @@ mod tests {
         assert_eq!(result.final_assistant.as_deref(), Some("done"));
         assert_eq!(compacted.usage.total_tokens + result.usage.total_tokens, 30);
         assert!(store.is_session_clean(&new_turn_session.id).unwrap());
+        let requests = store
+            .audit_events(&new_turn_session.id)
+            .unwrap()
+            .into_iter()
+            .skip(before)
+            .filter(|e| e["type"] == "provider_requested")
+            .map(|e| {
+                store
+                    .reconstruct_provider_request(
+                        &new_turn_session.id,
+                        e["exchange_id"].as_str().unwrap(),
+                    )
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(requests.len(), 2);
+        assert!(requests[0].get("response_format").is_none());
+        assert_eq!(
+            requests[1]["response_format"]["json_schema"]["schema"],
+            serde_json::json!({"type":"object"})
+        );
 
         let retry_session = store.create_session_seeded("system").unwrap();
         seed_history(&store, &retry_session.id);
@@ -3371,6 +3555,7 @@ mod tests {
                             None,
                             &"queued work".into(),
                             bash::TrapLevel::Destructive,
+                            None,
                         )
                         .unwrap();
                 }

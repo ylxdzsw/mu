@@ -18,14 +18,17 @@ pub(crate) async fn stream(
 ) -> Result<StreamResult, ProviderError> {
     let body = request.json(crate::provider::ModelApi::AnthropicMessages)?;
     let mut state = AnthropicStreamState::default();
-    provider
+    let delivery = provider
         .stream_sse(&body, &mut |event| match event {
             SseEvent::Tick => on_event(StreamEvent::Tick),
             SseEvent::Data(data) => consume_event(&data, &mut state, on_event),
         })
-        .await?;
+        .await;
+    if state.stop_reason.as_deref() != Some("refusal") {
+        delivery?;
+    }
 
-    if !state.terminal {
+    if !state.terminal && state.stop_reason.as_deref() != Some("refusal") {
         return Err(ProviderError::Transport(
             "Anthropic stream ended before message_stop".into(),
         ));
@@ -46,6 +49,17 @@ pub(crate) async fn stream(
         });
     }
     let finish_reason = finish_reason(state.stop_reason.as_deref(), &blocks, has_tools);
+    let finish_reason = if state.stop_reason.as_deref() == Some("refusal") {
+        let mut detail = assistant_text(&items)
+            .filter(|text| !text.is_empty())
+            .unwrap_or_else(|| "Anthropic refused the request".into());
+        if let Some(details) = &state.stop_details {
+            detail.push_str(&format!(": {details}"));
+        }
+        FinishReason::Refusal(detail)
+    } else {
+        finish_reason
+    };
     let usage = state.usage.finish();
     let native_response = Some(serde_json::json!({
         "type": "message",
@@ -53,6 +67,7 @@ pub(crate) async fn stream(
         "model": request.model.model_id,
         "content": &blocks,
         "stop_reason": &state.stop_reason,
+        "stop_details": &state.stop_details,
         "stop_sequence": null,
         "usage": usage.as_ref().map(|usage| serde_json::json!({
             "input_tokens": usage.input_tokens,
@@ -165,8 +180,21 @@ pub(crate) fn build_request_body(
             "type": "ephemeral",
         },
     });
-    if let Some(effort) = request.model.effort.as_deref() {
-        body["output_config"] = serde_json::json!({ "effort": effort });
+    if request.model.effort.is_some() || request.output_schema.is_some() {
+        let mut output_config = serde_json::Map::new();
+        if let Some(effort) = request.model.effort.as_deref() {
+            output_config.insert("effort".into(), Value::String(effort.to_string()));
+        }
+        if let Some(schema) = request.output_schema.as_ref() {
+            output_config.insert(
+                "format".into(),
+                serde_json::json!({
+                    "type": "json_schema",
+                    "schema": schema,
+                }),
+            );
+        }
+        body["output_config"] = Value::Object(output_config);
     }
     Ok(body)
 }
@@ -284,6 +312,7 @@ struct AnthropicStreamState {
     tool_arguments: BTreeMap<usize, String>,
     reasoning_index: Option<usize>,
     stop_reason: Option<String>,
+    stop_details: Option<Value>,
     usage: AnthropicUsage,
     terminal: bool,
 }
@@ -377,6 +406,9 @@ fn consume_event(
     state: &mut AnthropicStreamState,
     on_event: &mut dyn FnMut(StreamEvent) -> Result<(), ProviderError>,
 ) -> Result<(), ProviderError> {
+    if data.is_empty() || data == "[DONE]" {
+        return Ok(());
+    }
     let value: Value =
         serde_json::from_str(data).map_err(|error| ProviderError::Protocol(error.to_string()))?;
     match value["type"].as_str().unwrap_or("") {
@@ -495,21 +527,11 @@ fn consume_event(
         }
         "message_delta" => {
             if let Some(reason) = value["delta"]["stop_reason"].as_str() {
+                state.stop_reason = Some(reason.to_string());
                 if reason == "refusal" {
                     let details = &value["delta"]["stop_details"];
-                    let details = if details.is_null() {
-                        String::new()
-                    } else {
-                        format!(": {details}")
-                    };
-                    return Err(ProviderError::BadRequestPermanent {
-                        status: None,
-                        detail: format!(
-                            "Anthropic refused the request{details}; retry with a fallback model using `mu retry -m provider/model`"
-                        ),
-                    });
+                    state.stop_details = (!details.is_null()).then(|| details.clone());
                 }
-                state.stop_reason = Some(reason.to_string());
             }
             state.usage.update(&value["usage"]);
         }
@@ -634,11 +656,25 @@ mod tests {
             },
             cache_key: None,
             messages,
+            output_schema: None,
         }
     }
 
     fn request_body(effort: Option<&str>, messages: Vec<Message>) -> Result<Value, ProviderError> {
         request(effort, messages).json(ModelApi::AnthropicMessages)
+    }
+
+    #[test]
+    fn passes_output_schema_in_anthropic_output_config() {
+        let mut request = request(None, vec![system()]);
+        request.output_schema = Some(serde_json::json!({"type":"object"}));
+        let body = request.json(ModelApi::AnthropicMessages).unwrap();
+        assert_eq!(
+            body["output_config"]["format"],
+            serde_json::json!({
+                "type":"json_schema","schema":{"type":"object"}
+            })
+        );
     }
 
     fn system() -> Message {
@@ -972,10 +1008,10 @@ mod tests {
     }
 
     #[test]
-    fn surfaces_refusal_details_and_fallback_hint() {
+    fn accumulates_refusal_details_and_usage() {
         let mut state = AnthropicStreamState::default();
         let mut events = Vec::new();
-        let error = consume(
+        consume(
             &mut state,
             &mut events,
             serde_json::json!({
@@ -988,15 +1024,31 @@ mod tests {
                         "explanation": "declined",
                     },
                 },
-                "usage": { "output_tokens": 0 },
+                "usage": { "output_tokens": 3 },
             }),
         )
-        .unwrap_err();
+        .unwrap();
 
-        assert!(matches!(error, ProviderError::BadRequestPermanent { .. }));
-        let message = error.to_string();
-        assert!(message.contains(r#""category":"cyber""#));
-        assert!(message.contains("mu retry -m provider/model"));
+        assert_eq!(state.stop_reason.as_deref(), Some("refusal"));
+        assert!(
+            state
+                .stop_details
+                .as_ref()
+                .unwrap()
+                .to_string()
+                .contains("cyber")
+        );
+        assert_eq!(state.usage.finish().unwrap().output_tokens, 3);
+        consume_event("[DONE]", &mut state, &mut |_| Ok(())).unwrap();
+        assert!(!state.terminal);
+        consume(
+            &mut state,
+            &mut events,
+            serde_json::json!({"type":"message_stop"}),
+        )
+        .unwrap();
+        consume_event("[DONE]", &mut state, &mut |_| Ok(())).unwrap();
+        assert!(state.terminal);
     }
 
     #[test]

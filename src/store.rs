@@ -310,6 +310,8 @@ enum Event {
         cwd: String,
         trap: crate::bash::TrapLevel,
         #[serde(skip_serializing_if = "Option::is_none")]
+        output_schema: Option<ObjectRef>,
+        #[serde(skip_serializing_if = "Option::is_none")]
         git_worktree_root: Option<String>,
         prompt: PersistedUserContent,
     },
@@ -884,6 +886,7 @@ impl Store {
                 effort: effort.map(str::to_string),
             },
             cache_key: None,
+            output_schema: None,
             messages: self.load_context_messages(session_id)?,
         };
         let native = request.json(ModelApi::ChatCompletions)?;
@@ -1376,6 +1379,7 @@ impl Store {
             git_worktree_root,
             prompt,
             crate::bash::TrapLevel::Destructive,
+            None,
         )?;
         self.materialize_queued_prompt(session_id)?
             .context("queued prompt was not materialized")
@@ -1411,6 +1415,7 @@ impl Store {
         git_worktree_root: Option<&str>,
         prompt: &UserContent,
         trap: crate::bash::TrapLevel,
+        output_schema: Option<&Value>,
     ) -> Result<String> {
         let prompt_id = self.with_journal(session_id, |journal| {
             if compaction_start_before(journal, i64::MAX).is_some() {
@@ -1427,6 +1432,7 @@ impl Store {
                 prompt_id: prompt_id.clone(),
                 cwd: cwd.to_string(),
                 trap,
+                output_schema: self.persist_json(output_schema)?,
                 git_worktree_root: git_worktree_root.map(str::to_string),
                 prompt: self.persist_user_content(prompt)?,
             },
@@ -1658,6 +1664,7 @@ impl Store {
                 effort: None,
             },
             cache_key: None,
+            output_schema: None,
             messages,
         };
         let native_request = request.json(ModelApi::ChatCompletions)?;
@@ -2137,6 +2144,32 @@ impl Store {
         })
     }
 
+    pub fn turn_output_schema(&self, session_id: &str, turn_id: &str) -> Result<Option<Value>> {
+        self.with_journal(session_id, |journal| {
+            let prompt_id = journal.events.iter().find_map(|line| match &line.event {
+                Event::PromptMaterialized {
+                    prompt_id,
+                    turn_id: id,
+                } if id == turn_id => Some(prompt_id),
+                _ => None,
+            });
+            let schema = journal.events.iter().find_map(|line| match &line.event {
+                Event::PromptQueued {
+                    prompt_id: id,
+                    output_schema,
+                    ..
+                } if Some(id) == prompt_id => output_schema.as_ref(),
+                _ => None,
+            });
+            schema
+                .map(|object| {
+                    serde_json::from_slice(&self.read_object(object)?)
+                        .context("reading turn output schema")
+                })
+                .transpose()
+        })
+    }
+
     fn complete_provider_exchange(
         &self,
         session_id: &str,
@@ -2439,6 +2472,14 @@ impl Store {
                 effort: origin.effort.clone(),
             },
             cache_key,
+            output_schema: recipe
+                .envelope
+                .pointer(match api {
+                    ModelApi::ChatCompletions => "/response_format/json_schema/schema",
+                    ModelApi::Responses => "/text/format/schema",
+                    ModelApi::AnthropicMessages => "/output_config/format/schema",
+                })
+                .cloned(),
             messages,
         }
         .json(api)?;
@@ -3496,6 +3537,7 @@ fn queued_prompt_records(
                 trap,
                 git_worktree_root,
                 prompt,
+                ..
             } => Some((
                 prompt_id.as_str(),
                 (cwd.as_str(), git_worktree_root.as_deref(), prompt, *trap),
@@ -4136,6 +4178,7 @@ mod tests {
                 Some("/repo"),
                 &"12345678".into(),
                 crate::bash::TrapLevel::All,
+                None,
             )
             .unwrap();
         assert_eq!(
@@ -4184,6 +4227,7 @@ mod tests {
                 effort: None,
             },
             cache_key: None,
+            output_schema: None,
             messages: store.load_context_messages(&session.id).unwrap(),
         };
         let native = request.json(ModelApi::ChatCompletions).unwrap();
@@ -4254,6 +4298,7 @@ mod tests {
                 effort: None,
             },
             cache_key: None,
+            output_schema: None,
             messages: replay_messages.clone(),
         };
         let replay_native = replay_request.json(ModelApi::Responses).unwrap();
@@ -4351,6 +4396,7 @@ mod tests {
         let request = Request {
             model: target.clone(),
             cache_key: None,
+            output_schema: None,
             messages: messages.clone(),
         };
         let native = request.json(ModelApi::Responses).unwrap();
@@ -4435,6 +4481,7 @@ mod tests {
                 Some("/repo"),
                 &"queued".into(),
                 crate::bash::TrapLevel::Destructive,
+                None,
             )
             .unwrap();
         let source_turn_id = store
@@ -4953,6 +5000,7 @@ mod tests {
                 effort: Some("high".into()),
             },
             cache_key: Some(format!("mu:{}:agent", session.id)),
+            output_schema: None,
             messages,
         };
         let native = request.json(ModelApi::ChatCompletions).unwrap();
@@ -4991,6 +5039,110 @@ mod tests {
                 .unwrap(),
             native
         );
+    }
+
+    #[test]
+    fn output_schema_persists_and_reconstructs_for_each_api() {
+        for schema in [
+            serde_json::json!({"type":"object","custom":"unchanged"}),
+            Value::Null,
+            Value::Bool(false),
+        ] {
+            let (store, session) = test_session();
+            store
+                .queue_prompt(
+                    &session.id,
+                    "/tmp",
+                    None,
+                    &"hello".into(),
+                    crate::bash::TrapLevel::Destructive,
+                    Some(&schema),
+                )
+                .unwrap();
+            let turn = store
+                .materialize_queued_prompt(&session.id)
+                .unwrap()
+                .unwrap();
+            let reopened = Store::open(&store.root).unwrap();
+            assert_eq!(
+                reopened.turn_output_schema(&session.id, &turn).unwrap(),
+                Some(schema.clone())
+            );
+            for api in [
+                ModelApi::ChatCompletions,
+                ModelApi::Responses,
+                ModelApi::AnthropicMessages,
+            ] {
+                let request = Request {
+                    model: ResolvedModelRef {
+                        canonical: "test/model".into(),
+                        provider_id: "test".into(),
+                        model_id: "model".into(),
+                        effort: None,
+                    },
+                    cache_key: None,
+                    output_schema: Some(schema.clone()),
+                    messages: reopened.load_context_messages(&session.id).unwrap(),
+                };
+                let native = request.json(api).unwrap();
+                let recipe = reopened
+                    .request_recipe(
+                        api.request_format(),
+                        &native,
+                        serde_json::json!({"native_replay_origins":[]}),
+                    )
+                    .unwrap();
+                let exchange = reopened
+                    .start_provider_request(
+                        &session.id,
+                        &turn,
+                        ProviderOrigin {
+                            canonical_model_ref: "test/model".into(),
+                            provider_id: "test".into(),
+                            api: api.name().into(),
+                            endpoint: "https://example.test".into(),
+                            wire_model: "model".into(),
+                            effort: None,
+                        },
+                        recipe,
+                    )
+                    .unwrap();
+                assert_eq!(
+                    reopened
+                        .reconstruct_provider_request(&session.id, &exchange)
+                        .unwrap(),
+                    native
+                );
+                reopened
+                    .fail_provider_exchange(
+                        &session.id,
+                        &exchange,
+                        "test",
+                        serde_json::json!({}),
+                        None,
+                        None,
+                    )
+                    .unwrap();
+            }
+            reopened
+                .queue_prompt(
+                    &session.id,
+                    "/tmp",
+                    None,
+                    &"next".into(),
+                    crate::bash::TrapLevel::Destructive,
+                    None,
+                )
+                .unwrap();
+            let next = reopened
+                .materialize_queued_prompt(&session.id)
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                reopened.turn_output_schema(&session.id, &next).unwrap(),
+                None
+            );
+        }
     }
 
     #[test]
@@ -5041,6 +5193,7 @@ mod tests {
                 effort: Some("high".into()),
             },
             cache_key: None,
+            output_schema: None,
             messages: messages.clone(),
         };
         let native = request.json(ModelApi::AnthropicMessages).unwrap();
@@ -5146,6 +5299,7 @@ mod tests {
                 effort: None,
             },
             cache_key: None,
+            output_schema: None,
             messages: request_messages,
         };
         let endpoint = "https://target.test/v1/chat/completions";
@@ -5197,6 +5351,7 @@ mod tests {
                 effort: None,
             },
             cache_key: None,
+            output_schema: None,
             messages: store.load_context_messages(&session.id).unwrap(),
         };
         let native = request.json(ModelApi::ChatCompletions).unwrap();
@@ -5665,6 +5820,7 @@ mod tests {
                 effort: None,
             },
             cache_key: None,
+            output_schema: None,
             messages,
         };
         let projected = request(projected);

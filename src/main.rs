@@ -75,6 +75,10 @@ struct TurnArgs {
     #[arg(short = 'o', long, value_enum)]
     output: Option<OutputFormat>,
 
+    /// Request structured output using this JSON Schema (passed unchanged)
+    #[arg(long, value_name = "JSON", value_parser = parse_output_schema)]
+    output_schema: Option<serde_json::Value>,
+
     /// Trap Bash calls at this declared risk level
     #[arg(long, value_enum)]
     trap: Option<bash::TrapLevel>,
@@ -389,9 +393,13 @@ fn write_final_stdout(text: Option<&str>) -> io::Result<()> {
 }
 
 fn write_final_error(message: &str) -> io::Result<()> {
-    let mut stdout = io::stdout().lock();
-    writeln!(stdout, "error: {message}")?;
-    stdout.flush()
+    let mut stderr = io::stderr().lock();
+    writeln!(stderr, "error: {message}")?;
+    stderr.flush()
+}
+
+fn parse_output_schema(value: &str) -> std::result::Result<serde_json::Value, String> {
+    serde_json::from_str(value).map_err(|error| format!("invalid output schema JSON: {error}"))
 }
 
 fn exit_session_busy(output: OutputFormat) -> ! {
@@ -916,6 +924,7 @@ fn validate_cli_args(args: &Args) -> Result<()> {
         || args.turn.selection.model.is_some()
         || !args.turn.attachments.is_empty()
         || args.turn.output.is_some()
+        || args.turn.output_schema.is_some()
         || args.turn.trap.is_some()
         || args.turn.no_context;
     let reserved_prompt = args
@@ -985,6 +994,7 @@ async fn run_turn_from_source(
         git_worktree_root.as_deref(),
         &prompt_content,
         trap,
+        turn.output_schema.as_ref(),
     )?;
     // Publish the session only after its journal lock is held and its first
     // turn is durable. Standalone `new` deliberately does not select.
@@ -1417,6 +1427,24 @@ mod tests {
         assert!(Args::try_parse_from(["mu", "context", "--export", "--no-context"]).is_err());
         assert!(Args::try_parse_from(["mu", "status", "--no-context"]).is_err());
         let misplaced = Args::try_parse_from(["mu", "--no-context", "new"]).unwrap();
+        assert!(validate_cli_args(&misplaced).is_err());
+    }
+
+    #[test]
+    fn output_schema_is_json_and_independent_of_presentation() {
+        let schema = r#"{"type":"object","custom":"unchanged"}"#;
+        for output in ["final", "concise", "detail", "full"] {
+            let args =
+                Args::try_parse_from(["mu", "--output-schema", schema, "-o", output]).unwrap();
+            validate_cli_args(&args).unwrap();
+            assert_eq!(
+                args.turn.output_schema,
+                Some(serde_json::from_str(schema).unwrap())
+            );
+        }
+        assert!(Args::try_parse_from(["mu", "--output-schema", "{"]).is_err());
+        assert!(Args::try_parse_from(["mu", "retry", "--output-schema", schema]).is_err());
+        let misplaced = Args::try_parse_from(["mu", "--output-schema", schema, "new"]).unwrap();
         assert!(validate_cli_args(&misplaced).is_err());
     }
 

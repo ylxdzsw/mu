@@ -398,7 +398,7 @@ Output density changes presentation, not agent behavior:
 
 | Mode | Contract |
 |---|---|
-| `final` | Buffer the turn and write only the final assistant text on success, without an added newline. On unrecovered failure, write `error: ...\n` and exit nonzero. A trapped call is the sole tool-presentation exception. |
+| `final` | Buffer the turn and write only the final assistant text on success, without an added newline. On unrecovered failure, write `error: ...\n` to stderr and exit nonzero. A trapped call is the sole tool-presentation exception. |
 | `concise` | Stream assistant text and notices; reduce each Bash call to one committed outcome line. Reasoning progress is ephemeral. |
 | `detail` | Normal human transcript: thought status, tool headers, bounded output previews, exits, and turn summary. |
 | `full` | Expose available reasoning/summary text and complete redacted tool presentation. Model-context truncation still applies. |
@@ -423,6 +423,12 @@ no configuration supplied a value.
 Assistant text, tool presentation, tool failures, and Bash output go to stdout.
 Fatal process diagnostics and the normal `detail`/`full` summary go to stderr.
 The summary is shown only for a successful turn when stderr is a terminal.
+
+Fatal diagnostics, including final-mode failures and session-busy errors, are
+written to stderr in every output mode. `final` writes only the final assistant
+text to stdout on success. A trapped call remains the exception: it prints its
+complete command and stdin to stdout and exits 3. A failure after non-final
+assistant text has streamed does not retract that output.
 
 A trapped call always exposes its complete title, declared risk, command,
 effective cwd, and stdin on stdout in every output mode. It bypasses width,
@@ -587,6 +593,7 @@ Provider errors are classified by meaning rather than raw status text:
 | `context_length`, `request_too_large` | Apply emergency context recovery when enabled. |
 | `unavailable`, `auth` | Advance a floating provider candidate immediately. |
 | `overloaded`, `rate_limit`, `transport` | Retry the candidate, then advance if floating. |
+| `refusal` | Fail without automatic retry or fallback; retain audit details for manual retry. |
 | `bad_request`, `protocol` | Fail immediately. |
 
 Classification uses structured provider codes before status/message
@@ -594,6 +601,18 @@ heuristics. HTTP 413 and the structured `request_too_large` code/type explicitly
 identify request-size overflow and take precedence over other classifications,
 including generic gateway errors. Invalid or malformed successful responses are
 protocol failures, not accepted partial progress.
+
+An explicit provider refusal from any supported API is a dedicated refusal
+failure, not a retryable provider error: Mu does not automatically retry it or
+advance a floating provider choice. The audit retains provider-native refusal
+details and usage when available, without accepting assistant content or
+executing tools. The invocation exits 1 with a diagnostic on stderr; the
+persisted failure remains available to a later manual `mu retry`. Refusal
+classification uses explicit provider refusal signals, never textual phrase
+matching.
+Refusal-like prose without a native refusal signal remains ordinary assistant
+output. Once a refusal signal is known, a later delivery interruption does not
+make it retryable.
 
 A fixed provider/model permits five retries after the initial attempt. A
 floating model permits three retries per candidate. Delays are deterministic
@@ -605,6 +624,10 @@ One known Anthropic delivery anomaly is intentionally narrow: a delta that
 references a content block no longer open is treated as transport failure so
 the bounded retry/fallback path can discard the malformed partial response.
 Other invalid content-block sequencing remains a fatal protocol error.
+
+Anthropic Messages accepts an OpenAI-style `[DONE]` sentinel appended by a
+gateway, but successful completion still requires the native `message_stop`
+event. A known refusal remains a failure even if delivery ends early.
 
 ### 7.3 Model selection
 
@@ -838,7 +861,8 @@ A default invocation runs one turn:
 
 ```text
 mu [-s ID | -c] [-m MODEL] [-a FILE ...]
-   [-o final|concise|detail|full] [--no-context] [PROMPT_FILE_OR_COMMAND]
+   [-o final|concise|detail|full] [--output-schema JSON] [--no-context]
+   [PROMPT_FILE_OR_COMMAND]
 ```
 
 Without a positional target, stdin is the complete prompt. A positional name
@@ -849,6 +873,29 @@ File-backed prompts strip the leading shebang. Discovered custom commands also
 strip supported skill frontmatter; explicit prompt files retain it. Terminal
 stdin is left unread; non-terminal stdin, when non-empty, is appended after
 `\n---\n\n` as a custom instruction.
+
+`--output-schema <JSON>` is an ordinary-turn option that supplies a
+provider-native constrained JSON response format. The argument must parse as
+JSON; Mu rejects invalid JSON before queueing the prompt. Mu passes the parsed
+schema value through unchanged: it does not check schema compatibility,
+rewrite the schema, or validate the final answer as JSON or against the schema.
+There is no schema file option; shell substitution can read a file, for
+example `--output-schema "$(cat schema.json)"`. The option is allowed with
+every `-o` presentation mode and does not change presentation.
+
+The contract is stored with the submitted turn and reconstructed unchanged on
+`mu retry`, without requiring the flag again. It is not session-global: a new
+prompt without the option resets the contract. Compaction summaries do not use
+the schema, while an in-turn continuation of the ordinary turn retains it.
+
+Providers receive their native constrained-format mapping: Chat Completions
+uses `response_format.json_schema` with `name: "mu_output"`, `strict: true`,
+and the unchanged schema; Responses uses `text.format` with the same name,
+strictness, and schema; Anthropic uses `output_config.format` with
+`type: "json_schema"` and the unchanged schema, without a strict field.
+If a schema-constrained response ends in an incomplete terminal output state,
+the turn fails nonzero. Otherwise, Mu does not parse the final answer or check
+its adherence to the schema.
 
 Management commands:
 
@@ -917,6 +964,13 @@ incomplete work, or complete. Array position is authoritative. Replay origin
 derives from the associated provider request after completion-time validation;
 the request recipe records the exact replay-origin selection so reconstruction
 remains stable across configuration changes.
+
+The queued ordinary turn stores its optional output-schema contract so every
+request and retry in that turn can reconstruct it. It is not session-wide.
+Compaction requests omit the schema, but continuation requests for the
+ordinary turn retain it. A refusal is recorded as a dedicated provider
+failure, with native refusal details and usage when available and no accepted
+assistant message or executable tool call.
 
 The journal format is version 4. It deliberately does not read version 3.
 Context epoch at event sequence `S` is the number of valid prior
@@ -1124,6 +1178,11 @@ Exit status:
 - `3`: Bash command trapped before execution;
 - `128 + signal`: forwarded terminating signal, commonly 130 for SIGINT and
   143 for SIGTERM.
+
+Fatal diagnostics, including session-busy and final-mode failures, are written
+to stderr. In `final` mode stdout remains empty on failure, except that a
+trapped call prints its forced full block and exits 3. Previously streamed
+non-final assistant output is not retracted.
 
 Mu cannot pause and resume a partial provider stream. Resume always restarts
 from the last completed semantic boundary.

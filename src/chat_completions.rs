@@ -28,6 +28,7 @@ struct ChunkChoice {
 #[derive(Debug, Deserialize, Default)]
 struct ChunkDelta {
     content: Option<String>,
+    refusal: Option<String>,
     reasoning_content: Option<Value>,
     tool_calls: Option<Vec<ToolCallDelta>>,
 }
@@ -82,6 +83,7 @@ type ToolCallAccumulator = BTreeMap<usize, (Option<String>, Option<String>, Stri
 #[derive(Default)]
 struct StreamParseState {
     content: String,
+    refusal: Option<String>,
     reasoning_content: Option<String>,
     tool_accum: ToolCallAccumulator,
     finish_reason: Option<FinishReason>,
@@ -96,12 +98,20 @@ pub(crate) async fn stream(
 ) -> Result<StreamResult, ProviderError> {
     let body = request.json(crate::provider::ModelApi::ChatCompletions)?;
     let mut state = StreamParseState::default();
-    provider
+    let delivery = provider
         .stream_sse(&body, &mut |event| match event {
             SseEvent::Tick => on_event(StreamEvent::Tick),
             SseEvent::Data(data) => consume_event(&data, &mut state, on_event),
         })
-        .await?;
+        .await;
+    if state.refusal.is_none() {
+        delivery?;
+        if request.output_schema.is_some() && state.finish_reason.is_none() {
+            return Err(ProviderError::Transport(
+                "Chat stream ended before a finish reason".into(),
+            ));
+        }
+    }
     if state.reasoning_active {
         on_event(StreamEvent::ReasoningEnd)?;
     }
@@ -122,6 +132,7 @@ pub(crate) async fn stream(
             "message": {
                 "role": "assistant",
                 "content": content,
+                "refusal": state.refusal,
                 "reasoning_content": reasoning_content,
                 "tool_calls": tool_calls.as_ref().map(|calls| calls.iter().map(|call| serde_json::json!({
                     "id": &call.id,
@@ -132,10 +143,11 @@ pub(crate) async fn stream(
                     },
                 })).collect::<Vec<_>>()),
             },
-            "finish_reason": match &finish_reason {
+            "finish_reason": match state.finish_reason.as_ref().unwrap_or(&FinishReason::Stop) {
                 FinishReason::Stop => "stop",
                 FinishReason::ToolCalls => "tool_calls",
                 FinishReason::Resume => "stop",
+                FinishReason::Refusal(_) => "refusal",
                 FinishReason::Other(reason) => reason,
             },
         }],
@@ -186,6 +198,16 @@ pub(crate) fn build_request_body(request: &Request, tools: &[Value]) -> Value {
         // nested `reasoning: { effort }` object is the Responses API shape and
         // is rejected by real OpenAI `/chat/completions`.)
         body["reasoning_effort"] = Value::String(effort.to_string());
+    }
+    if let Some(schema) = request.output_schema.as_ref() {
+        body["response_format"] = serde_json::json!({
+            "type": "json_schema",
+            "json_schema": {
+                "name": "mu_output",
+                "strict": true,
+                "schema": schema,
+            },
+        });
     }
     body
 }
@@ -394,6 +416,7 @@ fn consume_event(
             on_event(StreamEvent::ReasoningDelta(text))?;
         } else if state.reasoning_active
             && (choice.delta.content.is_some()
+                || choice.delta.refusal.is_some()
                 || choice.delta.tool_calls.is_some()
                 || choice.finish_reason.is_some())
         {
@@ -401,7 +424,16 @@ fn consume_event(
             state.reasoning_active = false;
         }
 
-        if let Some(text) = choice.delta.content.clone() {
+        if let Some(refusal) = choice.delta.refusal.as_deref() {
+            state.refusal.get_or_insert_default().push_str(refusal);
+        }
+
+        if let Some(text) = choice
+            .delta
+            .content
+            .clone()
+            .filter(|_| state.refusal.is_none())
+        {
             on_event(StreamEvent::TextDelta(text.clone()))?;
             state.content.push_str(&text);
         }
@@ -452,6 +484,13 @@ fn consume_event(
 }
 
 fn finalized_finish_reason(state: &StreamParseState) -> FinishReason {
+    if let Some(refusal) = &state.refusal {
+        return FinishReason::Refusal(if refusal.is_empty() {
+            "provider refused the request".into()
+        } else {
+            refusal.clone()
+        });
+    }
     if state.finish_reason == Some(FinishReason::Stop)
         && state
             .reasoning_content
@@ -556,6 +595,7 @@ mod tests {
             model: test_model(effort),
             cache_key: None,
             messages,
+            output_schema: None,
         }
     }
 
@@ -565,6 +605,69 @@ mod tests {
         messages: Vec<Message>,
     ) -> Result<Value, ProviderError> {
         request(effort, messages).json(api)
+    }
+
+    #[test]
+    fn passes_output_schema_in_chat_json_schema_envelope() {
+        let schema = serde_json::json!({"type":"object","properties":{"ok":{"type":"boolean"}}});
+        let mut request = request(None, vec![]);
+        request.output_schema = Some(schema.clone());
+        let body = request.json(ModelApi::ChatCompletions).unwrap();
+        assert_eq!(
+            body["response_format"],
+            serde_json::json!({
+                "type": "json_schema",
+                "json_schema": {"name":"mu_output","strict":true,"schema":schema}
+            })
+        );
+    }
+
+    #[test]
+    fn accumulates_explicit_refusal_without_text_delta() {
+        let mut state = StreamParseState::default();
+        let mut events = Vec::new();
+        consume_event(
+            r#"{"choices":[{"delta":{"refusal":"I cannot help."},"finish_reason":"stop"}],"usage":{"prompt_tokens":4,"completion_tokens":2,"total_tokens":6}}"#,
+            &mut state,
+            &mut |event| { events.push(event); Ok(()) },
+        ).unwrap();
+
+        assert_eq!(
+            finalized_finish_reason(&state),
+            FinishReason::Refusal("I cannot help.".into())
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, StreamEvent::TextDelta(_)))
+        );
+        assert_eq!(state.usage.as_ref().unwrap().total_tokens, 6);
+    }
+
+    #[test]
+    fn recognizes_only_documented_refusal_markers() {
+        let mut state = StreamParseState::default();
+        consume_event(
+            r#"{"choices":[{"delta":{"refusal":""},"finish_reason":"stop"}]}"#,
+            &mut state,
+            &mut |_| Ok(()),
+        )
+        .unwrap();
+        assert!(matches!(
+            finalized_finish_reason(&state),
+            FinishReason::Refusal(_)
+        ));
+        let mut state = StreamParseState::default();
+        consume_event(
+            r#"{"choices":[{"delta":{},"finish_reason":"refusal"}]}"#,
+            &mut state,
+            &mut |_| Ok(()),
+        )
+        .unwrap();
+        assert_eq!(
+            finalized_finish_reason(&state),
+            FinishReason::Other("refusal".into())
+        );
     }
 
     #[test]

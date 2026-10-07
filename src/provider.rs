@@ -352,6 +352,7 @@ pub struct Request {
     pub model: ResolvedModelRef,
     pub cache_key: Option<String>,
     pub messages: Vec<Message>,
+    pub output_schema: Option<Value>,
 }
 
 impl Request {
@@ -866,6 +867,7 @@ pub enum FinishReason {
     Stop,
     ToolCalls,
     Resume,
+    Refusal(String),
     Other(String),
 }
 
@@ -897,6 +899,9 @@ pub enum ProviderError {
         status: Option<u16>,
         detail: String,
     },
+    Refusal {
+        detail: String,
+    },
     Transport(String),
     Protocol(String),
 }
@@ -922,6 +927,7 @@ impl fmt::Display for ProviderError {
             Self::ModelUnavailable { detail } | Self::AuthFailed { detail } => {
                 formatter.write_str(detail)
             }
+            Self::Refusal { detail } => write!(formatter, "provider refusal: {detail}"),
             Self::Overloaded {
                 status,
                 retry_after,
@@ -955,6 +961,7 @@ impl ProviderError {
             Self::Overloaded { .. } => "overloaded",
             Self::RateLimit { .. } => "rate_limit",
             Self::BadRequestPermanent { .. } => "bad_request",
+            Self::Refusal { .. } => "refusal",
             Self::Transport(_) => "transport",
             Self::Protocol(_) => "protocol",
         }
@@ -969,7 +976,9 @@ impl ProviderError {
             Self::Overloaded { .. } | Self::RateLimit { .. } | Self::Transport(_) => {
                 ProviderDisposition::Retry
             }
-            Self::BadRequestPermanent { .. } | Self::Protocol(_) => ProviderDisposition::Fail,
+            Self::BadRequestPermanent { .. } | Self::Refusal { .. } | Self::Protocol(_) => {
+                ProviderDisposition::Fail
+            }
         }
     }
 
@@ -1161,6 +1170,28 @@ fn classify_provider_error(
             &nested.to_string(),
             retry_after,
         );
+    }
+
+    let param = error.get("param").and_then(Value::as_str);
+    if code_is("invalid_json_schema")
+        || param.is_some_and(|param| {
+            matches!(
+                param,
+                "text.format.schema"
+                    | "response_format"
+                    | "response_format.json_schema.schema"
+                    | "output_config.format.schema"
+            )
+        })
+        || (error_type == "invalid_request_error"
+            && message.starts_with("output_config.format.schema:"))
+    {
+        let detail = if let Some(param) = param {
+            format!("{param}: {detail}")
+        } else {
+            detail
+        };
+        return ProviderError::BadRequestPermanent { status, detail };
     }
 
     if code_is("context_length_exceeded") || code_is("string_above_max_length") {
@@ -1788,6 +1819,17 @@ mod tests {
     }
 
     #[test]
+    fn refusal_error_is_a_terminal_refusal_diagnostic() {
+        let error = ProviderError::Refusal {
+            detail: "explicit refusal".into(),
+        };
+        assert_eq!(error.class(), "refusal");
+        assert_eq!(error.disposition(), ProviderDisposition::Fail);
+        assert_eq!(error.to_string(), "provider refusal: explicit refusal");
+        assert_eq!(error.diagnostic()["message"], error.to_string());
+    }
+
+    #[test]
     fn classifies_gateway_wrappers_and_rejects_weak_context_phrases() {
         let wrapped_auth = serde_json::json!({
             "error": {
@@ -1846,6 +1888,24 @@ mod tests {
                 None
             ),
             ProviderError::ContextLength { .. }
+        ));
+    }
+
+    #[test]
+    fn schema_errors_remain_permanent_through_gateway_wrappers() {
+        let upstream = serde_json::json!({"error": {
+            "type":"invalid_request_error", "code":"invalid_json_schema", "param":"text.format.schema",
+            "message":"Invalid schema: input context maximum exceeded"
+        }});
+        let wrapper = serde_json::json!({"error": {"code":400,"message":"Provider returned error","metadata":{"raw":upstream.to_string()}}});
+        let error = classify_http_error(400, wrapper.to_string(), None);
+        assert!(matches!(error, ProviderError::BadRequestPermanent { .. }));
+        assert_eq!(error.disposition(), ProviderDisposition::Fail);
+        assert!(error.to_string().contains("text.format.schema"));
+        let anthropic = serde_json::json!({"error": {"type":"invalid_request_error", "message":"output_config.format.schema: Invalid JSON Schema in output format"}});
+        assert!(matches!(
+            classify_http_error(400, anthropic.to_string(), None),
+            ProviderError::BadRequestPermanent { .. }
         ));
     }
 

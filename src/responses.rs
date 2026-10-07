@@ -16,25 +16,40 @@ pub(crate) async fn stream(
 ) -> Result<StreamResult, ProviderError> {
     let body = request.json(crate::provider::ModelApi::Responses)?;
     let mut state = ResponsesStreamState::default();
-    provider
+    let delivery = provider
         .stream_sse(&body, &mut |event| match event {
             SseEvent::Tick => on_event(StreamEvent::Tick),
             SseEvent::Data(data) => consume_event(&data, &mut state, on_event),
         })
-        .await?;
+        .await;
+    if state.refusal.is_none() {
+        delivery?;
+    }
     if state.reasoning_active {
         on_event(StreamEvent::ReasoningEnd)?;
     }
-    if !state.terminal {
+    if !state.terminal && state.refusal.is_none() {
         return Err(ProviderError::Transport(
             "Responses stream ended before response.completed".into(),
         ));
     }
 
-    let native_response = state.native_response;
+    let native_response = state.native_response.or_else(|| {
+        state.refusal.as_ref().map(|refusal| {
+            serde_json::json!({
+                "refusal": refusal,
+                "output": state.streamed_output.values().collect::<Vec<_>>(),
+            })
+        })
+    });
     let output = state.output;
     let mut items = responses_items(&output)?;
-    if !state.content.is_empty()
+    if let Some(refusal) = state.refusal.as_ref() {
+        items.retain(|item| !matches!(item, AssistantItem::Text { .. }));
+        state.finish_reason = Some(FinishReason::Refusal(refusal.clone()));
+    }
+    if state.refusal.is_none()
+        && !state.content.is_empty()
         && !items
             .iter()
             .any(|item| matches!(item, AssistantItem::Text { .. }))
@@ -100,6 +115,16 @@ pub(crate) fn build_request_body(
     reasoning.insert("summary".into(), Value::String("auto".into()));
     if let Some(effort) = request.model.effort.as_deref() {
         reasoning.insert("effort".into(), Value::String(effort.to_string()));
+    }
+    if let Some(schema) = request.output_schema.as_ref() {
+        body["text"] = serde_json::json!({
+            "format": {
+                "type": "json_schema",
+                "name": "mu_output",
+                "strict": true,
+                "schema": schema,
+            }
+        });
     }
     body["reasoning"] = Value::Object(reasoning);
     Ok(body)
@@ -206,6 +231,7 @@ fn responses_user_content(content: &UserContent) -> Result<Value, ProviderError>
 #[derive(Default)]
 pub(crate) struct ResponsesStreamState {
     pub(crate) content: String,
+    pub(crate) refusal: Option<String>,
     pub(crate) output: Vec<Value>,
     pub(crate) streamed_output: BTreeMap<usize, Value>,
     pub(crate) usage: Option<Usage>,
@@ -272,10 +298,20 @@ pub(crate) fn consume_event(
                 })?;
             }
         }
-        "response.output_text.delta" | "response.refusal.delta" => {
+        "response.output_text.delta" => {
             if let Some(delta) = value["delta"].as_str() {
                 state.content.push_str(delta);
                 on_event(StreamEvent::TextDelta(delta.to_string()))?;
+            }
+        }
+        "response.refusal.delta" => {
+            if let Some(delta) = value["delta"].as_str() {
+                state.refusal.get_or_insert_default().push_str(delta);
+            }
+        }
+        "response.refusal.done" => {
+            if let Some(refusal) = value["refusal"].as_str() {
+                state.refusal = Some(refusal.to_string());
             }
         }
         "response.function_call_arguments.delta" => {
@@ -296,11 +332,13 @@ pub(crate) fn consume_event(
             state.replayable = true;
             retain_native_response(state, &value["response"]);
             state.usage = responses_usage(&value["response"]["usage"]);
+            collect_refusals(&state.output, &mut state.refusal);
         }
         "response.incomplete" => {
             state.terminal = true;
             retain_native_response(state, &value["response"]);
             state.usage = responses_usage(&value["response"]["usage"]);
+            collect_refusals(&state.output, &mut state.refusal);
             let reason = value["response"]["incomplete_details"]["reason"]
                 .as_str()
                 .unwrap_or("incomplete");
@@ -312,6 +350,22 @@ pub(crate) fn consume_event(
     }
 
     Ok(())
+}
+
+fn collect_refusals(output: &[Value], refusal: &mut Option<String>) {
+    let mut complete = None::<String>;
+    for part in output
+        .iter()
+        .flat_map(|item| item["content"].as_array().into_iter().flatten())
+        .filter(|part| part["type"] == "refusal")
+    {
+        complete
+            .get_or_insert_default()
+            .push_str(part["refusal"].as_str().unwrap_or_default());
+    }
+    if complete.is_some() {
+        *refusal = complete;
+    }
 }
 
 fn merge_output_item(output: &mut BTreeMap<usize, Value>, index: usize, item: &Value) {
@@ -417,7 +471,6 @@ fn responses_items(output: &[Value]) -> Result<Vec<AssistantItem>, ProviderError
                 for part in item["content"].as_array().into_iter().flatten() {
                     let text = match part["type"].as_str() {
                         Some("output_text") => part["text"].as_str(),
-                        Some("refusal") => part["refusal"].as_str(),
                         _ => None,
                     };
                     if let Some(text) = text {
@@ -476,7 +529,8 @@ mod tests {
             consume(&mut state, &mut events, data).unwrap();
         }
 
-        assert_eq!(state.content, "hello no");
+        assert_eq!(state.content, "hello");
+        assert_eq!(state.refusal.as_deref(), Some(" no"));
         assert!(state.terminal);
         assert!(state.replayable);
         let usage = state.usage.unwrap();
@@ -486,6 +540,28 @@ mod tests {
         assert_eq!(usage.output_tokens, 5);
         assert_eq!(usage.reasoning_output_tokens, 4);
         assert_eq!(usage.total_tokens, 17);
+    }
+
+    #[test]
+    fn passes_output_schema_in_responses_text_format_envelope() {
+        let request = Request {
+            model: crate::models::ResolvedModelRef {
+                canonical: "test/model".into(),
+                provider_id: "test".into(),
+                model_id: "model".into(),
+                effort: None,
+            },
+            cache_key: None,
+            messages: vec![],
+            output_schema: Some(serde_json::json!({"type":"object"})),
+        };
+        let body = request.json(crate::provider::ModelApi::Responses).unwrap();
+        assert_eq!(
+            body["text"]["format"],
+            serde_json::json!({
+                "type":"json_schema","name":"mu_output","strict":true,"schema":{"type":"object"}
+            })
+        );
     }
 
     #[test]
@@ -555,7 +631,7 @@ mod tests {
     }
 
     #[test]
-    fn falls_back_to_completed_output_text_and_refusals() {
+    fn falls_back_to_completed_output_text_without_projecting_refusal_text() {
         let output = serde_json::json!([
             {
                 "type": "message",
@@ -580,11 +656,10 @@ mod tests {
             items.as_slice(),
             [
                 AssistantItem::Text { text: first },
-                AssistantItem::Text { text: second },
                 AssistantItem::Reasoning { text: None },
                 AssistantItem::BashCall(ToolCall { id, .. }),
                 AssistantItem::Text { text: third },
-            ] if first == "first" && second == " second" && id == "call-1" && third == " third"
+            ] if first == "first" && id == "call-1" && third == " third"
         ));
     }
 
