@@ -19,7 +19,6 @@ set -g _MU_FISH_TRACKED_SCOPE
 set -q MU_FISH_SESSION_ID; or set -g MU_FISH_SESSION_ID
 set -g _MU_FISH_MODEL
 set -g _MU_FISH_TRAP
-set -g _MU_FISH_PENDING_ATTACHMENTS
 set -g _MU_FISH_SAVED_BIND_MODE default
 set -q _MU_FISH_DEFAULT_TAB_BINDING; or set -g _MU_FISH_DEFAULT_TAB_BINDING
 set -q _MU_FISH_INSERT_TAB_BINDING; or set -g _MU_FISH_INSERT_TAB_BINDING
@@ -121,7 +120,6 @@ function _mu_fish_clear_tracked_state
     _mu_fish_clear_session_state
     _mu_fish_clear_model_state
     _mu_fish_clear_trap_state
-    set -g _MU_FISH_PENDING_ATTACHMENTS
     set -g _MU_FISH_TRACKED_SCOPE
 end
 
@@ -280,10 +278,8 @@ end
 
 function _mu_fish_build_mode_prompt
     set -l bundle_active 0
-    set -l attachment_count 0
     if _mu_fish_bundle_active
         set bundle_active 1
-        set attachment_count (count $_MU_FISH_PENDING_ATTACHMENTS)
     end
     set -l status_json (_mu_fish_status_json | string collect)
     set -l fields
@@ -357,13 +353,6 @@ function _mu_fish_build_mode_prompt
         set_color normal
     end
 
-    if test $attachment_count -gt 0
-        printf ' '
-        set_color magenta
-        printf '[%d attachments]' "$attachment_count"
-        set_color normal
-    end
-
     if test $bundle_active -eq 1; and set -q _MU_FISH_TRAP[1]; and test -n "$_MU_FISH_TRAP"
         printf ' '
         set_color yellow
@@ -432,7 +421,7 @@ function _mu_fish_has_custom_slash_command --argument-names requested_command
 end
 
 function _mu_fish_slash_command_candidates
-    printf '%s\n' /attach /load /model /trap
+    printf '%s\n' /load /model /trap
     _mu_fish_has_active_session; and printf '%s\n' /new /retry /compact
     _mu_fish_custom_slash_commands 2>/dev/null
 end
@@ -606,42 +595,6 @@ function _mu_fish_run_slash_command --argument-names line
     set -l scope (_mu_fish_current_scope)
 
     switch "$slash_command"
-        case /attach
-            if test -z "$rest"
-                _mu_fish_activate_scope "$scope"
-                if set -q _MU_FISH_PENDING_ATTACHMENTS[1]
-                    _mu_fish_print_block_message "[mu] pending attachments: "(string join ', ' -- $_MU_FISH_PENDING_ATTACHMENTS)
-                else
-                    _mu_fish_print_block_message '[mu] no pending attachments'
-                end
-                return 0
-            end
-            if test "$rest" = --clear
-                _mu_fish_activate_scope "$scope"
-                set -g _MU_FISH_PENDING_ATTACHMENTS
-                _mu_fish_print_block_message '[mu] cleared pending attachments'
-                return 0
-            end
-            if string match -q "*\n*" -- "$rest"
-                _mu_fish_print_block_message '[mu] /attach accepts exactly one file'
-                return 1
-            end
-            set -l attachment_path "$rest"
-            if string match -q '~/*' -- "$attachment_path"
-                set attachment_path "$HOME/"(string replace -r '^~/' '' -- "$attachment_path")
-            end
-            if not test -f "$attachment_path"; or not test -r "$attachment_path"
-                _mu_fish_print_block_message "[mu] attachment is not a readable file: $rest"
-                return 1
-            end
-            set attachment_path (path resolve -- "$attachment_path")
-            _mu_fish_activate_scope "$scope"
-            set -ga _MU_FISH_PENDING_ATTACHMENTS "$attachment_path"
-            set -l count (count $_MU_FISH_PENDING_ATTACHMENTS)
-            set -l label files
-            test $count -eq 1; and set label file
-            _mu_fish_print_block_message "[mu] attached "(path basename "$attachment_path")" for the next message ($count $label)"
-
         case /model
             if test -z "$rest"
                 _mu_fish_print_block_message '[mu] usage: /model <model>'
@@ -750,15 +703,11 @@ function _mu_fish_submit_prompt --argument-names input target
     end
 
     set -l command (_mu_fish_base_command "$scope")
-    for attachment in $_MU_FISH_PENDING_ATTACHMENTS
-        set -a command -a "$attachment"
-    end
     if test -n "$target"
         set -a command "$target"
     else
         _mu_fish_record_turn_history "$input" $command
     end
-    set -g _MU_FISH_PENDING_ATTACHMENTS
 
     if test -z "$target"
         printf '%s\n' "$input" | $command
@@ -832,18 +781,6 @@ function _mu_fish_complete_slash
     set -l buffer (commandline)
     set -l cursor (commandline -C)
     set -l left (string sub --length $cursor -- "$buffer")
-
-    if string match -q '/attach *' -- "$left"
-        set -l fragment (string replace -r '^/attach ' '' -- "$left")
-        set -l escaped_fragment (string escape -- "$fragment")
-        set -l raw_candidates (complete -C "cat $escaped_fragment")
-        set -l candidates
-        for candidate in $raw_candidates
-            set -a candidates (string split -m1 \t -- "$candidate")[1]
-        end
-        _mu_fish_complete_values '/attach ' "$fragment" '' $candidates
-        return
-    end
 
     if string match -q '/model *' -- "$left"
         commandline -f complete

@@ -159,17 +159,13 @@ string replace -q '[to compact]' '' -- "$prompt"; or fail 'session prompt marks 
 set command (_mu_fish_base_command)
 assert_equal (string join \x1e -- $command) (string join \x1e -- mu -s ses_0000000a) 'builds active turn command'
 
-set attachment "$TEST_TMPDIR/file with spaces.png"
-printf image >"$attachment"
 set -g _MU_FISH_MODEL openai/gpt
-set -g _MU_FISH_PENDING_ATTACHMENTS "$attachment"
 rm -f "$capture_args" "$capture_calls"
 set -gx TEST_CAPTURE_STATUS "$TEST_TMPDIR/load-status"
 set load_output (_mu_fish_run_slash_command '/load ses_0000000b' | string collect)
 assert_equal (cat "$TEST_CAPTURE_STATUS" | string collect) 'status --json -s ses_0000000b' 'explicit /load uses one model-free status preflight'
 assert_equal "$MU_FISH_SESSION_ID" ses_0000000b '/load attaches the selected session'
 assert_equal "$_MU_FISH_MODEL" openai/gpt '/load preserves the model override'
-set -q _MU_FISH_PENDING_ATTACHMENTS[1]; or fail '/load preserves pending attachments'
 assert_contains "$load_output" 'Loaded transcript.' '/load renders the selected transcript'
 assert_contains "$load_output" '[mu] loaded session ses_0000000b' '/load confirms the selected session'
 set load_args (cat "$capture_args")
@@ -200,15 +196,12 @@ not test -e "$capture_calls"; or fail 'failed status preflight must not run tran
 _mu_fish_run_slash_command '/load ses_0000000b extra' >/dev/null; and fail '/load should accept exactly one session id'
 set -g MU_FISH_SESSION_ID ses_0000000a
 _mu_fish_clear_model_state
-set -g _MU_FISH_PENDING_ATTACHMENTS
-set -g _MU_FISH_PENDING_ATTACHMENTS "$attachment"
 rm -f "$capture_args" "$capture_stdin" "$capture_calls"
 _mu_fish_submit_prompt 'inspect this'
 assert_equal (cat "$capture_calls") x 'submits one turn'
 assert_equal (cat "$capture_stdin") 'inspect this' 'passes prompt on stdin'
 set submitted_args (cat "$capture_args")
-assert_equal (string join \x1e -- $submitted_args) (string join \x1e -- -s ses_0000000a -a "$attachment") 'forwards session and attachment'
-not set -q _MU_FISH_PENDING_ATTACHMENTS[1]; or fail 'submission clears attachments'
+assert_equal (string join \x1e -- $submitted_args) (string join \x1e -- -s ses_0000000a) 'forwards session'
 
 set replay (builtin history search --max 1 | string collect)
 assert_contains "$replay" 'true mu-history ' 'tags Fish Mu history'
@@ -220,12 +213,6 @@ fish -n -c "$replay"; or fail 'recorded Fish history is not valid Fish syntax'
 builtin history save
 set expected_history_file "$XDG_DATA_HOME/fish/$fish_history"_history
 test -f "$expected_history_file"; or fail "test history escaped isolated data directory: $expected_history_file"
-
-_mu_fish_run_slash_command "/attach $attachment"
-assert_equal "$_MU_FISH_PENDING_ATTACHMENTS[1]" "$attachment" '/attach stages resolved file'
-_mu_fish_run_slash_command /attach
-_mu_fish_run_slash_command '/attach --clear'
-not set -q _MU_FISH_PENDING_ATTACHMENTS[1]; or fail '/attach --clear clears queue'
 
 _mu_fish_run_slash_command '/model gpt'
 assert_equal "$_MU_FISH_MODEL" openai/gpt '/model stores canonical model'
@@ -267,11 +254,9 @@ assert_equal (string join \x1e -- $literal_matches) 'file*star' 'candidate match
 
 set -g MU_FISH_SESSION_ID ses_0000000a
 set -g _MU_FISH_TRACKED_SCOPE (_mu_fish_current_scope)
-_mu_fish_run_slash_command "/attach $attachment"
 _mu_fish_run_slash_command /new
 not set -q MU_FISH_SESSION_ID[1]; or fail '/new clears session'
 assert_equal "$_MU_FISH_MODEL" openai/gpt '/new preserves model override'
-set -q _MU_FISH_PENDING_ATTACHMENTS[1]; or fail '/new preserves pending attachments'
 
 rm -f "$capture_args" "$capture_stdin" "$capture_calls"
 _mu_fish_run_slash_command '/review.md First line
@@ -290,34 +275,27 @@ cd "$project_a/subdir"
 set -g _MU_FISH_TRACKED_SCOPE (_mu_fish_current_scope)
 set -g MU_FISH_SESSION_ID ses_0000000a
 set -g _MU_FISH_MODEL local/solo
-set -g _MU_FISH_PENDING_ATTACHMENTS "$attachment"
 
 cd "$project_b/subdir"
 set observed_command (_mu_fish_base_command)
 assert_equal (string join \x1e -- $observed_command) (string join \x1e -- mu) 'passive observation hides another scope bundle'
-set observed_prompt (_mu_fish_build_mode_prompt | string collect)
-not string match -q '*attachments*' -- "$observed_prompt"; or fail 'prompt hides another scope attachments'
 
 cd "$project_a/subdir"
 _mu_fish_bundle_active; or fail 'returning without an action restores the parked bundle'
 assert_equal "$MU_FISH_SESSION_ID" ses_0000000a 'returning without an action restores parked session'
 assert_equal "$_MU_FISH_MODEL" local/solo 'returning without an action restores parked model'
-assert_equal (count $_MU_FISH_PENDING_ATTACHMENTS) 1 'returning without an action restores parked attachments'
 
 cd "$project_b/subdir"
 _mu_fish_run_slash_command '/model unknown'; and fail 'invalid model elsewhere should fail'
-_mu_fish_run_slash_command "/attach $TEST_TMPDIR/missing-scope-file"; and fail 'invalid attachment elsewhere should fail'
 _mu_fish_run_slash_command '/load ses_missing'; and fail 'invalid load elsewhere should fail'
 cd "$project_a/subdir"
 assert_equal "$MU_FISH_SESSION_ID" ses_0000000a 'invalid actions elsewhere preserve parked session'
 assert_equal "$_MU_FISH_MODEL" local/solo 'invalid actions elsewhere preserve parked model'
-set -q _MU_FISH_PENDING_ATTACHMENTS[1]; or fail 'invalid actions elsewhere preserve parked attachments'
 
 cd "$project_b/subdir"
 _mu_fish_run_slash_command '/model gpt'
 not set -q MU_FISH_SESSION_ID[1]; or fail 'valid model action elsewhere invalidates parked session'
 assert_equal "$_MU_FISH_MODEL" openai/gpt 'valid model action elsewhere replaces parked model'
-not set -q _MU_FISH_PENDING_ATTACHMENTS[1]; or fail 'valid model action elsewhere invalidates parked attachments'
 assert_equal "$_MU_FISH_TRACKED_SCOPE" "project:$project_b" 'valid model action moves tracked scope'
 
 rm -f "$capture_args" "$capture_stdin" "$capture_calls" "$capture_session_args"
@@ -350,12 +328,10 @@ end
 set -g MU_FISH_SESSION_ID ses_0000000e
 set -g _MU_FISH_TRACKED_SCOPE project:/stale
 set -g _MU_FISH_MODEL stale/model
-set -g _MU_FISH_PENDING_ATTACHMENTS stale.png
 source "$TEST_ROOT/mu.fish"
 _mu_fish_bundle_active; or fail 're-sourcing adopts the documented session seed in the current scope'
 assert_equal "$MU_FISH_SESSION_ID" ses_0000000e 're-sourcing preserves the documented session seed'
 not set -q _MU_FISH_MODEL[1]; or fail 're-sourcing resets the private model'
-not set -q _MU_FISH_PENDING_ATTACHMENTS[1]; or fail 're-sourcing resets private attachments'
 _mu_fish_clear_tracked_state
 set status_prompt "$TEST_TMPDIR/status-prompt"
 false | true

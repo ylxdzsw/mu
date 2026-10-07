@@ -17,7 +17,6 @@ typeset -g _MU_ZSH_TRAP=
 typeset -g _MU_ZSH_PENDING_INPUT=
 typeset -g _MU_ZSH_PENDING_PROMPT=
 typeset -g _MU_ZSH_SPECULATIVE_MODEL_BUFFER=
-typeset -ga _MU_ZSH_PENDING_ATTACHMENTS=()
 typeset -g _MU_ZSH_ORIGINAL_PROMPT=
 typeset -g _MU_ZSH_ORIGINAL_RPROMPT=
 typeset -g _MU_ZSH_SAVED_KEYMAP=main
@@ -135,7 +134,6 @@ _mu_zsh_clear_tracked_state() {
   _mu_zsh_clear_session_state
   _mu_zsh_clear_model_state
   _mu_zsh_clear_trap_state
-  _MU_ZSH_PENDING_ATTACHMENTS=()
   _MU_ZSH_TRACKED_SCOPE=
 }
 
@@ -255,8 +253,8 @@ _mu_zsh_status_json() {
 }
 
 _mu_zsh_build_mode_prompt() {
-  local status_json model context_raw context context_source context_segment to_compact compaction_segment cwd project_root project_segment attachment_segment trap_segment
-  local clean unclean_segment bundle_active=0 attachment_count=0
+  local status_json model context_raw context context_source context_segment to_compact compaction_segment cwd project_root project_segment trap_segment
+  local clean unclean_segment bundle_active=0
   local escaped_model escaped_context escaped_project_root escaped_unclean_text
 
   # One jq pass extracts every prompt field as TSV; forking jq per field
@@ -265,7 +263,6 @@ _mu_zsh_build_mode_prompt() {
   local -a fields
   if _mu_zsh_bundle_active; then
     bundle_active=1
-    attachment_count=${#_MU_ZSH_PENDING_ATTACHMENTS[@]}
   fi
   status_json=$(_mu_zsh_status_json) || status_json=
   if [[ -n "$status_json" ]] && command -v jq >/dev/null 2>&1; then
@@ -311,11 +308,6 @@ _mu_zsh_build_mode_prompt() {
     project_segment=
   fi
 
-  if (( attachment_count )); then
-    attachment_segment=" %F{5}[${attachment_count} attachments]%f"
-  else
-    attachment_segment=
-  fi
   if (( bundle_active )) && [[ -n "$_MU_ZSH_TRAP" ]]; then
     trap_segment=" %F{3}[trap:${_MU_ZSH_TRAP}]%f"
   else
@@ -331,7 +323,7 @@ _mu_zsh_build_mode_prompt() {
     unclean_segment=
   fi
 
-  print -r -- "%F{12}${escaped_model}%f${context_segment}${compaction_segment} %F{6}${cwd}%f${project_segment}${unclean_segment}${attachment_segment}${trap_segment}
+  print -r -- "%F{12}${escaped_model}%f${context_segment}${compaction_segment} %F{6}${cwd}%f${project_segment}${unclean_segment}${trap_segment}
 mu> "
 }
 
@@ -384,7 +376,7 @@ _mu_zsh_reset_mode_prompt() {
 _mu_zsh_slash_command_candidates() {
   local -a commands
 
-  commands=(/attach /load /model /trap)
+  commands=(/load /model /trap)
   _mu_zsh_bundle_active && [[ -n "$MU_ZSH_SESSION_ID" ]] && commands+=(/new /retry /compact)
   commands+=("${(@f)$(_mu_zsh_custom_slash_commands 2>/dev/null || true)}")
 
@@ -508,8 +500,6 @@ _mu_zsh_slash_completion_context() {
     return
   fi
 
-  [[ "$left" == "/attach "* ]] && return 0
-
   [[ "$left" != *[[:space:]]* ]]
 }
 
@@ -532,8 +522,6 @@ _mu_zsh_completion_candidates() {
     return
   fi
 
-  [[ "$left" == "/attach "* ]] && return 1
-
   [[ "$left" == /* ]] || return 1
   [[ "$left" != *[[:space:]]* ]] || return 1
 
@@ -553,12 +541,6 @@ _mu_zsh_complete_candidates() {
   local left=${BUFFER[1,$CURSOR]} arg effort_suffix expl
   local group=mu-slash-command description='mu slash command' suffix=' '
   local -a candidates effort_suffixes ordering
-
-  if [[ "$adapter" == compsys && "$left" == "/attach "* ]]; then
-    compset -P '/attach '
-    _files
-    return
-  fi
 
   if [[ "$left" == "/model "* ]]; then
     # Direct native/list-choices entry points also get one local snapshot.
@@ -776,40 +758,6 @@ _mu_zsh_run_slash_command() {
   _mu_zsh_set_scope_key_for_dir "$PWD"
   scope=$REPLY
   case "$command" in
-    /attach)
-      if [[ -z "$rest" ]]; then
-        _mu_zsh_activate_scope "$scope"
-        if (( ${#_MU_ZSH_PENDING_ATTACHMENTS[@]} )); then
-          _mu_zsh_print_block_message "[mu] pending attachments: ${(j:, :)_MU_ZSH_PENDING_ATTACHMENTS}"
-        else
-          _mu_zsh_print_block_message "[mu] no pending attachments"
-        fi
-        return 0
-      fi
-      if [[ "$rest" == --clear ]]; then
-        _mu_zsh_activate_scope "$scope"
-        _MU_ZSH_PENDING_ATTACHMENTS=()
-        _mu_zsh_print_block_message "[mu] cleared pending attachments"
-        return 0
-      fi
-      if [[ "$rest" == *$'\n'* ]]; then
-        _mu_zsh_print_block_message "[mu] /attach accepts exactly one file"
-        return 1
-      fi
-      local attachment_path=$rest
-      [[ "$attachment_path" == '~/'* ]] && attachment_path="${HOME:-}${attachment_path#\~}"
-      attachment_path=${attachment_path:A}
-      if [[ ! -f "$attachment_path" || ! -r "$attachment_path" ]]; then
-        _mu_zsh_print_block_message "[mu] attachment is not a readable file: $rest"
-        return 1
-      fi
-      _mu_zsh_activate_scope "$scope"
-      _MU_ZSH_PENDING_ATTACHMENTS+=("$attachment_path")
-      local attachment_count=${#_MU_ZSH_PENDING_ATTACHMENTS[@]}
-      local attachment_label=files
-      (( attachment_count == 1 )) && attachment_label=file
-      _mu_zsh_print_block_message "[mu] attached ${attachment_path:t} for the next message ($attachment_count $attachment_label)"
-      ;;
     /model)
       if [[ -z "$rest" ]]; then
         _mu_zsh_print_block_message "[mu] usage: /model <model>"
@@ -1031,7 +979,7 @@ _mu_zsh_history_down() {
 _mu_zsh_submit_prompt() {
   local input=$1
   local target=${2:-}
-  local scope attachment
+  local scope
   local -a command
 
   _mu_zsh_set_scope_key_for_dir "$PWD"
@@ -1040,16 +988,12 @@ _mu_zsh_submit_prompt() {
   [[ -n "$MU_ZSH_SESSION_ID" ]] ||
     _mu_zsh_create_session_for_scope "$scope" || return $?
   _mu_zsh_base_command command "$scope"
-  for attachment in "${_MU_ZSH_PENDING_ATTACHMENTS[@]}"; do
-    command+=(-a "$attachment")
-  done
   if [[ -n "$target" ]]; then
     command+=("$target")
   else
     # Record the actual command after model-free session creation.
     _mu_zsh_record_history "$input" "${command[@]}"
   fi
-  _MU_ZSH_PENDING_ATTACHMENTS=()
 
   if [[ -z "$target" ]]; then
     "${command[@]}" <<< "$input"

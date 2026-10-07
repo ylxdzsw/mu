@@ -488,7 +488,7 @@ The plugins provide the same product contract:
 - Ctrl-D retains normal shell EOF behavior.
 - Up/Down navigate within multiline input and then browse Mu-tagged shell
   history without mixing ordinary commands. Recalled prompts run with the
-  current session, model, scope, and attachment state.
+  current session, model, trap level, and scope.
 - Shift+Enter inserts a newline when the terminal provides a distinguishable
   key sequence.
 - Slash commands and model names use native shell completion.
@@ -504,8 +504,7 @@ Each shell integration tracks one in-memory bundle:
 - active scope;
 - optional session id;
 - optional sticky model override;
-- optional sticky trap override;
-- staged attachments.
+- optional sticky trap override.
 
 Changing directory temporarily masks a bundle from another scope. A submitted
 prompt or valid slash action activates the current scope and discards a bundle
@@ -518,16 +517,12 @@ turn, then passes that id explicitly. `MU_ZSH_SESSION_ID` or
 
 ### 6.2 Slash behavior
 
-- `/new` clears the session id but preserves shell model/trap overrides and
-  staged attachments.
+- `/new` clears the session id but preserves shell model/trap overrides.
 - `/load [<id>]` replays a session and attaches only after successful replay.
   Without an id, it selects the active scope's persisted `current-session`.
 - `/model <ref>` stores a shell-only override for later turns and retries.
 - `/trap <off|destructive|reversible|all>` stores a shell-only override for
   later turns, retries, and compaction. `/trap default` clears it.
-- `/attach <file>` stages a readable attachment; `/attach` lists and
-  `/attach --clear` discards the queue. The next ordinary prompt or custom
-  command consumes the queue.
 - `/retry` and `/compact` call the corresponding management operation.
 - Discovered custom commands accept the remainder of the slash input as their
   custom instruction.

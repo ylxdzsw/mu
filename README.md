@@ -90,7 +90,7 @@ mu> what changed in the last three commits?
 
 Type `/` to list prompt-mode commands. The common ones:
 
-- `/new` starts a new session while keeping the current model, trap level, and attachments.
+- `/new` starts a new session while keeping the current model and trap level.
 - `/load [<session-id>]` renders an existing session's transcript and attaches
   the shell to it for later turns. Without an id, it loads the active scope's
   last selected session. It uses the current output density.
@@ -98,7 +98,6 @@ Type `/` to list prompt-mode commands. The common ones:
   Use Tab to auto complete the provider, model name, and effort levels.
 - `/trap <off|destructive|reversible|all>` persistently selects the Bash trap
   level for this shell scope. `/trap default` returns to configuration.
-- `/attach <file>` adds an image or audio file to the next turn.
 - `/retry` resumes a turn interrupted by Ctrl-C, a crash, a lost connection, or
   exhausted automatic resume attempts.
 - `/compact` checkpoints a long session through a synthetic summary turn,

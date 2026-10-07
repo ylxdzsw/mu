@@ -336,23 +336,23 @@ path=("$prompt_fake_bin" $path)
 MU_ZSH_SESSION_ID=
 _MU_ZSH_TRACKED_SCOPE=
 command_candidates=("${(@f)$(_mu_zsh_slash_command_candidates)}")
-[[ "${(j:,:)command_candidates}" == "/attach,/load,/model,/trap,/review.md" ]] || fail "hides session commands without a valid session"
+[[ "${(j:,:)command_candidates}" == "/load,/model,/trap,/review.md" ]] || fail "hides session commands without a valid session"
 MU_ZSH_SESSION_ID=tracked-session
 _MU_ZSH_TRACKED_SCOPE=$(current_scope_key)
 command_candidates=("${(@f)$(_mu_zsh_slash_command_candidates)}")
-[[ "${(j:,:)command_candidates}" == "/attach,/load,/model,/trap,/new,/retry,/compact,/review.md" ]] || fail "shows session commands with a valid session: ${(j:,:)command_candidates}"
+[[ "${(j:,:)command_candidates}" == "/load,/model,/trap,/new,/retry,/compact,/review.md" ]] || fail "shows session commands with a valid session: ${(j:,:)command_candidates}"
 BUFFER="/ret"
 CURSOR=${#BUFFER}
 completion_candidates=("${(@f)$(_mu_zsh_completion_candidates)}")
-[[ "${(j:,:)completion_candidates}" == "/attach,/load,/model,/trap,/new,/retry,/compact,/review.md" ]] || fail "offers zsh the complete slash-command set: ${(j:,:)completion_candidates}"
+[[ "${(j:,:)completion_candidates}" == "/load,/model,/trap,/new,/retry,/compact,/review.md" ]] || fail "offers zsh the complete slash-command set: ${(j:,:)completion_candidates}"
 BUFFER="/M"
 CURSOR=${#BUFFER}
 completion_candidates=("${(@f)$(_mu_zsh_completion_candidates)}")
-[[ "${(j:,:)completion_candidates}" == "/attach,/load,/model,/trap,/new,/retry,/compact,/review.md" ]] || fail "leaves case matching to zsh: ${(j:,:)completion_candidates}"
+[[ "${(j:,:)completion_candidates}" == "/load,/model,/trap,/new,/retry,/compact,/review.md" ]] || fail "leaves case matching to zsh: ${(j:,:)completion_candidates}"
 BUFFER="/unknown"
 CURSOR=${#BUFFER}
 completion_candidates=("${(@f)$(_mu_zsh_completion_candidates)}")
-[[ "${(j:,:)completion_candidates}" == "/attach,/load,/model,/trap,/new,/retry,/compact,/review.md" ]] || fail "keeps freeform slash input advisory: ${(j:,:)completion_candidates}"
+[[ "${(j:,:)completion_candidates}" == "/load,/model,/trap,/new,/retry,/compact,/review.md" ]] || fail "keeps freeform slash input advisory: ${(j:,:)completion_candidates}"
 model_candidates=("${(@f)$(_mu_zsh_model_query "")}")
 [[ "${(j:,:)model_candidates}" == "solo,shared,gpt,gpt-5.6-luna,local/solo,local/shared,openai/gpt,openai/gpt-5.6-luna,openai/shared" ]] || fail "model discovery preserves provider order and deduplicates floating names"
 [[ " ${(j: :)model_candidates} " == *" openai/gpt "* ]] || fail "offers provider-qualified model"
@@ -414,11 +414,7 @@ completion_candidates=("${(@f)$(_mu_zsh_completion_candidates)}")
 [[ " ${(j: :)completion_candidates} " == *" openai/gpt:high "* ]] || fail "offers model variants to zsh from the zle buffer"
 [[ " ${(j: :)completion_candidates} " == *" local/solo:max "* ]] || fail "does not prefilter model variants in zsh"
 
-attachment_one=$tmpdir/screenshot.png
-attachment_two=$tmpdir/recording.wav
-touch -- "$attachment_one" "$attachment_two"
 _MU_ZSH_MODEL=openai/gpt
-_MU_ZSH_PENDING_ATTACHMENTS=("$attachment_one")
 rm -f "$MU_ZSH_FAKE_LOG"
 load_output=$tmpdir/load-output
 export MU_ZSH_TEST_STATUS_LOG=$tmpdir/load-status
@@ -426,7 +422,6 @@ _mu_zsh_run_slash_command "/load ses_0000000b" > "$load_output"
 [[ $(<"$MU_ZSH_TEST_STATUS_LOG") == 'status --json -s ses_0000000b' ]] || fail "explicit load uses one model-free status preflight"
 [[ "$MU_ZSH_SESSION_ID" == ses_0000000b ]] || fail "load attaches the selected session"
 [[ "$_MU_ZSH_MODEL" == openai/gpt ]] || fail "load preserves the model override"
-(( ${#_MU_ZSH_PENDING_ATTACHMENTS[@]} == 1 )) || fail "load preserves pending attachments"
 grep -Fq -- "Loaded transcript." "$load_output" || fail "load renders the selected transcript"
 grep -Fq -- "[mu] loaded session ses_0000000b" "$load_output" || fail "load confirms the selected session"
 grep -Fq -- "transcript --session ses_0000000b --output concise" "$MU_ZSH_FAKE_LOG" ||
@@ -464,32 +459,7 @@ if _mu_zsh_run_slash_command "/load ses_0000000b extra" >/dev/null; then
   fail "load should accept exactly one session id"
 fi
 MU_ZSH_SESSION_ID=tracked-session
-_MU_ZSH_PENDING_ATTACHMENTS=()
-_mu_zsh_run_slash_command "/attach $attachment_one"
-_mu_zsh_run_slash_command "/attach $attachment_two"
-(( ${#_MU_ZSH_PENDING_ATTACHMENTS[@]} == 2 )) || fail "attach slash command queues repeated files"
-pending_prompt=$(_mu_zsh_build_mode_prompt)
-[[ "$pending_prompt" == *'[2 attachments]'* ]] || fail "prompt shows pending attachment count"
-_mu_zsh_run_slash_command "/model gpt"
-(( ${#_MU_ZSH_PENDING_ATTACHMENTS[@]} == 2 )) || fail "model command preserves pending attachments"
 _mu_zsh_clear_model_state
-rm -f "$MU_ZSH_FAKE_LOG"
-_mu_zsh_submit_prompt "inspect these"
-grep -Fq -- "-a $attachment_one -a $attachment_two" "$MU_ZSH_FAKE_LOG" || fail "prompt forwards every pending attachment"
-(( ${#_MU_ZSH_PENDING_ATTACHMENTS[@]} == 0 )) || fail "prompt consumes pending attachments"
-
-_mu_zsh_run_slash_command "/attach $attachment_one"
-rm -f "$MU_ZSH_FAKE_LOG"
-_mu_zsh_run_slash_command "/review.md Inspect image"
-grep -Fq -- "-a $attachment_one review.md" "$MU_ZSH_FAKE_LOG" || fail "custom command forwards pending attachments"
-(( ${#_MU_ZSH_PENDING_ATTACHMENTS[@]} == 0 )) || fail "custom command consumes pending attachments"
-
-_mu_zsh_run_slash_command "/attach $attachment_one"
-_mu_zsh_run_slash_command "/attach --clear"
-(( ${#_MU_ZSH_PENDING_ATTACHMENTS[@]} == 0 )) || fail "attach clear discards pending attachments"
-if _mu_zsh_run_slash_command "/attach $tmpdir/missing.png"; then
-  fail "attach should reject unreadable files"
-fi
 
 rm -f "$MU_ZSH_FAKE_LOG"
 _mu_zsh_run_slash_command "/retry"
@@ -519,13 +489,10 @@ _mu_zsh_run_slash_command $'/review.md First line\nSecond line'
 custom_prompt=$(cat "$MU_ZSH_FAKE_LOG")
 [[ "$custom_prompt" == *$'prompt=First line\nSecond line'* ]] || fail "custom slash command preserves multiline instruction"
 _mu_zsh_run_slash_command "/model gpt"
-_mu_zsh_run_slash_command "/attach $attachment_one"
 _mu_zsh_run_slash_command "/new"
 [[ -z "$MU_ZSH_SESSION_ID" && -n "$_MU_ZSH_TRACKED_SCOPE" ]] || fail "new slash command lazily clears only the tracked session"
 [[ "$_MU_ZSH_MODEL" == openai/gpt ]] || fail "new slash command preserves the model override"
-(( ${#_MU_ZSH_PENDING_ATTACHMENTS[@]} == 1 )) || fail "new slash command preserves pending attachments"
 _mu_zsh_clear_model_state
-_MU_ZSH_PENDING_ATTACHMENTS=()
 rm -f "$MU_ZSH_FAKE_LOG"
 _mu_zsh_run_slash_command "/review.md"
 [[ "$MU_ZSH_SESSION_ID" == "ses_01234567" ]] || fail "custom slash command captures new session id"
@@ -619,13 +586,10 @@ _mu_zsh_submit_prompt "project a prompt"
 [[ "$MU_ZSH_SESSION_ID" == "ses_0000000a" ]] || fail "creates a scoped session for the first project"
 
 _MU_ZSH_MODEL=model-for-a
-_MU_ZSH_PENDING_ATTACHMENTS=("$attachment_one")
 
 builtin cd "$project_b/subdir"
 _mu_zsh_base_command _MU_ZSH_TEST_COMMAND_REPLY
 assert_command_reply "does not reuse another project's session before submitting there" mu
-parked_prompt=$(_mu_zsh_build_mode_prompt)
-[[ "$parked_prompt" != *'[1 attachments]'* ]] || fail "prompt hides another scope's attachments"
 : > "$MU_ZSH_SCOPE_LOG"
 status_json=$(_mu_zsh_status_json)
 [[ "$status_json" == *"\"project_root\":\"$project_b\""* ]] || fail "status follows the current project"
@@ -634,29 +598,21 @@ status_json=$(_mu_zsh_status_json)
 builtin cd "$project_a/subdir"
 _mu_zsh_base_command _MU_ZSH_TEST_COMMAND_REPLY
 assert_command_reply "returns to the original scoped session and model after cd-ing back" mu -s ses_0000000a --model model-for-a
-(( ${#_MU_ZSH_PENDING_ATTACHMENTS[@]} == 1 )) || fail "passive scope observation preserves parked attachments"
-restored_prompt=$(_mu_zsh_build_mode_prompt)
-[[ "$restored_prompt" == *'[1 attachments]'* ]] || fail "prompt restores parked attachments in their scope"
 
 builtin cd "$project_b/subdir"
 if _mu_zsh_run_slash_command "/model invalid/model"; then
   fail "invalid model in another scope should fail"
-fi
-if _mu_zsh_run_slash_command "/attach $tmpdir/missing-scope-file"; then
-  fail "invalid attachment in another scope should fail"
 fi
 if _mu_zsh_run_slash_command "/load ses_missing"; then
   fail "invalid load in another scope should fail"
 fi
 builtin cd "$project_a/subdir"
 [[ "$MU_ZSH_SESSION_ID" == "ses_0000000a" && "$_MU_ZSH_MODEL" == model-for-a ]] || fail "invalid actions elsewhere preserve parked session and model"
-(( ${#_MU_ZSH_PENDING_ATTACHMENTS[@]} == 1 )) || fail "invalid actions elsewhere preserve parked attachments"
 
 builtin cd "$project_b/subdir"
 _mu_zsh_run_slash_command "/model model-for-b"
 [[ -z "$MU_ZSH_SESSION_ID" ]] || fail "valid model action elsewhere invalidates the parked session"
 [[ "$_MU_ZSH_MODEL" == model-for-b ]] || fail "valid model action elsewhere replaces the parked model"
-(( ${#_MU_ZSH_PENDING_ATTACHMENTS[@]} == 0 )) || fail "valid model action elsewhere invalidates parked attachments"
 [[ "$_MU_ZSH_TRACKED_SCOPE" == "project:$project_b" ]] || fail "valid model action moves the tracked scope"
 
 : > "$MU_ZSH_SCOPE_LOG"
@@ -677,11 +633,10 @@ rm -f "$MU_ZSH_SCOPE_LOG"
 MU_ZSH_SESSION_ID=ses_0000000e
 _MU_ZSH_TRACKED_SCOPE=project:/stale
 _MU_ZSH_MODEL=stale/model
-_MU_ZSH_PENDING_ATTACHMENTS=(stale.png)
 source "$root/mu.zsh"
 _mu_zsh_bundle_active || fail "re-sourcing adopts the documented session seed in the current scope"
 [[ "$MU_ZSH_SESSION_ID" == ses_0000000e ]] || fail "re-sourcing preserves the documented session seed"
-[[ -z "$_MU_ZSH_MODEL" && ${#_MU_ZSH_PENDING_ATTACHMENTS[@]} -eq 0 ]] || fail "re-sourcing resets private bundle state"
+[[ -z "$_MU_ZSH_MODEL" ]] || fail "re-sourcing resets private bundle state"
 _mu_zsh_clear_tracked_state
 
 if [[ ${MU_ZSH_SKIP_PTY:-0} == 1 ]]; then
