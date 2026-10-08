@@ -1041,8 +1041,15 @@ fn load_prompt_with_stdin(
             } else {
                 "prompt file"
             };
-            let raw = std::fs::read_to_string(path)
-                .with_context(|| format!("reading {kind} {}", path.display()))?;
+            let read_path = std::path::absolute(path)?;
+            let raw = std::fs::read_to_string(&read_path).map_err(|error| {
+                let message = if error.kind() == io::ErrorKind::NotFound {
+                    format!("{kind} not found: {}", read_path.display())
+                } else {
+                    format!("cannot read {kind} {}: {error}", read_path.display())
+                };
+                anyhow::Error::new(error).context(message)
+            })?;
             let shebang = skills::parse_mu_shebang(raw.lines().next().unwrap_or_default())
                 .with_context(|| format!("invalid {kind} {} shebang", path.display()))?;
             let body = if is_command {
