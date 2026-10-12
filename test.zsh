@@ -307,18 +307,18 @@ _mu_zsh_base_command _MU_ZSH_TEST_COMMAND_REPLY
 assert_command_reply "builds new-session command" mu
 path=("$prompt_fake_bin" $path)
 
-_MU_ZSH_MODEL=openai/gpt
+_MU_ZSH_MODEL=openai/gpt:high@fast
 _MU_ZSH_TRACKED_SCOPE=$(current_scope_key)
 _mu_zsh_base_command _MU_ZSH_TEST_COMMAND_REPLY
-assert_command_reply "builds pending-model command" mu --model openai/gpt
+assert_command_reply "builds pending-model command" mu --model openai/gpt:high@fast
 status_json=$(_mu_zsh_status_json)
-[[ "$status_json" == *"\"canonical\":\"openai/gpt\""* ]] || fail "status uses pending model"
+[[ "$status_json" == *"\"canonical\":\"openai/gpt:high@fast\""* ]] || fail "status uses pending model suffix"
 MU_ZSH_SESSION_ID=abc123
 _mu_zsh_base_command _MU_ZSH_TEST_COMMAND_REPLY
-assert_command_reply "builds attached pending-model command" mu -s abc123 --model openai/gpt
+assert_command_reply "builds attached pending-model command" mu -s abc123 --model openai/gpt:high@fast
 _MU_ZSH_TRAP=all
 _mu_zsh_base_command _MU_ZSH_TEST_COMMAND_REPLY
-assert_command_reply "builds attached trap command" mu -s abc123 --model openai/gpt --trap all
+assert_command_reply "builds attached trap command" mu -s abc123 --model openai/gpt:high@fast --trap all
 _MU_ZSH_TRAP=
 _mu_zsh_clear_model_state
 _mu_zsh_clear_session_state
@@ -367,6 +367,14 @@ model_candidates=("${(@f)$(_mu_zsh_model_query "")}")
 [[ " ${(j: :)model_candidates} " == *" local/shared "* ]] || fail "offers other ambiguous model qualified"
 [[ " ${(j: :)model_candidates} " == *" shared "* ]] || fail "offers shared model as floating choice"
 [[ " ${(j: :)model_candidates} " != *":low "* ]] || fail "does not show variants before colon"
+model_suffix_candidates=("${(@f)$(_mu_zsh_model_query "gpt@")}")
+[[ " ${(j: :)model_suffix_candidates} " == *" gpt@fast "* && " ${(j: :)model_suffix_candidates} " == *" gpt@standard "* ]] || fail "completes fast and standard for bare model refs"
+qualified_suffix_candidates=("${(@f)$(_mu_zsh_model_query "openai/gpt@")}")
+[[ " ${(j: :)qualified_suffix_candidates} " == *" openai/gpt@fast "* && " ${(j: :)qualified_suffix_candidates} " == *" openai/gpt@standard "* ]] || fail "completes suffixes for provider-qualified model refs"
+effort_suffix_candidates=("${(@f)$(_mu_zsh_model_query "gpt:custom@")}")
+[[ " ${(j: :)effort_suffix_candidates} " == *" gpt:custom@fast "* && " ${(j: :)effort_suffix_candidates} " == *" gpt:custom@standard "* ]] || fail "completes suffixes for effort refs"
+post_suffix_candidates=("${(@f)$(_mu_zsh_model_query "gpt@high")}")
+[[ " ${(j: :)post_suffix_candidates} " == *" gpt@fast "* && " ${(j: :)post_suffix_candidates} " != *":high"* ]] || fail "does not interpret text after @ as an effort"
 model_candidates=("${(@f)$(_mu_zsh_model_query "gpt")}")
 [[ " ${(j: :)model_candidates} " == *" gpt "* ]] || fail "keeps all base models available for zsh matching"
 [[ " ${(j: :)model_candidates} " != *":high "* ]] || fail "does not show variants until colon"
@@ -417,6 +425,10 @@ CURSOR=${#BUFFER}
 completion_candidates=("${(@f)$(_mu_zsh_completion_candidates)}")
 [[ " ${(j: :)completion_candidates} " == *" openai/gpt:high "* ]] || fail "offers model variants to zsh from the zle buffer"
 [[ " ${(j: :)completion_candidates} " == *" local/solo:max "* ]] || fail "does not prefilter model variants in zsh"
+BUFFER="/model openai/gpt:high@f"
+CURSOR=${#BUFFER}
+completion_candidates=("${(@f)$(_mu_zsh_completion_candidates)}")
+[[ " ${(j: :)completion_candidates} " == *" openai/gpt:high@fast "* ]] || fail "offers suffix candidates for effort refs from the zle buffer"
 
 _MU_ZSH_MODEL=openai/gpt
 rm -f "$MU_ZSH_FAKE_LOG"
@@ -515,8 +527,8 @@ fi
 if _mu_zsh_run_slash_command "/unknown"; then
   fail "unknown slash command should fail"
 fi
-_mu_zsh_run_slash_command "/model gpt"
-[[ "$_MU_ZSH_MODEL" == openai/gpt ]] || fail "model slash command records canonical model"
+_mu_zsh_run_slash_command "/model openai/gpt:high@fast"
+[[ "$_MU_ZSH_MODEL" == openai/gpt:high@fast ]] || fail "model slash command records canonical model suffix"
 [[ "$_MU_ZSH_TRACKED_SCOPE" == "$(current_scope_key)" ]] || fail "model slash command records scope"
 if _mu_zsh_run_slash_command "/model invalid/model"; then
   fail "model slash command should validate model refs"
@@ -614,9 +626,9 @@ builtin cd "$project_a/subdir"
 [[ "$MU_ZSH_SESSION_ID" == "ses_0000000a" && "$_MU_ZSH_MODEL" == model-for-a ]] || fail "invalid actions elsewhere preserve parked session and model"
 
 builtin cd "$project_b/subdir"
-_mu_zsh_run_slash_command "/model model-for-b"
+_mu_zsh_run_slash_command "/model openai/gpt:high@fast"
 [[ -z "$MU_ZSH_SESSION_ID" ]] || fail "valid model action elsewhere invalidates the parked session"
-[[ "$_MU_ZSH_MODEL" == model-for-b ]] || fail "valid model action elsewhere replaces the parked model"
+[[ "$_MU_ZSH_MODEL" == openai/gpt:high@fast ]] || fail "valid model action elsewhere replaces the parked model with its suffix"
 [[ "$_MU_ZSH_TRACKED_SCOPE" == "project:$project_b" ]] || fail "valid model action moves the tracked scope"
 
 : > "$MU_ZSH_SCOPE_LOG"
@@ -624,7 +636,7 @@ _mu_zsh_submit_prompt "project b prompt"
 [[ "$MU_ZSH_SESSION_ID" == "ses_0000000b" ]] || fail "creates a new scoped session after submitting in the second project"
 [[ "$_MU_ZSH_TRACKED_SCOPE" == "project:$project_b" ]] || fail "keeps the tracked scope after starting in the second project"
 grep -Fxq -- "$project_b/subdir :: new" "$MU_ZSH_SCOPE_LOG" || fail "creates an empty session without forwarding the model override"
-grep -Fq -- "$project_b/subdir :: -s ses_0000000b --model model-for-b" "$MU_ZSH_SCOPE_LOG" || fail "forwards the model override on the first real turn"
+grep -Fq -- "$project_b/subdir :: -s ses_0000000b --model openai/gpt:high@fast" "$MU_ZSH_SCOPE_LOG" || fail "forwards the suffixed model override on the first real turn"
 
 builtin cd "$project_a/subdir"
 _mu_zsh_base_command _MU_ZSH_TEST_COMMAND_REPLY

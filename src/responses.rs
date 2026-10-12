@@ -556,6 +556,7 @@ mod tests {
                 provider_id: "test".into(),
                 model_id: "model".into(),
                 effort: None,
+                processing: None,
             },
             cache_key: None,
             messages: vec![],

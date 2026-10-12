@@ -345,6 +345,19 @@ impl ModelApi {
             Self::AnthropicMessages => "anthropic.messages.v1",
         }
     }
+
+    pub fn validate_processing(
+        self,
+        processing: Option<crate::models::Processing>,
+    ) -> Result<(), ProviderError> {
+        if processing.is_some() && self == Self::AnthropicMessages {
+            return Err(ProviderError::BadRequestPermanent {
+                status: None,
+                detail: "processing suffixes are supported only by Chat Completions and Responses; Messages tier mapping is not supported".into(),
+            });
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug)]
@@ -357,6 +370,7 @@ pub struct Request {
 
 impl Request {
     pub fn json(&self, api: ModelApi) -> Result<Value, ProviderError> {
+        api.validate_processing(self.model.processing)?;
         let description = crate::bash::description();
         let parameters = crate::bash::parameters_schema();
         // Bump ModelApi request formats when this wire definition changes.
@@ -383,13 +397,17 @@ impl Request {
                 "input_schema": parameters,
             }),
         }];
-        match api {
+        let mut body = match api {
             ModelApi::ChatCompletions => {
                 Ok(crate::chat_completions::build_request_body(self, &tools))
             }
             ModelApi::Responses => crate::responses::build_request_body(self, &tools),
             ModelApi::AnthropicMessages => crate::anthropic::build_request_body(self, &tools),
+        }?;
+        if let Some(processing) = self.model.processing {
+            body["service_tier"] = Value::String(processing.service_tier().into());
         }
+        Ok(body)
     }
 }
 
@@ -837,6 +855,18 @@ pub struct StreamResult {
     pub finish_reason: FinishReason,
     pub usage: Option<Usage>,
     pub native_response: Option<Value>,
+}
+
+pub fn reported_service_tier(response: Option<&Value>) -> Option<&str> {
+    let response = response?;
+    response
+        .get("service_tier")
+        .and_then(Value::as_str)
+        .or_else(|| {
+            response
+                .pointer("/usage/service_tier")
+                .and_then(Value::as_str)
+        })
 }
 
 #[derive(Debug, Clone)]
@@ -1547,6 +1577,7 @@ mod tests {
             provider_id: "target".into(),
             model_id: "target-model".into(),
             effort: None,
+            processing: None,
         }
     }
 

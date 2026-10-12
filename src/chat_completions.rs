@@ -15,6 +15,7 @@ struct ChunkResponse {
     #[serde(default)]
     choices: Vec<ChunkChoice>,
     usage: Option<UsageJson>,
+    service_tier: Option<String>,
     #[serde(default)]
     error: Option<Value>,
 }
@@ -88,6 +89,7 @@ struct StreamParseState {
     tool_accum: ToolCallAccumulator,
     finish_reason: Option<FinishReason>,
     usage: Option<Usage>,
+    service_tier: Option<String>,
     reasoning_active: bool,
 }
 
@@ -127,6 +129,7 @@ pub(crate) async fn stream(
     let native_response = Some(serde_json::json!({
         "object": "chat.completion",
         "model": request.model.model_id,
+        "service_tier": state.service_tier,
         "choices": [{
             "index": 0,
             "message": {
@@ -373,6 +376,10 @@ fn consume_event(
         return Err(classify_stream_error(&error));
     }
 
+    if let Some(tier) = parsed.service_tier {
+        state.service_tier = Some(tier);
+    }
+
     if let Some(u) = parsed.usage {
         let prompt_tokens_details = u.prompt_tokens_details.unwrap_or_default();
         let completion_tokens_details = u.completion_tokens_details.unwrap_or_default();
@@ -583,6 +590,7 @@ mod tests {
             provider_id: "test".into(),
             model_id: "gpt-test".into(),
             effort: effort.map(str::to_string),
+            processing: None,
         }
     }
 
@@ -616,6 +624,68 @@ mod tests {
                 "json_schema": {"name":"mu_output","strict":true,"schema":schema}
             })
         );
+    }
+
+    #[test]
+    fn processing_maps_to_openai_service_tiers_without_changing_model_or_effort() {
+        use crate::models::Processing;
+        for processing in [None, Some(Processing::Fast), Some(Processing::Standard)] {
+            let mut request = request(
+                Some("high"),
+                vec![Message::System {
+                    content: "system".into(),
+                }],
+            );
+            request.model.processing = processing;
+            for api in [ModelApi::ChatCompletions, ModelApi::Responses] {
+                let body = request.json(api).unwrap();
+                assert_eq!(body["model"], "gpt-test");
+                assert_eq!(
+                    body.get("service_tier").and_then(Value::as_str),
+                    processing.map(Processing::service_tier)
+                );
+                assert_eq!(
+                    body.pointer(if api == ModelApi::Responses {
+                        "/reasoning/effort"
+                    } else {
+                        "/reasoning_effort"
+                    })
+                    .unwrap(),
+                    "high"
+                );
+            }
+            if processing.is_some() {
+                assert_eq!(
+                    request
+                        .json(ModelApi::AnthropicMessages)
+                        .unwrap_err()
+                        .class(),
+                    "bad_request"
+                );
+            } else {
+                assert!(request.json(ModelApi::AnthropicMessages).is_ok());
+            }
+        }
+    }
+
+    #[test]
+    fn processing_metadata_retains_reported_tier_across_chunks() {
+        let mut state = StreamParseState::default();
+        for chunk in [
+            r#"{"choices":[],"service_tier":"default"}"#,
+            r#"{"choices":[{"delta":{"content":"done"},"finish_reason":"stop"}]}"#,
+        ] {
+            consume_event(chunk, &mut state, &mut |_| Ok(())).unwrap();
+        }
+        assert_eq!(state.service_tier.as_deref(), Some("default"));
+        let mut missing = StreamParseState::default();
+        consume_event(
+            r#"{"choices":[],"service_tier":null}"#,
+            &mut missing,
+            &mut |_| Ok(()),
+        )
+        .unwrap();
+        assert!(missing.service_tier.is_none());
     }
 
     #[test]

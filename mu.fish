@@ -448,6 +448,38 @@ function _mu_fish_model_candidates --argument-names fragment
     test (count $records) -gt 0; or return 0
 
     set -l matches
+    if string match -q '*@*' -- "$fragment"
+        set -l reference (string replace -r '@.*$' '' -- "$fragment")
+        if string match -q '*:*' -- "$reference"
+            set -l model_prefix (string replace -r ':.*$' '' -- "$reference")
+            set -l effort_prefix (string replace -r '^[^:]*:' '' -- "$reference")
+            test -n "$effort_prefix"; or return 0
+            for field_index in 2 1
+                for record in $records
+                    set -l fields (string split \t -- "$record")
+                    set -l model "$fields[$field_index]"
+                    test -n "$model"; or continue
+                    string match -q "$model_prefix*" -- "$model"; or continue
+                    contains -- "$model:$effort_prefix@fast" $matches; or set -a matches "$model:$effort_prefix@fast"
+                    contains -- "$model:$effort_prefix@standard" $matches; or set -a matches "$model:$effort_prefix@standard"
+                end
+            end
+        else
+            for field_index in 2 1
+                for record in $records
+                    set -l fields (string split \t -- "$record")
+                    set -l model "$fields[$field_index]"
+                    test -n "$model"; or continue
+                    string match -q "$reference*" -- "$model"; or continue
+                    contains -- "$model@fast" $matches; or set -a matches "$model@fast"
+                    contains -- "$model@standard" $matches; or set -a matches "$model@standard"
+                end
+            end
+        end
+        printf '%s\n' $matches
+        return 0
+    end
+
     for field_index in 2 1
         for record in $records
             set -l fields (string split \t -- "$record")

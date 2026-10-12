@@ -195,13 +195,13 @@ assert_equal "$MU_FISH_SESSION_ID" ses_0000000d 'failed load preserves the attac
 not test -e "$capture_calls"; or fail 'failed status preflight must not run transcript'
 _mu_fish_run_slash_command '/load ses_0000000b extra' >/dev/null; and fail '/load should accept exactly one session id'
 set -g MU_FISH_SESSION_ID ses_0000000a
-_mu_fish_clear_model_state
+set -g _MU_FISH_MODEL openai/gpt:high@fast
 rm -f "$capture_args" "$capture_stdin" "$capture_calls"
 _mu_fish_submit_prompt 'inspect this'
 assert_equal (cat "$capture_calls") x 'submits one turn'
 assert_equal (cat "$capture_stdin") 'inspect this' 'passes prompt on stdin'
 set submitted_args (cat "$capture_args")
-assert_equal (string join \x1e -- $submitted_args) (string join \x1e -- -s ses_0000000a) 'forwards session'
+assert_equal (string join \x1e -- $submitted_args) (string join \x1e -- -s ses_0000000a --model openai/gpt:high@fast) 'forwards the suffixed model with the session'
 
 set replay (builtin history search --max 1 | string collect)
 assert_contains "$replay" 'true mu-history ' 'tags Fish Mu history'
@@ -214,8 +214,8 @@ builtin history save
 set expected_history_file "$XDG_DATA_HOME/fish/$fish_history"_history
 test -f "$expected_history_file"; or fail "test history escaped isolated data directory: $expected_history_file"
 
-_mu_fish_run_slash_command '/model gpt'
-assert_equal "$_MU_FISH_MODEL" openai/gpt '/model stores canonical model'
+_mu_fish_run_slash_command '/model openai/gpt:high@fast'
+assert_equal "$_MU_FISH_MODEL" openai/gpt:high@fast '/model stores canonical model suffix'
 _mu_fish_run_slash_command '/model unknown'; and fail '/model should reject unknown model'
 _mu_fish_run_slash_command '/trap reversible'
 assert_equal "$_MU_FISH_TRAP" reversible '/trap stores persistent level'
@@ -238,6 +238,17 @@ contains gpt:high $efforts; or fail 'effort candidates include high'
 set shared_efforts (_mu_fish_model_candidates shared:)
 contains shared:medium $shared_efforts; or fail 'floating effort candidates merge provider suggestions'
 set model_records (_mu_fish_model_records)
+set bare_suffix_candidates (_mu_fish_model_candidates 'gpt@' $model_records)
+contains gpt@fast $bare_suffix_candidates; or fail 'completes @fast for bare model refs'
+contains gpt@standard $bare_suffix_candidates; or fail 'completes @standard for bare model refs'
+set qualified_suffix_candidates (_mu_fish_model_candidates 'openai/gpt@' $model_records)
+contains openai/gpt@fast $qualified_suffix_candidates; or fail 'completes suffix for provider-qualified model refs'
+set effort_suffix_candidates (_mu_fish_model_candidates 'gpt:custom@' $model_records)
+contains gpt:custom@fast $effort_suffix_candidates; or fail 'completes suffix for manually entered effort refs'
+contains gpt:custom@standard $effort_suffix_candidates; or fail 'completes standard suffix for effort refs'
+set post_suffix_candidates (_mu_fish_model_candidates 'gpt@high' $model_records)
+contains gpt@fast $post_suffix_candidates; or fail 'suffix completion uses the model before @'
+contains gpt:high $post_suffix_candidates; and fail 'text after @ is not treated as a reasoning effort'
 _mu_fish_model_completion_transition gpt $model_records; or fail 'unshadowed exact models transition to efforts'
 _mu_fish_model_completion_transition shared $model_records; or fail 'floating exact models transition to efforts'
 set shadow_records \
@@ -293,9 +304,9 @@ assert_equal "$MU_FISH_SESSION_ID" ses_0000000a 'invalid actions elsewhere prese
 assert_equal "$_MU_FISH_MODEL" local/solo 'invalid actions elsewhere preserve parked model'
 
 cd "$project_b/subdir"
-_mu_fish_run_slash_command '/model gpt'
+_mu_fish_run_slash_command '/model openai/gpt:high@fast'
 not set -q MU_FISH_SESSION_ID[1]; or fail 'valid model action elsewhere invalidates parked session'
-assert_equal "$_MU_FISH_MODEL" openai/gpt 'valid model action elsewhere replaces parked model'
+assert_equal "$_MU_FISH_MODEL" openai/gpt:high@fast 'valid model action elsewhere replaces parked model with suffix'
 assert_equal "$_MU_FISH_TRACKED_SCOPE" "project:$project_b" 'valid model action moves tracked scope'
 
 rm -f "$capture_args" "$capture_stdin" "$capture_calls" "$capture_session_args"
@@ -303,7 +314,7 @@ _mu_fish_submit_prompt 'project b prompt'
 set session_args (cat "$capture_session_args")
 assert_equal (string join \x1e -- $session_args) new 'creates an empty session without forwarding model override'
 set submitted_args (cat "$capture_args")
-assert_equal (string join \x1e -- $submitted_args) (string join \x1e -- -s ses_01234567 --model openai/gpt) 'forwards model override on first real turn'
+assert_equal (string join \x1e -- $submitted_args) (string join \x1e -- -s ses_01234567 --model openai/gpt:high@fast) 'forwards suffixed model override on first real turn'
 
 cd "$project_a/subdir"
 set observed_command (_mu_fish_base_command)

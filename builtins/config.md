@@ -173,16 +173,22 @@ The limits bound the model-visible preview of bash output by lines, total bytes,
 and bytes per line. The bell sounds only for turns lasting at least
 `min_duration_ms`.
 
-Model references use `provider/model[:effort]` for a fixed provider or
-`model[:effort]` for ordered provider fallback. `(provider)/model[:effort]`
-starts a floating choice at that configured provider; quote it in the shell.
+Model references use `provider/model[:effort][@fast|@standard]` for a fixed
+provider or `model[:effort][@fast|@standard]` for ordered provider fallback.
+`(provider)/model[:effort][@fast|@standard]` starts a floating choice at that
+configured provider; quote it in the shell.
 A bare model includes every provider defining that model id; a session
 remembers its position per model.
 Provider and model object order controls the default model, fallback, status,
 and completion order, with project entries before inherited global entries.
-Effort strings are provider-defined and unrestricted; `supported_efforts` is
+Effort strings are provider-defined; `supported_efforts` is
 only an ordered status/completion hint. Model ids cannot contain `:` because it
-separates the effort suffix.
+separates the effort suffix. The processing suffix is final: only `@fast` and
+`@standard` are recognized, `@` is reserved in model IDs and effort strings,
+and unknown suffixes are errors. This per-reference preference adds no
+configuration field or default and does not change context metadata, effective
+`replay_key`, floating provider position, or cache-epoch identity; see [the CLI
+reference](cli.md) for adapter mappings and restrictions.
 
 `replay_key` is a non-empty, non-secret compatibility label, defaulting to
 `provider/model`. Responses and Anthropic native state is shared only within

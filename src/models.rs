@@ -9,6 +9,30 @@ pub struct ResolvedModelRef {
     pub provider_id: String,
     pub model_id: String,
     pub effort: Option<String>,
+    pub processing: Option<Processing>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Processing {
+    Fast,
+    Standard,
+}
+
+impl Processing {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Fast => "fast",
+            Self::Standard => "standard",
+        }
+    }
+
+    pub fn service_tier(self) -> &'static str {
+        match self {
+            Self::Fast => "priority",
+            Self::Standard => "default",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -92,7 +116,7 @@ pub fn validate_config(config: &Config) -> Result<()> {
 pub fn first_model_choice(config: &Config) -> Result<ResolvedModelChoice> {
     for (provider_id, provider) in config.providers.iter() {
         if let Some((model_id, _)) = provider.models.iter().next() {
-            return resolve_model(config, provider_id, model_id, None, false)
+            return resolve_model(config, provider_id, model_id, None, None, false)
                 .map(ResolvedModelChoice::fixed);
         }
     }
@@ -111,13 +135,15 @@ pub fn resolve_model_choice(config: &Config, raw: &str) -> Result<ResolvedModelC
     }
 
     if let Some((provider_id, rest)) = parenthesized_provider(raw) {
+        let (rest, processing) = split_processing(rest)?;
         let (model_id, effort) = split_model_effort(rest);
-        return resolve_floating_model(config, model_id, effort, Some(provider_id));
+        return resolve_floating_model(config, model_id, effort, processing, Some(provider_id));
     }
 
     if let Some((provider_id, model_id)) = explicit_provider(config, raw) {
+        let (model_id, processing) = split_processing(model_id)?;
         let (model_id, effort) = split_model_effort(model_id);
-        return resolve_model(config, provider_id, model_id, effort, false)
+        return resolve_model(config, provider_id, model_id, effort, processing, false)
             .map(ResolvedModelChoice::fixed);
     }
 
@@ -125,13 +151,14 @@ pub fn resolve_model_choice(config: &Config, raw: &str) -> Result<ResolvedModelC
         bail!("model not configured: {raw}");
     }
 
+    let (raw, processing) = split_processing(raw)?;
     let (model_id, effort) = split_model_effort(raw);
     if config
         .providers
         .iter()
         .any(|(_, provider)| provider.models.contains_key(model_id))
     {
-        return resolve_floating_model(config, model_id, effort, None);
+        return resolve_floating_model(config, model_id, effort, processing, None);
     }
 
     bail!("model not configured: {model_id}")
@@ -184,17 +211,44 @@ fn split_model_effort(raw: &str) -> (&str, Option<String>) {
         })
 }
 
+pub(crate) fn split_processing(raw: &str) -> Result<(&str, Option<Processing>)> {
+    let Some((base, suffix)) = raw.split_once('@') else {
+        return Ok((raw, None));
+    };
+    let processing = match suffix {
+        "fast" => Processing::Fast,
+        "standard" => Processing::Standard,
+        _ => bail!(
+            "invalid processing suffix `@{suffix}`: use `@fast` or `@standard` after the optional effort"
+        ),
+    };
+    if base.is_empty() {
+        bail!("processing suffix requires a model id");
+    }
+    Ok((base, Some(processing)))
+}
+
 fn resolve_floating_model(
     config: &Config,
     model_id: &str,
     effort: Option<String>,
+    processing: Option<Processing>,
     preferred_provider: Option<&str>,
 ) -> Result<ResolvedModelChoice> {
     let candidates = config
         .providers
         .iter()
         .filter(|(_, provider)| provider.models.contains_key(model_id))
-        .map(|(provider_id, _)| resolve_model(config, provider_id, model_id, effort.clone(), true))
+        .map(|(provider_id, _)| {
+            resolve_model(
+                config,
+                provider_id,
+                model_id,
+                effort.clone(),
+                processing,
+                true,
+            )
+        })
         .collect::<Result<Vec<_>>>()?;
     if candidates.is_empty() {
         bail!("model not configured: {model_id}");
@@ -218,6 +272,7 @@ fn resolve_model(
     provider_id: &str,
     model_id: &str,
     effort: Option<String>,
+    processing: Option<Processing>,
     floating: bool,
 ) -> Result<ResolvedModelRef> {
     if model_id.trim().is_empty() {
@@ -228,10 +283,17 @@ fn resolve_model(
         .with_context(|| format!("model not configured: {provider_id}/{model_id}"))?;
 
     Ok(ResolvedModelRef {
-        canonical: canonical_ref(provider_id, model_id, effort.as_deref(), floating),
+        canonical: canonical_ref(
+            provider_id,
+            model_id,
+            effort.as_deref(),
+            processing,
+            floating,
+        ),
         provider_id: provider_id.to_string(),
         model_id: model_id.to_string(),
         effort,
+        processing,
     })
 }
 
@@ -239,6 +301,7 @@ fn canonical_ref(
     provider_id: &str,
     model_id: &str,
     effort: Option<&str>,
+    processing: Option<Processing>,
     floating: bool,
 ) -> String {
     let base = if floating {
@@ -246,9 +309,13 @@ fn canonical_ref(
     } else {
         canonical_base(provider_id, model_id)
     };
-    match effort {
+    let reference = match effort {
         Some(level) => format!("{base}:{level}"),
         None => base,
+    };
+    match processing {
+        Some(processing) => format!("{reference}@{}", processing.name()),
+        None => reference,
     }
 }
 
@@ -331,6 +398,52 @@ mod tests {
         assert_eq!(resolved.model_id, "common-model");
         assert_eq!(resolved.effort.as_deref(), Some("high"));
         assert_eq!(resolved.canonical, "alpha/common-model:high");
+    }
+
+    #[test]
+    fn processing_suffix_is_canonical_and_follows_floating_selection() {
+        for (suffix, processing) in [
+            ("fast", Processing::Fast),
+            ("standard", Processing::Standard),
+        ] {
+            let fixed =
+                resolve_model_ref(&test_config(), &format!("alpha/common-model:high@{suffix}"))
+                    .unwrap();
+            assert_eq!(fixed.model_id, "common-model");
+            assert_eq!(fixed.effort.as_deref(), Some("high"));
+            assert_eq!(fixed.processing, Some(processing));
+            assert_eq!(fixed.canonical, format!("alpha/common-model:high@{suffix}"));
+            let mut choice =
+                resolve_model_choice(&test_config(), &format!("common-model@{suffix}")).unwrap();
+            assert_eq!(
+                choice.active_model().canonical,
+                format!("(alpha)/common-model@{suffix}")
+            );
+            assert!(choice.advance());
+            assert_eq!(
+                choice.active_model().canonical,
+                format!("(beta)/common-model@{suffix}")
+            );
+            let restored =
+                resolve_model_choice(&test_config(), &choice.active_model().canonical).unwrap();
+            assert_eq!(restored.active_model(), choice.active_model());
+        }
+    }
+
+    #[test]
+    fn rejects_invalid_processing_suffixes() {
+        for reference in [
+            "common-model@",
+            "common-model@priority",
+            "common-model@fast:high",
+            "common-model@fast@standard",
+            "alpha/@fast",
+        ] {
+            assert!(
+                resolve_model_choice(&test_config(), reference).is_err(),
+                "{reference}"
+            );
+        }
     }
 
     #[test]

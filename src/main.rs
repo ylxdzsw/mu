@@ -955,6 +955,9 @@ async fn run_turn_from_source(
     let store = store::Store::open(&store_path)?;
     turn.selection.model = turn.selection.model.or(loaded_prompt.model);
     let resolved = resolve_invocation(&store, config, &turn.selection)?;
+    let active_model = resolved.model.active_model();
+    provider::classify_endpoint(&config.provider(&active_model.provider_id)?.endpoint)?
+        .validate_processing(active_model.processing)?;
     if let Some(error) = &resolved.ignored_current_session {
         warn_unsupported_session(error, "starting a new session");
     }
@@ -1206,6 +1209,9 @@ async fn run_turn(args: RunTurnArgs<'_>) -> Result<()> {
     let config = &invocation_config;
     let active_model = model.active_model();
     let provider = build_provider(config, &active_model.provider_id)?;
+    provider
+        .api()
+        .validate_processing(active_model.processing)?;
 
     let turn_done_bell_min_duration = config
         .terminal_bell
@@ -1360,6 +1366,14 @@ fn print_status_report(report: &StatusReport) {
         println!(
             "turns: {}  messages: {}  updated: {}",
             session.turn_count, session.message_count, session.updated_at
+        );
+    }
+    if let Some(tier) = &report.last_provider_tier {
+        println!(
+            "last provider tier: {} (requested: {}; model: {})",
+            tier.actual.as_deref().unwrap_or("unknown"),
+            tier.requested.as_deref().unwrap_or("upstream default"),
+            tier.model,
         );
     }
     if report.active.as_ref().is_some_and(|active| active.busy) {

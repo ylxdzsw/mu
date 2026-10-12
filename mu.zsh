@@ -433,14 +433,39 @@ _mu_zsh_model_query() {
       efforts: (.supported_efforts // [])
     }] as $models
     | if $mode == "candidates" then
-        [
-          ("short", "canonical") as $key
-          | $models[]
-          | if ($fragment | contains(":")) then
-              .[$key] as $model | .efforts[]? | "\($model):\(.)"
-            else .[$key]
+        if ($fragment | contains("@")) then
+          ($fragment | split("@")[0]) as $reference
+          | if ($reference | contains(":")) then
+              ($reference | split(":")) as $parts
+              | if ($parts | length) == 2 and $parts[1] != "" then
+                  [
+                    ("short", "canonical") as $key
+                    | $models[]
+                    | select(.[$key] | startswith($parts[0]))
+                    | .[$key] as $model
+                    | "\($model):\($parts[1])@fast",
+                      "\($model):\($parts[1])@standard"
+                  ] | dedup | .[]
+                else empty end
+            else
+              [
+                ("short", "canonical") as $key
+                | $models[]
+                | select(.[$key] | startswith($reference))
+                | .[$key] as $model
+                | "\($model)@fast", "\($model)@standard"
+              ] | dedup | .[]
             end
-        ] | dedup | .[]
+        else
+          [
+            ("short", "canonical") as $key
+            | $models[]
+            | if ($fragment | contains(":")) then
+                .[$key] as $model | .efforts[]? | "\($model):\(.)"
+              else .[$key]
+              end
+          ] | dedup | .[]
+        end
       else
         (if $mode == "transition" then
           ($fragment | if contains("/") then "canonical" else "short" end) as $key
@@ -551,15 +576,21 @@ _mu_zsh_complete_candidates() {
     group=mu-model description=model suffix=''
     arg=${left#"/model "}
     if [[ "$arg" == *:* ]]; then
-      effort_suffixes=("${(@f)$(_mu_zsh_model_query "${arg%:*}:" suffix)}")
-      effort_suffixes=("${(@)effort_suffixes:#}")
-      if (( ${#effort_suffixes[@]} )); then
-        compset -P '*:' 2>/dev/null || true
-        for effort_suffix in "${effort_suffixes[@]}"; do
-          candidates+=("${effort_suffix#:}")
-        done
-        group=mu-model-effort description='model effort'
+      if [[ "$arg" == *@* ]]; then
+        candidates=("${(@f)$(_mu_zsh_model_query "$arg")}")
+      else
+        effort_suffixes=("${(@f)$(_mu_zsh_model_query "${arg%:*}:" suffix)}")
+        effort_suffixes=("${(@)effort_suffixes:#}")
+        if (( ${#effort_suffixes[@]} )); then
+          compset -P '*:' 2>/dev/null || true
+          for effort_suffix in "${effort_suffixes[@]}"; do
+            candidates+=("${effort_suffix#:}")
+          done
+          group=mu-model-effort description='model effort'
+        fi
       fi
+    elif [[ "$arg" == *@* ]]; then
+      candidates=("${(@f)$(_mu_zsh_model_query "$arg")}")
     fi
   fi
 
@@ -606,6 +637,8 @@ _mu_zsh_complete_slash() {
       # An empty effort token needs menu-complete; expand-or-complete would
       # spend this Tab rebuilding the already-visible candidate list.
       (( ${#effort_suffixes[@]} )) && completion_mode=menu
+    elif [[ "$model_arg" == *@ ]]; then
+      completion_mode=menu
     fi
   fi
 

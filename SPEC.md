@@ -633,11 +633,16 @@ event. A known refusal remains a failure even if delivery ends early.
 
 ### 7.3 Model selection
 
-- `provider/model[:effort]` is fixed.
-- `model[:effort]` expands to providers defining that model in merged
-  configuration order.
-- `(provider)/model[:effort]` selects a floating choice starting at that
-  configured provider; shell invocations must quote the parentheses.
+- `provider/model[:effort][@fast|@standard]` is fixed.
+- `model[:effort][@fast|@standard]` expands to providers defining that model
+  in merged configuration order.
+- `(provider)/model[:effort][@fast|@standard]` selects a floating choice
+  starting at that configured provider; shell invocations must quote the
+  parentheses.
+- The parser resolves a reference into model, optional effort, and optional
+  processing preference. The final `@fast` or `@standard` suffix selects that
+  preference; unknown `@` suffixes are rejected. Model ids and effort strings
+  cannot contain `@`. There is no separate fast flag or slash command.
 - Model ids cannot contain `:`; it separates the optional effort.
 - `supported_efforts` is an ordered status/completion hint, not validation of
   manually entered effort strings.
@@ -650,6 +655,41 @@ event. A known refusal remains a failure even if delivery ends early.
 Without an invocation override, an attached session's latest configured choice
 wins, then the prior `current-session` choice for a new session, then the first
 configured model.
+
+The canonical model choice includes its processing suffix. Session
+continuation, retry, and compaction retain it; a fresh session may inherit it
+through `current-session`. An explicit `-m` reference without a suffix replaces
+the choice without an explicit processing preference. Processing does not
+change the provider, model id, effort, `context_window`, effective
+`replay_key`, floating provider position, or cache-epoch identity.
+
+Chat Completions and Responses map `@fast` to `service_tier: "priority"` and
+`@standard` to `service_tier: "default"`; without a suffix they omit
+`service_tier`. Priority processing can cost more than standard processing.
+These are requested preferences, not strict service or speed
+guarantees. A successful upstream or gateway response at standard tier is
+accepted even when priority was requested. Mu does not use model allowlists or
+automatically remove or downgrade a preference after provider errors; existing
+retry and fallback policy is unchanged.
+
+Native Anthropic Messages locally rejects either processing suffix before
+accepting a new prompt or contacting the network, rather than silently
+ignoring it. OpenRouter Chat and
+Responses can apply the same tier mapping to models supported by its tier
+normalization, including Claude models. OpenRouter Messages accepts `priority`
+unlike native Anthropic, but Mu defers all Messages tier mapping for v1. The
+requested preference is retained in the canonical selection and native request
+envelope, and covered by the checksummed request recipe. Actual provider tier
+is preserved in native audit/status metadata when supplied; missing or null
+tier metadata remains unknown and is not inferred from the request.
+
+The normal interactive `detail`/`full` summary reports actual tiers across
+completed exchanges in the invocation, including mixed or unknown tiers and
+the explicit requested preference. `status` exposes the selected processing
+preference; `--include-session-details` adds the latest completed exchange's
+canonical selection, requested tier, and actual tier. Historical actual-tier
+metadata does not describe a newly overridden selection. Tier reporting never
+adds semantic context or extra `final` stdout.
 
 ### 7.4 Automatic resume
 
@@ -945,7 +985,8 @@ The durable event model is:
 - **`compaction_started`** — binds one synthetic compaction turn to its prompt,
   trap level, trigger, mode, and before-context measurements.
 - **`provider_requested`** — resolved provider/model origin and a checksummed
-  recipe sufficient to reconstruct the native request. Its event sequence is
+  recipe sufficient to reconstruct the native request, including its
+  canonical selection and requested processing tier. Its event sequence is
   the request's context boundary.
 - **`provider_completed`** — completed native response and accepted semantic
   projection.

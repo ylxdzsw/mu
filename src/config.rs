@@ -438,6 +438,18 @@ impl Config {
                 if model_id.contains(':') {
                     bail!("model id `{model_id}` contains reserved `:` in config.jsonc");
                 }
+                if model_id.contains('@') {
+                    bail!("model id `{model_id}` contains reserved `@` in config.jsonc");
+                }
+                if model
+                    .supported_efforts
+                    .as_ref()
+                    .is_some_and(|efforts| efforts.iter().any(|effort| effort.contains('@')))
+                {
+                    bail!(
+                        "model `{provider_id}/{model_id}` has a supported effort containing reserved `@` in config.jsonc"
+                    );
+                }
                 if model
                     .replay_key
                     .as_deref()

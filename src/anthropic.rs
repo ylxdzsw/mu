@@ -74,6 +74,7 @@ pub(crate) async fn stream(
             "output_tokens": usage.output_tokens,
             "cache_read_input_tokens": usage.cache_read_input_tokens,
             "cache_creation_input_tokens": usage.cache_write_input_tokens,
+            "service_tier": state.usage.service_tier,
         })),
     }));
 
@@ -348,6 +349,7 @@ impl AnthropicStreamState {
 #[derive(Default)]
 struct AnthropicUsage {
     seen: bool,
+    service_tier: Option<String>,
     input_tokens: u64,
     cache_creation_input_tokens: u64,
     cache_read_input_tokens: u64,
@@ -361,6 +363,9 @@ impl AnthropicUsage {
             return;
         }
         self.seen = true;
+        if let Some(tier) = value["service_tier"].as_str() {
+            self.service_tier = Some(tier.into());
+        }
         replace_u64(&mut self.input_tokens, &value["input_tokens"]);
         replace_u64(
             &mut self.cache_creation_input_tokens,
@@ -659,6 +664,7 @@ mod tests {
                 provider_id: "anthropic".into(),
                 model_id: "claude-opus-5".into(),
                 effort: effort.map(str::to_owned),
+                processing: None,
             },
             cache_key: None,
             messages,

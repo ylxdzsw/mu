@@ -20,13 +20,49 @@ Session and model selection:
 - No `-s` or `-c`: create a fresh session.
 - `-s|--session <id>`: run in that session in the active scope.
 - `-c|--continue`: continue the active scope's last selected session.
-- `-m|--model provider/model[:effort]`: use a fixed provider.
-- `-m|--model model[:effort]`: use ordered provider fallback.
-- `-m|--model '(provider)/model[:effort]'`: use fallback starting at that
-  configured provider. Quote the parentheses in shell commands.
+- `-m|--model provider/model[:effort][@fast|@standard]`: use a fixed provider.
+- `-m|--model model[:effort][@fast|@standard]`: use ordered provider fallback.
+- `-m|--model '(provider)/model[:effort][@fast|@standard]'`: use fallback
+  starting at that configured provider. Quote the parentheses in shell
+  commands.
 - `--trap off|destructive|reversible|all`: set the turn's Bash trap level.
 - `--output-schema <JSON>`: request a provider-native constrained JSON
   response format for this ordinary turn. The argument must be valid JSON.
+
+The optional final processing suffix is `@fast` or `@standard`; `@` is reserved
+in model IDs and effort strings, and unknown suffixes are rejected. Without a
+suffix, no processing preference is requested. There is no separate `--fast`
+option or `/fast` command. The complete model reference, including its suffix,
+is the canonical selection: continuation, retry, and compaction retain it, and
+a fresh session may inherit it through `current-session`. An explicit `-m`
+reference without a suffix replaces the selection without an explicit
+processing preference.
+
+For Chat Completions and Responses, `@fast` requests
+`service_tier: "priority"` and `@standard` requests
+`service_tier: "default"`; no suffix omits `service_tier`. Priority processing
+can cost more than standard processing. These are
+preferences, not strict guarantees: an upstream or gateway may successfully
+serve a priority request at standard tier. Mu does not use a model allowlist or
+automatically strip/downgrade the preference after errors; ordinary retry and
+fallback policy applies. Native Anthropic Messages rejects either suffix
+locally before accepting a new prompt or contacting the network, rather than
+ignoring it. OpenRouter Chat and
+Responses can apply the mapping to models it supports through tier
+normalization, including Claude. OpenRouter Messages accepts `priority` unlike
+native Anthropic, but Mu defers all Messages tier mapping for v1. Actual
+provider tier is kept in native audit/status metadata when supplied; missing
+or null metadata remains unknown and is not inferred from the request.
+
+For example, `/model openai/gpt-5:high@fast` selects priority processing in
+shell prompt mode; `mu -m openai/gpt-5:high@standard` explicitly requests
+standard processing. Use your configured provider and model names. Removing
+the suffix leaves upstream defaults in control, which may still select
+priority processing on providers with a project-level priority default.
+
+The normal interactive `detail`/`full` turn summary shows reported tiers,
+including mixed or unknown tiers, and an explicit requested preference.
+`final` output remains only the assistant answer.
 
 `--no-context` skips skills (including built-ins and their loading guidance)
 and global/project `AGENTS.md` when assembling a system prompt. The system
@@ -167,6 +203,13 @@ epoch.
 Inspect resolved session, model, context, scope, and output state.
 `--include-git`, `--include-session-details`, `--include-models`,
 `--include-commands`, and `--include-skills` add their corresponding data.
+
+The model object includes its selected `processing` preference (`fast`,
+`standard`, or null). `--include-session-details` also reports
+`last_provider_tier` for the latest completed exchange: its canonical `model`,
+`requested` service tier, and provider-reported `actual` tier. A null actual
+tier means unknown; a null requested tier means upstream default. This record
+describes the historical exchange, not an invocation model override.
 
 Every Bash tool call receives `MU_SESSION_ID`, identifying the agent session
 executing the tool, not the scope's `current-session`. Mu overrides inherited

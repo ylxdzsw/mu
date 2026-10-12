@@ -20,6 +20,7 @@ pub struct InvocationOverrides {
     #[arg(short = 'c', long = "continue", conflicts_with = "session")]
     pub continue_current: bool,
 
+    /// Model reference: [provider/]model[:effort][@fast|@standard]
     #[arg(short = 'm', long)]
     pub model: Option<String>,
 }
@@ -54,6 +55,7 @@ pub struct StatusModel {
     pub provider_id: String,
     pub model_id: String,
     pub effort: Option<String>,
+    pub processing: Option<crate::models::Processing>,
     pub canonical: String,
     pub replay_key: String,
 }
@@ -73,6 +75,8 @@ pub struct StatusReport {
     pub git: Option<GitStatus>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub session: Option<StatusSession>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_provider_tier: Option<crate::store::ProviderTier>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub active: Option<StatusActiveTurn>,
     /// Whether the selected session's last turn finished cleanly. `false` means
@@ -384,6 +388,16 @@ pub fn build_status_report(
             .unwrap_or_default(),
         git: includes.git.then(|| project.map(git_status)).flatten(),
         session: session_summary.map(status_session),
+        last_provider_tier: if includes.session_details {
+            resolved
+                .attached_session
+                .as_ref()
+                .map(|session| store.last_provider_tier(&session.id))
+                .transpose()?
+                .flatten()
+        } else {
+            None
+        },
         active,
         clean,
         compaction,
@@ -399,6 +413,7 @@ fn status_model(config: &Config, model: &ResolvedModelRef) -> StatusModel {
         provider_id: model.provider_id.clone(),
         model_id: model.model_id.clone(),
         effort: model.effort.clone(),
+        processing: model.processing,
         canonical: model.canonical.clone(),
         replay_key: config.replay_key(&model.provider_id, &model.model_id),
     }
@@ -582,6 +597,79 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn processing_selection_is_remembered_but_not_a_separate_floating_position() {
+        let store = Store::open_memory().unwrap();
+        let session = store.create_session("/tmp").unwrap();
+        finish_attempt(
+            &store,
+            &session.id,
+            "(beta)/default-model:high@fast",
+            "completed",
+        );
+        store.select_session(&session.id).unwrap();
+        let session = store.get_session(&session.id).unwrap().unwrap();
+        let config = test_config();
+        for (selected, provider) in [
+            (
+                resolve_invocation(&store, &config, &InvocationOverrides::default())
+                    .unwrap()
+                    .model,
+                "alpha",
+            ),
+            (
+                resolve_session_model_selection(&store, &config, &session, None)
+                    .unwrap()
+                    .model,
+                "beta",
+            ),
+        ] {
+            assert_eq!(
+                selected.active_model().canonical,
+                format!("({provider})/default-model:high@fast")
+            );
+        }
+        let changed = resolve_session_model_selection(
+            &store,
+            &config,
+            &session,
+            Some("default-model:high@standard"),
+        )
+        .unwrap();
+        assert_eq!(
+            changed.model.active_model().canonical,
+            "(beta)/default-model:high@standard"
+        );
+        let cleared =
+            resolve_session_model_selection(&store, &config, &session, Some("default-model:high"))
+                .unwrap();
+        assert_eq!(
+            cleared.model.active_model().canonical,
+            "(beta)/default-model:high"
+        );
+        let report = build_status_report(
+            &store,
+            &config,
+            &InvocationOverrides {
+                session: Some(session.id),
+                ..Default::default()
+            },
+            None,
+            StatusIncludes {
+                session_details: true,
+                ..Default::default()
+            },
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            report.model.processing,
+            Some(crate::models::Processing::Fast)
+        );
+        assert!(report.last_provider_tier.unwrap().actual.is_none());
     }
 
     #[test]

@@ -80,6 +80,9 @@ pub struct Renderer {
     concise_tool: Option<ConciseToolState>,
     last_committed_was_tool: bool,
     turn_done_bell_min_duration: Option<Duration>,
+    requested_tiers: Vec<String>,
+    served_tiers: Vec<String>,
+    processing_requested: bool,
     format: OutputFormat,
 }
 
@@ -216,6 +219,9 @@ impl Renderer {
             concise_tool: None,
             last_committed_was_tool: false,
             turn_done_bell_min_duration,
+            requested_tiers: Vec::new(),
+            served_tiers: Vec::new(),
+            processing_requested: false,
             format,
         }
     }
@@ -1007,6 +1013,24 @@ impl Renderer {
         Ok(())
     }
 
+    pub fn provider_tier(
+        &mut self,
+        requested: Option<crate::models::Processing>,
+        served: Option<&str>,
+    ) {
+        self.processing_requested |= requested.is_some();
+        let requested =
+            requested.map_or("upstream default", |processing| processing.service_tier());
+        for (tiers, tier) in [
+            (&mut self.requested_tiers, requested),
+            (&mut self.served_tiers, served.unwrap_or("unknown")),
+        ] {
+            if !tiers.iter().any(|existing| existing == tier) {
+                tiers.push(tier.into());
+            }
+        }
+    }
+
     pub fn turn_summary(
         &mut self,
         input_tokens: u64,
@@ -1025,7 +1049,7 @@ impl Renderer {
         if self.has_committed_stdout {
             self.stderr.write_all(b"\n")?;
         }
-        let summary = format_turn_summary(
+        let mut summary = format_turn_summary(
             input_tokens,
             cache_read_input_tokens,
             cache_write_input_tokens,
@@ -1033,6 +1057,15 @@ impl Renderer {
             context_pct,
             elapsed,
         );
+        if self.processing_requested || self.served_tiers.iter().any(|tier| tier != "unknown") {
+            summary.push_str(&format!("  tier: {}", self.served_tiers.join(", ")));
+            if self.processing_requested {
+                summary.push_str(&format!(
+                    " (requested: {})",
+                    self.requested_tiers.join(", ")
+                ));
+            }
+        }
         if self.styled {
             write!(self.stderr, "{GRAY}{summary}{RESET}\n\n")?;
         } else {
@@ -4737,5 +4770,28 @@ mod tests {
         assert!(transcript.contains("line1\nline2\nline3\nline4\nline5\nline6\nline7\nline8\n"));
         assert!(!transcript.contains("omitted"));
         assert!(transcript.ends_with("✓ exit 0 · 5ms\n"));
+    }
+
+    #[test]
+    fn processing_summary_reports_downgrades_and_unknown_without_final_output() {
+        for format in [OutputFormat::Detail, OutputFormat::Final] {
+            let (mut renderer, stdout, stderr) =
+                Renderer::with_test_output(format, false, true, None);
+            renderer.provider_tier(Some(crate::models::Processing::Fast), Some("default"));
+            renderer.provider_tier(Some(crate::models::Processing::Fast), None);
+            renderer
+                .turn_summary(1, 0, None, 1, None, Duration::from_millis(1))
+                .unwrap();
+            assert!(stdout.transcript().is_empty());
+            if format == OutputFormat::Final {
+                assert!(stderr.transcript().is_empty());
+            } else {
+                assert!(
+                    stderr
+                        .transcript()
+                        .contains("tier: default, unknown (requested: priority)")
+                );
+            }
+        }
     }
 }

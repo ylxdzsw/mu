@@ -648,6 +648,10 @@ impl<'a> AgentLoop<'a> {
                 },
             )?;
             context.push(accepted_message.clone());
+            self.renderer.provider_tier(
+                self.model.active_model().processing,
+                crate::provider::reported_service_tier(stream_result.native_response.as_ref()),
+            );
 
             if bash::soft_interrupt_requested()
                 && stream_result.finish_reason == FinishReason::ToolCalls

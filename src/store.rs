@@ -69,6 +69,13 @@ pub struct SessionSummary {
     pub turn_count: u64,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct ProviderTier {
+    pub model: String,
+    pub requested: Option<String>,
+    pub actual: Option<String>,
+}
+
 pub struct SessionListing {
     pub sessions: Vec<(Session, String)>,
     pub skipped: Vec<UnsupportedSessionVersion>,
@@ -806,6 +813,57 @@ impl Store {
         self.get_session(id)
     }
 
+    pub fn last_provider_tier(&self, session_id: &str) -> Result<Option<ProviderTier>> {
+        self.with_journal(session_id, |journal| {
+            let Some((exchange, response)) =
+                journal
+                    .events
+                    .iter()
+                    .rev()
+                    .find_map(|line| match &line.event {
+                        Event::ProviderCompleted {
+                            exchange_id,
+                            response_json,
+                            ..
+                        } => Some((exchange_id, response_json)),
+                        _ => None,
+                    })
+            else {
+                return Ok(None);
+            };
+            let (origin, recipe) = journal
+                .events
+                .iter()
+                .find_map(|line| match &line.event {
+                    Event::ProviderRequested {
+                        exchange_id,
+                        origin,
+                        request_recipe,
+                        ..
+                    } if exchange_id == exchange => Some((origin, request_recipe)),
+                    _ => None,
+                })
+                .context("provider completion has no request")?;
+            let response: Option<Value> = response
+                .as_ref()
+                .map(|object| {
+                    serde_json::from_slice(&self.read_object(object)?)
+                        .context("reading provider response tier")
+                })
+                .transpose()?;
+            Ok(Some(ProviderTier {
+                model: origin.canonical_model_ref.clone(),
+                requested: recipe
+                    .envelope
+                    .get("service_tier")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+                actual: crate::provider::reported_service_tier(response.as_ref())
+                    .map(str::to_owned),
+            }))
+        })
+    }
+
     pub fn select_session(&self, session_id: &str) -> Result<()> {
         if !valid_session_id(session_id) {
             bail!("session not found: {session_id}")
@@ -875,6 +933,7 @@ impl Store {
             .strip_prefix('(')
             .and_then(|provider_id| provider_id.strip_suffix(')'))
             .unwrap_or(provider_id);
+        let (wire_model, processing) = crate::models::split_processing(wire_model)?;
         let (wire_model, effort) = wire_model
             .split_once(':')
             .map_or((wire_model, None), |(model, effort)| (model, Some(effort)));
@@ -884,6 +943,7 @@ impl Store {
                 provider_id: provider_id.to_string(),
                 model_id: wire_model.to_string(),
                 effort: effort.map(str::to_string),
+                processing,
             },
             cache_key: None,
             output_schema: None,
@@ -1662,6 +1722,7 @@ impl Store {
                 provider_id: "test".into(),
                 model_id: "model".into(),
                 effort: None,
+                processing: None,
             },
             cache_key: None,
             output_schema: None,
@@ -2484,6 +2545,16 @@ impl Store {
                 provider_id: origin.provider_id.clone(),
                 model_id: origin.wire_model.clone(),
                 effort: origin.effort.clone(),
+                processing: match recipe.envelope.get("service_tier") {
+                    None => None,
+                    Some(Value::String(tier)) if tier == "priority" => {
+                        Some(crate::models::Processing::Fast)
+                    }
+                    Some(Value::String(tier)) if tier == "default" => {
+                        Some(crate::models::Processing::Standard)
+                    }
+                    _ => bail!("invalid provider request service_tier"),
+                },
             },
             cache_key,
             output_schema: recipe
@@ -4239,6 +4310,7 @@ mod tests {
                 provider_id: "source".into(),
                 model_id: "model".into(),
                 effort: None,
+                processing: None,
             },
             cache_key: None,
             output_schema: None,
@@ -4310,6 +4382,7 @@ mod tests {
                 provider_id: "legacy".into(),
                 model_id: "model".into(),
                 effort: None,
+                processing: None,
             },
             cache_key: None,
             output_schema: None,
@@ -5012,6 +5085,7 @@ mod tests {
                 provider_id: "test".into(),
                 model_id: "model".into(),
                 effort: Some("high".into()),
+                processing: None,
             },
             cache_key: Some(format!("mu:{}:agent", session.id)),
             output_schema: None,
@@ -5056,6 +5130,90 @@ mod tests {
     }
 
     #[test]
+    fn processing_request_reconstructs_and_reports_actual_tier() {
+        use crate::models::Processing;
+        for api in [ModelApi::ChatCompletions, ModelApi::Responses] {
+            for processing in [None, Some(Processing::Fast), Some(Processing::Standard)] {
+                let (store, session) = test_session();
+                let turn = store
+                    .start_turn(&session.id, "/tmp", None, &"hello".into())
+                    .unwrap();
+                let canonical = format!(
+                    "test/model:high{}",
+                    processing.map_or(String::new(), |p| format!("@{}", p.name()))
+                );
+                let request = Request {
+                    model: ResolvedModelRef {
+                        canonical: canonical.clone(),
+                        provider_id: "test".into(),
+                        model_id: "model".into(),
+                        effort: Some("high".into()),
+                        processing,
+                    },
+                    cache_key: Some(format!("mu:{}:epoch:0", session.id)),
+                    output_schema: None,
+                    messages: store.load_context_messages(&session.id).unwrap(),
+                };
+                let native = request.json(api).unwrap();
+                let exchange = store
+                    .start_provider_request(
+                        &session.id,
+                        &turn,
+                        ProviderOrigin {
+                            canonical_model_ref: canonical.clone(),
+                            provider_id: "test".into(),
+                            api: api.name().into(),
+                            endpoint: "https://example.test".into(),
+                            wire_model: "model".into(),
+                            effort: Some("high".into()),
+                        },
+                        store
+                            .request_recipe(
+                                api.request_format(),
+                                &native,
+                                serde_json::json!({"native_replay_origins":[]}),
+                            )
+                            .unwrap(),
+                    )
+                    .unwrap();
+                let response = serde_json::json!({"service_tier":"default"});
+                store
+                    .complete_assistant_exchange(
+                        &session.id,
+                        &exchange,
+                        &Message::assistant(Some("done".into()), None, None, None),
+                        Some(&response),
+                        None,
+                    )
+                    .unwrap();
+                let reopened = Store::open(&store.root).unwrap();
+                assert_eq!(
+                    reopened
+                        .reconstruct_provider_request(&session.id, &exchange)
+                        .unwrap(),
+                    native
+                );
+                assert_eq!(
+                    reopened
+                        .get_session(&session.id)
+                        .unwrap()
+                        .unwrap()
+                        .last_model
+                        .as_deref(),
+                    Some(canonical.as_str())
+                );
+                let tier = reopened.last_provider_tier(&session.id).unwrap().unwrap();
+                assert_eq!(tier.model, canonical);
+                assert_eq!(
+                    tier.requested.as_deref(),
+                    processing.map(Processing::service_tier)
+                );
+                assert_eq!(tier.actual.as_deref(), Some("default"));
+            }
+        }
+    }
+
+    #[test]
     fn output_schema_persists_and_reconstructs_for_each_api() {
         for schema in [
             serde_json::json!({"type":"object","custom":"unchanged"}),
@@ -5093,6 +5251,7 @@ mod tests {
                         provider_id: "test".into(),
                         model_id: "model".into(),
                         effort: None,
+                        processing: None,
                     },
                     cache_key: None,
                     output_schema: Some(schema.clone()),
@@ -5205,6 +5364,7 @@ mod tests {
                 provider_id: "test".into(),
                 model_id: "model".into(),
                 effort: Some("high".into()),
+                processing: None,
             },
             cache_key: None,
             output_schema: None,
@@ -5311,6 +5471,7 @@ mod tests {
                 provider_id: "target".into(),
                 model_id: "other-model".into(),
                 effort: None,
+                processing: None,
             },
             cache_key: None,
             output_schema: None,
@@ -5363,6 +5524,7 @@ mod tests {
                 provider_id: "test".into(),
                 model_id: "model".into(),
                 effort: None,
+                processing: None,
             },
             cache_key: None,
             output_schema: None,
@@ -5832,6 +5994,7 @@ mod tests {
                 provider_id: "test".into(),
                 model_id: "model".into(),
                 effort: None,
+                processing: None,
             },
             cache_key: None,
             output_schema: None,
