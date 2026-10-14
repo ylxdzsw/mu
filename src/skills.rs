@@ -32,9 +32,10 @@ pub struct CommandMeta {
     pub scope: InstructionScope,
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, Default, PartialEq)]
 pub struct MuShebang {
     pub model: Option<String>,
+    pub automated: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
@@ -147,16 +148,22 @@ pub fn parse_mu_shebang(line: &str) -> Result<Option<MuShebang>> {
         return Ok(None);
     };
 
-    match args.as_slice() {
-        [] => Ok(Some(MuShebang { model: None })),
-        [flag] if matches!(*flag, "-m" | "--model") => {
-            anyhow::bail!("mu shebang {flag} requires a value")
+    let mut shebang = MuShebang::default();
+    let mut tokens = args.iter().copied();
+    while let Some(flag) = tokens.next() {
+        match flag {
+            "--automated" if !shebang.automated => shebang.automated = true,
+            "-m" | "--model" if shebang.model.is_none() => {
+                let model = tokens
+                    .next()
+                    .filter(|value| !value.starts_with('-'))
+                    .with_context(|| format!("mu shebang {flag} requires a value"))?;
+                shebang.model = Some(model.to_string());
+            }
+            _ => anyhow::bail!("unsupported mu shebang arguments: {}", args.join(" ")),
         }
-        [flag, model] if matches!(*flag, "-m" | "--model") => Ok(Some(MuShebang {
-            model: Some((*model).to_string()),
-        })),
-        _ => anyhow::bail!("unsupported mu shebang arguments: {}", args.join(" ")),
     }
+    Ok(Some(shebang))
 }
 
 fn mu_shebang_args(line: &str) -> Option<Vec<&str>> {
@@ -434,21 +441,42 @@ mod tests {
     fn detects_and_parses_mu_shebangs() {
         assert_eq!(
             parse_mu_shebang("#!/usr/bin/env mu").unwrap(),
-            Some(MuShebang { model: None })
+            Some(MuShebang::default())
         );
         assert_eq!(
             parse_mu_shebang("#!/usr/bin/env -S mu --model openai/gpt-5:high").unwrap(),
             Some(MuShebang {
-                model: Some("openai/gpt-5:high".into())
+                model: Some("openai/gpt-5:high".into()),
+                automated: false,
             })
         );
         assert_eq!(
             parse_mu_shebang("#!/usr/bin/env -S mu -m openai/gpt-5:high").unwrap(),
             Some(MuShebang {
-                model: Some("openai/gpt-5:high".into())
+                model: Some("openai/gpt-5:high".into()),
+                automated: false,
             })
         );
         assert_eq!(parse_mu_shebang("#!/usr/bin/env bash").unwrap(), None);
+        for args in [
+            "--automated --model openai/gpt-5:high",
+            "-m openai/gpt-5:high --automated",
+        ] {
+            assert_eq!(
+                parse_mu_shebang(&format!("#!/usr/bin/env -S mu {args}")).unwrap(),
+                Some(MuShebang {
+                    model: Some("openai/gpt-5:high".into()),
+                    automated: true,
+                })
+            );
+        }
+        assert_eq!(
+            parse_mu_shebang("#!/usr/bin/env -S mu --automated").unwrap(),
+            Some(MuShebang {
+                automated: true,
+                ..MuShebang::default()
+            })
+        );
     }
 
     #[test]
@@ -460,6 +488,8 @@ mod tests {
             "#!/usr/bin/env -S mu --model=openai/gpt-5",
             "#!/usr/bin/env -S mu --model openai/gpt-5 extra",
             "#!/usr/bin/env -S mu --model one --model two",
+            "#!/usr/bin/env -S mu --automated --automated",
+            "#!/usr/bin/env -S mu --model --automated",
         ] {
             assert!(parse_mu_shebang(line).is_err(), "accepted {line}");
         }

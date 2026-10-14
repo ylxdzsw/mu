@@ -235,7 +235,7 @@ One normal turn follows this sequence:
    executing its pending calls.
 6. Durably queue the submitted prompt, working directory, Git worktree root,
    trap level, and attachment references. Only then select the session as
-   `current-session`.
+   `current-session`, unless the invocation is automated.
 7. Build the candidate semantic provider context. If it exceeds the soft
    threshold, complete an out-of-turn compaction before materializing the
    queued prompt as a turn; otherwise materialize it immediately.
@@ -461,7 +461,8 @@ Interactive `detail` and `full` show complete link destinations; interactive
 the model's Markdown in every non-final mode.
 
 When configured, a terminal bell sounds after a successful non-final
-interactive turn whose duration meets the configured minimum.
+interactive turn whose duration meets the configured minimum. Automated
+invocations suppress the bell.
 
 ### 5.2 Reasoning visibility
 
@@ -755,8 +756,10 @@ or system prompt.
 ### 8.2 Custom commands
 
 A regular instruction file becomes a custom command when its first line is a
-supported Mu shebang. The shebang accepts no arguments or exactly
-`-m|--model <model-ref>`. Command names are exact relative instruction-root
+supported Mu shebang. The shebang accepts optional `--automated` and
+`-m|--model <model-ref>` arguments as separate tokens in either order, each at
+most once. Automation is enabled if either the invocation or shebang requests
+it. Command names are exact relative instruction-root
 paths, including an extension when the file has one. Executable permission does
 not affect discovery, but suffixless executable command files are recommended
 so they can also be invoked directly through their shebang. Shipped built-in
@@ -923,7 +926,7 @@ A default invocation runs one turn:
 
 ```text
 mu [-s ID | -c] [-m MODEL] [-a FILE ...]
-   [-o final|concise|detail|full] [--output-schema JSON] [--no-context]
+   [-o final|concise|detail|full] [--output-schema JSON] [--no-context] [--automated]
    [PROMPT_FILE_OR_COMMAND]
 ```
 
@@ -1054,7 +1057,20 @@ events.
   absent, broken, or targets an unsupported journal version.
 - No selection creates a fresh session for a turn.
 - `mu new` creates but does not select a session.
-- `current-session` changes only after a submitted turn is durable.
+- `current-session` changes only after a submitted turn is durable, and never
+  during an automated invocation.
+
+`--automated` is supported for ordinary turns, retry, and manual compaction,
+and may be declared in a prompt-file or custom-command shebang. It is
+invocation-local, not persisted as session or turn policy: a supervisor must
+pass it again for retry or manual compaction. It suppresses both pointer
+updates and the completion bell, without changing journaling, listing, output,
+trapping, context loading, or model inheritance. Explicit session selection and
+`--continue` retain their normal read semantics, including continuation's
+fallback to a fresh session, but never update the pointer when automated.
+A later non-automated invocation may select the session normally. Automation
+is not inferred from stdin, terminal state, or parent-agent environment, and
+does not add model-visible guidance.
 
 An exclusive, nonblocking advisory lock on the journal owns a mutable
 operation. The descriptor remains open for the operation and the kernel

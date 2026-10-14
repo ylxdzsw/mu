@@ -248,9 +248,13 @@ common `mu` shebang:
 Summarize the current checkout and suggest the next release note.
 ```
 
-The shebang accepts no arguments or exactly `-m|--model <model-ref>` as separate
-tokens; other arguments and `--model=value` are rejected on invocation. Use
-`env -S` with a model. Commands are discovered by their exact relative `.mu`
+The shebang accepts optional `--automated` and `-m|--model <model-ref>` arguments
+as separate tokens in either order, each at most once; other arguments and
+`--model=value` are rejected on invocation. `--automated` preserves
+`current-session` and suppresses the completion bell for that invocation, with
+no change to model inheritance, output, trapping, or context loading. Either
+the CLI or shebang can enable it; it is not a persistent session setting. Use
+`env -S` with arguments. Commands are discovered by their exact relative `.mu`
 path, including an extension when present. A file may be both a command and a
 skill; command execution strips the shebang and skill frontmatter. Executable
 permission does not affect discovery, but a suffixless executable file is the

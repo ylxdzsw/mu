@@ -8,12 +8,24 @@ selected output, persists completed state, and exits. Run `mu --help` or
 
 ```text
 mu [-s <session-id> | -c] [-m <model>] [-a <file> ...]
-   [-o final|concise|detail|full] [--output-schema <JSON>] [--no-context]
+   [-o final|concise|detail|full] [--output-schema <JSON>] [--no-context] [--automated]
 mu [turn options] <prompt-file-or-command>
 ```
 
 With no positional file or command, Mu reads the complete prompt from stdin.
 `-a|--attach` is repeatable and accepts supported image and audio files.
+
+`--automated` leaves the scope's `current-session` pointer untouched and
+suppresses the completion bell. Sessions are still journaled and listed normally.
+Session selection and model inheritance are unchanged: `-s` still attaches to
+that session, and `-c` still follows the current pointer, but even a replacement
+session does not update it. Use an explicit model for predictable automation.
+Output density, trapping, and context loading are unchanged.
+
+Automation is invocation-local, not a session property or a model instruction.
+Pass `--automated` again when retrying or compacting automated work. A later
+normal invocation can select the same session as usual. Piped input and
+non-terminal execution do not implicitly enable automation.
 
 Session and model selection:
 
@@ -159,11 +171,17 @@ A prompt file may start with a Mu shebang:
 Summarize the current checkout.
 ```
 
-The shebang accepts no arguments or exactly `-m|--model <model-ref>` as separate
-tokens. An invocation model overrides the shebang; the shebang otherwise
-overrides the attached session or configured default. It does not change
-configuration, but becomes the session's latest recorded model once a provider
-request is persisted.
+The shebang accepts optional `--automated` and `-m|--model <model-ref>` arguments
+as separate tokens, in either order. Each option may appear once; other
+arguments and `--model=value` are rejected. An invocation model overrides the
+shebang; the shebang otherwise overrides the attached session or configured
+default. It does not change configuration, but becomes the session's latest
+recorded model once a provider request is persisted.
+
+Automation is enabled when either the CLI or shebang requests it. For example,
+`#!/usr/bin/env -S mu --automated --model openai/gpt-5:high` preserves the
+`current-session` pointer whether invoked as a command, an explicit prompt file,
+or an executable.
 
 Mu strips the shebang and optional skill frontmatter from discovered commands.
 Explicit prompt files strip only the leading shebang, retaining frontmatter.
@@ -264,7 +282,7 @@ creating session state. With no target, stdin is the prompt. Interactive output
 includes provenance and rendered Markdown; redirected output is the exact
 composed prompt.
 
-### `mu retry [selection options] [-o <format>] [--trap <level>] [--no-context]`
+### `mu retry [selection options] [-o <format>] [--trap <level>] [--no-context] [--automated]`
 
 Resume an interrupted turn, defaulting to `current-session`. It normalizes the
 interrupted provider tail, restores the submitted working directory, resumes
@@ -276,7 +294,7 @@ overrides it only for this invocation.
 `--no-context` affects only a new system prompt assembled when this invocation
 successfully applies compaction, including recovery of an already saved summary.
 
-### `mu compact [-s <id>] [-o <format>] [--trap <level>] [--no-context]`
+### `mu compact [-s <id>] [-o <format>] [--trap <level>] [--no-context] [--automated]`
 
 Force compaction for a session, defaulting to `current-session` and the
 configured output density. `--output` overrides configuration. Non-terminal

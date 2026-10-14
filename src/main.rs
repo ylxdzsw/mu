@@ -68,6 +68,10 @@ struct TurnArgs {
     #[command(flatten)]
     selection: InvocationOverrides,
 
+    /// Preserve current-session and suppress the completion bell
+    #[arg(long)]
+    automated: bool,
+
     #[arg(short = 'a', long = "attach", value_name = "FILE")]
     attachments: Vec<PathBuf>,
 
@@ -92,6 +96,10 @@ struct TurnArgs {
 struct RetryArgs {
     #[command(flatten)]
     selection: InvocationOverrides,
+
+    /// Preserve current-session and suppress the completion bell
+    #[arg(long)]
+    automated: bool,
 
     /// Output density (overrides config)
     #[arg(short = 'o', long, value_enum)]
@@ -175,6 +183,10 @@ enum Command {
     Compact {
         #[arg(short = 's', long)]
         session: Option<String>,
+
+        /// Preserve current-session and suppress the completion bell
+        #[arg(long)]
+        automated: bool,
 
         /// Output density (overrides config)
         #[arg(short = 'o', long, value_enum)]
@@ -276,6 +288,7 @@ enum PromptSource {
 struct LoadedPrompt {
     text: String,
     model: Option<String>,
+    automated: bool,
 }
 
 struct RunTurnArgs<'a> {
@@ -287,6 +300,7 @@ struct RunTurnArgs<'a> {
     output: OutputFormat,
     trap: bash::TrapLevel,
     no_context: bool,
+    automated: bool,
     /// A short notice rendered before the turn (e.g. "resuming interrupted turn").
     preamble_notice: Option<&'a str>,
     model_fallback: Option<runtime::ModelFallback>,
@@ -815,7 +829,9 @@ async fn run() -> Result<()> {
             }
             let stored_trap = store.pending_trap_level(&session.id)?;
 
-            store.select_session(&session.id)?;
+            if !retry_args.automated {
+                store.select_session(&session.id)?;
+            }
             std::env::set_current_dir(&session.cwd).with_context(|| {
                 format!(
                     "restoring submitted working directory for retry: {}",
@@ -839,6 +855,7 @@ async fn run() -> Result<()> {
                 output,
                 trap: retry_args.trap.unwrap_or(stored_trap),
                 no_context: retry_args.no_context,
+                automated: retry_args.automated,
                 preamble_notice: Some("[mu] resuming incomplete turn"),
                 model_fallback: selection.fallback,
                 mode: RunTurnMode::Resume,
@@ -849,6 +866,7 @@ async fn run() -> Result<()> {
         }
         Some(Command::Compact {
             session,
+            automated,
             output,
             trap,
             no_context,
@@ -881,7 +899,9 @@ async fn run() -> Result<()> {
                     .notice("[mu] compaction inapplicable: session has no conversation history")?;
                 return Ok(());
             }
-            store.select_session(&session)?;
+            if !automated {
+                store.select_session(&session)?;
+            }
             run_turn(RunTurnArgs {
                 config: &config,
                 project_config_dir: project_config_dir.as_deref(),
@@ -891,6 +911,7 @@ async fn run() -> Result<()> {
                 output,
                 trap,
                 no_context,
+                automated,
                 preamble_notice: None,
                 model_fallback: None,
                 mode: RunTurnMode::ManualCompaction(custom_focus.as_deref()),
@@ -926,7 +947,8 @@ fn validate_cli_args(args: &Args) -> Result<()> {
         || args.turn.output.is_some()
         || args.turn.output_schema.is_some()
         || args.turn.trap.is_some()
-        || args.turn.no_context;
+        || args.turn.no_context
+        || args.turn.automated;
     let reserved_prompt = args
         .prompt_file
         .as_ref()
@@ -949,6 +971,7 @@ async fn run_turn_from_source(
 ) -> Result<()> {
     let loaded_prompt = load_prompt(prompt_source)?;
     let prompt = loaded_prompt.text;
+    turn.automated |= loaded_prompt.automated;
 
     paths::ensure_project_layout(scope)?;
     let store_path = scope.state_dir();
@@ -1000,8 +1023,10 @@ async fn run_turn_from_source(
         turn.output_schema.as_ref(),
     )?;
     // Publish the session only after its journal lock is held and its first
-    // turn is durable. Standalone `new` deliberately does not select.
-    store.select_session(&session_id)?;
+    // turn is durable. Automated turns and standalone `new` do not select.
+    if !turn.automated {
+        store.select_session(&session_id)?;
+    }
 
     run_turn(RunTurnArgs {
         config,
@@ -1012,6 +1037,7 @@ async fn run_turn_from_source(
         output,
         trap,
         no_context: turn.no_context,
+        automated: turn.automated,
         preamble_notice: None,
         model_fallback: resolved.model_fallback,
         mode: RunTurnMode::QueuedPrompt,
@@ -1035,7 +1061,11 @@ fn load_prompt_with_stdin(
         PromptSource::Stdin => {
             let mut text = String::new();
             stdin.read_to_string(&mut text)?;
-            LoadedPrompt { text, model: None }
+            LoadedPrompt {
+                text,
+                model: None,
+                automated: false,
+            }
         }
         PromptSource::File(path) | PromptSource::Command { path, .. } => {
             let is_command = matches!(source, PromptSource::Command { .. });
@@ -1065,6 +1095,7 @@ fn load_prompt_with_stdin(
             };
             LoadedPrompt {
                 text: body.to_string(),
+                automated: shebang.as_ref().is_some_and(|shebang| shebang.automated),
                 model: shebang.and_then(|shebang| shebang.model),
             }
         }
@@ -1200,6 +1231,7 @@ async fn run_turn(args: RunTurnArgs<'_>) -> Result<()> {
         output,
         trap,
         no_context,
+        automated,
         preamble_notice,
         model_fallback,
         mode,
@@ -1213,9 +1245,7 @@ async fn run_turn(args: RunTurnArgs<'_>) -> Result<()> {
         .api()
         .validate_processing(active_model.processing)?;
 
-    let turn_done_bell_min_duration = config
-        .terminal_bell
-        .enabled
+    let turn_done_bell_min_duration = (config.terminal_bell.enabled && !automated)
         .then_some(Duration::from_millis(config.terminal_bell.min_duration_ms));
     let mut renderer = Renderer::with_terminal_bell(output, turn_done_bell_min_duration);
     let turn_started = Instant::now();
@@ -1411,7 +1441,7 @@ mod tests {
         let path = temp_file_path("shebang");
         std::fs::write(
             &path,
-            "#!/usr/bin/env -S mu --model openai/gpt-5:high\nhello\n",
+            "#!/usr/bin/env -S mu --automated --model openai/gpt-5:high\nhello\n",
         )
         .unwrap();
         let mut stdin = Cursor::new("Focus on auth.\nKeep the second line.\n");
@@ -1423,6 +1453,26 @@ mod tests {
             "hello\n---\n\nFocus on auth.\nKeep the second line.\n"
         );
         assert_eq!(prompt.model.as_deref(), Some("openai/gpt-5:high"));
+        assert!(prompt.automated);
+    }
+
+    #[test]
+    fn automated_is_local_to_agent_invocations() {
+        let turn = Args::try_parse_from(["mu", "--automated", "-a", "image.png"]).unwrap();
+        assert!(turn.turn.automated);
+        assert_eq!(turn.turn.attachments, [PathBuf::from("image.png")]);
+        for name in ["retry", "compact"] {
+            let args = Args::try_parse_from(["mu", name, "--automated"]).unwrap();
+            validate_cli_args(&args).unwrap();
+            assert!(match args.command.unwrap() {
+                Command::Retry(args) => args.automated,
+                Command::Compact { automated, .. } => automated,
+                _ => unreachable!(),
+            });
+        }
+        assert!(Args::try_parse_from(["mu", "status", "--automated"]).is_err());
+        let misplaced = Args::try_parse_from(["mu", "--automated", "retry"]).unwrap();
+        assert!(validate_cli_args(&misplaced).is_err());
     }
 
     #[test]
@@ -1479,6 +1529,7 @@ mod tests {
                 output: None,
                 trap: None,
                 no_context: false,
+                automated: false,
             })
         ));
         let selected_compact =
@@ -1490,6 +1541,7 @@ mod tests {
                 output: Some(OutputFormat::Full),
                 trap: None,
                 no_context: false,
+                automated: false,
             }) if session == "ses_example"
         ));
 
