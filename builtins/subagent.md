@@ -151,14 +151,33 @@ It is preferred to use this method to explicitly assign the same model for the s
 if the user has expressed no preference. Omitting `-m` causes the subagent to use the last
 model used in the scope, which may differ from the calling session.
 
+## Parent Context
+
+In a subagent's Bash calls, `MU_PARENT_SESSION_ID` identifies its calling agent.
+When the parent journal exists in the active scope, Mu includes a runtime hint
+to consult it for additional context if necessary:
+
+```bash
+mu transcript -s "$MU_PARENT_SESSION_ID" -o concise
+```
+
+Run this in the same scope. Cross-scope delegation omits the hint when the
+parent journal is unavailable; Mu does not search other projects. Parentage is
+invocation-local, so resuming a former subagent directly from a normal shell
+does not restore this variable, even if its saved runtime hint remains.
+
 ## Parent Responsibilities
 
-- Include enough context: subagents run in fresh sessions and do not see conversation history.
+- Include enough context: subagents run in fresh sessions and do not automatically receive conversation history.
 - Name allowed folders or files for editing when the scope is narrow.
 - Ask readonly subagents to list key sources checked.
 - Ask readwrite subagents to list all changes made and checks run.
 - Verify important findings before editing or reporting them as certain.
 
-`mu` propagates `MU_SUBAGENT_DEPTH` through bash tool calls and rejects recursive
-grandchild turns, so subagents can use harmless management commands such as
-`mu status` but cannot start further delegated agent turns.
+Mu exports each agent's own ID as `MU_SESSION_ID` and its parent ID as
+`MU_PARENT_SESSION_ID` in Bash calls, unsetting the latter for root invocations.
+A nested Mu process uses inherited `MU_SESSION_ID` as its parent and rejects
+agent execution if inherited `MU_PARENT_SESSION_ID` is present. This permits
+one level of delegation: subagents can use management commands such as
+`mu status` and `mu transcript`, but cannot start another agent turn, retry, or
+compaction through their tools.

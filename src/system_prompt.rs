@@ -87,6 +87,17 @@ pub fn build_system_prompt(
     if let Some(project_root) = project_config_dir.and_then(Path::parent) {
         runtime.push_str(&format!("\nmu project root: {}", project_root.display()));
     }
+    if let Ok(parent_session_id) = std::env::var(crate::bash::SESSION_ID_ENV)
+        && project_config_dir
+            .unwrap_or(global_config_dir)
+            .join("sessions")
+            .join(format!("{parent_session_id}.jsonl"))
+            .is_file()
+    {
+        runtime.push_str(
+            "\nYou are running as a subagent; consult `mu transcript -s \"$MU_PARENT_SESSION_ID\" -o concise` in this scope for additional context if necessary.",
+        );
+    }
     parts.push(format!("<runtime>\n{runtime}\n</runtime>"));
 
     if no_context {

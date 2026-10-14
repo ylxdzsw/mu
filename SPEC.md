@@ -340,9 +340,17 @@ resolved selection, not a snapshot tied to the Bash claim. Session IDs alone
 do not support cross-scope lookup. The literal ID is not added to the seeded
 system prompt.
 
-Recursive Mu delegation is bounded by `MU_SUBAGENT_DEPTH`: management commands
-remain available, but recursive agent turns beyond one nested level are
-rejected.
+Mu treats its inherited process `MU_SESSION_ID` as its invocation's parent ID.
+Every Bash child receives that ID as `MU_PARENT_SESSION_ID`, or has the variable
+explicitly unset for a root invocation. Like `MU_SESSION_ID`, this setting
+overrides the configured environment without changing Mu's own process
+environment. Parentage is invocation-local, not persisted session metadata.
+
+Ordinary turns, retry, and compaction reject an inherited
+`MU_PARENT_SESSION_ID`: its presence means the caller is already a subagent.
+This allows exactly one level of delegation without a depth counter or
+configurable limit. Non-agent management commands remain available. The guard
+does not depend on finding the parent journal in the active scope.
 
 ### 4.1 Bash output
 
@@ -877,6 +885,15 @@ session only at a successful compaction boundary. Its fixed order is:
 3. one complete Markdown `<skills>` document when active skills exist;
 4. global `<agents_md>`;
 5. project `<agents_md>`.
+
+If the inherited `MU_SESSION_ID` names an existing journal file in the active
+scope, `<runtime>` adds one sentence identifying the invocation as a subagent
+and suggesting `mu transcript -s "$MU_PARENT_SESSION_ID" -o concise` in that
+scope for additional context if necessary. It embeds neither the literal ID
+nor an absolute journal path, does not load the transcript, and does not search
+other scopes. A missing parent journal silently omits the hint. The hint
+follows normal prompt-epoch persistence: it can become stale if a former
+subagent is resumed directly from a normal shell without a parent environment.
 
 `--no-context` omits the skills document (including built-in skills and loading
 guidance) and both AGENTS.md blocks, retaining the system preamble and runtime.

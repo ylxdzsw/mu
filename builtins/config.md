@@ -36,8 +36,10 @@ before filesystem root. If no project is found, `mu` uses global scope.
 
 Bash runtime metadata overrides the environment overlay: `MU_SESSION_ID` is
 always set to the tool-executing agent's session ID, regardless of inherited
-or `.env` values. It does not implicitly select a session or model. See the
-[`mu status` reference](cli.md) for lookup.
+or `.env` values. `MU_PARENT_SESSION_ID` is set to the Mu process's inherited
+`MU_SESSION_ID`, or explicitly unset when that variable is absent. Mu's own
+process environment is unchanged. These IDs do not implicitly select a session
+or model. See the [`mu status` reference](cli.md) for lookup.
 
 Use project files for repository-specific behavior. Use global files for the
 user's personal defaults. Avoid editing built-ins unless the user is changing

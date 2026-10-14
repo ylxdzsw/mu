@@ -222,6 +222,18 @@ From the calling agent's scope, inspect its running session:
 mu status -s "$MU_SESSION_ID" --json
 ```
 
+For a subagent's Bash calls, `MU_PARENT_SESSION_ID` identifies its calling
+agent; root invocations explicitly unset it. If the parent journal exists in
+the active scope, the subagent's runtime prompt suggests reading it with
+`mu transcript -s "$MU_PARENT_SESSION_ID" -o concise`. No parent ID or absolute
+journal path is embedded in the prompt, and other scopes are not searched.
+
+An inherited `MU_PARENT_SESSION_ID` blocks ordinary turns, retry, and
+compaction, enforcing one level of delegation. Non-agent management commands
+remain available. Parentage is invocation-local: resuming a former subagent
+directly from a normal shell does not restore its parent environment, although
+its saved runtime hint may remain until compaction.
+
 ### `mu context [--export | --no-context]`
 
 Without `--export`, print the assembled system prompt Mu would use.

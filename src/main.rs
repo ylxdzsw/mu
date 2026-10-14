@@ -216,7 +216,6 @@ struct StatusArgs {
     include_skills: bool,
 }
 
-const MAX_SUBAGENT_TURN_DEPTH: u32 = 1;
 const OUTPUT_FINAL: u8 = 0;
 const OUTPUT_CONCISE: u8 = 1;
 const OUTPUT_DETAIL: u8 = 2;
@@ -425,9 +424,9 @@ fn acquire_session_lock_or_exit<'a>(
     }
 }
 
-fn ensure_subagent_turn_allowed(depth: u32) -> Result<()> {
-    if depth > MAX_SUBAGENT_TURN_DEPTH {
-        bail!("subagent recursion depth exceeded: {depth} (maximum {MAX_SUBAGENT_TURN_DEPTH})");
+fn ensure_subagent_turn_allowed() -> Result<()> {
+    if std::env::var_os(bash::PARENT_SESSION_ID_ENV).is_some() {
+        bail!("subagents cannot start further agent turns");
     }
     Ok(())
 }
@@ -792,7 +791,7 @@ async fn run() -> Result<()> {
             return Ok(());
         }
         Some(Command::Retry(retry_args)) => {
-            ensure_subagent_turn_allowed(bash::subagent_depth_from_env())?;
+            ensure_subagent_turn_allowed()?;
             let config =
                 Config::load_for_scope(project_config_dir.as_deref(), ConfigLoadMode::Runtime)?;
             let output = resolve_output(retry_args.output, config.output);
@@ -854,6 +853,7 @@ async fn run() -> Result<()> {
             trap,
             no_context,
         }) => {
+            ensure_subagent_turn_allowed()?;
             let custom_focus = load_optional_stdin_instruction()?;
             let config =
                 Config::load_for_scope(project_config_dir.as_deref(), ConfigLoadMode::Runtime)?;
@@ -901,7 +901,7 @@ async fn run() -> Result<()> {
         None => {}
     }
 
-    ensure_subagent_turn_allowed(bash::subagent_depth_from_env())?;
+    ensure_subagent_turn_allowed()?;
     let config = Config::load_for_scope(project_config_dir.as_deref(), ConfigLoadMode::Runtime)?;
     let output = resolve_output(default_turn.output, config.output);
     set_resolved_output(output);

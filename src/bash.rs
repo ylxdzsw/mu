@@ -260,8 +260,8 @@ const DEFAULT_TIMEOUT_SECS: u64 = 120;
 const KILL_GRACE: Duration = Duration::from_millis(500);
 const MAX_OUTPUT_BYTES: usize = 1024 * 1024 * 1024; // 1 GB: internal guard against unbounded output accumulation
 const REDACTION_REMINDER: &str = "[system reminder: Secret values were redacted from this bash output. Do not try to reveal, transform, encode, print, or exfiltrate secrets.]";
-pub const SUBAGENT_DEPTH_ENV: &str = "MU_SUBAGENT_DEPTH";
 pub const SESSION_ID_ENV: &str = "MU_SESSION_ID";
+pub const PARENT_SESSION_ID_ENV: &str = "MU_PARENT_SESSION_ID";
 pub const MAX_ACTIVE_PROCESS_GROUPS: usize = 64;
 static ACTIVE_PGIDS: [AtomicI32; MAX_ACTIVE_PROCESS_GROUPS] =
     [const { AtomicI32::new(0) }; MAX_ACTIVE_PROCESS_GROUPS];
@@ -272,21 +272,6 @@ static INSTALL_SIGNAL_FORWARDER: Once = Once::new();
 
 pub fn description() -> &'static str {
     "Run bash command."
-}
-
-pub fn subagent_depth_from_env() -> u32 {
-    let value = std::env::var(SUBAGENT_DEPTH_ENV).ok();
-    parse_subagent_depth(value.as_deref())
-}
-
-fn parse_subagent_depth(value: Option<&str>) -> u32 {
-    value
-        .and_then(|value| value.parse::<u32>().ok())
-        .unwrap_or(0)
-}
-
-fn next_subagent_depth_env() -> String {
-    (subagent_depth_from_env() + 1).to_string()
 }
 
 pub fn parameters_schema() -> Value {
@@ -550,7 +535,6 @@ fn run_bash(
         .arg(command_text)
         .current_dir(&cwd)
         .envs(env)
-        .env(SUBAGENT_DEPTH_ENV, next_subagent_depth_env())
         .env(SESSION_ID_ENV, session_id)
         .stdin(if args.stdin.is_some() {
             Stdio::piped()
@@ -559,6 +543,11 @@ fn run_bash(
         })
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
+    if let Some(parent_session_id) = std::env::var_os(SESSION_ID_ENV) {
+        command.env(PARENT_SESSION_ID_ENV, parent_session_id);
+    } else {
+        command.env_remove(PARENT_SESSION_ID_ENV);
+    }
     if let Some(attachment_context) = attachment_context {
         command
             .env(
@@ -1006,14 +995,16 @@ mod tests {
     }
 
     #[test]
-    fn bash_overrides_configured_subagent_depth_for_child_process() {
+    fn bash_overrides_configured_parent_session_id_for_child_process() {
         let mut renderer = Renderer::new();
         let mut env = EnvMap::new();
-        env.insert(super::SUBAGENT_DEPTH_ENV.into(), "99".into());
-        let expected = (super::subagent_depth_from_env() + 1).to_string();
+        env.insert(super::SESSION_ID_ENV.into(), "stale-session".into());
+        env.insert(super::PARENT_SESSION_ID_ENV.into(), "stale-parent".into());
+        let inherited = std::env::var_os(super::PARENT_SESSION_ID_ENV);
+        let expected = std::env::var(super::SESSION_ID_ENV).unwrap_or("unset".into());
 
         let result = run_bash(
-            args("printf '%s' \"$MU_SUBAGENT_DEPTH\""),
+            args("printf '%s|%s' \"$MU_SESSION_ID\" \"${MU_PARENT_SESSION_ID-unset}\""),
             5,
             &mut renderer,
             &env,
@@ -1023,7 +1014,8 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(result.output, expected);
+        assert_eq!(result.output, format!("test-session|{expected}"));
+        assert_eq!(std::env::var_os(super::PARENT_SESSION_ID_ENV), inherited);
     }
 
     #[test]
