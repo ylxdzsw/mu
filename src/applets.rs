@@ -35,6 +35,7 @@ pub fn dispatch(applet: Applet) -> i32 {
 
 mod apply_patch {
     use std::collections::HashMap;
+    use std::fmt;
     use std::fs::{self, OpenOptions};
     use std::io::{Read, Seek, SeekFrom, Write};
     use std::path::{Component, Path, PathBuf};
@@ -42,6 +43,20 @@ mod apply_patch {
     use anyhow::{Context, Result, bail};
 
     use super::resolve_path;
+
+    const LARGE_PATCH_BYTES: usize = 8 * 1024;
+    const LARGE_PATCH_REMINDER: &str = "[system reminder: This large patch failed because its expected source text was not found. No changes from this patch were applied. Re-read the relevant file sections, then retry as smaller, focused patches with enough context to identify each change uniquely.]";
+
+    #[derive(Debug)]
+    struct MatchNotFound(String);
+
+    impl fmt::Display for MatchNotFound {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str(&self.0)
+        }
+    }
+
+    impl std::error::Error for MatchNotFound {}
 
     #[derive(Debug)]
     enum Operation {
@@ -117,17 +132,29 @@ mod apply_patch {
             );
             return 0;
         }
-        match read_patch().and_then(|patch| run(&patch)) {
+        let result = read_patch()
+            .map_err(|error| failure_output(0, &error))
+            .and_then(|patch| run(&patch).map_err(|error| failure_output(patch.len(), &error)));
+        match result {
             Ok(summary) => {
                 print!("{summary}");
                 let _ = std::io::stdout().flush();
                 0
             }
             Err(error) => {
-                eprintln!("apply_patch: {error:#}");
+                eprintln!("{error}");
                 1
             }
         }
+    }
+
+    fn failure_output(patch_bytes: usize, error: &anyhow::Error) -> String {
+        let mut output = format!("apply_patch: {error:#}");
+        if patch_bytes > LARGE_PATCH_BYTES && error.is::<MatchNotFound>() {
+            output.push_str("\n\n");
+            output.push_str(LARGE_PATCH_REMINDER);
+        }
+        output
     }
 
     fn read_patch() -> Result<String> {
@@ -533,8 +560,11 @@ mod apply_patch {
         for chunk in chunks {
             if let Some(locator) = &chunk.locator {
                 let index = seek_sequence(&lines, std::slice::from_ref(locator), cursor, false)
-                    .with_context(|| {
-                        format!("failed to find context `{locator}` in {}", path.display())
+                    .ok_or_else(|| {
+                        MatchNotFound(format!(
+                            "failed to find context `{locator}` in {}",
+                            path.display()
+                        ))
                     })?;
                 cursor = index + 1;
             }
@@ -561,12 +591,12 @@ mod apply_patch {
                     cursor
                 }
             } else {
-                seek_sequence(&lines, &old, cursor, chunk.end_of_file).with_context(|| {
-                    format!(
+                seek_sequence(&lines, &old, cursor, chunk.end_of_file).ok_or_else(|| {
+                    MatchNotFound(format!(
                         "failed to find expected lines in {}:\n{}",
                         path.display(),
                         old.join("\n")
-                    )
+                    ))
                 })?
             };
             lines.splice(index..index + old.len(), new.iter().cloned());
@@ -912,6 +942,68 @@ mod apply_patch {
             );
             assert!(!dir.join("old.txt").exists());
             assert!(!dir.join("delete.txt").exists());
+            fs::remove_dir_all(dir).unwrap();
+        }
+
+        #[test]
+        fn large_patch_matching_failures_get_retry_guidance() {
+            let dir = temp_dir();
+            let path = dir.join("file.txt");
+            let added = dir.join("added.txt");
+            fs::write(&path, "original\n").unwrap();
+            for (header, diagnostic) in [
+                ("@@", "failed to find expected lines"),
+                (
+                    "@@ missing locator",
+                    "failed to find context `missing locator`",
+                ),
+            ] {
+                let patch = format!(
+                    "*** Begin Patch\n*** Add File: {}\n+{}\n*** Update File: {}\n{header}\n-missing\n+replacement\n*** End Patch\n",
+                    added.display(),
+                    "x".repeat(LARGE_PATCH_BYTES),
+                    path.display()
+                );
+                let error = run(&patch).unwrap_err();
+                assert!(error.is::<MatchNotFound>());
+                let output = failure_output(patch.len(), &error);
+                assert!(output.starts_with(&format!("apply_patch: {error:#}\n\n")));
+                assert!(output.contains(diagnostic));
+                assert!(output.ends_with(LARGE_PATCH_REMINDER));
+                for bytes in [
+                    LARGE_PATCH_BYTES - 1,
+                    LARGE_PATCH_BYTES,
+                    LARGE_PATCH_BYTES + 1,
+                ] {
+                    assert_eq!(
+                        failure_output(bytes, &error).contains(LARGE_PATCH_REMINDER),
+                        bytes > LARGE_PATCH_BYTES
+                    );
+                }
+                assert_eq!(fs::read_to_string(&path).unwrap(), "original\n");
+                assert!(!added.exists());
+            }
+            fs::remove_dir_all(dir).unwrap();
+        }
+
+        #[test]
+        fn large_patch_other_failures_do_not_get_retry_guidance() {
+            let dir = temp_dir();
+            let padding = "x".repeat(LARGE_PATCH_BYTES + 1);
+            for patch in [
+                padding.clone(),
+                format!(
+                    "*** Begin Patch\n*** Update File: {}\n@@\n-missing\n+{padding}\n*** End Patch\n",
+                    dir.join("missing.txt").display()
+                ),
+            ] {
+                let error = run(&patch).unwrap_err();
+                assert!(!error.is::<MatchNotFound>());
+                assert_eq!(
+                    failure_output(patch.len(), &error),
+                    format!("apply_patch: {error:#}")
+                );
+            }
             fs::remove_dir_all(dir).unwrap();
         }
 

@@ -131,6 +131,19 @@ bash({
 })
 ```
 
+## Patch editing
+
+Inside Bash tool calls, `apply_patch` accepts one structured patch as an
+argument or through stdin. It preflights the complete patch before applying
+changes.
+
+If a patch exceeds 8 KiB of UTF-8 text and cannot find expected source lines
+or a context locator, its error includes a reminder to re-read the relevant
+file sections and retry as smaller, focused patches. No changes from that
+patch were applied. The reminder is advice, not a size limit; other failures
+and successful patches do not trigger it. Separate patch calls have separate
+preflight boundaries, so keep logically coupled changes together where needed.
+
 ## Prompt files and custom commands
 
 A positional name first resolves to a discovered custom command in the active
