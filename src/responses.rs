@@ -43,7 +43,18 @@ pub(crate) async fn stream(
         })
     });
     let output = state.output;
-    let mut items = responses_items(&output)?;
+    let mut items = match responses_items(&output) {
+        Ok(items) => items,
+        Err(error) => {
+            if let Some(response) = native_response {
+                on_event(StreamEvent::FailedResponse {
+                    response,
+                    usage: state.usage,
+                })?;
+            }
+            return Err(error);
+        }
+    };
     if let Some(refusal) = state.refusal.as_ref() {
         items.retain(|item| !matches!(item, AssistantItem::Text { .. }));
         state.finish_reason = Some(FinishReason::Refusal(refusal.clone()));

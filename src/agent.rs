@@ -294,6 +294,8 @@ impl<'a> AgentLoop<'a> {
                         bail!("turn interrupted");
                     }
                     let mut current_partial_output = String::new();
+                    let mut current_partial_response = None;
+                    let mut current_usage = None;
                     let mut command_headers = StreamingCommandHeaders::default();
                     let emergency = active_compaction
                         .as_ref()
@@ -431,6 +433,11 @@ impl<'a> AgentLoop<'a> {
                                         delta,
                                         self.config.trap,
                                     ),
+                                    StreamEvent::FailedResponse { response, usage } => {
+                                        current_partial_response = Some(response);
+                                        current_usage = usage;
+                                        Ok(())
+                                    }
                                     StreamEvent::Tick => self.renderer.thinking_tick(),
                                 };
                                 if let Err(error) = result {
@@ -477,8 +484,10 @@ impl<'a> AgentLoop<'a> {
                         &exchange_id,
                         error.class(),
                         error.diagnostic(),
-                        partial_response(&current_partial_output).as_ref(),
-                        None,
+                        current_partial_response
+                            .or_else(|| partial_response(&current_partial_output))
+                            .as_ref(),
+                        current_usage.as_ref(),
                     )?;
                     match error.disposition() {
                         ProviderDisposition::ContextRecovery => {

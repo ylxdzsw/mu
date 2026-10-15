@@ -874,9 +874,17 @@ pub enum StreamEvent {
     TextDelta(String),
     ReasoningStart(ReasoningVisibility),
     ReasoningDelta(String),
-    ReasoningSummaryDelta { part_index: usize, text: String },
+    ReasoningSummaryDelta {
+        part_index: usize,
+        text: String,
+    },
     ReasoningEnd,
     ToolCallDelta(ToolCallDelta),
+    /// Audit-only response rejected before semantic projection.
+    FailedResponse {
+        response: Value,
+        usage: Option<Usage>,
+    },
     Tick,
 }
 
