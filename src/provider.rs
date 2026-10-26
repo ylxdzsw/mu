@@ -441,7 +441,9 @@ pub(crate) enum SseEvent {
 impl HttpProvider {
     pub fn new(endpoint: String, api_key: Option<String>) -> anyhow::Result<Self> {
         let parsed = parse_endpoint(&endpoint)?;
-        let mut client = Client::builder().connect_timeout(CONNECT_TIMEOUT);
+        let mut client = Client::builder()
+            .user_agent(concat!("mu/", env!("CARGO_PKG_VERSION")))
+            .connect_timeout(CONNECT_TIMEOUT);
         if let Some(socket) = parsed.unix_socket.as_ref() {
             client = client.unix_socket(socket.as_path());
         }

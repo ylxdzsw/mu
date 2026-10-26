@@ -1404,6 +1404,11 @@ mod tests {
 
             let wire_request = server.await.unwrap();
             assert!(wire_request.starts_with(&format!("POST /{path}?route=local HTTP/1.1\r\n")));
+            assert!(wire_request.to_ascii_lowercase().contains(concat!(
+                "\r\nuser-agent: mu/",
+                env!("CARGO_PKG_VERSION"),
+                "\r\n"
+            )));
             assert!(
                 wire_request
                     .to_ascii_lowercase()
