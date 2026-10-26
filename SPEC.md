@@ -180,8 +180,20 @@ without rewriting it. The override also governs compaction and continuation
 within that invocation, while any automatically created compaction still
 persists the inherited base level.
 
+`mu retry --approve` bypasses trapping for exactly the first pending Bash claim
+after interruption recovery, captured by its persisted call id under the session
+lock. After a normal trap, this is the displayed command. Approval is local to
+the invocation, does not change the stored or effective trap level, and never
+extends to siblings or newly generated claims. Explicit `--trap` still sets the
+invocation policy independently; it does not shift the approval target to the
+next matching claim. An approval invocation with no pending claim fails with
+exit 1 before provider contact. Approval does not bypass argument validation,
+interruption handling, or the prohibition on repeating started higher-risk
+claims. If execution stops before the claim starts, approval expires.
+
 Mu evaluates valid claims in provider order. Allowed predecessors may finish;
 the first matching claim and every later sibling remain unstarted and pending.
+Readonly batching also stops before an unapproved claim matching the trap level.
 A trapped compaction remains an ordinary incomplete compaction recoverable
 through `mu retry`.
 
@@ -290,9 +302,11 @@ claims as superseded before appending the new prompt.
 A trapped claim follows the same incomplete-turn path. Retry reapplies the
 stored trap level before provider contact; an explicit `--trap` may loosen it.
 Retry under the same level immediately stops on and redisplays the same claim.
-After a looser retry succeeds, semantic history contains the original claim
-and its eventual result as though no trap occurred. A new prompt supersedes
-the unstarted claim rather than approving or executing it.
+`--approve` releases only that first pending claim, then continues normally
+under the effective level. After a looser or approved retry succeeds, semantic
+history contains the original claim and its eventual result as though no trap
+occurred. A new prompt supersedes the unstarted claim rather than approving or
+executing it.
 
 ---
 
@@ -442,6 +456,8 @@ A trapped call always exposes its complete title, declared risk, command,
 effective cwd, and stdin on stdout in every output mode. It bypasses width,
 preview, stdin-summary, and Bash-output limits, then reports that execution did
 not start. It emits no final assistant answer or duplicate generic error.
+Only the blocked command is displayed in full; its footer counts later pending
+commands and states that approval applies only to this command.
 Complete commands and stdin can therefore enter redirected logs even under
 `--output final`.
 
@@ -533,6 +549,10 @@ turn, then passes that id explicitly. `MU_ZSH_SESSION_ID` or
 - `/trap <off|destructive|reversible|all>` stores a shell-only override for
   later turns, retries, and compaction. `/trap default` clears it.
 - `/retry` and `/compact` call the corresponding management operation.
+- `/approve` accepts no arguments and calls `mu retry --approve` for the attached
+  session, forwarding shell model/trap overrides exactly like `/retry` without
+  changing them. It requires an active session and appears beside `/retry` in
+  completion. Built-in slash commands take precedence over custom commands.
 - Discovered custom commands accept the remainder of the slash input as their
   custom instruction.
 
@@ -973,7 +993,7 @@ Management commands:
 | `mu status` | Report resolved scope, selection, model, context, and optional expensive indexes. |
 | `mu context` | Show the system prompt Mu would assemble; `--export` emits user instructions and non-built-in skill guidance for a foreign agent. |
 | `mu cat` | Resolve and preview exact prompt input without provider contact or session creation. |
-| `mu retry` | Recover and continue an interrupted turn without a new prompt, including pending Bash claims; `--trap` overrides its stored policy for this invocation; a clean session reports a no-op. |
+| `mu retry` | Recover and continue an interrupted turn without a new prompt, including pending Bash claims; `--trap` overrides its stored policy for this invocation; `--approve` releases only the first pending claim without changing policy and fails if none exists; otherwise a clean session reports a no-op. |
 | `mu compact` | Force compaction with configured or explicit output density and trap level, optionally using non-terminal stdin as a focus instruction. |
 
 Provider-free management commands do not contact a provider.
@@ -1095,6 +1115,11 @@ claim. If it is later started, the journal retains no historical indication
 that an earlier invocation trapped it. A crash before an otherwise ordinary
 start is likewise indistinguishable from a trap, but in both cases the claim
 was not attempted.
+
+Approval is likewise invocation control, not a journal event. Mu does not
+persist proof that a claim was displayed: approval targets the first pending
+claim at retry time, including after a crash or an intervening invocation.
+Users can retry without approval to inspect the next trap after an interruption.
 
 Before retry, Mu appends interruption outcomes for unmatched provider requests.
 Never-started claims remain pending. A started unresolved readonly claim also
@@ -1291,6 +1316,9 @@ authority.
 **Interactive approval for every action — rejected.** It would turn Mu into an
 approval-driven UI, interrupt composition, and still rely on the model's action
 description.
+
+An explicit `retry --approve` invocation is not an interactive approval UI: Mu
+still exits at a trap and never waits in-process for user approval.
 
 **Static Bash parsing to discover privileged or destructive commands —
 rejected.** Bash permits variables, functions, aliases, sourced files, nested

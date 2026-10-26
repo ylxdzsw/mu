@@ -109,6 +109,10 @@ struct RetryArgs {
     #[arg(long, value_enum)]
     trap: Option<bash::TrapLevel>,
 
+    /// Approve the first pending Bash command for this retry without changing the trap level
+    #[arg(long)]
+    approve: bool,
+
     /// Omit skills and AGENTS.md if this retry applies a compaction
     #[arg(long)]
     no_context: bool,
@@ -309,7 +313,7 @@ struct RunTurnArgs<'a> {
 
 enum RunTurnMode<'a> {
     QueuedPrompt,
-    Resume,
+    Resume(Option<i64>),
     ManualCompaction(Option<&'a str>),
 }
 
@@ -820,6 +824,18 @@ async fn run() -> Result<()> {
             let session = resolve_session_or_current(&store, Some(&session.id))?;
             store.recover_interrupted_tail_for_retry(&session.id)?;
 
+            let approved_call = if retry_args.approve {
+                Some(
+                    store
+                        .pending_bash_calls(&session.id)?
+                        .first()
+                        .context("no pending Bash command to approve")?
+                        .call_id,
+                )
+            } else {
+                None
+            };
+
             // Nothing to resume on a session whose last turn already finished.
             if store.is_session_clean(&session.id)? && store.queued_prompt(&session.id)?.is_none() {
                 if output != OutputFormat::Final {
@@ -858,7 +874,7 @@ async fn run() -> Result<()> {
                 automated: retry_args.automated,
                 preamble_notice: Some("[mu] resuming incomplete turn"),
                 model_fallback: selection.fallback,
-                mode: RunTurnMode::Resume,
+                mode: RunTurnMode::Resume(approved_call),
             })
             .await?;
 
@@ -1276,7 +1292,7 @@ async fn run_turn(args: RunTurnArgs<'_>) -> Result<()> {
     bash::install_signal_forwarder(config.soft_interrupt);
     let result = match mode {
         RunTurnMode::QueuedPrompt => agent.run_queued_turn().await,
-        RunTurnMode::Resume => agent.resume_turn().await,
+        RunTurnMode::Resume(approved_call) => agent.resume_turn(approved_call).await,
         RunTurnMode::ManualCompaction(focus) => agent.run_manual_compaction(focus).await,
     };
 
@@ -1572,6 +1588,18 @@ mod tests {
             Some(bash::TrapLevel::All)
         );
         assert!(Args::try_parse_from(["mu", "--trap", "readonly"]).is_err());
+        assert!(Args::try_parse_from(["mu", "--approve"]).is_err());
+        assert!(Args::try_parse_from(["mu", "compact", "--approve"]).is_err());
+        assert!(matches!(
+            Args::try_parse_from(["mu", "retry", "--approve", "--trap", "all"])
+                .unwrap()
+                .command,
+            Some(Command::Retry(RetryArgs {
+                approve: true,
+                trap: Some(bash::TrapLevel::All),
+                ..
+            }))
+        ));
         assert_eq!(
             match Args::try_parse_from(["mu", "retry", "--trap", "off"])
                 .unwrap()

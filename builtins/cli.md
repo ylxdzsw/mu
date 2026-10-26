@@ -282,7 +282,7 @@ creating session state. With no target, stdin is the prompt. Interactive output
 includes provenance and rendered Markdown; redirected output is the exact
 composed prompt.
 
-### `mu retry [selection options] [-o <format>] [--trap <level>] [--no-context] [--automated]`
+### `mu retry [selection options] [-o <format>] [--approve] [--trap <level>] [--no-context] [--automated]`
 
 Resume an interrupted turn, defaulting to `current-session`. It normalizes the
 interrupted provider tail, restores the submitted working directory, resumes
@@ -291,6 +291,28 @@ continuing without a new user prompt. Started higher-risk calls are not
 repeated. A clean session is a no-op.
 Without `--trap`, retry reuses the persisted turn policy. An explicit value
 overrides it only for this invocation.
+
+`--approve` authorizes only the first pending Bash command after interruption
+recovery: following a normal trap, the command just displayed. It bypasses that
+claim's trap check without changing the stored or effective trap level, then
+continues the turn normally. Later pending commands and newly generated commands
+still obey the effective level. For example, `mu retry --approve --trap all`
+executes the approved command and stops before any subsequent valid command.
+Approval does not shift to another command if `--trap` changes which risks match.
+It does not bypass validation or rerun started higher-risk commands.
+
+Approval expires with the invocation, including if interrupted before execution.
+If no command remains pending after recovery, `--approve` fails with exit 1 and
+`no pending Bash command to approve`, without contacting a provider. Mu does not
+record whether a pending command was displayed; after a crash or intervening
+invocation it approves the current first pending command. Retry without approval
+to inspect the next trap. Each trap displays only its blocked command in full,
+counts later pending commands, and states that approval covers only this command.
+
+In zsh and Fish prompt mode, `/approve` is shorthand for `mu retry --approve`
+with the attached session and existing shell model/trap overrides. It requires
+an attached session, accepts no arguments, and changes no shell overrides.
+
 `--no-context` affects only a new system prompt assembled when this invocation
 successfully applies compaction, including recovery of an already saved summary.
 

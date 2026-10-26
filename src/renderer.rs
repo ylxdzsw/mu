@@ -717,6 +717,7 @@ impl Renderer {
         &mut self,
         args: &serde_json::Value,
         trap: crate::bash::TrapLevel,
+        later_pending: usize,
     ) -> io::Result<()> {
         self.assistant_end()?;
         self.end_reasoning_run()?;
@@ -766,6 +767,14 @@ impl Renderer {
         }
         self.write_stdout_committed(&format!(
             "⊘ trapped before execution · declared {risk}, trap {trap}\n"
+        ))?;
+        let commands = if later_pending == 1 {
+            "command"
+        } else {
+            "commands"
+        };
+        self.write_stdout_committed(&format!(
+            "{later_pending} later {commands} pending · approval applies only to this command\n"
         ))
     }
 
@@ -4350,12 +4359,15 @@ mod tests {
             let (mut renderer, stdout, stderr) =
                 Renderer::with_test_output(format, false, false, None);
             renderer
-                .trapped_bash(&args, crate::bash::TrapLevel::Destructive)
+                .trapped_bash(&args, crate::bash::TrapLevel::Destructive, 2)
                 .unwrap();
             let output = stdout.transcript();
             assert!(output.contains(&command), "{format:?}: {output:?}");
             assert!(output.contains(&stdin), "{format:?}: {output:?}");
             assert!(output.contains("⊘ trapped before execution"));
+            assert!(
+                output.contains("2 later commands pending · approval applies only to this command")
+            );
             assert_eq!(stderr.transcript(), "");
         }
     }

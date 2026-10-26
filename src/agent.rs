@@ -126,7 +126,7 @@ pub struct AgentLoop<'a> {
 impl<'a> AgentLoop<'a> {
     #[cfg(test)]
     pub async fn run_turn(&mut self) -> Result<TurnResult> {
-        self.run_turn_inner(NextRequest::User).await
+        self.run_turn_inner(NextRequest::User, None).await
     }
 
     pub async fn run_queued_turn(&mut self) -> Result<TurnResult> {
@@ -162,16 +162,17 @@ impl<'a> AgentLoop<'a> {
                 .materialize_queued_prompt(self.session_id)?
                 .ok_or_else(|| anyhow::anyhow!("queued prompt disappeared"))?;
         }
-        self.run_turn_inner(NextRequest::User).await
+        self.run_turn_inner(NextRequest::User, None).await
     }
 
-    pub async fn resume_turn(&mut self) -> Result<TurnResult> {
+    pub async fn resume_turn(&mut self, approved_call: Option<i64>) -> Result<TurnResult> {
         if self.store.pending_compaction(self.session_id)?.is_none()
             && self.store.queued_prompt(self.session_id)?.is_some()
         {
             return self.run_queued_turn().await;
         }
-        self.run_turn_inner(NextRequest::Continue).await
+        self.run_turn_inner(NextRequest::Continue, approved_call)
+            .await
     }
 
     pub async fn run_manual_compaction(&mut self, focus: Option<&str>) -> Result<TurnResult> {
@@ -189,10 +190,14 @@ impl<'a> AgentLoop<'a> {
         };
         let before = self.current_context_tokens()?;
         self.begin_compaction(CompactionTrigger::Manual, mode, before, focus)?;
-        self.run_turn_inner(NextRequest::Continue).await
+        self.run_turn_inner(NextRequest::Continue, None).await
     }
 
-    async fn run_turn_inner(&mut self, mut next_request: NextRequest) -> Result<TurnResult> {
+    async fn run_turn_inner(
+        &mut self,
+        mut next_request: NextRequest,
+        approved_call: Option<i64>,
+    ) -> Result<TurnResult> {
         let mut context = self.load_context()?;
         let mut active_compaction =
             self.store
@@ -210,7 +215,12 @@ impl<'a> AgentLoop<'a> {
             if !pending_calls.is_empty() {
                 let mut command_headers = StreamingCommandHeaders::default();
                 match self
-                    .execute_pending_bash_calls(&pending_calls, &mut context, &mut command_headers)
+                    .execute_pending_bash_calls(
+                        &pending_calls,
+                        &mut context,
+                        &mut command_headers,
+                        approved_call,
+                    )
                     .await?
                 {
                     BashCallStop::Complete => {}
@@ -735,6 +745,7 @@ impl<'a> AgentLoop<'a> {
                             &pending_calls,
                             &mut context,
                             &mut command_headers,
+                            None,
                         )
                         .await?
                     {
@@ -817,6 +828,7 @@ impl<'a> AgentLoop<'a> {
         calls: &[PendingBashCall],
         context: &mut Vec<Message>,
         command_headers: &mut StreamingCommandHeaders,
+        approved_call: Option<i64>,
     ) -> Result<BashCallStop> {
         let mut cursor = 0;
         while cursor < calls.len() {
@@ -857,8 +869,9 @@ impl<'a> AgentLoop<'a> {
                 }
             };
 
-            if self.config.trap.traps(bash_args.risk) {
-                self.renderer.trapped_bash(&args, self.config.trap)?;
+            if self.config.trap.traps(bash_args.risk) && approved_call != Some(pending.call_id) {
+                self.renderer
+                    .trapped_bash(&args, self.config.trap, calls.len() - cursor - 1)?;
                 return Ok(BashCallStop::Trapped(calls.len() - cursor));
             }
 
@@ -869,7 +882,11 @@ impl<'a> AgentLoop<'a> {
                     // handles argument errors when it reaches this call.
                     if !parse_tool_args(&calls[end].call)
                         .and_then(|args| bash::parse_args::<bash::BashArgs>(&args))
-                        .is_ok_and(|args| args.risk == BashRisk::Readonly)
+                        .is_ok_and(|args| {
+                            args.risk == BashRisk::Readonly
+                                && (!self.config.trap.traps(args.risk)
+                                    || approved_call == Some(calls[end].call_id))
+                        })
                     {
                         break;
                     }
@@ -2323,7 +2340,7 @@ mod tests {
                 seen: seen.clone(),
             });
             init_test_signals(&config);
-            let result = agent.resume_turn().await.unwrap();
+            let result = agent.resume_turn(None).await.unwrap();
             assert_eq!(result.final_assistant.as_deref(), Some("not JSON"));
             assert_eq!(
                 *seen.lock().unwrap(),
@@ -2574,7 +2591,7 @@ mod tests {
         };
 
         init_test_signals(retry.config);
-        let result = retry.resume_turn().await.unwrap();
+        let result = retry.resume_turn(None).await.unwrap();
 
         assert_eq!(result.final_assistant.as_deref(), Some("done"));
         assert!(store.is_session_clean(&session.id).unwrap());
@@ -2792,7 +2809,7 @@ mod tests {
                     );
                     if failures != 1 {
                         init_test_signals(agent.config);
-                        assert!(agent.resume_turn().await.is_err());
+                        assert!(agent.resume_turn(None).await.is_err());
                         let requests = seen.lock().unwrap();
                         assert_eq!(requests.len(), count + 1);
                         assert_eq!(requests[count], requests[count - 1]);
@@ -3062,7 +3079,7 @@ mod tests {
         };
 
         init_test_signals(agent.config);
-        let result = agent.resume_turn().await.unwrap();
+        let result = agent.resume_turn(None).await.unwrap();
         assert_eq!(result.final_assistant.as_deref(), Some("done"));
         assert!(seen.lock().unwrap()[0].iter().any(|message| {
             matches!(
@@ -3093,7 +3110,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn destructive_trap_stops_before_start_and_lifted_retry_executes_pending_claim() {
+    async fn destructive_trap_approval_executes_pending_claim_without_changing_policy() {
         let tmp = crate::random::create_temp_dir(&std::env::temp_dir(), "mu-agent-trap-").unwrap();
         let marker = tmp.join("marker");
         let store = Store::open(&tmp.join("mu.db")).unwrap();
@@ -3156,12 +3173,12 @@ mod tests {
             renderer: &mut renderer,
         };
         init_test_signals(same_policy_retry.config);
-        let trapped_again = same_policy_retry.resume_turn().await.unwrap();
+        let trapped_again = same_policy_retry.resume_turn(None).await.unwrap();
         assert!(trapped_again.trapped);
         assert_eq!(*step.lock().unwrap(), 1);
         assert!(!marker.exists());
 
-        config.trap = bash::TrapLevel::Off;
+        let approved_call = store.pending_bash_calls(&session.id).unwrap()[0].call_id;
         let mut renderer = Renderer::with_format(OutputFormat::Final);
         let mut retry = AgentLoop {
             config: &config,
@@ -3176,9 +3193,14 @@ mod tests {
             renderer: &mut renderer,
         };
         init_test_signals(retry.config);
-        let completed = retry.resume_turn().await.unwrap();
+        let completed = retry.resume_turn(Some(approved_call)).await.unwrap();
         assert_eq!(completed.final_assistant.as_deref(), Some("done"));
         assert!(marker.exists());
+        assert_eq!(config.trap, bash::TrapLevel::Destructive);
+        assert_eq!(
+            store.pending_trap_level(&session.id).unwrap(),
+            bash::TrapLevel::Destructive
+        );
         let audit = store.audit_events(&session.id).unwrap();
         assert_eq!(
             audit
@@ -3193,6 +3215,70 @@ mod tests {
                 .filter(|event| event["type"] == "bash_completed")
                 .count(),
             1
+        );
+        let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    #[tokio::test]
+    async fn approval_does_not_release_readonly_siblings_or_new_commands() {
+        let tmp = crate::random::create_temp_dir(&std::env::temp_dir(), "mu-approve-").unwrap();
+        let barrier = tmp.join("barrier");
+        std::fs::write(&barrier, "").unwrap();
+        let marker = tmp.join("marker");
+        let store = Store::open(&tmp.join("mu.db")).unwrap();
+        let session = store.create_session("system").unwrap();
+        store
+            .start_turn(&session.id, "/tmp", None, &"run both".into())
+            .unwrap();
+        let config = Config {
+            trap: bash::TrapLevel::All,
+            ..test_config()
+        };
+        let model = crate::models::resolve_model_ref(&config, "test/fake-model").unwrap();
+        let mut renderer = Renderer::with_format(OutputFormat::Final);
+        let mut agent = AgentLoop {
+            config: &config,
+            system_prompt_source: SystemPromptSource::fixed("system"),
+            model: ResolvedModelChoice::fixed(model),
+            provider: Box::new(TwoReadonlyThenStopProvider {
+                step: Mutex::new(0),
+                barrier_path: barrier.display().to_string(),
+            }),
+            store: &store,
+            session_id: &session.id,
+            renderer: &mut renderer,
+        };
+        init_test_signals(&config);
+        assert!(agent.run_turn().await.unwrap().trapped);
+        let pending = store.pending_bash_calls(&session.id).unwrap();
+        assert_eq!(pending.len(), 2);
+        let result = agent.resume_turn(Some(pending[0].call_id)).await.unwrap();
+        assert!(result.trapped);
+        let remaining = store.pending_bash_calls(&session.id).unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].call_id, pending[1].call_id);
+        assert_eq!(remaining[0].attempts, 0);
+        assert!(agent.resume_turn(None).await.unwrap().trapped);
+
+        agent.provider = Box::new(DestructiveThenStopProvider {
+            step: Arc::new(Mutex::new(0)),
+            path: marker.display().to_string(),
+        });
+        assert!(
+            agent
+                .resume_turn(Some(remaining[0].call_id))
+                .await
+                .unwrap()
+                .trapped
+        );
+        assert!(!marker.exists());
+        let new_pending = store.pending_bash_calls(&session.id).unwrap();
+        assert_eq!(new_pending.len(), 1);
+        assert_ne!(new_pending[0].call_id, remaining[0].call_id);
+        assert_eq!(new_pending[0].attempts, 0);
+        assert_eq!(
+            store.pending_trap_level(&session.id).unwrap(),
+            bash::TrapLevel::Destructive
         );
         let _ = std::fs::remove_dir_all(tmp);
     }
@@ -3489,7 +3575,7 @@ mod tests {
         // A new invocation can proceed; a soft interrupt during its final
         // user response is consumed as normal completion.
         init_test_signals(new_turn_agent.config);
-        let result = new_turn_agent.resume_turn().await.unwrap();
+        let result = new_turn_agent.resume_turn(None).await.unwrap();
         assert!(bash::soft_interrupt_requested());
         assert!(!result.soft_interrupted);
         assert_eq!(result.final_assistant.as_deref(), Some("done"));
@@ -3530,7 +3616,7 @@ mod tests {
             renderer: &mut renderer,
         };
         init_test_signals(retry_agent.config);
-        retry_agent.resume_turn().await.unwrap();
+        retry_agent.resume_turn(None).await.unwrap();
         assert_eq!(
             store.latest_summary_sequence(&retry_session.id).unwrap(),
             None
@@ -3611,7 +3697,7 @@ mod tests {
                 if durable_summary && interrupt {
                     assert_eq!(unsafe { libc::raise(libc::SIGQUIT) }, 0);
                 }
-                let result = agent.resume_turn().await.unwrap();
+                let result = agent.resume_turn(None).await.unwrap();
 
                 let awaiting_user = mode == CompactionMode::AwaitUser && !queued;
                 let soft_interrupted = interrupt && !awaiting_user;

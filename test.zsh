@@ -344,19 +344,19 @@ command_candidates=("${(@f)$(_mu_zsh_slash_command_candidates)}")
 MU_ZSH_SESSION_ID=tracked-session
 _MU_ZSH_TRACKED_SCOPE=$(current_scope_key)
 command_candidates=("${(@f)$(_mu_zsh_slash_command_candidates)}")
-[[ "${(j:,:)command_candidates}" == "/load,/model,/trap,/new,/retry,/compact,/review.md" ]] || fail "shows session commands with a valid session: ${(j:,:)command_candidates}"
+[[ "${(j:,:)command_candidates}" == "/load,/model,/trap,/new,/retry,/approve,/compact,/review.md" ]] || fail "shows session commands with a valid session: ${(j:,:)command_candidates}"
 BUFFER="/ret"
 CURSOR=${#BUFFER}
 completion_candidates=("${(@f)$(_mu_zsh_completion_candidates)}")
-[[ "${(j:,:)completion_candidates}" == "/load,/model,/trap,/new,/retry,/compact,/review.md" ]] || fail "offers zsh the complete slash-command set: ${(j:,:)completion_candidates}"
+[[ "${(j:,:)completion_candidates}" == "/load,/model,/trap,/new,/retry,/approve,/compact,/review.md" ]] || fail "offers zsh the complete slash-command set: ${(j:,:)completion_candidates}"
 BUFFER="/M"
 CURSOR=${#BUFFER}
 completion_candidates=("${(@f)$(_mu_zsh_completion_candidates)}")
-[[ "${(j:,:)completion_candidates}" == "/load,/model,/trap,/new,/retry,/compact,/review.md" ]] || fail "leaves case matching to zsh: ${(j:,:)completion_candidates}"
+[[ "${(j:,:)completion_candidates}" == "/load,/model,/trap,/new,/retry,/approve,/compact,/review.md" ]] || fail "leaves case matching to zsh: ${(j:,:)completion_candidates}"
 BUFFER="/unknown"
 CURSOR=${#BUFFER}
 completion_candidates=("${(@f)$(_mu_zsh_completion_candidates)}")
-[[ "${(j:,:)completion_candidates}" == "/load,/model,/trap,/new,/retry,/compact,/review.md" ]] || fail "keeps freeform slash input advisory: ${(j:,:)completion_candidates}"
+[[ "${(j:,:)completion_candidates}" == "/load,/model,/trap,/new,/retry,/approve,/compact,/review.md" ]] || fail "keeps freeform slash input advisory: ${(j:,:)completion_candidates}"
 model_candidates=("${(@f)$(_mu_zsh_model_query "")}")
 [[ "${(j:,:)model_candidates}" == "solo,shared,gpt,gpt-5.6-luna,local/solo,local/shared,openai/gpt,openai/gpt-5.6-luna,openai/shared" ]] || fail "model discovery preserves provider order and deduplicates floating names"
 [[ " ${(j: :)model_candidates} " == *" openai/gpt "* ]] || fail "offers provider-qualified model"
@@ -484,6 +484,15 @@ _mu_zsh_run_slash_command "/model gpt"
 rm -f "$MU_ZSH_FAKE_LOG"
 _mu_zsh_run_slash_command "/retry"
 grep -q -- "retry -s tracked-session --model openai/gpt" "$MU_ZSH_FAKE_LOG" || fail "retry slash command forwards pending model"
+_mu_zsh_run_slash_command "/trap all"
+rm -f "$MU_ZSH_FAKE_LOG"
+_mu_zsh_run_slash_command "/approve"
+grep -q -- "retry -s tracked-session --approve --model openai/gpt --trap all" "$MU_ZSH_FAKE_LOG" || fail "approve forwards session, model, and trap"
+[[ "$_MU_ZSH_TRAP" == all ]] || fail "approve preserves trap override"
+if _mu_zsh_run_slash_command "/approve extra"; then
+  fail "approve rejects arguments"
+fi
+_mu_zsh_run_slash_command "/trap default"
 _mu_zsh_clear_model_state
 rm -f "$MU_ZSH_FAKE_LOG"
 _mu_zsh_run_slash_command "/compact"

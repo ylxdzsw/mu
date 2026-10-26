@@ -99,7 +99,8 @@ Type `/` to list prompt-mode commands. The common ones:
 - `/trap <off|destructive|reversible|all>` persistently selects the Bash trap
   level for this shell scope. `/trap default` returns to configuration.
 - `/retry` resumes a turn interrupted by Ctrl-C, a crash, a lost connection, or
-  exhausted automatic resume attempts.
+  exhausted automatic resume attempts. `/approve` retries with one-time lifting
+  of traps.
 - `/compact` checkpoints a long session through a synthetic summary turn,
   optionally with a focus instruction.
 - When `soft_interrupt` is enabled (the default), press **Ctrl+\\** while Mu is

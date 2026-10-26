@@ -220,6 +220,12 @@ _mu_fish_run_slash_command '/model unknown'; and fail '/model should reject unkn
 _mu_fish_run_slash_command '/trap reversible'
 assert_equal "$_MU_FISH_TRAP" reversible '/trap stores persistent level'
 
+_mu_fish_run_slash_command '/approve'
+set approve_args (cat "$capture_args")
+assert_equal (string join \x1e -- $approve_args) (string join \x1e -- retry -s ses_0000000a --approve --model openai/gpt:high@fast --trap reversible) '/approve forwards session, model, and trap'
+assert_equal "$_MU_FISH_TRAP" reversible '/approve preserves trap override'
+_mu_fish_run_slash_command '/approve extra'; and fail '/approve rejects arguments'
+
 rm -f "$capture_args" "$capture_stdin" "$capture_calls"
 _mu_fish_run_slash_command '/compact' >/dev/null
 set compact_args (cat "$capture_args")

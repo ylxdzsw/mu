@@ -422,7 +422,7 @@ end
 
 function _mu_fish_slash_command_candidates
     printf '%s\n' /load /model /trap
-    _mu_fish_has_active_session; and printf '%s\n' /new /retry /compact
+    _mu_fish_has_active_session; and printf '%s\n' /new /retry /approve /compact
     _mu_fish_custom_slash_commands 2>/dev/null
 end
 
@@ -687,14 +687,15 @@ function _mu_fish_run_slash_command --argument-names line
             _mu_fish_clear_session_state
             _mu_fish_print_block_message '[mu] next turn will start a new session'
 
-        case /retry
+        case /retry /approve
             if test -n "$rest"
-                _mu_fish_print_block_message '[mu] /retry does not accept arguments'
+                _mu_fish_print_block_message "[mu] $slash_command does not accept arguments"
                 return 1
             end
             _mu_fish_activate_scope "$scope"
-            _mu_fish_require_active_session /retry; or return 1
+            _mu_fish_require_active_session $slash_command; or return 1
             set -l retry_command mu retry -s "$MU_FISH_SESSION_ID"
+            test "$slash_command" = /approve; and set -a retry_command --approve
             set -q _MU_FISH_MODEL[1]; and test -n "$_MU_FISH_MODEL"; and set -a retry_command --model "$_MU_FISH_MODEL"
             set -q _MU_FISH_TRAP[1]; and test -n "$_MU_FISH_TRAP"; and set -a retry_command --trap "$_MU_FISH_TRAP"
             $retry_command

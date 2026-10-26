@@ -377,7 +377,7 @@ _mu_zsh_slash_command_candidates() {
   local -a commands
 
   commands=(/load /model /trap)
-  _mu_zsh_bundle_active && [[ -n "$MU_ZSH_SESSION_ID" ]] && commands+=(/new /retry /compact)
+  _mu_zsh_bundle_active && [[ -n "$MU_ZSH_SESSION_ID" ]] && commands+=(/new /retry /approve /compact)
   commands+=("${(@f)$(_mu_zsh_custom_slash_commands 2>/dev/null || true)}")
 
   local command
@@ -849,13 +849,14 @@ _mu_zsh_run_slash_command() {
       _mu_zsh_clear_session_state
       _mu_zsh_print_block_message "[mu] next turn will start a new session"
       ;;
-    /retry)
+    /retry|/approve)
       _mu_zsh_validate_no_args "$command" "$rest" || return 1
       _mu_zsh_activate_scope "$scope"
       _mu_zsh_require_active_session "$command" || return 1
       session_id=$MU_ZSH_SESSION_ID
       local -a retry_command
       retry_command=(mu retry -s "$session_id")
+      [[ "$command" == /approve ]] && retry_command+=(--approve)
       [[ -n "$_MU_ZSH_MODEL" ]] && retry_command+=(--model "$_MU_ZSH_MODEL")
       [[ -n "$_MU_ZSH_TRAP" ]] && retry_command+=(--trap "$_MU_ZSH_TRAP")
       if "${retry_command[@]}"; then
