@@ -202,16 +202,6 @@ pub(crate) fn build_request_body(request: &Request, tools: &[Value]) -> Value {
         // is rejected by real OpenAI `/chat/completions`.)
         body["reasoning_effort"] = Value::String(effort.to_string());
     }
-    if let Some(schema) = request.output_schema.as_ref() {
-        body["response_format"] = serde_json::json!({
-            "type": "json_schema",
-            "json_schema": {
-                "name": "mu_output",
-                "strict": true,
-                "schema": schema,
-            },
-        });
-    }
     body
 }
 
@@ -599,7 +589,6 @@ mod tests {
             model: test_model(effort),
             cache_key: None,
             messages,
-            output_schema: None,
         }
     }
 
@@ -609,21 +598,6 @@ mod tests {
         messages: Vec<Message>,
     ) -> Result<Value, ProviderError> {
         request(effort, messages).json(api)
-    }
-
-    #[test]
-    fn passes_output_schema_in_chat_json_schema_envelope() {
-        let schema = serde_json::json!({"type":"object","properties":{"ok":{"type":"boolean"}}});
-        let mut request = request(None, vec![]);
-        request.output_schema = Some(schema.clone());
-        let body = request.json(ModelApi::ChatCompletions).unwrap();
-        assert_eq!(
-            body["response_format"],
-            serde_json::json!({
-                "type": "json_schema",
-                "json_schema": {"name":"mu_output","strict":true,"schema":schema}
-            })
-        );
     }
 
     #[test]

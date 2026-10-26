@@ -181,21 +181,8 @@ pub(crate) fn build_request_body(
             "type": "ephemeral",
         },
     });
-    if request.model.effort.is_some() || request.output_schema.is_some() {
-        let mut output_config = serde_json::Map::new();
-        if let Some(effort) = request.model.effort.as_deref() {
-            output_config.insert("effort".into(), Value::String(effort.to_string()));
-        }
-        if let Some(schema) = request.output_schema.as_ref() {
-            output_config.insert(
-                "format".into(),
-                serde_json::json!({
-                    "type": "json_schema",
-                    "schema": schema,
-                }),
-            );
-        }
-        body["output_config"] = Value::Object(output_config);
+    if let Some(effort) = request.model.effort.as_deref() {
+        body["output_config"] = serde_json::json!({"effort": effort});
     }
     Ok(body)
 }
@@ -668,25 +655,11 @@ mod tests {
             },
             cache_key: None,
             messages,
-            output_schema: None,
         }
     }
 
     fn request_body(effort: Option<&str>, messages: Vec<Message>) -> Result<Value, ProviderError> {
         request(effort, messages).json(ModelApi::AnthropicMessages)
-    }
-
-    #[test]
-    fn passes_output_schema_in_anthropic_output_config() {
-        let mut request = request(None, vec![system()]);
-        request.output_schema = Some(serde_json::json!({"type":"object"}));
-        let body = request.json(ModelApi::AnthropicMessages).unwrap();
-        assert_eq!(
-            body["output_config"]["format"],
-            serde_json::json!({
-                "type":"json_schema","schema":{"type":"object"}
-            })
-        );
     }
 
     fn system() -> Message {

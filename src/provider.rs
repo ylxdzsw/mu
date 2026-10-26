@@ -365,7 +365,6 @@ pub struct Request {
     pub model: ResolvedModelRef,
     pub cache_key: Option<String>,
     pub messages: Vec<Message>,
-    pub output_schema: Option<Value>,
 }
 
 impl Request {
@@ -1212,28 +1211,6 @@ fn classify_provider_error(
         );
     }
 
-    let param = error.get("param").and_then(Value::as_str);
-    if code_is("invalid_json_schema")
-        || param.is_some_and(|param| {
-            matches!(
-                param,
-                "text.format.schema"
-                    | "response_format"
-                    | "response_format.json_schema.schema"
-                    | "output_config.format.schema"
-            )
-        })
-        || (error_type == "invalid_request_error"
-            && message.starts_with("output_config.format.schema:"))
-    {
-        let detail = if let Some(param) = param {
-            format!("{param}: {detail}")
-        } else {
-            detail
-        };
-        return ProviderError::BadRequestPermanent { status, detail };
-    }
-
     if code_is("context_length_exceeded") || code_is("string_above_max_length") {
         return ProviderError::ContextLength { detail };
     }
@@ -1929,24 +1906,6 @@ mod tests {
                 None
             ),
             ProviderError::ContextLength { .. }
-        ));
-    }
-
-    #[test]
-    fn schema_errors_remain_permanent_through_gateway_wrappers() {
-        let upstream = serde_json::json!({"error": {
-            "type":"invalid_request_error", "code":"invalid_json_schema", "param":"text.format.schema",
-            "message":"Invalid schema: input context maximum exceeded"
-        }});
-        let wrapper = serde_json::json!({"error": {"code":400,"message":"Provider returned error","metadata":{"raw":upstream.to_string()}}});
-        let error = classify_http_error(400, wrapper.to_string(), None);
-        assert!(matches!(error, ProviderError::BadRequestPermanent { .. }));
-        assert_eq!(error.disposition(), ProviderDisposition::Fail);
-        assert!(error.to_string().contains("text.format.schema"));
-        let anthropic = serde_json::json!({"error": {"type":"invalid_request_error", "message":"output_config.format.schema: Invalid JSON Schema in output format"}});
-        assert!(matches!(
-            classify_http_error(400, anthropic.to_string(), None),
-            ProviderError::BadRequestPermanent { .. }
         ));
     }
 

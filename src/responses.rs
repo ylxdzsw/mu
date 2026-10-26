@@ -132,16 +132,6 @@ pub(crate) fn build_request_body(
     if let Some(effort) = request.model.effort.as_deref() {
         reasoning.insert("effort".into(), Value::String(effort.to_string()));
     }
-    if let Some(schema) = request.output_schema.as_ref() {
-        body["text"] = serde_json::json!({
-            "format": {
-                "type": "json_schema",
-                "name": "mu_output",
-                "strict": true,
-                "schema": schema,
-            }
-        });
-    }
     body["reasoning"] = Value::Object(reasoning);
     Ok(body)
 }
@@ -557,29 +547,6 @@ mod tests {
         assert_eq!(usage.output_tokens, 5);
         assert_eq!(usage.reasoning_output_tokens, 4);
         assert_eq!(usage.total_tokens, 17);
-    }
-
-    #[test]
-    fn passes_output_schema_in_responses_text_format_envelope() {
-        let request = Request {
-            model: crate::models::ResolvedModelRef {
-                canonical: "test/model".into(),
-                provider_id: "test".into(),
-                model_id: "model".into(),
-                effort: None,
-                processing: None,
-            },
-            cache_key: None,
-            messages: vec![],
-            output_schema: Some(serde_json::json!({"type":"object"})),
-        };
-        let body = request.json(crate::provider::ModelApi::Responses).unwrap();
-        assert_eq!(
-            body["text"]["format"],
-            serde_json::json!({
-                "type":"json_schema","name":"mu_output","strict":true,"schema":{"type":"object"}
-            })
-        );
     }
 
     #[test]

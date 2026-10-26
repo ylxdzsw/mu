@@ -8,7 +8,7 @@ selected output, persists completed state, and exits. Run `mu --help` or
 
 ```text
 mu [-s <session-id> | -c] [-m <model>] [-a <file> ...]
-   [-o final|concise|detail|full] [--output-schema <JSON>] [--no-context] [--automated]
+   [-o final|concise|detail|full] [--no-context] [--automated]
 mu [turn options] <prompt-file-or-command>
 ```
 
@@ -38,8 +38,6 @@ Session and model selection:
   starting at that configured provider. Quote the parentheses in shell
   commands.
 - `--trap off|destructive|reversible|all`: set the turn's Bash trap level.
-- `--output-schema <JSON>`: request a provider-native constrained JSON
-  response format for this ordinary turn. The argument must be valid JSON.
 
 The optional final processing suffix is `@fast` or `@standard`; `@` is reserved
 in model IDs and effort strings, and unknown suffixes are rejected. Without a
@@ -99,26 +97,6 @@ errors and session-busy errors, go to stderr in every output mode. A trapped
 Bash call is the exception: Mu prints its complete command and stdin to stdout
 and exits with status 3. Non-final assistant text already streamed before a
 failure remains visible.
-
-`--output-schema` accepts JSON directly; there is no file option. For example,
-pass a file's contents with `--output-schema "$(cat schema.json)"`. Mu parses
-the argument as JSON, then passes the schema value unchanged: it performs no
-schema compatibility checks or rewrites and does not parse or validate the
-final answer against the schema. An invalid JSON argument fails before the
-prompt is queued. This option works with every `-o` presentation mode and does
-not alter presentation.
-
-The schema contract persists with the ordinary turn and is reused by `mu
-retry` without the flag. It is not session-global; submitting a new prompt
-without `--output-schema` resets it. Compaction summaries omit the schema, but
-an in-turn continuation retains the ordinary turn's contract. Provider
-mapping: Chat Completions uses `response_format.json_schema` with
-`name: "mu_output"`, `strict: true`, and the schema; Responses uses
-`text.format` with the same name, strictness, and schema; Anthropic uses
-`output_config.format` with `type: "json_schema"` and the schema, without a
-strict field. If a constrained response ends in an incomplete terminal output
-state, the invocation fails nonzero. Mu does not otherwise validate answer
-format or schema adherence.
 
 An explicit refusal reported by a provider is a dedicated failure, detected
 from provider refusal signals rather than textual phrase matching. It is not

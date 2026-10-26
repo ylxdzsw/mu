@@ -946,7 +946,7 @@ A default invocation runs one turn:
 
 ```text
 mu [-s ID | -c] [-m MODEL] [-a FILE ...]
-   [-o final|concise|detail|full] [--output-schema JSON] [--no-context] [--automated]
+   [-o final|concise|detail|full] [--no-context] [--automated]
    [PROMPT_FILE_OR_COMMAND]
 ```
 
@@ -958,29 +958,6 @@ File-backed prompts strip the leading shebang. Discovered custom commands also
 strip supported skill frontmatter; explicit prompt files retain it. Terminal
 stdin is left unread; non-terminal stdin, when non-empty, is appended after
 `\n---\n\n` as a custom instruction.
-
-`--output-schema <JSON>` is an ordinary-turn option that supplies a
-provider-native constrained JSON response format. The argument must parse as
-JSON; Mu rejects invalid JSON before queueing the prompt. Mu passes the parsed
-schema value through unchanged: it does not check schema compatibility,
-rewrite the schema, or validate the final answer as JSON or against the schema.
-There is no schema file option; shell substitution can read a file, for
-example `--output-schema "$(cat schema.json)"`. The option is allowed with
-every `-o` presentation mode and does not change presentation.
-
-The contract is stored with the submitted turn and reconstructed unchanged on
-`mu retry`, without requiring the flag again. It is not session-global: a new
-prompt without the option resets the contract. Compaction summaries do not use
-the schema, while an in-turn continuation of the ordinary turn retains it.
-
-Providers receive their native constrained-format mapping: Chat Completions
-uses `response_format.json_schema` with `name: "mu_output"`, `strict: true`,
-and the unchanged schema; Responses uses `text.format` with the same name,
-strictness, and schema; Anthropic uses `output_config.format` with
-`type: "json_schema"` and the unchanged schema, without a strict field.
-If a schema-constrained response ends in an incomplete terminal output state,
-the turn fails nonzero. Otherwise, Mu does not parse the final answer or check
-its adherence to the schema.
 
 Management commands:
 
@@ -1051,12 +1028,13 @@ derives from the associated provider request after completion-time validation;
 the request recipe records the exact replay-origin selection so reconstruction
 remains stable across configuration changes.
 
-The queued ordinary turn stores its optional output-schema contract so every
-request and retry in that turn can reconstruct it. It is not session-wide.
-Compaction requests omit the schema, but continuation requests for the
-ordinary turn retain it. A refusal is recorded as a dedicated provider
-failure, with native refusal details and usage when available and no accepted
-assistant message or executable tool call.
+Native request reconstruction reuses the saved envelope and regenerates only
+messages, system content, and tools from semantic history. The canonical
+checksum must match before the reconstructed request is returned.
+
+A refusal is recorded as a dedicated provider failure, with native refusal
+details and usage when available and no accepted assistant message or
+executable tool call.
 
 The journal format is version 4. It deliberately does not read version 3.
 Context epoch at event sequence `S` is the number of valid prior

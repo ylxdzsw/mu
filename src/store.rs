@@ -317,8 +317,6 @@ enum Event {
         cwd: String,
         trap: crate::bash::TrapLevel,
         #[serde(skip_serializing_if = "Option::is_none")]
-        output_schema: Option<ObjectRef>,
-        #[serde(skip_serializing_if = "Option::is_none")]
         git_worktree_root: Option<String>,
         prompt: PersistedUserContent,
     },
@@ -946,7 +944,6 @@ impl Store {
                 processing,
             },
             cache_key: None,
-            output_schema: None,
             messages: self.load_context_messages(session_id)?,
         };
         let native = request.json(ModelApi::ChatCompletions)?;
@@ -1439,7 +1436,6 @@ impl Store {
             git_worktree_root,
             prompt,
             crate::bash::TrapLevel::Destructive,
-            None,
         )?;
         self.materialize_queued_prompt(session_id)?
             .context("queued prompt was not materialized")
@@ -1475,7 +1471,6 @@ impl Store {
         git_worktree_root: Option<&str>,
         prompt: &UserContent,
         trap: crate::bash::TrapLevel,
-        output_schema: Option<&Value>,
     ) -> Result<String> {
         let prompt_id = self.with_journal(session_id, |journal| {
             if compaction_start_before(journal, i64::MAX).is_some() {
@@ -1492,7 +1487,6 @@ impl Store {
                 prompt_id: prompt_id.clone(),
                 cwd: cwd.to_string(),
                 trap,
-                output_schema: self.persist_json(output_schema)?,
                 git_worktree_root: git_worktree_root.map(str::to_string),
                 prompt: self.persist_user_content(prompt)?,
             },
@@ -1725,7 +1719,6 @@ impl Store {
                 processing: None,
             },
             cache_key: None,
-            output_schema: None,
             messages,
         };
         let native_request = request.json(ModelApi::ChatCompletions)?;
@@ -2205,46 +2198,6 @@ impl Store {
         })
     }
 
-    pub fn turn_output_schema(&self, session_id: &str, turn_id: &str) -> Result<Option<Value>> {
-        self.with_journal(session_id, |journal| {
-            let mut source_prompt_id = None;
-            let prompt_id = journal.events.iter().find_map(|line| match &line.event {
-                Event::PromptMaterialized {
-                    prompt_id,
-                    turn_id: id,
-                } => {
-                    source_prompt_id = Some(prompt_id);
-                    (id == turn_id).then_some(prompt_id)
-                }
-                Event::CompactionStarted {
-                    mode: CompactionMode::AwaitUser,
-                    ..
-                } => {
-                    source_prompt_id = None;
-                    None
-                }
-                Event::CompactionApplied { .. } if turn_id == format!("t{}", line.seq) => {
-                    source_prompt_id
-                }
-                _ => None,
-            });
-            let schema = journal.events.iter().find_map(|line| match &line.event {
-                Event::PromptQueued {
-                    prompt_id: id,
-                    output_schema,
-                    ..
-                } if Some(id) == prompt_id => output_schema.as_ref(),
-                _ => None,
-            });
-            schema
-                .map(|object| {
-                    serde_json::from_slice(&self.read_object(object)?)
-                        .context("reading turn output schema")
-                })
-                .transpose()
-        })
-    }
-
     fn complete_provider_exchange(
         &self,
         session_id: &str,
@@ -2529,45 +2482,31 @@ impl Store {
             serde_json::from_value(recipe.input["native_replay_origins"].clone())
                 .context("agent request recipe has no valid native replay origins")?;
         let messages = crate::provider::filter_native_replay_for_origins(&messages, api, &origins);
-        let cache_key = recipe
-            .envelope
-            .get("prompt_cache_key")
-            .map(|value| {
-                value
-                    .as_str()
-                    .context("provider request prompt_cache_key is not a string")
-            })
-            .transpose()?
-            .map(str::to_owned);
-        let request = Request {
+        let body = Request {
             model: ResolvedModelRef {
                 canonical: origin.canonical_model_ref.clone(),
                 provider_id: origin.provider_id.clone(),
                 model_id: origin.wire_model.clone(),
                 effort: origin.effort.clone(),
-                processing: match recipe.envelope.get("service_tier") {
-                    None => None,
-                    Some(Value::String(tier)) if tier == "priority" => {
-                        Some(crate::models::Processing::Fast)
-                    }
-                    Some(Value::String(tier)) if tier == "default" => {
-                        Some(crate::models::Processing::Standard)
-                    }
-                    _ => bail!("invalid provider request service_tier"),
-                },
+                processing: None,
             },
-            cache_key,
-            output_schema: recipe
-                .envelope
-                .pointer(match api {
-                    ModelApi::ChatCompletions => "/response_format/json_schema/schema",
-                    ModelApi::Responses => "/text/format/schema",
-                    ModelApi::AnthropicMessages => "/output_config/format/schema",
-                })
-                .cloned(),
+            cache_key: None,
             messages,
         }
         .json(api)?;
+        // The saved envelope is authoritative, including historical provider options.
+        // Only messages, system, and tools are regenerated from semantic history.
+        let mut request = recipe
+            .envelope
+            .as_object()
+            .context("provider request envelope is not an object")?
+            .clone();
+        for key in ["input", "messages", "system", "tools"] {
+            if let Some(value) = body.get(key) {
+                request.insert(key.into(), value.clone());
+            }
+        }
+        let request = Value::Object(request);
         if hex(Sha256::digest(canonical_json(&request))) != recipe.canonical_sha256 {
             bail!("reconstructed provider request checksum mismatch")
         }
@@ -4263,7 +4202,6 @@ mod tests {
                 Some("/repo"),
                 &"12345678".into(),
                 crate::bash::TrapLevel::All,
-                None,
             )
             .unwrap();
         assert_eq!(
@@ -4313,7 +4251,6 @@ mod tests {
                 processing: None,
             },
             cache_key: None,
-            output_schema: None,
             messages: store.load_context_messages(&session.id).unwrap(),
         };
         let native = request.json(ModelApi::ChatCompletions).unwrap();
@@ -4385,7 +4322,6 @@ mod tests {
                 processing: None,
             },
             cache_key: None,
-            output_schema: None,
             messages: replay_messages.clone(),
         };
         let replay_native = replay_request.json(ModelApi::Responses).unwrap();
@@ -4483,7 +4419,6 @@ mod tests {
         let request = Request {
             model: target.clone(),
             cache_key: None,
-            output_schema: None,
             messages: messages.clone(),
         };
         let native = request.json(ModelApi::Responses).unwrap();
@@ -4568,7 +4503,6 @@ mod tests {
                 Some("/repo"),
                 &"queued".into(),
                 crate::bash::TrapLevel::Destructive,
-                None,
             )
             .unwrap();
         let source_turn_id = store
@@ -5072,61 +5006,75 @@ mod tests {
     }
 
     #[test]
-    fn agent_request_reconstructs_from_semantic_history() {
-        let (store, session) = test_session();
-        let turn = store
-            .start_turn(&session.id, "/tmp", Some("/repo"), &"hello".into())
-            .unwrap();
-        let messages = store.load_context_messages(&session.id).unwrap();
-        let endpoint = "https://example.test/v1/chat/completions";
-        let request = Request {
-            model: ResolvedModelRef {
-                canonical: "test/model:high".into(),
-                provider_id: "test".into(),
-                model_id: "model".into(),
-                effort: Some("high".into()),
-                processing: None,
-            },
-            cache_key: Some(format!("mu:{}:agent", session.id)),
-            output_schema: None,
-            messages,
-        };
-        let native = request.json(ModelApi::ChatCompletions).unwrap();
-        let recipe = store
-            .request_recipe(
-                "openai.chat_completions.v1",
-                &native,
-                serde_json::json!({
-                    "native_replay_origins": [],
-                }),
-            )
-            .unwrap();
-        assert_eq!(
-            recipe.envelope["prompt_cache_key"],
-            format!("mu:{}:agent", session.id)
-        );
-        let exchange = store
-            .start_provider_request(
-                &session.id,
-                &turn,
-                ProviderOrigin {
-                    canonical_model_ref: request.model.canonical.clone(),
-                    provider_id: request.model.provider_id.clone(),
-                    api: "chat_completions".into(),
-                    endpoint: endpoint.into(),
-                    wire_model: request.model.model_id.clone(),
-                    effort: request.model.effort.clone(),
+    fn request_reconstruction_preserves_envelope_and_checks_checksum() {
+        for api in [
+            ModelApi::ChatCompletions,
+            ModelApi::Responses,
+            ModelApi::AnthropicMessages,
+        ] {
+            let (store, session) = test_session();
+            let turn = store
+                .start_turn(&session.id, "/tmp", Some("/repo"), &"hello".into())
+                .unwrap();
+            let request = Request {
+                model: ResolvedModelRef {
+                    canonical: "test/model:high".into(),
+                    provider_id: "test".into(),
+                    model_id: "model".into(),
+                    effort: Some("high".into()),
+                    processing: None,
                 },
-                recipe,
-            )
-            .unwrap();
-
-        assert_eq!(
-            store
-                .reconstruct_provider_request(&session.id, &exchange)
-                .unwrap(),
-            native
-        );
+                cache_key: Some(format!("mu:{}:agent", session.id)),
+                messages: store.load_context_messages(&session.id).unwrap(),
+            };
+            let mut native = request.json(api).unwrap();
+            // Historical envelope fields need not be supported by today's adapter.
+            native["historical_option"] = serde_json::json!({"nested": [null, false, {}]});
+            native["stream"] = Value::Bool(false);
+            let recipe = store
+                .request_recipe(
+                    api.request_format(),
+                    &native,
+                    serde_json::json!({"native_replay_origins": []}),
+                )
+                .unwrap();
+            let exchange = store
+                .start_provider_request(
+                    &session.id,
+                    &turn,
+                    ProviderOrigin {
+                        canonical_model_ref: request.model.canonical.clone(),
+                        provider_id: request.model.provider_id.clone(),
+                        api: api.name().into(),
+                        endpoint: "https://example.test".into(),
+                        wire_model: request.model.model_id.clone(),
+                        effort: request.model.effort.clone(),
+                    },
+                    recipe,
+                )
+                .unwrap();
+            let reopened = Store::open(&store.root).unwrap();
+            assert_eq!(
+                reopened
+                    .reconstruct_provider_request(&session.id, &exchange)
+                    .unwrap(),
+                native
+            );
+            let mut journal = reopened.load(&session.id).unwrap();
+            let Event::ProviderRequested { request_recipe, .. } =
+                &mut Arc::make_mut(&mut journal.events).last_mut().unwrap().event
+            else {
+                panic!("missing provider request")
+            };
+            request_recipe.envelope["historical_option"] = Value::Null;
+            assert!(
+                reopened
+                    .reconstruct_provider_request_from(&journal, &exchange)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("checksum mismatch")
+            );
+        }
     }
 
     #[test]
@@ -5151,7 +5099,6 @@ mod tests {
                         processing,
                     },
                     cache_key: Some(format!("mu:{}:epoch:0", session.id)),
-                    output_schema: None,
                     messages: store.load_context_messages(&session.id).unwrap(),
                 };
                 let native = request.json(api).unwrap();
@@ -5214,111 +5161,6 @@ mod tests {
     }
 
     #[test]
-    fn output_schema_persists_and_reconstructs_for_each_api() {
-        for schema in [
-            serde_json::json!({"type":"object","custom":"unchanged"}),
-            Value::Null,
-            Value::Bool(false),
-        ] {
-            let (store, session) = test_session();
-            store
-                .queue_prompt(
-                    &session.id,
-                    "/tmp",
-                    None,
-                    &"hello".into(),
-                    crate::bash::TrapLevel::Destructive,
-                    Some(&schema),
-                )
-                .unwrap();
-            let turn = store
-                .materialize_queued_prompt(&session.id)
-                .unwrap()
-                .unwrap();
-            let reopened = Store::open(&store.root).unwrap();
-            assert_eq!(
-                reopened.turn_output_schema(&session.id, &turn).unwrap(),
-                Some(schema.clone())
-            );
-            for api in [
-                ModelApi::ChatCompletions,
-                ModelApi::Responses,
-                ModelApi::AnthropicMessages,
-            ] {
-                let request = Request {
-                    model: ResolvedModelRef {
-                        canonical: "test/model".into(),
-                        provider_id: "test".into(),
-                        model_id: "model".into(),
-                        effort: None,
-                        processing: None,
-                    },
-                    cache_key: None,
-                    output_schema: Some(schema.clone()),
-                    messages: reopened.load_context_messages(&session.id).unwrap(),
-                };
-                let native = request.json(api).unwrap();
-                let recipe = reopened
-                    .request_recipe(
-                        api.request_format(),
-                        &native,
-                        serde_json::json!({"native_replay_origins":[]}),
-                    )
-                    .unwrap();
-                let exchange = reopened
-                    .start_provider_request(
-                        &session.id,
-                        &turn,
-                        ProviderOrigin {
-                            canonical_model_ref: "test/model".into(),
-                            provider_id: "test".into(),
-                            api: api.name().into(),
-                            endpoint: "https://example.test".into(),
-                            wire_model: "model".into(),
-                            effort: None,
-                        },
-                        recipe,
-                    )
-                    .unwrap();
-                assert_eq!(
-                    reopened
-                        .reconstruct_provider_request(&session.id, &exchange)
-                        .unwrap(),
-                    native
-                );
-                reopened
-                    .fail_provider_exchange(
-                        &session.id,
-                        &exchange,
-                        "test",
-                        serde_json::json!({}),
-                        None,
-                        None,
-                    )
-                    .unwrap();
-            }
-            reopened
-                .queue_prompt(
-                    &session.id,
-                    "/tmp",
-                    None,
-                    &"next".into(),
-                    crate::bash::TrapLevel::Destructive,
-                    None,
-                )
-                .unwrap();
-            let next = reopened
-                .materialize_queued_prompt(&session.id)
-                .unwrap()
-                .unwrap();
-            assert_eq!(
-                reopened.turn_output_schema(&session.id, &next).unwrap(),
-                None
-            );
-        }
-    }
-
-    #[test]
     fn resumed_anthropic_request_reconstructs_derived_continuation() {
         let (store, session) = test_session();
         let turn = store
@@ -5367,7 +5209,6 @@ mod tests {
                 processing: None,
             },
             cache_key: None,
-            output_schema: None,
             messages: messages.clone(),
         };
         let native = request.json(ModelApi::AnthropicMessages).unwrap();
@@ -5474,7 +5315,6 @@ mod tests {
                 processing: None,
             },
             cache_key: None,
-            output_schema: None,
             messages: request_messages,
         };
         let endpoint = "https://target.test/v1/chat/completions";
@@ -5527,7 +5367,6 @@ mod tests {
                 processing: None,
             },
             cache_key: None,
-            output_schema: None,
             messages: store.load_context_messages(&session.id).unwrap(),
         };
         let native = request.json(ModelApi::ChatCompletions).unwrap();
@@ -5997,7 +5836,6 @@ mod tests {
                 processing: None,
             },
             cache_key: None,
-            output_schema: None,
             messages,
         };
         let projected = request(projected);
