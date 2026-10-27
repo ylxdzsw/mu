@@ -853,7 +853,11 @@ Precedence is:
 2. global `config.jsonc`;
 3. project `config.jsonc`.
 
-Objects merge recursively; scalar and array values replace inherited values.
+Objects merge recursively; scalar values replace inherited values.
+Array merging is field-specific: `supported_efforts` replaces the inherited
+list, while `redaction.env` combines selectors across bundled defaults, global
+config, and project config, removing duplicates in first-seen order. An empty
+`redaction.env` adds nothing and does not disable inherited selectors.
 Provider/model object order is meaningful for defaults, fallback, status, and
 completion. Bundled provider entries seed a missing global config but do not
 silently merge into an existing one.

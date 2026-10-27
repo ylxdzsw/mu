@@ -496,7 +496,7 @@ fn load_config(
         let project_path = dir.join("config.jsonc");
         if project_path.exists() {
             let (project, project_order) = read_config_file(&project_path, mode)?;
-            merge_json(&mut value, project);
+            merge_config(&mut value, project);
             order = combined_config_order(&global_order, Some(&project_order));
         }
     }
@@ -553,7 +553,7 @@ fn config_from_value(value: serde_json::Value) -> Result<Config> {
 
 fn deserialize_config(value: serde_json::Value, discard_invalid_providers: bool) -> Result<Config> {
     let mut merged = bundled_defaults()?;
-    merge_json(&mut merged, value);
+    merge_config(&mut merged, value);
     if !discard_invalid_providers {
         return serde_json::from_value(merged).context("invalid config.jsonc structure");
     }
@@ -685,6 +685,22 @@ fn apply_config_order(config: &mut Config, order: &ConfigOrder) {
     }
 }
 
+fn merge_config(base: &mut serde_json::Value, mut overlay: serde_json::Value) {
+    if let (Some(serde_json::Value::Array(inherited)), Some(serde_json::Value::Array(selectors))) = (
+        base.pointer("/redaction/env"),
+        overlay.pointer_mut("/redaction/env"),
+    ) {
+        let mut merged = inherited.clone();
+        for selector in selectors.drain(..) {
+            if !merged.contains(&selector) {
+                merged.push(selector);
+            }
+        }
+        *selectors = merged;
+    }
+    merge_json(base, overlay);
+}
+
 fn merge_json(base: &mut serde_json::Value, overlay: serde_json::Value) {
     match (base, overlay) {
         (serde_json::Value::Object(base), serde_json::Value::Object(overlay)) => {
@@ -718,36 +734,57 @@ mod tests {
 
     #[test]
     fn config_overlays_are_recursive_without_injecting_starter_providers() {
-        let mut user = serde_json::json!({
+        let user = serde_json::json!({
             "providers": {
                 "custom": {
                     "endpoint": "http://localhost/chat/completions",
-                    "models": {"model": {"context_window": 128000}}
+                    "models": {"model": {
+                        "context_window": 128000,
+                        "supported_efforts": ["low", "high"]
+                    }}
                 }
             },
             "limits": {"max_lines": 123},
             "compaction": {"enabled": false},
             "redaction": {"env": ["*_TOKEN"]}
         });
-        let project = serde_json::json!({
-            "limits": {"max_bytes": 456},
-            "redaction": {"env": []}
-        });
-        merge_json(&mut user, project);
-
-        let config = config_from_value(user).unwrap();
-        assert_eq!(
-            config
-                .providers
-                .keys()
-                .map(String::as_str)
-                .collect::<Vec<_>>(),
-            ["custom"]
-        );
-        assert_eq!(config.limits.max_lines, 123);
-        assert_eq!(config.limits.max_bytes, 456);
-        assert!(!config.compaction.enabled);
-        assert!(config.redaction.env.is_empty());
+        for selectors in [
+            serde_json::json!([]),
+            serde_json::json!(["PROJECT_SECRET", "*_TOKEN"]),
+        ] {
+            let project = serde_json::json!({
+                "providers": {"custom": {"models": {"model": {"supported_efforts": ["high"]}}}},
+                "limits": {"max_bytes": 456},
+                "redaction": {"env": selectors}
+            });
+            let mut merged = user.clone();
+            merge_config(&mut merged, project);
+            let config = config_from_value(merged).unwrap();
+            let mut expected = Config::default().redaction.env;
+            expected.push("*_TOKEN".into());
+            if !selectors.as_array().unwrap().is_empty() {
+                expected.push("PROJECT_SECRET".into());
+            }
+            assert_eq!(config.redaction.env, expected);
+            assert_eq!(
+                config
+                    .model_config("custom", "model")
+                    .unwrap()
+                    .supported_efforts,
+                Some(vec!["high".into()])
+            );
+            assert_eq!(
+                config
+                    .providers
+                    .keys()
+                    .map(String::as_str)
+                    .collect::<Vec<_>>(),
+                ["custom"]
+            );
+            assert_eq!(config.limits.max_lines, 123);
+            assert_eq!(config.limits.max_bytes, 456);
+            assert!(!config.compaction.enabled);
+        }
     }
 
     #[test]

@@ -66,7 +66,7 @@
   },
   // Environment values redacted from Bash output.
   "redaction": {
-    // Exact names or *suffix selectors to redact.
+    // Exact names or *suffix selectors; combined across defaults, global, and project.
     "env": ["*_API_KEY", "*_API_TOKEN", "*_AUTH_TOKEN", "*_ACCESS_TOKEN"]
   }
 }

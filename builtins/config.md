@@ -52,8 +52,10 @@ and `compact` create missing global config with a starter provider. `init`,
 `new`, `sessions`, `transcript`, `context`, and `cat` do not. Project config from
 `mu init` is only an overlay stub. Omitted non-provider fields inherit
 from bundled defaults; bundled providers are used only to create a missing
-global config. Objects merge recursively across scopes; scalars and arrays
-replace inherited values.
+global config. Objects merge recursively across scopes; scalars replace
+inherited values. `supported_efforts` replaces the inherited list, while
+`redaction.env` combines selectors from bundled defaults, global config, and
+project config, removing duplicates.
 
 `mu transcript` is a read-only exception: it does not create a missing global
 config or load `.env` files, and provider validation errors do not prevent it
@@ -220,8 +222,10 @@ atomically and its last duplicate wins.
 The effective environment is passed to bash and used for API keys and skill
 requirements. Values named by `api_key_env` or `redaction.env` are redacted
 before bash output is stored or shown to the model. Redaction selectors are
-case-sensitive exact names or one leading `*` plus a non-empty suffix; `[]`
-disables the defaults, and empty selected values are ignored.
+case-sensitive exact names or one leading `*` plus a non-empty suffix. Selectors
+accumulate across bundled defaults, global config, and project config; `[]`
+adds nothing and does not disable inherited selectors. Empty selected values
+are ignored.
 
 ## AGENTS.md
 
