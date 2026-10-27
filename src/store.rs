@@ -5098,7 +5098,7 @@ mod tests {
                         effort: Some("high".into()),
                         processing,
                     },
-                    cache_key: Some(format!("mu:{}:epoch:0", session.id)),
+                    cache_key: Some(format!("test/model:{}:0", session.id)),
                     messages: store.load_context_messages(&session.id).unwrap(),
                 };
                 let native = request.json(api).unwrap();

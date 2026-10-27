@@ -1211,7 +1211,8 @@ prompt. The “after” estimate is the immediate next provider input. Automatic
 `await_user` compaction includes the queued prompt because Mu materializes it
 immediately, while `continue_turn` measures the checkpoint continuation.
 
-Every provider request uses cache key `mu:<session>:epoch:<N>`. The compaction
+Every provider request uses cache key `<replay-key>:<session-id>:<epoch>`, using
+the active model's effective replay key. The compaction
 request remains in the old epoch; only a successfully applied checkpoint
 advances the epoch. Once a compaction turn is durable, new prompts and another
 manual compaction for that session are rejected until `/retry` completes it.

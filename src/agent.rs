@@ -353,9 +353,14 @@ impl<'a> AgentLoop<'a> {
                     );
                     let epoch = self.store.context_epoch(self.session_id)?;
                     let turn_id = self.store.current_turn_id(self.session_id)?;
+                    let model = self.model.active_model();
                     let request = Request {
-                        model: self.model.active_model().clone(),
-                        cache_key: Some(format!("mu:{}:epoch:{epoch}", self.session_id)),
+                        model: model.clone(),
+                        cache_key: Some(format!(
+                            "{}:{}:{epoch}",
+                            self.config.replay_key(&model.provider_id, &model.model_id),
+                            self.session_id
+                        )),
                         messages: request_context,
                     };
                     let native_request = request.json(self.provider.api())?;
@@ -3665,7 +3670,7 @@ mod tests {
                         .unwrap();
                     assert_eq!(
                         request["prompt_cache_key"],
-                        format!("mu:{}:epoch:{}", session.id, u64::from(!summarizing))
+                        format!("test/fake-model:{}:{}", session.id, u64::from(!summarizing))
                     );
                     assert_eq!(
                         request["messages"][0]["content"],

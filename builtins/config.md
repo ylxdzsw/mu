@@ -145,7 +145,9 @@ Compaction asks the active model to summarize the exact current context as a
 normal persisted agent turn, then replaces the model-facing history with the
 system prompt and a session checkpoint. Each successful checkpoint increments
 the session context epoch; provider cache keys have the form
-`mu:<session>:epoch:<N>`. When automatic compaction is enabled, a context-length
+`<replay-key>:<session-id>:<epoch>`, using the active model's effective replay key
+(configured `replay_key`, or `provider/model` when omitted).
+When automatic compaction is enabled, a context-length
 or request-size error starts emergency compaction. It preserves the latest real
 user prompt or Bash output in full, including all its attachments, and replaces
 all earlier attachments with omission markers and object references. Synthetic
