@@ -766,16 +766,17 @@ impl Renderer {
             }
         }
         self.write_stdout_committed(&format!(
-            "⊘ trapped before execution · declared {risk}, trap {trap}\n"
+            "⊘ trapped before execution · declared {risk}, trap {trap}"
         ))?;
-        let commands = if later_pending == 1 {
-            "command"
-        } else {
-            "commands"
-        };
-        self.write_stdout_committed(&format!(
-            "{later_pending} later {commands} pending · approval applies only to this command\n"
-        ))
+        if later_pending > 0 {
+            let commands = if later_pending == 1 {
+                "command"
+            } else {
+                "commands"
+            };
+            self.write_stdout_committed(&format!(" · {later_pending} later {commands} pending"))?;
+        }
+        self.write_stdout_committed("\n")
     }
 
     pub fn bash_header_cwd_line(&mut self, raw_cwd: &str) -> io::Result<()> {
@@ -4356,19 +4357,27 @@ mod tests {
             OutputFormat::Detail,
             OutputFormat::Full,
         ] {
-            let (mut renderer, stdout, stderr) =
-                Renderer::with_test_output(format, false, false, None);
-            renderer
-                .trapped_bash(&args, crate::bash::TrapLevel::Destructive, 2)
-                .unwrap();
-            let output = stdout.transcript();
-            assert!(output.contains(&command), "{format:?}: {output:?}");
-            assert!(output.contains(&stdin), "{format:?}: {output:?}");
-            assert!(output.contains("⊘ trapped before execution"));
-            assert!(
-                output.contains("2 later commands pending · approval applies only to this command")
-            );
-            assert_eq!(stderr.transcript(), "");
+            for (later_pending, suffix) in [
+                (0, ""),
+                (1, " · 1 later command pending"),
+                (2, " · 2 later commands pending"),
+            ] {
+                let (mut renderer, stdout, stderr) =
+                    Renderer::with_test_output(format, false, false, None);
+                renderer
+                    .trapped_bash(&args, crate::bash::TrapLevel::Destructive, later_pending)
+                    .unwrap();
+                let output = stdout.transcript();
+                assert!(output.contains(&command), "{format:?}: {output:?}");
+                assert!(output.contains(&stdin), "{format:?}: {output:?}");
+                assert_eq!(
+                    output.lines().last().unwrap(),
+                    format!(
+                        "⊘ trapped before execution · declared destructive, trap destructive{suffix}"
+                    )
+                );
+                assert_eq!(stderr.transcript(), "");
+            }
         }
     }
 

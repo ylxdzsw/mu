@@ -456,8 +456,10 @@ A trapped call always exposes its complete title, declared risk, command,
 effective cwd, and stdin on stdout in every output mode. It bypasses width,
 preview, stdin-summary, and Bash-output limits, then reports that execution did
 not start. It emits no final assistant answer or duplicate generic error.
-Only the blocked command is displayed in full; its footer counts later pending
-commands and states that approval applies only to this command.
+Only the blocked command is displayed in full. When later commands are pending,
+their count is appended to the final trap-status line as
+` · N later commands pending` (singular `command` for one); the suffix is omitted
+when none are pending. The footer includes no approval-scope message.
 Complete commands and stdin can therefore enter redirected logs even under
 `--output final`.
 
