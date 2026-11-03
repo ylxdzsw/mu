@@ -8,8 +8,9 @@ pub const EMERGENCY_OUTPUT_UNAVAILABLE: &str =
 
 const COMMON_PROMPT: &str = "\
 We are replacing the current model context. Produce only a self-contained Markdown \
-summary for the next context. Do not wrap it in XML or JSON. Do not address the user \
-and do not continue the task yet. Avoid tools unless they are genuinely necessary.
+summary for the next context. Do not address the user and do not continue the task yet. \
+Do not repeat or summarize instructions from the AGENTS.md blocks in the system \
+prompt; they will be supplied again in the new context.
 
 Use these sections, omitting only sections with no useful content:
 - `## Purpose and current request`
@@ -21,21 +22,19 @@ Use these sections, omitting only sections with no useful content:
 - `## Pending work`
 - `## Recovery references`
 
-You may add `## Notes` as a catch-all only for important material that fits nowhere \
-else.";
+You may add `## Notes` as a catch-all for important material that fits nowhere else.";
 
 pub fn compaction_prompt(mode: CompactionMode, focus: Option<&str>) -> UserContent {
     let mode_prompt = match mode {
         CompactionMode::AwaitUser => {
             "\
 This is an out-of-turn checkpoint. Summarize the completed conversation state and open \
-threads, then stop. There is no new user prompt in this context."
+threads, then stop."
         }
         CompactionMode::ContinueTurn => {
             "\
 This is an in-turn checkpoint that will be continued immediately. Include a final \
-`## Immediate next step` section as the last section and make it concrete enough for \
-another instance to continue without asking the user to repeat the request."
+`## Immediate next step` section as the last section."
         }
     };
     let focus = focus
@@ -45,10 +44,17 @@ another instance to continue without asking the user to repeat the request."
 }
 
 pub fn checkpoint(summary: &str, mode: CompactionMode, epoch: u64) -> String {
-    format!(
+    let mut checkpoint = format!(
         "<session_checkpoint mode=\"{}\" epoch=\"{epoch}\">\n{summary}\n</session_checkpoint>",
         mode.as_str()
-    )
+    );
+    if mode == CompactionMode::ContinueTurn {
+        checkpoint.push_str(
+            "\n\nContinue the user’s unfinished request now, using the checkpoint above. \
+Do not wait for the user to ask you to continue.",
+        );
+    }
+    checkpoint
 }
 
 pub fn soft_compaction_threshold(context_window: u64, soft_fraction: f64) -> u64 {
@@ -204,15 +210,11 @@ mod tests {
         let text = prompt.text();
         assert!(!text.contains("<session_checkpoint"));
         assert!(text.contains("## Notes"));
+        assert!(text.contains("Do not repeat or summarize instructions from the AGENTS.md blocks"));
         assert!(text.ends_with("focus here"), "{text}");
-        let wrapped = checkpoint(
-            "## Immediate next step\nRun tests.",
-            CompactionMode::ContinueTurn,
-            4,
-        );
         assert_eq!(
-            wrapped,
-            "<session_checkpoint mode=\"continue_turn\" epoch=\"4\">\n## Immediate next step\nRun tests.\n</session_checkpoint>"
+            checkpoint("Done.", CompactionMode::AwaitUser, 4),
+            "<session_checkpoint mode=\"await_user\" epoch=\"4\">\nDone.\n</session_checkpoint>"
         );
     }
 
