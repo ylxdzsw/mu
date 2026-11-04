@@ -1052,7 +1052,12 @@ creation time and compaction elapsed time derive from event timestamps.
 
 There is no mutable session row, title, cached status flag, owner PID, or
 separate run entity. Session listings and status are projections of journal
-events.
+events. `mu sessions --limit N` selects at most N journals by descending
+filesystem modification time before parsing them, then orders the results by
+their last journal activity timestamp. Displayed fields remain journal-derived.
+Skipped incompatible or incompletely initialized journals are not backfilled
+from older files; warnings and corruption checks apply only to selected files.
+The default limit is 20, and a limit of zero examines no journals.
 
 ### 11.1 Session selection and ownership
 

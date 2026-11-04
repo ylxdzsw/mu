@@ -191,8 +191,15 @@ as `current-session`.
 
 ### `mu sessions [--limit <count>]`
 
-List recent sessions in the active scope. The default limit is 20. Sessions
-written in an unsupported journal version are skipped with a warning.
+Examine the N most recently modified session journals in the active scope,
+then list supported sessions in descending journal activity-time order. The
+default limit is 20; `--limit 0` examines none. Displayed timestamps and other
+session details come from journal events, not filesystem modification times.
+
+Selected journals written in an unsupported version are skipped with a warning;
+incompletely initialized journals are also skipped. Neither is backfilled from
+older files, so fewer than N sessions may be shown. Warnings and corruption
+checks apply only to selected journals.
 
 ### `mu transcript [-s <id>] [-o <format>] [--epoch <n>]`
 

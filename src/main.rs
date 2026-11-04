@@ -142,6 +142,7 @@ enum Command {
     },
     /// List recent sessions
     Sessions {
+        /// Examine only the N most recently modified journals; display by activity time
         #[arg(long, default_value_t = 20)]
         limit: usize,
     },

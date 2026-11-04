@@ -737,12 +737,21 @@ impl Store {
     pub fn list_sessions(&self, limit: usize) -> Result<SessionListing> {
         let mut sessions = Vec::new();
         let mut skipped = Vec::new();
+        if limit == 0 {
+            return Ok(SessionListing { sessions, skipped });
+        }
+        let mut paths = Vec::new();
         for entry in std::fs::read_dir(self.root.join("sessions"))? {
             let entry = entry?;
             let path = entry.path();
             if path.extension().and_then(|value| value.to_str()) != Some("jsonl") {
                 continue;
             }
+            paths.push((entry.metadata()?.modified()?, path));
+        }
+        paths.sort_unstable_by(|left, right| right.cmp(left));
+        paths.truncate(limit);
+        for (_, path) in paths {
             let journal = match self.load_path(&path) {
                 Ok(journal) => journal,
                 Err(_) if incomplete_session_initialization(&path)? => continue,
@@ -759,7 +768,6 @@ impl Store {
             sessions.push((session, updated));
         }
         sessions.sort_by(|left, right| right.1.cmp(&left.1));
-        sessions.truncate(limit);
         skipped.sort_by(|left, right| left.session_id.cmp(&right.session_id));
         Ok(SessionListing { sessions, skipped })
     }
@@ -4672,6 +4680,73 @@ mod tests {
                     }] if filename == "result.png" && data == &[4, 5, 6]
                 )
         ));
+    }
+
+    #[test]
+    fn session_listing_selects_by_mtime_and_orders_by_activity() {
+        let store = Store::open_memory().unwrap();
+        let mut ids = Vec::new();
+        for (mtime, at) in [
+            (1, "2026-01-03T00:00:00.000Z"),
+            (2, "2026-01-02T00:00:00.000Z"),
+            (3, "2026-01-01T00:00:00.000Z"),
+        ] {
+            let session = store.create_session_seeded("system").unwrap();
+            let path = store.session_path(&session.id);
+            let text = std::fs::read_to_string(&path).unwrap();
+            let (meta, event) = text.split_once('\n').unwrap();
+            let mut event: EventLine = serde_json::from_str(event.trim_end()).unwrap();
+            event.at = at.into();
+            std::fs::write(
+                &path,
+                format!("{meta}\n{}\n", serde_json::to_string(&event).unwrap()),
+            )
+            .unwrap();
+            File::open(&path)
+                .unwrap()
+                .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(mtime))
+                .unwrap();
+            ids.push(session.id);
+        }
+
+        let listing = store.list_sessions(2).unwrap();
+        assert_eq!(
+            listing
+                .sessions
+                .iter()
+                .map(|(session, at)| (session.id.as_str(), at.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                (ids[1].as_str(), "2026-01-02T00:00:00.000Z"),
+                (ids[2].as_str(), "2026-01-01T00:00:00.000Z"),
+            ]
+        );
+
+        // Only selected journals are checked; skipped candidates are not backfilled.
+        store.set_session_version_for_test(&ids[0], FORMAT_VERSION - 1);
+        let listing = store.list_sessions(1).unwrap();
+        assert!(listing.sessions.is_empty());
+        assert_eq!(listing.skipped[0].session_id.as_ref(), Some(&ids[0]));
+
+        let path = store.session_path(&ids[0]);
+        let text = std::fs::read_to_string(&path).unwrap();
+        let meta = text.lines().next().unwrap();
+        std::fs::write(&path, format!("{meta}\n")).unwrap();
+        let listing = store.list_sessions(1).unwrap();
+        assert!(listing.sessions.is_empty());
+        assert!(listing.skipped.is_empty());
+
+        std::fs::write(&path, format!("{meta}\ninvalid event\n")).unwrap();
+        store.set_session_version_for_test(&ids[0], FORMAT_VERSION);
+        assert!(store.list_sessions(1).is_err());
+        let listing = store.list_sessions(0).unwrap();
+        assert!(listing.sessions.is_empty());
+        assert!(listing.skipped.is_empty());
+        File::open(&path)
+            .unwrap()
+            .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1))
+            .unwrap();
+        assert_eq!(store.list_sessions(2).unwrap().sessions.len(), 2);
     }
 
     #[test]
