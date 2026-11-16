@@ -867,7 +867,7 @@ mod apply_patch {
     }
 
     fn change_label_relative(change: &PlannedChange, cwd: &Path) -> String {
-        let relative = |path: &Path| path.strip_prefix(cwd).unwrap_or(path).display().to_string();
+        let relative = |path: &Path| path.trim_prefix(cwd).display().to_string();
         match change {
             PlannedChange::Add { path, .. } => format!("A {}", relative(path)),
             PlannedChange::Delete { path, .. } => format!("D {}", relative(path)),
@@ -1663,10 +1663,10 @@ mod edit {
         }
 
         matches.sort_by_key(|found| (found.start, found.end, found.block));
-        for pair in matches.windows(2) {
-            if pair[1].start < pair[0].end {
-                let first = pair[0].block + 1;
-                let second = pair[1].block + 1;
+        for [first, second] in matches.array_windows() {
+            if second.start < first.end {
+                let first = first.block + 1;
+                let second = second.block + 1;
                 bail!(
                     "blocks {first} and {second} overlap in {}; combine them into one block",
                     reported_path.display()
@@ -1938,10 +1938,7 @@ mod edit {
     }
 
     fn format_summary(edit: &PlannedEdit, cwd: &Path) -> String {
-        let path = edit
-            .reported_path
-            .strip_prefix(cwd)
-            .unwrap_or(&edit.reported_path);
+        let path = edit.reported_path.trim_prefix(cwd);
         let block_label = if edit.blocks == 1 { "block" } else { "blocks" };
         let replacement_label = if edit.replacements == 1 {
             "replacement"

@@ -28,9 +28,12 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7.0.1
         with:
           fetch-depth: 0
+
+      - name: Install stable Rust
+        run: rustup toolchain install stable --profile minimal --component rustfmt,clippy --default
 
       - name: Install system dependencies
         run: |
@@ -68,7 +71,7 @@ jobs:
           cargo build --bins --features portable
 
       - name: Upload resolved Cargo.lock
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@v7.0.2
         with:
           name: cargo-lock
           path: Cargo.lock
@@ -100,7 +103,7 @@ jobs:
           pacman -S --needed --noconfirm \
             fish git jq openssl perl pkgconf rust util-linux zsh
 
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7.0.1
         with:
           fetch-depth: 0
 
@@ -133,7 +136,7 @@ jobs:
           cp "$package" "$GITHUB_WORKSPACE/"
 
       - name: Upload the Arch package
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@v7.0.2
         with:
           name: native-arch-package
           path: mu-*.pkg.tar.zst
@@ -177,7 +180,10 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7.0.1
+
+      - name: Install stable Rust
+        run: rustup toolchain install stable --profile minimal --component rustfmt,clippy --default
 
       - name: Install the musl target
         run: |
@@ -243,7 +249,7 @@ jobs:
             dist/mu-linux-x86_64-musl
 
       - name: Upload the portable binary
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@v7.0.2
         with:
           name: portable-linux-x86_64-musl
           path: dist/mu-linux-x86_64-musl
@@ -268,7 +274,10 @@ jobs:
     runs-on: ${{ matrix.runner }}
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7.0.1
+
+      - name: Install stable Rust
+        run: rustup toolchain install stable --profile minimal --component rustfmt,clippy --default
 
       - name: Build the portable binary
         run: cargo build --release --features portable
@@ -319,7 +328,7 @@ jobs:
           cp target/release/mu "dist/mu-macos-${{ matrix.arch }}"
 
       - name: Upload the portable binary
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@v7.0.2
         with:
           name: portable-macos-${{ matrix.arch }}
           path: dist/mu-macos-${{ matrix.arch }}
@@ -335,13 +344,13 @@ jobs:
       contents: write
 
     steps:
-      - uses: actions/checkout@v6
-      - uses: actions/download-artifact@v8
+      - uses: actions/checkout@v7.0.1
+      - uses: actions/download-artifact@v8.0.2
         with:
           pattern: portable-*
           path: dist
           merge-multiple: true
-      - uses: actions/download-artifact@v8
+      - uses: actions/download-artifact@v8.0.2
         with:
           name: native-arch-package
           path: dist

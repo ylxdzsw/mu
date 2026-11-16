@@ -1471,7 +1471,7 @@ impl TerminalLineWrapper {
     fn push(&mut self, text: &str, out: &mut String) {
         for part in text.split_inclusive('\n') {
             let has_newline = part.ends_with('\n');
-            let body = part.strip_suffix('\n').unwrap_or(part);
+            let body = part.trim_suffix('\n');
             self.pending.push_str(body);
             self.flush_overflow(out, has_newline);
             if has_newline {
@@ -2511,7 +2511,7 @@ fn render_block_quote_line(line: &str, complete: bool, format: OutputFormat) -> 
     let mut depth = 0usize;
     while let Some(after_marker) = rest.strip_prefix('>') {
         depth += 1;
-        rest = after_marker.strip_prefix(' ').unwrap_or(after_marker);
+        rest = after_marker.trim_prefix(' ');
     }
     if depth == 0 {
         return None;
@@ -3799,7 +3799,7 @@ fn truncate_visible_text(text: &str, max_width: usize) -> String {
 
 fn truncate_styled_line(text: &str, max_width: usize) -> String {
     let newline = text.ends_with('\n');
-    let body = text.strip_suffix('\n').unwrap_or(text);
+    let body = text.trim_suffix('\n');
     if visible_text_width(body) <= max_width {
         return text.to_string();
     }
@@ -4020,7 +4020,7 @@ fn compute_bash_preview_snapshot(
 }
 
 fn trim_complete_terminal_line(line: &str) -> String {
-    let line = line.strip_suffix('\n').unwrap_or(line);
+    let line = line.trim_suffix('\n');
     let trimmed = line.trim_end_matches([' ', '\t']);
     format!("{trimmed}\n")
 }
@@ -4042,7 +4042,7 @@ fn trim_to_last_bytes(text: &str, max_bytes: usize) -> String {
 fn cap_tail_line(line: &str, complete_line: bool, max_cells: Option<usize>) -> (String, usize) {
     let newline = complete_line && line.ends_with('\n');
     let body = if newline {
-        line.strip_suffix('\n').unwrap_or(line)
+        line.trim_suffix('\n')
     } else {
         line
     };
@@ -4102,7 +4102,7 @@ fn truncate_prefix(
 ) -> LinePreview {
     let newline = preserve_newline && text.ends_with('\n');
     let body = if newline {
-        text.strip_suffix('\n').unwrap_or(text)
+        text.trim_suffix('\n')
     } else {
         text
     };
@@ -4316,7 +4316,8 @@ fn format_compaction_result(report: &CompactionReport) -> String {
 }
 
 fn format_number(number: u64) -> String {
-    let digits = number.to_string();
+    let mut buffer = std::fmt::NumBuffer::new();
+    let digits = number.format_into(&mut buffer);
     let mut grouped = String::with_capacity(digits.len() + digits.len() / 3);
     for (index, byte) in digits.bytes().enumerate() {
         if index > 0 && (digits.len() - index).is_multiple_of(3) {

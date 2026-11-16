@@ -1,5 +1,6 @@
 use std::fmt;
 use std::io::Write;
+use std::mem::DropGuard;
 use std::os::unix::process::CommandExt;
 use std::os::unix::process::ExitStatusExt;
 use std::path::Path;
@@ -160,10 +161,7 @@ fn truncate_line(line: &str, max_bytes: usize) -> String {
         return line.to_string();
     }
     let budget = max_bytes.saturating_sub(3);
-    let mut end = budget.min(line.len());
-    while end > 0 && !line.is_char_boundary(end) {
-        end -= 1;
-    }
+    let end = line.floor_char_boundary(budget);
     format!("{}…", &line[..end])
 }
 
@@ -582,7 +580,10 @@ fn run_bash(
         }
     })?;
     let child_id = child.id();
-    let _active = ActiveProcessGroup::new(child_id);
+    let _active = DropGuard::new(
+        set_active_process_group(child_id),
+        clear_active_process_group,
+    );
 
     if let Some(stdin) = args.stdin {
         let mut child_stdin = child.stdin.take().context("taking bash stdin")?;
@@ -794,24 +795,6 @@ fn signal_name(signal: i32) -> &'static str {
         libc::SIGINT => "SIGINT",
         libc::SIGTERM => "SIGTERM",
         _ => "signal",
-    }
-}
-
-struct ActiveProcessGroup {
-    slot: Option<usize>,
-}
-
-impl ActiveProcessGroup {
-    fn new(child_id: u32) -> Self {
-        Self {
-            slot: set_active_process_group(child_id),
-        }
-    }
-}
-
-impl Drop for ActiveProcessGroup {
-    fn drop(&mut self) {
-        clear_active_process_group(self.slot);
     }
 }
 

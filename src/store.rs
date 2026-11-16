@@ -1,7 +1,6 @@
 use std::collections::{HashMap, HashSet};
-use std::fs::{File, OpenOptions};
+use std::fs::{File, OpenOptions, TryLockError};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
-use std::os::fd::AsRawFd;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
@@ -695,7 +694,7 @@ impl Store {
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
                 Err(error) => return Err(error.into()),
             };
-            flock(&file, libc::LOCK_EX)?;
+            file.lock()?;
             let created_at = now();
             let meta = Meta {
                 kind: "meta".into(),
@@ -716,7 +715,7 @@ impl Store {
             )?;
             file.sync_all()?;
             sync_dir(&self.root.join("sessions"))?;
-            flock(&file, libc::LOCK_UN)?;
+            file.unlock()?;
             return Ok(Session {
                 id,
                 cwd: String::new(),
@@ -2162,7 +2161,7 @@ impl Store {
         }
         match open_current_locked(&self.session_path(session_id)) {
             Ok(file) => {
-                flock(&file, libc::LOCK_UN)?;
+                file.unlock()?;
                 Ok(false)
             }
             Err(error) if error.downcast_ref::<SessionBusy>().is_some() => Ok(true),
@@ -2881,7 +2880,7 @@ impl Store {
         drop(locks);
         let mut locked = self.open_locked_session(session_id)?;
         let result = operation(&mut locked);
-        flock(&locked.file, libc::LOCK_UN)?;
+        locked.file.unlock()?;
         result
     }
 
@@ -2995,7 +2994,7 @@ impl Drop for SessionLock<'_> {
             .expect("session lock map poisoned")
             .remove(&self.session_id)
         {
-            let _ = flock(&locked.file, libc::LOCK_UN);
+            let _ = locked.file.unlock();
         }
     }
 }
@@ -3015,7 +3014,7 @@ pub fn stage_bash_attachment(
     let mut options = OpenOptions::new();
     options.read(true).write(true).create(true).mode(0o600);
     let mut file = options.open(manifest)?;
-    flock(&file, libc::LOCK_EX)?;
+    file.lock()?;
     let prefix = complete_prefix(&mut file, true)?;
     let entries = parse_manifest(&prefix)?;
     if entries
@@ -3024,7 +3023,7 @@ pub fn stage_bash_attachment(
         .count()
         >= MAX_BASH_ATTACHMENTS
     {
-        flock(&file, libc::LOCK_UN)?;
+        file.unlock()?;
         bail!("Bash emitted more than {MAX_BASH_ATTACHMENTS} attachments")
     }
     let object = write_object_to(objects_dir, &attachment.data)?;
@@ -3040,7 +3039,7 @@ pub fn stage_bash_attachment(
         },
     )?;
     file.sync_data()?;
-    flock(&file, libc::LOCK_UN)?;
+    file.unlock()?;
     Ok(())
 }
 
@@ -3054,16 +3053,16 @@ pub fn read_bash_attachments(
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(error) => return Err(error.into()),
     };
-    flock(&file, libc::LOCK_EX)?;
+    file.lock()?;
     let entries = parse_manifest(&complete_prefix(&mut file, true)?)?
         .into_iter()
         .filter(|entry| entry.call_id == call_id)
         .collect::<Vec<_>>();
     if entries.len() > MAX_BASH_ATTACHMENTS {
-        flock(&file, libc::LOCK_UN)?;
+        file.unlock()?;
         bail!("Bash emitted more than {MAX_BASH_ATTACHMENTS} attachments")
     }
-    flock(&file, libc::LOCK_UN)?;
+    file.unlock()?;
     let mut cache: HashMap<String, Vec<u8>> = HashMap::new();
     entries
         .into_iter()
@@ -3095,7 +3094,7 @@ fn cleanup_bash_attachments(manifest: &Path, call_id: i64) -> Result<()> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(error) => return Err(error.into()),
     };
-    flock(&file, libc::LOCK_EX)?;
+    file.lock()?;
     let entries = parse_manifest(&complete_prefix(&mut file, true)?)?;
     file.seek(SeekFrom::Start(0))?;
     file.set_len(0)?;
@@ -3103,7 +3102,7 @@ fn cleanup_bash_attachments(manifest: &Path, call_id: i64) -> Result<()> {
         write_json_line(&mut file, &entry)?;
     }
     file.sync_data()?;
-    flock(&file, libc::LOCK_UN)?;
+    file.unlock()?;
     Ok(())
 }
 
@@ -3149,7 +3148,7 @@ fn write_object_to(objects_dir: &Path, bytes: &[u8]) -> Result<ObjectRef> {
         }
         Err(error) => return Err(error.into()),
     };
-    flock(&file, libc::LOCK_EX)?;
+    file.lock()?;
     let mut existing = Vec::new();
     file.read_to_end(&mut existing)?;
     if existing != bytes {
@@ -3161,17 +3160,17 @@ fn write_object_to(objects_dir: &Path, bytes: &[u8]) -> Result<ObjectRef> {
     if created {
         sync_dir(objects_dir)?;
     }
-    flock(&file, libc::LOCK_UN)?;
+    file.unlock()?;
     Ok(ObjectRef { sha256 })
 }
 
 fn read_object_from(objects_dir: &Path, sha256: &str) -> Result<Vec<u8>> {
     let path = objects_dir.join(sha256);
     let mut file = File::open(&path).with_context(|| format!("opening object {sha256}"))?;
-    flock(&file, libc::LOCK_SH)?;
+    file.lock_shared()?;
     let mut bytes = Vec::new();
     file.read_to_end(&mut bytes)?;
-    flock(&file, libc::LOCK_UN)?;
+    file.unlock()?;
     if hex(Sha256::digest(&bytes)) != sha256 {
         bail!("object checksum mismatch: {sha256}")
     }
@@ -3195,19 +3194,19 @@ fn journal_version(file: &mut File) -> Result<u32> {
 fn open_current_locked(path: &Path) -> Result<File> {
     loop {
         let file = OpenOptions::new().read(true).write(true).open(path)?;
-        match flock_nonblocking(&file) {
+        match file.try_lock() {
             Ok(()) => {}
-            Err(error) if error.raw_os_error() == Some(libc::EWOULDBLOCK) => {
+            Err(TryLockError::WouldBlock) => {
                 return Err(anyhow::Error::new(SessionBusy));
             }
-            Err(error) => return Err(error.into()),
+            Err(TryLockError::Error(error)) => return Err(error.into()),
         }
         let opened = file.metadata()?;
         let current = std::fs::metadata(path)?;
         if opened.dev() == current.dev() && opened.ino() == current.ino() {
             return Ok(file);
         }
-        flock(&file, libc::LOCK_UN)?;
+        file.unlock()?;
     }
 }
 
@@ -4083,19 +4082,6 @@ fn write_json_line(file: &mut File, value: &impl Serialize) -> Result<()> {
     serde_json::to_writer(&mut *file, value)?;
     file.write_all(b"\n")?;
     Ok(())
-}
-
-fn flock(file: &File, operation: libc::c_int) -> std::io::Result<()> {
-    let result = unsafe { libc::flock(file.as_raw_fd(), operation) };
-    if result == 0 {
-        Ok(())
-    } else {
-        Err(std::io::Error::last_os_error())
-    }
-}
-
-fn flock_nonblocking(file: &File) -> std::io::Result<()> {
-    flock(file, libc::LOCK_EX | libc::LOCK_NB)
 }
 
 fn hex(bytes: impl AsRef<[u8]>) -> String {

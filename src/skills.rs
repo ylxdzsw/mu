@@ -404,7 +404,7 @@ fn strip_closed_frontmatter(content: &str) -> Option<&str> {
     let rest = content.strip_prefix("---")?;
     let end = rest.find("\n---")?;
     let after_marker = &rest[end + "\n---".len()..];
-    Some(after_marker.strip_prefix('\n').unwrap_or(after_marker))
+    Some(after_marker.trim_prefix('\n'))
 }
 
 fn valid_skill_name(name: &str) -> bool {
