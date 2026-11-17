@@ -34,7 +34,8 @@ threads, then stop."
         CompactionMode::ContinueTurn => {
             "\
 This is an in-turn checkpoint that will be continued immediately. Include a final \
-`## Immediate next step` section as the last section."
+`## Immediate next step` section as the last section, telling the next instance to \
+continue the unfinished request without waiting for the user."
         }
     };
     let focus = focus
@@ -44,17 +45,11 @@ This is an in-turn checkpoint that will be continued immediately. Include a fina
 }
 
 pub fn checkpoint(summary: &str, mode: CompactionMode, epoch: u64) -> String {
-    let mut checkpoint = format!(
+    // Historical request checksums depend on this projection staying byte-stable.
+    format!(
         "<session_checkpoint mode=\"{}\" epoch=\"{epoch}\">\n{summary}\n</session_checkpoint>",
         mode.as_str()
-    );
-    if mode == CompactionMode::ContinueTurn {
-        checkpoint.push_str(
-            "\n\nContinue the user’s unfinished request now, using the checkpoint above. \
-Do not wait for the user to ask you to continue.",
-        );
-    }
-    checkpoint
+    )
 }
 
 pub fn soft_compaction_threshold(context_window: u64, soft_fraction: f64) -> u64 {
@@ -211,10 +206,15 @@ mod tests {
         assert!(!text.contains("<session_checkpoint"));
         assert!(text.contains("## Notes"));
         assert!(text.contains("Do not repeat or summarize instructions from the AGENTS.md blocks"));
+        assert!(text.contains("continue the unfinished request without waiting for the user"));
         assert!(text.ends_with("focus here"), "{text}");
         assert_eq!(
             checkpoint("Done.", CompactionMode::AwaitUser, 4),
             "<session_checkpoint mode=\"await_user\" epoch=\"4\">\nDone.\n</session_checkpoint>"
+        );
+        assert_eq!(
+            checkpoint("Next step.", CompactionMode::ContinueTurn, 4),
+            "<session_checkpoint mode=\"continue_turn\" epoch=\"4\">\nNext step.\n</session_checkpoint>"
         );
     }
 
