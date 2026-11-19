@@ -1951,7 +1951,8 @@ impl MarkdownStream {
 
     fn push_line_stream_text(&mut self, text: &str, out: &mut Vec<String>) {
         let mut rendered = String::new();
-        self.inline_stream.push(text, &mut rendered);
+        let heading = matches!(self.line_stream, Some(LineStreamState::Heading { .. }));
+        self.inline_stream.push(text, heading, &mut rendered);
         if rendered.is_empty() {
             return;
         }
@@ -1975,43 +1976,37 @@ impl MarkdownStream {
         let Some(state) = self.line_stream.take() else {
             return;
         };
+        let heading = matches!(state, LineStreamState::Heading { .. });
         let mut rendered = String::new();
-        self.inline_stream.finish(&mut rendered);
-        let raw_fallback = self
-            .line_prefix
-            .as_ref()
-            .is_some_and(|prefix| !prefix.emitted);
-        if raw_fallback {
-            let mut combined = String::new();
-            if let Some(prefix) = self.line_prefix.take() {
-                combined.push_str(&prefix.raw);
-            }
-            combined.push_str(&rendered);
-            combined.push('\n');
-            self.emit_wrappable(&combined, out);
+        self.inline_stream.finish(heading, &mut rendered);
+        if !heading
+            && rendered.is_empty()
+            && let Some(mut prefix) = self.line_prefix.take_if(|prefix| !prefix.emitted)
+        {
+            prefix.raw.push('\n');
+            self.emit_wrappable(&prefix.raw, out);
             return;
         }
+        let mut combined = self.take_rendered_line_prefix();
         self.line_prefix = None;
-        let mut combined = rendered;
+        combined.push_str(&rendered);
         if matches!(
             state,
             LineStreamState::Heading { .. } | LineStreamState::Quote
         ) {
             combined.push_str(RESET);
         }
-        if matches!(state, LineStreamState::Heading { .. }) {
-            combined.push('\n');
+        if heading {
             self.pending_block_separator = true;
-        } else {
-            combined.push('\n');
         }
+        combined.push('\n');
         self.emit_wrappable(&combined, out);
     }
 
     fn push_line(&mut self, line: &str, complete: bool, out: &mut Vec<String>) {
         self.resolve_pending_block_separator(line, out);
         if let Some(fence) = self.code_fence {
-            if complete && is_closing_fence(line, fence) {
+            if is_closing_fence(line, fence) {
                 self.code_fence = None;
                 let mut closing = RESET.to_string();
                 if !fence.has_content {
@@ -2072,16 +2067,15 @@ impl MarkdownStream {
             self.emit_wrappable(line, out);
             return;
         }
-        if parse_heading_line(line).is_some() {
-            if let Some(rendered) = render_heading_line(line, self.format) {
-                self.emit_wrappable(&rendered, out);
-                self.pending_block_separator = true;
-            } else {
-                self.emit_wrappable(line, out);
-            }
+        if is_heading_line(line) {
+            let rendered = render_markdown(line, self.max_width, self.format);
+            // Defer the blank line in case the source already supplies one.
+            let body = rendered.trim_end_matches(RESET).trim_end_matches('\n');
+            self.emit_wrappable(&format!("{body}\n"), out);
+            self.pending_block_separator = true;
             return;
         }
-        if is_single_line_block(line.trim()) {
+        if is_thematic_break(line.trim()) {
             let rendered = render_markdown(line, self.max_width, self.format);
             self.emit_wrappable(&rendered, out);
             return;
@@ -2177,7 +2171,8 @@ fn is_table_candidate_line(line: &str) -> bool {
     }
     let (body, _) = split_line_ending(line);
     let trimmed = body.trim_start_matches(' ');
-    !is_single_line_block(trimmed)
+    !is_heading_line(trimmed)
+        && !is_thematic_break(trimmed)
         && parse_list_marker(trimmed).is_none()
         && !trimmed.starts_with('>')
 }
@@ -2261,7 +2256,7 @@ fn parse_streaming_heading_prefix(line: &str) -> Option<(HeadingLevel, usize)> {
     let (level, marker_len, rest) = parse_heading_marker(line)?;
     let whitespace = rest
         .char_indices()
-        .take_while(|(_, ch)| ch.is_whitespace())
+        .take_while(|(_, ch)| matches!(ch, ' ' | '\t'))
         .last()
         .map(|(idx, ch)| idx + ch.len_utf8())?;
     Some((level, marker_len + whitespace))
@@ -2335,36 +2330,16 @@ fn is_ambiguous_line_prefix(line: &str) -> bool {
     false
 }
 
-fn is_single_line_block(line: &str) -> bool {
-    let heading = line
-        .strip_prefix('#')
-        .is_some_and(|rest| rest.is_empty() || rest.starts_with('#') || rest.starts_with(' '));
-    let rule = line.len() >= 3
+fn is_thematic_break(line: &str) -> bool {
+    line.len() >= 3
         && ['-', '*', '_']
             .into_iter()
-            .any(|mark| line.chars().all(|ch| ch == mark || ch.is_whitespace()));
-    heading || rule
+            .any(|mark| line.chars().all(|ch| ch == mark || ch.is_whitespace()))
 }
 
-fn render_heading_line(line: &str, format: OutputFormat) -> Option<String> {
-    let (level, content) = parse_heading_line(line)?;
-    let rendered = render_inline_markdown(content, format)?;
-    let mut out = String::new();
-    let mut styles = Vec::new();
-    push_styles(&mut out, &mut styles, heading_styles(level));
-    out.push_str(&rendered);
-    out.push_str(RESET);
-    out.push('\n');
-    Some(out)
-}
-
-fn parse_heading_line(line: &str) -> Option<(HeadingLevel, &str)> {
-    let (body, _) = split_line_ending(line);
-    let (level, _, rest) = parse_heading_marker(body)?;
-    if !rest.is_empty() && !rest.starts_with(char::is_whitespace) {
-        return None;
-    }
-    Some((level, rest.trim()))
+fn is_heading_line(line: &str) -> bool {
+    parse_heading_marker(line.trim_end_matches(['\r', '\n']))
+        .is_some_and(|(_, _, rest)| rest.is_empty() || rest.starts_with([' ', '\t']))
 }
 
 fn parse_heading_marker(line: &str) -> Option<(HeadingLevel, usize, &str)> {
@@ -2394,7 +2369,7 @@ fn split_line_ending(line: &str) -> (&str, &str) {
 
 fn render_inline_or_raw_line(line: &str, complete: bool, format: OutputFormat) -> String {
     let (body, ending) = split_line_ending(line);
-    render_inline_markdown(body, format)
+    render_inline_markdown(body, format, &[])
         .map(|rendered| format!("{rendered}{ending}"))
         .unwrap_or_else(|| {
             if complete {
@@ -2411,7 +2386,7 @@ fn render_list_line(line: &str, complete: bool, format: OutputFormat) -> Option<
     let indent = body.len().saturating_sub(trimmed.len());
     let (marker, rest) = parse_list_marker(trimmed)?;
     let (task, rest) = parse_task_marker(rest);
-    let rendered = render_inline_markdown(rest, format)?;
+    let rendered = render_inline_markdown(rest, format, &[])?;
 
     let mut out = String::new();
     out.push_str(&"  ".repeat(indent / 2));
@@ -2516,7 +2491,7 @@ fn render_block_quote_line(line: &str, complete: bool, format: OutputFormat) -> 
         return None;
     }
 
-    let rendered = render_inline_markdown(rest, format)?;
+    let rendered = render_inline_markdown(rest, format, block_quote_styles())?;
     let mut out = String::new();
     for style in block_quote_styles() {
         out.push_str(style.ansi());
@@ -2529,14 +2504,28 @@ fn render_block_quote_line(line: &str, complete: bool, format: OutputFormat) -> 
     Some(out)
 }
 
-fn render_inline_markdown(markdown: &str, format: OutputFormat) -> Option<String> {
-    let options = Options::ENABLE_STRIKETHROUGH;
-    let parser = Parser::new_ext(markdown, options);
+fn render_inline_markdown(
+    markdown: &str,
+    format: OutputFormat,
+    base_styles: &[MdStyle],
+) -> Option<String> {
+    render_inline_events(
+        Parser::new_ext(markdown, Options::ENABLE_STRIKETHROUGH),
+        format,
+        base_styles,
+    )
+}
+
+fn render_inline_events<'a>(
+    events: impl IntoIterator<Item = Event<'a>>,
+    format: OutputFormat,
+    base_styles: &[MdStyle],
+) -> Option<String> {
     let mut out = String::new();
-    let mut styles: Vec<MdStyle> = Vec::new();
+    let mut styles = base_styles.to_vec();
     let mut links: Vec<String> = Vec::new();
 
-    for event in parser {
+    for event in events {
         match event {
             Event::Start(tag) => match tag {
                 Tag::Paragraph => {}
@@ -2583,7 +2572,7 @@ fn render_inline_markdown(markdown: &str, format: OutputFormat) -> Option<String
         }
     }
 
-    if styles.is_empty() && links.is_empty() {
+    if styles.len() == base_styles.len() && links.is_empty() {
         Some(out)
     } else {
         None
@@ -2595,174 +2584,141 @@ impl InlineStream {
         self.base_styles = styles;
     }
 
-    fn push(&mut self, text: &str, out: &mut String) {
+    fn push(&mut self, text: &str, heading: bool, out: &mut String) {
         self.pending.push_str(text);
-        self.flush_available(out);
+        loop {
+            let end = self.content_end(heading);
+            if end == 0 {
+                return;
+            }
+            let plain = self.pending[..end]
+                .find(['*', '_', '`', '[', '!', '~', '\\'])
+                .unwrap_or(end);
+            let consumed = if plain > 0 {
+                out.push_str(&self.pending[..plain]);
+                plain
+            } else if let Some((rendered, consumed)) = self.render_prefix(end) {
+                out.push_str(&rendered);
+                consumed
+            } else {
+                return;
+            };
+            self.previous_source_char = self.pending[..consumed].chars().next_back();
+            self.pending.replace_range(..consumed, "");
+        }
     }
 
-    fn finish(&mut self, out: &mut String) {
-        out.push_str(&self.pending);
+    fn finish(&mut self, heading: bool, out: &mut String) {
+        self.pending.truncate(self.content_end(heading));
+        if !self.pending.is_empty() {
+            let (source, _, previous) = self.with_context();
+            let rendered = render_inline_markdown(&source, self.format, self.base_styles);
+            if let Some(tail) = rendered
+                .as_deref()
+                .and_then(|text| text.strip_prefix('x')?.strip_prefix(previous))
+            {
+                out.push_str(tail);
+            } else {
+                out.push_str(&self.pending);
+            }
+        }
         self.pending.clear();
         self.base_styles = &[];
         self.previous_source_char = None;
     }
 
-    fn flush_available(&mut self, out: &mut String) {
-        loop {
-            let Some(marker) = earliest_inline_marker(&self.pending) else {
-                if !self.pending.is_empty() {
-                    self.previous_source_char = self
-                        .pending
-                        .chars()
-                        .next_back()
-                        .or(self.previous_source_char);
-                    out.push_str(&self.pending);
-                    self.pending.clear();
-                }
-                return;
-            };
-            if marker > 0 {
-                let text = &self.pending[..marker];
-                self.previous_source_char = text.chars().next_back().or(self.previous_source_char);
-                out.push_str(text);
-                self.pending.replace_range(..marker, "");
-            }
-            let Some((rendered, consumed)) = self.render_span_at_start() else {
-                return;
-            };
-            self.previous_source_char = self.pending[..consumed]
-                .chars()
-                .next_back()
-                .or(self.previous_source_char);
-            out.push_str(&rendered);
-            self.pending.replace_range(..consumed, "");
+    fn content_end(&self, heading: bool) -> usize {
+        if !heading {
+            return self.pending.len();
+        }
+        // Hold a possible ATX closing sequence until the line finishes.
+        let body = self.pending.trim_end_matches([' ', '\t']);
+        let before_hashes = body.trim_end_matches('#');
+        if before_hashes.ends_with([' ', '\t'])
+            || (before_hashes.is_empty() && self.previous_source_char.is_none())
+        {
+            before_hashes.trim_end_matches([' ', '\t']).len()
+        } else {
+            body.len()
         }
     }
 
-    fn render_span_at_start(&self) -> Option<(String, usize)> {
-        if self.pending.starts_with("![") {
+    fn render_prefix(&self, limit: usize) -> Option<(String, usize)> {
+        let mut chars = self.pending.chars();
+        let first = chars.next()?;
+        let next = chars.next();
+        match first {
+            '\\' => {
+                let next = next?;
+                return if next.is_ascii_punctuation() {
+                    Some((next.to_string(), 2))
+                } else {
+                    Some((first.to_string(), 1))
+                };
+            }
+            '!' if next? != '[' => return Some((first.to_string(), 1)),
+            '~' if next?.is_whitespace() => return Some((first.to_string(), 1)),
+            '_' if self.previous_source_char.is_some_and(char::is_alphanumeric) => {
+                let rest = self.pending.trim_start_matches('_');
+                if rest.starts_with(char::is_alphanumeric) {
+                    let end = self.pending.len() - rest.len();
+                    return Some((self.pending[..end].to_owned(), end));
+                }
+            }
+            _ => {}
+        }
+
+        let (source, start, _) = self.with_context();
+        let mut events = Parser::new_ext(&source, Options::ENABLE_STRIKETHROUGH)
+            .into_offset_iter()
+            .filter(|(event, range)| {
+                range.end > start
+                    && !matches!(
+                        event,
+                        Event::Start(Tag::Paragraph) | Event::End(TagEnd::Paragraph)
+                    )
+            });
+        let (event, range) = events.next()?;
+        if range.start != start || range.end - start > limit {
             return None;
         }
-        if self.pending.starts_with("**") {
-            return self.render_delimited("**", strong_styles());
-        }
-        if self.pending.starts_with("__") {
-            return self.render_underscore_delimited("__", strong_styles());
-        }
-        if self.pending.starts_with("~~") {
-            return self.render_delimited("~~", &[MdStyle::Strike]);
-        }
-        if self.pending.starts_with('*') {
-            return self.render_delimited("*", emphasis_styles());
-        }
-        if self.pending.starts_with('_') {
-            return self.render_underscore_delimited("_", emphasis_styles());
-        }
-        if self.pending.starts_with('`') {
-            return self.render_delimited("`", inline_code_styles());
-        }
-        if self.pending.starts_with('[') {
-            return self.render_link();
-        }
-        None
-    }
-
-    fn render_delimited(&self, delimiter: &str, styles: &[MdStyle]) -> Option<(String, usize)> {
-        let rest = &self.pending[delimiter.len()..];
-        let end = rest.find(delimiter)?;
-        Some(self.render_delimited_until(delimiter, end, styles))
-    }
-
-    fn render_underscore_delimited(
-        &self,
-        delimiter: &str,
-        styles: &[MdStyle],
-    ) -> Option<(String, usize)> {
-        let rest = &self.pending[delimiter.len()..];
-        let after_open = rest.chars().next()?;
-        if !underscore_can_open(self.previous_source_char, after_open) {
-            return Some((delimiter.to_string(), delimiter.len()));
-        }
-
-        let mut search_start = 0;
-        while let Some(relative_end) = rest[search_start..].find(delimiter) {
-            let end = search_start + relative_end;
-            let before_close = rest[..end].chars().next_back();
-            let after_close = rest[end + delimiter.len()..].chars().next();
-            if underscore_can_close(before_close, after_close) {
-                return Some(self.render_delimited_until(delimiter, end, styles));
+        match event {
+            Event::Start(Tag::Link { .. }) => {}
+            Event::Start(Tag::Emphasis | Tag::Strong | Tag::Strikethrough) | Event::Code(_) => {
+                // Another delimiter in the next delta can extend this closing run.
+                if source[range.end..].trim_start_matches(first).is_empty() {
+                    return None;
+                }
             }
-            search_start = end + delimiter.len();
+            _ => return None,
         }
-        None
+        let mut span = vec![event];
+        for (event, next) in events.take_while(|(_, next)| next.start < range.end) {
+            // An unmatched backtick may open code that consumes this span's closing marker.
+            if matches!(event, Event::Text(_)) && source[next].contains('`') {
+                return None;
+            }
+            span.push(event);
+        }
+        Some((
+            render_inline_events(span, self.format, self.base_styles)?,
+            range.end - start,
+        ))
     }
 
-    fn render_delimited_until(
-        &self,
-        delimiter: &str,
-        end: usize,
-        styles: &[MdStyle],
-    ) -> (String, usize) {
-        let rest = &self.pending[delimiter.len()..];
-        let body = &rest[..end];
-        let mut out = String::new();
-        for style in styles {
-            out.push_str(style.ansi());
+    fn with_context(&self) -> (String, usize, char) {
+        // Force paragraph context, while retaining the preceding character's
+        // effect on delimiter flanking without treating it as markup again.
+        let previous = self.previous_source_char.unwrap_or(' ');
+        let mut source = String::from("x");
+        if previous.is_ascii_punctuation() {
+            source.push('\\');
         }
-        out.push_str(body);
-        out.push_str(RESET);
-        self.reapply_base(&mut out);
-        (out, delimiter.len() + end + delimiter.len())
+        source.push(previous);
+        let start = source.len();
+        source.push_str(&self.pending);
+        (source, start, previous)
     }
-
-    fn render_link(&self) -> Option<(String, usize)> {
-        let label_end = self.pending.find("](")?;
-        let url_start = label_end + 2;
-        let url_end = self.pending[url_start..].find(')')? + url_start;
-        let label = &self.pending[1..label_end];
-        let url = &self.pending[url_start..url_end];
-
-        let mut out = String::new();
-        for style in link_styles() {
-            out.push_str(style.ansi());
-        }
-        out.push_str(&open_hyperlink(url));
-        out.push_str(label);
-        out.push_str(OSC8_CLOSE);
-        out.push_str(RESET);
-        self.reapply_base(&mut out);
-        if append_link_destination(&mut out, url, self.format) {
-            self.reapply_base(&mut out);
-        }
-        Some((out, url_end + 1))
-    }
-
-    fn reapply_base(&self, out: &mut String) {
-        for style in self.base_styles {
-            out.push_str(style.ansi());
-        }
-    }
-}
-
-fn underscore_can_open(before: Option<char>, after: char) -> bool {
-    !after.is_whitespace() && !chars_are_intraword(before, Some(after))
-}
-
-fn underscore_can_close(before: Option<char>, after: Option<char>) -> bool {
-    before.is_some_and(|ch| !ch.is_whitespace()) && !chars_are_intraword(before, after)
-}
-
-fn chars_are_intraword(before: Option<char>, after: Option<char>) -> bool {
-    before.is_some_and(char::is_alphanumeric) && after.is_some_and(char::is_alphanumeric)
-}
-
-fn earliest_inline_marker(text: &str) -> Option<usize> {
-    text.char_indices().find_map(|(idx, ch)| match ch {
-        '*' | '_' | '`' | '[' => Some(idx),
-        '!' if text[idx..].starts_with("![") => Some(idx),
-        '~' if text[idx..].starts_with("~~") => Some(idx),
-        _ => None,
-    })
 }
 
 #[derive(Clone, Copy)]
@@ -3595,12 +3551,10 @@ fn hyperlink_text(url: &str, text: &str) -> String {
     format!("{}{text}{OSC8_CLOSE}", open_hyperlink(url))
 }
 
-fn append_link_destination(out: &mut String, url: &str, format: OutputFormat) -> bool {
-    if format == OutputFormat::Concise {
-        return false;
+fn append_link_destination(out: &mut String, url: &str, format: OutputFormat) {
+    if format != OutputFormat::Concise {
+        out.push_str(&format!("{DIM} ({}){RESET}", hyperlink_text(url, url)));
     }
-    out.push_str(&format!("{DIM} ({}){RESET}", hyperlink_text(url, url)));
-    true
 }
 
 fn format_tool(exit_code: i32, elapsed: Duration, styled: bool) -> String {
@@ -4506,6 +4460,90 @@ mod tests {
         assert!(quote.contains(ITALIC), "{quote:?}");
         assert!(!quote.contains('│'), "{quote:?}");
         assert_eq!(strip_ansi(&stream.push("\n").concat()), "\n");
+    }
+
+    #[test]
+    fn markdown_stream_formats_headings_and_nested_code_across_chunks() {
+        for (markdown, expected) in [
+            (
+                "### 1. Name: I’d choose `mount`, with `bind` second\n\nNext.\n",
+                format!(
+                    "{BOLD}1. Name: I’d choose {CODE}mount{RESET}{BOLD}, with {CODE}bind{RESET}{BOLD} second{RESET}\n\nNext.\n"
+                ),
+            ),
+            (
+                "### `mount`\n\nNext.\n",
+                format!("{BOLD}{CODE}mount{RESET}{BOLD}{RESET}\n\nNext.\n"),
+            ),
+            (
+                "**`mu mount deck -- connector-exec steamdeck`** communicates the idea well.\n",
+                format!(
+                    "{BOLD}{CODE}mu mount deck -- connector-exec steamdeck{RESET}{BOLD}{RESET} communicates the idea well.\n"
+                ),
+            ),
+            (
+                "Run **`printf '**'` now**.\n",
+                format!("Run {BOLD}{CODE}printf '**'{RESET}{BOLD} now{RESET}.\n"),
+            ),
+        ] {
+            for (split, _) in markdown.char_indices() {
+                let mut stream = MarkdownStream::default();
+                let actual: String = [
+                    stream.push(&markdown[..split]),
+                    stream.push(&markdown[split..]),
+                    stream.finish(),
+                ]
+                .into_iter()
+                .flatten()
+                .collect();
+                assert_eq!(actual, expected, "{markdown:?} split at byte {split}");
+            }
+        }
+    }
+
+    #[test]
+    fn markdown_stream_matches_whole_lines_at_character_boundaries() {
+        let url = "https://example.com/a_(b)";
+        let link = format!("See [**docs**]({url}) next.\n");
+        let styled_link = format!("{}{BOLD}docs", open_hyperlink(url));
+        let quote_tail = format!("{RESET}{DIM}{ITALIC} in the quote.");
+        for (markdown, plain, styled) in [
+            (link.as_str(), "See docs next.\n", styled_link.as_str()),
+            (
+                "Read *outer **inner** tail* now.\n",
+                "Read outer inner tail now.\n",
+                BOLD,
+            ),
+            ("Keep ~~old~~ for now.\n", "Keep old for now.\n", STRIKE),
+            ("Show \\*literal\\* here.\n", "Show *literal* here.\n", ""),
+            (
+                "The literal [ marker and **bold** example.\n",
+                "The literal [ marker and bold example.\n",
+                BOLD,
+            ),
+            ("### Title ###\n\nNext.\n", "Title\n\nNext.\n", BOLD),
+            (
+                "> Keep `cargo test` in the quote.\n",
+                "Keep cargo test in the quote.\n",
+                quote_tail.as_str(),
+            ),
+            ("```sh\necho hi\n```", "echo hi\n", CODE),
+        ] {
+            let mut stream = MarkdownStream::new(None, OutputFormat::Concise);
+            let whole = [stream.push(markdown), stream.finish()]
+                .into_iter()
+                .flatten()
+                .collect::<String>();
+            assert_eq!(strip_ansi(&whole), plain, "{markdown:?}");
+            assert!(whole.contains(styled), "{whole:?}");
+
+            let mut actual = String::new();
+            for ch in markdown.chars() {
+                actual.extend(stream.push(ch.encode_utf8(&mut [0; 4])));
+            }
+            actual.extend(stream.finish());
+            assert_eq!(actual, whole, "{markdown:?}");
+        }
     }
 
     #[test]
