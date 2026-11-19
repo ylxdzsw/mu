@@ -906,14 +906,12 @@ impl<'a> AgentLoop<'a> {
             self.renderer.tool_start()?;
             let started = Instant::now();
 
-            let (manifest, objects_dir) = self.store.attachment_paths(self.session_id)?;
+            let call = self.bash_call_context(pending.call_id)?;
             let mut ctx = ToolContext {
                 config: self.config,
                 session_id: self.session_id,
                 renderer: self.renderer,
-                attachment_manifest: Some(&manifest),
-                objects_dir: Some(&objects_dir),
-                bash_call_id: pending.call_id,
+                call: Some(&call),
             };
             let tool_result = bash::execute(args, &mut ctx);
             self.persist_bash_result(
@@ -1062,6 +1060,16 @@ impl<'a> AgentLoop<'a> {
         Ok(true)
     }
 
+    fn bash_call_context(&self, bash_call_id: i64) -> Result<bash::CallContext> {
+        let (manifest, objects_dir) = self.store.attachment_paths(self.session_id)?;
+        Ok(bash::CallContext {
+            manifest,
+            objects_dir,
+            bash_call_id,
+            mounts: self.store.mounts(self.session_id)?,
+        })
+    }
+
     fn persist_bash_result(
         &mut self,
         bash_call_id: i64,
@@ -1070,12 +1078,21 @@ impl<'a> AgentLoop<'a> {
         elapsed: Duration,
         context: &mut Vec<Message>,
     ) -> Result<()> {
-        let (output, attachments, outcome, exit_code) = match result {
+        // Readonly calls may have staged competing registrations against the same snapshot.
+        // Reject a conflict as a tool error, not an unfinished journal claim.
+        let result = result.and_then(|result| {
+            if !result.mounts.is_empty() {
+                crate::mount::merge(&mut self.store.mounts(self.session_id)?, &result.mounts)?;
+            }
+            Ok(result)
+        });
+        let (output, attachments, mounts, outcome, exit_code) = match result {
             Ok(result) => {
                 self.renderer.tool_finished(result.exit_code, elapsed)?;
                 (
                     result.output,
                     result.attachments,
+                    result.mounts,
                     "completed",
                     Some(result.exit_code),
                 )
@@ -1083,13 +1100,14 @@ impl<'a> AgentLoop<'a> {
             Err(error) => {
                 let message = bash::model_failure_output(&error, &self.config.limits);
                 self.renderer.tool_failed(&error.to_string(), elapsed)?;
-                (message, Vec::new(), "error", None)
+                (message, Vec::new(), Default::default(), "error", None)
             }
         };
 
         let (_, attachments) = self.store.persist_bash_result(
             self.session_id,
             BashResultRecord {
+                mounts: &mounts,
                 bash_call_id,
                 outcome,
                 exit_code,
@@ -1115,7 +1133,6 @@ impl<'a> AgentLoop<'a> {
     ) -> Result<usize> {
         let mut executions = Vec::new();
         let mut hard_interrupted = false;
-        let (manifest, objects_dir) = self.store.attachment_paths(self.session_id)?;
         for pending in batch {
             if bash::cancellation_requested() {
                 hard_interrupted = true;
@@ -1138,9 +1155,7 @@ impl<'a> AgentLoop<'a> {
                     bash_args,
                     self.config,
                     self.session_id,
-                    Some(&manifest),
-                    Some(&objects_dir),
-                    pending.call_id,
+                    Some(self.bash_call_context(pending.call_id)?),
                 )?,
             });
         }
@@ -2674,6 +2689,7 @@ mod tests {
                     .persist_bash_result(
                         &session.id,
                         BashResultRecord {
+                            mounts: &Default::default(),
                             bash_call_id: calls[0],
                             outcome: "completed",
                             exit_code: Some(0),

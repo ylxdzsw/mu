@@ -168,7 +168,7 @@ does not restore this variable, even if its saved runtime hint remains.
 
 ## Parent Responsibilities
 
-- Include enough context: subagents run in fresh sessions and do not automatically receive conversation history.
+- A fresh child session inherits neither the parent's conversation nor its mounts. Include the task context in the delegation prompt. If it needs a mount, pass the target and wrapper registration recipe (not credentials); the mount name alone is not enough.
 - Name allowed folders or files for editing when the scope is narrow.
 - Ask readonly subagents to list key sources checked.
 - Ask readwrite subagents to list all changes made and checks run.

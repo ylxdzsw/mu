@@ -219,6 +219,10 @@ epoch.
 Inspect resolved session, model, context, scope, and output state.
 `--include-git`, `--include-session-details`, `--include-models`,
 `--include-commands`, and `--include-skills` add their corresponding data.
+Status also reports the registered mounts for the selected session, in both
+text and JSON output. Plain `mu status` also lists the scope's current-session
+mounts if any, labeled with their owning session ID. This does not change its
+fresh-turn preview or contact the mounted executors.
 
 The model object includes its selected `processing` preference (`fast`,
 `standard`, or null). `--include-session-details` also reports
@@ -249,6 +253,40 @@ compaction, enforcing one level of delegation. Non-agent management commands
 remain available. Parentage is invocation-local: resuming a former subagent
 directly from a normal shell does not restore its parent environment, although
 its saved runtime hint may remain until compaction.
+
+### `mu mount [-s SESSION] [ID -- PROGRAM [ARG...]]`
+
+With no mount arguments, list the mounts registered for the session. Outside a
+live Bash call, `-s|--session` selects a session; otherwise `current-session` is
+used. Inside a Bash call, Mu uses the calling session, and an explicit session
+must match it. Register an executor with `mu mount ID -- PROGRAM [ARG...]`.
+IDs contain only ASCII letters, digits, `.`, `_`, and `-`.
+Registrations made inside a Bash call are staged for that call and committed
+when it completes. A listing in the same call includes staged registrations;
+use the mount from a later Bash call.
+
+The registration stores a local argv prefix and the canonical local working
+directory. `PROGRAM` is resolved through `PATH`, or relative to that directory
+when it contains `/`. Re-registering an identical binding is a no-op; a
+different binding for an existing ID is rejected, and there is no removal
+operation. The registered command is visible in mount listings and status, so
+do not put credentials in its arguments.
+
+In a Bash tool call, set `cwd` to `ID:path` to use that mount. Mu splits at the
+first colon and passes the rest of the path unchanged as the wrapper's
+penultimate argument; the command script is its final argument. `ID:` passes an
+empty path for the executor's default directory. The tool's `stdin`
+is forwarded literally to the wrapper. Mu does not run the mounted command
+through local Bash; the executor interprets the command. An unknown mount is an
+error, never a fallback to local execution. To name a literal local directory
+like `deck:logs`, use `./deck:logs`.
+
+Mounts are durable per session across restarts, retries, and compaction. A new
+session, including a subagent session, starts without its parent's mounts; pass
+the target and wrapper registration recipe if a child needs one. Mount
+inventories are not injected into the system prompt or compaction checkpoint.
+Use `mu mount` or `mu status` to inspect the live registry; neither probes
+whether an executor is online.
 
 ### `mu context [--export | --no-context]`
 

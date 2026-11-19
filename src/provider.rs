@@ -340,9 +340,9 @@ impl ModelApi {
 
     pub fn request_format(self) -> &'static str {
         match self {
-            Self::ChatCompletions => "openai.chat_completions.v1",
-            Self::Responses => "openai.responses.v1",
-            Self::AnthropicMessages => "anthropic.messages.v1",
+            Self::ChatCompletions => "openai.chat_completions.v2",
+            Self::Responses => "openai.responses.v2",
+            Self::AnthropicMessages => "anthropic.messages.v2",
         }
     }
 
@@ -369,9 +369,16 @@ pub struct Request {
 
 impl Request {
     pub fn json(&self, api: ModelApi) -> Result<Value, ProviderError> {
+        self.json_with_parameters(api, crate::bash::parameters_schema())
+    }
+
+    pub(crate) fn json_with_parameters(
+        &self,
+        api: ModelApi,
+        parameters: Value,
+    ) -> Result<Value, ProviderError> {
         api.validate_processing(self.model.processing)?;
         let description = crate::bash::description();
-        let parameters = crate::bash::parameters_schema();
         // Bump ModelApi request formats when this wire definition changes.
         let tools = [match api {
             ModelApi::ChatCompletions => serde_json::json!({

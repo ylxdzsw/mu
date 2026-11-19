@@ -739,26 +739,25 @@ impl Renderer {
             .get("command")
             .and_then(|value| value.as_str())
             .unwrap_or_default();
-        let base = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-        let cwd = args
+        let raw = args
             .get("cwd")
-            .and_then(|value| value.as_str())
-            .map(PathBuf::from)
-            .map(|cwd| {
-                if cwd.is_absolute() {
-                    cwd
-                } else {
-                    base.join(cwd)
-                }
-            })
-            .unwrap_or(base);
-        let cwd = std::fs::canonicalize(&cwd).unwrap_or(cwd);
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or(".");
+        let cwd = if crate::mount::split_cwd(raw).is_some() {
+            raw.to_owned()
+        } else {
+            let path = crate::bash::resolve_path(raw);
+            std::fs::canonicalize(&path)
+                .unwrap_or(path)
+                .display()
+                .to_string()
+        };
 
         self.write_stdout_committed(&format!("# {title}\n$ [{risk}] {command}"))?;
         if !command.ends_with('\n') {
             self.write_stdout_committed("\n")?;
         }
-        self.write_stdout_committed(&format!("@ {}\n", cwd.display()))?;
+        self.write_stdout_committed(&format!("@ {cwd}\n"))?;
         if let Some(stdin) = args.get("stdin").and_then(|value| value.as_str()) {
             self.write_stdout_committed(&format!("< {stdin}"))?;
             if !stdin.ends_with('\n') {
@@ -3721,6 +3720,9 @@ fn format_cwd_line(raw_cwd: &str, styled: bool) -> String {
 }
 
 fn should_render_bash_cwd(raw_cwd: &str) -> bool {
+    if crate::mount::split_cwd(raw_cwd).is_some() {
+        return true;
+    }
     let pwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let raw_path = PathBuf::from(raw_cwd);
     let resolved = if raw_path.is_absolute() {

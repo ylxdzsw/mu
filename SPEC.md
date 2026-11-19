@@ -84,11 +84,14 @@ making Mu less scriptable.
 ### 2.3 One model-visible tool
 
 **Decision.** The only function tool is `bash`. Mu-owned `apply_patch`, `edit`,
-and `view_image` applets are commands available inside Bash. Skills are
+and `view_image` applets are commands available inside local Bash. Skills are
 Markdown files loaded through Bash.
 
 One stable schema is easier for models to learn, works across providers, and
 retains the full Unix tool ecosystem without an adapter per command.
+Session mounts (§4.3) change where a call runs, not the tool schema. An
+external executor owns the transport, so the model writes the destination
+command once and can still use stdin for data.
 
 **Rejected: a broad built-in tool catalog.** Separate read, write, search,
 process, web, and skill tools would duplicate shell capabilities and enlarge
@@ -328,15 +331,16 @@ bash({
 - `title` is concise human-facing action text.
 - `risk` is advisory audit/UI metadata used by trapping. It does not change
   process permissions or provide confinement.
-- `command` runs as `bash -lc`.
+- `command` runs as `bash -lc` for a local call. A mounted executor receives
+  the command as one argument and determines how to interpret it (§4.3).
 - `cwd` applies to this call only. Calls do not share `cd`, shell variables, or
   exported environment changes.
 - `stdin` is written literally to the child and is the preferred path for
   multiline or escaping-sensitive data.
 - `timeout` is a positive number of seconds and defaults to 120.
 
-The resolved Mu applet directory is prepended to the post-login `PATH`. Calls
-run in separate process groups. Timeout or interruption sends TERM, waits a
+For local Bash, the Mu applet directory is prepended to the post-login `PATH`.
+Calls run in separate process groups. Timeout or interruption sends TERM, waits a
 short grace period, then sends KILL; Linux also requests a parent-death signal
 for the direct child. Ordinary calls are expected not to outlive their tool
 result.
@@ -411,6 +415,40 @@ These are shell commands, not function tools:
 User attachments and `view_image` use the same 20 MiB per-file limit. Turn
 attachments additionally support WAV and MP3. Provider-specific media support
 is defined in §7.
+
+### 4.3 Session executor mounts
+
+`mu mount ID -- PROGRAM [ARG…]` binds a name to a local executable, fixed
+arguments, and the registration directory. Mu resolves the executable and
+records the absolute local working directory at registration. Repeating the
+same binding is a no-op; a different binding for that ID is rejected. There
+is no unmount operation. Bindings are journaled and visible in listings, so
+credentials belong in the executor's credential source, not its arguments.
+
+A `cwd` beginning with `ID:` selects a mount. IDs are nonempty and use ASCII
+letters, digits, `.`, `_`, or `-`. Mu splits at the first colon and passes the
+remainder verbatim: `laptop:C:\Temp` passes `C:\Temp`, and `deck:` passes an
+empty string for the executor's default directory. An unknown ID fails rather
+than falling back to local execution. Use `./deck:logs` for a literal local
+directory named `deck:logs`. Omitting `cwd` still runs the call locally.
+
+Mu directly invokes `PROGRAM ARG… REMOTE_CWD COMMAND` in the registration
+directory, without local shell parsing. Stdin is forwarded literally; the
+wrapper's output and exit status use the ordinary Bash result path. Existing
+trap and approval rules apply, and the trap preview shows `ID:path` as given.
+A mount is neither a filesystem mount nor a persistent shell. Killing the
+local wrapper does not establish that remote work stopped. Applets are not
+installed on the destination; a local wrapper can receive image bytes and
+call local `view_image` to attach them to its result.
+
+`mu mount` with no operands lists registrations without contacting executors.
+Outside a tool call it uses `-s SESSION` or the active scope's `current-session`.
+Inside a call it uses the calling session: registrations are staged per call,
+visible to `mu mount` in that call, and committed by the journal owner with
+the tool result. Later calls can then use them. A resumed session keeps its
+mounts; a fresh session, including a subagent, starts empty. To delegate work
+on a mount, pass the registration recipe, not just its name. See the
+[mount skill](builtins/mount.md) for SSH and systemd-nspawn examples.
 
 ---
 
@@ -743,8 +781,8 @@ Operations that make provider requests—a turn, a dirty retry, and compaction�
 require a configured provider, supported endpoint, model, and any named API-key
 environment value. `status` validates and resolves provider/model
 configuration but does not contact a provider or require its key. `init`,
-`new`, `sessions`, `transcript`, `context`, and `cat` remain available without
-a configured provider. API keys are read from the effective environment and
+`new`, `sessions`, `transcript`, `mount`, `context`, and `cat` remain available
+without a configured provider. API keys are read from the effective environment and
 are not written into session provider-request records.
 
 ---
@@ -973,13 +1011,19 @@ Management commands:
 | `mu new` | Create a model-free session without selecting it. |
 | `mu sessions` | List recent active-scope sessions. |
 | `mu transcript` | Replay the persisted semantic transcript without contacting a provider. |
-| `mu status` | Report resolved scope, selection, model, context, and optional expensive indexes. |
+| `mu status` | Report resolved scope, selection, model, context, selected-session mounts, and optional expensive indexes. |
+| `mu mount` | List or register session-scoped executor bindings (§4.3). |
 | `mu context` | Show the system prompt Mu would assemble; `--export` emits user instructions and non-built-in skill guidance for a foreign agent. |
 | `mu cat` | Resolve and preview exact prompt input without provider contact or session creation. |
 | `mu retry` | Recover and continue an interrupted turn without a new prompt, including pending Bash claims; `--trap` overrides its stored policy for this invocation; `--approve` releases only the first pending claim without changing policy and fails if none exists; otherwise a clean session reports a no-op. |
 | `mu compact` | Force compaction with configured or explicit output density and trap level, optionally using non-terminal stdin as a focus instruction. |
 
 Provider-free management commands do not contact a provider.
+
+`mu status --json` reports the selected session's `mounts` map (empty when no
+session is selected). Plain `mu status` still previews a fresh turn, but also
+lists the scope's current-session mounts, labeled with their owning session
+ID, if any. Text status omits empty mount sections. Neither form probes hosts.
 
 ---
 
@@ -1018,13 +1062,19 @@ The durable event model is:
 - **`bash_started`** — write-ahead execution boundary for one Bash attempt.
   More than one start is valid only when explicitly retrying an unresolved
   readonly claim.
-- **`bash_completed`** — unique inline result and attachment references for one
-  started Bash claim. Text is always stored directly in the journal; binary
-  attachments remain content-addressed objects.
+- **`mounts_registered`** — registrations made outside a live Bash call.
+- **`bash_completed`** — unique inline result, attachment references, and any
+  staged registrations committed for one started Bash claim. Text is stored
+  directly in the journal; binary attachments remain content-addressed objects.
 - **`bash_not_attempted`** — terminal model-visible result for a claim
   deliberately abandoned before its first start.
-- **`compaction_applied`** — exact new-epoch system prompt and after-context
-  telemetry for the committed epoch transition.
+- **`compaction_applied`** — exact new-epoch system prompt, after-context
+  telemetry, and a structured snapshot of the active mount registry.
+
+Mount reconstruction starts with the latest applied snapshot (or an empty
+registry before the first compaction) and applies subsequent registration
+deltas. The snapshot is execution state: Mu does not inject a mount inventory
+into the system prompt or append one to the model's compaction checkpoint.
 
 Assistant projections contain one ordered item array, optional resumable and
 non-final bits, and provider-native replay payload without copied provider

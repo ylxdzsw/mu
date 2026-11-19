@@ -140,6 +140,7 @@ pub struct BashResultRecord<'a> {
     pub outcome: &'a str,
     pub exit_code: Option<i32>,
     pub duration_ms: Option<u64>,
+    pub mounts: &'a crate::mount::Mounts,
 }
 
 #[derive(Debug, Clone)]
@@ -358,6 +359,11 @@ enum Event {
         duration_ms: Option<u64>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         attachments: Vec<PersistedToolAttachment>,
+        #[serde(default, skip_serializing_if = "crate::mount::Mounts::is_empty")]
+        mounts: crate::mount::Mounts,
+    },
+    MountsRegistered {
+        mounts: crate::mount::Mounts,
     },
     BashNotAttempted {
         call_id: i64,
@@ -369,6 +375,8 @@ enum Event {
         after_context_tokens_estimate: u64,
         #[serde(skip_serializing_if = "Option::is_none")]
         after_context_window: Option<u64>,
+        #[serde(default)]
+        mounts: crate::mount::Mounts,
     },
 }
 
@@ -731,6 +739,27 @@ impl Store {
             return Ok(None);
         };
         Ok(Some(self.project_session(&journal)?))
+    }
+
+    pub fn mounts(&self, session_id: &str) -> Result<crate::mount::Mounts> {
+        self.with_journal(session_id, mounts_from_journal)
+    }
+
+    pub fn register_mounts(&self, session_id: &str, mounts: &crate::mount::Mounts) -> Result<()> {
+        self.with_writer(session_id, |locked| {
+            let mut visible = mounts_from_journal(&locked.journal)?;
+            let before = visible.len();
+            crate::mount::merge(&mut visible, mounts)?;
+            if before != visible.len() {
+                Self::append_locked(
+                    locked,
+                    Event::MountsRegistered {
+                        mounts: mounts.clone(),
+                    },
+                )?;
+            }
+            Ok(())
+        })
     }
 
     pub fn list_sessions(&self, limit: usize) -> Result<SessionListing> {
@@ -1169,6 +1198,7 @@ impl Store {
                 exit_code: None,
                 duration_ms: None,
                 attachments: Vec::new(),
+                mounts: Default::default(),
             },
         )?;
         if let Ok((manifest, _)) = self.attachment_paths(session_id) {
@@ -1646,22 +1676,25 @@ impl Store {
         if application.system_prompt.trim().is_empty() {
             bail!("compaction application has an empty system prompt")
         }
-        let to_epoch = self.with_journal(session_id, |journal| {
+        self.with_writer(session_id, |locked| {
+            let journal = &locked.journal;
             let (_, turn_id, _) = compaction_start_before(journal, i64::MAX)
                 .context("session has no pending compaction")?;
             compaction_summary_before(journal, turn_id, i64::MAX)
                 .context("pending compaction has no accepted summary")?;
-            Ok(context_epoch(journal, i64::MAX).saturating_add(1))
-        })?;
-        self.append(
-            session_id,
-            Event::CompactionApplied {
-                system_prompt: application.system_prompt,
-                after_context_tokens_estimate: application.after_context_tokens_estimate,
-                after_context_window: application.after_context_window,
-            },
-        )?;
-        Ok(to_epoch)
+            let to_epoch = context_epoch(journal, i64::MAX).saturating_add(1);
+            let mounts = mounts_from_journal(journal)?;
+            Self::append_locked(
+                locked,
+                Event::CompactionApplied {
+                    system_prompt: application.system_prompt,
+                    after_context_tokens_estimate: application.after_context_tokens_estimate,
+                    after_context_window: application.after_context_window,
+                    mounts,
+                },
+            )?;
+            Ok(to_epoch)
+        })
     }
 
     #[cfg(test)]
@@ -1878,7 +1911,8 @@ impl Store {
         content: &str,
         attachments: &[ToolAttachment],
     ) -> Result<(i64, Vec<ToolAttachment>)> {
-        let already_completed = self.with_journal(session_id, |journal| {
+        let (seq, attachments) = self.with_writer(session_id, |locked| {
+            let journal = &locked.journal;
             find_call(journal, record.bash_call_id)
                 .context("locating Bash claim for result persistence")?;
             if !journal.events.iter().any(|line| {
@@ -1889,33 +1923,37 @@ impl Store {
             }) {
                 bail!("Bash result has no start event")
             }
-            Ok(journal.events.iter().any(|line| {
+            if journal.events.iter().any(|line| {
                 matches!(
                     line.event,
                     Event::BashCompleted { call_id, .. }
                         | Event::BashNotAttempted { call_id, .. }
                         if call_id == record.bash_call_id
                 )
-            }))
+            }) {
+                bail!("Bash result already exists")
+            }
+            if !record.mounts.is_empty() {
+                crate::mount::merge(&mut mounts_from_journal(journal)?, record.mounts)?;
+            }
+            let persisted_attachments = attachments
+                .iter()
+                .map(|attachment| self.persist_tool_attachment(attachment))
+                .collect::<Result<Vec<_>>>()?;
+            let seq = Self::append_locked(
+                locked,
+                Event::BashCompleted {
+                    call_id: record.bash_call_id,
+                    outcome: record.outcome.to_string(),
+                    output: content.to_string(),
+                    exit_code: record.exit_code,
+                    duration_ms: record.duration_ms,
+                    attachments: persisted_attachments.clone(),
+                    mounts: record.mounts.clone(),
+                },
+            )?;
+            Ok((seq, persisted_attachments))
         })?;
-        if already_completed {
-            bail!("Bash result already exists")
-        }
-        let attachments = attachments
-            .iter()
-            .map(|attachment| self.persist_tool_attachment(attachment))
-            .collect::<Result<Vec<_>>>()?;
-        let seq = self.append(
-            session_id,
-            Event::BashCompleted {
-                call_id: record.bash_call_id,
-                outcome: record.outcome.to_string(),
-                output: content.to_string(),
-                exit_code: record.exit_code,
-                duration_ms: record.duration_ms,
-                attachments: attachments.clone(),
-            },
-        )?;
         let hydrated = attachments
             .iter()
             .map(|attachment| self.hydrate_tool_attachment(attachment))
@@ -1977,6 +2015,7 @@ impl Store {
                 system_prompt: system_prompt.to_string(),
                 after_context_tokens_estimate: 0,
                 after_context_window: None,
+                mounts: Default::default(),
             },
         });
         if mode == CompactionMode::AwaitUser && queued_prompt(&journal).is_some() {
@@ -2463,9 +2502,11 @@ impl Store {
             })
             .with_context(|| format!("provider request not found: {exchange_id}"))?;
         let api = match recipe.format.as_str() {
-            "openai.chat_completions.v1" => ModelApi::ChatCompletions,
-            "openai.responses.v1" => ModelApi::Responses,
-            "anthropic.messages.v1" => ModelApi::AnthropicMessages,
+            "openai.chat_completions.v1" | "openai.chat_completions.v2" => {
+                ModelApi::ChatCompletions
+            }
+            "openai.responses.v1" | "openai.responses.v2" => ModelApi::Responses,
+            "anthropic.messages.v1" | "anthropic.messages.v2" => ModelApi::AnthropicMessages,
             format => bail!("unsupported provider request format: {format}"),
         };
         let through_seq = request_seq.saturating_sub(1);
@@ -2489,6 +2530,12 @@ impl Store {
             serde_json::from_value(recipe.input["native_replay_origins"].clone())
                 .context("agent request recipe has no valid native replay origins")?;
         let messages = crate::provider::filter_native_replay_for_origins(&messages, api, &origins);
+        let mut parameters = crate::bash::parameters_schema();
+        if recipe.format.ends_with(".v1") {
+            parameters["properties"]["command"]["description"] =
+                "Command to run with bash -lc; can be multiline".into();
+            parameters["properties"]["cwd"]["description"] = "Working directory for this invocation; Prefer absolute path; Prefer this argument over `cd`".into();
+        }
         let body = Request {
             model: ResolvedModelRef {
                 canonical: origin.canonical_model_ref.clone(),
@@ -2500,7 +2547,7 @@ impl Store {
             cache_key: None,
             messages,
         }
-        .json(api)?;
+        .json_with_parameters(api, parameters)?;
         // The saved envelope is authoritative, including historical provider options.
         // Only messages, system, and tools are regenerated from semantic history.
         let mut request = recipe
@@ -2844,24 +2891,26 @@ impl Store {
 
     // Journal I/O and locking.
     fn append(&self, session_id: &str, event: Event) -> Result<i64> {
-        self.with_writer(session_id, |locked| {
-            let seq = locked.journal.next_seq();
-            let line = EventLine {
-                seq,
-                at: now(),
-                event,
-            };
-            Arc::make_mut(&mut locked.journal.events).push(line.clone());
-            let offset = locked.file.seek(SeekFrom::End(0))?;
-            if let Err(error) = write_json_line(&mut locked.file, &line)
-                .and_then(|()| locked.file.sync_data().map_err(Into::into))
-            {
-                let _ = locked.file.set_len(offset);
-                Arc::make_mut(&mut locked.journal.events).pop();
-                return Err(error);
-            }
-            Ok(seq)
-        })
+        self.with_writer(session_id, |locked| Self::append_locked(locked, event))
+    }
+
+    fn append_locked(locked: &mut LockedSession, event: Event) -> Result<i64> {
+        let seq = locked.journal.next_seq();
+        let line = EventLine {
+            seq,
+            at: now(),
+            event,
+        };
+        Arc::make_mut(&mut locked.journal.events).push(line.clone());
+        let offset = locked.file.seek(SeekFrom::End(0))?;
+        if let Err(error) = write_json_line(&mut locked.file, &line)
+            .and_then(|()| locked.file.sync_data().map_err(Into::into))
+        {
+            let _ = locked.file.set_len(offset);
+            Arc::make_mut(&mut locked.journal.events).pop();
+            return Err(error);
+        }
+        Ok(seq)
     }
 
     fn next_seq(&self, session_id: &str) -> Result<i64> {
@@ -3492,6 +3541,29 @@ fn validate_events(events: &[EventLine]) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn mounts_from_journal(journal: &Journal) -> Result<crate::mount::Mounts> {
+    let (mut mounts, start) = journal
+        .events
+        .iter()
+        .enumerate()
+        .rev()
+        .find_map(|(i, line)| match &line.event {
+            Event::CompactionApplied { mounts, .. } => Some((mounts.clone(), i + 1)),
+            _ => None,
+        })
+        .unwrap_or_default();
+    for line in &journal.events[start..] {
+        match &line.event {
+            Event::BashCompleted { mounts: delta, .. }
+            | Event::MountsRegistered { mounts: delta } => {
+                crate::mount::merge(&mut mounts, delta).context("reconstructing session mounts")?;
+            }
+            _ => {}
+        }
+    }
+    Ok(mounts)
 }
 
 fn latest_active_turn_id(journal: &Journal) -> Option<String> {
@@ -4262,7 +4334,7 @@ mod tests {
                 },
                 store
                     .request_recipe(
-                        "openai.chat_completions.v1",
+                        ModelApi::ChatCompletions.request_format(),
                         &native,
                         serde_json::json!({
                             "native_replay_origins": [],
@@ -4487,6 +4559,13 @@ mod tests {
     #[test]
     fn projected_compaction_context_matches_applied_journal() {
         let (store, session) = test_session();
+        let wrapper = crate::mount::Mount {
+            program: "/bin/echo".into(),
+            args: vec![],
+            cwd: "/tmp".into(),
+        };
+        let mounts = [("before".into(), wrapper.clone())].into();
+        store.register_mounts(&session.id, &mounts).unwrap();
         store
             .start_turn(&session.id, "/tmp", None, &"test".into())
             .unwrap();
@@ -4551,6 +4630,21 @@ mod tests {
                 },
             )
             .unwrap();
+        assert!(
+            matches!(&store.load(&session.id).unwrap().events.last().unwrap().event,
+            Event::CompactionApplied { mounts: snapshot, .. } if snapshot == &mounts)
+        );
+        let after = [("after".into(), wrapper)].into();
+        store.register_mounts(&session.id, &after).unwrap();
+        let mut expected = mounts;
+        crate::mount::merge(&mut expected, &after).unwrap();
+        assert_eq!(
+            Store::open(&store.root)
+                .unwrap()
+                .mounts(&session.id)
+                .unwrap(),
+            expected
+        );
         store.materialize_queued_prompt(&session.id).unwrap();
 
         assert_eq!(
@@ -4633,6 +4727,7 @@ mod tests {
                     outcome: "completed",
                     exit_code: Some(0),
                     duration_ms: Some(1),
+                    mounts: &Default::default(),
                 },
                 "result",
                 &[ToolAttachment {
@@ -4811,6 +4906,7 @@ mod tests {
                     outcome: "completed",
                     exit_code: Some(0),
                     duration_ms: Some(7),
+                    mounts: &Default::default(),
                 },
                 "ok",
                 &[],
@@ -5030,6 +5126,7 @@ mod tests {
                     outcome: "completed",
                     exit_code: Some(0),
                     duration_ms: Some(1),
+                    mounts: &Default::default(),
                 },
                 "done",
                 &attachments,
@@ -5275,7 +5372,7 @@ mod tests {
         let native = request.json(ModelApi::AnthropicMessages).unwrap();
         let recipe = store
             .request_recipe(
-                "anthropic.messages.v1",
+                ModelApi::AnthropicMessages.request_format(),
                 &native,
                 serde_json::json!({
                     "native_replay_origins":
@@ -5345,6 +5442,7 @@ mod tests {
                     outcome: "completed",
                     exit_code: Some(0),
                     duration_ms: Some(1),
+                    mounts: &Default::default(),
                 },
                 "/tmp",
                 &[],
@@ -5382,7 +5480,7 @@ mod tests {
         let native = request.json(ModelApi::ChatCompletions).unwrap();
         let recipe = store
             .request_recipe(
-                "openai.chat_completions.v1",
+                ModelApi::ChatCompletions.request_format(),
                 &native,
                 serde_json::json!({
                     "native_replay_origins": replay_origins,
@@ -5817,6 +5915,7 @@ mod tests {
                             outcome: "completed",
                             exit_code: Some(0),
                             duration_ms: Some(1),
+                            mounts: &Default::default(),
                         },
                         "output",
                         &[],
@@ -6014,6 +6113,7 @@ mod tests {
                     outcome: "completed",
                     exit_code: Some(0),
                     duration_ms: Some(1),
+                    mounts: &Default::default(),
                 },
                 "ok",
                 &[],

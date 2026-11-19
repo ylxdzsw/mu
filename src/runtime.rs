@@ -8,6 +8,7 @@ use crate::models::{
     AvailableModelsPayload, ResolvedModelChoice, ResolvedModelRef, available_models,
     first_model_choice, resolve_model_choice,
 };
+use crate::mount::Mounts;
 use crate::skills::{CommandMeta, SkillMeta};
 use crate::store::{Session, Store, UnsupportedSessionVersion};
 
@@ -65,6 +66,7 @@ pub struct StatusReport {
     pub model: StatusModel,
     pub output: crate::OutputFormat,
     pub session_id: Option<String>,
+    pub mounts: Mounts,
     pub context_tokens: Option<u64>,
     pub context_usage_source: Option<ContextUsageSource>,
     pub project_root: Option<String>,
@@ -358,6 +360,12 @@ pub fn build_status_report(
         .map(|session| store.is_session_clean(&session.id))
         .transpose()?
         .unwrap_or(true);
+    let mounts = resolved
+        .attached_session
+        .as_ref()
+        .map(|session| store.mounts(&session.id))
+        .transpose()?
+        .unwrap_or_default();
     let model = status_model(config, active_model);
     let context_usage = context_usage(
         store,
@@ -373,6 +381,7 @@ pub fn build_status_report(
             .attached_session
             .as_ref()
             .map(|session| session.id.clone()),
+        mounts,
         context_tokens: context_usage.map(|(tokens, _)| tokens),
         context_usage_source: context_usage.map(|(_, source)| source),
         project_root: project.map(|project| project.root.display().to_string()),
@@ -1007,8 +1016,17 @@ mod tests {
     fn status_report_only_builds_requested_session_details() {
         let store = Store::open_memory().unwrap();
         let session = store.create_session("/tmp").unwrap();
+        let mounts = Mounts::from([(
+            "deck".into(),
+            crate::mount::Mount {
+                program: "/usr/bin/connector-exec".into(),
+                args: vec!["steamdeck".into()],
+                cwd: "/work".into(),
+            },
+        )]);
+        store.register_mounts(&session.id, &mounts).unwrap();
         let overrides = InvocationOverrides {
-            session: Some(session.id),
+            session: Some(session.id.clone()),
             continue_current: false,
             model: None,
         };
@@ -1030,6 +1048,11 @@ mod tests {
         assert!(lean_json.get("session").is_none());
         assert!(lean_json.get("active").is_none());
         assert!(lean_json.get("compaction").is_none());
+        assert_eq!(lean.mounts, mounts);
+        assert_eq!(
+            lean_json["mounts"]["deck"]["program"],
+            "/usr/bin/connector-exec"
+        );
 
         let detailed = build_status_report(
             &store,

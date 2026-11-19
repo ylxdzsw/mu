@@ -27,6 +27,7 @@ const BUILTINS: &[(&str, &str)] = &[
     ("config.md", include_str!("../builtins/config.md")),
     ("exa-search.md", include_str!("../builtins/exa-search.md")),
     ("markitdown.md", include_str!("../builtins/markitdown.md")),
+    ("mount.md", include_str!("../builtins/mount.md")),
     ("mu-doc.md", include_str!("../builtins/mu-doc.md")),
     ("subagent.md", include_str!("../builtins/subagent.md")),
     ("ultracode", include_str!("../builtins/ultracode")),

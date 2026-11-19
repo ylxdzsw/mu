@@ -3,7 +3,6 @@ use std::io::Write;
 use std::mem::DropGuard;
 use std::os::unix::process::CommandExt;
 use std::os::unix::process::ExitStatusExt;
-use std::path::Path;
 use std::path::PathBuf;
 use std::process::{Command, ExitStatus, Stdio};
 use std::sync::Once;
@@ -18,6 +17,7 @@ use serde_json::{Value, json};
 use tokio::task::JoinHandle;
 
 use crate::config::{Config, EnvMap, LimitsConfig};
+use crate::mount::Mounts;
 use crate::provider::ToolAttachment;
 use crate::redaction::SecretRedactor;
 use crate::renderer::Renderer;
@@ -27,6 +27,7 @@ pub struct ToolResult {
     pub output: String,
     pub exit_code: i32,
     pub attachments: Vec<ToolAttachment>,
+    pub mounts: Mounts,
 }
 
 #[derive(Debug)]
@@ -58,9 +59,7 @@ pub struct ToolContext<'a> {
     pub config: &'a Config,
     pub session_id: &'a str,
     pub renderer: &'a mut Renderer,
-    pub attachment_manifest: Option<&'a Path>,
-    pub objects_dir: Option<&'a Path>,
-    pub bash_call_id: i64,
+    pub call: Option<&'a CallContext>,
 }
 
 pub fn resolve_path(path: &str) -> PathBuf {
@@ -282,8 +281,8 @@ pub fn parameters_schema() -> Value {
                 "enum": ["readonly", "reversible", "destructive"],
                 "description": "Advisory risk label for UI and auditing. Choose by how reliably and easily the command's effects can be undone, using the highest risk of any part: readonly only when no persistent local or remote state changes; reversible for bounded changes with a known, practical way to restore the prior state; destructive when unique state could be lost, rollback is uncertain, or reversal would be unusually broad or costly. Judge intended material effects; incidental traces of ordinary reads, such as access logs and API usage, do not make them state-changing. Consider the actual target and context rather than the command name, and choose the higher risk when uncertain about recoverability."
             },
-            "command": { "type": "string", "description": "Command to run with bash -lc; can be multiline" },
-            "cwd": { "type": "string", "description": "Working directory for this invocation; Prefer absolute path; Prefer this argument over `cd`" },
+            "command": { "type": "string", "description": "Multiline command. Locally runs with bash -lc; on a mount, write the command directly for the destination shell. stdin is separate." },
+            "cwd": { "type": "string", "description": "Local working directory (prefer an absolute path over cd), or ID:path on a session mount. ID: uses its default directory. Run mu mount locally to list mounts." },
             "timeout": { "type": "integer", "minimum": 1, "description": "Timeout in seconds (default 120)" },
             "stdin": { "type": "string", "description": "Literal stdin bytes to pipe to the command; omit unless the command needs non-empty piped input; prefer this argument over long heredoc" }
         },
@@ -300,21 +299,13 @@ pub fn execute(args: Value, ctx: &mut ToolContext<'_>) -> Result<ToolResult> {
         ctx.renderer.notice(&format!("[redaction] {warning}"))?;
     }
 
-    let attachment_context =
-        ctx.attachment_manifest
-            .zip(ctx.objects_dir)
-            .map(|(manifest, objects_dir)| AttachmentContext {
-                manifest: manifest.to_path_buf(),
-                objects_dir: objects_dir.to_path_buf(),
-                bash_call_id: ctx.bash_call_id,
-            });
     execute_bash(
         args,
         ctx.config,
         ctx.session_id,
         ctx.renderer,
         redactor,
-        attachment_context.as_ref(),
+        ctx.call,
     )
 }
 
@@ -324,6 +315,7 @@ struct BashRunResult {
     exit_code: i32,
     redacted: bool,
     attachments: Vec<ToolAttachment>,
+    mounts: Mounts,
 }
 
 #[derive(Default)]
@@ -416,21 +408,12 @@ pub fn start_bash_task(
     args: BashArgs,
     config: &Config,
     session_id: &str,
-    attachment_manifest: Option<&Path>,
-    objects_dir: Option<&Path>,
-    bash_call_id: i64,
+    call: Option<CallContext>,
 ) -> Result<RunningBash> {
     let redactor = SecretRedactor::from_config(config)?;
     let warnings = redactor.warnings().to_vec();
     let config = config.clone();
     let session_id = session_id.to_string();
-    let attachment_context = attachment_manifest
-        .zip(objects_dir)
-        .map(|(manifest, objects_dir)| AttachmentContext {
-            manifest: manifest.to_path_buf(),
-            objects_dir: objects_dir.to_path_buf(),
-            bash_call_id,
-        });
     let shared = Arc::new(SharedBashState::default());
     let shared_for_task = Arc::clone(&shared);
     let task = tokio::task::spawn_blocking(move || {
@@ -441,7 +424,7 @@ pub fn start_bash_task(
             &session_id,
             &mut BufferedBashTarget::new(shared_for_task),
             redactor,
-            attachment_context.as_ref(),
+            call.as_ref(),
         );
         (result, started.elapsed())
     });
@@ -453,10 +436,11 @@ pub fn start_bash_task(
 }
 
 #[derive(Debug, Clone)]
-struct AttachmentContext {
-    manifest: PathBuf,
-    objects_dir: PathBuf,
-    bash_call_id: i64,
+pub struct CallContext {
+    pub manifest: PathBuf,
+    pub objects_dir: PathBuf,
+    pub bash_call_id: i64,
+    pub mounts: Mounts,
 }
 
 fn execute_bash(
@@ -465,7 +449,7 @@ fn execute_bash(
     session_id: &str,
     target: &mut impl BashOutputTarget,
     mut redactor: SecretRedactor,
-    attachment_context: Option<&AttachmentContext>,
+    call: Option<&CallContext>,
 ) -> Result<ToolResult> {
     let timeout = args.timeout.unwrap_or(DEFAULT_TIMEOUT_SECS);
     if timeout == 0 {
@@ -479,7 +463,7 @@ fn execute_bash(
         &config.env,
         session_id,
         &mut redactor,
-        attachment_context,
+        call,
     )?;
     let exit_code = result.exit_code;
     let attachments = result.attachments;
@@ -492,6 +476,7 @@ fn execute_bash(
     Ok(ToolResult {
         output: truncate_bash_output(&full, &config.limits),
         exit_code,
+        mounts: result.mounts,
         attachments,
     })
 }
@@ -503,35 +488,51 @@ fn run_bash(
     env: &EnvMap,
     session_id: &str,
     redactor: &mut SecretRedactor,
-    attachment_context: Option<&AttachmentContext>,
+    call: Option<&CallContext>,
 ) -> Result<BashRunResult> {
-    let cwd = args
-        .cwd
-        .as_deref()
-        .map(resolve_path)
-        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
-    let cwd_metadata = std::fs::metadata(&cwd).map_err(|error| {
-        if error.kind() == std::io::ErrorKind::NotFound {
-            anyhow::anyhow!("working directory does not exist: {}", cwd.display())
-        } else {
-            anyhow::anyhow!(error).context(format!("accessing working directory {}", cwd.display()))
-        }
-    })?;
-    if !cwd_metadata.is_dir() {
-        bail!("working directory is not a directory: {}", cwd.display());
-    }
     let applets = crate::paths::applets_dir()?;
-    let command_text = format!(
-        "export PATH={}:$PATH\nexec 2>&1\n{}",
-        shell_quote(&applets.to_string_lossy()),
-        args.command
-    );
-
-    let mut command = Command::new("bash");
+    let mounted = args.cwd.as_deref().and_then(crate::mount::split_cwd);
+    let mut command = if let Some((id, remote_cwd)) = mounted {
+        let mount = call
+            .and_then(|call| call.mounts.get(id))
+            .with_context(|| format!("unknown mount: {id}"))?;
+        let mut command = Command::new(&mount.program);
+        command
+            .args(&mount.args)
+            .arg(remote_cwd)
+            .arg(&args.command)
+            .current_dir(&mount.cwd);
+        command
+    } else {
+        let cwd = args
+            .cwd
+            .as_deref()
+            .map(resolve_path)
+            .unwrap_or_else(|| PathBuf::from("."));
+        match std::fs::metadata(&cwd) {
+            Ok(m) if m.is_dir() => (),
+            Ok(_) => bail!("working directory is not a directory: {}", cwd.display()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                bail!("working directory does not exist: {}", cwd.display())
+            }
+            Err(e) => {
+                return Err(e)
+                    .with_context(|| format!("accessing working directory {}", cwd.display()));
+            }
+        }
+        let mut command = Command::new("bash");
+        command
+            .arg("-lc")
+            .arg(format!(
+                "export PATH={}:$PATH\nexec 2>&1\n{}",
+                shell_quote(&applets.to_string_lossy()),
+                args.command
+            ))
+            .current_dir(cwd);
+        command
+    };
+    let (stdout, writer) = std::io::pipe()?;
     command
-        .arg("-lc")
-        .arg(command_text)
-        .current_dir(&cwd)
         .envs(env)
         .env(SESSION_ID_ENV, session_id)
         .stdin(if args.stdin.is_some() {
@@ -539,28 +540,43 @@ fn run_bash(
         } else {
             Stdio::null()
         })
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null());
+        .stdout(writer.try_clone()?);
+    if mounted.is_some() {
+        let path = env
+            .get("PATH")
+            .map(std::ffi::OsString::from)
+            .or_else(|| std::env::var_os("PATH"))
+            .unwrap_or_default();
+        command
+            .env(
+                "PATH",
+                std::env::join_paths(std::iter::once(applets).chain(std::env::split_paths(&path)))?,
+            )
+            .stderr(writer);
+    } else {
+        command.stderr(Stdio::null());
+        drop(writer);
+    }
     if let Some(parent_session_id) = std::env::var_os(SESSION_ID_ENV) {
         command.env(PARENT_SESSION_ID_ENV, parent_session_id);
     } else {
         command.env_remove(PARENT_SESSION_ID_ENV);
     }
-    if let Some(attachment_context) = attachment_context {
+    let handoff = if let Some(call) = call {
+        let handoff = crate::mount::Handoff::create(session_id, &call.mounts)?;
         command
-            .env(
-                crate::store::ATTACHMENT_MANIFEST_ENV,
-                &attachment_context.manifest,
-            )
+            .env(crate::store::ATTACHMENT_MANIFEST_ENV, &call.manifest)
             .env(
                 crate::store::BASH_CALL_ID_ENV,
-                attachment_context.bash_call_id.to_string(),
+                call.bash_call_id.to_string(),
             )
-            .env(
-                crate::store::OBJECTS_DIR_ENV,
-                &attachment_context.objects_dir,
-            );
-    }
+            .env(crate::store::OBJECTS_DIR_ENV, &call.objects_dir)
+            .env(crate::mount::HANDOFF_ENV, &handoff.path);
+        Some(handoff)
+    } else {
+        command.env_remove(crate::mount::HANDOFF_ENV);
+        None
+    };
     configure_process_group(&mut command);
 
     if cancellation_requested() {
@@ -576,9 +592,13 @@ fn run_bash(
         if is_e2big(&error) {
             anyhow::anyhow!("command is too large to execute: OS reported argument list too long")
         } else {
-            anyhow::anyhow!(error).context("spawning bash")
+            anyhow::anyhow!(error).context(format!(
+                "spawning {}",
+                command.get_program().to_string_lossy()
+            ))
         }
     })?;
+    drop(command);
     let child_id = child.id();
     let _active = DropGuard::new(
         set_active_process_group(child_id),
@@ -592,7 +612,6 @@ fn run_bash(
         });
     }
 
-    let stdout = child.stdout.take().context("taking bash stdout")?;
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
         let mut stdout = stdout;
@@ -658,6 +677,11 @@ fn run_bash(
         drain_available(&rx, target, &mut output, redactor)?;
         flush_redactor(target, &mut output, redactor)?;
         let _ = child.wait();
+        let reason = if mounted.is_some() {
+            format!("{reason}; the remote command may still be running")
+        } else {
+            reason
+        };
         return Err(BashExecutionError::new(reason, output, redactor.did_redact()).into());
     }
 
@@ -675,7 +699,11 @@ fn run_bash(
         output: output.trim_end_matches('\n').to_string(),
         exit_code: status.code().unwrap_or(1),
         redacted: redactor.did_redact(),
-        attachments: attachment_context.map_or_else(
+        mounts: match handoff {
+            Some(mut handoff) => handoff.staged()?,
+            None => Mounts::new(),
+        },
+        attachments: call.map_or_else(
             || Ok(Vec::new()),
             |context| {
                 crate::store::read_bash_attachments(
@@ -864,7 +892,7 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        AttachmentContext, BashArgs, BashExecutionError, BashRisk, REDACTION_REMINDER, ToolContext,
+        BashArgs, BashExecutionError, BashRisk, CallContext, REDACTION_REMINDER, ToolContext,
         model_failure_output, run_bash, truncate_bash_output,
     };
     use crate::config::EnvMap;
@@ -978,6 +1006,62 @@ mod tests {
     }
 
     #[test]
+    fn mount_passes_opaque_arguments_and_literal_stdin() {
+        let mount = crate::mount::Mount {
+            program: "/bin/bash".into(),
+            args: [
+                "-c",
+                r#"printf '%s\n' "$1" "$2"; cat; printf '!stderr' >&2; exit 7"#,
+                "wrapper",
+            ]
+            .map(String::from)
+            .to_vec(),
+            cwd: "/".into(),
+        };
+        let context = CallContext {
+            mounts: [("deck".into(), mount)].into(),
+            manifest: "/unused/mount-test.jsonl".into(),
+            objects_dir: "/unused/objects".into(),
+            bash_call_id: 1,
+        };
+        let script = "printf '%s' \"$HOME\" | sed 's/$/:/'\nexit";
+        let path = r"C:\Users\a b";
+        let mut request = args(script);
+        request.cwd = Some(format!("deck:{path}"));
+        request.stdin = Some("literal $HOME\n".into());
+        let mut renderer = Renderer::new();
+        let result = run_bash(
+            request,
+            5,
+            &mut renderer,
+            &empty_env(),
+            "test-session",
+            &mut SecretRedactor::default(),
+            Some(&context),
+        )
+        .unwrap();
+        assert_eq!(result.exit_code, 7);
+        assert_eq!(
+            result.output,
+            format!("{path}\n{script}\nliteral $HOME\n!stderr")
+        );
+
+        let mut unknown = args("exit 0");
+        unknown.cwd = Some("unknown:".into());
+        let failure = run_bash(
+            unknown,
+            5,
+            &mut renderer,
+            &empty_env(),
+            "test-session",
+            &mut SecretRedactor::default(),
+            Some(&context),
+        )
+        .unwrap_err();
+        assert!(failure.to_string().contains("unknown mount"));
+    }
+
+    #[test]
     fn bash_overrides_configured_parent_session_id_for_child_process() {
         let mut renderer = Renderer::new();
         let mut env = EnvMap::new();
@@ -1031,9 +1115,7 @@ mod tests {
             config: &config,
             session_id: "calling-session",
             renderer: &mut renderer,
-            attachment_manifest: None,
-            objects_dir: None,
-            bash_call_id: 0,
+            call: None,
         };
         let result = super::execute(
             json!({
@@ -1052,8 +1134,6 @@ mod tests {
                 &config,
                 session_id,
                 None,
-                None,
-                0,
             )
             .unwrap()
         });
@@ -1071,7 +1151,8 @@ mod tests {
     #[test]
     fn bash_attachment_context_exports_manifest_call_and_object_paths() {
         let mut renderer = Renderer::new();
-        let context = AttachmentContext {
+        let context = CallContext {
+            mounts: Default::default(),
             manifest: PathBuf::from("/tmp/attachments.jsonl"),
             objects_dir: PathBuf::from("/tmp/objects"),
             bash_call_id: 42,
@@ -1103,9 +1184,7 @@ mod tests {
             config: &config,
             session_id: "test-session",
             renderer: &mut renderer,
-            attachment_manifest: None,
-            objects_dir: None,
-            bash_call_id: 0,
+            call: None,
         };
         let args = serde_json::json!({
             "title": "redact",

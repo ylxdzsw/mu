@@ -20,6 +20,7 @@ mod compaction;
 mod config;
 mod install;
 mod models;
+mod mount;
 mod paths;
 mod provider;
 mod random;
@@ -36,6 +37,7 @@ use attachment::MAX_ATTACHMENT_BYTES;
 use attachment::load_attachments;
 use config::{Config, ConfigLoadMode};
 use models::ResolvedModelChoice;
+use mount::{Mount, Mounts};
 use provider::build_provider;
 use provider::{ContentPart, UserContent};
 use renderer::{CompactionReport, Renderer};
@@ -161,6 +163,22 @@ enum Command {
     },
     /// Inspect the resolved model and context state
     Status(StatusArgs),
+    /// List or register session-scoped command executors
+    #[command(
+        long_about = concat!(
+            "List the mounts registered for a session, or register a local executor.",
+            "\n\nUSAGE\n",
+            "  mu mount [-s SESSION]\n",
+            "  mu mount [-s SESSION] ID -- PROGRAM [ARG ...]",
+            "\n\nREGISTRY SCHEMA\n",
+            "  {\"ID\": {\"program\": \"/absolute/program\", \"args\": [\"fixed\", \"arguments\"], \"cwd\": \"/absolute/local/registration/directory\"}}",
+            "\n\nA registration resolves PROGRAM through PATH (or relative to the registration directory when it contains a slash) and stores absolute paths. Existing IDs are idempotent only when the complete registration is identical; a different binding is rejected. There is no removal operation.",
+            "\n\nEXECUTOR CONTRACT\n",
+            "  A cwd of ID:path selects a mount, splitting at the first colon. ID: passes an empty path for the executor's default directory. Mu invokes PROGRAM ARG... REMOTE_CWD COMMAND, passing the Bash call's stdin unchanged. The executor decides how command is interpreted. Unknown IDs are errors, never local fallbacks.",
+            "\n\nMounts belong to one session and are persisted. Outside a live tool call, -s selects a session or the active scope's current session is used. Inside a Bash call, registration is staged for the calling session and committed by the parent Mu process when the call completes; listing combines the committed snapshot and registrations staged in that call. A fresh subagent session starts without inherited mounts. Listing reports registration only and does not probe the executor."
+        )
+    )]
+    Mount(MountArgs),
     /// Print the user's mu instructions and skills for a foreign agent
     Context {
         /// Emit the curated projection for another agent to ingest (user
@@ -227,6 +245,21 @@ struct StatusArgs {
 
     #[arg(long)]
     include_skills: bool,
+}
+
+#[derive(ClapArgs, Debug, Clone)]
+struct MountArgs {
+    /// Select a session; defaults to the current session in the active scope
+    #[arg(short = 's', long, value_name = "SESSION")]
+    session: Option<String>,
+
+    /// Mount ID to register (omit to list mounts)
+    #[arg(value_name = "ID")]
+    id: Option<String>,
+
+    /// Local program followed by fixed arguments; pass after `--`
+    #[arg(last = true, value_name = "PROGRAM_AND_ARGS")]
+    program_and_args: Vec<String>,
 }
 
 const OUTPUT_FINAL: u8 = 0;
@@ -773,7 +806,24 @@ async fn run() -> Result<()> {
                 println!("{}", serde_json::to_string(&report)?);
             } else {
                 print_status_report(&report);
+                // An unselected status previews a fresh turn. Don't imply that
+                // mounts belonging to the current session would be inherited.
+                if report.session_id.is_none()
+                    && status_args.selection.model.is_none()
+                    && report.ignored_current_session.is_none()
+                    && let Some(current) = store.current_session()?
+                {
+                    let mounts = store.mounts(&current.id)?;
+                    if !mounts.is_empty() {
+                        println!("mounts (current session {}):", current.id);
+                        print_mounts(&mounts);
+                    }
+                }
             }
+            return Ok(());
+        }
+        Some(Command::Mount(mount_args)) => {
+            run_mount(mount_args, &scope, &cwd)?;
             return Ok(());
         }
         Some(Command::Context { export, no_context }) => {
@@ -946,6 +996,88 @@ async fn run() -> Result<()> {
         prompt_source,
     )
     .await
+}
+
+fn run_mount(args: MountArgs, scope: &paths::Scope, cwd: &Path) -> Result<()> {
+    let add = match (&args.id, args.program_and_args.is_empty()) {
+        (Some(id), _) => mount::registration(id, &args.program_and_args, cwd)?,
+        (None, true) => Mounts::new(),
+        (None, false) => bail!("registration requires ID -- PROGRAM [ARG ...]"),
+    };
+    let visible = if let Some(path) = std::env::var_os(mount::HANDOFF_ENV) {
+        let session =
+            std::env::var(bash::SESSION_ID_ENV).context("mount handoff missing session ID")?;
+        if args.session.as_ref().is_some_and(|id| *id != session) {
+            bail!("live mount handoff is for the calling session ({session})");
+        }
+        mount::in_call(Path::new(&path), &session, &add)?
+    } else {
+        let root = scope.state_dir();
+        if !root.join("sessions").is_dir() {
+            if let Some(id) = args.session {
+                return Err(ExitError::session_not_found(&id));
+            }
+            if !add.is_empty() {
+                bail!("no current session; select one with -s SESSION");
+            }
+            print_mounts(&add);
+            return Ok(());
+        }
+        let store = store::Store::open(&root)?;
+        let session = if let Some(id) = args.session {
+            Some(
+                store
+                    .get_session(&id)?
+                    .ok_or_else(|| ExitError::session_not_found(&id))?,
+            )
+        } else {
+            store.current_session()?
+        };
+        if let Some(session) = session {
+            if !add.is_empty() {
+                store.register_mounts(&session.id, &add)?;
+            }
+            store.mounts(&session.id)?
+        } else if add.is_empty() {
+            Mounts::new()
+        } else {
+            bail!("no current session; select one with -s SESSION")
+        }
+    };
+    print_mounts(if add.is_empty() { &visible } else { &add });
+    Ok(())
+}
+
+fn print_mounts(mounts: &Mounts) {
+    if mounts.is_empty() {
+        println!("(no mounts)");
+        return;
+    }
+    for (id, mount) in mounts {
+        print_mount(id, mount);
+    }
+}
+
+fn print_mount(id: &str, mount: &Mount) {
+    let mut command = vec![display_shell_word(&mount.program.to_string_lossy())];
+    command.extend(mount.args.iter().map(|arg| display_shell_word(arg)));
+    println!(
+        "{id}  → {} (local cwd: {})",
+        command.join(" "),
+        mount.cwd.display()
+    );
+}
+
+fn display_shell_word(value: &str) -> String {
+    if !value.is_empty()
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"_./:@%+=,-".contains(&byte))
+    {
+        value.to_string()
+    } else {
+        format!("'{}'", value.replace('\'', "'\"'\"'"))
+    }
 }
 
 fn validate_cli_args(args: &Args) -> Result<()> {
@@ -1386,6 +1518,10 @@ fn print_status_report(report: &StatusReport) {
     println!("session: {session}");
     println!("context: {context}");
     println!("project: {project}");
+    if !report.mounts.is_empty() {
+        println!("mounts:");
+        print_mounts(&report.mounts);
+    }
     if let Some(git) = &report.git
         && let Some(branch) = &git.branch
     {
@@ -1590,6 +1726,35 @@ mod tests {
 
         let misplaced = Args::try_parse_from(["mu", "-m", "gpt-5", "new"]).unwrap();
         assert!(validate_cli_args(&misplaced).is_err());
+    }
+
+    #[test]
+    fn mount_cli_accepts_listing_and_argv_prefix_registration_forms() {
+        assert!(matches!(
+            Args::try_parse_from(["mu", "mount"])
+                .unwrap()
+                .command,
+            Some(Command::Mount(MountArgs {
+                session: None,
+                id: None,
+                ref program_and_args,
+            })) if program_and_args.is_empty()
+        ));
+
+        assert!(matches!(
+            Args::try_parse_from([
+                "mu", "mount", "-s", "ses_example", "deck", "--", "connector-exec", "steamdeck"
+            ])
+            .unwrap()
+            .command,
+            Some(Command::Mount(MountArgs {
+                session: Some(ref session),
+                id: Some(ref id),
+                ref program_and_args,
+            })) if session == "ses_example"
+                && id == "deck"
+                && program_and_args == &["connector-exec", "steamdeck"]
+        ));
     }
 
     #[test]
